@@ -40,6 +40,14 @@ final class ModelsScreenVM {
         pollTask = nil
     }
 
+    /// Blank the last-known model list when the server leaves running-like
+    /// state (§F6) — without this, `allModels` stays frozen at its last
+    /// successful poll forever. Mirrors `MenubarMetricsStore.markServerStopped()`.
+    func clearOnServerStopped() {
+        allModels = []
+        lastError = nil
+    }
+
     func load(id: String, client: OMLXClient) {
         Task { [weak self] in
             do {

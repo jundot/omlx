@@ -81,6 +81,7 @@ final class MenubarController: NSObject {
     /// so the empty submenu can say "Loading…" instead of "No models available"
     /// while the initial fetch is still in flight.
     private var modelsFetched = false
+    private var modelsFetchFailed = false
     private var modelsFetchTask: Task<Void, Never>?
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
@@ -637,10 +638,7 @@ final class MenubarController: NSObject {
     private func rebuildStatsSubmenu() {
         statsSubmenu.removeAllItems()
 
-        let isRunning: Bool
-        if case .running = server?.state { isRunning = true } else { isRunning = false }
-
-        if !isRunning {
+        if !serverIsRunning {
             statsSubmenu.addItem(disabled(String(localized: "menubar.stats.server_off",
                                                  defaultValue: "Server is off",
                                                  comment: "Disabled placeholder in the Serving Stats submenu when the server isn't running")))
@@ -809,6 +807,7 @@ final class MenubarController: NSObject {
             unloadingIDs.removeAll()
             loadingIDs.removeAll()
             modelsFetched = false
+            modelsFetchFailed = false
             metricsStore.markServerStopped()
         default:
             break
@@ -1079,13 +1078,20 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
 
         if models.isEmpty {
-            let placeholder = modelsFetched
-                ? String(localized: "menubar.models.empty",
-                         defaultValue: "No models available",
-                         comment: "Disabled placeholder in the Models submenu when no models are discovered")
-                : String(localized: "menubar.models.fetching",
-                         defaultValue: "Loading…",
-                         comment: "Disabled placeholder in the Models submenu while the model list is being fetched")
+            let placeholder: String
+            if modelsFetchFailed {
+                placeholder = String(localized: "menubar.models.fetch_failed",
+                                      defaultValue: "Failed to load models",
+                                      comment: "Disabled placeholder in the Models submenu when the model list fetch failed")
+            } else if modelsFetched {
+                placeholder = String(localized: "menubar.models.empty",
+                                      defaultValue: "No models available",
+                                      comment: "Disabled placeholder in the Models submenu when no models are discovered")
+            } else {
+                placeholder = String(localized: "menubar.models.fetching",
+                                      defaultValue: "Loading…",
+                                      comment: "Disabled placeholder in the Models submenu while the model list is being fetched")
+            }
             modelsSubmenu.addItem(disabled(placeholder))
             return
         }
@@ -1235,13 +1241,24 @@ final class MenubarController: NSObject {
 
     private func refreshModels() async {
         guard serverIsRunning, let client else { return }
-        guard let resp = try? await client.listModels() else { return }
-        guard !Task.isCancelled else { return }
-        models = MenubarController.visibleMenuModels(resp.models)
-        modelsFetched = true
-        unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
-        loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
-        rebuildModelsSubmenu()
+        do {
+            let resp = try await client.listModels()
+            guard !Task.isCancelled else { return }
+            models = MenubarController.visibleMenuModels(resp.models)
+            modelsFetched = true
+            modelsFetchFailed = false
+            unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
+            loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
+            rebuildModelsSubmenu()
+        } catch {
+            // scheduleModelsRefresh() cancels the previous fetch on every call
+            // (menu re-open, load/unload actions), so a superseded fetch's own
+            // cancellation must not paint "Failed to load models" — only a
+            // fetch that actually ran to completion and failed should.
+            guard !Task.isCancelled, (error as? URLError)?.code != .cancelled else { return }
+            modelsFetchFailed = true
+            rebuildModelsSubmenu()
+        }
     }
 
     // MARK: - Per-model actions
@@ -1358,9 +1375,13 @@ final class MenubarController: NSObject {
         return it
     }
 
+    // .unresponsive (a missed health check, process still alive and was just
+    // serving) counts as "on" here — this gates model/stats submenus and the
+    // web-dashboard/chat click handlers, all of which want "is the server
+    // process still up" rather than "did the last health check land" (§F4).
+    // menuAvailability(for:), below, intentionally stays stricter.
     private var serverIsRunning: Bool {
-        if case .running = server?.state { return true }
-        return false
+        server?.state.isRunningLike ?? false
     }
 
     private func appendStat(_ label: String, _ value: String) {

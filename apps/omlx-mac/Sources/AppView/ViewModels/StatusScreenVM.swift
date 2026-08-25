@@ -89,6 +89,15 @@ final class StatusScreenVM {
         metrics.stop()
     }
 
+    /// Blank the last-known stats when the server leaves running-like state
+    /// (§F6) — without this, `stats` stays frozen at its last successful poll
+    /// forever, since the poll loop's own failures don't touch it (see
+    /// `clearsError` above). Mirrors `MenubarMetricsStore.markServerStopped()`.
+    func clearOnServerStopped() {
+        stats = nil
+        lastError = nil
+    }
+
     /// `clearsError`: the 5s poll loop (below) must not touch `lastError` —
     /// it was wiping a clearStats/clearSsdCache/clearHotCache failure within
     /// that window (§G2). Those three action methods call this right after

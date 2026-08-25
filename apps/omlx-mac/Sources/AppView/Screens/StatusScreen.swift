@@ -131,6 +131,9 @@ struct StatusScreen: View {
             await vm.start(client: services.client)
         }
         .onDisappear { vm.stop() }
+        .onChange(of: services.serverState) { _, newState in
+            if !newState.isRunningLike { vm.clearOnServerStopped() }
+        }
         .confirmationDialog(
             vm.scope == "alltime"
                 ? String(localized: "status.confirm.clear_alltime",

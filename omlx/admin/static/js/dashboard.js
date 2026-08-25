@@ -630,6 +630,7 @@
             downloaderSource: 'hf',
             msAvailable: false,
             msInitialized: false,
+            msChecking: false,
             msRepoId: '',
             msToken: '',
             msDownloading: false,
@@ -6631,6 +6632,16 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+
+                        // Snapshots for saveClaudeCodeSettings/saveIntegrationSettings
+                        // to revert to on a failed save (§C2). Deliberately NOT a
+                        // full loadGlobalSettings() re-fetch on failure — this tab's
+                        // fields auto-save on change from many different call sites,
+                        // and a full reload here would also clobber any unsaved edit
+                        // in progress elsewhere on the Settings tab (see the same
+                        // reasoning in saveIdleTimeout, below).
+                        this._lastSavedClaudeCode = { ...this.globalSettings.claude_code };
+                        this._lastSavedIntegrations = { ...this.globalSettings.integrations };
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -6860,9 +6871,13 @@
                         await this.loadGlobalSettings();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to delete sub key', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to delete sub key:', err);
+                    this.showNotification('Failed to delete sub key', 'error');
                 }
             },
 
@@ -7693,9 +7708,14 @@
                             if (newProfile) {
                                 await this.applyProfileToForm(newProfile);
                             }
+                        } else if (r.status === 401) {
+                            window.location.href = '/admin';
+                        } else {
+                            const data = await r.json().catch(() => ({}));
+                            this.profileError = data.detail || 'Failed to create profile from template';
                         }
                     } catch (e) {
-                        console.error('Failed to create profile from template:', e);
+                        this.profileError = String(e);
                     }
                 }
             },
@@ -8845,11 +8865,24 @@
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save Claude Code settings');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
                     }
+                    if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
+                        this.globalSettings.claude_code = { ...this._lastSavedClaudeCode };
+                        this.showNotification(
+                            data.detail || window.t('js.error.save_claude_code_settings_failed'),
+                            'error'
+                        );
+                        return;
+                    }
+                    this._lastSavedClaudeCode = { ...this.globalSettings.claude_code };
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                    this.globalSettings.claude_code = { ...this._lastSavedClaudeCode };
+                    this.showNotification(window.t('js.error.save_claude_code_settings_failed'), 'error');
                 }
             },
 
@@ -8927,11 +8960,24 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save integration settings');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
                     }
+                    if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
+                        this.globalSettings.integrations = { ...this._lastSavedIntegrations };
+                        this.showNotification(
+                            data.detail || window.t('js.error.save_integration_settings_failed'),
+                            'error'
+                        );
+                        return;
+                    }
+                    this._lastSavedIntegrations = { ...this.globalSettings.integrations };
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                    this.globalSettings.integrations = { ...this._lastSavedIntegrations };
+                    this.showNotification(window.t('js.error.save_integration_settings_failed'), 'error');
                 }
             },
 
@@ -9041,47 +9087,69 @@
 
             async clearStats() {
                 try {
-                    await fetch('/admin/api/stats/clear', { method: 'POST' });
+                    const resp = await fetch('/admin/api/stats/clear', { method: 'POST' });
                     this.showClearStatsConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear stats', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear stats:', err);
                     this.showClearStatsConfirm = false;
+                    this.showNotification('Failed to clear stats', 'error');
                 }
             },
 
             async clearAlltimeStats() {
                 try {
-                    await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
+                    const resp = await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
                     this.showClearAlltimeConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear all-time stats', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
+                    this.showNotification('Failed to clear all-time stats', 'error');
                 }
             },
 
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
                     this.showClearSsdCacheConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear SSD cache', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
                     this.showClearSsdCacheConfirm = false;
+                    this.showNotification('Failed to clear SSD cache', 'error');
                 }
             },
 
             async clearHotCache() {
                 try {
                     const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
                     this.showClearHotCacheConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear hot cache', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear hot cache:', err);
                     this.showClearHotCacheConfirm = false;
+                    this.showNotification('Failed to clear hot cache', 'error');
                 }
             },
 
@@ -9488,6 +9556,7 @@
                 if (this.benchEventSource) {
                     this.benchEventSource.close();
                 }
+                this._stopBenchPolling();
 
                 const es = new EventSource(`/admin/api/bench/${benchId}/stream`);
                 this.benchEventSource = es;
@@ -9561,6 +9630,14 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                        } else if (data.type === 'cancelled') {
+                            // User-initiated cancel, not a failure — no benchError.
+                            // The backend still unloads the model (§C1), so refresh.
+                            this.benchRunning = false;
+                            this.benchProgress = null;
+                            es.close();
+                            this.benchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -9576,14 +9653,68 @@
                 };
 
                 es.onerror = () => {
+                    es.close();
+                    this.benchEventSource = null;
+                    // SSE disconnected — fall back to polling rather than
+                    // immediately declaring the run dead (§C1): a dropped
+                    // connection is common (tab backgrounded, brief network
+                    // blip) and the run is very likely still going server-side.
                     if (this.benchRunning) {
+                        this._startBenchPolling();
+                    }
+                };
+            },
+
+            async _pollBenchOnce(benchId) {
+                try {
+                    const resp = await fetch(`/admin/api/bench/${benchId}/results`);
+                    if (resp.status === 404) {
+                        // Run no longer exists server-side (restart) — terminal.
+                        this._stopBenchPolling();
                         this.benchError = window.t('js.error.benchmark_connection_lost');
                         this.benchRunning = false;
                         this.benchProgress = null;
+                        return;
                     }
-                    es.close();
-                    this.benchEventSource = null;
-                };
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const terminal = data.status === 'completed'
+                        || data.status === 'cancelled'
+                        || data.status === 'error';
+                    if (terminal) {
+                        this._stopBenchPolling();
+                        this.benchRunning = false;
+                        this.benchProgress = null;
+                        if (data.status === 'error' && data.error) {
+                            this.benchError = data.error;
+                        }
+                        this.loadModels();
+                        return;
+                    }
+                    // Still running — try to reconnect the live stream; replay-
+                    // on-subscribe restores progress/results, and our result
+                    // arrays dedupe so a replay can't double-add rows.
+                    if (!this.benchEventSource) {
+                        this._stopBenchPolling();
+                        this.connectBenchSSE(benchId);
+                    }
+                } catch (err) {
+                    // Transient — next tick retries.
+                }
+            },
+
+            _startBenchPolling() {
+                this._stopBenchPolling();
+                const benchId = this.benchBenchId;
+                if (!benchId) return;
+                this._benchPollTimer = setInterval(() => this._pollBenchOnce(benchId), 3000);
+            },
+
+            _stopBenchPolling() {
+                if (this._benchPollTimer) {
+                    clearInterval(this._benchPollTimer);
+                    this._benchPollTimer = null;
+                }
             },
 
             async cancelBenchmark() {
@@ -9593,7 +9724,7 @@
                 } catch (err) {
                     console.error('Failed to cancel benchmark:', err);
                 }
-                // SSE handler will update state when error/done event arrives
+                // SSE handler will update state when cancelled/error/done event arrives
             },
 
             // Context benchmark functions
@@ -9642,6 +9773,7 @@
                 if (this.ctxBenchEventSource) {
                     this.ctxBenchEventSource.close();
                 }
+                this._stopCtxBenchPolling();
 
                 const es = new EventSource(`/admin/api/bench/context/${benchId}/stream`);
                 this.ctxBenchEventSource = es;
@@ -9665,6 +9797,13 @@
                             this.ctxBenchEventSource = null;
                             // The applied setting changed the model row.
                             this.loadModels();
+                        } else if (data.type === 'cancelled') {
+                            // User-initiated cancel, not a failure — no ctxBenchError.
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.ctxBenchError = data.message;
                             this.ctxBenchRunning = false;
@@ -9679,14 +9818,63 @@
                 };
 
                 es.onerror = () => {
+                    es.close();
+                    this.ctxBenchEventSource = null;
+                    // SSE disconnected — fall back to polling rather than
+                    // immediately declaring the run dead (§C1).
                     if (this.ctxBenchRunning) {
+                        this._startCtxBenchPolling();
+                    }
+                };
+            },
+
+            async _pollCtxBenchOnce(benchId) {
+                try {
+                    const resp = await fetch(`/admin/api/bench/context/${benchId}/results`);
+                    if (resp.status === 404) {
+                        this._stopCtxBenchPolling();
                         this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
                         this.ctxBenchRunning = false;
                         this.ctxBenchProgress = null;
+                        return;
                     }
-                    es.close();
-                    this.ctxBenchEventSource = null;
-                };
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const terminal = data.status === 'completed'
+                        || data.status === 'cancelled'
+                        || data.status === 'error';
+                    if (terminal) {
+                        this._stopCtxBenchPolling();
+                        this.ctxBenchRunning = false;
+                        this.ctxBenchProgress = null;
+                        if (data.status === 'error' && data.error) {
+                            this.ctxBenchError = data.error;
+                        }
+                        if (data.result) this.ctxBenchResult = data.result;
+                        this.loadModels();
+                        return;
+                    }
+                    if (!this.ctxBenchEventSource) {
+                        this._stopCtxBenchPolling();
+                        this.connectContextBenchSSE(benchId);
+                    }
+                } catch (err) {
+                    // Transient — next tick retries.
+                }
+            },
+
+            _startCtxBenchPolling() {
+                this._stopCtxBenchPolling();
+                const benchId = this.ctxBenchBenchId;
+                if (!benchId) return;
+                this._ctxBenchPollTimer = setInterval(() => this._pollCtxBenchOnce(benchId), 3000);
+            },
+
+            _stopCtxBenchPolling() {
+                if (this._ctxBenchPollTimer) {
+                    clearInterval(this._ctxBenchPollTimer);
+                    this._ctxBenchPollTimer = null;
+                }
             },
 
             async cancelContextBenchmark() {
@@ -9696,7 +9884,7 @@
                 } catch (err) {
                     console.error('Failed to cancel context benchmark:', err);
                 }
-                // SSE handler will update state when the error event arrives
+                // SSE handler will update state when the cancelled/error event arrives
             },
 
             async loadCtxBenchState() {
@@ -12117,19 +12305,34 @@
             // =================================================================
 
             async initMsDownloader() {
-                if (this.msInitialized) return;
-                this.msInitialized = true;
+                // msChecking (not just msInitialized) guards re-entrancy: without
+                // it, two quick clicks on the ModelScope tab before the first
+                // fetch resolves would fire two concurrent status checks.
+                if (this.msInitialized || this.msChecking) return;
+                this.msChecking = true;
                 try {
                     const response = await fetch('/admin/api/ms/status');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
                     if (response.ok) {
                         const data = await response.json();
+                        // A definitive server answer (available either way) is a
+                        // stable environmental fact — latch it so we don't
+                        // re-check on every tab click. A failed request below is
+                        // NOT latched: it may be a transient blip, and the amber
+                        // "unavailable" banner shouldn't be permanent on a guess.
                         this.msAvailable = data.available === true;
+                        this.msInitialized = true;
                     } else {
                         this.msAvailable = false;
                     }
                 } catch (err) {
                     this.msAvailable = false;
                     console.error('Failed to check MS status:', err);
+                } finally {
+                    this.msChecking = false;
                 }
                 if (this.msAvailable) {
                     await this.loadMSTasks();
