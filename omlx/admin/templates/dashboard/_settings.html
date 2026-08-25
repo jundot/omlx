@@ -1603,10 +1603,11 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="openModelSettings(model)"
-                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    :disabled="modelSettingsLoadingId === model.id"
+                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                                                     :title="window.t('settings.models.table.sampling_settings_tooltip')"
                                                 >
-                                                    <i data-lucide="settings" class="w-4 h-4"></i>
+                                                    <i data-lucide="settings" class="w-4 h-4" :class="modelSettingsLoadingId === model.id && 'animate-spin'"></i>
                                                 </button>
                                             </template>
                                             <template x-if="model.virtual">

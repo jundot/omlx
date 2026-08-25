@@ -433,6 +433,27 @@ final class AppServices: NSObject {
         }
     }
 
+    /// Offline-only counterpart to `applyServerEndpoint`, for Apply while
+    /// the managed server exists but isn't running-like. `applyServerEndpoint`
+    /// always calls `server.start()` when `server != nil` (needed for its
+    /// online reconfigure-and-bounce contract, which callers like `restart()`
+    /// and the Welcome wizard rely on) — that would launch the server as a
+    /// surprise side effect of an offline settings save. This persists to
+    /// AppConfig only; the change takes effect the next time the server is
+    /// started manually. Does not change `applyServerEndpoint`'s own semantics.
+    func saveServerEndpointOffline(host: String? = nil, port: Int? = nil) throws {
+        let resolvedBindAddress = host ?? config.bindAddress
+        let resolvedPort = port ?? config.port
+
+        var updated = config
+        updated.bindAddress = resolvedBindAddress
+        updated.port = resolvedPort
+        try updated.save()
+        self.config = updated
+
+        client.configure(host: updated.host, port: resolvedPort, apiKey: updated.apiKey)
+    }
+
     deinit {
         NotificationCenter.default.removeObserver(self)
     }

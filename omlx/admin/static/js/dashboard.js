@@ -207,6 +207,9 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            _modelSettingsSeq: 0,
+            _modelSettingsSnapshot: null,
+            modelSettingsLoadingId: null,  // model.id/name mid-open, for a per-row spinner
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -544,8 +547,16 @@
             // Log viewer state
             logContent: '',
             logLines: 500,
-            logRefreshInterval: 5,  // seconds, 0 = disabled
-            logAutoRefresh: false,
+            // Persisted separately (§B13): previously the only way to pause
+            // was setting the interval to 0, which destroyed whatever
+            // cadence the user preferred and required re-typing it to
+            // resume. Neither value survived a reload before this either.
+            logRefreshInterval: (() => {
+                const n = parseInt(localStorage.getItem('logRefreshInterval'), 10);
+                return Number.isFinite(n) && n >= 0 && n <= 300 ? n : 5;
+            })(),
+            logAutoRefreshEnabled: localStorage.getItem('logAutoRefreshEnabled') !== 'false',
+            logAutoRefresh: false,  // derived: true only while the timer is actually armed
             logAutoScroll: true,
             logLoading: false,
             logError: '',
@@ -7095,14 +7106,36 @@
                 if (!this.activeProfileName) { this.profilesDrift = false; return; }
                 const active = this.profiles.find(p => p.name === this.activeProfileName);
                 if (!active) { this.profilesDrift = false; return; }
-                const form = this.formValuesForProfile();
-                for (const [k, v] of Object.entries(active.settings || {})) {
-                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) {
-                        this.profilesDrift = true;
-                        return;
-                    }
+                this.profilesDrift = this._profileDrift(active.settings || {}, this.formValuesForProfile());
+            },
+            // Symmetric key comparison (union of form + profile keys), unlike
+            // the backend's own narrower check below — a field the user just
+            // set that the saved profile doesn't have yet (e.g. enabling
+            // guided_grammar_enabled for the first time) previously wasn't
+            // detected as drift at all (§B10).
+            _profileDrift(activeSettings, form) {
+                const keys = new Set([...Object.keys(form), ...Object.keys(activeSettings)]);
+                for (const k of keys) {
+                    // Backend treats a profile value of None as "unconstrained"
+                    // (routes.py:2769-2773) — match that here so this doesn't
+                    // flag drift the backend won't actually act on.
+                    if (activeSettings[k] === null) continue;
+                    if (JSON.stringify(form[k]) !== JSON.stringify(activeSettings[k])) return true;
                 }
-                this.profilesDrift = false;
+                return false;
+            },
+            // Mirrors the backend's PUT-time divergence check exactly
+            // (routes.py:2753-2794, profile-keys-only): true only when an
+            // EXISTING profile field's value actually changed. When this is
+            // false but _profileDrift is true, the difference is form-only
+            // keys, and the backend's real behavior for those is NOT to
+            // unlink the profile — it silently merges them into it.
+            _profileDiverged(activeSettings, form) {
+                for (const [k, v] of Object.entries(activeSettings)) {
+                    if (v === null) continue;
+                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) return true;
+                }
+                return false;
             },
             matchedPreset(settings) {
                 // Return the preset whose universal-field settings match the current model
@@ -7140,12 +7173,19 @@
                 if (description) lines.push(description);
                 return lines.join('\n');
             },
-            async loadProfilesForModel(modelId) {
+            // `isCurrent`: optional guard checked right before the fetched
+            // data is applied — lets a caller that fires overlapping calls
+            // (openModelSettings, when two "Settings" clicks race) drop a
+            // superseded response instead of letting it land after a newer
+            // call already applied its own (§B9). Callers that don't race
+            // (profile/template CRUD flows) just use the default no-op.
+            async loadProfilesForModel(modelId, isCurrent = () => true) {
                 this.profiles = [];
                 try {
                     const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
                     if (r.ok) {
                         const data = await r.json();
+                        if (!isCurrent()) return;
                         this.profiles = data.profiles || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
@@ -7154,11 +7194,12 @@
                     console.error('Failed to load profiles:', e);
                 }
             },
-            async loadTemplates() {
+            async loadTemplates(isCurrent = () => true) {
                 try {
                     const r = await fetch('/admin/api/profile-templates');
                     if (r.ok) {
                         const data = await r.json();
+                        if (!isCurrent()) return;
                         this.templates = data.templates || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
@@ -7491,6 +7532,7 @@
                     mtp_enabled: s.mtp_enabled || false,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
+                    mtplx_sidecar_available: model?.mtplx_sidecar_available === true,
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
@@ -8149,51 +8191,86 @@
             },
 
             async openModelSettings(model) {
-                this.profileError = '';
-                this.showNewProfileForm = false;
-                this.showNewTemplateForm = false;
-                this.editingProfile = null;
-                this.editingTemplate = null;
-                this.profileDeleteConfirm = null;
-                this.templateDeleteConfirm = null;
-                const isDiffusion = this.isDiffusionModel(model);
-                this.activeProfileName = isDiffusion
-                    ? null
-                    : ((model.settings && model.settings.active_profile_name) || null);
-                if (isDiffusion) {
-                    this.profiles = [];
-                    this.templates = [];
-                    this.profilesDrift = false;
-                } else {
-                    try {
-                        const saved = localStorage.getItem('omlx_profile_scope');
-                        if (saved === 'preset' || saved === 'global' || saved === 'model') {
-                            this.profileScope = saved;
-                        }
-                    } catch (e) {}
-                    await Promise.all([
-                        this.loadProfilesForModel(model.id),
-                        this.loadTemplates(),
-                    ]);
-                    if (this.reasoningParsers.length === 0) {
+                // Guards against two overlapping opens (click model A's
+                // Settings, then B's before A's awaits resolve): the loaded
+                // profiles/templates are threaded an isCurrent() check so a
+                // superseded response can't land after a newer one already
+                // applied, and the final state assignment below bails
+                // entirely if superseded (§B9).
+                const seq = ++this._modelSettingsSeq;
+                const isCurrent = () => seq === this._modelSettingsSeq;
+                this.modelSettingsLoadingId = model.id;
+                try {
+                    this.profileError = '';
+                    this.showNewProfileForm = false;
+                    this.showNewTemplateForm = false;
+                    this.editingProfile = null;
+                    this.editingTemplate = null;
+                    this.profileDeleteConfirm = null;
+                    this.templateDeleteConfirm = null;
+                    const isDiffusion = this.isDiffusionModel(model);
+                    this.activeProfileName = isDiffusion
+                        ? null
+                        : ((model.settings && model.settings.active_profile_name) || null);
+                    if (isDiffusion) {
+                        this.profiles = [];
+                        this.templates = [];
+                        this.profilesDrift = false;
+                    } else {
                         try {
-                            const resp = await fetch('/admin/api/grammar/parsers');
-                            if (resp.ok) this.reasoningParsers = await resp.json();
-                            else if (resp.status === 401) window.location.href = '/admin';
-                        } catch (_) { /* network error */ }
+                            const saved = localStorage.getItem('omlx_profile_scope');
+                            if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                                this.profileScope = saved;
+                            }
+                        } catch (e) {}
+                        await Promise.all([
+                            this.loadProfilesForModel(model.id, isCurrent),
+                            this.loadTemplates(isCurrent),
+                        ]);
+                        if (this.reasoningParsers.length === 0) {
+                            try {
+                                const resp = await fetch('/admin/api/grammar/parsers');
+                                if (resp.ok) {
+                                    const parsers = await resp.json();
+                                    if (isCurrent()) this.reasoningParsers = parsers;
+                                } else if (resp.status === 401) {
+                                    window.location.href = '/admin';
+                                }
+                            } catch (_) { /* network error */ }
+                        }
                     }
+                    if (!isCurrent()) return;
+                    this.selectedModel = model;
+                    this.modelSettings = this.buildModelSettingsState(
+                        model,
+                        model.settings || {},
+                    );
+                    if (isDiffusion) {
+                        this.profilesDrift = false;
+                    } else {
+                        this.computeDrift();
+                    }
+                    // Snapshot for the dirty-check on backdrop/escape/cancel
+                    // close (§B8) — modelSettings is a flat, JSON-serializable
+                    // form-state object built above.
+                    this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);
+                    this.showModelSettingsModal = true;
+                } finally {
+                    if (isCurrent()) this.modelSettingsLoadingId = null;
                 }
-                this.selectedModel = model;
-                this.modelSettings = this.buildModelSettingsState(
-                    model,
-                    model.settings || {},
-                );
-                if (isDiffusion) {
-                    this.profilesDrift = false;
-                } else {
-                    this.computeDrift();
+            },
+
+            /// Close the Model Settings modal, confirming first if the form
+            /// has unsaved edits vs. what it opened with. Route every close
+            /// path (backdrop, header X, footer Cancel, Escape) through this
+            /// — `saveModelSettings()` closes directly on success, which is
+            /// correct since there's nothing to discard at that point.
+            closeModelSettingsModal() {
+                if (this._modelSettingsSnapshot !== null
+                    && JSON.stringify(this.modelSettings) !== this._modelSettingsSnapshot) {
+                    if (!confirm(window.t('modal.model_settings.discard_confirm'))) return;
                 }
-                this.showModelSettingsModal = true;
+                this.showModelSettingsModal = false;
             },
 
             async importMtplxSidecar() {
@@ -8305,6 +8382,22 @@
                     return;
                 }
 
+                // Surface the backend's silent-merge behavior (§B10): if the
+                // only reason this save "drifts" from the active profile is
+                // form-only keys the profile doesn't have yet, the backend
+                // won't unlink the profile — it'll rewrite it to absorb
+                // those fields. The generic drift dot doesn't say that.
+                if (this.activeProfileName) {
+                    const active = this.profiles.find(p => p.name === this.activeProfileName);
+                    if (active) {
+                        const form = this.formValuesForProfile();
+                        const activeSettings = active.settings || {};
+                        if (this._profileDrift(activeSettings, form) && !this._profileDiverged(activeSettings, form)) {
+                            this.showNotification(window.t('modal.model_settings.profile_merge_notice'), 'warning');
+                        }
+                    }
+                }
+
                 this.savingModelSettings = true;
                 try {
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
@@ -8343,8 +8436,8 @@
                             const payload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
-                                max_context_window: this.modelSettings.max_context_window || null,
-                                max_tokens: this.modelSettings.max_tokens || null,
+                                max_context_window: Number.isFinite(this.modelSettings.max_context_window) ? this.modelSettings.max_context_window : null,
+                                max_tokens: Number.isFinite(this.modelSettings.max_tokens) ? this.modelSettings.max_tokens : null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
                                 top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
                                 top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
@@ -8353,7 +8446,7 @@
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
-                                ttl_seconds: this.modelSettings.ttl_seconds || null,
+                                ttl_seconds: Number.isFinite(this.modelSettings.ttl_seconds) ? this.modelSettings.ttl_seconds : null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
@@ -9051,6 +9144,11 @@
             },
 
             async loadStats(includeAlltime = true) {
+                // A model switch or the periodic refresh timer can overlap
+                // two calls; without this a slower older request could land
+                // after a newer one and repaint stats for the wrong model
+                // (§B11).
+                const seq = ++this._statsReqSeq;
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -9058,8 +9156,10 @@
                     }
                     const url = '/admin/api/stats' + (params.toString() ? '?' + params : '');
                     const response = await fetch(url);
+                    if (seq !== this._statsReqSeq) return;
                     if (response.ok) {
                         const data = await response.json();
+                        if (seq !== this._statsReqSeq) return;
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -9076,8 +9176,10 @@
                     }
                     const alltimeUrl = '/admin/api/stats?' + alltimeParams;
                     const alltimeResponse = await fetch(alltimeUrl);
+                    if (seq !== this._statsReqSeq) return;
                     if (alltimeResponse.ok) {
                         const alltimeData = await alltimeResponse.json();
+                        if (seq !== this._statsReqSeq) return;
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
                 } catch (err) {
@@ -10081,8 +10183,8 @@
                             pad(this.benchFmtNum(r.tpot_ms, 2), 10),
                             pad(this.benchFmtNum(r.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
-                            pad(r.e2e_latency_s.toFixed(3), 10),
-                            pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(r.e2e_latency_s, 3), 10),
+                            pad(this.benchFmtNum(r.total_throughput, 1, ' tok/s'), 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
                         ];
                         lines.push(row.join('  '));
@@ -10107,7 +10209,7 @@
                             pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(baseline.ttft_ms, 1), 10),
-                            pad(baseline.e2e_latency_s.toFixed(3), 10),
+                            pad(this.benchFmtNum(baseline.e2e_latency_s, 3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
@@ -10120,7 +10222,7 @@
                             pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
-                            pad(r.e2e_latency_s.toFixed(3), 10),
+                            pad(this.benchFmtNum(r.e2e_latency_s, 3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
@@ -10470,10 +10572,13 @@
                                 }
                                 break;
                             case 'done':
+                                this.accRunning = false;
                                 this.accProgress = null;
                                 es.close();
                                 this.accEventSource = null;
-                                // Check for next in queue
+                                // Check for next in queue — _pollForNextRun's
+                                // own loadAccQueueStatus() flips accRunning
+                                // back to true within ~1s if one starts.
                                 this._pollForNextRun();
                                 break;
                             case 'error':
@@ -10801,6 +10906,11 @@
             },
 
             async loadLogs() {
+                // Switching log files (or the auto-refresh timer firing
+                // mid-switch) can overlap two calls; without a sequence
+                // guard a slower, older request can land after a newer one
+                // and paint the wrong file's content (§B11).
+                const seq = ++this._logsReqSeq;
                 this.logLoading = true;
                 this.logError = '';
 
@@ -10813,9 +10923,11 @@
                     }
 
                     const response = await fetch(`/admin/api/logs?${params}`);
+                    if (seq !== this._logsReqSeq) return;
 
                     if (response.ok) {
                         const data = await response.json();
+                        if (seq !== this._logsReqSeq) return;
                         this.logContent = data.logs;
                         this.logTotalLines = data.total_lines;
                         this.logAvailableFiles = data.available_files || ['server.log'];
@@ -10834,20 +10946,21 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
+                        if (seq !== this._logsReqSeq) return;
                         this.logError = data.detail || window.t('js.error.load_logs_failed');
                     }
                 } catch (err) {
                     console.error('Failed to load logs:', err);
-                    this.logError = window.t('js.error.load_logs_failed');
+                    if (seq === this._logsReqSeq) this.logError = window.t('js.error.load_logs_failed');
                 } finally {
-                    this.logLoading = false;
+                    if (seq === this._logsReqSeq) this.logLoading = false;
                 }
             },
 
             startLogRefresh() {
                 this.stopLogRefresh();  // Clear existing timer
 
-                if (this.logRefreshInterval > 0) {
+                if (this.logAutoRefreshEnabled && this.logRefreshInterval > 0) {
                     this.logAutoRefresh = true;
                     this._logRefreshTimer = setInterval(() => {
                         this.loadLogs();
@@ -10861,6 +10974,17 @@
                     this._logRefreshTimer = null;
                 }
                 this.logAutoRefresh = false;
+            },
+
+            saveLogRefreshInterval() {
+                localStorage.setItem('logRefreshInterval', String(this.logRefreshInterval));
+                this.restartLogRefresh();
+            },
+
+            toggleLogAutoRefresh() {
+                this.logAutoRefreshEnabled = !this.logAutoRefreshEnabled;
+                localStorage.setItem('logAutoRefreshEnabled', String(this.logAutoRefreshEnabled));
+                this.restartLogRefresh();
             },
 
             restartLogRefresh() {
@@ -12106,9 +12230,13 @@
                     most_params:  { col: 'params',    dir: 'desc' },
                     least_params: { col: 'params',    dir: 'asc'  },
                     downloads:    { col: 'downloads', dir: 'desc' },
-                    trending:     { col: 'downloads', dir: 'desc' },
-                    created:      { col: 'downloads', dir: 'desc' },
-                    updated:      { col: 'downloads', dir: 'desc' },
+                    // trending/created/updated are already sorted server-side
+                    // (that's the whole point of picking them) — 'rank'
+                    // preserves the backend's order instead of re-sorting by
+                    // downloads and discarding it (§B7).
+                    trending:     { col: 'rank',      dir: 'asc'  },
+                    created:      { col: 'rank',      dir: 'asc'  },
+                    updated:      { col: 'rank',      dir: 'asc'  },
                 };
                 const m = map[this.hfSearchSort];
                 if (m) {
@@ -12182,7 +12310,11 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
-                        this.hfSearchResults = data.models || [];
+                        // Attach original rank so a trending/created/updated
+                        // sort (server-ordered) survives the client-side
+                        // re-sort in sortModels() — same pattern as
+                        // loadRecommendedModels' trending/popular lists.
+                        this.hfSearchResults = (data.models || []).map((m, i) => ({ ...m, rank: i + 1 }));
                         this.hfSearchLoaded = true;
                         // Save to search history
                         this.addSearchHistory(this.hfSearchQuery.trim());

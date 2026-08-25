@@ -675,11 +675,16 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str, bool]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
-    Returns ``(compatible, reason)``. Reason is empty on success and
-    suitable for surfacing to users (admin UI shows it under the toggle).
+    Returns ``(compatible, reason, mtplx_sidecar_available)``. Reason is
+    empty on success and suitable for surfacing to users (admin UI shows
+    it under the toggle). ``mtplx_sidecar_available`` is a structured
+    signal for whether the one-click MTPLX side-car import button should
+    show — the UI used to pattern-match the reason string for "MTPLX
+    side-car", which broke if this text ever changed and threw outright
+    when no model was selected (reason undefined).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -701,21 +706,21 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
-        return False, paro_reason
+        return False, paro_reason, False
 
     model_path = model_info.get("model_path") or ""
     if not model_path:
-        return False, "model_path missing"
+        return False, "model_path missing", False
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
-        return False, "config.json not found"
+        return False, "config.json not found", False
     try:
         cfg = json.loads(cfg_path.read_text())
     except Exception as e:
-        return False, f"failed to read config: {e}"
+        return False, f"failed to read config: {e}", False
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
-        return False, "model has no MTP heads in config"
+        return False, "model has no MTP heads in config", False
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
     # the dedicated VLM path in omlx.utils.model_loading (vendored mlx-vlm
     # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
@@ -728,28 +733,26 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             f"model_type={model_type!r} is not on the MTP whitelist "
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
             "gemma4, gemma4_unified)"
-        )
+        ), False
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
 
         if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
-            # The dashboard keys the one-click import button off this
-            # "MTPLX side-car" marker (models.js).
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
-            )
+            ), True
         if model_type == "qwen4_exp":
             return False, (
                 "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
                 "native nextn layers are not supported by its dedicated runtime."
-            )
+            ), False
         return False, (
             "Config declares MTP layers but the weight files contain neither "
             "mtp.* tensors nor native nextn layers. Re-convert from HF with a "
             "converter that preserves MTP weights."
-        )
-    return True, ""
+        ), False
+    return True, "", False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -1946,7 +1949,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason, mtplx_sidecar_available = _mtp_compat_for_model(model_info)
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2028,6 +2031,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "mtplx_sidecar_available": mtplx_sidecar_available,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2073,6 +2077,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_ssd_cache_available": False,
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
+                "mtplx_sidecar_available": False,
                 "is_paroquant": False,
                 "paroquant_reason": "",
                 "virtual": True,
