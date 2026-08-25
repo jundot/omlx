@@ -76,7 +76,7 @@ final class UpdateController {
     enum CheckState: Equatable, Sendable {
         case idle(lastChecked: Date?)
         case checking
-        case downloading(percent: Int)
+        case downloading(AvailableUpdate, percent: Int)
         case available(AvailableUpdate)
         case ready(AvailableUpdate)
     }
@@ -114,6 +114,22 @@ final class UpdateController {
     var autoNotify: Bool {
         didSet { if !suspendPersist { persist() } }
     }
+    /// Warm the DMG while the release notes are open. Toggled from the sheet
+    /// footer, so it takes effect on the download that is running right now.
+    var autoPrefetch: Bool {
+        didSet {
+            guard !suspendPersist else { return }
+            persist()
+            if autoPrefetch {
+                if let info = confirmationUpdate,
+                   let dmg = Self.prefetchURL(state: state, info: info, automatic: false, enabled: true) {
+                    startDownload(info: info, dmgURL: dmg, autoInstall: false)
+                }
+            } else {
+                cancelPrefetch()
+            }
+        }
+    }
 
     private let storeURL: URL
     private let currentVersion: String
@@ -123,6 +139,12 @@ final class UpdateController {
     private var checkTask: Task<Void, Never>?
     @ObservationIgnored
     private var updater: AppUpdater?
+    @ObservationIgnored
+    private var installWhenReady = false
+    /// Bumped per download attempt so a cancelled updater's late callbacks
+    /// can't stomp the state of the one that replaced it.
+    @ObservationIgnored
+    private var downloadGeneration = 0
     @ObservationIgnored
     private var backgroundTimer: Timer?
     @ObservationIgnored
@@ -139,11 +161,12 @@ final class UpdateController {
         self.storeURL = storeURL
         self.currentVersion = currentVersion
         let prefs = Self.readPrefs(from: storeURL) ?? Prefs(
-            channel: .stable, autoCheck: true, autoNotify: false
+            channel: .stable, autoCheck: true, autoNotify: false, autoPrefetch: true
         )
         self.channel = prefs.channel
         self.autoCheck = prefs.autoCheck
         self.autoNotify = prefs.autoNotify
+        self.autoPrefetch = prefs.autoPrefetch
         self.deferredPromptVersion = prefs.deferredPromptVersion
         self.suspendPersist = false
     }
@@ -188,6 +211,9 @@ final class UpdateController {
             presentConfirmation(for: info, automatic: false)
         case .ready(let info):
             presentConfirmation(for: info, automatic: false)
+        case .downloading(let info, _):
+            // Prefetch in flight — reopen the notes instead of starting over.
+            presentConfirmation(for: info, automatic: false)
         default:
             break
         }
@@ -195,12 +221,27 @@ final class UpdateController {
 
     func dismissUpdateConfirmation() {
         confirmationUpdate = nil
+        cancelPrefetch()
     }
 
     func deferUpdate(_ info: AvailableUpdate) {
         deferredPromptVersion = info.version
         persist()
         confirmationUpdate = nil
+        cancelPrefetch()
+    }
+
+    /// Drop a background prefetch the user walked away from. A download they
+    /// asked to install is kept — `confirmUpdate` also closes the sheet, which
+    /// routes through `dismissUpdateConfirmation` right after arming the swap.
+    private func cancelPrefetch() {
+        guard !installWhenReady, case .downloading(let info, _) = state else { return }
+        updater?.cancel()
+        updater = nil
+        downloadGeneration &+= 1
+        // `cancel()` suppresses the updater's callbacks, so roll the state
+        // back here or the UI stays stuck on "Downloading…".
+        state = .available(info)
     }
 
     func confirmUpdate(_ info: AvailableUpdate) {
@@ -227,17 +268,34 @@ final class UpdateController {
             startDownload(info: info, dmgURL: dmg, autoInstall: true)
         case .ready(let info):
             guard matchingVersion == nil || matchingVersion == info.version else { return }
-            performSwap()
+            // Let the confirmation sheet close first — see `performSwap`.
+            DispatchQueue.main.async { [weak self] in self?.performSwap() }
+        case .downloading(let info, _):
+            guard matchingVersion == nil || matchingVersion == info.version else { return }
+            // Prefetch already running — swap as soon as staging finishes.
+            MenubarLog.write("update: install armed while downloading \(info.version)")
+            installWhenReady = true
         default:
             break
         }
     }
 
     private func performSwap() {
-        if AppUpdater.performSwapAndRelaunch() {
+        let scheduled = AppUpdater.performSwapAndRelaunch()
+        MenubarLog.write("update: swap scheduled=\(scheduled)")
+        if scheduled {
+            // A sheet still attached to its parent window swallows
+            // `NSApp.terminate` — the app then stays alive while the swap
+            // worker waits for a PID that never exits. Detach any before
+            // quitting.
+            for sheet in NSApp.windows where sheet.sheetParent != nil {
+                sheet.sheetParent?.endSheet(sheet)
+            }
             if let terminateForUpdate {
+                MenubarLog.write("update: calling terminate handler")
                 terminateForUpdate()
             } else {
+                MenubarLog.write("update: no terminate handler — bare NSApp.terminate")
                 NSApp.terminate(nil)
             }
         } else {
@@ -312,33 +370,46 @@ final class UpdateController {
     }
 
     private func startDownload(info: AvailableUpdate, dmgURL: URL, autoInstall: Bool) {
+        installWhenReady = autoInstall
+        downloadGeneration &+= 1
+        let generation = downloadGeneration
         let updater = AppUpdater(
             dmgURL: dmgURL,
             version: info.version,
             onProgress: { [weak self] progress in
                 guard let self else { return }
+                guard self.downloadGeneration == generation else { return }
                 switch progress {
                 case .starting, .mounting, .staging:
                     if case .downloading = self.state { /* keep showing percent */ } else {
-                        self.state = .downloading(percent: 0)
+                        self.state = .downloading(info, percent: 0)
                     }
                 case .downloading(let pct, _, _):
-                    self.state = .downloading(percent: pct)
+                    self.state = .downloading(info, percent: pct)
                 case .ready:
                     self.state = .ready(info)
                 }
             },
             onError: { [weak self] err in
                 guard let self else { return }
-                self.lastError = String(describing: err)
+                guard self.downloadGeneration == generation else { return }
+                // A prefetch nobody asked for must not shout at someone who
+                // only opened the release notes — surface it once they do
+                // press install (e.g. `.notWritable` for a locked-down /Applications).
+                MenubarLog.write("update: failed (\(err)) — installWhenReady=\(self.installWhenReady)")
+                if self.installWhenReady { self.lastError = String(describing: err) }
+                self.installWhenReady = false
                 self.state = .available(info)
                 self.updater = nil
             },
             onReady: { [weak self] in
                 guard let self else { return }
+                guard self.downloadGeneration == generation else { return }
+                MenubarLog.write("update: staged \(info.version) — installWhenReady=\(self.installWhenReady)")
                 self.state = .ready(info)
                 self.updater = nil
-                if autoInstall {
+                if self.installWhenReady {
+                    self.installWhenReady = false
                     self.performSwap()
                 }
             }
@@ -354,6 +425,26 @@ final class UpdateController {
         lastError = nil
         confirmationUpdate = info
         presentUpdateConfirmation?()
+        // Warm the DMG while the user reads. Failures stay quiet until they
+        // actually press install — see `startDownload`'s `onError`.
+        if let dmg = Self.prefetchURL(state: state, info: info, automatic: automatic, enabled: autoPrefetch) {
+            MenubarLog.write("update: prefetching \(info.version)")
+            startDownload(info: info, dmgURL: dmg, autoInstall: false)
+        }
+    }
+
+    /// The DMG to warm when the notes sheet opens: only for a sheet the user
+    /// asked for (an unattended prompt must not pull ~1 GB), and only for a
+    /// release that is neither downloading nor staged already — reopening the
+    /// sheet must not race a second `AppUpdater` onto the same staged path.
+    static func prefetchURL(
+        state: CheckState,
+        info: AvailableUpdate,
+        automatic: Bool,
+        enabled: Bool
+    ) -> URL? {
+        guard enabled, !automatic, case .available = state else { return nil }
+        return info.dmgURL
     }
 
     private var noInstallableDMGMessage: String {
@@ -368,6 +459,7 @@ final class UpdateController {
         var channel: UpdateChannel
         var autoCheck: Bool
         var autoNotify: Bool
+        var autoPrefetch: Bool
         var deferredPromptVersion: String?
 
         enum CodingKeys: String, CodingKey {
@@ -375,6 +467,7 @@ final class UpdateController {
             case autoCheck
             case autoNotify
             case autoDownload
+            case autoPrefetch
             case deferredPromptVersion
         }
 
@@ -382,11 +475,13 @@ final class UpdateController {
             channel: UpdateChannel,
             autoCheck: Bool,
             autoNotify: Bool,
+            autoPrefetch: Bool,
             deferredPromptVersion: String? = nil
         ) {
             self.channel = channel
             self.autoCheck = autoCheck
             self.autoNotify = autoNotify
+            self.autoPrefetch = autoPrefetch
             self.deferredPromptVersion = deferredPromptVersion
         }
 
@@ -397,6 +492,7 @@ final class UpdateController {
             self.autoNotify = try container.decodeIfPresent(Bool.self, forKey: .autoNotify)
                 ?? container.decodeIfPresent(Bool.self, forKey: .autoDownload)
                 ?? false
+            self.autoPrefetch = try container.decodeIfPresent(Bool.self, forKey: .autoPrefetch) ?? true
             self.deferredPromptVersion = try container.decodeIfPresent(String.self, forKey: .deferredPromptVersion)
         }
 
@@ -405,6 +501,7 @@ final class UpdateController {
             try container.encode(channel, forKey: .channel)
             try container.encode(autoCheck, forKey: .autoCheck)
             try container.encode(autoNotify, forKey: .autoNotify)
+            try container.encode(autoPrefetch, forKey: .autoPrefetch)
             try container.encodeIfPresent(deferredPromptVersion, forKey: .deferredPromptVersion)
         }
     }
@@ -419,6 +516,7 @@ final class UpdateController {
             channel: channel,
             autoCheck: autoCheck,
             autoNotify: autoNotify,
+            autoPrefetch: autoPrefetch,
             deferredPromptVersion: deferredPromptVersion
         )
         guard let data = try? JSONEncoder().encode(prefs) else { return }

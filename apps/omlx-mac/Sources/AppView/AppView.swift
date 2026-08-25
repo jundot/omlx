@@ -140,11 +140,35 @@ private struct UpdateConfirmationSheet: View {
         ReleaseNotesHTML.blocks(from: trimmedNotes)
     }
 
-    private var isStaged: Bool {
+    /// Percent of the in-flight download, but only when it belongs to the
+    /// release these notes describe.
+    private var downloadPercent: Int? {
+        if case .downloading(let info, let pct) = updates.state, info.version == update.version {
+            return pct
+        }
+        return nil
+    }
+
+    /// True when pressing the primary button won't start a fresh download:
+    /// the bundle is staged, or the background prefetch is already running.
+    private var isFetchingOrStaged: Bool {
+        if downloadPercent != nil { return true }
         if case .ready(let ready) = updates.state {
             return ready.version == update.version
         }
         return false
+    }
+
+    /// Download size before the prefetch reports in, live percent afterwards.
+    private var footerDetail: String {
+        if let pct = downloadPercent {
+            return String(localized: "update.confirm.downloading",
+                          defaultValue: "Downloading… \(pct)%",
+                          comment: "Update confirmation footer while the release DMG downloads in the background; placeholder is the percent complete")
+        }
+        return String(localized: "update.confirm.size",
+                      defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
+                      comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown")
     }
 
     var body: some View {
@@ -171,7 +195,7 @@ private struct UpdateConfirmationSheet: View {
                     .font(.omlxText(17, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "update.confirm.subtitle",
-                            defaultValue: "Review the release notes before downloading and relaunching.",
+                            defaultValue: "The update downloads in the background while you read.",
                             comment: "Subtitle for the update confirmation sheet"))
                     .font(.omlxText(12))
                     .foregroundStyle(theme.textSecondary)
@@ -230,9 +254,7 @@ private struct UpdateConfirmationSheet: View {
     private var footer: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(String(localized: "update.confirm.size",
-                            defaultValue: "Download size: \(update.sizeText ?? "Unknown")",
-                            comment: "Update confirmation download size line; placeholder is a formatted byte size or Unknown"))
+                Text(footerDetail)
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "update.confirm.restart_notice",
@@ -240,6 +262,7 @@ private struct UpdateConfirmationSheet: View {
                             comment: "Notice explaining what happens after confirming an update"))
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textTertiary)
+                prefetchToggle
             }
             Spacer()
             Button(String(localized: "update.confirm.later",
@@ -257,8 +280,25 @@ private struct UpdateConfirmationSheet: View {
         .padding(.vertical, 14)
     }
 
+    /// Opting out of the background download, right where it happens. Takes
+    /// effect immediately: unchecking cancels the transfer that is running.
+    private var prefetchToggle: some View {
+        Toggle(isOn: Binding(
+            get: { updates.autoPrefetch },
+            set: { updates.autoPrefetch = $0 }
+        )) {
+            Text(String(localized: "update.confirm.auto_prefetch",
+                        defaultValue: "Download in the background while reading",
+                        comment: "Checkbox in the update confirmation sheet that enables downloading the update while the release notes are open"))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textSecondary)
+        }
+        .toggleStyle(.checkbox)
+        .padding(.top, 2)
+    }
+
     private var primaryButtonTitle: String {
-        if isStaged {
+        if isFetchingOrStaged {
             return String(localized: "update.confirm.install_ready",
                           defaultValue: "Install & Relaunch",
                           comment: "Primary button when the update is already staged")

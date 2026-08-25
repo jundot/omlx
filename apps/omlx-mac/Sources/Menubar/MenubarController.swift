@@ -443,9 +443,11 @@ final class MenubarController: NSObject {
             updateItem.title = String(localized: "menubar.item.install_update_version",
                                       defaultValue: "Install oMLX \(info.version)…",
                                       comment: "Menubar update item when an app update is available; placeholder is the version")
-        case .downloading(let pct):
+        case .downloading(_, let pct):
             updateItem.isHidden = false
-            updateItem.isEnabled = false
+            // Clickable while the DMG warms in the background: reopens the
+            // release notes instead of dead-ending the user.
+            updateItem.isEnabled = true
             updateItem.title = String(localized: "menubar.item.downloading_update",
                                       defaultValue: "Downloading update… \(pct)%",
                                       comment: "Menubar update item while an app update is downloading; placeholder is the percent")
