@@ -141,10 +141,6 @@ final class UpdateController {
     private var updater: AppUpdater?
     @ObservationIgnored
     private var installWhenReady = false
-    /// Bumped per download attempt so a cancelled updater's late callbacks
-    /// can't stomp the state of the one that replaced it.
-    @ObservationIgnored
-    private var downloadGeneration = 0
     @ObservationIgnored
     private var backgroundTimer: Timer?
     @ObservationIgnored
@@ -238,7 +234,6 @@ final class UpdateController {
         guard !installWhenReady, case .downloading(let info, _) = state else { return }
         updater?.cancel()
         updater = nil
-        downloadGeneration &+= 1
         // `cancel()` suppresses the updater's callbacks, so roll the state
         // back here or the UI stays stuck on "Downloading…".
         state = .available(info)
@@ -247,6 +242,12 @@ final class UpdateController {
     func confirmUpdate(_ info: AvailableUpdate) {
         confirmationUpdate = nil
         installAndRestart(matchingVersion: info.version)
+        // Failed on the spot (a non-writable install location fails before
+        // the first byte). Keep the sheet up carrying the error instead of
+        // closing on a click that did nothing.
+        if lastError != nil {
+            confirmationUpdate = info
+        }
     }
 
     /// One-button "Install & Restart". When the state is `.available`, kick
@@ -273,7 +274,6 @@ final class UpdateController {
         case .downloading(let info, _):
             guard matchingVersion == nil || matchingVersion == info.version else { return }
             // Prefetch already running — swap as soon as staging finishes.
-            MenubarLog.write("update: install armed while downloading \(info.version)")
             installWhenReady = true
         default:
             break
@@ -292,10 +292,8 @@ final class UpdateController {
                 sheet.sheetParent?.endSheet(sheet)
             }
             if let terminateForUpdate {
-                MenubarLog.write("update: calling terminate handler")
                 terminateForUpdate()
             } else {
-                MenubarLog.write("update: no terminate handler — bare NSApp.terminate")
                 NSApp.terminate(nil)
             }
         } else {
@@ -371,14 +369,14 @@ final class UpdateController {
 
     private func startDownload(info: AvailableUpdate, dmgURL: URL, autoInstall: Bool) {
         installWhenReady = autoInstall
-        downloadGeneration &+= 1
-        let generation = downloadGeneration
+        // Only ever one updater in flight: a stale one would race a second
+        // `ditto` onto the same staged bundle path.
+        updater?.cancel()
         let updater = AppUpdater(
             dmgURL: dmgURL,
             version: info.version,
             onProgress: { [weak self] progress in
                 guard let self else { return }
-                guard self.downloadGeneration == generation else { return }
                 switch progress {
                 case .starting, .mounting, .staging:
                     if case .downloading = self.state { /* keep showing percent */ } else {
@@ -392,7 +390,6 @@ final class UpdateController {
             },
             onError: { [weak self] err in
                 guard let self else { return }
-                guard self.downloadGeneration == generation else { return }
                 // A prefetch nobody asked for must not shout at someone who
                 // only opened the release notes — surface it once they do
                 // press install (e.g. `.notWritable` for a locked-down /Applications).
@@ -404,8 +401,6 @@ final class UpdateController {
             },
             onReady: { [weak self] in
                 guard let self else { return }
-                guard self.downloadGeneration == generation else { return }
-                MenubarLog.write("update: staged \(info.version) — installWhenReady=\(self.installWhenReady)")
                 self.state = .ready(info)
                 self.updater = nil
                 if self.installWhenReady {

@@ -139,7 +139,6 @@ final class AppUpdater {
         }
 
         if cancelled { return }
-        MenubarLog.write("update: downloaded, mounting")
         onProgress(.mounting)
 
         let mountPoint: URL
@@ -159,7 +158,6 @@ final class AppUpdater {
         defer { _ = try? unmountDMG(at: mountPoint) }
 
         if cancelled { return }
-        MenubarLog.write("update: mounted at \(mountPoint.path), staging")
         onProgress(.staging)
 
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
@@ -174,7 +172,6 @@ final class AppUpdater {
         }
 
         if cancelled { return }
-        MenubarLog.write("update: staged at \(stagedApp.path)")
         onProgress(.ready)
         onReady()
     }

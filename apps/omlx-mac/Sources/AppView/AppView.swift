@@ -62,7 +62,11 @@ struct AppView: View {
                 },
                 onConfirm: {
                     services.updates.confirmUpdate(update)
-                    presentedUpdate = nil
+                    // The controller keeps `confirmationUpdate` set when the
+                    // install failed on the spot — leave the sheet up then.
+                    if services.updates.confirmationUpdate == nil {
+                        presentedUpdate = nil
+                    }
                 }
             )
                 .environment(\.omlxTheme, theme)
@@ -157,6 +161,16 @@ private struct UpdateConfirmationSheet: View {
             return ready.version == update.version
         }
         return false
+    }
+
+    /// Whatever the user most needs to know: a failed install first, then
+    /// live download progress, then the plain download size.
+    private var footerPrimaryLine: some View {
+        let failure = updates.lastError
+        return Text(failure ?? footerDetail)
+            .font(.omlxText(11))
+            .foregroundStyle(failure == nil ? theme.textSecondary : theme.redDot)
+            .lineLimit(2)
     }
 
     /// Download size before the prefetch reports in, live percent afterwards.
@@ -254,9 +268,7 @@ private struct UpdateConfirmationSheet: View {
     private var footer: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(footerDetail)
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.textSecondary)
+                footerPrimaryLine
                 Text(String(localized: "update.confirm.restart_notice",
                             defaultValue: "oMLX will quit, install the update, and relaunch.",
                             comment: "Notice explaining what happens after confirming an update"))
