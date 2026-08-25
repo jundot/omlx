@@ -168,7 +168,11 @@ final class ThroughputBenchScreenVM {
                 ].joined(separator: "\t"))
             }
         }
-        return lines.isEmpty ? "No results yet." : lines.joined(separator: "\n")
+        return lines.isEmpty
+            ? String(localized: "bench.throughput.text_export.no_results",
+                     defaultValue: "No results yet.",
+                     comment: "Exported text for the throughput benchmark when no results have been recorded yet")
+            : lines.joined(separator: "\n")
     }
 
     // MARK: Lifecycle
