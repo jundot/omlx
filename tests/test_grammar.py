@@ -10,7 +10,10 @@ Covers:
 - Scheduler grammar path (_build_sampler_and_processors)
 """
 
+import copy
 import json
+from importlib.metadata import version as distribution_version
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -458,6 +461,37 @@ class TestCompileGrammarForRequest:
         engine = _make_engine()
         assert self._call(engine) is None
 
+    @pytest.mark.parametrize(
+        ("installed_version", "expected"),
+        [
+            ("0.2.3", True),
+            ("0.2.4", True),
+            ("0.2.5", True),
+            ("0.2.6rc1", False),
+            ("0.2.6", False),
+            ("0.3.0", False),
+        ],
+    )
+    def test_maxlength_completion_observer_version_allowlist(
+        self, installed_version, expected
+    ):
+        """Only the known released xgrammar range enables the observer."""
+        from omlx.server import _xgrammar_supports_maxlength_completion_observer
+
+        with patch("importlib.metadata.version", return_value=installed_version):
+            assert _xgrammar_supports_maxlength_completion_observer() is expected
+
+    def test_maxlength_completion_observer_is_disabled_without_xgrammar(self):
+        """A missing xgrammar distribution cannot enable the workaround."""
+        from importlib.metadata import PackageNotFoundError
+
+        from omlx.server import _xgrammar_supports_maxlength_completion_observer
+
+        with patch(
+            "importlib.metadata.version", side_effect=PackageNotFoundError
+        ):
+            assert _xgrammar_supports_maxlength_completion_observer() is False
+
     def test_raises_when_no_compiler_and_structured_outputs(self):
         from fastapi import HTTPException
         engine = _make_engine(grammar_compiler=None)
@@ -483,6 +517,189 @@ class TestCompileGrammarForRequest:
         })
         assert result == "compiled_json"
         compiler.compile_json_schema.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "request_shape",
+        ["structured_outputs", "response_format"],
+        ids=["structured_outputs.json_schema", "response_format.json_schema.schema"],
+    )
+    def test_known_maxlength_root_object_builds_private_completion_observer(
+        self, request_shape
+    ):
+        """A known xgrammar maxLength schema receives an observer only at the shared seam.
+
+        Use this model-free fixture to guard the normalized JSON Schema compiler
+        path for the affected xgrammar range. Do not use private prompts,
+        responses, provider token ids, or a companion for non-schema formats.
+        """
+        from omlx.api.grammar import _GrammarCompletionObserver
+
+        schema_path = Path(__file__).with_name("fixtures") / (
+            "xgrammar_maxlength_root_object.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        primary = object()
+        observer = object()
+        compiler = MagicMock()
+        compiler.compile_json_schema.side_effect = [primary, observer]
+        engine = _make_engine(grammar_compiler=compiler)
+        if request_shape == "structured_outputs":
+            request_kwargs = {"structured_outputs": {"json": schema}}
+        else:
+            request_kwargs = {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "bounded", "schema": schema},
+                }
+            }
+
+        with patch(
+            "omlx.server._xgrammar_supports_maxlength_completion_observer",
+            return_value=True,
+        ):
+            result = self._call(engine, **request_kwargs)
+
+        assert isinstance(result, _GrammarCompletionObserver)
+        assert result.primary is primary
+        assert result.completion is observer
+        assert result.validator.schema == schema
+        assert compiler.compile_json_schema.call_count == 2
+
+    def test_observer_copy_removes_only_schema_keyword_maxlength(self):
+        """The completion copy preserves data and property names named maxLength.
+
+        Use this to keep the observer schema-aware and non-mutating. Do not
+        recurse through arbitrary JSON values merely because they contain a
+        string key matching a JSON Schema keyword.
+        """
+        from omlx.server import _copy_schema_without_maxlength
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "maxLength": {"type": "string", "maxLength": 4},
+            },
+            "const": {"maxLength": "data"},
+            "x-opaque": {"maxLength": "vendor-data"},
+            "allOf": [{"type": "object", "maxLength": 8}],
+        }
+
+        copied, changed = _copy_schema_without_maxlength(schema)
+
+        assert changed is True
+        assert copied == {
+            "type": "object",
+            "properties": {"maxLength": {"type": "string"}},
+            "const": {"maxLength": "data"},
+            "x-opaque": {"maxLength": "vendor-data"},
+            "allOf": [{"type": "object"}],
+        }
+        assert schema["properties"]["maxLength"]["maxLength"] == 4
+
+    def test_future_xgrammar_version_keeps_maxlength_observer_disabled(self):
+        """A future or prerelease xgrammar version retains only primary admission.
+
+        Use this exact negative case for versions such as 0.2.6rc1, whose
+        primary rejection behavior must never be bypassed. Do not infer support
+        from a loose version range or from observer compilation succeeding.
+        """
+        schema_path = Path(__file__).with_name("fixtures") / (
+            "xgrammar_maxlength_root_object.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        primary = object()
+        compiler = MagicMock()
+        compiler.compile_json_schema.return_value = primary
+        engine = _make_engine(grammar_compiler=compiler)
+
+        with patch(
+            "omlx.server._xgrammar_supports_maxlength_completion_observer",
+            return_value=False,
+        ):
+            result = self._call(engine, structured_outputs={"json": schema})
+
+        assert result is primary
+        compiler.compile_json_schema.assert_called_once()
+
+    def test_open_root_object_keeps_maxlength_observer_disabled(self):
+        """An open root object is outside the narrow self-delimiting contract.
+
+        Use this negative case to keep the workaround confined to closed root
+        objects. Do not attach an observer to schemas that still admit arbitrary
+        top-level properties after the apparent JSON object boundary.
+        """
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "string", "maxLength": 4}},
+            "additionalProperties": True,
+        }
+        primary = object()
+        compiler = MagicMock()
+        compiler.compile_json_schema.return_value = primary
+        engine = _make_engine(grammar_compiler=compiler)
+
+        with patch(
+            "omlx.server._xgrammar_supports_maxlength_completion_observer",
+            return_value=True,
+        ):
+            result = self._call(engine, structured_outputs={"json": schema})
+
+        assert result is primary
+        compiler.compile_json_schema.assert_called_once()
+
+    def test_qwen_structural_tag_compiles_primary_and_observer(self):
+        """The Qwen structural-tag route compiles both normalized schema peers.
+
+        Use this to retain request-shape parity after the shared normalized seam
+        enters a reasoning structural tag. Do not compile the observer bare when
+        primary enforcement uses a structural tag.
+        """
+        from omlx.api.grammar import _GrammarCompletionObserver
+
+        schema_path = Path(__file__).with_name("fixtures") / (
+            "xgrammar_maxlength_root_object.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        primary = object()
+        observer = object()
+        engine = _make_engine(grammar_compiler=MagicMock())
+
+        with patch(
+            "omlx.server._xgrammar_supports_maxlength_completion_observer",
+            return_value=True,
+        ), patch(
+            "omlx.server._compile_with_structural_tag",
+            side_effect=[primary, observer],
+        ) as compile_tag:
+            result = self._call(
+                engine,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "bounded", "schema": schema},
+                },
+                reasoning_parser="qwen",
+                chat_template_kwargs={"enable_thinking": False},
+            )
+
+        assert isinstance(result, _GrammarCompletionObserver)
+        assert compile_tag.call_count == 2
+        assert compile_tag.call_args_list[0].args[1] == {
+            "type": "json_schema",
+            "json_schema": schema,
+        }
+        observer_schema = compile_tag.call_args_list[1].args[1]["json_schema"]
+        assert "maxLength" not in observer_schema["$defs"]["BoundedName"]
+        assert "maxLength" not in observer_schema["$defs"]["GeneratedFileMutationV2"][
+            "anyOf"
+        ][0]["properties"]["content"]
+        assert compile_tag.call_args_list[0].args[2:] == (
+            "qwen",
+            {"enable_thinking": False},
+        )
+        assert compile_tag.call_args_list[1].args[2:] == (
+            "qwen",
+            {"enable_thinking": False},
+        )
 
     def test_bare_regex(self):
         compiler = MagicMock()
@@ -874,6 +1091,21 @@ class TestGrammarConstraintProcessor:
 
         assert proc.must_end is False
 
+    def test_completion_validation_fails_closed_when_schema_ref_is_unresolvable(self):
+        """A validator resolution error is not allowed to escape as a stop."""
+        from jsonschema import Draft202012Validator
+
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        proc = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+        proc._completion_terminated = True
+        proc._completion_diverged = False
+        proc._completion_validator = Draft202012Validator(
+            {"$ref": "urn:omlx:missing-schema"}
+        )
+
+        assert proc.completion_validates({"value": 1}) is False
+
     def test_must_end_after_self_delimiting_output(self, compiler):
         """A completed literal with only EOS available must end logically."""
         from omlx.api.grammar import GrammarConstraintProcessor
@@ -942,6 +1174,149 @@ class TestGrammarConstraintProcessor:
 
         assert proc.matcher.is_completed()
         assert proc.must_end is False
+
+    def test_public_maxlength_replay_observer_terminates_after_primary_accepts_root(
+        self,
+    ):
+        """The public 0.2.3 replay reaches only the private observer's terminal state.
+
+        Use this model-free character-token replay to prove the primary accepts
+        the final root token without becoming complete while its maxLength-free
+        observer does terminate. Do not use provider token ids, prompts, or
+        response artifacts; the content below is synthetic and schema-valid.
+        """
+        xgr = pytest.importorskip("xgrammar")
+        if distribution_version("xgrammar") not in {"0.2.3", "0.2.4", "0.2.5"}:
+            pytest.skip("only known under-completing xgrammar versions are covered")
+
+        from jsonschema import validate
+        from jsonschema.validators import validator_for
+
+        from omlx.api.grammar import (
+            GrammarConstraintProcessor,
+            _GrammarCompletionObserver,
+        )
+
+        schema_path = Path(__file__).with_name("fixtures") / (
+            "xgrammar_maxlength_root_object.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        observer_schema = copy.deepcopy(schema)
+        del observer_schema["$defs"]["BoundedName"]["maxLength"]
+        del observer_schema["$defs"]["GeneratedFileMutationV2"]["anyOf"][0][
+            "properties"
+        ]["content"]["maxLength"]
+        del observer_schema["$defs"]["GeneratedFileMutationV2"]["anyOf"][1][
+            "properties"
+        ]["content"]["maxLength"]
+        del observer_schema["$defs"]["JavaClassName"]["maxLength"]
+        del observer_schema["$defs"]["JavaIdentifier"]["maxLength"]
+
+        change_properties = schema["$defs"]["TestChangeSetV2"]["properties"]
+        instance = {
+            "output_mode": schema["properties"]["output_mode"]["enum"][0],
+            "change_set": {
+                key: definition["enum"][0]
+                for key, definition in change_properties.items()
+                if "enum" in definition
+            },
+            "coverage_matrix": {
+                "approved_spec_hash": schema["$defs"]["ExecutableCoverageMatrixV1"][
+                    "properties"
+                ]["approved_spec_hash"]["enum"][0],
+                "assertions": [
+                    {
+                        "assertion_id": "a",
+                        "requirement_id": "a",
+                        "source_path": "a",
+                        "test_class": "a.b",
+                        "test_method": "a",
+                    }
+                ],
+            },
+        }
+        instance["change_set"]["mutations"] = [
+            {
+                "operation": "CREATE",
+                "path": "app/src/androidTest/a.kt",
+                "content": "line\n" * 2600,
+            }
+        ]
+        validate(instance, schema)
+        root = json.dumps(instance, separators=(",", ":"))
+
+        vocabulary = [chr(index) for index in range(256)]
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(vocabulary, stop_token_ids=[])
+        )
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+        processor = GrammarConstraintProcessor(
+            _GrammarCompletionObserver(
+                primary=compiler.compile_json_schema(schema),
+                completion=compiler.compile_json_schema(observer_schema),
+                validator=validator_type(schema),
+            ),
+            len(vocabulary),
+        )
+
+        for token in root:
+            processor.accept_token(ord(token))
+
+        assert processor.matcher.is_completed() is False
+        assert processor.is_terminated is False
+        assert processor.completion_terminated is True
+
+    def test_primary_maxlength_rejection_does_not_advance_real_observer(self):
+        """A primary maxLength rejection never reaches an otherwise real observer.
+
+        Use this narrow token transition to prevent the observer from bypassing
+        primary admission. Do not infer admission from observer completion or
+        let a rejected token mutate either terminal signal.
+        """
+        xgr = pytest.importorskip("xgrammar")
+        from jsonschema.validators import validator_for
+
+        from omlx.api.grammar import (
+            GrammarConstraintProcessor,
+            _GrammarCompletionObserver,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "string", "maxLength": 1}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+        observer_schema = {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+        vocabulary = [chr(index) for index in range(256)]
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(vocabulary, stop_token_ids=[])
+        )
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+        processor = GrammarConstraintProcessor(
+            _GrammarCompletionObserver(
+                primary=compiler.compile_json_schema(schema),
+                completion=compiler.compile_json_schema(observer_schema),
+                validator=validator_type(schema),
+            ),
+            len(vocabulary),
+        )
+        for token in '{"value":"a':
+            processor.accept_token(ord(token))
+
+        recording_observer = MagicMock(wraps=processor._completion_matcher)
+        processor._completion_matcher = recording_observer
+        processor.accept_token(ord("b"))
+
+        recording_observer.accept_token.assert_not_called()
+        assert processor.completion_terminated is False
 
     def test_call_marks_the_row_pending(self, compiler):
         """The scheduler accepts at the top of the *next* step, so the

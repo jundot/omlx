@@ -25,12 +25,33 @@ The processor supports two usage modes:
 """
 
 import logging
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _GrammarCompletionObserver:
+    """Keep a private completion observer beside its enforcing grammar.
+
+    Use this carrier only for the narrow server-built maxLength workaround.
+    Do not expose it as a request API or use its completion grammar to mask
+    logits, admit tokens, or replace the primary grammar.
+
+    Args:
+        primary: The only grammar allowed to constrain generated tokens.
+        completion: The maxLength-free grammar used solely to observe a root end.
+        validator: A validator constructed from the exact original schema
+            before scheduling.
+    """
+
+    primary: Any
+    completion: Any
+    validator: Any
 
 
 def create_grammar_compiler(tokenizer, model):
@@ -70,7 +91,26 @@ class GrammarConstraintProcessor:
         import xgrammar as xgr
         from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
 
-        self._matcher = xgr.GrammarMatcher(compiled_grammar)
+        primary_grammar = compiled_grammar
+        completion_grammar = None
+        completion_validator = None
+        if isinstance(compiled_grammar, _GrammarCompletionObserver):
+            primary_grammar = compiled_grammar.primary
+            completion_grammar = compiled_grammar.completion
+            completion_validator = compiled_grammar.validator
+
+        self._matcher = xgr.GrammarMatcher(primary_grammar)
+        self._completion_matcher = (
+            xgr.GrammarMatcher(
+                completion_grammar,
+                terminate_without_stop_token=True,
+            )
+            if completion_grammar is not None
+            else None
+        )
+        self._completion_validator = completion_validator
+        self._completion_terminated = False
+        self._completion_diverged = False
         self._vocab_size = vocab_size
         self._apply_mask = apply_token_bitmask_mlx
 
@@ -123,15 +163,51 @@ class GrammarConstraintProcessor:
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
 
+    def _accept_token(self, token_id: int) -> bool:
+        """Advance primary admission before observing the accepted token.
+
+        Use this transition from both per-request and batched decoding paths.
+        Do not call the completion observer when the primary grammar rejects a
+        token, and do not let observer state mutate primary termination.
+
+        Args:
+            token_id: The sampled token to admit through the primary matcher.
+
+        Returns:
+            True when the primary matcher accepted the token; otherwise False.
+        """
+        if not self._matcher.accept_token(token_id):
+            logger.warning("GrammarMatcher rejected token %d", token_id)
+            return False
+
+        completion_matcher = getattr(self, "_completion_matcher", None)
+        if completion_matcher is not None:
+            if not completion_matcher.accept_token(token_id):
+                logger.warning("Completion observer rejected token %d", token_id)
+                self._completion_matcher = None
+                self._completion_validator = None
+                self._completion_diverged = True
+            elif completion_matcher.is_terminated():
+                self._completion_terminated = True
+
+        if self._matcher.is_terminated():
+            self._terminated = True
+        return True
+
     def accept_token(self, token_id: int) -> None:
-        """Accept a generated token to advance matcher state."""
+        """Accept a generated token to advance matcher state.
+
+        Use after a token was selected by the primary grammar bitmask.
+        Do not call this method to test whether the observer would admit a
+        token; only the primary matcher owns admission.
+
+        Args:
+            token_id: The generated token id selected after primary masking.
+        """
         self._pending = False
         if self._terminated:
             return
-        if not self._matcher.accept_token(token_id):
-            logger.warning("GrammarMatcher rejected token %d", token_id)
-        if self._matcher.is_terminated():
-            self._terminated = True
+        self._accept_token(token_id)
 
     @property
     def pending(self) -> bool:
@@ -170,6 +246,49 @@ class GrammarConstraintProcessor:
         """
         return getattr(self, "_must_end", False)
 
+    @property
+    def completion_terminated(self) -> bool:
+        """Return whether the private observer reached a self-delimiting root.
+
+        Use this only to request host validation at the scheduler response
+        boundary. Do not use it for logits masking, token admission, or the
+        primary matcher's terminal state.
+
+        Returns:
+            True after an observer has accepted a complete root object.
+        """
+        return getattr(self, "_completion_terminated", False)
+
+    def completion_validates(self, instance: Any) -> bool:
+        """Validate a completed observer value against the exact original schema.
+
+        Use only after :attr:`completion_terminated` is true and immediately
+        before returning a logical stop. Do not treat a validator error or a
+        missing validator as a successful completion.
+
+        Args:
+            instance: JSON-decoded output to validate against the original schema.
+
+        Returns:
+            True when the exact original-schema validator accepts ``instance``.
+        """
+        validator = getattr(self, "_completion_validator", None)
+        if (
+            not self.completion_terminated
+            or getattr(self, "_completion_diverged", False)
+            or validator is None
+        ):
+            return False
+        try:
+            validator.validate(instance)
+        except Exception as error:
+            logger.warning(
+                "Completion observer host validation failed (%s)",
+                type(error).__name__,
+            )
+            return False
+        return True
+
     def advance(self, tokens: mx.array) -> bool:
         """Accept the previous token and advance grammar state.
 
@@ -185,10 +304,6 @@ class GrammarConstraintProcessor:
             self._first_call = False
         elif len(tokens) > 0:
             last_token = int(tokens[-1])
-            if not self._matcher.accept_token(last_token):
-                logger.warning("GrammarMatcher rejected token %d", last_token)
-            if self._matcher.is_terminated():
-                self._terminated = True
-                return False
+            self._accept_token(last_token)
 
-        return True
+        return not self._terminated

@@ -5642,6 +5642,261 @@ class TestSchedulerGrammarMustEnd:
         assert output.new_token_ids == [ord("a")]
         assert request.status == RequestStatus.RUNNING
 
+    @pytest.mark.parametrize(
+        (
+            "validator_result",
+            "expected_reason",
+            "expected_status",
+            "expected_finished",
+        ),
+        [
+            (True, "stop", RequestStatus.FINISHED_STOPPED, True),
+            (False, None, RequestStatus.RUNNING, False),
+        ],
+        ids=["schema-valid", "schema-invalid-remains-running"],
+    )
+    def test_completion_observer_host_validates_before_finishing(
+        self,
+        mock_model,
+        validator_result,
+        expected_reason,
+        expected_status,
+        expected_finished,
+    ):
+        """An observer terminal state becomes stop only after exact host validation.
+
+        Use this scheduler boundary test to retain the accepted final `}` token
+        while checking the original-schema validator before returning. Do not
+        let observer completion alone claim a schema-valid successful response.
+        """
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        token_map = {ord(token): token for token in '{"value":1}'}
+        tokenizer = TestOutputParserSmoke._GemmaTokenizer(token_map)
+        mock_model.config.model_type = "llama"
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        uid = 74
+        request_id = "grammar-observer"
+        prefix = '{"value":1'
+        request = Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=32),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        request.output_token_ids = [ord(token) for token in prefix]
+        scheduler.running[request_id] = request
+        scheduler.requests[request_id] = request
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler.request_id_to_uid[request_id] = uid
+
+        processor = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+        processor._must_end = False
+        processor._completion_terminated = True
+        processor.completion_validates = MagicMock(return_value=validator_result)
+        scheduler_module._register_uid_rows(
+            scheduler.model, [uid], [None], [[processor]]
+        )
+        try:
+            outputs, finished_ids = scheduler._process_batch_responses(
+                [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=ord("}"),
+                        finish_reason=None,
+                        logprobs=None,
+                        prompt_cache=None,
+                    )
+                ]
+            )
+        finally:
+            scheduler_module._unregister_uid_row(scheduler.model, uid)
+
+        output = outputs[-1]
+        processor.completion_validates.assert_called_once_with({"value": 1})
+        assert finished_ids == ({request_id} if expected_finished else set())
+        assert output.finished is expected_finished
+        assert output.finish_reason == expected_reason
+        assert output.new_token_ids == [ord("}")]
+        assert output.output_token_ids == [ord(token) for token in '{"value":1}']
+        assert request.status == expected_status
+
+    def test_completion_observer_cleans_qwen_thinking_text_without_parser(
+        self, mock_model
+    ):
+        """A raw Qwen thinking block is removed before observer JSON validation."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        token_map = {
+            10: "reasoning</think>",
+            11: '{"value":1',
+            12: "}",
+        }
+        tokenizer = TestOutputParserSmoke._GemmaTokenizer(token_map)
+        mock_model.config.model_type = "qwen3"
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        assert scheduler._get_output_parser_session("grammar-observer-qwen") is None
+        uid = 75
+        request_id = "grammar-observer-qwen"
+        request = Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=32),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        request.output_token_ids = [10, 11]
+        scheduler.running[request_id] = request
+        scheduler.requests[request_id] = request
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler.request_id_to_uid[request_id] = uid
+
+        processor = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+        processor._must_end = False
+        processor._completion_terminated = True
+        processor.completion_validates = MagicMock(return_value=True)
+        scheduler_module._register_uid_rows(
+            scheduler.model, [uid], [None], [[processor]]
+        )
+        try:
+            outputs, finished_ids = scheduler._process_batch_responses(
+                [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=12,
+                        finish_reason=None,
+                        logprobs=None,
+                        prompt_cache=None,
+                    )
+                ]
+            )
+        finally:
+            scheduler_module._unregister_uid_row(scheduler.model, uid)
+
+        output = outputs[-1]
+        processor.completion_validates.assert_called_once_with({"value": 1})
+        assert finished_ids == {request_id}
+        assert output.finished is True
+        assert output.finish_reason == "stop"
+        assert output.output_token_ids == [10, 11, 12]
+        assert request.status == RequestStatus.FINISHED_STOPPED
+
+    def test_completion_observer_invalid_json_keeps_the_primary_row_running(
+        self, mock_model
+    ):
+        """Observer completion cannot stop a raw non-JSON output."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        tokenizer = TestOutputParserSmoke._GemmaTokenizer({10: "not-json", 11: "}"})
+        mock_model.config.model_type = "llama"
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        uid = 76
+        request_id = "grammar-observer-invalid-json"
+        request = Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=32),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        request.output_token_ids = [10]
+        scheduler.running[request_id] = request
+        scheduler.requests[request_id] = request
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler.request_id_to_uid[request_id] = uid
+
+        processor = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+        processor._must_end = False
+        processor._completion_terminated = True
+        processor.completion_validates = MagicMock(return_value=True)
+        scheduler_module._register_uid_rows(
+            scheduler.model, [uid], [None], [[processor]]
+        )
+        try:
+            outputs, finished_ids = scheduler._process_batch_responses(
+                [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=11,
+                        finish_reason=None,
+                        logprobs=None,
+                        prompt_cache=None,
+                    )
+                ]
+            )
+        finally:
+            scheduler_module._unregister_uid_row(scheduler.model, uid)
+
+        output = outputs[-1]
+        processor.completion_validates.assert_not_called()
+        assert finished_ids == set()
+        assert output.finished is False
+        assert output.finish_reason is None
+        assert request.status == RequestStatus.RUNNING
+
+    def test_completion_observer_runtime_validation_error_preserves_upstream_length(
+        self, mock_model
+    ):
+        """A validator runtime error fails closed without changing an upstream cap."""
+        from omlx.api.grammar import GrammarConstraintProcessor
+
+        token_map = {ord(token): token for token in '{"value":1}'}
+        tokenizer = TestOutputParserSmoke._GemmaTokenizer(token_map)
+        mock_model.config.model_type = "llama"
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        uid = 77
+        request_id = "grammar-observer-validation-error"
+        request = Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=32),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        request.output_token_ids = [ord(token) for token in '{"value":1']
+        scheduler.running[request_id] = request
+        scheduler.requests[request_id] = request
+        scheduler.uid_to_request_id[uid] = request_id
+        scheduler.request_id_to_uid[request_id] = uid
+
+        processor = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+        processor._must_end = False
+        processor._completion_terminated = True
+        processor.completion_validates = MagicMock(return_value=False)
+        scheduler_module._register_uid_rows(
+            scheduler.model, [uid], [None], [[processor]]
+        )
+        try:
+            outputs, finished_ids = scheduler._process_batch_responses(
+                [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=ord("}"),
+                        finish_reason="length",
+                        logprobs=None,
+                        prompt_cache=None,
+                    )
+                ]
+            )
+        finally:
+            scheduler_module._unregister_uid_row(scheduler.model, uid)
+
+        output = outputs[-1]
+        processor.completion_validates.assert_called_once_with({"value": 1})
+        assert finished_ids == {request_id}
+        assert output.finished is True
+        assert output.finish_reason == "length"
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
 
 class TestVLMPositionStateClearing:
     """Tests for conditional mRoPE position state clearing (#531).

@@ -16,6 +16,7 @@ import copy
 import gc
 import importlib
 import inspect
+import json
 import logging
 import os
 import threading
@@ -47,6 +48,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from .api.utils import clean_output_text
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -10385,16 +10387,18 @@ class Scheduler:
             # accepted token. A completed row can stop here without waiting
             # for an upstream EOS, while still retaining that normal token.
             grammar_must_end = False
+            completion_observer = None
             with _uid_row_registry_lock:
                 registry_row = _uid_row_registry.get((id(self.model), response.uid))
             if registry_row is not None:
                 from .api.grammar import GrammarConstraintProcessor
 
-                grammar_must_end = any(
-                    isinstance(processor, GrammarConstraintProcessor)
-                    and processor.must_end
-                    for processor in registry_row.logits_processors
-                )
+                for processor in registry_row.logits_processors:
+                    if not isinstance(processor, GrammarConstraintProcessor):
+                        continue
+                    grammar_must_end = grammar_must_end or processor.must_end
+                    if processor.completion_terminated:
+                        completion_observer = processor
             if grammar_must_end and response.finish_reason in (None, "length"):
                 response.finish_reason = "stop"
                 is_stop = True
@@ -10465,6 +10469,42 @@ class Scheduler:
                         else:
                             new_text = ""
                         break
+
+            # A private maxLength-free observer is never an admission or mask
+            # authority. It can request a logical stop only after the retained
+            # normal token is decoded and the exact original schema validates
+            # on the host. A validation miss deliberately leaves a running row
+            # running; an upstream length remains length rather than becoming
+            # a successful schema stop.
+            if (
+                completion_observer is not None
+                and response.finish_reason in (None, "length")
+            ):
+                completion_text = (
+                    request.output_text
+                    if parser_session is not None
+                    else clean_output_text(
+                        self.tokenizer.decode(request.output_token_ids)
+                    )
+                )
+                try:
+                    completion_instance = json.loads(completion_text)
+                except (TypeError, json.JSONDecodeError):
+                    logger.warning(
+                        "Completion observer reached a non-JSON response; "
+                        "leaving the primary row running"
+                    )
+                else:
+                    if completion_observer.completion_validates(completion_instance):
+                        response.finish_reason = "stop"
+                        is_stop = True
+                        is_length = False
+                        is_finished = True
+                    else:
+                        logger.warning(
+                            "Completion observer failed exact-schema validation; "
+                            "leaving primary termination unchanged"
+                        )
 
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
