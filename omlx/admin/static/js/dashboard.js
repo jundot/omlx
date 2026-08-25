@@ -156,6 +156,7 @@
                 },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
+                cluster: { auto_evict_competing_local_models: false },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -6640,6 +6641,7 @@
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
+                            cluster: { ...this.globalSettings.cluster, ...data.cluster },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
@@ -10067,6 +10069,24 @@
                     this.globalSettings.idle_timeout.idle_timeout_seconds = prev;
                     this.idleTimeoutValue = prev == null ? '' : String(prev);
                     this.showNotification(window.t('js.error.save_settings_failed'), 'error');
+                }
+            },
+
+            async saveClusterAutoEvict(value) {
+                const prev = this.globalSettings.cluster.auto_evict_competing_local_models;
+                if (prev === value) return;
+                this.globalSettings.cluster.auto_evict_competing_local_models = value;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ cluster_auto_evict_competing_local_models: value }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save cluster auto-evict setting:', err);
+                    this.globalSettings.cluster.auto_evict_competing_local_models = prev;
+                    this.showNotification('Failed to save setting', 'error');
                 }
             },
 
