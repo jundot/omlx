@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -614,5 +613,5 @@ def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
     for key in keys:
         assert key in template + dashboard_js
     for locale_path in i18n_dir.glob("*.json"):
-        locale = json.loads(locale_path.read_text(encoding="utf-8"))
+        locale = admin_routes._load_locale(locale_path.stem)
         assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"

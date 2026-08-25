@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat image upload functionality."""
-import json
 from pathlib import Path
 
 import pytest
 
-
-I18N_DIR = Path(__file__).parent.parent / "omlx" / "admin" / "i18n"
+from omlx.admin.routes import _load_locale
 
 # Required i18n keys used by chat image upload feature
 REQUIRED_IMAGE_KEYS = [
@@ -87,8 +85,7 @@ class TestChatImageUpload:
     )
     def test_i18n_image_keys_present(self, lang_file):
         """All image-related i18n keys exist in every language file"""
-        with open(I18N_DIR / lang_file) as f:
-            translations = json.load(f)
+        translations = _load_locale(Path(lang_file).stem)
 
         for key in REQUIRED_IMAGE_KEYS:
             assert key in translations, f"Missing key '{key}' in {lang_file}"

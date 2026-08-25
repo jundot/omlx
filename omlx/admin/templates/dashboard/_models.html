@@ -837,7 +837,7 @@
                                                     <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                             @click="retryHFDownload(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                                                            :title="window.t('models.queue.retry_tooltip') || 'Retry download'">
+                                                            :title="window.t('models.queue.retry_tooltip')">
                                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                     </button>
                                                     <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak
@@ -1268,7 +1268,7 @@
                                                                 <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                                         @click="retryMSDownload(task.task_id)"
                                                                         class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                                                                        title="Retry download">
+                                                                        :title="window.t('models.queue.retry_tooltip')">
                                                                     <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                                 </button>
                                                                 <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak

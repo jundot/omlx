@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for external accuracy-benchmark Extra Body controls."""
 
-import json
 from pathlib import Path
+
+from omlx.admin.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 I18N_DIR = ROOT / "omlx" / "admin" / "i18n"
@@ -30,6 +31,6 @@ def test_accuracy_extra_body_i18n_keys_exist_in_every_locale():
         "js.error.external_extra_body_protected",
     }
     for locale_path in I18N_DIR.glob("*.json"):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing = keys - translations.keys()
         assert not missing, f"{locale_path.name} is missing {sorted(missing)}"
