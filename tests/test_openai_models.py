@@ -716,6 +716,43 @@ class TestChatCompletionChunk:
 class TestCompletionModels:
     """Tests for text completion models."""
 
+    def test_repetition_context_size_defaults_to_none(self):
+        """The penalty window rides along only when a client sends it."""
+        chat = ChatCompletionRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        completion = CompletionRequest(model="m", prompt="hello")
+        assert chat.repetition_context_size is None
+        assert completion.repetition_context_size is None
+
+    def test_repetition_context_size_is_kept_and_validated(self):
+        chat = ChatCompletionRequest.model_validate(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "repetition_context_size": 128,
+            }
+        )
+        assert chat.repetition_context_size == 128
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "repetition_context_size": 0,
+                }
+            )
+
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "prompt": "hello",
+                    "repetition_context_size": 0,
+                }
+            )
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(

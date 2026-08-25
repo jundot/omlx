@@ -969,3 +969,266 @@ def test_laguna_attention_resolves_sdpa_through_module():
     code = laguna_model.Attention.__call__.__code__
     assert "mlx_lm_base" in code.co_names
     assert "scaled_dot_product_attention" in code.co_names
+
+
+# --- mlxfast-challenge port: compiled fusions (Validate submission 8b4de42b) ---
+
+
+def _nvfp4_sparse_config(**overrides):
+    """Sparse-MoE NVFP4-shaped config exercising the fused decode path."""
+    cfg = _minimal_laguna_config(
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        mlp_only_layers=[],
+        mlp_layer_types=["sparse", "sparse"],
+        moe_routed_scaling_factor=2.5,
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+def _registered_laguna_module():
+    """The exec'd model module the loader registers (patch must precede it)."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+    import mlx_lm.models.laguna as lm
+
+    return lm
+
+
+def _quantized_sparse_model():
+    """Small 2-layer sparse model with NVFP4 group-16 4-bit switch banks."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(**_nvfp4_sparse_config())
+    model = laguna.Model(args)
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            sw = sp.switch_mlp
+            sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
+            sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
+            sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
+    return model
+
+
+def test_compiled_softplus_gate_matches_eager():
+    """Compiled softplus gate is bit-identical to the eager float32 path."""
+    import mlx.nn as nn
+
+    lm = _registered_laguna_module()
+    gate = mx.random.normal((1, 1, 4), dtype=mx.float32)
+    out = lm._compiled_softplus_gate(gate)
+    ref = nn.softplus(gate.astype(mx.float32)).astype(gate.dtype)
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
+
+
+def test_compiled_swiglu_matches_eager():
+    """Compiled SiLU product is bit-identical to mlx_lm's swiglu."""
+    from mlx_lm.models.activations import swiglu
+
+    lm = _registered_laguna_module()
+    gate = mx.random.normal((1, 1, 8, 32), dtype=mx.float32)
+    up = mx.random.normal((1, 1, 8, 32), dtype=mx.float32)
+    out = lm._swiglu(gate, up)
+    ref = swiglu(gate, up)
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
+
+
+def test_compiled_fusions_bit_exact(monkeypatch):
+    """Compiled fusions reproduce eager output exactly on one model instance."""
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+
+    def run(compiled):
+        monkeypatch.setattr(lm, "_COMPILED_FUSIONS", compiled)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+    assert int(mx.max(mx.abs(dec_on - dec_off)).item()) == 0
+
+
+# --- mlxfast-challenge port: fused gate/up banks (Validate submission 613aaf69) ---
+
+
+def test_fused_routed_gate_up_parity_is_bit_exact(monkeypatch):
+    """Fused [gate; up] decode bank must be bit-identical to the stock path.
+
+    Toggles the actual registered model module (``mlx_lm.models.laguna``): the
+    loader exec's ``laguna_model.py`` into that module and the model reads its
+    ``_FUSED_ROUTED_GATE_UP`` global from there.
+    """
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+
+    def run(fusion_on):
+        monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", fusion_on)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+
+    block = model.model.layers[0].mlp
+    assert block._fusion_ready is True
+    assert block._fused_gateup_split == 32
+    assert block._fused_gateup_weight.shape == (4, 64, 8)
+
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+
+
+def test_fused_shared_gate_up_parity_is_bit_exact(monkeypatch):
+    """Fused shared-expert [gate; up] NVFP4 bank must be bit-identical."""
+    lm = _registered_laguna_module()
+    model = _quantized_sparse_model()
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            se = sp.shared_expert
+            se.gate_proj = se.gate_proj.to_quantized(16, 4, mode="nvfp4")
+            se.up_proj = se.up_proj.to_quantized(16, 4, mode="nvfp4")
+            se.down_proj = se.down_proj.to_quantized(16, 4, mode="nvfp4")
+
+    def run(fused):
+        monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", fused)
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill, decode)
+        return prefill, decode
+
+    pre_on, dec_on = run(True)
+    pre_off, dec_off = run(False)
+    se = model.model.layers[0].mlp.shared_expert
+    assert se._fusion_ready is True
+    assert mx.array_equal(pre_on, pre_off)
+    assert mx.array_equal(dec_on, dec_off)
+
+
+def test_fused_banks_default_off_and_guard_unquantized(monkeypatch):
+    """Fusion defaults OFF (neutral on current MLX); unquantized banks refuse."""
+    lm = _registered_laguna_module()
+    assert lm._FUSED_ROUTED_GATE_UP is False
+    assert lm._FUSED_SHARED_GATE_UP is False
+    monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", True)
+    monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", True)
+    model = _quantized_sparse_model()
+    for layer in model.model.layers:
+        sp = layer.mlp
+        if type(sp).__name__ == "LagunaSparseMoeBlock":
+            from mlx_lm.models.switch_layers import SwitchLinear
+
+            sp.switch_mlp.gate_proj = SwitchLinear(64, 32, 4)
+            sp.switch_mlp.up_proj = SwitchLinear(64, 32, 4)
+            sp.switch_mlp.down_proj = SwitchLinear(32, 64, 4)
+    cache = model.make_cache()
+    out = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+    mx.eval(out)
+    assert model.model.layers[0].mlp._fusion_ready is False
+
+
+def test_two_output_compiled_tail_is_numerically_close():
+    """C1 marker: two-output mx.compile parity depends on the Apple GPU.
+
+    The Swift challenge compiles the router tail
+    ``(sigmoid(logits), -(sigmoid(logits)+bias))`` into one kernel (challenge
+    commit f8848e0 / submission 8adb56be). In Python MLX 0.32.0 that two-output
+    compiled function is bit-exact on the macos-14-arm64 CI runner but is
+    deterministically ULP-divergent on an M3 Ultra. The router tail therefore
+    stays eager in the port because it feeds argpartition expert selection.
+    A zero difference on one GPU does not resolve C1 for every supported Mac.
+    """
+    key = mx.random.normal((2, 256), dtype=mx.float32)
+    bias = mx.random.normal((256,), dtype=mx.float32)
+
+    def tail(a, b):
+        s = mx.sigmoid(a)
+        return s, -(s + b.astype(s.dtype))
+
+    compiled = mx.compile(tail, shapeless=True)
+    scores, neg = compiled(key, bias)
+    ref_scores, ref_neg = tail(key, bias)
+    mx.eval(scores, neg, ref_scores, ref_neg)
+    sig_diff = float(mx.max(mx.abs(scores - ref_scores)).item())
+    neg_diff = float(mx.max(mx.abs(neg - ref_neg)).item())
+    assert sig_diff <= 1e-4, f"compiled score tail changed: max-abs {sig_diff}"
+    assert neg_diff <= 1e-4, f"compiled corrected tail changed: max-abs {neg_diff}"
+
+
+def test_compiled_combine_matches_eager():
+    """The compiled weighted-expert combine reproduces the eager reduction."""
+    lm = _registered_laguna_module()
+    combine = lm._compiled_combine_for(2.5)
+    y = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    out = combine(y, weights, shared)
+    ref = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)
+
+
+def test_normalize_then_combine_equals_folded():
+    """eb76e2b8 equivalence gate: router-side normalize + combine is bit-identical
+    to the Swift's folded lagunaCompiledNormalizedExpertCombine.
+
+    The submission folds top-k renormalization into the expert combine
+    (deferred). oMLX keeps the normalize in the router (8adb56be) and the
+    combine separate (9a37e4dc); this pins that the two compositions are
+    bit-identical, so the folded variant adds nothing and is not re-ported.
+    """
+    scale = 2.5
+    outputs = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+
+    # oMLX path: normalize in the router, then the compiled combine.
+    normalized = weights / mx.sum(weights, axis=-1, keepdims=True)
+    typed = normalized.astype(outputs.dtype)
+    routed = mx.sum(outputs * typed[..., None], axis=-2)
+    separate = routed * scale + shared
+
+    # Swift folded path (lagunaCompiledNormalizedExpertCombine body).
+    folded = (
+        mx.sum(outputs * (weights / mx.sum(weights, axis=-1, keepdims=True)).astype(
+            outputs.dtype
+        )[..., None], axis=-2)
+        * scale
+        + shared
+    )
+    mx.eval(separate, folded)
+    assert mx.array_equal(separate, folded)
+
+
+def test_compiled_combine_residual_matches_eager():
+    """The compiled residual combine reproduces the eager h + moe bit-exactly."""
+    lm = _registered_laguna_module()
+    combine = lm._compiled_combine_residual_for(2.5)
+    y = mx.random.normal((1, 1, 2, 64), dtype=mx.float32)
+    weights = mx.random.uniform(shape=(1, 1, 2), dtype=mx.float32)
+    shared = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    residual = mx.random.normal((1, 1, 64), dtype=mx.float32)
+    out = combine(y, weights, shared, residual)
+    moe = mx.sum(y * weights[..., None], axis=-2) * 2.5 + shared
+    ref = residual + moe
+    mx.eval(out, ref)
+    assert mx.array_equal(out, ref)

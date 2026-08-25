@@ -26,9 +26,9 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
-        # New long-context tuning knobs (issue #1276). None → dflash-mlx default.
         assert settings.dflash_draft_window_size is None
-        assert settings.dflash_draft_sink_size is None
+        assert settings.dflash_draft_sink_size == 0
+        assert settings.dflash_block_size is None
         assert settings.dflash_verify_mode is None
 
     def test_no_speculative_tokens_field(self):
@@ -54,9 +54,10 @@ class TestDFlashModelSettings:
         assert "dflash_draft_quant_activation_bits" not in d
         assert "dflash_draft_quant_group_size" not in d
         assert "dflash_max_ctx" not in d
-        # Tuning knobs default to None → omitted from on-disk JSON.
         assert "dflash_draft_window_size" not in d
-        assert "dflash_draft_sink_size" not in d
+        assert d["dflash_draft_sink_size"] == 0
+        # Remaining tuning knobs default to None → omitted from on-disk JSON.
+        assert "dflash_block_size" not in d
         assert "dflash_verify_mode" not in d
 
     def test_from_dict_with_dflash_fields(self):
@@ -98,6 +99,8 @@ class TestDFlashModelSettings:
         assert settings.dflash_in_memory_cache_max_entries == 4
         assert settings.dflash_in_memory_cache_max_bytes == 8 * 1024 * 1024 * 1024
         assert settings.dflash_ssd_cache is False
+        assert settings.dflash_draft_window_size is None
+        assert settings.dflash_draft_sink_size == 0
 
     def test_from_dict_ignores_removed_speculative_tokens(self):
         """dflash_speculative_tokens (removed in v2) is silently dropped."""
@@ -115,11 +118,13 @@ class TestDFlashModelSettings:
             "dflash_enabled": True,
             "dflash_draft_window_size": 2048,
             "dflash_draft_sink_size": 32,
+            "dflash_block_size": 5,
             "dflash_verify_mode": "adaptive",
         }
         settings = ModelSettings.from_dict(data)
         assert settings.dflash_draft_window_size == 2048
         assert settings.dflash_draft_sink_size == 32
+        assert settings.dflash_block_size == 5
         assert settings.dflash_verify_mode == "adaptive"
 
     def test_roundtrip_serialization(self):
@@ -311,6 +316,7 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_block_size=5),
         )
         target_model = object()
         target_ops = object()
@@ -356,6 +362,12 @@ class TestDFlashEngineInit:
         event_iter, _, stop_ids = engine._stream_dflash_events(
             prompt_tokens=[1, 2],
             max_tokens=3,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.05,
+            repetition_penalty=1.2,
+            repetition_context_size=128,
         )
 
         assert list(event_iter) == []
@@ -363,6 +375,13 @@ class TestDFlashEngineInit:
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
+        assert captured["temperature"] == 1.0
+        assert captured["top_p"] == 0.95
+        assert captured["top_k"] == 20
+        assert captured["min_p"] == 0.05
+        assert captured["repetition_penalty"] == 1.2
+        assert captured["repetition_context_size"] == 128
+        assert captured["block_tokens"] == 5
         assert fake_flow.snapshot is None
         assert prefix_kwargs["max_new_tokens"] == 3
         model_provider = prefix_kwargs["model_provider"]
@@ -452,7 +471,7 @@ class TestDFlashEngineInit:
                     captured["bound_target"] = target_model
                     captured["bound_target_ops"] = target_ops
 
-            return FakeDraft(), {}
+            return FakeDraft(), {"config": {"sliding_window": 2048}}
 
         monkeypatch.setattr(
             dflash_loading, "load_target_bundle", fake_load_target_bundle
@@ -499,6 +518,8 @@ class TestDFlashEngineInit:
             assert captured["fused_target"] is engine._target_model
             assert captured["bound_target"] is engine._target_model
             assert captured["bound_target_ops"] is engine._target_ops
+            assert engine._draft_window_size == 2048
+            assert engine._runtime_context.runtime.draft_window_size == 2048
         finally:
             await engine.stop()
 
@@ -615,7 +636,8 @@ class TestDFlashEngineInit:
             draft_model_path="test-draft",
         )
         assert engine._draft_window_size is None
-        assert engine._draft_sink_size is None
+        assert engine._draft_sink_size == 0
+        assert engine._block_size is None
         assert engine._verify_mode is None
 
     def test_long_context_knobs_read_from_settings(self):
@@ -631,12 +653,57 @@ class TestDFlashEngineInit:
             model_settings=ModelSettings(
                 dflash_draft_window_size=2048,
                 dflash_draft_sink_size=32,
+                dflash_block_size=5,
                 dflash_verify_mode="adaptive",
             ),
         )
         assert engine._draft_window_size == 2048
         assert engine._draft_sink_size == 32
+        assert engine._block_size == 5
         assert engine._verify_mode == "adaptive"
+
+    def test_none_runtime_settings_remain_unset_before_checkpoint_load(self):
+        """Explicit null window remains unset until draft metadata is loaded."""
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(
+                dflash_draft_window_size=None,
+                dflash_draft_sink_size=None,
+            ),
+        )
+        assert engine._draft_window_size is None
+        assert engine._draft_sink_size == 0
+
+    @pytest.mark.parametrize(
+        ("draft_meta", "expected"),
+        [
+            ({"config": {"sliding_window": 2048}}, 2048),
+            ({"config": SimpleNamespace(sliding_window=4096)}, 4096),
+            ({"config": {"sliding_window": None}}, None),
+            ({"config": {"sliding_window": 0}}, None),
+            ({"config": {"sliding_window": "invalid"}}, None),
+            ({"config": {}}, None),
+            ({}, None),
+        ],
+    )
+    def test_checkpoint_draft_window_size(self, draft_meta, expected):
+        from omlx.engine.dflash import DFlashEngine
+
+        assert DFlashEngine._checkpoint_draft_window_size(draft_meta) == expected
+
+    def test_explicit_window_overrides_checkpoint_config(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine(
+            model_name="test-model",
+            draft_model_path="test-draft",
+            model_settings=ModelSettings(dflash_draft_window_size=512),
+        )
+        draft_meta = {"config": {"sliding_window": 2048}}
+        assert engine._resolve_draft_window_size(draft_meta) == 512
 
     def test_build_runtime_context_passes_knobs(self):
         """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
@@ -660,8 +727,8 @@ class TestDFlashEngineInit:
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
 
-    def test_build_runtime_context_defaults_to_dflash_mlx_values(self):
-        """None settings → dflash-mlx fills DEFAULT_RUNTIME_CONFIG (1024 / 64 / 'adaptive')."""
+    def test_build_runtime_context_leaves_window_unset(self):
+        """No setting leaves the window unset; checkpoint resolution happens at load."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -673,8 +740,8 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
-        assert runtime.draft_window_size == 1024
-        assert runtime.draft_sink_size == 64
+        assert engine._draft_window_size is None
+        assert runtime.draft_sink_size == 0
         assert runtime.verify_mode == "adaptive"
 
     def test_l2_max_bytes_from_settings(self, tmp_path):
@@ -1375,12 +1442,30 @@ class TestDFlashCachedTokensWiring:
         )
         fake_flow = SimpleNamespace(hit_tokens=4273)
 
-        def fake_stream_events(*, prompt_tokens, max_tokens):
+        def fake_stream_events(
+            *,
+            prompt_tokens,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            repetition_context_size,
+        ):
+            assert (temperature, top_p, top_k, min_p) == (0.7, 0.9, 0, 0.0)
+            assert repetition_penalty == 1.2
+            assert repetition_context_size == 128
             return iter([summary]), fake_flow, [2]
 
         monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)
 
-        out = await engine.generate("hello", max_tokens=4)
+        out = await engine.generate(
+            "hello",
+            max_tokens=4,
+            repetition_penalty=1.2,
+            repetition_context_size=128,
+        )
         assert out.cached_tokens == 4273
 
 

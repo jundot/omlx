@@ -491,3 +491,178 @@ def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
     assert NodeBudget(
         node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
     ).role == "workstation"
+
+
+def test_nemotron_h_quant_group_divisors_cap_tp_degree():
+    """Quantized even-split row-parallel dims contribute their group counts.
+
+    The Nemotron-H MoE routed experts use a custom *uneven* split (29 groups),
+    so 29 must NOT appear as a strict divisor. But the shared-expert down_proj
+    (3712 / 64 = 58 groups) uses the even ``shard_inplace`` path, so 58 must be
+    present — capping the model at TP=2 for the quantization reason as well as
+    the ``num_key_value_heads=2`` reason.
+    """
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 58 in divisors, divisors  # shared down_proj even-split group count
+    assert 29 not in divisors, divisors  # routed fc2 handled by the uneven path
+    assert all(v % 2 == 0 for v in divisors)  # TP=2 stays viable
+    assert not all(v % 4 == 0 for v in divisors)  # TP=4 rejected (58 % 4 != 0)
+
+
+def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
+    """Without a quantization block there are no group-count constraints."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+    }
+    divisors = _tensor_parallel_divisors(config)
+    assert 58 not in divisors
+    assert set(divisors) == {32, 2, 64, 8}
+
+
+def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
+    tmp_path, monkeypatch
+):
+    """An in-place shard rewrite bumps neither the directory mtime nor
+    config.json's, so the shard stats themselves must be in the cache key."""
+
+    from omlx.cluster import planner
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 100)]
+    )
+
+    calls = []
+    real_inspect = planner.inspect_safetensors_layout
+
+    def counting_inspect(path):
+        calls.append(str(path))
+        return real_inspect(path)
+
+    monkeypatch.setattr(planner, "inspect_safetensors_layout", counting_inspect)
+
+    planner.complete_model_layout(tmp_path)
+    planner.complete_model_layout(tmp_path)
+    assert len(calls) == 1  # second read served from the cache
+
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 200)]
+    )
+    layout = planner.complete_model_layout(tmp_path)
+    assert len(calls) == 2  # overwrite invalidated the cached entry
+    assert layout.layer_weight_bytes == (200,)
+
+
+def test_nemotron_h_per_module_quant_overrides_tighten_the_guard():
+    """oQ mixed checkpoints override group_size per module inside the
+    quantization dict; a coarser override can leave a prime group count the
+    top-level size hides, so its group counts must constrain the degree too."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "backbone.layers.0.mixer.shared_experts.down_proj": {
+                "group_size": 128,
+                "bits": 6,
+            },
+        },
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 58 in divisors  # 3712 / 64 under the top-level size
+    assert 29 in divisors  # 3712 / 128 under the override
+
+
+def test_nemotron_h_head_dim_falls_back_to_hidden_over_heads():
+    """A config without head_dim must not silently drop the attention
+    constraint; the runtime falls back to hidden_size // heads and so must
+    the guard."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "hidden_size": 4096,
+        "n_groups": 8,
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 64 in divisors  # (32 * 128) / 64 via the fallback head_dim
+
+
+def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
+    # The text backbone declares a pipeline() in mlx-lm source, but the on-disk
+    # checkpoint carries a vision sub-config, so it is served by mlx-vlm and has
+    # no model.model.pipeline (progressive_loading gates on exactly that). The
+    # static flag must mirror the runtime, i.e. report False.
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
+    assert planner._supports_pipeline(config) is False
+
+
+def test_supports_pipeline_true_for_text_model(monkeypatch):
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    assert planner._supports_pipeline({"model_type": "qwen3_moe"}) is True
+
+
+def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
+    # A VLM oMLX explicitly vouches for (ships its own pipeline()) stays True.
+    import sys
+    import types
+
+    from omlx.cluster import planner
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.minimax_m3_vl",
+        types.SimpleNamespace(SUPPORTS_PIPELINE=True),
+    )
+    config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
+    assert planner._supports_pipeline(config) is True

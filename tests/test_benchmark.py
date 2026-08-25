@@ -129,6 +129,27 @@ class TestBenchmarkRequest:
         )
         assert req.warmup_mode is BenchmarkWarmupMode.ANE_2048
 
+    def test_ane_aligned_prompt_adds_one_to_single_trials(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+            align_prompt_to_ane=True,
+        )
+
+        assert _single_prompt_lengths(req) == [4097, 8193]
+
+    def test_standard_prompt_lengths_remain_unchanged(self):
+        from omlx.admin.benchmark import _single_prompt_lengths
+
+        req = BenchmarkRequest(
+            model_id="test-model",
+            prompt_lengths=[4096, 8192],
+        )
+
+        assert _single_prompt_lengths(req) == [4096, 8192]
+
     def test_unknown_warmup_mode_is_rejected(self):
         with pytest.raises(ValueError, match="warmup_mode"):
             BenchmarkRequest(
@@ -2113,6 +2134,58 @@ class TestRunExternalBenchmark:
 
 
 class TestAneBenchmarkTrace:
+    def test_summary_reports_observed_scheduler_calls_not_implied_prompt_width(
+        self, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=4097,
+                prefill_duration_s=1.0,
+                config={"sequence_length": 2048, "mlp_layers": 2},
+                profile={"mlp": {"operations": 4}},
+                scheduler_trace={
+                    "chunk_tokens": [2048, 2048],
+                    "requested_steps": [4096, 4096],
+                    "boundary_enabled": True,
+                    "cache_block_size": 2048,
+                },
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        summary = next(m for m in messages if "[benchmark-ane-summary]" in m)
+        assert "model_calls=2" in summary
+        assert "model_call_widths=2048x2" in summary
+        assert "requested_steps=4096x2" in summary
+        assert "boundary_enabled=True" in summary
+        assert "cache_block_size=2048" in summary
+        assert "accounting=observed" in summary
+        assert "full_ane_tiles=2" in summary
+        assert "gpu_tail_tokens=0" in summary
+
+    def test_summary_distinguishes_one_wide_call_from_two_tiles(self, caplog):
+        with caplog.at_level(logging.INFO):
+            _log_ane_benchmark_trace(
+                pp_len=4097,
+                prefill_duration_s=1.0,
+                config={"sequence_length": 2048, "mlp_layers": 2},
+                profile={"mlp": {"operations": 4}},
+                scheduler_trace={
+                    "chunk_tokens": [4096],
+                    "requested_steps": [4096],
+                    "boundary_enabled": False,
+                    "cache_block_size": 0,
+                },
+            )
+
+        summary = next(
+            record.getMessage()
+            for record in caplog.records
+            if "[benchmark-ane-summary]" in record.getMessage()
+        )
+        assert "model_calls=1" in summary
+        assert "model_call_widths=4096x1" in summary
+        assert "full_ane_tiles=2" in summary
+
     def test_expectations_follow_compiled_layers(self, caplog):
         with caplog.at_level(logging.INFO):
             _log_ane_benchmark_trace(

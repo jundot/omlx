@@ -61,6 +61,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_dir",
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
+        "hot_cache_write_through",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -108,6 +109,12 @@ def serve_command(args):
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
+
+    # The native ANE compile-cache gate reads this env var once, at the first
+    # compile, so it must be exported before any engine loads. setdefault
+    # keeps an explicit env override authoritative.
+    if settings.cache.ane_compile_cache:
+        os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
     # Register TRACE level (5) — includes full message content
     TRACE = 5
@@ -304,6 +311,13 @@ def serve_command(args):
             scheduler_config.hot_cache_max_size = hot_cache_max_bytes
         else:
             scheduler_config.hot_cache_max_size = 0
+
+        # Write-through: explicit CLI flag > settings file (already mapped by
+        # settings.to_scheduler_config()).
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            scheduler_config.hot_cache_write_through = bool(
+                args.hot_cache_write_through
+            )
 
         if args.no_cache:
             print(
@@ -1106,6 +1120,13 @@ Example directory structure:
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
     )
     serve_parser.add_argument(
+        "--hot-cache-write-through",
+        action="store_true",
+        default=None,
+        help="Persist every hot-cache block to SSD immediately (write-through). "
+        "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
+    )
+    serve_parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Disable oMLX paged SSD cache. mlx-lm BatchGenerator still manages KV states internally.",
@@ -1412,10 +1433,16 @@ Example directory structure:
         help="Emit machine-readable JSON",
     )
 
-    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
-    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
-    # Non-launch commands keep the previous strictness by rejecting unknowns.
-    args, extra_args = parser.parse_known_args()
+    # Split launch's forwarding separator before argparse. parse_known_args()
+    # inconsistently retains it when known options precede it, and stripping it
+    # afterward cannot distinguish it from a separator intended for the tool.
+    argv = sys.argv[1:]
+    if argv[:1] == ["launch"] and "--" in argv[2:]:
+        separator_index = argv.index("--", 2)
+        args, extra_args = parser.parse_known_args(argv[:separator_index])
+        extra_args.extend(argv[separator_index + 1 :])
+    else:
+        args, extra_args = parser.parse_known_args(argv)
 
     if args.command == "launch":
         launch_command(args, extra_args=extra_args)

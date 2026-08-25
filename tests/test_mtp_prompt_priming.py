@@ -239,6 +239,39 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
         assert prompt_priming.prime_ctx_stats(model) is None
 
+    def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
+        """A warm prefix cache leaves only a small remainder to fold; the
+        window must cap that folded span (the head-KV it exists to bound),
+        not the absolute prompt offset — otherwise every long-context
+        warm-cache request runs unprimed even when the remainder is tiny
+        (#2909)."""
+        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "6")
+        tokens = _tokens(12, seed=8)
+        cache = _make_cache(model)
+        with prompt_priming.suppress_capture():
+            _chunked_prefill(model, cache, tokens[:8], [8])
+        assert prompt_priming.prime_ctx_stats(model) is None
+        # Remainder of 4 tokens at absolute offset 12: over the old
+        # absolute-offset guard (12 > 6), within the span guard (4 <= 6).
+        _chunked_prefill(model, cache, tokens[8:], [4])
+        assert prompt_priming.prime_ctx_stats(model) == 3
+
+    def test_window_overflow_stays_latched_across_small_chunks(
+        self, model, monkeypatch
+    ):
+        """An oversized multi-chunk remainder must not restart priming after
+        the first context is dropped."""
+        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
+        tokens = _tokens(17, seed=9)
+        cache = _make_cache(model)
+        with prompt_priming.suppress_capture():
+            _chunked_prefill(model, cache, tokens[:8], [8])
+        _chunked_prefill(model, cache, tokens[8:], [3, 3, 3])
+        assert prompt_priming.prime_ctx_stats(model) is None
+        ctx = prompt_priming._find_ctx(model)
+        assert ctx is not None and ctx.window_exceeded
+        assert ctx.expected_offset == 17
+
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
         tokens = _tokens(7, seed=6)

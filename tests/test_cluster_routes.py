@@ -56,6 +56,35 @@ def _enrollment_client() -> TestClient:
     return TestClient(app)
 
 
+def test_ssh_key_generation_requires_explicit_overwrite(monkeypatch, tmp_path):
+    from omlx.cluster import ssh_keys
+
+    calls = []
+    key_pair = SimpleNamespace(
+        key_type="ed25519",
+        fingerprint="SHA256:test",
+        public_key="ssh-ed25519 AAAA test",
+        private_key_path=tmp_path / "omlx_cluster",
+        public_key_path=tmp_path / "omlx_cluster.pub",
+        created_at=123.0,
+    )
+
+    def generate(*, overwrite=False):
+        calls.append(overwrite)
+        return key_pair
+
+    monkeypatch.setattr(ssh_keys, "generate_ssh_key_pair", generate)
+
+    created = _client().post("/admin/api/cluster/ssh-key/generate")
+    rotated = _client().post("/admin/api/cluster/ssh-key/generate?overwrite=true")
+
+    assert created.status_code == 200
+    assert rotated.status_code == 200
+    assert created.json()["available"] is True
+    assert rotated.json()["created_at"] == 123.0
+    assert calls == [False, True]
+
+
 def _worker_claim() -> dict:
     return {
         "node_id": "cuda-worker-1-machine",
@@ -194,7 +223,7 @@ def test_cluster_status_route(monkeypatch):
 
     response = _client().get(
         "/admin/api/cluster/status",
-        params={"route_to": "192.168.100.197"},
+        params={"route_to": "198.51.100.197"},
     )
 
     assert response.status_code == 200
@@ -1196,6 +1225,7 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert "/cluster/join/bootstrap.py" in payload["command"]
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
+    assert payload["expires_at"] - payload["created_at"] == 30 * 60
     assert '"join_key":' not in _enrollment_client().get(
         "/admin/api/cluster/join-status"
     ).text
@@ -2081,3 +2111,175 @@ def test_verified_cuda_pair_is_kept_adjacent_in_outer_ring():
     )
 
     assert ordered == ["127.0.0.1", "spark-a", "spark-b", "other"]
+
+
+def _incident_store(tmp_path, monkeypatch):
+    """Configure a fresh incident store without leaking into other tests."""
+
+    from omlx.cluster import incidents as incidents_module
+    from omlx.cluster.incidents import IncidentStore
+
+    store = IncidentStore(tmp_path)
+    monkeypatch.setattr(incidents_module, "_configured_incidents", store)
+    return store
+
+
+def test_activation_failure_records_matching_incident(tmp_path, monkeypatch):
+    from omlx.cluster.planner import PlanningError
+
+    store = _incident_store(tmp_path, monkeypatch)
+
+    def raise_planning(_request):
+        raise PlanningError("the model does not fit the approved budgets")
+
+    monkeypatch.setattr(routes, "_create_deployment", raise_planning)
+    body = {
+        "model_path": "~/.omlx/models/example",
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+            {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+        ],
+        "approved_placement": "0" * 32,
+    }
+
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    recorded = store.list()
+    assert len(recorded) == 1
+    incident = recorded[0]
+    assert incident.message == detail
+    assert incident.severity == "error"
+    assert incident.state_code == "activation_rejected"
+    assert incident.source == "coordinator"
+    assert incident.guidance_code
+
+
+def test_cluster_incidents_cursor_only_returns_unseen(tmp_path, monkeypatch):
+    from omlx.cluster.incidents import Severity
+
+    store = _incident_store(tmp_path, monkeypatch)
+    first = store.record(
+        Severity.ERROR, "coordinator", "activation_launch_failed", "rank 1 died"
+    )
+    store.record(
+        Severity.WARN, "peer:studio", "peer_unhealthy", "studio stopped answering"
+    )
+    client = _client()
+
+    everything = client.get("/admin/api/cluster/incidents?since=0")
+    assert everything.status_code == 200
+    payload = everything.json()
+    assert [item["message"] for item in payload["incidents"]] == [
+        "rank 1 died",
+        "studio stopped answering",
+    ]
+    latest = payload["latest_seq"]
+    assert latest > first.seq
+
+    unseen = client.get(f"/admin/api/cluster/incidents?since={first.seq}")
+    assert [item["message"] for item in unseen.json()["incidents"]] == [
+        "studio stopped answering"
+    ]
+
+    caught_up = client.get(f"/admin/api/cluster/incidents?since={latest}")
+    caught_up_payload = caught_up.json()
+    assert caught_up_payload["incidents"] == []
+    assert caught_up_payload["latest_seq"] == latest
+    # The epoch names the seq numbering so a client can detect a log reset.
+    assert isinstance(caught_up_payload["epoch"], str) and caught_up_payload["epoch"]
+
+
+def test_dismissed_incident_stays_in_diagnostics_bundle(tmp_path, monkeypatch):
+    from omlx.cluster.incidents import Severity
+
+    store = _incident_store(tmp_path, monkeypatch)
+    incident = store.record(
+        Severity.ERROR,
+        "coordinator",
+        "staging_failed",
+        "Model staging failed on small",
+    )
+    monkeypatch.setattr(routes, "collect_cluster_status", lambda **_: _status())
+    monkeypatch.setattr(
+        routes, "read_runtime_markers", lambda: {"jobs": [], "warnings": []}
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            list=lambda: (),
+            to_dict=lambda: {"schema_version": 1, "deployments": []},
+        ),
+    )
+    client = _client()
+
+    dismissed = client.post(f"/admin/api/cluster/incidents/{incident.id}/dismiss")
+    assert dismissed.status_code == 200
+    assert dismissed.json() == {"ok": True}
+    missing = client.post("/admin/api/cluster/incidents/nope/dismiss")
+    assert missing.status_code == 404
+
+    bundle = client.get("/admin/api/cluster/diagnostics")
+    assert bundle.status_code == 200
+    bundled = bundle.json()["incidents"]
+    assert len(bundled) == 1
+    assert bundled[0]["id"] == incident.id
+    assert bundled[0]["dismissed_at"] is not None
+
+    # Dismissal is invisible to the cursor: the record keeps its seq, so a
+    # caller that already saw it is not re-sent a deletion it could act on.
+    feed = client.get("/admin/api/cluster/incidents?since=0").json()
+    assert feed["incidents"][0]["dismissed_at"] is not None
+
+
+def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
+    store = _incident_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(routes, "_PEER_HEALTH_LAST_HEALTHY", {})
+    monkeypatch.setattr(
+        routes, "describe_failure", lambda health: "studio stopped answering"
+    )
+
+    def fake_peer(healthy):
+        return SimpleNamespace(
+            healthy=healthy,
+            node_id="studio",
+            to_dict=lambda: {"node_id": "studio", "healthy": healthy},
+        )
+
+    state = {"healthy": True}
+    monkeypatch.setattr(
+        routes,
+        "check_peers",
+        lambda hosts_by_rank, **_: (fake_peer(state["healthy"]),),
+    )
+    client = _client()
+    url = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d1"
+
+    assert client.get(url).json()["healthy"] is True
+    assert store.list() == ()
+
+    # The first unhealthy poll after a healthy one narrates the death — once
+    # per transition, not once per poll.
+    state["healthy"] = False
+    assert client.get(url).json()["healthy"] is False
+    assert client.get(url).json()["healthy"] is False
+    recorded = store.list()
+    assert len(recorded) == 1
+    incident = recorded[0]
+    assert incident.state_code == "peer_unhealthy"
+    assert incident.source == "peer:studio"
+    assert incident.deployment_id == "d1"
+    assert incident.message == "studio stopped answering"
+
+    # A never-healthy deployment (fresh server) does not emit on sight.
+    fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
+    assert client.get(fresh).json()["healthy"] is False
+    assert len(store.list()) == 1

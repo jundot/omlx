@@ -22,7 +22,7 @@
                          x-show="clusterGuidance"
                          x-text="clusterGuidance ? clusterGuidance.explanation : ''"></div>
                 </div>
-                <button @click="clusterError = ''; clusterConnectionError = ''; dismissClusterGuidance()"
+                <button @click="dismissClusterErrorBanner()"
                         class="p-1 text-red-400 hover:text-red-700 flex-shrink-0"
                         aria-label="Dismiss">
                     <i data-lucide="x" class="w-3.5 h-3.5"></i>
@@ -89,6 +89,46 @@
                 <div class="px-4 pb-3 text-[11px] font-mono text-red-700 break-all" x-text="clusterDisplayedError()"></div>
             </details>
         </div>
+
+        <!-- Server-owned incident feed. Polls merge into this list and never
+             delete: the badge and rows survive browser reloads because the
+             records live on the coordinator, not in component state. B4 gives
+             this the full three-surface layout; this is the minimal render. -->
+        <details x-show="clusterActiveIncidents().length" x-cloak
+                 class="mb-6 rounded-xl border border-amber-200 bg-amber-50 overflow-hidden">
+            <summary class="flex items-center gap-2 px-4 py-2.5 text-sm text-amber-900 cursor-pointer select-none">
+                <i data-lucide="bell-ring" class="w-4 h-4 flex-shrink-0"></i>
+                <span class="font-semibold">Cluster incidents</span>
+                <span class="inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-amber-600 text-white text-[10px] font-bold"
+                      x-text="clusterActiveIncidents().length"></span>
+            </summary>
+            <ul class="border-t border-amber-200 divide-y divide-amber-100 max-h-72 overflow-y-auto">
+                <template x-for="incident in clusterActiveIncidents()" :key="incident.id">
+                    <li class="flex items-start gap-2.5 px-4 py-2.5 text-xs">
+                        <span class="mt-1 w-2 h-2 rounded-full flex-shrink-0"
+                              :class="{
+                                  'bg-red-500': incident.severity === 'error',
+                                  'bg-amber-500': incident.severity === 'warn',
+                                  'bg-neutral-400': incident.severity === 'info'
+                              }"></span>
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 text-[10px] text-amber-800">
+                                <span class="font-semibold uppercase tracking-wider" x-text="incident.severity"></span>
+                                <span class="font-mono" x-text="incident.source"></span>
+                                <span x-text="clusterIncidentAge(incident.ts)"></span>
+                                <span x-show="incident.superseded_by" class="italic">superseded</span>
+                            </div>
+                            <div class="text-amber-900 mt-0.5 break-words" x-text="incident.message"></div>
+                        </div>
+                        <button type="button"
+                                @click="dismissClusterIncident(incident.id)"
+                                class="px-2 py-1 text-[10px] font-medium text-amber-800 border border-amber-300 rounded-md hover:bg-amber-100 flex-shrink-0">
+                            Dismiss
+                        </button>
+                    </li>
+                </template>
+            </ul>
+        </details>
 
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
@@ -791,7 +831,7 @@
                         </div>
 
                         <p class="mt-3 text-[11px] leading-relaxed text-neutral-500">
-                            The command is single-use and expires after 10 minutes. It may ask for
+                            The command is single-use and expires after 30 minutes. It may ask for
                             sudo on the CUDA box; after that, discovery, SSH setup, environment
                             creation, compatibility checks, and pool selection are automatic.
                             Generate a fresh command for the second CUDA worker.
@@ -1583,6 +1623,7 @@
                                             </div>
                                             <div class="text-xs text-neutral-500 mt-1 font-mono break-all" x-text="clusterSshKey.fingerprint"></div>
                                             <div class="text-[10px] text-neutral-400 mt-1" x-text="'Created: ' + new Date(clusterSshKey.created_at * 1000).toLocaleString()"></div>
+                                            <div class="text-[10px] text-amber-700 mt-1">Regenerating disconnects every paired worker. You must exchange keys again on every Mac.</div>
                                         </div>
                                         <button @click="generateClusterSshKey()"
                                                 :disabled="clusterSshKeyGenerating"

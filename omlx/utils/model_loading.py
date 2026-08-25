@@ -241,6 +241,29 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_hy_v3_rope_config(cfg: dict) -> dict:
+    """Adapt legacy Hy-MT2 RoPE settings to mlx-lm's ``hy_v3`` schema.
+
+    Tencent's Hy-MT2 checkpoints publish the RoPE base as a root-level
+    ``rope_theta`` value, while the Hy3 model implementation consumes a
+    structured ``rope_parameters`` mapping. Fill that mapping only when it is
+    absent (or explicitly null) so newer checkpoints with an authoritative
+    structured configuration pass through unchanged.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if (
+        cfg.get("model_type") == "hy_v3"
+        and cfg.get("rope_parameters") is None
+        and cfg.get("rope_theta") is not None
+    ):
+        cfg["rope_parameters"] = {
+            "rope_theta": cfg["rope_theta"],
+            "rope_type": "default",
+        }
+    return cfg
+
+
 def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
 
@@ -339,6 +362,7 @@ def _patch_mlx_lm_load_config() -> None:
 
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
+        normalize_hy_v3_rope_config(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)

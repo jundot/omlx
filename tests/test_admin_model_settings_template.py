@@ -151,11 +151,22 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune",
         "modal.model_settings.qwen_ane_tune_hint",
         "modal.model_settings.qwen_ane_tune_start",
+        "modal.model_settings.qwen_ane_tune_again",
+        "modal.model_settings.qwen_ane_tune_overrides",
+        "modal.model_settings.qwen_ane_tune_allow_cpu",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gate",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_down",
+        "modal.model_settings.qwen_ane_tune_allow_ane_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_gdn",
+        "modal.model_settings.qwen_ane_tune_allow_cpu_scheduler",
         "modal.model_settings.qwen_ane_tune_cancel",
         "modal.model_settings.qwen_ane_tune_apply",
         "modal.model_settings.qwen_ane_tune_applying",
         "modal.model_settings.qwen_ane_tune_applied",
         "modal.model_settings.qwen_ane_tune_preparing",
+        "modal.model_settings.qwen_ane_tune_test",
+        "modal.model_settings.qwen_ane_tune_throughput",
+        "modal.model_settings.qwen_ane_tail_padding",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -170,6 +181,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     fields = {
         "qwen35_ane_prefill_enabled",
         "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_tail_padding_min_tokens",
         "qwen35_ane_prefill_fraction",
         "qwen35_ane_prefill_max_layers",
         "qwen35_ane_prefill_dual_ane",
@@ -186,13 +198,13 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
 
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
-    assert '<option value="0.53" selected>53%</option>' in html
-    assert '<option value="0.5" selected>50%</option>' in html
+    assert 'min="0.05" max="0.90" step="0.005"' in html
+    assert 'placeholder="0.53"' in html
+    assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
 
 
-def test_qwen_ane_selects_have_static_values_and_configured_defaults():
-    """Alpine initializes the select before dynamic child bindings."""
+def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     html = _model_settings_template()
     section = _section(
         html,
@@ -200,10 +212,23 @@ def test_qwen_ane_selects_have_static_values_and_configured_defaults():
         "<!-- TurboQuant KV Cache -->",
     )
 
-    assert '<option value="2048" selected>' in section
-    assert '<option value="0.53" selected>' in section
-    assert '<option value="0.5" selected>' in section
-    assert "<option :value=" not in section
+    for field in (
+        "qwen35_ane_prefill_sequence_length",
+        "qwen35_ane_prefill_tail_padding_min_tokens",
+        "qwen35_ane_prefill_fraction",
+        "qwen35_ane_prefill_cpu_fraction",
+        "qwen35_ane_prefill_cpu_down_fraction",
+        "qwen35_ane_prefill_cpu_gdn_fraction",
+        "qwen35_ane_prefill_cpu_threads",
+        "qwen35_ane_prefill_gdn_fraction",
+    ):
+        binding = f'x-model.number="modelSettings.{field}"'
+        before, after = section.split(binding, 1)
+        assert before.rsplit("<", 1)[-1].startswith("input ")
+        assert "</select>" not in after.split(">", 1)[0]
+
+    assert 'min="1024" step="64"' in section
+    assert 'min="0" max="64" step="1"' in section
 
 
 def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
@@ -214,23 +239,39 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "cancelANETuning()" in html
     assert "applyANETuningRecommendation()" in html
     assert "aneTuningRecommendationText()" in html
+    assert "aneTuningResultText(result)" in html
+    assert "aneTuning.status?.termination_reason" in html
+    assert "aneTuning.status?.results || []" in html
+    assert 'x-model="aneTuningOverrides.allowCpu"' in html
+    assert 'x-model="aneTuningOverrides.allowAneGdn"' in html
+    assert 'x-model="aneTuningOverrides.allowCpuGdn"' in html
     assert "'/admin/api/bench/ane-tune/start'" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
     assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
     assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
+    assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
+    assert "allow_cpu: this.aneTuningOverrides.allowCpu" in script
+    assert "allow_ane_gdn: this.aneTuningOverrides.allowAneGdn" in script
+    assert "allow_cpu_gdn: this.aneTuningOverrides.allowCpu" in script
+    assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
+    assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
+    assert "recommendation.cpu_shared_resource" in script
+    assert "if (result?.processing_tps === null" in script
+    assert "result?.latency_ms !== null" in script
 
 
-def test_qwen_ane_fraction_selects_cover_nax_tuner_results():
-    html = _model_settings_template()
-    section = _section(
-        html,
-        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
-        "<!-- TurboQuant KV Cache -->",
-    )
+def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
+    script = _dashboard_script()
 
-    for value in ("0.15", "0.25", "0.35", "0.45", "0.53"):
-        assert section.count(f'<option value="{value}"') == 2
+    assert "validateQwenAneSettings()" in script
+    assert "ANE prompt block must be a multiple of 64." in script
+    assert "MLP ANE and CPU fractions must total less than 1.0." in script
+    assert "GDN ANE and CPU fractions must total less than 1.0." in script
+    assert "CPU worker count must be between 0 and 64." in script
+    assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
+    assert "qwen35_ane_prefill_fraction: Number(" in script
 
 
 def test_qwen_ane_web_defaults_match_configured_profile():
@@ -246,6 +287,12 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
     assert "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48" in state
+    assert "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false" in state
+    assert "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135" in state
+    assert "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
+    assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+    assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
 
 
 def test_js_embedded_translations_escape_apostrophes():

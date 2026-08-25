@@ -109,6 +109,7 @@ def test_cuda_workers_join_from_a_gui_generated_one_time_command():
     assert "async revokeClusterJoinCommand()" in javascript
     assert "/admin/api/cluster/join-keys" in javascript
     assert "/admin/api/cluster/join-status" in javascript
+    assert "ttl_seconds: 1800" in javascript
     assert "service: 'oMLX CUDA Worker'" in javascript
     assert "selected.set(peer.ssh, peer)" in javascript
     # The command contains the one-time credential and therefore stays only
@@ -462,6 +463,9 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     assert "t('cluster.pairing.shared_secret_hint')" in cluster
     assert "data-cluster-ssh-setup" in cluster
     assert "openClusterPairingSetup()" in javascript
+    assert "Regenerating this key disconnects every paired worker" in javascript
+    assert "?overwrite=true" in javascript
+    assert "Regenerating disconnects every paired worker" in cluster
 
 
 def test_every_dashboard_locale_names_cluster_tab():

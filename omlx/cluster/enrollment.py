@@ -20,8 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-JOIN_KEY_TTL_SECONDS = 10 * 60
-JOIN_SESSION_TTL_SECONDS = 20 * 60
+# A fresh worker may need the command's bounded prerequisite installation
+# before Python can claim this key. Keep it single-use, but long enough for
+# that first-run path and a human paste delay.
+JOIN_KEY_TTL_SECONDS = 30 * 60
+# The worker claims before provisioning, then may spend up to 30 minutes in a
+# single dependency install and repeat that repair once after ``pip check``.
+# Keep the one-time session alive for the complete bounded bootstrap.
+JOIN_SESSION_TTL_SECONDS = 2 * 60 * 60
 MAX_PENDING_JOIN_KEYS = 32
 MAX_ENROLLED_NODES = 64
 

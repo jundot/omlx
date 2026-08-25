@@ -957,3 +957,56 @@ def test_the_tier_the_operator_chose_is_the_tier_that_is_measured(monkeypatch):
     assert safe["hard_limit"] <= aggressive["hard_limit"]
     # An explicit tier from a caller still wins over the operator's default.
     assert ceiling_breakdown("safe")["static"] == safe["static"]
+
+
+def test_operator_memory_settings_reads_real_settings_when_uninitialized(
+    monkeypatch, tmp_path
+):
+    """A fresh worker/probe process never calls init_settings, so the operator's
+    persisted tier must come from a real settings.json read, and the read must
+    not publish the process-wide singleton as a side effect."""
+    import json
+
+    import omlx.settings as settings_module
+    from omlx.cluster.memory_guard import _operator_memory_settings
+
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {
+                "memory": {
+                    "memory_guard_tier": "custom",
+                    "memory_guard_custom_ceiling_gb": 44.0,
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path))
+    monkeypatch.setattr(settings_module, "_global_settings", None)
+
+    tier, custom_gb, enabled = _operator_memory_settings()
+
+    assert tier == "custom"
+    assert custom_gb == 44.0
+    assert enabled is True
+    assert settings_module._global_settings is None
+
+
+def test_operator_memory_settings_falls_back_when_load_fails(monkeypatch):
+    import omlx.settings as settings_module
+    from omlx.cluster.memory_guard import _operator_memory_settings
+
+    def fake_get_settings():
+        raise RuntimeError("Settings not initialized")
+
+    def fake_load(cls, *args, **kwargs):
+        raise OSError("settings.json unreadable")
+
+    monkeypatch.setattr(settings_module, "get_settings", fake_get_settings)
+    monkeypatch.setattr(
+        settings_module.GlobalSettings, "load", classmethod(fake_load)
+    )
+
+    tier, custom_gb, enabled = _operator_memory_settings()
+    assert tier == "balanced"
+    assert custom_gb == 0.0
+    assert enabled is True

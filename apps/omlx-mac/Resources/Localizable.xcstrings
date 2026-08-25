@@ -21678,19 +21678,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (64)."
+            "value" : "Attention-sink tokens always kept in the window. Empty = dflash default (0)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (64)."
+            "value" : "Attention-sink-токены всегда остаются в окне. Пусто = значение DFlash по умолчанию (0)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "注意力 sink Token 始终保留在窗口中。空 = dflash 默认（64）。"
+            "value" : "注意力 sink Token 始终保留在窗口中。空 = dflash 默认（0）。"
           }
         }
       }
@@ -21942,19 +21942,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Draft model sliding-attention window. Empty = dflash default (1024)."
+            "value" : "Draft model sliding-attention window. Empty = dflash default (2048)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sliding-attention-окно draft-модели. Пусто = значение DFlash по умолчанию (1024)."
+            "value" : "Sliding-attention-окно draft-модели. Пусто = значение DFlash по умолчанию (2048)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "草稿模型滑动注意力窗口。空 = dflash 默认（1024）。"
+            "value" : "草稿模型滑动注意力窗口。空 = dflash 默认（2048）。"
           }
         }
       }

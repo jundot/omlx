@@ -125,7 +125,7 @@ the dashboard URL uses localhost, set **Settings > Server host** to `0.0.0.0`,
 restart oMLX, and enter the Studio's private IPv4 address in the card.
 
 Select **Generate join command**, copy it, and paste it into one CUDA worker. The
-command expires after ten minutes and can be claimed only once. It may ask for
+command expires after thirty minutes and can be claimed only once. It may ask for
 `sudo`; package installation, the worker-only virtual environment, SSH key
 exchange, source verification, live imports, and pool selection happen
 automatically. Generate a fresh command for the second CUDA worker. No join

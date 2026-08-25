@@ -47,6 +47,69 @@ def _try_parse_json(s: str):
         return s
 
 
+_TOOL_OUTPUT_TEXT_TYPES = ("input_text", "text", "output_text")
+
+
+def _extract_tool_output_text(
+    output: List[Any],
+    image_parts: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Extract text from a multimodal function_call_output list.
+
+    Returns None when the list has no recognized content parts so the
+    caller can fall back to JSON serialization. Image parts are appended
+    to ``image_parts`` for VLM processing when provided; otherwise they
+    become a placeholder so base64 payloads never reach the prompt.
+    """
+    recognized = any(
+        isinstance(part, dict)
+        and part.get("type") in (*_TOOL_OUTPUT_TEXT_TYPES, "input_image")
+        for part in output
+    )
+    if not recognized:
+        return None
+
+    text_parts: List[str] = []
+    for part in output:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type in _TOOL_OUTPUT_TEXT_TYPES:
+                text_parts.append(part.get("text", ""))
+            elif part_type == "input_image":
+                if image_parts is not None:
+                    image_url = part.get("image_url", part.get("url", ""))
+                    image_parts.append(
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": part.get("detail", "auto"),
+                        }
+                    )
+                else:
+                    text_parts.append("(see attached image)")
+            else:
+                text_parts.append(json.dumps(part))
+        else:
+            text_parts.append(str(part))
+    return "\n".join(p for p in text_parts if p)
+
+
+def _flush_pending_tool_images(
+    messages: List[Dict[str, Any]],
+    pending_images: List[Dict[str, Any]],
+) -> None:
+    """Flush tool-output images as a user message after a tool run.
+
+    Emitted only once the consecutive function_call_output items end so
+    tool messages stay contiguous for strict chat templates.
+    """
+    if pending_images:
+        messages.append({"role": "user", "content": list(pending_images)})
+        pending_images.clear()
+
+
 def _flush_pending_tool_calls(
     messages: List[Dict[str, Any]],
     pending: List[Dict[str, Any]],
@@ -115,6 +178,7 @@ def convert_responses_input_to_messages(
     instructions: Optional[str] = None,
     previous_messages: Optional[List[Dict[str, Any]]] = None,
     consolidate_system_messages: bool = True,
+    preserve_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert Responses API input to internal messages format.
 
@@ -126,6 +190,9 @@ def convert_responses_input_to_messages(
             into one leading system message for strict templates. Server code can
             set this to False and resolve placement after the target template is
             known.
+        preserve_images: If True, images in function_call_output lists are
+            preserved as a user message following the tool run so VLM engines
+            can extract them. If False, they become a text placeholder.
 
     Returns:
         List of message dicts compatible with chat template.
@@ -170,12 +237,18 @@ def convert_responses_input_to_messages(
     pending_tool_calls: List[Dict[str, Any]] = []
     # Track reasoning content to attach to the next assistant message
     pending_reasoning: str = ""
+    # Track images extracted from function_call_output lists; flushed as a
+    # user message once the consecutive tool-output run ends
+    pending_tool_images: List[Dict[str, Any]] = []
 
     for item in input_data:
         # Resolve effective type: EasyInputMessage has no type field
         item_type = item.type
         if item_type is None and item.role is not None:
             item_type = "message"
+
+        if item_type != "function_call_output":
+            _flush_pending_tool_images(messages, pending_tool_images)
 
         if item_type == "message":
             # Flush pending tool calls before a new message. Reasoning
@@ -281,16 +354,27 @@ def convert_responses_input_to_messages(
                 pending_reasoning=pending_reasoning,
             )
 
+            output_content = item.output or ""
+            if isinstance(item.output, list):
+                extracted = _extract_tool_output_text(
+                    item.output,
+                    pending_tool_images if preserve_images else None,
+                )
+                output_content = (
+                    extracted if extracted is not None else json.dumps(item.output)
+                )
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.call_id or "",
-                    "content": item.output or "",
+                    "content": output_content,
                 }
             )
 
-    # Flush remaining pending tool calls. If reasoning survived without
-    # a trailing message, attach it to the synthesized tool_calls message.
+    # Flush images from a trailing tool-output run, then any remaining
+    # pending tool calls. If reasoning survived without a trailing
+    # message, attach it to the synthesized tool_calls message.
+    _flush_pending_tool_images(messages, pending_tool_images)
     _flush_pending_tool_calls(
         messages,
         pending_tool_calls,

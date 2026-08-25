@@ -302,6 +302,9 @@ def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monke
         }
 
     monkeypatch.setattr("omlx.cluster.staging.remote_file_sizes", fake_remote)
+    monkeypatch.setattr(
+        "omlx.cluster.staging.remote_model_dir", lambda _host, path: path
+    )
     manifest = stage_manifest(
         root,
         [A("mbp", 0, 4), A("studio", 0, 4)],
@@ -327,6 +330,9 @@ def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
     monkeypatch.setattr(
         "omlx.cluster.staging.remote_file_sizes",
         lambda host, directory: weights,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.staging.remote_model_dir", lambda _host, path: path
     )
 
     manifest = stage_manifest(root, [A()], {"studio": "studio.local"})
@@ -439,6 +445,50 @@ def test_remote_staging_resumes_without_recopying_verified_files(
     assert result.copied == ()
 
 
+def test_remote_staging_probes_the_peer_destination_dir_not_the_source(
+    tmp_path,
+    monkeypatch,
+):
+    # A cross-user cluster: the source lives under the coordinator's home, but
+    # the peer holds its copy under a different $HOME. The present-file probe
+    # and scp destination must use the peer path, otherwise the probe reads an
+    # empty directory and re-copies the whole model.
+    from omlx.cluster.staging import stage_remote_files
+
+    root = _model(tmp_path / "source", layers=2, per_file=2)
+    peer_dir = "/Users/peer/.omlx/models/m"
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    landed = {
+        name: (root / name).stat().st_size
+        for name in (*plan.required, *sidecar_files(root))
+    }
+    seen_paths = []
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+
+    def present_reader(_host, path):
+        seen_paths.append(path)
+        return dict(landed)
+
+    result = stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        destination_dir=peer_dir,
+        sidecars=sidecar_files(root),
+        transfer=lambda **_kwargs: pytest.fail(
+            "files already on the peer must not be copied"
+        ),
+        present_reader=present_reader,
+    )
+
+    assert seen_paths == [peer_dir]
+    assert result.ok
+    assert result.copied == ()
+
+
 def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch):
     from omlx.cluster import staging
     from omlx.cluster.staging import StagingPlan, stage_files_from_source
@@ -470,6 +520,13 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
         "check_disk_for_staging",
         lambda *args, **kwargs: 100 * 1024**3,
     )
+    resolved = []
+
+    def fake_remote_model_dir(host, path, **_kwargs):
+        resolved.append((host, path))
+        return "/Users/peeruser/models/m"
+
+    monkeypatch.setattr(staging, "remote_model_dir", fake_remote_model_dir)
 
     result = stage_files_from_source(
         plan,
@@ -483,6 +540,10 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
     assert result.ok
     assert copies[0]["source_host"] == "studio"
     assert copies[0]["destination_host"] == "macbook"
+    # The scp source must be the path resolved in the SOURCE peer's own home,
+    # not the coordinator's absolute form.
+    assert resolved == [("studio", "/models/m")]
+    assert copies[0]["source_dir"] == "/Users/peeruser/models/m"
 
 
 def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
@@ -501,6 +562,9 @@ def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
         staging,
         "remote_model_staging_inventory",
         lambda _host, _path, **_kwargs: (shards, {"config.json": 2}),
+    )
+    monkeypatch.setattr(
+        staging, "remote_model_dir", lambda _host, path: path
     )
     monkeypatch.setattr(
         staging,
@@ -553,6 +617,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     app = FastAPI()
     app.include_router(routes.router)
     monkeypatch.setattr(routes, "remote_file_sizes", lambda _host, _path: {})
+    monkeypatch.setattr(routes, "remote_model_dir", lambda _host, path: path)
     monkeypatch.setattr(
         routes,
         "complete_model_layout",
@@ -571,6 +636,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         source_host,
         destination_host,
         expected_sizes,
+        destination_dir,
         parallel,
         progress,
     ):

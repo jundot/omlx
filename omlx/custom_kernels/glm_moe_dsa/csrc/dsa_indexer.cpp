@@ -1,5 +1,7 @@
 #include "dsa_indexer.h"
 
+#include "kernels/mma_dsa_indexer_score.h"
+
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -252,6 +254,141 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int unused_causal_prefix_topk_;
   bool skip_causal_future_store_;
   int causal_q_offset_;
+  int mask_ratio_;
+  int mask_q_offset_;
+};
+
+// ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
+// Split dispatch: the interior instantiation runs the unmodified hot loop on
+// fully-interior tiles; the boundary instantiation handles partial edge tiles
+// with clamped loads. Both write disjoint regions of ONE output allocation.
+// M/N/mask offsets are runtime params — a recompile per chunk would otherwise
+// stall prefill (N grows and mask_q_offset changes every chunk).
+// The kernel source is compiled ONCE at runtime by the macOS Metal compiler
+// (get_library builder path) instead of shipping in the metallib: the Xcode
+// CLI toolchain's codegen for this kernel measures 3.4 %-points slower (see
+// the header comment).
+class MMADSAIndexerScoresPrimitive : public Primitive {
+ public:
+  static constexpr int kBM = 64;
+  static constexpr int kBN = 64;
+  static constexpr int kThreads = 128; // WM=2, WN=2
+  static constexpr int kSwizzleLog = 2;
+
+  MMADSAIndexerScoresPrimitive(Stream stream, int mask_ratio, int mask_q_offset)
+      : Primitive(stream),
+        mask_ratio_(mask_ratio),
+        mask_q_offset_(mask_q_offset) {}
+
+  static bool unsupported(
+      const array& q,
+      const array& k,
+      const array& weights,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    // The kernel is instantiated for bf16 / H=64 / D=128 / weights-LH only.
+    if (q.dtype() != bfloat16 || k.dtype() != bfloat16 ||
+        weights.dtype() != bfloat16) {
+      return true;
+    }
+    if (!row_contiguous(q) || !row_contiguous(k) ||
+        !row_contiguous(weights)) {
+      return true;
+    }
+    if (q.ndim() != 4 || k.ndim() != 4 || weights.ndim() != 3) {
+      return true;
+    }
+    if (q.shape(1) != 64 || k.shape(1) != 1) {
+      return true;
+    }
+    if (weights.shape(1) != q.shape(2) || weights.shape(2) != q.shape(1)) {
+      return true;
+    }
+    if (q.shape(3) != 128 || k.shape(3) != 128) {
+      return true;
+    }
+    return k.shape(2) < 64;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("MMADSAIndexerScoresPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& q = inputs[0];
+    const auto& k = inputs[1];
+    const auto& weights = inputs[2];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const int B = q.shape(0);
+    const int M = q.shape(2);
+    const int N = k.shape(2);
+
+    const int tiles_m_full = M / kBM;
+    const int tiles_n_full = N / kBN;
+    const int tiles_m = (M + kBM - 1) / kBM;
+    const int tiles_n = (N + kBN - 1) / kBN;
+
+    OMLXMMADSAScoreParamsHost params{
+        /* int M = */ M,
+        /* int N = */ N,
+        /* int mask_ratio = */ mask_ratio_,
+        /* int mask_q_offset = */ mask_q_offset_};
+
+    // Swizzled threadgroup grid identical to the measured harness form.
+    const int tg_x = tiles_n << kSwizzleLog;
+    const int tg_y =
+        (tiles_m + (1 << kSwizzleLog) - 1) >> kSwizzleLog;
+    MTL::Size group_dims = MTL::Size(kThreads, 1, 1);
+    MTL::Size grid_dims = MTL::Size(tg_x, tg_y, B);
+
+    auto lib = d.get_library("omlx_glm_mma_dsa_v25", []() {
+      return std::string(kMMADSAScoreKernelSource);
+    });
+    auto& compute_encoder = metal::get_command_encoder(s);
+
+    auto dispatch = [&](const char* name) {
+      auto kernel = d.get_kernel(name, lib);
+      compute_encoder.set_compute_pipeline_state(kernel);
+      compute_encoder.set_input_array(q, 0);
+      compute_encoder.set_input_array(k, 1);
+      compute_encoder.set_input_array(weights, 2);
+      compute_encoder.set_output_array(out, 3);
+      compute_encoder.set_bytes(params, 4);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    };
+
+    if (tiles_m_full > 0 && tiles_n_full > 0) {
+      dispatch("mma_dsa_indexer_score_bfloat16_interior");
+    }
+    if (tiles_m > tiles_m_full || tiles_n > tiles_n_full) {
+      dispatch("mma_dsa_indexer_score_bfloat16_boundary");
+    }
+  }
+
+  DEFINE_NAME(OMLXMMADSAIndexerScores)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const MMADSAIndexerScoresPrimitive&>(other);
+    return mask_ratio_ == rhs.mask_ratio_ &&
+        mask_q_offset_ == rhs.mask_q_offset_;
+  }
+  auto state() const {
+    return std::make_tuple(mask_ratio_, mask_q_offset_);
+  }
+
+ private:
   int mask_ratio_;
   int mask_q_offset_;
 };
@@ -686,6 +823,64 @@ array dsa_indexer_scores(
           causal_q_offset,
           mask_ratio,
           mask_q_offset),
+      std::move(inputs));
+}
+
+array dsa_indexer_scores_mma(
+    const array& queries,
+    const array& keys,
+    const array& weights,
+    int mask_ratio,
+    int mask_q_offset,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] expected q/k rank 4 "
+        << "and weights rank 3 ([B, L, H]), got " << queries.shape() << ", "
+        << keys.shape() << ", " << weights.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.shape(1) != 1) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_mma] keys must have a "
+        "singleton indexer head axis.");
+  }
+  if (mask_ratio < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] mask_ratio must be "
+        << "non-negative (0 disables the fused pooled-causal mask), got "
+        << mask_ratio << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (mask_ratio > 0 && mask_q_offset < 0) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] mask_q_offset must "
+        << "be non-negative when mask_ratio > 0, got " << mask_q_offset
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto q = ensure_row_contiguous(queries, stream);
+  auto k = ensure_row_contiguous(keys, stream);
+  auto w = ensure_row_contiguous(weights, stream);
+
+  std::vector<array> inputs = {q, k, w};
+  if (MMADSAIndexerScoresPrimitive::unsupported(q, k, w, stream)) {
+    // Deliberately a hard error, not a silent Steel fallback: the caller's
+    // gate must already have routed unsupported configurations (fp16, H!=64,
+    // causal, weights rank 4, GLM shapes) to dsa_indexer_scores.
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.dsa_indexer_scores_mma] unsupported shape/dtype "
+        "(kernel serves bf16, H=64, D=128, weights [B, L, H] only).");
+  }
+
+  Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
+  return array(
+      std::move(out_shape),
+      bfloat16,
+      std::make_shared<MMADSAIndexerScoresPrimitive>(
+          stream, mask_ratio, mask_q_offset),
       std::move(inputs));
 }
 

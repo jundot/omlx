@@ -18,10 +18,90 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.liveness import check_peers, describe_failure
+from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+
+# How long one per-rank marker health read stays authoritative. Every request
+# preflights the cluster, so this bounds both the added latency (one SSH read
+# per peer, paid once per window) and how long a half-dead cluster can keep
+# answering 200s before requests start failing cleanly (#2708).
+_PEER_HEALTH_TTL = 10.0
+
+
+def _reasoning_effort_retry_payloads(
+    payload: dict[str, Any], detail: str
+) -> list[dict[str, Any]]:
+    """Payload variants to retry after rank-zero rejects ``reasoning_effort``.
+
+    Local engines render the chat template in-process, so they can try the
+    requested value, catch a template error, and fall back
+    (``apply_chat_template_with_reasoning_effort_fallback`` in
+    ``reasoning_effort.py``). The distributed engine cannot: only rank-zero's
+    private mlx-lm server renders the template, and it already told us — via
+    this failed response — which value it rejected. This mirrors the same
+    alias-then-drop fallback ladder reactively, at the HTTP boundary.
+
+    Returns at most three payloads (normalized value, alias fallback, then
+    reasoning_effort dropped entirely), so a client that always sends an
+    unsupported value can never turn into an unbounded retry loop. Returns
+    ``[]`` when the failure is not about reasoning_effort, or there is
+    nothing to retry.
+    """
+
+    if "reasoning effort" not in detail.lower():
+        return []
+    chat_template_kwargs = payload.get("chat_template_kwargs")
+    if not isinstance(chat_template_kwargs, dict):
+        return []
+    value = chat_template_kwargs.get("reasoning_effort")
+    if value is None:
+        return []
+
+    variants: list[dict[str, Any]] = []
+
+    def _variant(effort: Any) -> dict[str, Any]:
+        retry = dict(payload)
+        retry["chat_template_kwargs"] = {
+            **chat_template_kwargs,
+            "reasoning_effort": effort,
+        }
+        return retry
+
+    # Local engines normalize ("High" -> "high") before their first render
+    # attempt (reasoning_effort.py), so the normalized tier must come first
+    # here too or the same request behaves differently on a cluster.
+    normalized = _normalized_input(value)
+    if normalized != value:
+        variants.append(_variant(normalized))
+    candidate = _fallback_candidate(normalized)
+    if candidate is not None and candidate != normalized:
+        variants.append(_variant(candidate))
+    logger.info(
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
+        "without it",
+        value,
+        [
+            var["chat_template_kwargs"]["reasoning_effort"]
+            for var in variants
+        ],
+    )
+
+    dropped_kwargs = {
+        key: val
+        for key, val in chat_template_kwargs.items()
+        if key != "reasoning_effort"
+    }
+    dropped = dict(payload)
+    if dropped_kwargs:
+        dropped["chat_template_kwargs"] = dropped_kwargs
+    else:
+        dropped.pop("chat_template_kwargs", None)
+    variants.append(dropped)
+    return variants
 
 
 class DistributedInferenceError(RuntimeError):
@@ -86,6 +166,8 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_health_lock = asyncio.Lock()
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -340,6 +422,13 @@ class DistributedBatchedEngine(BatchedEngine):
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        repetition_context_size = kwargs.get("repetition_context_size")
+        if repetition_context_size is not None:
+            # Widens mlx-lm's look-back window for the repetition penalty
+            # (default 20 tokens). Verbatim loop units longer than that
+            # window never overlap their own penalty context, so the
+            # penalty is inert no matter its value.
+            payload["repetition_context_size"] = repetition_context_size
         if stop:
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
@@ -406,6 +495,10 @@ class DistributedBatchedEngine(BatchedEngine):
             "xtc_threshold": kwargs.get("xtc_threshold", 0.1),
             "stream": stream,
         }
+        repetition_context_size = kwargs.get("repetition_context_size")
+        if repetition_context_size is not None:
+            # See _completion_payload: widens the penalty look-back window.
+            payload["repetition_context_size"] = repetition_context_size
         if tools:
             payload["tools"] = tools
         if stop:
@@ -565,6 +658,14 @@ class DistributedBatchedEngine(BatchedEngine):
         started_at = time.monotonic()
         try:
             response = await client.post("/v1/chat/completions", json=payload)
+            if response.status_code >= 400:
+                detail = self._backend_error_detail(response)
+                for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
+                    response = await client.post(
+                        "/v1/chat/completions", json=retry_payload
+                    )
+                    if response.status_code < 400:
+                        break
             self._raise_for_backend(response)
             body = response.json()
         except httpx.ReadTimeout as exc:
@@ -670,128 +771,154 @@ class DistributedBatchedEngine(BatchedEngine):
 
         await self._enter_request()
         try:
-            async with client.stream(
-                "POST", "/v1/chat/completions", json=payload
-            ) as response:
-                if response.status_code >= 400:
-                    await response.aread()
-                self._raise_for_backend(response)
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line.removeprefix("data:").strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError as exc:
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted invalid chat SSE JSON"
-                        ) from exc
-                    if not isinstance(event, dict):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted an invalid chat SSE event"
-                        )
-                    usage = event.get("usage") or {}
-                    if usage:
-                        if not isinstance(usage, dict):
-                            raise DistributedInferenceError(
-                                "rank-zero backend emitted invalid chat usage"
+            # A client that always sends an unsupported reasoning_effort must
+            # never turn this into an unbounded retry loop: `attempts` is
+            # extended (by at most two entries) only once, from the FIRST
+            # failure's detail, so this terminates in at most three tries.
+            attempts = [payload]
+            attempt_index = 0
+            while True:
+                attempt_payload = attempts[attempt_index]
+                async with client.stream(
+                    "POST", "/v1/chat/completions", json=attempt_payload
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        if attempt_index == 0:
+                            detail = self._backend_error_detail(response)
+                            attempts.extend(
+                                _reasoning_effort_retry_payloads(
+                                    attempt_payload, detail
+                                )
                             )
-                        prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
-                        completion_tokens = int(
-                            usage.get("completion_tokens", completion_tokens)
-                        )
-                        details = usage.get("prompt_tokens_details") or {}
-                        if not isinstance(details, dict):
+                        if attempt_index + 1 < len(attempts):
+                            attempt_index += 1
+                            continue
+                        self._raise_for_backend(response)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line.removeprefix("data:").strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError as exc:
                             raise DistributedInferenceError(
-                                "rank-zero backend emitted invalid chat token details"
+                                "rank-zero backend emitted invalid chat SSE JSON"
+                            ) from exc
+                        if not isinstance(event, dict):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted an invalid chat SSE event"
                             )
-                        cached_tokens = int(details.get("cached_tokens", 0))
-                    choices = event.get("choices") or []
-                    if not isinstance(choices, list):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted invalid chat choices"
-                        )
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    if not isinstance(choice, dict):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted an invalid chat choice"
-                        )
-                    delta = choice.get("delta") or {}
-                    if not isinstance(delta, dict):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted an invalid chat delta"
-                        )
-
-                    raw_tool_calls = delta.get("tool_calls") or []
-                    if not isinstance(raw_tool_calls, list):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted invalid chat tool calls"
-                        )
-                    for raw_call in raw_tool_calls:
-                        if not isinstance(raw_call, dict):
+                        usage = event.get("usage") or {}
+                        if usage:
+                            if not isinstance(usage, dict):
+                                raise DistributedInferenceError(
+                                    "rank-zero backend emitted invalid chat usage"
+                                )
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
+                            completion_tokens = int(
+                                usage.get("completion_tokens", completion_tokens)
+                            )
+                            details = usage.get("prompt_tokens_details") or {}
+                            if not isinstance(details, dict):
+                                raise DistributedInferenceError(
+                                    "rank-zero backend emitted invalid "
+                                    "chat token details"
+                                )
+                            cached_tokens = int(details.get("cached_tokens", 0))
+                        choices = event.get("choices") or []
+                        if not isinstance(choices, list):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted invalid chat choices"
+                            )
+                        if not choices:
                             continue
-                        index = raw_call.get("index", len(backend_tool_calls))
-                        if not isinstance(index, int):
-                            continue
-                        target = backend_tool_calls.setdefault(
-                            index,
-                            {
-                                "id": None,
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            },
-                        )
-                        if raw_call.get("id"):
-                            target["id"] = raw_call["id"]
-                        function = raw_call.get("function") or {}
-                        if isinstance(function, dict):
-                            if isinstance(function.get("name"), str):
-                                target["function"]["name"] += function["name"]
-                            if isinstance(function.get("arguments"), str):
-                                target["function"]["arguments"] += function["arguments"]
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted an invalid chat choice"
+                            )
+                        delta = choice.get("delta") or {}
+                        if not isinstance(delta, dict):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted an invalid chat delta"
+                            )
 
-                    new_text = ""
-                    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-                    if isinstance(reasoning, str) and reasoning:
-                        if not reasoning_open:
-                            new_text += "<think>"
-                            reasoning_open = True
-                        new_text += reasoning
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        if reasoning_open:
+                        raw_tool_calls = delta.get("tool_calls") or []
+                        if not isinstance(raw_tool_calls, list):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted invalid chat tool calls"
+                            )
+                        for raw_call in raw_tool_calls:
+                            if not isinstance(raw_call, dict):
+                                continue
+                            index = raw_call.get("index", len(backend_tool_calls))
+                            if not isinstance(index, int):
+                                continue
+                            target = backend_tool_calls.setdefault(
+                                index,
+                                {
+                                    "id": None,
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if raw_call.get("id"):
+                                target["id"] = raw_call["id"]
+                            function = raw_call.get("function") or {}
+                            if isinstance(function, dict):
+                                if isinstance(function.get("name"), str):
+                                    target["function"]["name"] += function["name"]
+                                if isinstance(function.get("arguments"), str):
+                                    target["function"]["arguments"] += (
+                                        function["arguments"]
+                                    )
+
+                        new_text = ""
+                        reasoning = delta.get("reasoning") or delta.get(
+                            "reasoning_content"
+                        )
+                        if isinstance(reasoning, str) and reasoning:
+                            if not reasoning_open:
+                                new_text += "<think>"
+                                reasoning_open = True
+                            new_text += reasoning
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            if reasoning_open:
+                                new_text += "</think>"
+                                reasoning_open = False
+                            new_text += content
+                        if raw_tool_calls and reasoning_open:
                             new_text += "</think>"
                             reasoning_open = False
-                        new_text += content
-                    if raw_tool_calls and reasoning_open:
-                        new_text += "</think>"
-                        reasoning_open = False
 
-                    reason = choice.get("finish_reason")
-                    if reason is not None:
-                        finish_reason = reason
-                    if new_text:
-                        now = time.monotonic()
-                        if first_token_at is None:
-                            first_token_at = now
-                        full_text += new_text
-                        completion_tokens += 1
-                        yield GenerationOutput(
-                            text=full_text,
-                            new_text=new_text,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            finish_reason=None,
-                            finished=False,
-                            cached_tokens=cached_tokens,
-                            generated_at=now,
-                            generated_until=now,
-                            first_token_at=first_token_at,
-                        )
+                        reason = choice.get("finish_reason")
+                        if reason is not None:
+                            finish_reason = reason
+                        if new_text:
+                            now = time.monotonic()
+                            if first_token_at is None:
+                                first_token_at = now
+                            full_text += new_text
+                            completion_tokens += 1
+                            yield GenerationOutput(
+                                text=full_text,
+                                new_text=new_text,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                finish_reason=None,
+                                finished=False,
+                                cached_tokens=cached_tokens,
+                                generated_at=now,
+                                generated_until=now,
+                                first_token_at=first_token_at,
+                            )
+                    break
         except (TypeError, ValueError) as exc:
             raise DistributedInferenceError(
                 "rank-zero backend emitted invalid chat token counts"
@@ -869,6 +996,14 @@ class DistributedBatchedEngine(BatchedEngine):
         started_at = time.monotonic()
         try:
             response = await client.post("/v1/completions", json=payload)
+            if response.status_code >= 400:
+                detail = self._backend_error_detail(response)
+                for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
+                    response = await client.post(
+                        "/v1/completions", json=retry_payload
+                    )
+                    if response.status_code < 400:
+                        break
             self._raise_for_backend(response)
             body = response.json()
         except httpx.ReadTimeout as exc:
@@ -945,84 +1080,102 @@ class DistributedBatchedEngine(BatchedEngine):
 
         await self._enter_request()
         try:
-            async with client.stream(
-                "POST", "/v1/completions", json=payload
-            ) as response:
-                if response.status_code >= 400:
-                    await response.aread()
-                self._raise_for_backend(response)
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line.removeprefix("data:").strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError as exc:
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted invalid SSE JSON"
-                        ) from exc
-                    if not isinstance(event, dict):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted an invalid SSE event"
-                        )
-                    usage = event.get("usage") or {}
-                    if usage:
-                        if not isinstance(usage, dict):
-                            raise DistributedInferenceError(
-                                "rank-zero backend emitted invalid usage"
+            # See stream_chat for the retry-bound rationale.
+            attempts = [payload]
+            attempt_index = 0
+            while True:
+                attempt_payload = attempts[attempt_index]
+                async with client.stream(
+                    "POST", "/v1/completions", json=attempt_payload
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        if attempt_index == 0:
+                            detail = self._backend_error_detail(response)
+                            attempts.extend(
+                                _reasoning_effort_retry_payloads(
+                                    attempt_payload, detail
+                                )
                             )
-                        prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
-                        completion_tokens = int(
-                            usage.get("completion_tokens", completion_tokens)
-                        )
-                        details = usage.get("prompt_tokens_details") or {}
-                        if not isinstance(details, dict):
+                        if attempt_index + 1 < len(attempts):
+                            attempt_index += 1
+                            continue
+                        self._raise_for_backend(response)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line.removeprefix("data:").strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError as exc:
                             raise DistributedInferenceError(
-                                "rank-zero backend emitted invalid token details"
+                                "rank-zero backend emitted invalid SSE JSON"
+                            ) from exc
+                        if not isinstance(event, dict):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted an invalid SSE event"
                             )
-                        cached_tokens = int(details.get("cached_tokens", 0))
-                    choices = event.get("choices") or []
-                    if not isinstance(choices, list):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted invalid choices"
-                        )
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    if not isinstance(choice, dict):
-                        raise DistributedInferenceError(
-                            "rank-zero backend emitted an invalid choice"
-                        )
-                    new_text = choice.get("text") or ""
-                    reason = choice.get("finish_reason")
-                    if reason is not None:
-                        finish_reason = reason
-                        pending_final_text += new_text
-                        continue
-                    if new_text:
-                        now = time.monotonic()
-                        if first_token_at is None:
-                            first_token_at = now
-                        full_text += new_text
-                        # MLX-LM streams one generated response at a time but
-                        # sends exact usage only in its terminal SSE event.
-                        # Keep oMLX's live counters advancing, then replace
-                        # them with the exact backend count at completion.
-                        completion_tokens += 1
-                        yield GenerationOutput(
-                            text=full_text,
-                            new_text=new_text,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            finish_reason=None,
-                            finished=False,
-                            cached_tokens=cached_tokens,
-                            generated_at=now,
-                            generated_until=now,
-                            first_token_at=first_token_at,
-                        )
+                        usage = event.get("usage") or {}
+                        if usage:
+                            if not isinstance(usage, dict):
+                                raise DistributedInferenceError(
+                                    "rank-zero backend emitted invalid usage"
+                                )
+                            prompt_tokens = int(
+                                usage.get("prompt_tokens", prompt_tokens)
+                            )
+                            completion_tokens = int(
+                                usage.get("completion_tokens", completion_tokens)
+                            )
+                            details = usage.get("prompt_tokens_details") or {}
+                            if not isinstance(details, dict):
+                                raise DistributedInferenceError(
+                                    "rank-zero backend emitted invalid token details"
+                                )
+                            cached_tokens = int(details.get("cached_tokens", 0))
+                        choices = event.get("choices") or []
+                        if not isinstance(choices, list):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted invalid choices"
+                            )
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            raise DistributedInferenceError(
+                                "rank-zero backend emitted an invalid choice"
+                            )
+                        new_text = choice.get("text") or ""
+                        reason = choice.get("finish_reason")
+                        if reason is not None:
+                            finish_reason = reason
+                            pending_final_text += new_text
+                            continue
+                        if new_text:
+                            now = time.monotonic()
+                            if first_token_at is None:
+                                first_token_at = now
+                            full_text += new_text
+                            # MLX-LM streams one generated response at a time but
+                            # sends exact usage only in its terminal SSE event.
+                            # Keep oMLX's live counters advancing, then replace
+                            # them with the exact backend count at completion.
+                            completion_tokens += 1
+                            yield GenerationOutput(
+                                text=full_text,
+                                new_text=new_text,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                finish_reason=None,
+                                finished=False,
+                                cached_tokens=cached_tokens,
+                                generated_at=now,
+                                generated_until=now,
+                                first_token_at=first_token_at,
+                            )
+                    break
         except (TypeError, ValueError) as exc:
             raise DistributedInferenceError(
                 "rank-zero backend emitted invalid token counts"
@@ -1116,25 +1269,89 @@ class DistributedBatchedEngine(BatchedEngine):
             logger.warning("Could not save cluster strategy measurement: %s", exc)
 
     @staticmethod
-    def _raise_for_backend(response: httpx.Response) -> None:
-        if response.status_code < 400:
-            return
+    def _backend_error_detail(response: httpx.Response) -> str:
         detail = ""
         with suppress(json.JSONDecodeError, TypeError, ValueError):
             payload = response.json()
             if isinstance(payload, dict):
                 detail = str(payload.get("error") or payload.get("detail") or "")
+        return detail
+
+    @classmethod
+    def _raise_for_backend(cls, response: httpx.Response) -> None:
+        if response.status_code < 400:
+            return
+        detail = cls._backend_error_detail(response)
         suffix = f": {detail[:500]}" if detail else ""
         raise DistributedInferenceError(
             f"rank-zero backend returned HTTP {response.status_code}{suffix}"
         )
 
+    async def _require_healthy_cluster(self) -> None:
+        """Refuse a request the cluster cannot serve, before the 200 commits.
+
+        A streaming response commits its status line before the body
+        generator runs, so any failure detected later reaches the client as
+        an error frame inside a 200 — the empty-response class from #2708.
+        Preflight is the last point a clean HTTP error is still possible.
+        The supervisor read is free; the per-rank marker read costs one SSH
+        round trip per peer and is cached for ``_PEER_HEALTH_TTL`` seconds.
+        """
+
+        status = self._supervisor.status()
+        if status.returncode is not None:
+            raise DistributedInferenceError(
+                f"distributed job exited with code {status.returncode}"
+            )
+        if status.failure_reason:
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
+            )
+        cached = self._peer_health
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_health
+                if cached is None or (
+                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
+                ):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(
+                            check_peers,
+                            hosts_by_rank,
+                            deployment_id=self.deployment.deployment_id,
+                            require_heartbeat=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        # A broken probe must not take down a serving
+                        # cluster; the supervisor checks above still catch
+                        # hard failures.
+                        logger.warning("peer health probe failed: %s", exc)
+                        cached = (time.monotonic(), True, "")
+                    else:
+                        healthy = all(item.healthy for item in health)
+                        cached = (
+                            time.monotonic(),
+                            healthy,
+                            "" if healthy else describe_failure(health),
+                        )
+                    self._peer_health = cached
+        if not cached[1]:
+            raise DistributedInferenceError(
+                f"cluster is not serving: {cached[2]}"
+            )
+
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        await self._require_healthy_cluster()
         return None
 
     def has_active_requests(self) -> bool:

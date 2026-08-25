@@ -470,6 +470,34 @@ class TestResponsesEndpoint:
         assert data["output"][1]["content"][0]["text"] == "Hello!"
         assert data["usage"]["output_tokens_details"]["reasoning_tokens"] == 3
 
+    def test_response_endpoint_marks_length_as_incomplete(
+        self, client, mock_llm_engine
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "incomplete"
+        assert data["incomplete_details"] == {"reason": "max_output_tokens"}
+
     def test_responses_forwards_request_chat_template_kwargs(
         self, client, mock_llm_engine
     ):
@@ -552,6 +580,45 @@ class TestResponsesEndpoint:
         assert output[1]["content"][0]["text"] == "Hello!"
         usage = completed["response"]["usage"]
         assert usage["output_tokens_details"]["reasoning_tokens"] == 3
+
+    def test_response_stream_emits_incomplete_event_on_length(
+        self, client, mock_llm_engine
+    ):
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text="Partial response",
+                new_text="Partial response",
+                prompt_tokens=2,
+                completion_tokens=3,
+                finish_reason="length",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "max_output_tokens": 3,
+                "stream": True,
+                "store": False,
+            },
+        )
+
+        assert response.status_code == 200
+        terminal_block = response.text.strip().split("\n\n")[-1]
+        assert terminal_block.startswith("event: response.incomplete\n")
+        data_line = next(
+            line for line in terminal_block.splitlines() if line.startswith("data: ")
+        )
+        event = json.loads(data_line.removeprefix("data: "))
+        assert event["type"] == "response.incomplete"
+        assert event["response"]["status"] == "incomplete"
+        assert event["response"]["incomplete_details"] == {
+            "reason": "max_output_tokens"
+        }
 
     def test_response_stream_summary_log_names_model(self, client, caplog):
         with caplog.at_level("INFO", logger="omlx.server"):

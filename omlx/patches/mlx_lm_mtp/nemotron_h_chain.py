@@ -54,16 +54,31 @@ def apply() -> bool:
         logger.debug("nemotron_h base MTP patch missing; chain patch skipped")
         return False
 
+    # Every sub-patch below guards itself per surface, so re-running them is
+    # a cheap no-op when nothing changed. Do NOT early-return on the class
+    # flag alone: a single flag cannot know that some surface was reinstalled
+    # underneath us (a module reload, a monkeypatched teardown, the base
+    # patch re-applying), and skipping the sub-patches then leaves that
+    # surface permanently unwrapped. Run them and let the per-surface
+    # markers decide; only the log is gated, which is what the planner's
+    # every-10s autoconfigure tick actually needed quieted.
+    already_applied = (
+        getattr(nh.Model, "_omlx_nh_chain_init", False)
+        and _is_ours(nh.Model, "mtp_forward")
+        and _is_ours(nh.NemotronHMamba2Mixer, "__call__")
+    )
+
     _patch_mixer(nh)
     _patch_ssm_sequential()
     _patch_conv_capture(nh)
     _patch_mtp_forward(nh)
     _patch_partial_rollback(nh)
     _patch_init_markers(nh)
-    logger.info(
-        "nemotron_h MTP chain patch applied "
-        "(depth-k drafting, sequential fused verify, replay-free rollback)"
-    )
+    if not already_applied:
+        logger.info(
+            "nemotron_h MTP chain patch applied "
+            "(depth-k drafting, sequential fused verify, replay-free rollback)"
+        )
     return True
 
 

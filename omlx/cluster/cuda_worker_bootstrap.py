@@ -26,6 +26,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import suppress
 from pathlib import Path
 
 INSTALL_ROOT = Path("/opt/omlx-cluster-worker")
@@ -229,13 +230,48 @@ def _install_controller_key(
 ) -> None:
     ssh_dir = home / ".ssh"
     authorized_keys = ssh_dir / "authorized_keys"
+    if ssh_dir.is_symlink():
+        raise BootstrapError("SSH directory must not be a symbolic link")
     ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if ssh_dir.is_symlink():
+        raise BootstrapError("SSH directory must not be a symbolic link")
+    if authorized_keys.is_symlink():
+        raise BootstrapError("authorized_keys must not be a symbolic link")
     existing = authorized_keys.read_text(encoding="utf-8") if authorized_keys.exists() else ""
     key_parts = public_key.strip().split()
     key_identity = " ".join(key_parts[:2])
-    if key_identity not in existing:
-        with authorized_keys.open("a", encoding="utf-8") as stream:
-            stream.write(f'from="{controller_ip}",restrict {public_key.strip()}\n')
+    restricted_line = f'from="{controller_ip}",restrict {public_key.strip()}'
+    updated: list[str] = []
+    installed = False
+    for line in existing.splitlines():
+        fields = line.split()
+        matches = any(
+            " ".join(fields[index : index + 2]) == key_identity
+            for index in range(max(0, len(fields) - 1))
+        )
+        if not matches:
+            updated.append(line)
+            continue
+        if not installed:
+            updated.append(restricted_line)
+            installed = True
+    if not installed:
+        updated.append(restricted_line)
+    rendered = "\n".join(updated) + "\n"
+    if rendered != existing:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".authorized_keys.", dir=ssh_dir
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(rendered)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, authorized_keys)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary)
     os.chmod(ssh_dir, 0o700)
     os.chmod(authorized_keys, 0o600)
     os.chown(ssh_dir, uid, gid)
@@ -407,7 +443,6 @@ def main(argv: list[str] | None = None) -> int:
         raise BootstrapError("the worker bootstrap must run through sudo")
     controller, controller_ip, controller_port = _controller_url(args.controller)
     ssh_user, home, uid, gid = _ssh_user(args.ssh_user)
-    _ensure_system_packages()
 
     hostname = socket.gethostname().strip()[:255]
     local_ip = _local_address(controller_ip, controller_port)
@@ -438,6 +473,10 @@ def main(argv: list[str] | None = None) -> int:
     ):
         raise BootstrapError("controller identity or enrollment response did not verify")
 
+    # Consume the short-lived join key before apt can use its full bounded
+    # timeout. The longer claimed session covers provisioning and remains
+    # revocable from the controller dashboard.
+    _ensure_system_packages()
     _install_controller_key(
         controller_key,
         controller_ip=controller_ip,

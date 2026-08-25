@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -484,6 +485,53 @@ _INDEXER_POOL_TILE = 16384
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
+_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
+    "OMLX_DSV4F_M2_MMA_SCORE", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+
+
+def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
+    """True only for the exact DeepSeek-V4-Flash / Apple M2 Ultra pairing.
+
+    The v25 MMA indexer score kernel is benchmark-proven (and bit-exact
+    validated) on precisely this checkpoint/hardware combination; every
+    other pairing keeps the Steel kernel.
+    """
+    if compress_ratio != 4:
+        return False
+    try:
+        if mx.device_info().get("device_name") != "Apple M2 Ultra":
+            return False
+    except Exception:
+        return False
+    return (
+        config.model_type == "deepseek_v4"
+        and config.vocab_size == 129280
+        and config.hidden_size == 4096
+        and config.moe_intermediate_size == 2048
+        and config.num_hidden_layers == 43
+        and config.num_attention_heads == 64
+        and config.n_routed_experts == 256
+        and config.num_experts_per_tok == 6
+        and config.max_position_embeddings == 1048576
+        and config.index_n_heads == 64
+        and config.index_head_dim == 128
+        and config.index_topk == 512
+    )
+
+
+def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
+
+    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
+    and an extension build exposing the symbol. The kernel serves bf16 /
+    H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
+    the fingerprint and this call site; N >= 64 is re-checked per call.
+    """
+    if not _DEEPSEEK_V4_M2_MMA_SCORE:
+        return False
+    return _dsv4f_m2_exact_pairing(config, compress_ratio)
 
 
 @partial(mx.compile, shapeless=True)
@@ -1205,6 +1253,9 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
+            config, compress_ratio
+        )
 
     def __call__(
         self,
@@ -1289,14 +1340,44 @@ class Indexer(nn.Module):
                     ):
                         _mask_ratio = int(pool_cache.ratio)
                         _mask_q_offset = int(offset)
-                    scores4 = glm_fast.dsa_indexer_scores(
-                        q,
-                        pooled[:, None],
-                        weights,
-                        causal=False,
-                        mask_ratio=_mask_ratio,
-                        mask_q_offset=_mask_q_offset,
+                    # v25 from-scratch MMA score kernel: 1.37x over Steel
+                    # on the exact M2/DSV4F pairing, bit-exact incl. the
+                    # fused pooled-ratio mask (validated across aligned and
+                    # unaligned M/N and chunked-prefill offsets). Gated by
+                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
+                    # symbol; every other configuration keeps the Steel
+                    # path below unchanged.
+                    _use_mma = (
+                        self._m2_mma_score
+                        and getattr(glm_fast, "_EXT_MMA_SCORE", False)
+                        and q.dtype == mx.bfloat16
+                        and pooled.shape[1] >= 64
                     )
+                    global _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED
+                    if _use_mma and not _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED:
+                        _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = True
+                        logging.getLogger(__name__).info(
+                            "deepseek_v4: DSV4F/M2 v25 MMA indexer score "
+                            "kernel active (zero-per-head-barrier, "
+                            "1.37x over Steel)"
+                        )
+                    if _use_mma:
+                        scores4 = glm_fast.dsa_indexer_scores_mma(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
+                    else:
+                        scores4 = glm_fast.dsa_indexer_scores(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            causal=False,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
                     if _mask_ratio == 0 and pmask is not None:
                         scores4 = mx.where(
                             (pmask[:, None] if pmask.ndim == 3 else pmask[None, None]),

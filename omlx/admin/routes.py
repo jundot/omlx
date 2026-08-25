@@ -137,12 +137,20 @@ class ModelSettingsRequest(BaseModel):
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
+    qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
     qwen35_ane_prefill_gdn: bool | None = None
     qwen35_ane_prefill_gdn_fraction: float | None = None
     qwen35_ane_prefill_gdn_max_layers: int | None = None
+    qwen35_ane_prefill_cpu_enabled: bool | None = None
+    qwen35_ane_prefill_cpu_fraction: float | None = None
+    qwen35_ane_prefill_cpu_down_fraction: float | None = None
+    qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
+    qwen35_ane_prefill_cpu_threads: int | None = None
+    qwen35_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -163,6 +171,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
+    dflash_block_size: int | None = None
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
@@ -266,6 +275,8 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: str | None = None
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
+    hot_cache_write_through: bool | None = None
+    ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str | None = None
@@ -536,6 +547,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_max_ctx",
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
+        "dflash_block_size",
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
@@ -642,6 +654,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
+    settings.dflash_block_size = None
     settings.dflash_verify_mode = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
@@ -952,6 +965,9 @@ async def _apply_cache_settings_runtime(
     # These settings all affect objects constructed with each scheduler. Keep
     # the pool template synchronized before unloading existing engines.
     pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
+    pool._scheduler_config.hot_cache_write_through = (
+        global_settings.cache.hot_cache_write_through
+    )
     pool._scheduler_config.gdn_ssd_split_enabled = (
         global_settings.cache.get_gdn_ssd_split_enabled()
     )
@@ -2321,6 +2337,25 @@ async def update_model_settings(
                 detail="ANE prompt block must be a multiple of 64 and at least 1024.",
             )
         current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            # A crossover is calibrated for one fixed program width. Changing
+            # that width invalidates it; disable padding until the next tune.
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
+    if "qwen35_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.qwen35_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.qwen35_ane_prefill_sequence_length)
+        if value is None or not 0 <= value < sequence_length:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ANE tail padding threshold must be zero or less than the "
+                    "ANE prompt block."
+                ),
+            )
+        current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
     if "qwen35_ane_prefill_fraction" in sent:
         value = request.qwen35_ane_prefill_fraction
         if value is None or not 0.05 <= value <= 0.90:
@@ -2358,6 +2393,90 @@ async def update_model_settings(
                 detail="ANE GDN layer limit must be zero or greater.",
             )
         current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
+    if "qwen35_ane_prefill_cpu_enabled" in sent:
+        current_settings.qwen35_ane_prefill_cpu_enabled = bool(
+            request.qwen35_ane_prefill_cpu_enabled
+        )
+    if "qwen35_ane_prefill_fused_down" in sent:
+        current_settings.qwen35_ane_prefill_fused_down = bool(
+            request.qwen35_ane_prefill_fused_down
+        )
+    if "qwen35_ane_prefill_cpu_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value <= 0.25:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP fraction must be between 0.0 and 0.25.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_down_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_down_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP down fraction must be between 0.0 and 0.50.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_down_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_gdn_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_gdn_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU GDN fraction must be between 0.0 and 0.50",
+            )
+        current_settings.qwen35_ane_prefill_cpu_gdn_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_threads" in sent:
+        value = request.qwen35_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU worker count must be between 0 and 64.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_threads = int(value)
+    if "qwen35_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
+            request.qwen35_ane_prefill_cpu_shared_resource
+        )
+    if (
+        current_settings.qwen35_ane_prefill_fused_down
+        and current_settings.qwen35_ane_prefill_fraction > 0.50
+    ):
+        # The fused loader reuses the MLP fraction for the down projection and
+        # rejects anything above 0.50 at enable time. Without this check the
+        # save succeeds and the next load silently disables ANE prefill.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Fused MLP/down offload needs an MLP ANE fraction of 0.50 or "
+                "less."
+            ),
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_fraction
+        * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
+        + current_settings.qwen35_ane_prefill_cpu_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Two per-ANE MLP shares and the CPU share must total less than 1.0."
+                if current_settings.qwen35_ane_prefill_fused_down
+                else "MLP ANE and CPU fractions must total less than 1.0."
+            ),
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_gdn
+        and current_settings.qwen35_ane_prefill_gdn_fraction
+        + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -2459,16 +2578,21 @@ async def update_model_settings(
             request.dflash_ssd_cache_max_bytes
         )
     if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → fall back to dflash-mlx internal default (1024).
+        # 0 / None / negative → use config.sliding_window when present.
         value = request.dflash_draft_window_size
         current_settings.dflash_draft_window_size = (
             int(value) if value and value > 0 else None
         )
     if "dflash_draft_sink_size" in sent:
-        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        # Negative / None → oMLX default 0 (no sink tokens).
         value = request.dflash_draft_sink_size
         current_settings.dflash_draft_sink_size = (
-            int(value) if value is not None and value >= 0 else None
+            int(value) if value is not None and value >= 0 else 0
+        )
+    if "dflash_block_size" in sent:
+        value = request.dflash_block_size
+        current_settings.dflash_block_size = (
+            int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
         value = request.dflash_verify_mode
@@ -2608,9 +2732,15 @@ async def update_model_settings(
         entry.is_pinned = request.is_pinned
     if request.is_default is not None:
         current_settings.is_default = request.is_default
-        # Update server_state.default_model if setting as default
-        if request.is_default and server_state:
-            server_state.default_model = model_id
+        if server_state:
+            if request.is_default:
+                server_state.default_model = model_id
+            elif server_state.default_model == model_id:
+                # Unsetting the model that IS the current default must clear
+                # the pointer, not just this model's own flag -- otherwise the
+                # server keeps treating an unpinned model as default until the
+                # next restart re-derives it from persisted settings.
+                server_state.default_model = None
     if request.is_hidden is not None:
         current_settings.is_hidden = request.is_hidden
     if request.is_favorite is not None:
@@ -3378,6 +3508,8 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 )
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
+            "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
+            "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
@@ -3909,6 +4041,11 @@ async def update_global_settings(
     if request.hot_cache_only is not None:
         global_settings.cache.hot_cache_only = request.hot_cache_only
         cache_changed = True
+    if request.hot_cache_write_through is not None:
+        global_settings.cache.hot_cache_write_through = (
+            request.hot_cache_write_through
+        )
+        cache_changed = True
     if requested_storage is not None:
         global_settings.cache.set_gdn_snapshot_storage(requested_storage)
         cache_changed = True
@@ -3931,6 +4068,15 @@ async def update_global_settings(
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
         cache_changed = True
+    # No cache_changed: reloading models cannot re-arm the native gate, which
+    # reads the env var once at the first ANE compile of the process. The env
+    # update covers a process that has not compiled yet; otherwise restart.
+    if request.ane_compile_cache is not None:
+        global_settings.cache.ane_compile_cache = request.ane_compile_cache
+        if request.ane_compile_cache:
+            os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] = "1"
+        else:
+            os.environ.pop("OMLX_QWEN35_ANE_COMPILE_CACHE", None)
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(

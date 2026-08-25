@@ -200,6 +200,20 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
     return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
+def _post_ane_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
+    # The native q8 tile only pays off at long sequences, and post-ANE suffix
+    # inputs sit at the fixed ANE shape far below that. Route q8 through the
+    # same OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS boundary as the prefill linear
+    # patch instead of hardcoding stock MLX for it.
+    bits = getattr(linear, "bits", None)
+    q8_min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
+    )
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, 0, q8_min_tokens):
+        return linear(x)
+    return _linear_qmm(linear, x, variant)
+
+
 def _make_patched_mlp(
     orig_call: Callable[..., mx.array],
     variant: int,
@@ -537,6 +551,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
+                or os.environ.get("OMLX_QWEN35_Q4_LM_LINEAR", "1") == "0"
             ):
                 if n_confirmed:
                     return orig_gdn(
@@ -550,7 +565,15 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 self.in_proj_b,
                 self.in_proj_a,
             )
-            if not any(should_route(linear, inputs) for linear in input_linears):
+            backend = _LM_GDN_PREFILL_BACKEND
+            projections = (
+                backend(self, inputs, bool(n_confirmed))
+                if backend is not None
+                else None
+            )
+            if projections is None and not any(
+                should_route(linear, inputs) for linear in input_linears
+            ):
                 if n_confirmed:
                     return orig_gdn(
                         self, inputs, mask=mask, cache=cache, n_confirmed=n_confirmed
@@ -558,10 +581,6 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
                 return orig_gdn(self, inputs, mask=mask, cache=cache)
 
             B, S, _ = inputs.shape
-            projections = None
-            backend = _LM_GDN_PREFILL_BACKEND
-            if backend is not None:
-                projections = backend(self, inputs, bool(n_confirmed))
             if projections is None:
                 qkv = qmm_or_linear(self.in_proj_qkv, inputs)
                 z = qmm_or_linear(self.in_proj_z, inputs)

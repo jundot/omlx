@@ -185,7 +185,15 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     assert exc.value.request.requested_tokens == 2048
     assert exc.value.request.reason == "adaptive_prefill_throttle"
 
-    # The same request does not loop on eviction; it falls back to throttling.
+    # A second pause is allowed: the first pass can be satisfied by a
+    # marginal transient reclaim without ever reaching the durable rungs
+    # (ANE bank release), so recurring pressure earns one more shot at the
+    # ladder before the guard falls back to throttling for good.
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert request.prefill_eviction_retries == 2
+
+    # The third time the request does not loop on eviction; it throttles.
     result = _call(ns, 2048)
     assert result < 2048
 
@@ -365,6 +373,32 @@ def test_guard_raises_clean_error_when_even_floor_cannot_fit():
     assert "lower memory_guard_tier" not in str(exc.value)
     assert exc.value.estimated_bytes is not None
     assert exc.value.limit_bytes == int(hard * Scheduler._PREFILL_ABORT_MARGIN)
+
+
+def test_guard_rejection_logs_admission_terms_breakdown(caplog):
+    """The Phase 0.1 diagnostic line (docs/qwen35-hardening-and-optimization.md)
+    must break the admission bound down into its separate contributors on
+    every rejection, so a rejection is diagnosable from one log line without
+    re-deriving which term actually bound."""
+    hard = 42 * _GB
+    current = 41 * _GB
+    bpt = 27 * 1024 * 1024
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt, reclaim_to=current)
+    ns._fake_current = current
+
+    with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+        with pytest.raises(PrefillMemoryExceededError):
+            _guard_call(ns, 256, kv_len=122_000)
+
+    terms_records = [
+        r for r in caplog.records if "admission terms" in r.getMessage()
+    ]
+    assert len(terms_records) == 1
+    msg = terms_records[0].getMessage()
+    assert "current=" in msg
+    assert "predicted_transient=" in msg
+    assert "observed_max_bytes=" in msg
+    assert "ane_prefill_transient_bytes=0.00GB" in msg  # ns.memory_monitor is None
 
 
 def test_guard_requests_eviction_before_capacity_rejection():

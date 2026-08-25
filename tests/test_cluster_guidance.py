@@ -87,8 +87,18 @@ def test_guidance_serialises_for_the_dashboard():
         "doc_anchor",
         "command",
         "keygen_command",
+        "code",
     }
     assert isinstance(payload["steps"], list)
+
+
+def test_every_rule_carries_a_stable_code():
+    from omlx.cluster.guidance import _FALLBACK, _RULES
+
+    assert _FALLBACK.code == "unknown_failure"
+    codes = [guidance.code for _pattern, guidance in _RULES]
+    assert all(codes)
+    assert len(set(codes)) == len(codes)
 
 
 def test_first_seen_host_key_has_a_copyable_terminal_fallback():

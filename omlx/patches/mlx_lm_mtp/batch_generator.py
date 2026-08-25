@@ -192,17 +192,27 @@ def apply() -> bool:
                         active = getattr(self, "_omlx_mtp_state", None)
                         if active is not None:
                             _reconcile_mtp_to_standard(self, active)
+                            if active.reentry_probe:
+                                try:
+                                    delattr(self, "_omlx_mtp_park_state")
+                                except AttributeError:
+                                    pass
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
-            if getattr(self, "_omlx_mtp_tax_probe", None) is not None:
+            tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
+            park_state = _mtp_park_state_for_batch(self)
+            if tax_probe is not None or park_state is not None:
                 step_t0 = time.perf_counter()
                 result = original_next(self, *args, **kwargs)
-                _record_std_tax_sample(
-                    self, (time.perf_counter() - step_t0) * 1000.0
-                )
+                if tax_probe is not None:
+                    _record_std_tax_sample(
+                        self, (time.perf_counter() - step_t0) * 1000.0
+                    )
+                if park_state is not None:
+                    _record_parked_standard_step(self)
                 return result
             return original_next(self, *args, **kwargs)
 
@@ -218,6 +228,10 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
+                if host_state.reentry_probe:
+                    park_state = _mtp_park_state_for_batch(self)
+                    if park_state is not None:
+                        park_state.defer_probe()
                 _reconcile_mtp_to_standard(self, host_state)
                 _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
@@ -242,6 +256,7 @@ def apply() -> bool:
                 old_uids=old_uids,
                 log_empty=True,
             )
+            _mtp_park_state_for_batch(self)
             return result
 
         GenerationBatch.__init__ = patched_init
@@ -378,15 +393,20 @@ def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
 
 
 def _mtp_common_eligible(gen_batch: Any) -> bool:
-    parked_uid = getattr(gen_batch, "_omlx_mtp_parked_uid", None)
-    if parked_uid is not None and parked_uid in (getattr(gen_batch, "uids", None) or ()):
-        # This sequence already proved speculation loses to plain decoding
-        # (depth controller parked and handed off); do not re-activate it.
-        # Keyed by uid, not the batch object: GenerationBatch instances are
-        # reused across requests via extend() merges, and a bare flag would
-        # leak the park to whichever request joins the batch next. Once the
-        # parked uid leaves the batch the marker is stale and ignored.
-        return False
+    park_state = _mtp_park_state_for_batch(gen_batch)
+    if park_state is not None:
+        uids = getattr(gen_batch, "uids", None) or ()
+        active = getattr(gen_batch, "_omlx_mtp_state", None)
+        active_probe = bool(
+            active is not None
+            and getattr(active, "uid", None) == park_state.uid
+            and getattr(active, "reentry_probe", False)
+        )
+        # Performance parking is reversible, but re-entry is deliberately a
+        # singleton operation. Multi-row decode keeps using the standard path
+        # until the parked row is alone and its cache is activation-safe.
+        if len(uids) != 1 or (not active_probe and not park_state.probe_ready()):
+            return False
     if not hasattr(gen_batch, "model"):
         return False
     if not hasattr(gen_batch.model, "mtp_forward"):
@@ -732,6 +752,10 @@ class _MtpState:
     # drafts the next chain builds from rolling accept/latency estimates.
     controller: Optional[Any] = None
 
+    # True while this state is a bounded re-entry probe after a performance
+    # handoff. Correctness fallbacks and late-join handoffs do not set it.
+    reentry_probe: bool = False
+
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
 
@@ -741,6 +765,90 @@ class _MtpBatchState:
     """Experimental row-wise MTP state for a multi-sequence GenerationBatch."""
 
     states: Dict[Any, _MtpState] = field(default_factory=dict)
+
+
+# The existing depth controller decides whether a re-entry probe wins. This
+# policy state only schedules retries; it deliberately does not duplicate the
+# controller's acceptance and cycle-cost model.
+_MTP_REENTRY_INITIAL_COOLDOWN_TOKENS = 128
+_MTP_REENTRY_MAX_COOLDOWN_TOKENS = 4096
+
+
+@dataclass
+class _MtpParkState:
+    """Per-sequence policy state for reversible performance parking.
+
+    The MTP cache itself is dropped so the standard decoder regains its
+    pipelined fast path. This host-side record survives the handoff and admits
+    a later MTP probe. It is keyed by uid because GenerationBatch objects are
+    reused across requests.
+    """
+
+    uid: Any
+    cooldown_tokens: int = _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+    tokens_remaining: int = _MTP_REENTRY_INITIAL_COOLDOWN_TOKENS
+
+    def observe_standard(self) -> None:
+        self.tokens_remaining = max(0, self.tokens_remaining - 1)
+
+    def probe_ready(self) -> bool:
+        return self.tokens_remaining <= 0 and not _prefill_activity_recent()
+
+    def restart_after_failed_probe(self) -> None:
+        self.cooldown_tokens = min(
+            _MTP_REENTRY_MAX_COOLDOWN_TOKENS,
+            self.cooldown_tokens * 2,
+        )
+        self.tokens_remaining = self.cooldown_tokens
+
+    def defer_probe(self) -> None:
+        """Yield a probe for a batch-shape handoff without penalizing it."""
+        self.tokens_remaining = 0
+
+
+def _mtp_park_state_for_batch(gen_batch: Any) -> Optional[_MtpParkState]:
+    state = getattr(gen_batch, "_omlx_mtp_park_state", None)
+    if state is None:
+        return None
+    uids = getattr(gen_batch, "uids", None) or ()
+    if state.uid in uids:
+        return state
+    try:
+        delattr(gen_batch, "_omlx_mtp_park_state")
+    except AttributeError:
+        pass
+    return None
+
+
+def _record_parked_standard_step(gen_batch: Any) -> None:
+    state = _mtp_park_state_for_batch(gen_batch)
+    if state is not None:
+        state.observe_standard()
+
+
+def _maybe_finish_mtp_reentry_probe(
+    gen_batch: Any,
+    state: _MtpState,
+    *,
+    was_warmup: bool,
+) -> bool:
+    """Clear the cooldown once the existing controller measures a win."""
+    controller = state.controller
+    if (
+        not state.reentry_probe
+        or controller is None
+        or was_warmup
+        or controller._warmup
+        or controller.exit_streak != 0
+    ):
+        return False
+    try:
+        delattr(gen_batch, "_omlx_mtp_park_state")
+    except AttributeError:
+        pass
+    state.reentry_probe = False
+    logger.info("MTP[%s] re-entry probe succeeded", state.uid)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1093,12 +1201,24 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
     if state is not None:
         _drop_mtp_state(gen_batch, "stale-owner")
 
+    park_state = _mtp_park_state_for_batch(gen_batch)
     _set_singleton_mrope_delta(gen_batch)
     _post_init_mtp(gen_batch)
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
         _drop_mtp_state(gen_batch, "post-init-invalid")
         return None
+
+    # Eligibility already admitted this parked singleton. Mark the fresh
+    # state unconditionally so a prefill arriving between the two checks
+    # cannot strand the cooldown marker beside a normal MTP state.
+    if park_state is not None:
+        state.reentry_probe = True
+        logger.info(
+            "MTP[%s] re-entry probe started after %d standard tokens",
+            state.uid,
+            park_state.cooldown_tokens,
+        )
 
     logger.info(
         "MTP path activated for uid=%s (model has mtp_forward, batch=1, primed=%d)",
@@ -1800,8 +1920,8 @@ class _DepthController:
         # the baseline the exit decision compares against, is data-driven
         # within max_depth + 3 cycles. The baseline gets extra samples
         # because it may never be selected again (no refresh path), and
-        # the one-way exit decision must not hang on a single first-run
-        # sample; plain-step warmup cycles cost almost nothing.
+        # a performance handoff must not hang on a single first-run sample;
+        # plain-step warmup cycles cost almost nothing.
         self._warmup: List[int] = list(range(self.max_depth, 0, -1))
         if self.max_depth > 1:
             self._warmup.extend([0, 0, 0])
@@ -2597,15 +2717,25 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     unlike ``_reconcile_mtp_to_standard`` no re-prefill is needed: feed
     ``state.next_main`` (already streamed, not yet in the cache), sample its
     successor as ``_next_tokens``, and drop the MTP state. The batch is
-    marked so eligibility never re-activates MTP — the controller already
-    proved speculation loses here, and the standard step's async pipelining
-    is what the parked cycles cannot match.
+    marked for a cooldown so the standard step's async pipelining can run
+    without the MTP loop tax. A later singleton probe creates a fresh depth
+    controller; repeated failed probes exponentially extend the cooldown.
     """
     if not _feed_next_main_to_standard(gen_batch, state):
         return False
-    gen_batch._omlx_mtp_parked_uid = state.uid
+    park_state = _mtp_park_state_for_batch(gen_batch)
+    if state.reentry_probe and park_state is not None:
+        park_state.restart_after_failed_probe()
+    else:
+        park_state = _MtpParkState(uid=state.uid)
+        gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
         _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+    logger.info(
+        "MTP[%s] parked for %d standard tokens before re-entry probe",
+        state.uid,
+        park_state.cooldown_tokens,
+    )
     state._finish_reason = "parked"
     _drop_mtp_state(gen_batch, "parked-at-depth-0", log_stats=True)
     return True
@@ -2621,10 +2751,10 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     from the cache, so it becomes ``_next_tokens`` verbatim and its stored
     logprobs keep the standard step's emission byte-identical; with an
     empty queue the park-style 1-token forward re-derives the same state.
-    Unlike ``_park_mtp_to_standard`` this sets no parked uid and arms no
-    std-tax probe: the sequence is yielding to a batch merge, not losing to
-    standard decode, and must regain MTP once it is a compact singleton
-    again.
+    Unlike ``_park_mtp_to_standard`` this starts no performance cooldown and
+    arms no std-tax probe: the sequence is yielding to a batch merge, not
+    losing to standard decode, and must regain MTP once it is a compact
+    singleton again.
     """
     import mlx.core as mx
 
@@ -2637,6 +2767,10 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
         _clear_rollback(gen_batch.prompt_cache)
     elif not _feed_next_main_to_standard(gen_batch, state):
         return False
+    if state.reentry_probe:
+        park_state = _mtp_park_state_for_batch(gen_batch)
+        if park_state is not None:
+            park_state.defer_probe()
     state._finish_reason = "late-join-handoff"
     _drop_mtp_state(gen_batch, "late-join-handoff", log_stats=True)
     return True
@@ -2976,6 +3110,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     if materialize_boundary_emit:
         _materialize_mtp_boundary_emit(gen_batch, state)
     if state.controller is not None:
+        was_warmup = bool(state.controller._warmup)
         keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
         if keepalive:
             state.mtp_cache.fold_keepalive = False
@@ -2984,6 +3119,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             m,
             (time.perf_counter() - cycle_t0) * 1000,
             time_sample=not keepalive,
+        )
+        _maybe_finish_mtp_reentry_probe(
+            gen_batch,
+            state,
+            was_warmup=was_warmup,
         )
 
 

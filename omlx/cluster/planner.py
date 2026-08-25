@@ -8,6 +8,7 @@ import json
 import re
 import struct
 import subprocess
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -629,6 +630,47 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
                 _config_int(config, "n_groups", 1),
             )
         )
+        # Quantized row-parallel projections split with the even
+        # ``shard_inplace`` path (attention/Mamba ``out_proj`` and the
+        # shared-expert ``down_proj``) require a quant-group count divisible by
+        # the TP degree, or the split raises mid-load. Contribute those counts
+        # so a degree the head counts would allow but the quantization forbids
+        # is refused up front. The routed-expert ``fc1``/``fc2`` are excluded on
+        # purpose: they use the custom uneven split in ``tensor_strategies`` and
+        # only need ``group_count >= degree`` (see D1b in the cluster plan).
+        quant = config.get("quantization")
+        if isinstance(quant, dict):
+            # oQ mixed-precision checkpoints add per-module override dicts
+            # inside ``quantization`` (see _patch_mlx_lm_load_config). The
+            # top-level group_size alone under-constrains those: a down_proj
+            # overridden to a coarser group can have a prime group count the
+            # top-level size hides, approving a degree that then raises
+            # mid-load. Constrain against every group size present; a size
+            # that does not divide a projection cannot have quantized it.
+            group_sizes = {_config_int(quant, "group_size", 0)}
+            for override in quant.values():
+                if isinstance(override, dict):
+                    group_sizes.add(_config_int(override, "group_size", 0))
+            group_sizes.discard(0)
+            if group_sizes:
+                head_dim = _config_int(config, "head_dim", 0) or (
+                    _config_int(config, "hidden_size", 0, maximum=1_000_000)
+                    // max(_config_int(config, "num_attention_heads", 1), 1)
+                )
+                attn_dim = _config_int(config, "num_attention_heads", 0) * head_dim
+                mamba_dim = _config_int(
+                    config, "mamba_num_heads", 0
+                ) * _config_int(config, "mamba_head_dim", 0)
+                shared_dim = _config_int(
+                    config,
+                    "moe_shared_expert_intermediate_size",
+                    0,
+                    maximum=1_000_000,
+                )
+                for dim in (attn_dim, mamba_dim, shared_dim):
+                    for group_size in group_sizes:
+                        if dim > 0 and dim % group_size == 0:
+                            values.append(dim // group_size)
     return tuple(dict.fromkeys(values))
 
 
@@ -683,6 +725,26 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
 
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
+        return False
+    # An architecture oMLX explicitly vouches for wins, even a VLM: the
+    # minimax_m3_vl patch ships its own ``pipeline()`` and sets
+    # ``SUPPORTS_PIPELINE = True``. Honour that before the vision guard below.
+    import sys
+
+    declared = getattr(
+        sys.modules.get(f"mlx_lm.models.{model_type}"), "SUPPORTS_PIPELINE", None
+    )
+    if declared is not None:
+        return bool(declared)
+    # A checkpoint carrying a vision sub-config is served by mlx-vlm, whose
+    # loaded wrapper never exposes ``model.model.pipeline`` — the exact
+    # attribute progressive_loading gates on. Its text backbone's source-level
+    # ``pipeline()`` belongs to the mlx-lm implementation this model does not
+    # use, so trusting it (as ``_declares_pipeline`` does) is the false positive
+    # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
+    from omlx.model_discovery import _has_vision_subconfig
+
+    if _has_vision_subconfig(config):
         return False
     return _declares_pipeline(model_type)
 
@@ -993,6 +1055,15 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     )
 
 
+# Directory mtime + config mtime + per-shard (name, mtime, size). The shard
+# stats matter: an in-place shard overwrite changes neither the directory's
+# mtime (no entry added or removed) nor config.json's, and a stale layout
+# would silently mis-size every plan built from it.
+_LayoutFingerprint = tuple[float, float, tuple[tuple[str, float, int], ...]]
+_LAYOUT_CACHE: dict[str, tuple[_LayoutFingerprint, ModelLayout]] = {}
+_LAYOUT_CACHE_LOCK = threading.Lock()
+
+
 def complete_model_layout(model_path: str | Path) -> ModelLayout:
     """Layout of a model this node holds in full, refusing one it holds part of.
 
@@ -1002,6 +1073,13 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     nothing in them says the other 22 exist on another Mac. Planning from that
     number splits a model that does not exist, so a layout is measured against
     the depth declared in config.json — a sidecar every node is staged.
+
+    The planner recomputes this for every discovered model on every
+    autoconfigure tick (the admin dashboard's cluster tab polls every ~10s
+    while open), so opening and re-parsing every safetensors shard's header
+    each call put real, sustained disk I/O and CPU load on a node that may be
+    mid-inference. Layouts are cached per resolved path and only recomputed
+    when the model directory or its config.json actually changed.
     """
 
     root = Path(model_path).expanduser()
@@ -1013,7 +1091,34 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     maybe_apply_pre_load_patches(str(root))
-    layout = inspect_safetensors_layout(root)
+
+    resolved = str(root.resolve())
+    try:
+        shard_stats = []
+        for shard_path in sorted(root.glob("*.safetensors")):
+            stat = shard_path.stat()
+            shard_stats.append((shard_path.name, stat.st_mtime, stat.st_size))
+        fingerprint: _LayoutFingerprint | None = (
+            root.stat().st_mtime,
+            (root / "config.json").stat().st_mtime,
+            tuple(shard_stats),
+        )
+    except OSError:
+        fingerprint = None
+
+    layout: ModelLayout | None = None
+    if fingerprint is not None:
+        with _LAYOUT_CACHE_LOCK:
+            cached = _LAYOUT_CACHE.get(resolved)
+        if cached is not None and cached[0] == fingerprint:
+            layout = cached[1]
+
+    if layout is None:
+        layout = inspect_safetensors_layout(root)
+        if fingerprint is not None:
+            with _LAYOUT_CACHE_LOCK:
+                _LAYOUT_CACHE[resolved] = (fingerprint, layout)
+
     declared = _config_int(_model_config(root), "num_hidden_layers", 0)
     # Multi-token-prediction and draft heads add layers past the declared
     # depth, so only a shortfall means missing weights.

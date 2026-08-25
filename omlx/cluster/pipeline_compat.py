@@ -182,10 +182,26 @@ def _install_nemotron_h_pipeline(
         pipeline_model: Any,
         inputs: Any,
         cache: Any | None = None,
+        n_confirmed: int = 0,
     ) -> Any:
+        # The base MTP patch threads ``n_confirmed`` through every model
+        # ``__call__``. MTP is inactive on the distributed path — the worker
+        # always drives this with ``n_confirmed == 0`` — so accept the kwarg
+        # but refuse a non-zero value loudly: silently ignoring it would
+        # return wrong tokens for a caller that assumed MTP semantics.
+        if n_confirmed:
+            raise ValueError(
+                "n_confirmed is an MTP contract; MTP is not supported on the "
+                "distributed nemotron_h path"
+            )
         hidden_states = pipeline_model.embeddings(inputs)
-        pipeline_rank = pipeline_model.pipeline_rank
-        pipeline_size = pipeline_model.pipeline_size
+        # ``pipeline()`` sets these for the pipeline-parallel path. On the
+        # pure tensor-parallel path mlx-lm never calls ``pipeline()`` (each
+        # rank holds every layer, tensor-sharded), so default to a single
+        # stage: send/recv/all_gather below then correctly no-op and this
+        # becomes the ordinary full-stack forward.
+        pipeline_rank = getattr(pipeline_model, "pipeline_rank", 0)
+        pipeline_size = getattr(pipeline_model, "pipeline_size", 1)
         layers = pipeline_model.pipeline_layers
 
         if cache is None:
@@ -193,14 +209,21 @@ def _install_nemotron_h_pipeline(
                 layer.block_type in {"M", "*"} for layer in layers
             )
 
+        # The first attention / SSM cache slots. ``NemotronHModel.__init__``
+        # always sets both, and ``pipeline()`` re-publishes them for its stage
+        # subset, so a plain read is valid on both paths — a model without
+        # them should fail loudly here, not get silently recomputed indices.
+        fa_idx = pipeline_model.fa_idx
+        ssm_idx = pipeline_model.ssm_idx
+
         attention_mask = (
-            create_attention_mask(hidden_states, cache[pipeline_model.fa_idx])
-            if pipeline_model.fa_idx is not None
+            create_attention_mask(hidden_states, cache[fa_idx])
+            if fa_idx is not None
             else None
         )
         ssm_mask = (
-            create_ssm_mask(hidden_states, cache[pipeline_model.ssm_idx])
-            if pipeline_model.ssm_idx is not None
+            create_ssm_mask(hidden_states, cache[ssm_idx])
+            if ssm_idx is not None
             else None
         )
 

@@ -3171,6 +3171,194 @@ class TestSchedulerRotatingBlockAlignment:
         assert scheduler._deferred_clear_at > first_target
 
 
+class TestSchedulerArraysCacheBlockAlignment:
+    """ArraysCache boundaries must match the effective prefill chunk."""
+
+    @staticmethod
+    def _hybrid_model(model_type="qwen3_5"):
+        class ArraysCache:
+            def __init__(self):
+                self.state = [mx.zeros((1,))]
+
+            def size(self):
+                return 0
+
+        class HybridModel:
+            def __init__(self):
+                self.config = SimpleNamespace(
+                    model_type=model_type,
+                    num_hidden_layers=1,
+                )
+                self.model_type = model_type
+                self.prefill_calls = []
+
+            def make_cache(self):
+                return [ArraysCache()]
+
+            def __call__(self, tokens, cache=None, **kwargs):
+                self.prefill_calls.append(int(tokens.shape[1]))
+                return mx.zeros((1, tokens.shape[1], 1))
+
+        return HybridModel()
+
+    def test_qwen35_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
+            assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+    def test_qwen35_nax_host_keeps_2048_block(self, mock_tokenizer, tmp_path):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 2048
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_qwen35_small_host_keeps_2048_block(self, mock_tokenizer, tmp_path):
+        with patch("omlx.settings.get_system_memory", return_value=32 * 1024**3):
+            scheduler = Scheduler(
+                model=self._hybrid_model(),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_non_qwen_arrays_cache_keeps_2048_block(
+        self, mock_tokenizer, tmp_path
+    ):
+        with patch("omlx.settings.get_system_memory", return_value=64 * 1024**3):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="other_hybrid"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_custom_prefill_step_raises_arrays_block(self, mock_tokenizer, tmp_path):
+        scheduler = Scheduler(
+            model=self._hybrid_model(model_type="other_hybrid"),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4096,
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=256,
+            ),
+        )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+    def test_explicit_larger_block_is_preserved(self, mock_tokenizer, tmp_path):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=8192,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler.config.paged_cache_block_size == 8192
+        finally:
+            scheduler.shutdown()
+
+    def test_qwen35_cache_boundary_does_not_split_4096_prefill(
+        self, mock_tokenizer, tmp_path
+    ):
+        model = self._hybrid_model()
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        request = Request(
+            request_id="qwen-wide-prefill",
+            prompt=list(range(4097)),
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(4097))
+        request.num_prompt_tokens = 4097
+        request.benchmark_trace = True
+
+        try:
+            with patch.object(scheduler, "_emit_prefill_boundary_snapshot"):
+                scheduler._do_external_prefill(
+                    request,
+                    request.prompt_token_ids,
+                    model.make_cache(),
+                )
+
+            assert model.prefill_calls == [4096]
+            assert request.benchmark_prefill_chunks == [4096]
+            assert request.benchmark_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+
 class TestPeriodicClearGating:
     """Tests for the conditional periodic clear (#978/#1040 mitigation)."""
 

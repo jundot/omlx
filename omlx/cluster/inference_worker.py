@@ -1329,6 +1329,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # One shared argv launches every rank, so --model must be portable across
+    # Macs with different $HOME. Expand ~ in this rank's own home; a coordinator
+    # absolute path is left unchanged.
+    args.model = str(Path(args.model).expanduser())
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
     for name in (

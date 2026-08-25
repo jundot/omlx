@@ -41,15 +41,16 @@ class InputItem(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _serialize_complex_output(cls, data: Any) -> Any:
-        """Serialize list/dict output to JSON string for compatibility.
+        """Serialize dict output to JSON string for compatibility.
 
-        Agent frameworks may send multimodal tool outputs (e.g. images) as
-        lists or dicts. Convert them to JSON strings so downstream code that
-        expects ``str`` keeps working.
+        Agent frameworks may send dict tool outputs. Convert them to JSON
+        strings so downstream code that expects ``str`` keeps working. List
+        outputs pass through unchanged so multimodal parts (e.g. images)
+        stay extractable for VLM processing during message conversion.
         """
         if isinstance(data, dict):
             output = data.get("output")
-            if isinstance(output, (list, dict)):
+            if isinstance(output, dict):
                 data = {**data, "output": json.dumps(output)}
         return data
 
@@ -223,3 +224,4 @@ class ResponseObject(BaseModel):
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict)
     truncation: Optional[str] = None
     error: Optional[Dict[str, Any]] = None
+    incomplete_details: Optional[Dict[str, str]] = None

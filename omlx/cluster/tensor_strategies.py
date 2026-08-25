@@ -253,6 +253,81 @@ def _wrap_sharded_moe(inner: Any, group: Any, mx: Any) -> Any:
     return ShardedMoE(inner)
 
 
+def _uneven_group_ranges(total_groups: int, size: int) -> list[tuple[int, int]]:
+    """Contiguous per-rank ``[lo, hi)`` group ranges covering ``total_groups``.
+
+    When ``total_groups`` is not divisible by ``size`` the first
+    ``total_groups % size`` ranks receive one extra group. Low ranks get the
+    slightly larger shard on purpose: rank 0 is the coordinator, usually the
+    higher-memory node, so it absorbs the few-percent skew.
+    """
+
+    base, rem = divmod(total_groups, size)
+    ranges: list[tuple[int, int]] = []
+    lo = 0
+    for r in range(size):
+        hi = lo + base + (1 if r < rem else 0)
+        ranges.append((lo, hi))
+        lo = hi
+    return ranges
+
+
+def _shard_switch_mlp_uneven(
+    switch_mlp: Any, group: Any, mx: Any, rank: int, size: int
+) -> None:
+    """Group-aligned (possibly uneven) tensor-parallel split of a quantized MoE.
+
+    ``fc1`` is column-parallel — each rank owns a contiguous block of
+    intermediate neurons — and ``fc2`` is row-parallel over that same block.
+    ``fc2``'s intermediate axis is the quantization-group axis, so the split
+    must land on group boundaries. When the group count is not divisible by the
+    world size (Nemotron-H's MoE has 29 groups; world size 2 wants 14.5) the
+    even ``mx.split`` inside ``shard_inplace`` raises. We slice explicit,
+    possibly unequal, group ranges instead. The recombining ``all_sum`` in
+    :func:`_wrap_sharded_moe` is shape-agnostic, so unequal per-rank widths sum
+    back to the full result exactly (verified to fp noise on mlx 0.31.x).
+    """
+
+    from mlx.nn.layers.distributed import shard_inplace
+
+    fc1 = switch_mlp.fc1
+    fc2 = switch_mlp.fc2
+
+    # Non-quantized experts have no group constraint; the stock even split is
+    # correct and simpler.
+    if not hasattr(fc2, "scales"):
+        shard_inplace(fc1, "all-to-sharded", group=group)
+        shard_inplace(fc2, "sharded-to-all", group=group)
+        return
+
+    # One scales column per quant group along fc2's intermediate (contraction)
+    # axis. This is the axis that must divide the world size and, at TP=2 for
+    # Nemotron-H, does not (29 is prime).
+    groups = int(fc2.scales.shape[-1])
+    lo, hi = _uneven_group_ranges(groups, size)[rank]
+
+    # fc1: column-parallel. Its output rows *are* the intermediate neurons, so
+    # slicing the same group block keeps fc1's output aligned with fc2's input.
+    # Output is axis 1 of the 3D (experts, out, in) expert tensors.
+    neurons_per_group = int(fc1.weight.shape[1]) // groups
+    nlo, nhi = lo * neurons_per_group, hi * neurons_per_group
+    fc1.weight = mx.contiguous(fc1.weight[:, nlo:nhi, :])
+    if hasattr(fc1, "scales"):
+        fc1.scales = mx.contiguous(fc1.scales[:, nlo:nhi, :])
+    if getattr(fc1, "biases", None) is not None:
+        fc1.biases = mx.contiguous(fc1.biases[:, nlo:nhi, :])
+
+    # fc2: row-parallel over the packed intermediate axis. Packed columns per
+    # group = packed width / group count (8 for 4-bit: 32/4 values per uint32);
+    # scales/biases carry exactly one column per group.
+    packed_per_group = int(fc2.weight.shape[-1]) // groups
+    plo, phi = lo * packed_per_group, hi * packed_per_group
+    fc2.weight = mx.contiguous(fc2.weight[..., plo:phi])
+    fc2.scales = mx.contiguous(fc2.scales[..., lo:hi])
+    if getattr(fc2, "biases", None) is not None:
+        fc2.biases = mx.contiguous(fc2.biases[..., lo:hi])
+
+
 @_register(QWEN3_NEXT)
 def _shard_qwen3_next(
     model: Any,
@@ -469,6 +544,20 @@ def _shard_nemotron_h(
                 ]
             )
             mixer.in_proj.weight = mx.contiguous(mixer.in_proj.weight[indices])
+            # ``in_proj`` is frequently quantized (per-tensor override in the
+            # checkpoint's quantization dict). Its scales/biases carry one row
+            # per weight row, so they must be gathered with the *same* row
+            # ``indices`` — otherwise the sharded module keeps full-height
+            # scales against a half-height weight and the first Mamba forward
+            # fails a shape check. Row slicing is group-safe because quant
+            # groups run along the input (column) axis, untouched here.
+            if hasattr(mixer.in_proj, "scales"):
+                mixer.in_proj.scales = mx.contiguous(mixer.in_proj.scales[indices])
+            if getattr(mixer.in_proj, "biases", None) is not None:
+                mixer.in_proj.biases = mx.contiguous(mixer.in_proj.biases[indices])
+            # The affine layer bias (mamba_proj_bias) is per output row too.
+            if getattr(mixer.in_proj, "bias", None) is not None:
+                mixer.in_proj.bias = mx.contiguous(mixer.in_proj.bias[indices])
             mixer.out_proj = shard_linear(
                 mixer.out_proj, "sharded-to-all", group=group
             )
@@ -505,8 +594,9 @@ def _shard_nemotron_h(
             mixer.conv_dim = intermediate + 2 * bc
             mixer.heads_per_group = heads // groups
         elif isinstance(mixer, NemotronHMoE):
-            shard_inplace(mixer.switch_mlp.fc1, "all-to-sharded", group=group)
-            shard_inplace(mixer.switch_mlp.fc2, "sharded-to-all", group=group)
+            # Routed experts: group-aligned split that tolerates a quant-group
+            # count not divisible by the world size (Nemotron-H has 29).
+            _shard_switch_mlp_uneven(mixer.switch_mlp, group, mx, rank, size)
             if hasattr(mixer, "shared_experts"):
                 shard_inplace(
                     mixer.shared_experts.up_proj,

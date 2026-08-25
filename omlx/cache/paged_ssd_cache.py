@@ -29,7 +29,6 @@ import struct
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,15 +70,27 @@ _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
 
 # Conservative defaults for the per-block cost estimator. The actual
-# bytes-per-block depends on the model (num_layers × num_kv_heads ×
+# bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
 # head_dim × dtype_size × block_size_tokens × 2). At construction time
 # the PagedSSDCacheManager doesn't always know these — see __init__'s
 # ``expected_kv_bytes_per_token`` parameter — so the module-level
-# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB
-# spread across all layers. Smaller models will be over-conservative
-# (fine), larger models or larger blocks should pass an explicit value.
+# default targets a 35B-class bf16 model whose per-token KV is ≈200 KB.
+# Smaller models will be over-conservative (fine), while larger models or
+# larger blocks should pass an explicit value.
 _DEFAULT_BLOCK_SIZE_TOKENS = 256
 _DEFAULT_KV_BYTES_PER_TOKEN = 200_000
+
+
+def _normalize_kv_bytes_per_token(value: int) -> int:
+    """Return a safe positive estimate for writer-queue sizing.
+
+    A model with only fixed-state or rotating caches can legitimately report
+    zero *per-token* KV bytes.  Zero is not a useful queue-sizing input,
+    though: it would make every block appear to cost one byte and pin the
+    pending-write cap at its 256-entry ceiling.  Use the conservative manager
+    default for that case so the queue remains bounded by a realistic budget.
+    """
+    return value if value > 0 else _DEFAULT_KV_BYTES_PER_TOKEN
 
 
 def _compute_max_pending_writes(
@@ -118,10 +129,12 @@ def _compute_max_pending_writes(
 
     Defaults target a 35B-class bf16 model at the default
     ``paged_cache_block_size=256``; pass an explicit
-    ``kv_bytes_per_token`` for larger models or quantized configs.
+    ``kv_bytes_per_token`` for larger models or quantized configs. A
+    non-positive estimate uses the conservative default as well.
     """
     try:
         total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        kv_bytes_per_token = _normalize_kv_bytes_per_token(kv_bytes_per_token)
         block_bytes = max(1, block_size_tokens * kv_bytes_per_token)
         target = int(total_bytes * target_fraction / block_bytes)
         hard_cap = max(1, int(total_bytes * hard_fraction / block_bytes))
@@ -837,6 +850,29 @@ def _restore_tensor_from_bytes(
     return arr.reshape(shape)
 
 
+def _fsync_parent_dir(path: str | Path) -> None:
+    """Fsync the containing directory after a rename/replace into it.
+
+    POSIX doesn't guarantee a rename survives a crash until the directory
+    entry itself is flushed -- the renamed file can revert to its prior
+    name (or the new name can point at nothing) even though the rename
+    call returned success. Cheap relative to the write itself (one flush
+    of already-cached directory metadata, no data to flush), so applied
+    at every writer that promotes a temp file into place.
+    """
+    dir_path = os.path.dirname(str(path)) or "."
+    try:
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -887,6 +923,15 @@ def _write_safetensors_no_mx(
         f.write(header_json)
         for d in all_data:
             f.write(d)
+        # Durable before any caller renames this file into place (all four
+        # call sites across paged_ssd_cache.py and boundary_snapshot_store.py
+        # write to a *_tmp.safetensors path and rename/replace it into the
+        # final name right after this returns). Without this, a crash or
+        # power loss between close() and the rename can leave the temp file's
+        # data only in the OS page cache -- the rename still lands, but the
+        # file it points at can read back as truncated/zero-filled garbage.
+        f.flush()
+        os.fsync(f.fileno())
 
     return 8 + len(header_json) + offset
 
@@ -1545,6 +1590,7 @@ class PagedSSDCacheManager(CacheManager):
         max_size_bytes: int,
         hot_cache_max_bytes: int = 0,
         hot_cache_only: bool = False,
+        hot_cache_write_through: bool = False,
         hot_cache_budget: SharedHotCacheBudget | None = None,
         expected_model_name: str = "",
         expected_num_layers: int = 0,
@@ -1566,6 +1612,11 @@ class PagedSSDCacheManager(CacheManager):
             hot_cache_only: When True, skip directory init and writer thread.
                 All data is stored exclusively in the hot cache (RAM only).
                 No SSD I/O is performed.
+            hot_cache_write_through: When True (and hot cache is enabled, not
+                hot_cache_only), every saved block is retained in the hot cache
+                AND enqueued for immediate SSD persistence. Combines RAM-speed
+                resume for recent sessions with SSD durability for all
+                sessions, at the cost of one background write per block.
             hot_cache_budget: Optional process-wide hot cache budget shared
                 by all loaded model cache managers.
             expected_model_name: Current model name. Blocks saved for a
@@ -1587,11 +1638,13 @@ class PagedSSDCacheManager(CacheManager):
                 don't pin gigabytes at saturation; passing a smaller value lets
                 the cap grow to give workloads with many tiny blocks enough
                 burst headroom.
-            expected_kv_bytes_per_token: Per-token KV byte estimate (all
-                layers, K + V, dtype). Together with ``expected_block_size_tokens``
-                this drives the bytes-aware queue cap. Defaults to a
-                35B-class bf16 estimate; pass an explicit value for
-                quantized models or unusually wide/narrow architectures.
+            expected_kv_bytes_per_token: Per-token KV byte estimate (KV-cache
+                layers, K + V, dtype). Together with
+                ``expected_block_size_tokens`` this drives the bytes-aware
+                queue cap. Defaults to a 35B-class bf16 estimate; non-positive
+                values use that same conservative default. Pass an explicit
+                value for quantized models or unusually wide/narrow
+                architectures.
             expected_layer_cache_types: Optional current cache layout. When
                 provided, blocks with a different per-layer type list are
                 skipped at startup.
@@ -1683,6 +1736,7 @@ class PagedSSDCacheManager(CacheManager):
             else hot_cache_max_bytes
         )
         self._hot_cache_enabled = self._hot_cache_max_bytes > 0
+        self._hot_cache_write_through = bool(hot_cache_write_through)
         self._hot_cache: OrderedDict[bytes, dict] = OrderedDict()
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
@@ -1699,15 +1753,17 @@ class PagedSSDCacheManager(CacheManager):
         # cap appropriately. Falls back to the module-level constant
         # when no override is supplied.
         #
-        # Stash the inputs the constructor was called with so callers
-        # (and the plumbing-regression test) can verify what reached
-        # the manager without depending on the cap math landing in a
-        # particular floor/ceiling band on the test host.
+        # Stash the effective inputs so callers (and the plumbing-regression
+        # tests) can verify what reached the manager without depending on the
+        # cap math landing in a particular floor/ceiling band on the test
+        # host.
         self._expected_block_size_tokens = expected_block_size_tokens
-        self._expected_kv_bytes_per_token = expected_kv_bytes_per_token
+        self._expected_kv_bytes_per_token = _normalize_kv_bytes_per_token(
+            expected_kv_bytes_per_token
+        )
         self._max_pending_writes = _compute_max_pending_writes(
             block_size_tokens=expected_block_size_tokens,
-            kv_bytes_per_token=expected_kv_bytes_per_token,
+            kv_bytes_per_token=self._expected_kv_bytes_per_token,
         )
         self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
         # Track which block hashes are queued for background write
@@ -2363,6 +2419,7 @@ class PagedSSDCacheManager(CacheManager):
                     # is restored below and its file remains intact.
                     self._enforce_size_limit_for_new_block(staged_stat.st_size)
                     os.replace(staged_path, final_path)
+                    _fsync_parent_dir(final_path)
                     committed_at = time.time()
                     # os.replace preserves the staging file's timestamps. Stamp
                     # the actual commit/access time so a restart reconstructs LRU
@@ -2938,6 +2995,7 @@ class PagedSSDCacheManager(CacheManager):
             )
 
             os.rename(str(temp_path), str(file_path))
+            _fsync_parent_dir(file_path)
 
             # The block is now durable on disk; bump the persist counter
             # before any cleanup so ``saves_persisted`` reflects rename
@@ -3420,6 +3478,13 @@ class PagedSSDCacheManager(CacheManager):
                 # SSD index entry is created later when block is evicted or
                 # flushed to SSD (in _enqueue_ssd_write).
                 self._hot_cache_put(block_hash, cache_entry)
+                if self._hot_cache_write_through and not self._hot_cache_only:
+                    # Write-through mode: also persist to SSD immediately so a
+                    # crash or force-quit loses nothing. The block stays in the
+                    # hot cache for RAM-speed reads; the background writer
+                    # marks the retained entry clean once the file commits, so
+                    # a later LRU eviction can simply drop it.
+                    self._enqueue_ssd_write(block_hash, cache_entry)
                 self._stats["saves"] += 1
                 return True
 
@@ -4127,11 +4192,8 @@ class PagedSSDCacheManager(CacheManager):
         if len(to_load) < 4:
             return 0
 
-        # Cap workers to limit peak memory (each load allocates ~122-275MB).
-        # 8 workers ≈ 1.4GB peak, vs 2.8GB at 16. CPD-accepted (G1/Q3).
         start = time.perf_counter()
         loaded_count = 0
-        max_workers = min(8, len(to_load))
 
         def _load_one(block_hash: bytes, metadata: PagedSSDBlockMetadata) -> bool:
             file_path = metadata.file_path
@@ -4152,14 +4214,16 @@ class PagedSSDCacheManager(CacheManager):
                 logger.warning(f"Preload failed for block {block_hash.hex()[:16]}: {e}")
                 return False
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_load_one, bh, meta): bh for bh, meta in to_load}
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        loaded_count += 1
-                except Exception:
-                    pass
+        # Serialized, matching load_block's discipline (see the comment at
+        # the top of this file's single-block load path, ~3773-3778): a
+        # ThreadPoolExecutor running mx.load() in worker threads previously
+        # caused deadlocks when it contested Metal GPU resources with the
+        # calling thread's own inference work (MLX #978 #1040 #1106 #1437
+        # #1558). preload_matched_blocks runs inline on that same calling
+        # thread, so it is exposed to exactly that contention.
+        for block_hash, metadata in to_load:
+            if _load_one(block_hash, metadata):
+                loaded_count += 1
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._stats["preload_calls"] += 1
@@ -4169,7 +4233,7 @@ class PagedSSDCacheManager(CacheManager):
         if loaded_count > 0:
             logger.info(
                 f"Preloaded {loaded_count}/{len(to_load)} blocks into hot cache "
-                f"(workers={max_workers}, time={elapsed_ms:.1f}ms)"
+                f"(time={elapsed_ms:.1f}ms)"
             )
         return loaded_count
 
@@ -4634,18 +4698,41 @@ class PagedSSDCacheManager(CacheManager):
     def clear_hot_cache(self) -> int:
         """Clear all in-memory (hot) cache entries.
 
+        Dirty entries (never persisted to SSD) are flushed through the
+        background writer before being dropped, so clearing the hot cache
+        frees memory without losing blocks that exist nowhere else.
+
         Returns:
             Number of entries cleared.
         """
         with self._hot_cache_lock:
-            count = len(self._hot_cache)
+            entries = list(self._hot_cache.items())
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
         if self._hot_cache_budget is not None:
             self._hot_cache_budget.forget_owner(self)
-        if count:
-            logger.info("Cleared %d hot cache entries", count)
-        return count
+        flushed = 0
+        for i, (block_hash, entry) in enumerate(entries):
+            if self._writer_thread and not self._writer_thread.is_alive():
+                # A dead writer never drains the queue, so enqueued entries
+                # would stay pinned in the pending-write buffers forever.
+                # Drop the rest instead, which is the pre-flush behavior.
+                logger.warning(
+                    "Writer thread dead during hot cache clear, dropping "
+                    f"{len(entries) - i} remaining entries unflushed"
+                )
+                break
+            if entry.get("dirty", True) and self._enqueue_ssd_write(
+                block_hash, entry
+            ):
+                flushed += 1
+        if entries:
+            logger.info(
+                "Cleared %d hot cache entries (%d flushed to SSD first)",
+                len(entries),
+                flushed,
+            )
+        return len(entries)
 
     def shrink_hot_cache_to(
         self,

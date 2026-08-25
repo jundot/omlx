@@ -8,6 +8,7 @@ flags, and metadata.
 import copy
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -113,14 +114,30 @@ class ModelSettings:
             ANE/GPU prompt processing.
         qwen35_ane_prefill_sequence_length: Exact flattened token count routed
             through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
+            projection block padded to the compiled ANE shape (zero disables).
         qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
             across the ANE instances.
+        qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
+            into each dual-ANE/CPU hidden-channel branch.
         qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
         qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
         qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
         qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
             outputs assigned across the ANE instances.
         qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
+            with the CPU. Requires a separately preprocessed FP16 checkpoint.
+        qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
+            projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
+            down projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
+            z+qkv projection outputs assigned to the CPU after the ANE prefix.
+        qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
+            (zero lets Accelerate choose).
+        qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
+            shared-resource scheduling attributes for manually sharded CPU work.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -137,10 +154,12 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+        dflash_draft_window_size: Draft model sliding-attention window
+            (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (None = dflash default 64).
+            (default 0, disabling sink tokens).
+        dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
@@ -216,12 +235,20 @@ class ModelSettings:
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False
     qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
     qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_fused_down: bool = False
     qwen35_ane_prefill_max_layers: int = 64
     qwen35_ane_prefill_dual_ane: bool = True
     qwen35_ane_prefill_gdn: bool = True
     qwen35_ane_prefill_gdn_fraction: float = 0.50
     qwen35_ane_prefill_gdn_max_layers: int = 48
+    qwen35_ane_prefill_cpu_enabled: bool = False
+    qwen35_ane_prefill_cpu_fraction: float = 0.135
+    qwen35_ane_prefill_cpu_down_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_threads: int = 8
+    qwen35_ane_prefill_cpu_shared_resource: bool = True
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -254,11 +281,11 @@ class ModelSettings:
         False  # Requires in-memory cache and an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
-    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
-    # agentic workloads where acceptance drops on the default sliding window.
+    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
+    # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = 0
+    dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
@@ -481,17 +508,24 @@ class ModelSettingsManager:
             },
         }
 
+        # Write to temp file first, then rename for atomicity. The pid in
+        # the temp name keeps concurrent processes from sharing a temp path
+        # and renaming each other's partial writes into place.
+        temp_file = self.settings_file.with_name(
+            f"{self.settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def get_settings(self, model_id: str) -> ModelSettings:
@@ -689,15 +723,18 @@ class ModelSettingsManager:
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
-        temp_file = self.profiles_file.with_suffix(".tmp")
+        temp_file = self.profiles_file.with_name(
+            f"{self.profiles_file.name}.{os.getpid()}.tmp"
+        )
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.profiles_file)
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+            temp_file.unlink(missing_ok=True)
             raise
 
     @staticmethod
@@ -1203,13 +1240,18 @@ class ModelSettingsManager:
     def _save_templates(self) -> None:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
+        temp_file = self.templates_file.with_name(
+            f"{self.templates_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            temp_file = self.templates_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.templates_file)
         except Exception as e:
             logger.error(f"Failed to save templates file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def list_templates(self) -> list[dict]:
