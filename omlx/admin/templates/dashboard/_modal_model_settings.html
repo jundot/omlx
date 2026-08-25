@@ -13,6 +13,9 @@
         <!-- Modal -->
         <div class="flex min-h-full items-center justify-center p-4">
             <div class="relative bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-4xl p-4 sm:p-8"
+                 role="dialog" aria-modal="true" aria-labelledby="model-settings-modal-title" tabindex="-1"
+                 x-effect="showModelSettingsModal && $nextTick(() => $el.focus())"
+                 @keydown.tab="window.trapModalFocus($event)"
                  @click.stop
                  x-transition:enter="transition ease-out duration-200"
                  x-transition:enter-start="opacity-0 scale-95"
@@ -25,7 +28,7 @@
                 <div class="flex items-center justify-between mb-6">
                     <div>
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
-                        <h4 class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
+                        <h4 id="model-settings-modal-title" class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
                     </div>
                     <button @click="showModelSettingsModal = false"
                             class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
@@ -64,7 +67,7 @@
                             <button type="button" x-show="profileScope === 'preset'"
                                     @click="refreshPresets()"
                                     :disabled="refreshingPresets"
-                                    @mouseenter="showTip($event.currentTarget, 'Fetch latest presets from omlx.ai')"
+                                    @mouseenter="showTip($event.currentTarget, window.t('modal.model_settings.refresh_presets_tooltip'))"
                                     @mouseleave="hideTip()"
                                     class="p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -92,7 +95,7 @@
                                         class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
                                         x-text="p.display_name || p.name"></button>
                             </template>
-                            <span x-show="presets.length === 0" x-cloak class="text-xs text-neutral-400 italic">no presets available</span>
+                            <span x-show="presets.length === 0" x-cloak class="text-xs text-neutral-400 italic">{{ t('modal.model_settings.no_presets_available') }}</span>
                         </div>
                     </div>
 
@@ -320,7 +323,7 @@
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.reasoning_parser') }}</label>
                                     <select x-model="modelSettings.reasoning_parser"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="">None</option>
+                                        <option value="">{{ t('modal.model_settings.reasoning_parser_none') }}</option>
                                         <template x-for="p in reasoningParsers" :key="p.value">
                                             <option :value="p.value" x-text="p.label + ' (' + p.models.join(', ') + ')'"></option>
                                         </template>
@@ -437,6 +440,9 @@
                                             const effective = modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false);
                                             modelSettings.enable_thinking = !effective;
                                         "
+                                            role="switch"
+                                            :aria-checked="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.enable_thinking') }}"
                                             :class="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'translate-x-5' : 'translate-x-0'"
@@ -460,6 +466,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.thinking_budget_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                            role="switch"
+                                            :aria-checked="modelSettings.enableThinkingBudget ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.thinking_budget') }}"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
@@ -484,6 +493,9 @@
                                     </div>
                                     <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
                                             :disabled="modelSettings.vlm_mtp_enabled"
+                                            role="switch"
+                                            :aria-checked="modelSettings.guided_grammar_enabled ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.guided_grammar') }}"
                                             :class="[
                                                 modelSettings.guided_grammar_enabled ? 'bg-black' : 'bg-neutral-200',
                                                 modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''
@@ -510,6 +522,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.limit_tool_result_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
+                                            role="switch"
+                                            :aria-checked="modelSettings.enableToolResultLimit ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.limit_tool_result') }}"
                                             :class="modelSettings.enableToolResultLimit ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableToolResultLimit ? 'translate-x-5' : 'translate-x-0'"
@@ -531,6 +546,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.force_sampling_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.force_sampling = !modelSettings.force_sampling"
+                                            role="switch"
+                                            :aria-checked="modelSettings.force_sampling ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.force_sampling') }}"
                                             :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.force_sampling ? 'translate-x-5' : 'translate-x-0'"
@@ -547,6 +565,9 @@
                                         <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
+                                            role="switch"
+                                            :aria-checked="modelSettings.trust_remote_code ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.trust_remote_code') }}"
                                             :class="modelSettings.trust_remote_code ? 'bg-red-600' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
                                         <span :class="modelSettings.trust_remote_code ? 'translate-x-5' : 'translate-x-0'"
@@ -702,6 +723,9 @@
                                                                 : (modelSettings.vlm_mtp_enabled
                                                                     ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))"
+                                                role="switch"
+                                                :aria-checked="modelSettings.mtp_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.lightning_mtp') }}"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     ((!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -726,6 +750,9 @@
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.qwen35_ane_prefill_enabled = !modelSettings.qwen35_ane_prefill_enabled"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.qwen35_ane_prefill_enabled ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.qwen_ane') }}"
                                                     :class="modelSettings.qwen35_ane_prefill_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.qwen35_ane_prefill_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -771,6 +798,9 @@
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_dual_ane = !modelSettings.qwen35_ane_prefill_dual_ane"
+                                                        role="switch"
+                                                        :aria-checked="modelSettings.qwen35_ane_prefill_dual_ane ? 'true' : 'false'"
+                                                        aria-label="{{ t('modal.model_settings.qwen_ane_dual') }}"
                                                         :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'translate-x-5' : 'translate-x-0'"
@@ -786,6 +816,9 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
+                                                            role="switch"
+                                                            :aria-checked="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'true' : 'false'"
+                                                            aria-label="{{ t('modal.model_settings.qwen_ane_cpu') }}"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -829,6 +862,9 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_shared_resource = !modelSettings.qwen35_ane_prefill_cpu_shared_resource"
+                                                            role="switch"
+                                                            :aria-checked="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'true' : 'false'"
+                                                            aria-label="{{ t('modal.model_settings.qwen_ane_cpu_scheduler') }}"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'translate-x-5' : 'translate-x-0'"
@@ -844,6 +880,9 @@
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_gdn = !modelSettings.qwen35_ane_prefill_gdn"
+                                                        role="switch"
+                                                        :aria-checked="modelSettings.qwen35_ane_prefill_gdn ? 'true' : 'false'"
+                                                        aria-label="{{ t('modal.model_settings.qwen_ane_gdn') }}"
                                                         :class="modelSettings.qwen35_ane_prefill_gdn ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.qwen35_ane_prefill_gdn ? 'translate-x-5' : 'translate-x-0'"
@@ -1007,6 +1046,9 @@
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
+                                                role="switch"
+                                                :aria-checked="modelSettings.turboquant_kv_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.turboquant_kv') }}"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1043,6 +1085,9 @@
                                                     @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
                                                     :disabled="modelSettings.is_paroquant"
                                                     :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.enableIndexCache ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.index_cache') }}"
                                                     :class="[
                                                         modelSettings.enableIndexCache ? 'bg-black' : 'bg-neutral-200',
                                                         modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
@@ -1065,12 +1110,15 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Attention-based sparse prefill for MoE/hybrid models. (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">Paper</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">HuggingFace</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_hint_html') | safe }}</p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
+                                                role="switch"
+                                                :aria-checked="modelSettings.specprefill_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.specprefill') }}"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1082,33 +1130,33 @@
                                     </div>
                                     <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model_label') }}</label>
                                             <select x-model="modelSettings.specprefill_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="">Select draft model...</option>
+                                                <option value="">{{ t('modal.model_settings.select_draft_model_placeholder') }}</option>
                                                 <template x-for="m in specPrefillDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">Small model sharing tokenizer with target (e.g. Qwen3.5-0.8B for 35B)</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.specprefill_draft_model_hint') }}</p>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Keep Rate</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.keep_rate_label') }}</label>
                                             <select x-model="modelSettings.specprefill_keep_pct"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="0.1">10% — Aggressive (~5-7x, some quality loss)</option>
-                                                <option value="0.2">20% — Balanced (~3x, recommended)</option>
-                                                <option value="0.25">25% — Conservative+ (~2.5x)</option>
-                                                <option value="0.3">30% — Conservative (~2.2x)</option>
-                                                <option value="0.4">40% — Mild (~1.8x)</option>
-                                                <option value="0.5">50% — Minimal (~1.5x)</option>
+                                                <option value="0.1">{{ t('modal.model_settings.keep_rate_10') }}</option>
+                                                <option value="0.2">{{ t('modal.model_settings.keep_rate_20') }}</option>
+                                                <option value="0.25">{{ t('modal.model_settings.keep_rate_25') }}</option>
+                                                <option value="0.3">{{ t('modal.model_settings.keep_rate_30') }}</option>
+                                                <option value="0.4">{{ t('modal.model_settings.keep_rate_40') }}</option>
+                                                <option value="0.5">{{ t('modal.model_settings.keep_rate_50') }}</option>
                                             </select>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Threshold (tokens)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.threshold_tokens_label') }}</label>
                                             <input type="number" x-model.number="modelSettings.specprefill_threshold" min="1024" max="131072" step="1024" placeholder="8192"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Min tokens to trigger (shorter prompts use full prefill)</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.specprefill_threshold_hint') }}</p>
                                         </div>
                                     </div>
                                 </div>
@@ -1118,7 +1166,7 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">Block diffusion speculative decoding with compatible DFlash and DFlash2 checkpoints.<br><strong>Single-stream only: requests run one at a time.</strong><br>* MLX impl by bstnxbt(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">GitHub</a>)</p>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_hint_html') | safe }}</p>
                                             <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.dflash_compatibility_reason"></p>
@@ -1132,7 +1180,10 @@
                                                                 : (modelSettings.vlm_mtp_enabled
                                                                     ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))
-                                                            : (modelSettings.dflash_compatibility_reason || 'Unsupported model')"
+                                                            : (modelSettings.dflash_compatibility_reason || window.t('modal.model_settings.unsupported_model'))"
+                                                role="switch"
+                                                :aria-checked="modelSettings.dflash_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.dflash') }}"
                                                 :class="[
                                                     modelSettings.dflash_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (!modelSettings.dflash_compatible || modelSettings.mtp_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1144,23 +1195,26 @@
                                     </div>
                                     <div x-show="modelSettings.dflash_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft Model</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model_label') }}</label>
                                             <select x-model="modelSettings.dflash_draft_model"
                                                     class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                <option value="">Select draft model...</option>
+                                                <option value="">{{ t('modal.model_settings.select_draft_model_placeholder') }}</option>
                                                 <template x-for="m in dflashDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
                                                 </template>
                                             </select>
-                                            <p class="text-xs text-neutral-400 mt-1">DFlash draft checkpoint (e.g. z-lab/Qwen3-4B-DFlash-b16, z-lab/gemma-4-26B-A4B-it-DFlash, z-lab/Qwen3.8-27B-DFlash2, poolside/Laguna-S-2.1-DFlash-NVFP4). Note: -DFlash / -DFlash2 suffix; -assistant variants are for MTP.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_draft_model_hint') }}</p>
                                         </div>
                                         <div class="bg-neutral-50 rounded-xl">
                                             <div class="flex items-start justify-between gap-3">
                                                 <div class="min-w-0">
-                                                    <span class="text-sm font-medium text-neutral-700">Quantization</span>
-                                                    <p class="text-xs text-neutral-500 mt-0.5">Enable quantization for the draft model (weight, activation bits &amp; group size).</p>
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.quantization_label') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_quant_hint') }}</p>
                                                 </div>
                                                 <button type="button" @click="modelSettings.dflash_draft_quant_enabled = !modelSettings.dflash_draft_quant_enabled"
+                                                        role="switch"
+                                                        :aria-checked="modelSettings.dflash_draft_quant_enabled ? 'true' : 'false'"
+                                                        aria-label="{{ t('modal.model_settings.quantization_label') }}"
                                                         :class="modelSettings.dflash_draft_quant_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.dflash_draft_quant_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -1170,7 +1224,7 @@
                                         </div>
                                         <div class="grid grid-cols-3 gap-3 pl-4" x-show="modelSettings.dflash_draft_quant_enabled" x-transition>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Weight Bits</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.weight_bits_label') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_weight_bits"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="2">2-bit</option>
@@ -1179,7 +1233,7 @@
                                                 </select>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Activation Bits</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.activation_bits_label') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_activation_bits"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="16" selected>16-bit</option>
@@ -1187,7 +1241,7 @@
                                                 </select>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Group Size</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.group_size_label') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_group_size"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="32">32</option>
@@ -1197,51 +1251,54 @@
                                             </div>
                                         </div>
                                         <div>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Context (fallback threshold)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_fallback_label') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" placeholder="unlimited"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Prompts at or above this token count switch to BatchedEngine. Leave empty for unlimited.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.max_context_fallback_hint') }}</p>
                                         </div>
                                         <div class="pt-2 border-t border-neutral-200 space-y-3">
-                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">Long-context tuning</p>
+                                            <p class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.long_context_tuning_label') }}</p>
                                             <div class="grid grid-cols-2 gap-3">
                                                 <div>
-                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft window size</label>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_window_size_label') }}</label>
                                                     <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="2048"
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                    <p class="text-xs text-neutral-400 mt-1">Draft model sliding-attention window. Helps stabilise acceptance on long contexts. Leave empty for dflash default (2048).</p>
+                                                    <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.draft_window_size_hint') }}</p>
                                                 </div>
                                                 <div>
-                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Draft sink size</label>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_sink_size_label') }}</label>
                                                     <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="0"
                                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                    <p class="text-xs text-neutral-400 mt-1">Attention-sink tokens always kept regardless of window. Leave empty for dflash default (0).</p>
+                                                    <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.draft_sink_size_hint') }}</p>
                                                 </div>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Runtime block size</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.runtime_block_size_label') }}</label>
                                                 <input type="number" x-model.number="modelSettings.dflash_block_size" min="1" step="1" placeholder="checkpoint default"
                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                                <p class="text-xs text-neutral-400 mt-1">Maximum draft and verify tokens per cycle. Leave empty to use the checkpoint block size.</p>
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.runtime_block_size_hint') }}</p>
                                             </div>
                                             <div>
-                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Verify mode</label>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.verify_mode_label') }}</label>
                                                 <select x-model="modelSettings.dflash_verify_mode"
                                                         class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                    <option value="adaptive">adaptive (default)</option>
+                                                    <option value="adaptive">{{ t('modal.model_settings.verify_mode_adaptive') }}</option>
                                                     <option value="dflash">dflash</option>
                                                     <option value="ddtree">ddtree</option>
                                                     <option value="off">off</option>
                                                 </select>
-                                                <p class="text-xs text-neutral-400 mt-1">Verifier algorithm. "adaptive" shrinks block size when acceptance drops; "off" disables speculative verify.</p>
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.verify_mode_hint') }}</p>
                                             </div>
                                         </div>
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">In-memory cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">DFlash L1 prefix snapshot cache in RAM. Speeds up multi-turn chats with shared prefixes.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.in_memory_cache_label') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.in_memory_cache_hint') }}</p>
                                             </div>
                                             <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.dflash_in_memory_cache ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.in_memory_cache_label') }}"
                                                     :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.dflash_in_memory_cache ? 'translate-x-5' : 'translate-x-0'"
@@ -1249,27 +1306,30 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache max entries</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.in_memory_cache_max_entries_label') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Maximum number of prefix snapshots kept in L1 cache. Each entry stores KV + draft GDN state for one conversation prefix.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.in_memory_cache_max_entries_hint') }}</p>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache size (GiB)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.in_memory_cache_size_label') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Byte budget for L1 snapshots; LRU evicts when exceeded.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.in_memory_cache_size_hint') }}</p>
                                         </div>
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
-                                                <span class="text-sm font-medium text-neutral-700">SSD cache</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">L2 spill of evicted L1 entries to disk. Uses the oMLX paged SSD cache directory (<code>dflash_l2/</code>).</p>
-                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">Enable oMLX paged SSD cache first (<code>--paged-ssd-cache-dir</code>).</p>
-                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">Requires in-memory cache to be enabled.</p>
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.ssd_cache_label') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.ssd_cache_hint_html') | safe }}</p>
+                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.ssd_cache_unavailable_html') | safe }}</p>
+                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.ssd_cache_requires_memory_cache') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
                                                     :disabled="!modelSettings.dflash_ssd_cache_available || !modelSettings.dflash_in_memory_cache"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.dflash_ssd_cache ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.ssd_cache_label') }}"
                                                     :class="[
                                                         modelSettings.dflash_ssd_cache ? 'bg-black' : 'bg-neutral-200',
                                                         (!modelSettings.dflash_ssd_cache_available || !modelSettings.dflash_in_memory_cache) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1280,10 +1340,10 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_ssd_cache" x-transition>
-                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">SSD cache size (GiB)</label>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.ssd_cache_size_label') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_ssd_cache_max_gib" min="1" max="1024" step="1" placeholder="20"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
-                                            <p class="text-xs text-neutral-400 mt-1">Disk budget for L2 spill; oldest entries are evicted when exceeded.</p>
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.ssd_cache_size_hint') }}</p>
                                         </div>
                                     </div>
                                 </div>
@@ -1303,6 +1363,9 @@
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled && !vlmMtpProcessorConflict()) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled || vlmMtpProcessorConflict()"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                role="switch"
+                                                :aria-checked="modelSettings.vlm_mtp_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.vlm_mtp') }}"
                                                 :class="[
                                                     modelSettings.vlm_mtp_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled || vlmMtpProcessorConflict()) ? 'opacity-40 cursor-not-allowed' : ''

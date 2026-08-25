@@ -1004,8 +1004,9 @@
             <p class="text-sm text-fg-tertiary mb-4">{{ t('chat.api_key_prompt') }}</p>
             <input type="password" x-model="apiKeyInput" @keydown.enter="saveApiKey"
                 placeholder="{{ t('chat.api_key_placeholder') }}"
-                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong"
+                class="w-full px-4 py-3 border border-line rounded-xl mb-1 focus:outline-none focus:border-line-strong"
                 style="background: var(--bg-primary); color: var(--text-primary);">
+            <p class="text-xs text-fg-tertiary mb-4">{{ t('chat.api_key_storage_note') }}</p>
             <button @click="saveApiKey"
                 class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
                 :disabled="!apiKeyInput.trim()">
@@ -1720,9 +1721,15 @@
             <template x-for="dot in timelineDots" :key="dot.index">
                 <div class="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto cursor-pointer"
                     :style="'top:' + dot.topPx + 'px;width:9px;height:9px;display:flex;align-items:center;justify-content:center;border-radius:50%;'"
+                    role="button" tabindex="0"
+                    :aria-label="window.t('chat.timeline.jump_to_message') + ': ' + (getTextContent(messages[dot.index]?.content)?.slice(0, 60) || '')"
                     @mouseenter="showDotTooltip($event, messages[dot.index], dot.index)"
                     @mouseleave="hideDotTooltip()"
-                    @click="scrollToMessage(dot.index)">
+                    @focus="showDotTooltip($event, messages[dot.index], dot.index)"
+                    @blur="hideDotTooltip()"
+                    @click="scrollToMessage(dot.index)"
+                    @keydown.enter="scrollToMessage(dot.index)"
+                    @keydown.space.prevent="scrollToMessage(dot.index)">
                     <span class="timeline-dot"
                         :class="timelineActive === dot.index ? 'timeline-dot-active' : ''"></span>
                 </div>
@@ -5135,7 +5142,7 @@
     // ===== PROFILE Tab: Add New Profile =====
 
     addNewPromptProfile() {
-        let baseName = 'New Profile';
+        let baseName = window.t('chat.new_profile_default_name');
         let counter = 1;
         let name = baseName;
         while (this.promptProfiles.some(p => p.name === name)) {
@@ -5687,7 +5694,7 @@
                 }
             }
             if (finalText == null && !stream.streamingContent) {
-                throw new Error('Transcription stream ended without a result');
+                throw new Error(window.t('chat.error.transcription_stream_ended'));
             }
             chatSession.messages.push({
                 id: stream.targetMessageId,
@@ -6816,7 +6823,7 @@
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
-        const branchName = 'Branch of ' + (originalChat?.title || this.untitledChatTitle());
+        const branchName = window.t('chat.branch_of_prefix') + (originalChat?.title || this.untitledChatTitle());
 
         const branchId = 'chat_' + Date.now();
         const branchMessages = session.messages.slice(0, index + 1).map(msg => this.cloneData(msg));
@@ -7522,7 +7529,7 @@
                 const wandIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/></svg>';
                 const renderBtn = document.createElement('button');
                 renderBtn.className = 'svg-render-btn';
-                renderBtn.innerHTML = wandIcon + ' Render';
+                renderBtn.innerHTML = wandIcon + ' ' + window.t('chat.codeblock.render');
                 renderBtn.onclick = (e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -7534,7 +7541,7 @@
                         preview.remove();
                         pre.style.display = '';
                         if (copyBtn) copyBtn.style.display = '';
-                        renderBtn.innerHTML = wandIcon + ' Render';
+                        renderBtn.innerHTML = wandIcon + ' ' + window.t('chat.codeblock.render');
                         return;
                     }
                     const sanitized = DOMPurify.sanitize(rawText, {
@@ -7548,7 +7555,7 @@
                     pre.style.display = 'none';
                     if (copyBtn) copyBtn.style.display = 'none';
                     wrapper.appendChild(preview);
-                    renderBtn.innerHTML = '\u2190 Back';
+                    renderBtn.innerHTML = '\u2190 ' + window.t('chat.codeblock.back');
                 };
                 btnRow.appendChild(renderBtn);
             }
@@ -7557,13 +7564,13 @@
             const copyIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy-btn';
-            copyBtn.innerHTML = copyIcon + ' Copy';
+            copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copy');
             copyBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 this._copyText(codeBlock.textContent).then(() => {
-                    copyBtn.innerHTML = copyIcon + ' Copied!';
-                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' Copy', 2000);
+                    copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copied');
+                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copy'), 2000);
                 });
             };
             btnRow.appendChild(copyBtn);

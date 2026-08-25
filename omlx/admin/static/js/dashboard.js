@@ -100,6 +100,27 @@
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
+    // Minimal keyboard focus trap for modal dialogs: cycles Tab/Shift+Tab
+    // between the first and last focusable descendant of the dialog panel
+    // the handler is bound to. No Alpine plugin is bundled (only alpine.min.js
+    // core), so this is hand-rolled rather than using x-trap.
+    window.trapModalFocus = function (event) {
+        const container = event.currentTarget;
+        const focusable = container.querySelectorAll(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        );
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
+
     function dashboard() {
         return {
             // Theme
@@ -1046,7 +1067,7 @@
                 return message;
             },
 
-            clusterErrorMessage(detail, fallback = 'Something went wrong') {
+            clusterErrorMessage(detail, fallback = window.t('js.error.something_went_wrong')) {
                 if (!Array.isArray(detail)) {
                     if (detail && typeof detail === 'object') {
                         return detail.msg || detail.message || JSON.stringify(detail);
@@ -2309,8 +2330,7 @@
                 if (this.clusterSshKeyGenerating) return;
                 const overwrite = Boolean(this.clusterSshKey?.available);
                 if (overwrite && !window.confirm(
-                    'Regenerating this key disconnects every paired worker. '
-                    + 'You will need to exchange keys again on every Mac. Continue?'
+                    window.t('cluster.pairing.ssh_key_regenerate_confirm')
                 )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
@@ -2327,18 +2347,19 @@
                         if (overwrite) this.invalidateClusterPeer(true);
                         this.showNotification(
                             overwrite
-                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
-                                : 'SSH key generated successfully',
+                                ? window.t('cluster.pairing.ssh_key_regenerated')
+                                : window.t('cluster.pairing.ssh_key_generated'),
                             'success'
                         );
                     } else {
                         const error = await response.json();
-                        this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.ssh_key_generation_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('SSH key generation failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.ssh_key_generation_failed').replace('{detail}', error.message), 'error');
+                } finally {
+                    this.clusterSshKeyGenerating = false;
                 }
-                this.clusterSshKeyGenerating = false;
             },
 
             async generateKeyExchangeToken(nodeId) {
@@ -2358,12 +2379,13 @@
                         this.clusterExchangeToken = result.exchange_token;
                     } else {
                         const error = await response.json();
-                        this.showNotification('Key exchange token generation failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.exchange_token_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Key exchange token generation failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.exchange_token_failed').replace('{detail}', error.message), 'error');
+                } finally {
+                    this.clusterExchangeTokenLoading = false;
                 }
-                this.clusterExchangeTokenLoading = false;
             },
 
             async exchangeKeysWithPeer(exchangeToken) {
@@ -2382,7 +2404,7 @@
                     if (response.ok) {
                         this.clusterKeyExchangeResult = await response.json();
                         this.clusterPeerExchangeToken = '';
-                        this.showNotification('SSH keys exchanged successfully', 'success');
+                        this.showNotification(window.t('cluster.pairing.keys_exchanged'), 'success');
                         // Pairing just changed what a probe would find; retry
                         // now rather than waiting out the failure hold.
                         this.resetClusterProbeBackoff();
@@ -2390,10 +2412,10 @@
                         await this.loadClusterSshKey();
                     } else {
                         const error = await response.json();
-                        this.showNotification('Key exchange failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.exchange_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Key exchange failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.exchange_failed').replace('{detail}', error.message), 'error');
                 } finally {
                     this.clusterKeyExchangeLoading = false;
                 }
@@ -2408,18 +2430,19 @@
                     if (response.ok) {
                         const result = await response.json();
                         if (result.stored) {
-                            this.showNotification('Key fingerprint stored in macOS Keychain', 'success');
+                            this.showNotification(window.t('cluster.pairing.keychain_stored'), 'success');
                         } else {
-                            this.showNotification('Keychain storage unavailable on this system', 'warning');
+                            this.showNotification(window.t('cluster.pairing.keychain_unavailable'), 'warning');
                         }
                     } else {
                         const error = await response.json();
-                        this.showNotification('Keychain storage failed: ' + (error.detail || 'Unknown error'), 'error');
+                        this.showNotification(window.t('cluster.pairing.keychain_failed').replace('{detail}', error.detail || window.t('js.error.unknown')), 'error');
                     }
                 } catch (error) {
-                    this.showNotification('Keychain storage failed: ' + error.message, 'error');
+                    this.showNotification(window.t('cluster.pairing.keychain_failed').replace('{detail}', error.message), 'error');
+                } finally {
+                    this.clusterKeychainStoring = false;
                 }
-                this.clusterKeychainStoring = false;
             },
 
             async selectClusterDiscoveredPeer(peer) {
@@ -3605,8 +3628,8 @@
                 if (this.clusterDeactivatingId) {
                     return {
                         key: 'stopping',
-                        label: 'Stopping…',
-                        detail: 'The workers are finishing their current work safely.',
+                        label: window.t('cluster.status.stopping_label'),
+                        detail: window.t('cluster.status.stopping_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3614,8 +3637,8 @@
                 if (this.clusterActivationLoading) {
                     return {
                         key: 'starting',
-                        label: this.clusterActivationProgress || 'Preparing model…',
-                        detail: `oMLX is starting the model on ${this.clusterQuickNodes().length} devices.`,
+                        label: this.clusterActivationProgress || window.t('cluster.status.starting_label_default'),
+                        detail: window.t('cluster.status.starting_detail').replace('{count}', this.clusterQuickNodes().length),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3624,9 +3647,9 @@
                     return {
                         key: 'preparing',
                         label: this.clusterLinkSetupLoading
-                            ? 'Connecting the workers…'
-                            : 'Preparing the model…',
-                        detail: 'Connection, memory, and model split checks are automatic.',
+                            ? window.t('cluster.status.connecting_label')
+                            : window.t('cluster.status.preparing_label'),
+                        detail: window.t('cluster.status.preparing_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3637,20 +3660,20 @@
                     );
                     const name = deployedModel
                         ? this.clusterModelDisplayName(deployedModel)
-                        : String(deployment.model || 'The selected model').split('/').pop();
+                        : String(deployment.model || window.t('cluster.status.unnamed_model')).split('/').pop();
                     if (liveJobs.length) {
                         return {
                             key: 'running',
-                            label: `Running on ${this.clusterQuickNodes().length} devices`,
-                            detail: `${name} is loaded and available through oMLX.`,
+                            label: window.t('cluster.status.running_label').replace('{count}', this.clusterQuickNodes().length),
+                            detail: window.t('cluster.status.running_detail').replace('{name}', name),
                             tone: 'green',
                             busy: false,
                         };
                     }
                     return {
                         key: 'stopped',
-                        label: 'Cluster is stopped',
-                        detail: `${name} is configured but its weights are not loaded.`,
+                        label: window.t('cluster.status.stopped_label'),
+                        detail: window.t('cluster.status.stopped_detail').replace('{name}', name),
                         tone: 'amber',
                         busy: false,
                     };
@@ -3658,8 +3681,8 @@
                 if (error) {
                     return {
                         key: 'error',
-                        label: 'Needs attention',
-                        detail: 'oMLX kept the cluster stopped. Open the message below for the fix.',
+                        label: window.t('cluster.status.error_label'),
+                        detail: window.t('cluster.status.error_detail'),
                         tone: 'red',
                         busy: false,
                     };
@@ -3667,8 +3690,8 @@
                 if (!this.clusterPeerSsh.trim()) {
                     return {
                         key: 'finding',
-                        label: 'Finding workers…',
-                        detail: 'Keep every worker awake and connected to the cluster network.',
+                        label: window.t('cluster.status.finding_label'),
+                        detail: window.t('cluster.status.finding_detail'),
                         tone: 'blue',
                         busy: this.clusterDiscoveryLoading,
                     };
@@ -3679,8 +3702,8 @@
                     || !this.clusterPeerProbe) {
                     return {
                         key: 'checking',
-                        label: 'Checking the connection…',
-                        detail: 'oMLX is confirming every worker and the fastest shared links.',
+                        label: window.t('cluster.status.checking_label'),
+                        detail: window.t('cluster.status.checking_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3698,19 +3721,19 @@
                     if (this.clusterPeerProbe.bootstrap_required) {
                         return {
                             key: 'bootstrap',
-                            label: 'Worker runtime setup needed',
+                            label: window.t('cluster.status.bootstrap_label'),
                             detail: this.clusterConnectionError
                                 || mismatches[0]
-                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
+                                || window.t('cluster.status.bootstrap_detail_fallback'),
                             tone: 'amber',
                             busy: false,
                         };
                     }
                     return {
                         key: 'runtime-mismatch',
-                        label: 'Worker runtime mismatch',
+                        label: window.t('cluster.status.runtime_mismatch_label'),
                         detail: mismatches.join(' · ')
-                            || 'The worker runtime differs from this Mac.',
+                            || window.t('cluster.status.runtime_mismatch_detail_fallback'),
                         tone: 'red',
                         busy: false,
                     };
@@ -3718,8 +3741,8 @@
                 if (this.clusterPeerProbe.runtime_compatible !== true) {
                     return {
                         key: 'runtime-unverified',
-                        label: 'Worker runtime not verified',
-                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
+                        label: window.t('cluster.status.runtime_unverified_label'),
+                        detail: window.t('cluster.status.runtime_unverified_detail'),
                         tone: 'amber',
                         busy: false,
                     };
@@ -3727,8 +3750,8 @@
                 if (this.clusterCatalogueLoading && !selected) {
                     return {
                         key: 'choosing',
-                        label: 'Choosing a model…',
-                        detail: 'oMLX is checking which downloaded models fit this accelerator pool.',
+                        label: window.t('cluster.status.choosing_label'),
+                        detail: window.t('cluster.status.choosing_detail'),
                         tone: 'blue',
                         busy: true,
                     };
@@ -3736,8 +3759,8 @@
                 if (!selected) {
                     return {
                         key: 'model',
-                        label: 'Choose a model',
-                        detail: 'Pick a recommendation or search all downloaded models.',
+                        label: window.t('cluster.status.choose_model_label'),
+                        detail: window.t('cluster.status.choose_model_detail'),
                         tone: 'amber',
                         busy: false,
                     };
@@ -3747,22 +3770,23 @@
                     return {
                         key: 'model',
                         label: selectedFit.failure_kind === 'single_node_only'
-                            ? `${this.clusterFriendlyMacName(
-                                selectedFit.standalone_node_id
-                            )} only`
+                            ? window.t('cluster.status.single_node_only').replace(
+                                '{name}',
+                                this.clusterFriendlyMacName(selectedFit.standalone_node_id)
+                            )
                             : (selectedFit.failure_kind === 'cannot_split'
-                                ? 'Cannot combine these devices'
-                                : 'Choose another model'),
+                                ? window.t('cluster.status.cannot_combine')
+                                : window.t('cluster.status.choose_another')),
                         detail: selectedFit.reason
-                            || 'The selected model cannot run with this cluster configuration.',
+                            || window.t('cluster.status.model_fit_detail_fallback'),
                         tone: 'amber',
                         busy: false,
                     };
                 }
                 return {
                     key: 'ready',
-                    label: 'Ready',
-                    detail: 'Every worker and the selected model passed the setup checks.',
+                    label: window.t('cluster.status.ready_label'),
+                    detail: window.t('cluster.status.ready_detail'),
                     tone: 'green',
                     busy: false,
                 };
@@ -3826,30 +3850,32 @@
             },
 
             clusterPrimaryActionLabel() {
-                if (this.clusterDeactivatingId) return 'Stopping…';
+                if (this.clusterDeactivatingId) return window.t('cluster.status.stopping_label');
                 if (this.clusterActivationLoading) {
-                    return this.clusterActivationProgress || 'Starting on every worker…';
+                    return this.clusterActivationProgress || window.t('cluster.action.starting_default');
                 }
-                if (this.clusterLinkSetupLoading) return 'Connecting the workers…';
-                if (this.clusterAutoconfigureLoading) return 'Preparing the model…';
+                if (this.clusterLinkSetupLoading) return window.t('cluster.action.connecting');
+                if (this.clusterAutoconfigureLoading) return window.t('cluster.action.preparing');
                 if (this.clusterPrimaryDeployment() && this.clusterLiveJobs().length) {
-                    return 'Stop';
+                    return window.t('cluster.action.stop');
                 }
-                if (!this.clusterAllModels().length) return 'Get a model';
+                if (!this.clusterAllModels().length) return window.t('cluster.action.get_a_model');
                 if (!this.clusterPeerSsh.trim()) {
                     return this.clusterDiscoveryLoading
-                        ? 'Finding workers…'
-                        : 'Find workers';
+                        ? window.t('cluster.action.finding_workers')
+                        : window.t('cluster.action.find_workers');
                 }
                 const model = this.clusterSelectedModel();
-                if (!model) return 'Choose a model';
+                if (!model) return window.t('cluster.action.choose_a_model');
                 if (this.clusterCatalogueFit(model.model_path)?.fits === false) {
-                    return 'Choose a cluster-compatible model';
+                    return window.t('cluster.action.choose_compatible_model');
                 }
                 if (this.clusterError || this.clusterAutoconfigureError) {
-                    return `Retry ${this.clusterModelDisplayName(model)} setup`;
+                    return window.t('cluster.action.retry_setup').replace('{model}', this.clusterModelDisplayName(model));
                 }
-                return `Start ${this.clusterModelDisplayName(model)} on ${this.clusterQuickNodes().length} devices`;
+                return window.t('cluster.action.start_on_devices')
+                    .replace('{model}', this.clusterModelDisplayName(model))
+                    .replace('{count}', this.clusterQuickNodes().length);
             },
 
             async runClusterPrimaryAction() {
@@ -6663,16 +6689,16 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('status.node.host_label'));
+                if (!s.server.port) errors.push(window.t('js.field.port'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.field.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('js.field.max_concurrent_requests'));
+                if (!s.scheduler.embedding_batch_size) errors.push(window.t('js.field.embedding_batch_size'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.field.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.field.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
                 if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
-                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                    errors.push(window.t('js.error.gdn_ssd_sidecar_requires_hot_cache_disabled'));
                 }
 
                 if (errors.length > 0) {
@@ -7529,7 +7555,7 @@
                 this.profileError = '';
                 const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
@@ -7562,7 +7588,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7600,7 +7626,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to apply profile';
+                        this.profileError = data.detail || window.t('js.error.apply_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7645,6 +7671,11 @@
                             if (newProfile) {
                                 await this.applyProfileToForm(newProfile);
                             }
+                        } else if (r.status === 401) {
+                            window.location.href = '/admin';
+                        } else {
+                            const data = await r.json().catch(() => ({}));
+                            this.profileError = data.detail || window.t('js.error.create_profile_from_template_failed');
                         }
                     } catch (e) {
                         console.error('Failed to create profile from template:', e);
@@ -7679,7 +7710,7 @@
                 const description = (p._editDescription ?? p.description ?? '').trim();
                 const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 if (!this.isValidProfileName(apiName)) {
@@ -7722,7 +7753,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7732,7 +7763,7 @@
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -7758,7 +7789,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7779,7 +7810,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -9479,7 +9510,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('bench.community.uploading_progress'),
                                 current: 0,
                                 total: 0,
                             };
@@ -11184,7 +11215,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timed_out');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -11375,15 +11406,15 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
+                        this.oqSuccess = window.t('js.oq.quantization_started').replace('{name}', name).replace('{level}', this.oqLevel).replace('{suffix}', this.oqEnhanced ? 'e' : '');
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_unavailable');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -11447,6 +11478,11 @@
                 const pct = Math.round(task.progress || 0);
                 const label = task.progress_detail || task.phase || task.status;
                 return `${pct}% · ${label}`;
+            },
+
+            taskStatusLabel(status) {
+                const key = 'models.task_status.' + status;
+                return window._t[key] !== undefined ? window._t[key] : status;
             },
 
             formatOQElapsed(task) {
@@ -11602,7 +11638,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_unavailable');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -11655,15 +11691,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('js.upload.queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_unavailable');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -11760,9 +11796,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timed_out');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -11920,9 +11956,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timed_out');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -11998,9 +12034,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_request_timed_out');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -12089,7 +12125,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timed_out');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -12212,9 +12248,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timed_out');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -12277,9 +12313,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timed_out');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -12339,9 +12375,9 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_request_timed_out');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

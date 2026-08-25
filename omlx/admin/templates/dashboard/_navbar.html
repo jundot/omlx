@@ -54,9 +54,16 @@
                     <i data-lucide="network" class="w-4 h-4"></i>
                     {{ t('navbar.tab.cluster') }}
                 </button>
-                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
+                <div class="relative"
+                     @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false"
+                     @focusin="modelsDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) modelsDropdown = false"
+                     @keydown.escape="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
+                        aria-haspopup="true"
+                        aria-controls="dashboard-models-menu"
+                        :aria-expanded="modelsDropdown ? 'true' : 'false'"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -72,6 +79,7 @@
                           x-cloak></span>
                     <!-- Dropdown menu -->
                     <div
+                        id="dashboard-models-menu"
                         x-show="modelsDropdown"
                         x-transition:enter="transition ease-out duration-150"
                         x-transition:enter-start="opacity-0 translate-y-1"
@@ -124,9 +132,16 @@
                         </button>
                     </div>
                 </div>
-                <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
+                <div class="relative"
+                     @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false"
+                     @focusin="settingsDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) settingsDropdown = false"
+                     @keydown.escape="settingsDropdown = false">
                     <button
                         @click="setMainTab('settings')"
+                        aria-haspopup="true"
+                        aria-controls="dashboard-settings-menu"
+                        :aria-expanded="settingsDropdown ? 'true' : 'false'"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -137,6 +152,7 @@
                         <i data-lucide="chevron-down" class="w-3 h-3 ml-0.5 opacity-50 hidden"></i>
                     </button>
                     <div
+                        id="dashboard-settings-menu"
                         x-show="settingsDropdown"
                         x-transition:enter="transition ease-out duration-150"
                         x-transition:enter-start="opacity-0 translate-y-1"
@@ -189,9 +205,16 @@
                     <i data-lucide="scroll-text" class="w-4 h-4"></i>
                     {{ t('navbar.tab.logs') }}
                 </button>
-                <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
+                <div class="relative"
+                     @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false"
+                     @focusin="benchDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) benchDropdown = false"
+                     @keydown.escape="benchDropdown = false">
                     <button
                         @click="setMainTab('bench')"
+                        aria-haspopup="true"
+                        aria-controls="dashboard-bench-menu"
+                        :aria-expanded="benchDropdown ? 'true' : 'false'"
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -201,6 +224,7 @@
                         {{ t('navbar.tab.bench') }}
                     </button>
                     <div
+                        id="dashboard-bench-menu"
                         x-show="benchDropdown"
                         x-transition:enter="transition ease-out duration-150"
                         x-transition:enter-start="opacity-0 translate-y-1"

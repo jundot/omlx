@@ -25,15 +25,15 @@
                         <div class="flex flex-wrap items-center gap-4 px-4 sm:px-6 py-4">
                             <!-- Lines input -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.lines_label') }}</label>
-                                <input type="number" x-model.number="logLines" min="10" max="10000" step="100"
+                                <label for="logs-lines-input" class="text-sm text-neutral-600">{{ t('logs.lines_label') }}</label>
+                                <input id="logs-lines-input" type="number" x-model.number="logLines" min="10" max="10000" step="100"
                                        class="w-24 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                             </div>
 
                             <!-- Refresh interval input -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.refresh_label') }}</label>
-                                <input type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
+                                <label for="logs-refresh-interval-input" class="text-sm text-neutral-600">{{ t('logs.refresh_label') }}</label>
+                                <input id="logs-refresh-interval-input" type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
                                        @change="restartLogRefresh()"
                                        class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                 <span class="text-sm text-neutral-400">{{ t('logs.refresh_unit') }}</span>
@@ -41,8 +41,8 @@
 
                             <!-- Log file selector -->
                             <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.file_label') }}</label>
-                                <select x-model="logFile" @change="loadLogs()"
+                                <label for="logs-file-select" class="text-sm text-neutral-600">{{ t('logs.file_label') }}</label>
+                                <select id="logs-file-select" x-model="logFile" @change="loadLogs()"
                                         class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
                                     <template x-for="f in logAvailableFiles" :key="f">
                                         <option :value="f" x-text="f"></option>
@@ -61,6 +61,9 @@
                             <!-- Auto-scroll toggle -->
                             <div class="flex items-center gap-2">
                                 <button type="button" @click="logAutoScroll = !logAutoScroll"
+                                        role="switch"
+                                        :aria-checked="logAutoScroll ? 'true' : 'false'"
+                                        aria-label="{{ t('logs.auto_scroll') }}"
                                         :class="logAutoScroll ? 'bg-black' : 'bg-neutral-200'"
                                         class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none">
                                     <span :class="logAutoScroll ? 'translate-x-4' : 'translate-x-0'"
@@ -103,6 +106,7 @@
                             x-ref="logTextarea"
                             :value="filteredLogContent()"
                             readonly
+                            aria-label="{{ t('logs.viewer_label') }}"
                             class="w-full h-[400px] sm:h-[600px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
                             :placeholder="window.t('logs.placeholder')"
                         ></textarea>
@@ -110,7 +114,7 @@
 
                     <!-- Stats -->
                     <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
-                        <span x-show="logLastUpdated" x-text="'Last updated: ' + logLastUpdated"></span>
+                        <span x-show="logLastUpdated" x-text="window.t('logs.last_updated_prefix') + logLastUpdated"></span>
                         <span x-show="logError" class="text-red-500" x-text="logError"></span>
                     </div>
                 </div>

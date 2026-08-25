@@ -142,10 +142,14 @@ final class MenubarStatsPoller {
 
                 var detailParts = [modelID]
                 if let tokensPerSecond = progress.speed, tokensPerSecond > 0 {
-                    detailParts.append("\(Int(tokensPerSecond.rounded())) tok/s")
+                    detailParts.append(String(localized: "menubar.live_activity.tokens_per_second",
+                                               defaultValue: "\(Int(tokensPerSecond.rounded())) tok/s",
+                                               comment: "Prefill throughput shown in the menubar Live Activity detail line"))
                 }
                 if let etaSeconds = progress.eta, etaSeconds >= 0 {
-                    detailParts.append("\(formatDuration(etaSeconds)) left")
+                    detailParts.append(String(localized: "menubar.live_activity.time_left",
+                                               defaultValue: "\(formatDuration(etaSeconds)) left",
+                                               comment: "Estimated time remaining shown in the menubar Live Activity detail line"))
                 }
 
                 return LiveActivity(
@@ -173,9 +177,16 @@ final class MenubarStatsPoller {
             }
 
             private static func waiting(requestCount: Int) -> LiveActivity {
-                LiveActivity(
+                let detail = requestCount == 1
+                    ? String(localized: "menubar.live_activity.queued_request.singular",
+                              defaultValue: "\(requestCount) queued request",
+                              comment: "Menubar Live Activity detail: exactly one request waiting in the queue")
+                    : String(localized: "menubar.live_activity.queued_request.plural",
+                              defaultValue: "\(requestCount) queued requests",
+                              comment: "Menubar Live Activity detail: more than one request waiting in the queue")
+                return LiveActivity(
                     menuBarTitle: "WAIT \(requestCount)",
-                    detail: "\(requestCount) queued request\(requestCount == 1 ? "" : "s")"
+                    detail: detail
                 )
             }
 
@@ -184,7 +195,11 @@ final class MenubarStatsPoller {
                 activity: NonStreamingActivity
             ) -> LiveActivity {
                 let elapsed = activity.elapsedSeconds.map(formatDuration)
-                let activityDetail = activity.detail ?? activity.kind ?? "Active request"
+                let activityDetail = activity.detail ?? activity.kind ?? String(
+                    localized: "menubar.live_activity.active_request",
+                    defaultValue: "Active request",
+                    comment: "Menubar Live Activity detail fallback when the server reports no further detail about a non-streaming request"
+                )
                 var detailParts = [modelID, activityDetail]
                 if let elapsed {
                     detailParts.append(elapsed)

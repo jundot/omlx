@@ -4883,6 +4883,18 @@
         }
       }
     },
+    "bench.throughput.text_export.no_results" : {
+      "comment" : "Exported text for the throughput benchmark when no results have been recorded yet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No results yet."
+          }
+        }
+      }
+    },
     "bench.throughput.upload.count_submitted" : {
       "comment" : "Inline counter shown during community upload; placeholder is the submitted count",
       "extractionState" : "extracted_with_value",
@@ -8904,26 +8916,86 @@
         }
       }
     },
-    "menubar.stats.no_api_key" : {
-      "comment" : "Disabled placeholder in the Serving Stats submenu when no API key is configured",
+    "menubar.live_activity.tokens_per_second" : {
+      "comment" : "Prefill throughput shown in the menubar Live Activity detail line",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Set OMLX_API_KEY to enable stats"
+            "value" : "%lld tok/s"
+          }
+        }
+      }
+    },
+    "menubar.live_activity.time_left" : {
+      "comment" : "Estimated time remaining shown in the menubar Live Activity detail line",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ left"
+          }
+        }
+      }
+    },
+    "menubar.live_activity.queued_request.singular" : {
+      "comment" : "Menubar Live Activity detail: exactly one request waiting in the queue",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld queued request"
+          }
+        }
+      }
+    },
+    "menubar.live_activity.queued_request.plural" : {
+      "comment" : "Menubar Live Activity detail: more than one request waiting in the queue",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld queued requests"
+          }
+        }
+      }
+    },
+    "menubar.live_activity.active_request" : {
+      "comment" : "Menubar Live Activity detail fallback when the server reports no further detail about a non-streaming request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Active request"
+          }
+        }
+      }
+    },
+    "menubar.stats.no_api_key" : {
+      "comment" : "Disabled placeholder shown wherever stats are unavailable because no API key is configured",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Set an API key in the Security screen to enable stats"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Задайте OMLX_API_KEY, чтобы включить статистику"
+            "value" : "Задайте ключ API на экране Безопасность, чтобы включить статистику"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "设置 OMLX_API_KEY 以启用统计"
+            "value" : "在“安全”页面设置 API 密钥以启用统计"
           }
         }
       }

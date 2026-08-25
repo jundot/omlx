@@ -4,7 +4,7 @@
                     <span>{{ t(label_key) }}</span>
                     <i data-lucide="info"
                        class="w-3 h-3 text-neutral-400 flex-shrink-0 cursor-help"
-                       @mouseenter="benchTip = { text: `{{ t(tooltip_key) }}`, el: $event.target }; $nextTick(() => { const r = $event.target.getBoundingClientRect(); const tip = $refs.benchTipEl; const tw = tip.offsetWidth; let x = r.left + r.width / 2 - tw / 2; if (x + tw > window.innerWidth - 8) x = window.innerWidth - 8 - tw; if (x < 8) x = 8; tip.style.left = x + 'px'; tip.style.top = (r.top - tip.offsetHeight - 8) + 'px'; })"
+                       @mouseenter="benchTip = { text: window.t('{{ tooltip_key }}'), el: $event.target }; $nextTick(() => { const r = $event.target.getBoundingClientRect(); const tip = $refs.benchTipEl; const tw = tip.offsetWidth; let x = r.left + r.width / 2 - tw / 2; if (x + tw > window.innerWidth - 8) x = window.innerWidth - 8 - tw; if (x < 8) x = 8; tip.style.left = x + 'px'; tip.style.top = (r.top - tip.offsetHeight - 8) + 'px'; })"
                        @mouseleave="benchTip = null"></i>
                 </div>
             </th>
@@ -71,18 +71,18 @@
                         <div class="flex items-center gap-3">
                             <i data-lucide="info" class="w-5 h-5 text-amber-600 flex-shrink-0"></i>
                             <div class="text-sm text-amber-900">
-                                Another throughput benchmark is running on
+                                {{ t('bench.other_active.banner_prefix') }}
                                 <span class="font-medium" x-text="benchOtherActive?.model_id"></span>.
                             </div>
                         </div>
                         <div class="flex items-center gap-2 flex-shrink-0">
                             <button @click="acceptOtherBench()"
                                     class="px-3 py-1.5 bg-amber-600 text-white text-xs font-medium rounded-lg hover:bg-amber-700 transition-all">
-                                View live
+                                {{ t('bench.other_active.view_live') }}
                             </button>
                             <button @click="dismissOtherBench()"
                                     class="px-3 py-1.5 text-amber-700 text-xs font-medium hover:text-amber-900 transition-all">
-                                Dismiss
+                                {{ t('bench.other_active.dismiss') }}
                             </button>
                         </div>
                     </div>
@@ -223,6 +223,7 @@
                                                        @change="saveExternalEndpoint()"
                                                        :disabled="benchRunning"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                                <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.external_api_key_storage_note') }}</span>
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_model') }}</label>
@@ -243,7 +244,7 @@
                                 <button x-show="!benchRunning"
                                         @click="startBenchmark()"
                                         :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
-                                        :title="benchOtherActive ? 'Another throughput benchmark is already running in this server.' : ''"
+                                        :title="benchOtherActive ? window.t('bench.other_active.tooltip') : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('bench.config.run_button') }}
@@ -414,11 +415,11 @@
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="upload-cloud" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Community Benchmark Upload</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.community.section_label') }}</span>
                             </div>
                             <div x-show="benchUploading && benchUploadResults.length === 0" class="flex items-center gap-2">
                                 <div class="w-4 h-4 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin"></div>
-                                <span class="text-xs text-neutral-500">Uploading...</span>
+                                <span class="text-xs text-neutral-500">{{ t('bench.community.uploading') }}</span>
                             </div>
                         </div>
                         <div class="px-6 py-4 space-y-2">
@@ -447,7 +448,7 @@
                                             <a :href="r.url" target="_blank"
                                                class="flex items-center gap-1.5 text-sm text-amber-600 hover:text-amber-700">
                                                 <i data-lucide="copy" class="w-4 h-4"></i>
-                                                <span>Already exists</span>
+                                                <span>{{ t('bench.community.already_exists') }}</span>
                                                 <i data-lucide="external-link" class="w-3 h-3"></i>
                                             </a>
                                         </template>

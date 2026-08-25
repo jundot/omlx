@@ -229,6 +229,9 @@ private struct ModelDirectoriesEditor: View {
                 .help(String(localized: "server.model_dirs.add.help",
                              defaultValue: "Add model directory",
                              comment: "Tooltip for the add model directory button"))
+                .accessibilityLabel(String(localized: "server.model_dirs.add.help",
+                             defaultValue: "Add model directory",
+                             comment: "Tooltip for the add model directory button"))
             }
 
             VStack(spacing: 7) {
@@ -264,6 +267,9 @@ private struct ModelDirectoriesEditor: View {
             .help(String(localized: "server.model_dirs.browse.help",
                          defaultValue: "Choose folder",
                          comment: "Tooltip for choosing a model directory"))
+            .accessibilityLabel(String(localized: "server.model_dirs.browse.help",
+                         defaultValue: "Choose folder",
+                         comment: "Tooltip for choosing a model directory"))
 
             Button {
                 vm.removeModelDirectory(at: index)
@@ -272,6 +278,9 @@ private struct ModelDirectoriesEditor: View {
             }
             .buttonStyle(.omlx(.plain, size: .small))
             .help(String(localized: "server.model_dirs.remove.help",
+                         defaultValue: "Remove model directory",
+                         comment: "Tooltip for removing a model directory"))
+            .accessibilityLabel(String(localized: "server.model_dirs.remove.help",
                          defaultValue: "Remove model directory",
                          comment: "Tooltip for removing a model directory"))
         }
