@@ -34,6 +34,47 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PREFILL_STEP = 2048
 
 
+def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a config that may be a dict or an attribute object.
+
+    ``model.args`` on a live mlx-lm model is an attribute object, not a
+    dict — a dict-shaped ``.get()`` predicate against it would silently
+    return the default for every field and no-op the check it guards.
+    Mirrors ``memory_monitor._cfg_get``.
+    """
+
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _model_config(model: Any) -> Any | None:
+    """The same config object ``set_model_info_from_model`` reads from
+    ``model``: ``model.config`` when present, else ``model.args``."""
+
+    if hasattr(model, "config"):
+        return model.config
+    return getattr(model, "args", None)
+
+
+def _kv_cache_replicated_across_tp(config: Any) -> bool:
+    """Whether every tensor-parallel member holds this model's full KV cache.
+
+    Mirrors ``planner._kv_cache_replicated_across_tp`` for the live-model
+    path here: MLA-style latent KV (``kv_lora_rank``/``qk_rope_head_dim``)
+    is not per-head, so a ``kv_bytes_per_token`` override for one must not
+    be divided by the TP degree the way per-head KV is.
+    See docs/cluster-hardening-and-optimization.md §B2.
+    """
+
+    def _pos_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    return _pos_int(_cfg_get(config, "kv_lora_rank", 0)) and _pos_int(
+        _cfg_get(config, "qk_rope_head_dim", 0)
+    )
+
+
 def rank_monitor(
     model: Any,
     *,
@@ -76,7 +117,7 @@ def rank_monitor(
     if tp > 1:
         kv_heads = max(1, kv_heads // tp)
         heads = max(1, heads // tp)
-        if kv_override:
+        if kv_override and not _kv_cache_replicated_across_tp(_model_config(model)):
             kv_override = float(kv_override) / tp
 
     monitor.set_model_info(

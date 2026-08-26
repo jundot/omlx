@@ -77,6 +77,83 @@ def test_a_stage_accepts_a_prompt_the_whole_model_would_refuse():
     _guard(layer_count=16, ceiling=ceiling).check(tokens, current_usage_bytes=usage)
 
 
+def _fake_set_model_info_from_model(kv_bytes_per_token):
+    """Stand in for the real extraction: hand the monitor a KV override
+    directly, so the MLA test doesn't need a real ``make_cache()`` cache
+    list just to reach the code path under test."""
+
+    def fake(monitor, _model):
+        monitor.set_model_info(
+            num_layers=4,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=4,
+            kv_bytes_per_token=kv_bytes_per_token,
+        )
+
+    return fake
+
+
+class _MLAConfig:
+    num_hidden_layers = 4
+    num_key_value_heads = 8
+    num_attention_heads = 64
+    head_dim = 128
+    hidden_size = 5120
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+
+
+class _MLAModel:
+    args = _MLAConfig()
+
+
+def test_an_mla_shaped_models_kv_override_is_not_divided_by_tp(monkeypatch):
+    """B2/1.6: kv_lora_rank + qk_rope_head_dim means every TP member holds
+    the full latent KV cache, not a per-head shard of it -- dividing a
+    kv_bytes_per_token override by tp under-charges prefill by that factor
+    and admits a prompt that OOMs. ``model.args`` is an attribute object,
+    not a dict, so this also guards against a dict-shaped predicate that
+    would silently no-op here via getattr-vs-get."""
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.set_model_info_from_model",
+        _fake_set_model_info_from_model(576.0),
+    )
+
+    monitor = rank_monitor(_MLAModel(), tensor_parallel_size=2)
+
+    assert monitor is not None
+    assert monitor._kv_bytes_per_token_override == pytest.approx(576.0)
+
+
+def test_a_non_mla_models_kv_override_is_still_divided_by_tp(monkeypatch):
+    """The MLA carve-out must not blind the guard to genuine per-head
+    KV overrides (e.g. a quantized-KV byte count)."""
+
+    class _Config:
+        num_hidden_layers = 4
+        num_key_value_heads = 8
+        num_attention_heads = 64
+        head_dim = 128
+        hidden_size = 5120
+
+    class _Model:
+        args = _Config()
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.set_model_info_from_model",
+        _fake_set_model_info_from_model(576.0),
+    )
+
+    monitor = rank_monitor(_Model(), tensor_parallel_size=2)
+
+    assert monitor is not None
+    assert monitor._kv_bytes_per_token_override == pytest.approx(288.0)
+
+
 def test_a_tensor_parallel_rank_is_charged_for_its_head_shard():
     whole = rank_monitor(_Model())
     half = rank_monitor(_Model(), tensor_parallel_size=2)
