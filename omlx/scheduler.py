@@ -12411,6 +12411,12 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    # ANE-computed KV is a different numeric lineage than
+                    # GPU-computed KV; the flag is set by the engine when
+                    # the ANE prefill patch actually activates.
+                    ane_prefill=bool(
+                        getattr(self, "_qwen35_ane_prefill_active", False)
+                    ),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)

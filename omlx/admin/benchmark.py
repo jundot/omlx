@@ -216,7 +216,7 @@ class BenchmarkRun:
 # stream is `upload_done` (or `error`). `upload_skipped` is the external
 # endpoint's last event: without it here, subscribers to an external run would
 # wait for an `upload_done` that never comes.
-_BENCH_TERMINAL_TYPES = frozenset({"upload_done", "upload_skipped", "error"})
+_BENCH_TERMINAL_TYPES = frozenset({"upload_done", "upload_skipped", "error", "cancelled"})
 
 
 @dataclass(frozen=True)
@@ -2098,7 +2098,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         await _send_event(
             run,
             {
-                "type": "error",
+                "type": "cancelled",
                 "message": "Benchmark cancelled by user",
             },
         )
@@ -2277,7 +2277,7 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
         await _send_event(
             run,
             {
-                "type": "error",
+                "type": "cancelled",
                 "message": "Benchmark cancelled by user",
             },
         )

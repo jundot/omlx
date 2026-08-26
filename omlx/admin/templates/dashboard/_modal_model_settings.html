@@ -6,9 +6,10 @@
          x-transition:enter-end="opacity-100"
          x-transition:leave="transition ease-in duration-150"
          x-transition:leave-start="opacity-100"
-         x-transition:leave-end="opacity-0">
+         x-transition:leave-end="opacity-0"
+         @keydown.escape.window="showModelSettingsModal && closeModelSettingsModal()">
         <!-- Backdrop -->
-        <div class="fixed inset-0 bg-black/50" @click="showModelSettingsModal = false"></div>
+        <div class="fixed inset-0 bg-black/50" @click="closeModelSettingsModal()"></div>
 
         <!-- Modal -->
         <div class="flex min-h-full items-center justify-center p-4">
@@ -27,7 +28,7 @@
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
                         <h4 class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
                     </div>
-                    <button @click="showModelSettingsModal = false"
+                    <button @click="closeModelSettingsModal()"
                             class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
                         <i data-lucide="x" class="w-5 h-5"></i>
                     </button>
@@ -683,7 +684,7 @@
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.mtp_compatibility_reason"></p>
                                             <button type="button"
-                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtplx_sidecar_available"
                                                     @click="importMtplxSidecar()"
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
@@ -1337,7 +1338,7 @@
 
                 <!-- Actions -->
                 <div class="flex items-center justify-end gap-3 mt-8">
-                    <button @click="showModelSettingsModal = false"
+                    <button @click="closeModelSettingsModal()"
                             class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">
                         {{ t('modal.model_settings.cancel') }}
                     </button>

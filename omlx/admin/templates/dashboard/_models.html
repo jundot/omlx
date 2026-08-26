@@ -164,9 +164,10 @@
                                             <div class="flex items-center justify-end gap-1 shrink-0">
                                                 <template x-if="managerModelInfo(model.name)">
                                                     <button @click="openModelSettingsFromManager(model.name)"
-                                                            class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all"
+                                                            :disabled="modelSettingsLoadingId === model.name"
+                                                            class="p-1.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                                                             :title="window.t('models.manager.settings_tooltip')">
-                                                        <i data-lucide="settings-2" class="w-4 h-4"></i>
+                                                        <i data-lucide="settings-2" class="w-4 h-4" :class="modelSettingsLoadingId === model.name && 'animate-spin'"></i>
                                                     </button>
                                                 </template>
                                                 <template x-if="hfDeleteConfirm !== model.name">
@@ -836,7 +837,7 @@
                                                     <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                             @click="retryHFDownload(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                                                            :title="window.t('models.queue.retry_tooltip') || 'Retry download'">
+                                                            :title="window.t('models.queue.retry_tooltip')">
                                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                     </button>
                                                     <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak
@@ -858,8 +859,15 @@
                         <!-- ===== ModelScope Source ===== -->
                         <div x-show="downloaderSource === 'ms'" x-cloak>
 
+                            <!-- MS Checking Banner: shown only while the availability
+                                 check is in flight, so the amber "unavailable" banner
+                                 below doesn't flash misleadingly before it resolves. -->
+                            <div x-show="msChecking" x-cloak class="bg-neutral-50 border border-neutral-200 rounded-2xl p-6 mb-6 text-center">
+                                <p class="text-sm text-neutral-500" x-text="window.t('models.downloader.ms_checking')"></p>
+                            </div>
+
                             <!-- MS Unavailable Banner -->
-                            <div x-show="!msAvailable" class="bg-amber-50 border border-amber-200 rounded-2xl p-6 mb-6 text-center">
+                            <div x-show="!msChecking && !msAvailable" x-cloak class="bg-amber-50 border border-amber-200 rounded-2xl p-6 mb-6 text-center">
                                 <i data-lucide="alert-triangle" class="w-8 h-8 text-amber-400 mx-auto mb-3"></i>
                                 <p class="text-sm text-amber-700" x-text="window.t('models.downloader.ms_unavailable')"></p>
                             </div>
@@ -1260,7 +1268,7 @@
                                                                 <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                                         @click="retryMSDownload(task.task_id)"
                                                                         class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                                                                        title="Retry download">
+                                                                        :title="window.t('models.queue.retry_tooltip')">
                                                                     <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                                 </button>
                                                                 <button x-show="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" x-cloak

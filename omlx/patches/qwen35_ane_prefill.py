@@ -3128,6 +3128,30 @@ def enable_qwen35_ane_prefill(
             "Experimental ANE down projection currently requires dual ANE; "
             "continuing without ANE down offload"
         )
+    # Dense-only guard: this patch offloads dense Qwen MLPs (and GDN input
+    # projections) to fixed-shape ANE programs. A MoE checkpoint routes most
+    # of each token through gathered per-expert weights the fixed-shape path
+    # cannot serve, yet its *shared-expert* MLPs still expose
+    # gate_proj/up_proj/down_proj and would match the candidate scan below —
+    # producing plausible-speed, silently corrupted output (verified live on
+    # qwen3_5_moe: pure "!!!" garbage on any prompt long enough to engage
+    # ANE, with the corrupted prefill then persisted into the SSD prefix
+    # cache). Refuse loudly instead. Structural detection, not a config
+    # string, so every caller (engines, tuner, benchmarks, raw scripts) is
+    # covered.
+    for module in model.modules() if hasattr(model, "modules") else ():
+        if hasattr(module, "switch_mlp") or hasattr(module, "experts") or (
+            "moe" in type(module).__name__.lower()
+        ):
+            logger.warning(
+                "Qwen ANE prefill requested on a MoE model (found %s); the "
+                "fixed-shape ANE path supports dense Qwen3.5/3.6/3.8 MLPs "
+                "only and corrupts routed-expert output — ANE prefill "
+                "skipped, running prefill on GPU",
+                type(module).__name__,
+            )
+            return 0
+
     candidates = []
     scanned_mlp = 0
     modules = model.modules() if hasattr(model, "modules") else ()

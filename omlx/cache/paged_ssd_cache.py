@@ -259,6 +259,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    ane_prefill: bool | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -267,6 +268,15 @@ def _cache_compat_signature(
         "block_size": int(block_size or 0),
         "layer_cache_types": list(layer_cache_types or []),
     }
+    # ANE prefill computes KV through a different numeric path (fp16
+    # fixed-shape ANE programs vs the GPU kernels), so blocks written under
+    # it are not interchangeable with GPU-computed blocks — and if the ANE
+    # path ever corrupts (seen live on an unsupported MoE model), an
+    # unstamped cache converts that transient corruption into persistent
+    # poisoning that survives disabling the setting. Only stamped when
+    # active so pre-existing signatures stay byte-identical.
+    if ane_prefill:
+        payload["ane_prefill"] = True
     # TurboQuant packed state width depends on the bit depth
     # (packed_width = ceil(head_dim * bits / 32)), so blocks written at
     # different bit depths are shape-incompatible (#2045). Only stamped
@@ -315,6 +325,19 @@ def cache_signature_for(
         cachelist_subtypes=cachelist_subtypes,
         gdn_sidecar_state_dtype=gdn_sidecar_state_dtype,
     )
+
+
+def _signature_ane_prefill(cache_signature: str) -> bool:
+    """True when a stored signature was stamped as ANE-prefill-computed."""
+    if not cache_signature:
+        return False
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("ane_prefill"))
 
 
 def _signature_turboquant_bits(cache_signature: str) -> float | None:
@@ -1693,6 +1716,11 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Whether Qwen ANE prefill is active for the live engine; learned
+        # together with the layer signature. ANE-computed KV is a different
+        # numeric path than GPU-computed KV, so blocks written under one
+        # must not be replayed under the other.
+        self._expected_ane_prefill: bool = False
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -2687,7 +2715,23 @@ class PagedSSDCacheManager(CacheManager):
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
+        if not self._signature_ane_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_ane_match(self, cache_signature: str) -> bool:
+        """True when a block's ANE-prefill provenance matches expectations.
+
+        Strict both ways: an ANE-off session must never replay
+        ANE-computed blocks (the poisoning vector this check exists for),
+        and an ANE-on session must not adopt GPU-computed blocks as its
+        own numeric lineage. Legacy blocks carry no stamp and count as
+        GPU-computed.
+        """
+        return _signature_ane_prefill(cache_signature) == bool(
+            self._expected_ane_prefill
+        )
 
     def _signature_bits_match(self, cache_signature: str) -> bool:
         """True when a block's recorded TurboQuant depth satisfies expectations.
@@ -2735,6 +2779,13 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_ane_match(cache_signature):
+            return (
+                "ANE prefill provenance: expected "
+                f"{'ANE' if self._expected_ane_prefill else 'GPU'}-computed, "
+                f"got {'ANE' if _signature_ane_prefill(cache_signature) else 'GPU'}"
+                "-computed"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2802,6 +2853,7 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+            ane_prefill=self._expected_ane_prefill or None,
         )
 
     def gdn_cache_signature_for(
@@ -4275,6 +4327,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        ane_prefill: bool = False,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4299,6 +4352,8 @@ class PagedSSDCacheManager(CacheManager):
             float(turboquant_kv_bits) if turboquant_kv_bits is not None else None
         )
 
+        new_ane = bool(ane_prefill)
+
         with self._lock:
             old_signature = self._expected_layer_cache_types
             old_canonical = _canonicalize_layer_cache_types(old_signature)
@@ -4306,10 +4361,12 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
+            ane_changed = new_ane != self._expected_ane_prefill
             if (
                 old_canonical == new_canonical
                 and not bits_changed
                 and not subtypes_changed
+                and not ane_changed
             ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
@@ -4318,16 +4375,18 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
+            self._expected_ane_prefill = new_ane
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "cachelist_subtypes=%s, ane_prefill=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
             "yes" if cachelist_subtypes else "no",
+            "yes" if new_ane else "no",
         )
         return True
 
@@ -4389,6 +4448,9 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if not self._signature_ane_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (

@@ -2003,6 +2003,11 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
+                    # Stamp SSD cache blocks with ANE provenance so KV
+                    # computed on this numeric path is never replayed into
+                    # a non-ANE session (and vice versa). Read by
+                    # refresh_ssd_layer_signature().
+                    scheduler._qwen35_ane_prefill_active = True
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 

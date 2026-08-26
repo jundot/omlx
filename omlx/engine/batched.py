@@ -586,6 +586,10 @@ class BatchedEngine(BaseEngine):
                 scheduler,
                 ane_prefill_sequence_length,
             )
+            # Stamp SSD cache blocks with ANE provenance so KV computed on
+            # this numeric path is never replayed into a non-ANE session
+            # (and vice versa). Read by refresh_ssd_layer_signature().
+            scheduler._qwen35_ane_prefill_active = True
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
