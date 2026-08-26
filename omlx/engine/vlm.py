@@ -102,6 +102,7 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
@@ -245,6 +246,30 @@ def _load_cohere2_moe_text_model(
         processor = _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
 
     return model, processor
+
+
+def _load_qwen4_exp_text_model(
+    model_name: str,
+    *,
+    trust_remote_code: bool = False,
+):
+    """Load Qwen4-Exp text inference without constructing its vision processor."""
+    from mlx_vlm.utils import get_model_path, load_model
+    from transformers import AutoTokenizer
+
+    model_path = get_model_path(model_name)
+    model = load_model(
+        model_path,
+        lazy=False,
+        strict=True,
+        trust_remote_code=trust_remote_code,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=trust_remote_code,
+    )
+    eos_token_id = getattr(getattr(model, "config", None), "eos_token_id", None)
+    return model, _attach_vlm_tokenizer_runtime(tokenizer, model_path, eos_token_id)
 
 
 _video_processor_patched = False
@@ -1586,6 +1611,11 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
+                if _read_config_model_type(self._model_name) == QWEN4_EXP_MODEL_TYPE:
+                    return _load_qwen4_exp_text_model(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
                 with _load_optiq_vision_sidecar_on_load(
                     Path(self._model_name)
@@ -2756,9 +2786,19 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
+        if model_type == COHERE2_MOE_MODEL_TYPE and (
+            num_images > 0 or num_audios > 0
+        ):
             raise InvalidRequestError(
                 "Cohere2 MoE is a text-only model and does not support "
+                "image or audio input.",
+                field="messages",
+            )
+        if model_type == QWEN4_EXP_MODEL_TYPE and (
+            num_images > 0 or num_audios > 0
+        ):
+            raise InvalidRequestError(
+                "Qwen4-Exp is running in text-only mode and does not support "
                 "image or audio input.",
                 field="messages",
             )

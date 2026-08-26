@@ -21,6 +21,13 @@ class _FakeQwenModel:
 _FakeQwenModel.__module__ = "mlx_lm.models.qwen3_5_moe"
 
 
+class _FakeQwen4Model:
+    pass
+
+
+_FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+
+
 class _FakeOtherModel:
     pass
 
@@ -136,6 +143,13 @@ def test_laguna_family_fused_bit_exact():
     out = model(x)
     mx.eval(out)
     assert mx.array_equal(ref, out).item()
+
+
+def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
+    model = _make_model(model_cls=_FakeQwen4Model, n_blocks=1)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    assert hasattr(model.blocks[0], "gate_up_proj")
 
 
 def test_env_kill_switch(monkeypatch):

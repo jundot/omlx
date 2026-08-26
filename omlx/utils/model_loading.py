@@ -616,6 +616,19 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "qwen4_exp":
+        from ..patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+            configure_qwen4_exp_runtime,
+        )
+
+        if apply_mlx_vlm_qwen4_exp_compat_patch():
+            logger.info(
+                "Qwen4-Exp mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+        configure_qwen4_exp_runtime(model_name)
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
