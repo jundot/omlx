@@ -25,9 +25,11 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..exceptions import ModelBusyError, ModelNotFoundError
+from ..model_discovery import estimate_text_only_model_size
 from .autoconfigure import (
     STRATEGIES,
     build_rdma_matrix,
+    candidate_tensor_parallel_sizes,
     choose_backend,
     choose_parallelism,
     describe_preflight,
@@ -49,12 +51,14 @@ from .discovery import (
     record_peer_transports,
     verify_pairing_token,
 )
+from .doctor import run_fabric_doctor
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain
-from .incidents import Severity, get_cluster_incidents
+from .guidance import explain, explain_code
+from .incidents import Incident, Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    evict_remote_local_models,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
@@ -88,7 +92,8 @@ from .planner import (
     remote_model_layout,
     synthetic_model_layout,
 )
-from .probe import collect_cluster_status
+from .preconditions import ROW_IDS, readiness_rows
+from .probe import _system_memory_bytes, collect_cluster_status
 from .registry import get_cluster_registry
 from .runtime import read_runtime_markers
 from .staging import (
@@ -97,12 +102,18 @@ from .staging import (
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
+    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
     remote_model_dir,
     remote_model_staging_inventory,
     stage_files_from_source,
     stage_manifest,
+)
+from .start_job import (
+    StartJobConflictError,
+    get_start_job_store,
+    run_start_job,
 )
 from .strategy_benchmarks import get_strategy_benchmark_store
 from .supervisor import run_worker_smoke
@@ -116,6 +127,7 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
+from .vpn import detect_vpn, full_tunnel_warning, hostile_networks
 from .worker_bundle import (
     build_cuda_join_command,
     cuda_bootstrap_program,
@@ -344,22 +356,23 @@ def _record_cluster_incident(
     source: str = "coordinator",
     job_id: str | None = None,
     deployment_id: str | None = None,
-) -> None:
+) -> Incident | None:
     """Best-effort incident funnel for the routes layer.
 
     Failure paths call this immediately before re-raising, so nothing here may
     mask the original error: an unconfigured store (worker-only installs,
     bare test apps) or a failed save is swallowed. The message is redacted at
-    record time so the stored copy is already safe to serve.
+    record time so the stored copy is already safe to serve. Returns the
+    recorded incident (the B2 job runner links it to the job) or ``None``.
     """
 
     try:
         store = get_cluster_incidents()
     except RuntimeError:
-        return
+        return None
     redacted = str(_redact_diagnostic(str(message)))
     try:
-        store.record(
+        return store.record(
             severity,
             source,
             state_code,
@@ -369,7 +382,198 @@ def _record_cluster_incident(
             deployment_id=deployment_id,
         )
     except Exception:  # noqa: BLE001 - logging must never outrank the failure
+        return None
+
+
+# A full-tunnel VPN is a standing condition, not an event: one INFO incident
+# the first time each host shows it, not one per autoconfigure poll. In-memory
+# is enough — a server restart re-announcing a still-hungry VPN is correct.
+_VPN_FULL_TUNNEL_SEEN: set[str] = set()
+_VPN_FULL_TUNNEL_LOCK = threading.Lock()
+
+# The freshest admin port each peer advertised in its ClusterStatus (C5).
+# There is no server-side peer registry yet (Section A's PairedPeer will own
+# this field); until then, every capability probe that flows through this
+# module deposits the advertised port here so /node-budgets can aim the fast
+# ceiling probe at the peer's real server instead of guessing. In-memory is
+# correct: a restart simply re-learns the port from the next probe.
+_PEER_ADMIN_PORTS: dict[str, int] = {}
+_PEER_ADMIN_PORTS_LOCK = threading.Lock()
+# One WARN per dead advertised port, not one per dashboard poll.
+_CEILING_FALLBACK_SEEN: set[tuple[str, int]] = set()
+# The physical RAM each peer last reported in its ClusterStatus, deposited by
+# the same capability probes that teach the admin port (B5). /node-budgets
+# uses it as the top line of the memory-budget arithmetic; a peer that has
+# not been probed yet simply renders without the physical line.
+_PEER_PHYSICAL_BYTES: dict[str, int] = {}
+
+
+def _peer_key(ssh_target: str) -> str:
+    """One cache key for ``studio.local`` and ``user@studio.local`` alike."""
+
+    return ssh_target.strip().rsplit("@", 1)[-1].lower()
+
+
+def _note_peer_admin_port(probe_result: Any) -> None:
+    """Remember what a capability probe just saw a peer advertise.
+
+    Deposits the advertised admin port (C5) and the peer's physical RAM (B5,
+    the top line of the memory-budget arithmetic). Best-effort by design: a
+    probe payload without either field (older peer, hardware-inventory
+    fallback) simply teaches nothing — the fast path keeps its legacy port
+    guesses and the budget row renders without the physical line.
+    """
+
+    if not isinstance(probe_result, dict):
         return
+    status = probe_result.get("status")
+    if not isinstance(status, dict):
+        return
+    node = status.get("node")
+    if not isinstance(node, dict):
+        return
+    ssh_target = str(probe_result.get("ssh") or "")
+    if not ssh_target:
+        return
+    try:
+        port = int(node.get("admin_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    try:
+        physical = int(node.get("physical_memory_bytes") or 0)
+    except (TypeError, ValueError):
+        physical = 0
+    if port <= 0 and physical <= 0:
+        return
+    with _PEER_ADMIN_PORTS_LOCK:
+        if port > 0:
+            _PEER_ADMIN_PORTS[_peer_key(ssh_target)] = port
+        if physical > 0:
+            _PEER_PHYSICAL_BYTES[_peer_key(ssh_target)] = physical
+
+
+def _advertised_admin_port(ssh_target: str) -> int:
+    with _PEER_ADMIN_PORTS_LOCK:
+        return _PEER_ADMIN_PORTS.get(_peer_key(ssh_target), 0)
+
+
+def _peer_physical_bytes(ssh_target: str) -> int:
+    with _PEER_ADMIN_PORTS_LOCK:
+        return _PEER_PHYSICAL_BYTES.get(_peer_key(ssh_target), 0)
+
+
+# Drift is a standing condition too: one WARN per (subnet, kind), not one per
+# fabric read. A restart re-announcing still-drifted addressing is correct.
+_FABRIC_DRIFT_SEEN: set[tuple[str, str]] = set()
+_FABRIC_DRIFT_LOCK = threading.Lock()
+
+
+def _detect_fabric_drift(
+    hosts: list[str], interfaces: dict[str, Any]
+) -> dict[str, Any] | None:
+    """C5's drift watchdog, run where fresh interface readings are in hand.
+
+    Returns the ``DriftFinding`` as plain data (plus the intent's
+    ``addressing``) for the caller to act on, or None when there is no
+    recorded intent for this pair, the store is unconfigured, or live
+    addressing still matches the record. Poll-driven by design — no
+    wake/network-change watcher exists or is wanted; one dashboard tick is
+    when anyone can act on drift anyway.
+    """
+
+    from .fabric_intent import detect_drift, get_fabric_intent
+
+    try:
+        store = get_fabric_intent()
+    except RuntimeError:
+        return None
+    intent = store.current()
+    if intent is None or frozenset(intent.hosts) != frozenset(hosts):
+        return None
+    try:
+        intent_network = ipaddress.ip_network(intent.subnet)
+    except ValueError:
+        return None
+    try:
+        hostile = hostile_networks(hosts, interfaces=interfaces)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        hostile = ()
+    # The intent's own subnet sits on an interface, so the raw hostile set
+    # always contains it; that is not a collision with itself (the same
+    # ``own_networks`` filter configure_link applies).
+    collision_set = tuple(
+        net
+        for net in hostile
+        if net.version != intent_network.version
+        or not net.subnet_of(intent_network)
+    )
+
+    def collides(candidate: ipaddress.IPv4Network) -> bool:
+        return any(
+            candidate.version == net.version and candidate.overlaps(net)
+            for net in collision_set
+        )
+
+    finding = detect_drift(intent, interfaces.values(), collides=collides)
+    if finding is None:
+        return None
+    return {
+        "kind": finding.kind,
+        "live": finding.live,
+        "expected": finding.expected,
+        "auto_restore": finding.auto_restore,
+        "incident": finding.incident,
+        "addressing": intent.addressing,
+    }
+
+
+def _note_fabric_drift(fabric: dict[str, Any]) -> None:
+    """Act on a drift finding: confess the ones that need consent (C5).
+
+    ``auto_restore`` findings (networksetup-recorded intent, collision check
+    still passing) are deliberately not incidents and not acted on here: the
+    service configuration persists, and the next link setup re-asserts the
+    recorded intent via ``configure_link``'s tier 2 without any new consent.
+    Everything else becomes one deduped WARN inviting a consented Fabric
+    Doctor re-address — never a silent privileged action.
+    """
+
+    drift = fabric.get("drift")
+    if not isinstance(drift, dict) or drift.get("auto_restore"):
+        return
+    message = str(drift.get("incident") or "")
+    if not message:
+        return
+    key = (str(drift.get("expected") or ""), str(drift.get("kind") or ""))
+    with _FABRIC_DRIFT_LOCK:
+        if key in _FABRIC_DRIFT_SEEN:
+            return
+        _FABRIC_DRIFT_SEEN.add(key)
+    _record_cluster_incident(Severity.WARN, "fabric_drift", message)
+
+
+def _note_full_tunnel_vpns(fabric: dict[str, Any]) -> None:
+    """Record the C4 pre-warning for each newly seen full-tunnel VPN host.
+
+    Detection only warns and steers address selection; the incident exists so
+    the condition survives page reloads next to the banner. Severity is INFO
+    because the selection below is expected to route around the tunnel.
+    """
+
+    for entry in fabric.get("hosts") or ():
+        vpn = entry.get("vpn") or {}
+        if not vpn.get("full_tunnel"):
+            continue
+        host = str(entry.get("host") or "")
+        with _VPN_FULL_TUNNEL_LOCK:
+            if host in _VPN_FULL_TUNNEL_SEEN:
+                continue
+            _VPN_FULL_TUNNEL_SEEN.add(host)
+        _record_cluster_incident(
+            Severity.INFO,
+            "vpn_full_tunnel",
+            full_tunnel_warning(host, str(vpn.get("client") or "")),
+        )
 
 
 class ClusterPlanNodeRequest(BaseModel):
@@ -472,6 +676,11 @@ class ClusterDeploymentRequest(BaseModel):
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # Explicit opt-in to deploy a VLM-shaped checkpoint text-only: only its
+    # language model runs across ranks and vision stays disabled. Without the
+    # flag such checkpoints keep failing closed — silently dropping vision is
+    # treated as a bug (#1261/#1426), so the choice must be the user's.
+    text_only: bool = False
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -772,6 +981,108 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
     }
 
 
+def _strategy_support(model: Any, node_count: int) -> dict[str, dict[str, Any]]:
+    """Which parallelism modes planning would accept for this model, and why not.
+
+    A mode is ``supported`` exactly when an explicit request for it would not
+    raise ``PlanningError`` in ``_create_cluster_plan``/``choose_parallelism``
+    for this model and node count, so the dashboard can disable a radio at
+    plan time instead of offering a click that 400s (B5, failure #10).
+
+    **Parallelism authority (B5 decision):** plan-time gating reads
+    ``ModelLayout.supports_tensor_parallel`` / ``supports_pipeline`` — the
+    config-cheap flags computed once when the model profile is built — plus
+    the same divisor arithmetic ``choose_parallelism`` refuses with
+    (``candidate_tensor_parallel_sizes``). It deliberately does NOT consult
+    ``pipeline_compat.pipeline_assignment_is_honored()``: that answers a
+    different, narrower question (does the *installed runtime hook* consume an
+    unequal layer assignment), imports mlx_lm model modules, and stays the
+    load-time enforcement inside the worker path. The ``PlanningError`` paths
+    remain the API backstop for non-GUI callers — this gate is UX, not the
+    safety boundary. (B4's ``preconditions.py``, once it exists, inherits
+    this note.)
+    """
+
+    supported = {"supported": True, "reason": ""}
+    if (
+        node_count > 1
+        and model.source != "synthetic"
+        and not model.supports_pipeline
+    ):
+        pipeline = {
+            "supported": False,
+            "reason": (
+                "Pipeline parallelism is not possible for this model: the "
+                "architecture does not implement the MLX-LM pipeline forward "
+                "path."
+            ),
+        }
+    else:
+        pipeline = dict(supported)
+    tensor_candidates = [
+        size
+        for size in candidate_tensor_parallel_sizes(model, node_count)
+        if size > 1
+    ]
+    if tensor_candidates:
+        tensor = dict(supported)
+    elif node_count < 2:
+        tensor = {
+            "supported": False,
+            "reason": "Tensor parallelism needs at least two Macs.",
+        }
+    elif model.source == "synthetic":
+        tensor = {
+            "supported": False,
+            "reason": (
+                "Planning by size only: tensor parallelism needs the "
+                "downloaded model's architecture to know whether its heads "
+                "divide evenly."
+            ),
+        }
+    elif not model.supports_tensor_parallel:
+        tensor = {
+            "supported": False,
+            "reason": (
+                "Tensor parallelism is not possible for this model: the "
+                "architecture does not implement sharding in MLX-LM."
+            ),
+        }
+    else:
+        tensor = {
+            "supported": False,
+            "reason": (
+                f"No split divides {node_count} Macs across every "
+                "architecture-specific attention/Mamba head group "
+                f"{list(model.tensor_parallel_divisors)}."
+            ),
+        }
+    return {
+        "auto": {
+            "supported": tensor["supported"] or pipeline["supported"],
+            "reason": (
+                ""
+                if tensor["supported"] or pipeline["supported"]
+                else "Neither tensor nor pipeline parallelism can run this model."
+            ),
+        },
+        "tensor": tensor,
+        "pipeline": pipeline,
+    }
+
+
+def _strategies_payload(model: Any, node_count: int) -> dict[str, dict[str, Any]]:
+    """The static strategy descriptions merged with this plan's live gating.
+
+    A per-response copy: the module-level ``STRATEGIES`` labels never carry a
+    ``supported`` verdict of their own, and older dashboard code that only
+    reads ``label``/``summary``/``detail`` keeps working unchanged.
+    """
+
+    support = _strategy_support(model, node_count)
+    return {key: {**STRATEGIES.get(key, {}), **support[key]} for key in support}
+
+
 def _create_cluster_plan(request: ClusterPlanRequest):
     if (
         request.tensor_parallel_size > 1
@@ -930,6 +1241,12 @@ def _resolve_fabric(
     """
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
+    # VPN posture rides along on the reading already in hand. It is a warning
+    # and a selection hint only — a clean addressing read costs no extra SSH,
+    # and nothing here promotes the link past what the probes below prove.
+    vpn_profiles = {
+        host: detect_vpn(host, interfaces=interfaces[host]) for host in hosts
+    }
     verify = verifier or verify_link_reachability
     verified_links: dict[
         tuple[tuple[str, str, str], ...], tuple[bool, str]
@@ -1008,6 +1325,10 @@ def _resolve_fabric(
         "backend_reason": reason,
         "blocker": blocker,
         "fell_back": fell_back,
+        # C5 drift watchdog: the recorded fabric intent compared against the
+        # interface reading already in hand. Data only — the autoconfigure
+        # caller decides between silence, restore, and a WARN incident.
+        "drift": _detect_fabric_drift(hosts, interfaces),
         "link": (unresolved or links[0]).to_dict(),
         "rdma": rdma,
         "hosts": [
@@ -1016,6 +1337,7 @@ def _resolve_fabric(
                 "ips": [link.source.address] if link.source else [],
                 "interface": link.source.interface if link.source else "",
                 "rdma": list(matrix.rows[index]) if backend != "ring" else [],
+                "vpn": vpn_profiles[host].to_dict(),
             }
             for index, (host, link) in enumerate(zip(hosts, links))
         ],
@@ -1054,6 +1376,16 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     dashboard can activate as-is. This endpoint deliberately does not start
     processes itself: the dashboard only posts its activation block after all
     preflight and staging checks report ready.
+    """
+
+    return await _autoconfigure(request)
+
+
+async def _autoconfigure(request: ClusterAutoconfigureRequest) -> dict[str, Any]:
+    """One autoconfigure pass — the endpoint body, unchanged (B2 refactor).
+
+    Kept as a plain callable so the start-job runner can run the same ladder
+    the ``/autoconfigure`` endpoint serves, byte-identically.
     """
 
     _validate_cluster_hosts(request.hosts)
@@ -1152,6 +1484,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 peer_statuses[host.node_id] = await asyncio.to_thread(
                     probe_remote_host, host.ssh
                 )
+                _note_peer_admin_port(peer_statuses[host.node_id])
             except (DistributedLaunchError, OSError, ValueError):
                 peer_statuses[host.node_id] = None
     issues = preflight_issues(
@@ -1278,6 +1611,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 warnings.append(f"Address discovery failed: {fabric_error}")
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
+        # B1 consumer of the C4 detection: the pre-warning must survive page
+        # reloads, so the first sighting per host becomes an INFO incident.
+        _note_full_tunnel_vpns(fabric)
+        # B1 consumer of the C5 watchdog: drifted addressing that needs a
+        # consented re-address becomes one WARN; auto-restorable drift stays
+        # silent (configure_link tier 2 re-asserts it on the next setup).
+        _note_fabric_drift(fabric)
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
@@ -1444,7 +1784,10 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         },
         "performance_probe": performance_probe,
         "staging": staging,
-        "strategies": STRATEGIES,
+        # Each strategy's description plus whether this model can run it and
+        # why not (B5): the dashboard disables an unsupported radio with the
+        # reason inline instead of letting the click 400.
+        "strategies": _strategies_payload(model, len(nodes)),
         "preflight": _redact_diagnostic(preflight_summary),
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
@@ -1478,10 +1821,269 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     }
 
 
+# ---------------------------------------------------------------------------
+# B4: GET /readiness — the "why can't I start?" precondition rows.
+#
+# Responses are cached 10 s server-side so B2's job poll and the dashboard's
+# discovery tick never stampede SSH with the same five probes (house style:
+# _PEER_ADMIN_PORTS above). The cache key is the exact evidence question —
+# (hosts, model) — and served entries carry their age so the client can
+# stale-gray anything older than 30 s (design A.6's live-data rule).
+_READINESS_TTL_S = 10.0
+_READINESS_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_READINESS_CACHE_LOCK = threading.Lock()
+
+
+def _readiness_clock() -> float:
+    """Monotonic seconds. A seam so cache-TTL tests can advance time."""
+
+    return time.monotonic()
+
+
+async def _readiness_peers(hosts: list[str]) -> list[dict[str, Any]]:
+    """SSH reachability per host, probed in parallel with bounded timeouts.
+
+    ``probe_remote_host`` already carries its own SSH timeout; a host that
+    cannot be probed becomes evidence, never an exception.
+    """
+
+    async def _one(host: str) -> dict[str, Any]:
+        if _local_ssh_target(host):
+            return {"host": host, "reachable": True, "detail": "this Mac"}
+        try:
+            status = await asyncio.to_thread(probe_remote_host, host)
+            _note_peer_admin_port(status)
+            return {"host": host, "reachable": True, "detail": ""}
+        except (DistributedLaunchError, OSError, ValueError) as exc:
+            return {"host": host, "reachable": False, "detail": str(exc)}
+
+    return list(await asyncio.gather(*(_one(host) for host in hosts)))
+
+
+async def _readiness_fabric(
+    hosts: list[str],
+) -> tuple[bool | None, Any, str]:
+    """(fabric_ok, shared-link evidence, human detail) for the fabric row.
+
+    Reuses ``_resolve_fabric`` — the exact reading ``_autoconfigure`` gates
+    Start on — rather than a second probe path that could disagree with it.
+    """
+
+    try:
+        fabric = await asyncio.to_thread(_resolve_fabric, hosts)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, None, str(exc)
+    link = fabric.get("link") or {}
+    shared = SimpleNamespace(
+        ok=bool(link.get("ok")), kind=str(link.get("kind") or "")
+    )
+    if fabric.get("ok"):
+        endpoints = " ⇄ ".join(
+            (entry.get("ips") or [""])[0] or str(entry.get("host") or "")
+            for entry in fabric.get("hosts") or ()
+        )
+        label = str(link.get("kind") or fabric.get("backend") or "link")
+        return True, shared, f"reachable · {endpoints} · {label}"
+    blocker = str(
+        fabric.get("blocker")
+        or link.get("reason")
+        or "the cluster route did not verify"
+    )
+    return False, shared, blocker
+
+
+async def _cluster_readiness_report(
+    hosts: list[str], model_path: str
+) -> dict[str, Any]:
+    """Assemble B4's evidence and compose the five rows.
+
+    Shared verbatim by ``GET /readiness`` and ``omlx cluster status
+    --explain`` (design B.6: the CLI and the GUI can never tell different
+    stories). Every sub-step is one `_autoconfigure` already runs —
+    ``probe_remote_host``, ``_resolve_fabric``, the model layout, the
+    B5 budget probe, ``stage_manifest`` — never a re-implementation.
+    """
+
+    peers = await _readiness_peers(hosts)
+    remote_peers = [
+        peer for peer in peers if not _local_ssh_target(peer["host"])
+    ]
+
+    fabric_required = len(hosts) > 1
+    fabric_ok: bool | None = None
+    shared_link: Any = None
+    fabric_detail = ""
+    if fabric_required:
+        fabric_ok, shared_link, fabric_detail = await _readiness_fabric(hosts)
+
+    model_error = ""
+    layout = None
+    required_bytes = 0
+    strategies: dict[str, Any] | None = None
+    if model_path:
+        try:
+            layout = await asyncio.to_thread(
+                inspect_safetensors_layout, model_path
+            )
+            required_bytes = int(layout.total_weight_bytes)
+            strategies = _strategies_payload(layout, len(hosts))
+        except (OSError, RuntimeError, ValueError) as exc:
+            model_error = str(exc)
+
+    budgets: list[dict[str, Any]] = []
+    budget_errors: list[str] = []
+
+    async def _budget(host: str) -> dict[str, Any] | None:
+        try:
+            return await _node_budget_evidence(host, host)
+        except (DistributedLaunchError, OSError, ValueError) as exc:
+            budget_errors.append(f"{host}: {exc}")
+            return None
+
+    for result in await asyncio.gather(*(_budget(host) for host in hosts)):
+        if result is not None:
+            budgets.append(result)
+
+    plan_error = ""
+    staging: dict[str, Any] | None = None
+    if (
+        layout is not None
+        and not model_error
+        and len(budgets) == len(hosts)
+    ):
+        node_budgets = [
+            NodeBudget(
+                node_id=str(budget["node_id"]),
+                capacity_bytes=int(budget["capacity_bytes"]),
+                reserve_bytes=int(budget["reserve_bytes"]),
+                role=str(budget.get("role") or ""),
+                rank=rank,
+            )
+            for rank, budget in enumerate(budgets)
+        ]
+        try:
+            if (
+                len(hosts) > 1
+                and not layout.supports_pipeline
+                and layout.supports_tensor_parallel
+            ):
+                plan = plan_hybrid(
+                    layout, node_budgets, tensor_parallel_size=len(hosts)
+                )
+            else:
+                plan = plan_unequal_pipeline(layout, node_budgets)
+            staging = await asyncio.to_thread(
+                stage_manifest,
+                model_path,
+                plan.assignments,
+                {host: host for host in hosts},
+                source_host="127.0.0.1",
+            )
+        except PlanningError as exc:
+            plan_error = str(exc)
+        except (
+            ValueError,
+            RuntimeError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            staging = {"error": str(exc), "ready": False}
+    elif budget_errors and required_bytes > 0 and not model_error:
+        plan_error = "not every Mac reported a usable budget: " + "; ".join(
+            budget_errors
+        )
+
+    report = readiness_rows(
+        peers=remote_peers,
+        fabric_required=fabric_required,
+        shared_link=shared_link,
+        fabric_ok=fabric_ok,
+        fabric_detail=fabric_detail,
+        staging=staging,
+        budgets=budgets,
+        required_bytes=required_bytes,
+        plan_error=plan_error,
+        strategies=strategies,
+        model_error=model_error,
+        ages={row_id: 0.0 for row_id in ROW_IDS},
+    )
+    payload = report.to_dict()
+    payload["hosts"] = list(hosts)
+    payload["model"] = model_path
+    # Surface 1 of design B.4: the per-node status strip, state named in
+    # text (never color-only).
+    payload["nodes"] = [
+        {
+            "host": peer["host"],
+            "state": "reachable" if peer["reachable"] else "unreachable",
+            "detail": peer["detail"],
+        }
+        for peer in peers
+    ]
+    payload["age_s"] = 0.0
+    return _redact_diagnostic(payload)
+
+
+def _readiness_with_age(
+    payload: dict[str, Any], elapsed: float
+) -> dict[str, Any]:
+    """A served copy whose evidence ages include time spent in the cache."""
+
+    aged = json.loads(json.dumps(payload))
+    aged["age_s"] = round(elapsed, 1)
+    for row in aged.get("rows") or []:
+        row["evidence_age_s"] = round(
+            float(row.get("evidence_age_s") or 0.0) + elapsed, 1
+        )
+    return aged
+
+
+@router.get("/readiness")
+async def cluster_readiness(
+    hosts: str = Query(...), model: str = Query(default="")
+):
+    """Why Start is or is not green: one row per precondition (B4).
+
+    ``ready`` is the conjunction from design B.2: ``all(ssh_ok, fabric >=
+    reachable, model_staged, budget_fits_live, strategy_compatible)``.
+    """
+
+    host_list = [host.strip() for host in hosts.split(",") if host.strip()]
+    if not host_list:
+        raise HTTPException(status_code=400, detail="hosts is required")
+    try:
+        host_list = [
+            host if _local_ssh_target(host) else validate_ssh_target(host)
+            for host in host_list
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    key = (",".join(host_list), model.strip())
+    now = _readiness_clock()
+    with _READINESS_CACHE_LOCK:
+        cached = _READINESS_CACHE.get(key)
+    if cached is not None and now - cached[0] < _READINESS_TTL_S:
+        return _readiness_with_age(cached[1], now - cached[0])
+    payload = await _cluster_readiness_report(host_list, model.strip())
+    with _READINESS_CACHE_LOCK:
+        stale_before = _readiness_clock() - _READINESS_TTL_S
+        for cache_key in [
+            k for k, (ts, _) in _READINESS_CACHE.items() if ts < stale_before
+        ]:
+            _READINESS_CACHE.pop(cache_key, None)
+        _READINESS_CACHE[key] = (_readiness_clock(), payload)
+    return _readiness_with_age(payload, 0.0)
+
+
 class ClusterGuidanceRequest(BaseModel):
-    """A failure message the dashboard wants turned into next steps."""
+    """A failure message the dashboard wants turned into next steps.
+
+    ``code`` is the structured key (Guidance.code / readiness-ladder state
+    codes); when present it wins over message-regex matching.
+    """
 
     message: str = Field(default="", max_length=4096)
+    code: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/guidance")
@@ -1493,7 +2095,7 @@ async def cluster_guidance(request: ClusterGuidanceRequest):
     already depend on, and an explanation is only ever needed after a failure.
     """
 
-    return explain(request.message).to_dict()
+    return explain_code(request.code, request.message).to_dict()
 
 
 class ClusterStageRequest(BaseModel):
@@ -1792,6 +2394,389 @@ async def cluster_stage_status(job_id: str):
     return snapshot
 
 
+# --- B2: Start Cluster as a persisted server-owned job -----------------------
+#
+# The guard below is shared between the legacy sync activation endpoint and
+# the async job path. It is a threading.Lock around a counter, never held
+# across an await: both paths run on the same event loop, so holding a lock
+# for the duration of an activation would deadlock the server.
+_ACTIVATION_GUARD_LOCK = threading.Lock()
+_SYNC_ACTIVATIONS_IN_FLIGHT = 0
+
+# Strong references to running job tasks: a bare create_task result may be
+# garbage-collected mid-flight.
+_START_JOB_TASKS: dict[str, asyncio.Task] = {}
+
+
+def _claim_sync_activation() -> None:
+    """Admit one legacy ``POST /deployments`` call, or refuse with a 409."""
+
+    global _SYNC_ACTIVATIONS_IN_FLIGHT
+    with _ACTIVATION_GUARD_LOCK:
+        active = get_start_job_store().active_job()
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A Start Cluster job ({active['job_id']}) is already "
+                    "running; wait for it to finish or watch "
+                    f"/admin/api/cluster/start-jobs/{active['job_id']}."
+                ),
+            )
+        _SYNC_ACTIVATIONS_IN_FLIGHT += 1
+
+
+def _release_sync_activation() -> None:
+    global _SYNC_ACTIVATIONS_IN_FLIGHT
+    with _ACTIVATION_GUARD_LOCK:
+        _SYNC_ACTIVATIONS_IN_FLIGHT = max(0, _SYNC_ACTIVATIONS_IN_FLIGHT - 1)
+
+
+def _start_job_incident(
+    severity: Severity,
+    state_code: str,
+    message: str,
+    *,
+    job_id: str,
+    deployment_id: str | None = None,
+) -> str | None:
+    """The job runner's incident funnel; returns the incident id or None."""
+
+    incident = _record_cluster_incident(
+        severity,
+        state_code,
+        message,
+        job_id=job_id,
+        deployment_id=deployment_id,
+    )
+    return incident.id if incident is not None else None
+
+
+def _describe_start_job_error(exc: BaseException) -> str:
+    """The user-facing sentence for a failed phase, HTTP detail included."""
+
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc) or exc.__class__.__name__
+
+
+async def _configure_start_link(hosts: list[str]) -> None:
+    """The link phase of the ladder, exactly as the dashboard ran it.
+
+    ``GET /link-status`` then, when setup is available, ``configure_link``
+    per physical pair — the same pair selection ``prepareClusterLink()``
+    used: detected Thunderbolt/RDMA pairs, or the only pair there is.
+    """
+
+    if len(hosts) < 2:
+        return
+    status = await asyncio.to_thread(assess_link, hosts)
+    if not status.setup_available:
+        return
+    pairs: list[tuple[str, str]] = []
+    if len(hosts) == 2:
+        pairs.append((hosts[0], hosts[1]))
+    else:
+        try:
+            matrix = await asyncio.to_thread(detect_cluster_transports, hosts)
+            seen: set[tuple[str, ...]] = set()
+            for transport in matrix.transports:
+                if transport.kind not in {"thunderbolt", "rdma"}:
+                    continue
+                endpoints = (transport.source_node_id, transport.peer_node_id)
+                if any(endpoint not in hosts for endpoint in endpoints):
+                    continue
+                key = tuple(sorted(endpoints))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append(endpoints)
+        except (OSError, RuntimeError):
+            pairs = []
+        if not pairs:
+            raise RuntimeError(
+                "oMLX could not identify the physical links between these Macs."
+            )
+    for pair in pairs:
+        await asyncio.to_thread(configure_link, list(pair))
+
+
+async def _start_job_staging(proposal: dict[str, Any]) -> str:
+    """Spawn the existing staging job for the proposal; return its job id."""
+
+    activation = ClusterDeploymentRequest.model_validate(proposal["activation"])
+    snapshot = await cluster_stage(ClusterStageRequest(activation=activation))
+    return str(snapshot["job_id"])
+
+
+async def _wait_for_staging_job(staging_job_id: str) -> dict[str, Any]:
+    """Poll the staging job registry until the copy finishes either way."""
+
+    while True:
+        snapshot = _staging_job_snapshot(staging_job_id)
+        if snapshot is None:
+            raise RuntimeError(
+                "the staging job disappeared before it finished"
+            )
+        if snapshot.get("status") in {"completed", "failed"}:
+            return snapshot
+        await asyncio.sleep(1.0)
+
+
+async def _run_cluster_start_job(
+    job_id: str, request: ClusterAutoconfigureRequest
+) -> None:
+    """Wire the routes-layer phase callables into the start-job runner.
+
+    Every phase resolves its target through this module's globals at call
+    time, so tests can monkeypatch ``_autoconfigure`` / ``_run_staging_job``
+    / ``_activate`` and drive the same orchestration the server runs.
+    """
+
+    hosts = [host.ssh for host in request.hosts]
+    await run_start_job(
+        get_start_job_store(),
+        job_id,
+        link_setup=lambda: _configure_start_link(hosts),
+        autoconfigure=lambda: _autoconfigure(request),
+        start_staging=lambda proposal: _start_job_staging(proposal),
+        wait_staging=lambda staging_job_id: _wait_for_staging_job(
+            staging_job_id
+        ),
+        activate=lambda activation: _activate(
+            ClusterDeploymentRequest.model_validate(activation)
+        ),
+        record_incident=_start_job_incident,
+        describe_error=_describe_start_job_error,
+    )
+
+
+def _schedule_start_job(
+    job_id: str, request: ClusterAutoconfigureRequest
+) -> None:
+    """Run the job on the server's event loop — never a thread.
+
+    The activation phase is async and touches the engine pool, so the job
+    must live where the pool lives.
+    """
+
+    task = asyncio.get_running_loop().create_task(
+        _run_cluster_start_job(job_id, request),
+        name=f"omlx-cluster-start-{job_id[:8]}",
+    )
+    _START_JOB_TASKS[job_id] = task
+    task.add_done_callback(
+        lambda _task, job_id=job_id: _START_JOB_TASKS.pop(job_id, None)
+    )
+
+
+@router.post("/start-jobs", status_code=202)
+async def cluster_start_job_create(request: ClusterAutoconfigureRequest):
+    """Create one server-owned Start Cluster job and return its record.
+
+    The body is exactly the autoconfigure request the one-click button has
+    always posted; the server now owns the whole ladder, so a browser reload
+    re-attaches to this record instead of finding a dead button.
+    """
+
+    _validate_cluster_hosts(request.hosts)
+    model_path = (request.model_path or "").strip()
+    if not model_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a downloaded model before starting the cluster.",
+        )
+    store = get_start_job_store()
+    with _ACTIVATION_GUARD_LOCK:
+        if _SYNC_ACTIVATIONS_IN_FLIGHT:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A manual activation is already in flight; wait for it "
+                    "to finish before starting a cluster job."
+                ),
+            )
+        try:
+            job, superseded_ids = store.create(
+                model_path=model_path,
+                hosts=[host.ssh for host in request.hosts],
+            )
+        except StartJobConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for old_job_id in superseded_ids:
+        # "#4 replaces #3": the earlier attempt's incidents stay in the feed,
+        # flagged rather than deleted, and the new attempt says so.
+        incident = _record_cluster_incident(
+            Severity.INFO,
+            "start_job_superseded",
+            f"Start Cluster attempt #{job['attempt']} replaces the failed "
+            f"attempt {old_job_id}.",
+            job_id=job["job_id"],
+        )
+        if incident is not None:
+            try:
+                get_cluster_incidents().supersede(old_job_id, incident.id)
+            except Exception:  # noqa: BLE001 - history flagging is best-effort
+                pass
+    _schedule_start_job(job["job_id"], request)
+    return job
+
+
+@router.get("/start-jobs")
+async def cluster_start_jobs():
+    """Recent start jobs, newest first — the reload re-attach point."""
+
+    return {"jobs": get_start_job_store().list()}
+
+
+@router.get("/start-jobs/{job_id}")
+async def cluster_start_job_status(job_id: str):
+    """One start-job record; the dashboard button renders exactly this."""
+
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id):
+        raise HTTPException(status_code=404, detail="start job not found")
+    job = get_start_job_store().get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="start job not found")
+    return job
+
+
+class ClusterDoctorRequest(BaseModel):
+    """The two link endpoints one Fabric Doctor run inspects."""
+
+    hosts: list[str] = Field(min_length=2, max_length=2)
+
+
+# The Doctor's own tiny job dict, mirroring the staging-job pattern above.
+# Deliberately minimal and generic — job_id/phase/findings/verdict — so a
+# later generalized job store (B2) can absorb it without an API change.
+_DOCTOR_JOBS: dict[str, dict[str, Any]] = {}
+_DOCTOR_JOBS_LOCK = threading.Lock()
+_MAX_DOCTOR_JOBS = 16
+
+
+def _doctor_job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS.get(job_id)
+        if job is None:
+            return None
+        return json.loads(json.dumps(job))
+
+
+def _record_doctor_job(job: dict[str, Any]) -> None:
+    with _DOCTOR_JOBS_LOCK:
+        if len(_DOCTOR_JOBS) >= _MAX_DOCTOR_JOBS:
+            finished = [
+                key
+                for key, value in _DOCTOR_JOBS.items()
+                if value.get("phase") in {"completed", "failed"}
+            ]
+            if finished:
+                _DOCTOR_JOBS.pop(finished[0], None)
+        _DOCTOR_JOBS[job["job_id"]] = job
+
+
+def _update_doctor_job(job_id: str, update: Any) -> None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS[job_id]
+        update(job)
+        job["updated_at"] = time.time()
+
+
+def _run_doctor_job(job_id: str, hosts: tuple[str, ...]) -> None:
+    """Run the ladder checks and land the report in the incident feed.
+
+    The Doctor takes tens of seconds (SSH probes plus a bounded collective
+    handshake), so it runs off-thread behind a job id. Every completed run
+    records exactly one incident whose severity follows the verdict, and the
+    report stays queryable through the job dict and ``/diagnostics``.
+    """
+
+    _update_doctor_job(job_id, lambda job: job.update(phase="running"))
+    try:
+        report = run_fabric_doctor(hosts)
+    except Exception as exc:  # noqa: BLE001 - the job must always conclude
+        message = f"Fabric Doctor run failed: {type(exc).__name__}: {exc}"
+
+        def fail(job: dict[str, Any]) -> None:
+            job.update(phase="failed", error=str(_redact_diagnostic(message)))
+
+        _update_doctor_job(job_id, fail)
+        _record_cluster_incident(
+            Severity.ERROR, "fabric_doctor_failed", message, job_id=job_id
+        )
+        return
+
+    findings = [finding.to_dict() for finding in report.findings]
+
+    def complete(job: dict[str, Any]) -> None:
+        job.update(
+            phase="completed",
+            findings=findings,
+            verdict=report.verdict,
+        )
+
+    _update_doctor_job(job_id, complete)
+    states = {finding.state for finding in report.findings}
+    severity = (
+        Severity.ERROR
+        if "fail" in states
+        else Severity.WARN
+        if "skipped" in states
+        else Severity.INFO
+    )
+    _record_cluster_incident(
+        severity, "fabric_doctor", report.verdict, job_id=job_id
+    )
+
+
+@router.post("/doctor", status_code=202)
+async def cluster_doctor_start(request: ClusterDoctorRequest):
+    """Start one Fabric Doctor run against a pair of link endpoints."""
+
+    hosts = tuple(host.strip() for host in request.hosts)
+    for host in hosts:
+        if _local_ssh_target(host):
+            continue
+        try:
+            validate_ssh_target(host)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_id = secrets.token_hex(12)
+    _record_doctor_job(
+        {
+            "job_id": job_id,
+            "phase": "queued",
+            "hosts": list(hosts),
+            "findings": [],
+            "verdict": "",
+            "error": "",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    )
+    thread = threading.Thread(
+        target=_run_doctor_job,
+        args=(job_id, hosts),
+        name=f"omlx-fabric-doctor-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id}
+
+
+@router.get("/doctor/{job_id}")
+async def cluster_doctor_status(job_id: str):
+    """Phase, findings, and verdict for one Fabric Doctor run."""
+
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id):
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    snapshot = _doctor_job_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    return snapshot
+
+
 @router.get("/status")
 async def cluster_status(route_to: str | None = None):
     """Return this node's read-only distributed capability snapshot."""
@@ -1897,6 +2882,10 @@ async def cluster_diagnostics():
         staging_jobs = json.loads(
             json.dumps(list(_STAGING_JOBS.values())[-_MAX_STAGING_JOBS:])
         )
+    with _DOCTOR_JOBS_LOCK:
+        doctor_reports = json.loads(
+            json.dumps(list(_DOCTOR_JOBS.values())[-_MAX_DOCTOR_JOBS:])
+        )
     incidents: list[dict[str, Any]] = []
     try:
         incidents = [
@@ -1913,6 +2902,7 @@ async def cluster_diagnostics():
         "registry": registry_payload,
         "peer_health": peer_health,
         "staging_jobs": staging_jobs,
+        "fabric_doctor": doctor_reports,
         "incidents": incidents,
         "errors": errors,
     }
@@ -2393,11 +3383,16 @@ async def cluster_peer_probe(request: ClusterPeerProbeRequest):
     """Probe a trusted known_hosts peer without changing either Mac."""
 
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             probe_remote_host,
             request.ssh,
             route_to=request.route_to,
         )
+        # The freshest status this coordinator holds for the peer: remember
+        # the admin port it advertised so the fast ceiling probe (C5) can
+        # target the real server.
+        _note_peer_admin_port(result)
+        return result
     except DistributedLaunchError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2545,7 +3540,11 @@ async def cluster_plan(request: ClusterPlanRequest):
     # The signature travels back with the plan so activation can prove it is
     # launching the thing that was shown here, and not a re-plan built from a
     # payload that quietly dropped the reserve, the cap or the role.
-    return _plan_with_signature(plan.to_dict())
+    # `strategies` (B5) rides alongside — the signature hashes only the
+    # placement rows, so this additive key cannot invalidate an approval.
+    return _plan_with_signature(plan.to_dict()) | {
+        "strategies": _strategies_payload(plan.model, len(request.nodes)),
+    }
 
 
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
@@ -2632,6 +3631,19 @@ def _create_deployment(
         target_context_tokens=request.target_context_tokens,
     )
     plan = _create_cluster_plan(plan_request)
+    if request.text_only and not (
+        plan.model.supports_tensor_parallel or plan.model.supports_pipeline
+    ):
+        # Fail closed before any peer stages weights: the hybrid planner only
+        # validates divisor arithmetic, so a text-only VLM whose architecture
+        # has no mlx-lm shard()/pipeline() would otherwise plan cleanly and
+        # then fail on every rank at load time.
+        raise ValueError(
+            "text-only deployment is not available for this model: the "
+            "pinned MLX-LM runtime reports neither tensor-parallel nor "
+            "pipeline support for its language model architecture, so there "
+            "is no distributed strategy to run it."
+        )
     execution = _execution_for_request(
         request,
         plan.assignments,
@@ -2673,6 +3685,7 @@ def _create_deployment(
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        text_only=request.text_only,
     )
     return deployment, plan.to_dict()
 
@@ -2855,6 +3868,86 @@ async def cluster_node_roles() -> dict[str, Any]:
     }
 
 
+async def _node_budget_evidence(
+    node_id: str,
+    ssh: str,
+    *,
+    role: str = "headless",
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """One node's measured budget plus B5's arithmetic breakdown.
+
+    The single sub-step behind ``/node-budgets`` and B4's ``/readiness``
+    budget row, extracted so the readiness panel reuses the exact probe the
+    role editor renders rather than a drifted copy.
+    """
+
+    from .node_role import suggest_budget
+
+    capacity_bytes = 0
+    capacity_source: str | None = None
+    ceiling_components: dict[str, int] | None = None
+    physical_bytes = 0
+    if not _local_ssh_target(ssh):
+        admin_port = _advertised_admin_port(ssh)
+        physical_bytes = _peer_physical_bytes(ssh)
+        probe = await asyncio.to_thread(
+            probe_remote_admission_ceiling,
+            ssh,
+            # No fallback to sys.executable: inside the packaged app that
+            # is a bundled interpreter which exists on the peer but cannot
+            # import oMLX, so every poll 503'd (#2680). Unknown means the
+            # probe discovers the peer's own interpreter.
+            python_executable=python_executable,
+            admin_port=admin_port,
+        )
+        capacity_bytes = probe.ceiling_bytes
+        capacity_source = "admission_ceiling"
+        ceiling_components = probe.breakdown
+        if not probe.fast_probe_ok and admin_port > 0:
+            # The peer's own advertised port did not answer: the ceiling
+            # above came from the slower in-process computation. Confess
+            # once per dead port, not once per dashboard poll.
+            key = (_peer_key(ssh), admin_port)
+            with _PEER_ADMIN_PORTS_LOCK:
+                seen = key in _CEILING_FALLBACK_SEEN
+                _CEILING_FALLBACK_SEEN.add(key)
+            if not seen:
+                _record_cluster_incident(
+                    Severity.WARN,
+                    "ceiling_fast_probe_fallback",
+                    f"fast ceiling probe unreachable on port {admin_port}; "
+                    "using slower local computation"
+                    + (
+                        f" ({probe.fast_probe_error})"
+                        if probe.fast_probe_error
+                        else ""
+                    ),
+                )
+    else:
+        ceiling_components = await asyncio.to_thread(
+            _local_ceiling_components
+        )
+        physical_bytes = _system_memory_bytes()
+    budget = await asyncio.to_thread(
+        suggest_budget,
+        role=role,
+        ssh_target=ssh,
+        capacity_bytes=capacity_bytes,
+        capacity_source=capacity_source,
+    )
+    return {
+        "node_id": node_id,
+        "ssh": ssh,
+        **budget.to_dict(),
+        "breakdown": _budget_breakdown(
+            physical_bytes=physical_bytes,
+            components=ceiling_components,
+            budget=budget,
+        ),
+    }
+
+
 @router.post("/node-budgets")
 async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, Any]:
     """What each Mac should contribute, measured on the machine itself.
@@ -2864,8 +3957,6 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     memory pressure can lower that further. A plan built on the larger number
     is refused by the memory guard at load.
     """
-
-    from .node_role import suggest_budget
 
     try:
         hosts = [
@@ -2878,27 +3969,12 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _for(host: Any) -> dict[str, Any]:
-        capacity_bytes = 0
-        capacity_source: str | None = None
-        if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
-                host.ssh,
-                # No fallback to sys.executable: inside the packaged app that
-                # is a bundled interpreter which exists on the peer but cannot
-                # import oMLX, so every poll 503'd (#2680). Unknown means the
-                # probe discovers the peer's own interpreter.
-                python_executable=host.python_executable,
-            )
-            capacity_source = "admission_ceiling"
-        budget = await asyncio.to_thread(
-            suggest_budget,
+        return await _node_budget_evidence(
+            host.node_id,
+            host.ssh,
             role=request.roles.get(host.node_id, "headless"),
-            ssh_target=host.ssh,
-            capacity_bytes=capacity_bytes,
-            capacity_source=capacity_source,
+            python_executable=host.python_executable,
         )
-        return {"node_id": host.node_id, "ssh": host.ssh, **budget.to_dict()}
 
     try:
         nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
@@ -2908,6 +3984,69 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
             detail=f"Could not measure every Mac's usable model memory: {exc}",
         ) from exc
     return {"nodes": nodes}
+
+
+def _local_ceiling_components() -> dict[str, int] | None:
+    """This Mac's live ceiling_breakdown(), or None where the guard is absent.
+
+    Kept separate from ``node_role._enforcer_ceiling_bytes`` (which still
+    sources the capacity number through ``suggest_budget``, untouched): the
+    components here only *explain* that capacity — they never change it, per
+    B5's "no arithmetic invariants change" rule.
+    """
+
+    try:
+        from .memory_guard import ceiling_breakdown
+
+        return {key: int(value) for key, value in ceiling_breakdown().items()}
+    except Exception:  # noqa: BLE001 - the explanation is optional, the number is not
+        return None
+
+
+def _budget_breakdown(
+    *,
+    physical_bytes: int,
+    components: dict[str, int] | None,
+    budget: Any,
+) -> dict[str, Any]:
+    """The arithmetic behind one node's budget, naming what actually binds.
+
+    ``binding`` is the constraint whose relaxation would gain the most usable
+    memory: the role's reserve always competes, and a ceiling component
+    (``dynamic`` → live pressure from other applications, ``metal_cap`` → the
+    GPU allocation cap) competes only when it is the strict minimum of the
+    ceiling — i.e. when it, not the static tier reserve, set ``hard_limit``.
+    With no components (an older peer), the role reserve is the only visible
+    constraint and the ceiling renders alone.
+    """
+
+    breakdown: dict[str, Any] = {
+        "physical_bytes": max(0, int(physical_bytes or 0)),
+        "role": budget.role,
+        "reserve_bytes": int(budget.reserve_bytes),
+        "usable_bytes": int(budget.usable_bytes),
+    }
+    gains: dict[str, int] = {"role_reserve": max(0, int(budget.reserve_bytes))}
+    if components:
+        for key in ("static", "dynamic", "metal_cap", "hard_limit"):
+            breakdown[key] = int(components.get(key) or 0)
+        positive = {
+            key: breakdown[key]
+            for key in ("static", "dynamic", "metal_cap")
+            if breakdown[key] > 0
+        }
+        for key, label in (
+            ("dynamic", "dynamic_pressure"),
+            ("metal_cap", "metal_cap"),
+        ):
+            value = positive.get(key)
+            if value is None:
+                continue
+            others = [v for k, v in positive.items() if k != key]
+            if others and value < min(others):
+                gains[label] = min(others) - value
+    breakdown["binding"] = max(gains, key=gains.__getitem__)
+    return breakdown
 
 
 def _local_ssh_target(value: str) -> bool:
@@ -3107,9 +4246,180 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+# The memory guard names the rank and node it refused, and the launcher
+# carries that line back verbatim: ``rank 1 (node): InsufficientMemoryError``.
+_MEMORY_FAILURE_RANK = re.compile(
+    r"rank (\d+) \(([^)]+)\):\s*InsufficientMemoryError"
+)
+
+
+def _memory_squeezed_hosts(
+    deployment: ClusterDeployment, detail: str
+) -> list[ClusterHost]:
+    """Hosts implicated in a memory-attributable activation failure."""
+
+    if "InsufficientMemoryError" not in detail:
+        return []
+    by_node_id = {host.node_id: host for host in deployment.hosts}
+    implicated: dict[str, ClusterHost] = {}
+    for match in _MEMORY_FAILURE_RANK.finditer(detail):
+        rank, node_id = int(match.group(1)), match.group(2)
+        host = by_node_id.get(node_id)
+        if host is None and 0 <= rank < len(deployment.hosts):
+            host = deployment.hosts[rank]
+        if host is not None:
+            implicated[host.node_id] = host
+    # A memory-shaped failure that names no rank still deserves recovery on
+    # every node rather than none.
+    return list(implicated.values()) or list(deployment.hosts)
+
+
+async def _evict_local_models_on_host(
+    host: ClusterHost, reason: str
+) -> dict[str, Any]:
+    """Free one node's standalone models; the coordinator needs no SSH hop."""
+
+    if not _local_ssh_target(host.ssh):
+        return await asyncio.to_thread(
+            evict_remote_local_models,
+            host.ssh,
+            python_executable=host.python_executable,
+        )
+    pool = _engine_pool()
+    outcome: dict[str, Any] = {
+        "evicted": [],
+        "draining": [],
+        "skipped_pinned": [],
+        "errors": [],
+    }
+    for model_id in list(pool.get_loaded_model_ids()):
+        entry = pool.get_entry(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or getattr(entry, "source_type", "") == "cluster"
+        ):
+            continue
+        if entry.is_pinned:
+            outcome["skipped_pinned"].append(model_id)
+            continue
+        try:
+            unloaded = await pool.request_unload(model_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - collect, never mask
+            outcome["errors"].append(f"{model_id}: {exc}")
+            continue
+        (outcome["evicted"] if unloaded else outcome["draining"]).append(model_id)
+    return outcome
+
+
+async def _evict_competing_local_models(
+    deployment: ClusterDeployment | None, detail: str
+) -> str:
+    """After a memory-attributed launch failure, free the implicated Macs.
+
+    A standalone model loaded through a node's own server competes with the
+    cluster rank admitted onto the same unified memory, and every retry then
+    fails at a higher ceiling because the competitor keeps growing. Evict it
+    on exactly the nodes the failure names, so the very next retry is made
+    against the memory the plan was admitted for. This never raises and never
+    replaces the original failure — it appends what was freed so the operator
+    knows a retry is now worth making. Pinned models are left loaded.
+    """
+
+    if deployment is None:
+        return detail
+    hosts = _memory_squeezed_hosts(deployment, detail)
+    if not hosts:
+        return detail
+    reason = (
+        f"cluster activation of {deployment.deployment_id} "
+        "failed for lack of memory"
+    )
+    freed: list[str] = []
+    pending: list[str] = []
+    pinned: list[str] = []
+    problems: list[str] = []
+    for host in hosts:
+        try:
+            outcome = await _evict_local_models_on_host(host, reason)
+        except Exception as exc:  # noqa: BLE001 - recovery must not mask
+            problems.append(f"{host.node_id}: {exc}")
+            continue
+        freed.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("evicted") or []
+        )
+        pending.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("draining") or []
+        )
+        pinned.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("skipped_pinned") or []
+        )
+        problems.extend(
+            f"{host.node_id}: {error}" for error in outcome.get("errors") or []
+        )
+    notes: list[str] = []
+    if freed:
+        notes.append(
+            "oMLX unloaded the competing local model(s) "
+            f"{', '.join(freed)}; retry the activation."
+        )
+    if pending:
+        notes.append(
+            f"{', '.join(pending)} will unload once active requests "
+            "finish; retry the activation after that."
+        )
+    if pinned:
+        notes.append(
+            f"Pinned model(s) {', '.join(pinned)} were left loaded; unpin or "
+            "unload them if the retry still runs out of memory."
+        )
+    if problems:
+        notes.append(
+            "Local-model eviction could not complete everywhere: "
+            + "; ".join(problems)
+        )
+    if not notes:
+        notes.append(
+            "No competing local models were loaded on the implicated node(s)."
+        )
+    if freed or pending or pinned:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery",
+            " ".join(notes),
+            deployment_id=deployment.deployment_id,
+        )
+    if problems:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery_failed",
+            "Local-model eviction after the memory failure did not complete: "
+            + "; ".join(problems),
+            deployment_id=deployment.deployment_id,
+        )
+    return detail + "\n" + " ".join(notes)
+
+
 @router.post("/deployments")
 async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     """Recompute, preflight, eagerly load, and prove one distributed model."""
+
+    # B2 mutual exclusion: the legacy sync path and a server-owned start job
+    # must never race each other into the engine pool.
+    _claim_sync_activation()
+    try:
+        return await _activate(request)
+    finally:
+        _release_sync_activation()
+
+
+async def _activate(request: ClusterDeploymentRequest) -> dict[str, Any]:
+    """The activation body, unchanged (B2 refactor).
+
+    Kept as a plain callable so the start-job runner activates through
+    exactly the code path ``POST /deployments`` serves.
+    """
 
     plan_changes: dict[str, Any] = {
         "changed": False,
@@ -3226,7 +4536,13 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     }
         pool = _engine_pool()
         try:
-            model_id = pool.resolve_cluster_model_id(deployment.model)
+            # ``_create_deployment`` already refused a text-only request whose
+            # layout reports no shard strategy, so a text_only deployment that
+            # reaches this join is one the pinned mlx-lm can run.
+            model_id = pool.resolve_cluster_model_id(
+                deployment.model,
+                text_only=deployment.text_only,
+            )
         except ModelNotFoundError:
             register = getattr(pool, "register_cluster_model", None)
             if not callable(register):
@@ -3238,9 +4554,20 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     for assignment in deployment.assignments
                 )
             )
+            if deployment.text_only:
+                # The plan's byte total still counts the vision tower the
+                # text loaders drop; register the language-only estimate so
+                # cluster admission is not charged for weights that never
+                # load (#2385).
+                text_only_bytes = estimate_text_only_model_size(
+                    Path(deployment.model).expanduser()
+                )
+                if 0 < text_only_bytes < estimated_size:
+                    estimated_size = text_only_bytes
             model_id, _ = register(
                 deployment.model,
                 estimated_size=estimated_size,
+                text_only=deployment.text_only,
             )
         registry = get_cluster_registry()
         previous = await asyncio.to_thread(
@@ -3334,14 +4661,26 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
+        detail = str(exc)
         await asyncio.to_thread(
             _record_cluster_incident,
             Severity.ERROR,
             "activation_launch_failed",
-            str(exc),
+            detail,
             deployment_id=deployment.deployment_id if deployment else None,
         )
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        try:
+            detail = await _evict_competing_local_models(deployment, detail)
+        except Exception:  # noqa: BLE001 - recovery must never mask the failure
+            await asyncio.to_thread(
+                _record_cluster_incident,
+                Severity.WARN,
+                "activation_memory_recovery_failed",
+                "Local-model eviction after the memory failure crashed; the "
+                "implicated nodes may still hold a competing model.",
+                deployment_id=deployment.deployment_id if deployment else None,
+            )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except ModelNotFoundError as exc:
         await asyncio.to_thread(
             _record_cluster_incident,
@@ -3396,7 +4735,10 @@ async def deactivate_cluster_deployment(deployment_id: str):
     try:
         pool = _engine_pool()
         try:
-            model_id = pool.resolve_cluster_model_id(deployment.model)
+            model_id = pool.resolve_cluster_model_id(
+                deployment.model,
+                text_only=deployment.text_only,
+            )
         except ModelNotFoundError:
             model_id = None
         if model_id is not None:

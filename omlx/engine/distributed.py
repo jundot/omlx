@@ -383,6 +383,34 @@ class DistributedBatchedEngine(BatchedEngine):
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
 
+    def _reject_images_if_text_only(
+        self, messages: list[dict[str, Any]]
+    ) -> None:
+        """Refuse image content on a VLM deployed text-only.
+
+        A text-only cluster deployment loaded the language model and dropped the
+        vision tower, so an image part cannot be served. Fail with a clear error
+        naming the text-only mode instead of silently ignoring the image.
+        """
+
+        if not getattr(self.deployment, "text_only", False):
+            return
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"image_url", "image", "input_image"} or (
+                    "image_url" in part
+                ):
+                    raise ValueError(
+                        "This cluster deployment was activated text-only "
+                        "(vision disabled); image content is not supported. "
+                        "Serve the model on a single node to use vision."
+                    )
+
     def _completion_payload(
         self,
         *,
@@ -472,6 +500,7 @@ class DistributedBatchedEngine(BatchedEngine):
         """
 
         self._validate_request_features(kwargs)
+        self._reject_images_if_text_only(messages)
         if (
             kwargs.get("seed") is not None
             and self.deployment.execution.sampling_rank_only

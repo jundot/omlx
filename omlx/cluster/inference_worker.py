@@ -645,13 +645,31 @@ def _runtime_assignment(
     return result
 
 
+def _resolve_pipeline_model(model: Any) -> Any:
+    """The module that owns the mutable transformer layer list, or None.
+
+    Most text architectures expose it as ``model.model``, but wrapper models —
+    the qwen3_5 / qwen3_5_moe VLM family served text-only — nest it under
+    ``language_model.model``. Reuse the tensor strategy's resolver so validation
+    and sharding agree on which object is the pipeline stage.
+    """
+
+    from .tensor_strategies import _common_layer_owner
+
+    try:
+        owner, _layers = _common_layer_owner(model)
+        return owner
+    except RuntimeError:
+        return None
+
+
 def _validate_loaded_stage(
     model: Any,
     assignment: PipelineAssignment,
 ) -> None:
     """Fail closed if a model-specific pipeline hook ignored the shard plan."""
 
-    pipeline_model = getattr(model, "model", None)
+    pipeline_model = _resolve_pipeline_model(model)
     if pipeline_model is None:
         raise RuntimeError("loaded model does not expose an MLX pipeline model")
     start = getattr(pipeline_model, "start_idx", None)
@@ -693,7 +711,7 @@ def _loaded_stage(model: Any) -> dict[str, Any]:
     cannot be read, which is still the honest answer: not "the plan".
     """
 
-    pipeline_model = getattr(model, "model", None)
+    pipeline_model = _resolve_pipeline_model(model)
     layers = getattr(pipeline_model, "layers", None)
     return {
         "loaded_start_layer": getattr(pipeline_model, "start_idx", None),

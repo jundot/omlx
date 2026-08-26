@@ -130,6 +130,95 @@
             </ul>
         </details>
 
+        <!-- B4 surface 1: per-node status strip. State is named in text with
+             color as a secondary cue only — never color-only (design B.4).
+             The incident badge (surface 2, fed by B1's server-owned feed)
+             rides on the strip header so outage evidence and node state are
+             read in one place. -->
+        <div x-show="clusterReadiness" x-cloak
+             data-cluster-status-strip
+             class="mb-6 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5 border-b border-neutral-100">
+                <i data-lucide="list-checks" class="w-4 h-4 flex-shrink-0 text-neutral-500"></i>
+                <span class="text-sm font-semibold text-neutral-900">Cluster nodes</span>
+                <span class="text-[10px] uppercase tracking-wider font-semibold"
+                      :class="clusterReadiness?.ready ? 'text-green-700' : 'text-amber-700'"
+                      x-text="clusterReadiness?.ready ? 'ready to start' : 'not ready'"></span>
+                <span x-show="clusterActiveIncidents().length" x-cloak
+                      class="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold">
+                    <i data-lucide="bell-ring" class="w-3 h-3"></i>
+                    <span x-text="`${clusterActiveIncidents().length} incident${clusterActiveIncidents().length === 1 ? '' : 's'}`"></span>
+                </span>
+            </div>
+            <ul class="divide-y divide-neutral-100">
+                <template x-for="node in (clusterReadiness?.nodes || [])" :key="node.host">
+                    <li class="flex items-center gap-2.5 px-4 py-2 text-xs">
+                        <span class="font-mono text-neutral-700 truncate" x-text="node.host"></span>
+                        <!-- The state word itself, not only a dot. -->
+                        <span class="uppercase tracking-wider text-[10px] font-semibold"
+                              :class="node.state === 'reachable' ? 'text-green-700' : 'text-red-700'"
+                              x-text="node.state"></span>
+                        <span class="text-neutral-400 truncate" x-text="node.detail"></span>
+                    </li>
+                </template>
+            </ul>
+        </div>
+
+        <!-- C3: Fabric Doctor — the ladder checks in order, stopping at the
+             first red rung. Minimal check · state · evidence · fix rows;
+             B4 owns the full panel layout later. -->
+        <div class="mb-6 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5">
+                <i data-lucide="stethoscope" class="w-4 h-4 flex-shrink-0 text-neutral-500"></i>
+                <span class="text-sm font-semibold text-neutral-900">Fabric Doctor</span>
+                <span class="text-[10px] uppercase tracking-wider text-neutral-400"
+                      x-show="clusterDoctor" x-text="clusterDoctor?.phase"></span>
+                <button type="button"
+                        @click="runFabricDoctor()"
+                        :disabled="clusterDoctorRunning"
+                        class="ml-auto px-2.5 py-1 text-[11px] font-medium text-neutral-700 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50">
+                    Run Fabric Doctor
+                </button>
+            </div>
+            <template x-if="clusterDoctor && (clusterDoctor.findings || []).length">
+                <ul class="border-t border-neutral-200 divide-y divide-neutral-100">
+                    <template x-for="finding in clusterDoctor.findings" :key="finding.check_id">
+                        <li class="flex items-start gap-2.5 px-4 py-2 text-xs">
+                            <span class="mt-1 w-2 h-2 rounded-full flex-shrink-0"
+                                  :class="{
+                                      'bg-emerald-500': finding.state === 'pass',
+                                      'bg-red-500': finding.state === 'fail',
+                                      'bg-neutral-300': finding.state === 'skipped'
+                                  }"></span>
+                            <span class="font-mono text-neutral-500 w-32 flex-shrink-0"
+                                  x-text="finding.check_id"></span>
+                            <div class="min-w-0 flex-1">
+                                <div class="text-neutral-800 break-words" x-text="finding.evidence"></div>
+                                <div x-show="finding.state === 'fail' && finding.remedy"
+                                     class="text-neutral-500 mt-0.5" x-text="finding.remedy"></div>
+                            </div>
+                        </li>
+                    </template>
+                </ul>
+            </template>
+            <div x-show="clusterDoctor?.verdict" x-cloak
+                 class="border-t border-neutral-200 px-4 py-2 text-xs font-medium text-neutral-700"
+                 x-text="clusterDoctor?.verdict"></div>
+            <div x-show="clusterDoctor?.error" x-cloak
+                 class="border-t border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700"
+                 x-text="clusterDoctor?.error"></div>
+        </div>
+
+        <!-- C4: VPN pre-warning, shown before any fabric setup. A heuristic
+             read of the peer's configuration — it never gates Start; the
+             bound-connect probes remain the authority on the link. -->
+        <template x-for="warning in clusterVpnWarnings()" :key="'vpn-' + warning.host">
+            <div class="mb-6 flex items-start gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                <i data-lucide="shield-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                <span class="break-words" x-text="warning.message"></span>
+            </div>
+        </template>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -916,6 +1005,16 @@
                              x-text="clusterStatus.transport.rdma.enabled
                                 ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
                                 : 'RDMA not enabled'"></div>
+                        {# Readiness-ladder copy (B3): the node's reason/remedy render
+                           verbatim until the collective is proven. #}
+                        <template x-if="clusterStatus.transport.readiness && clusterStatus.transport.readiness.state !== 'collective_ok'">
+                            <div class="text-xs mt-2 space-y-0.5">
+                                <div class="text-neutral-500"
+                                     x-text="clusterStatus.transport.readiness.reason"></div>
+                                <div class="text-neutral-400"
+                                     x-text="clusterStatus.transport.readiness.remedy"></div>
+                            </div>
+                        </template>
                     </div>
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
@@ -1896,11 +1995,9 @@
                                         :disabled="clusterLinkSetupLoading || clusterAutoconfigureLoading || clusterActivationLoading"
                                         class="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap shrink-0">
                                     <i data-lucide="power" class="w-3.5 h-3.5"></i>
-                                    <span x-text="clusterLinkSetupLoading
-                                        ? (clusterActivationProgress || 'Configuring Thunderbolt…')
-                                        : (clusterActivationLoading
-                                            ? (clusterActivationProgress || 'Starting cluster…')
-                                            : (clusterAutoconfigureLoading ? 'Checking every worker…' : 'Start Cluster'))"></span>
+                                    <!-- B2: the label renders the server-owned
+                                         job's phase, so it survives reloads. -->
+                                    <span x-text="clusterStartButtonLabel()"></span>
                                 </button>
                             </div>
 
@@ -1935,6 +2032,53 @@
                                 </template>
                             </div>
 
+                            <!-- B4 surface 3: the precondition panel. When
+                                 Start is not green this renders in place of
+                                 the silent dead zone — one row per thing that
+                                 must be true, each with live evidence, its
+                                 age, and a fix that dispatches to an existing
+                                 action. State names are text; color is
+                                 secondary (never color-only, design B.4). -->
+                            <div x-show="clusterReadiness && !clusterReadiness.ready" x-cloak
+                                 data-cluster-preconditions
+                                 class="mt-3 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+                                <div class="px-3 py-2 border-b border-neutral-100 text-[10px] uppercase tracking-wider font-semibold text-neutral-500">
+                                    Why can't I start?
+                                </div>
+                                <ul class="divide-y divide-neutral-100">
+                                    <template x-for="row in (clusterReadiness?.rows || [])" :key="row.id">
+                                        <li class="flex items-start gap-2.5 px-3 py-2 text-xs">
+                                            <span class="mt-0.5 w-12 shrink-0 uppercase tracking-wider text-[10px] font-bold"
+                                                  :class="{
+                                                      'text-green-700': row.state === 'pass',
+                                                      'text-amber-700': row.state === 'warn',
+                                                      'text-red-700': row.state === 'fail'
+                                                  }"
+                                                  x-text="row.state"></span>
+                                            <div class="min-w-0 flex-1">
+                                                <div class="font-medium text-neutral-800"
+                                                     x-text="clusterReadinessRowLabel(row.id)"></div>
+                                                <div class="mt-0.5 break-words"
+                                                     :class="clusterReadinessRowStale(row) ? 'text-neutral-400' : 'text-neutral-600'"
+                                                     x-text="row.evidence"></div>
+                                                <div class="mt-0.5 text-[10px]"
+                                                     :class="clusterReadinessRowStale(row) ? 'text-neutral-400 italic' : 'text-neutral-400'"
+                                                     x-text="clusterReadinessRowStale(row)
+                                                         ? `${clusterReadinessRowAge(row)} — stale`
+                                                         : clusterReadinessRowAge(row)"></div>
+                                            </div>
+                                            <button x-show="row.fix" type="button"
+                                                    @click="applyClusterReadinessFix(row)"
+                                                    class="shrink-0 px-2 py-1 text-[10px] font-medium text-neutral-700 border border-neutral-200 rounded-md hover:bg-neutral-100"
+                                                    x-text="clusterReadinessFixLabel(row)"></button>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </div>
+
+                            <!-- The prose blocker stays alongside the panel
+                                 for one release (B4 backward-compat note):
+                                 the rows are additive, not a replacement yet. -->
                             <div x-show="clusterAutoconfigureError" x-cloak
                                  class="mt-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700"
                                  x-text="clusterAutoconfigureError"></div>
@@ -2341,22 +2485,26 @@
                         </template>
                         <div class="flex items-center gap-4 mb-4">
                             <label class="block text-xs font-medium text-neutral-600">Tensor parallelism</label>
+                            {# A mode this model cannot run renders disabled with the
+                               server's reason inline (B5) — never a live option that
+                               400s only after the click. #}
                             <div class="inline-flex items-center rounded-lg border border-neutral-200 bg-white p-0.5">
-                                <template x-for="size in clusterTensorParallelOptions()" :key="size">
+                                <template x-for="choice in clusterParallelismChoices()" :key="choice.size">
                                     <button type="button"
-                                            @click="clusterPlanTensorParallelSize = size; invalidateClusterPlan()"
+                                            @click="if (choice.supported) { clusterPlanTensorParallelSize = choice.size; invalidateClusterPlan(); }"
+                                            :disabled="!choice.supported"
+                                            :title="choice.supported ? '' : choice.reason"
+                                            :aria-disabled="!choice.supported"
                                             class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors"
-                                            :class="Number(clusterPlanTensorParallelSize) === size
-                                                ? 'bg-neutral-900 text-white'
-                                                : 'text-neutral-600 hover:bg-neutral-100'"
-                                            x-text="size === 1
-                                                ? 'Pipeline only'
-                                                : `${size}-way tensor`"></button>
+                                            :class="!choice.supported
+                                                ? 'text-neutral-300 cursor-not-allowed line-through decoration-neutral-300'
+                                                : (Number(clusterPlanTensorParallelSize) === choice.size
+                                                    ? 'bg-neutral-900 text-white'
+                                                    : 'text-neutral-600 hover:bg-neutral-100')"
+                                            x-text="choice.label"></button>
                                 </template>
                             </div>
-                            <span class="text-xs text-neutral-400" x-text="clusterPlanTensorParallelSize > 1
-                                ? 'Every detected accelerator works on every token'
-                                : `Each of the ${clusterPlanNodes.length} detected accelerators holds different layers`"></span>
+                            <span class="text-xs text-neutral-400" x-text="clusterParallelismHint()"></span>
                         </div>
                         <div x-show="clusterPlanError" x-cloak
                              class="mt-4 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700"
@@ -2424,6 +2572,20 @@
                                 <div class="text-[10px] text-neutral-400 mt-1 font-mono"
                                      x-text="node.measured
                                         || `${node.capacity_gib} GiB capacity, ${node.reserve_gib} GiB held back`"></div>
+                                {# The arithmetic behind the number (B5): physical −
+                                   ceiling − role reserve = usable, plus which
+                                   constraint binds and how old the reading is. #}
+                                <template x-if="clusterBudgetBreakdownLine(node)">
+                                    <div class="mt-1 space-y-0.5">
+                                        <div class="text-[10px] text-neutral-500 font-mono"
+                                             x-text="clusterBudgetBreakdownLine(node)"></div>
+                                        <div class="text-[10px] text-neutral-400">
+                                            <span x-text="clusterBudgetBindingLabel(node)"></span>
+                                            <span x-show="clusterBudgetEvidenceAge(node)"
+                                                  x-text="' · ' + clusterBudgetEvidenceAge(node)"></span>
+                                        </div>
+                                    </div>
+                                </template>
                                 <!-- An automatic role can raise an untouched
                                      form default. A moved cockpit slider is
                                      explicit and remains authoritative. If

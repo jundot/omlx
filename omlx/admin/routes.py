@@ -3315,6 +3315,41 @@ async def get_generation_config(
     return result
 
 
+@router.get("/api/models/{model_id}/auto_context")
+async def get_auto_context(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Largest context window that fits on this Mac for a local model.
+
+    Reuses the cluster planner's context bisection with a single local
+    node whose capacity is the live memory ceiling. Advisory: a model
+    whose layout cannot be read returns zeros rather than an error, so
+    the settings modal can simply hide its Auto button.
+
+    Returns:
+        JSON with ``max_context_tokens`` and ``declared_context_tokens``
+        (0 for either when unknown).
+
+    Raises:
+        HTTPException: 404 if the model is not found, 503 if the engine
+        pool is not initialized.
+    """
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    from omlx.local_context import local_auto_context
+
+    # Real (cheap, mtime-cached) file I/O plus planner bisection — keep it
+    # off the event loop like the other planner-touching endpoints here.
+    return await asyncio.to_thread(local_auto_context, entry.model_path)
+
+
 # =============================================================================
 # Global Settings API Routes
 # =============================================================================

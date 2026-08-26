@@ -298,7 +298,7 @@ def cluster(tmp_path, monkeypatch):
         def __init__(self):
             self.entry = SimpleNamespace(engine=None)
 
-        def resolve_cluster_model_id(self, path):
+        def resolve_cluster_model_id(self, path, *, text_only=False):
             assert path == str(model_path)
             return "big"
 

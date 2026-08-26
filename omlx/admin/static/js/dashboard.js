@@ -244,6 +244,10 @@
             savingModelSettings: false,
             importingMtplx: false,
             loadingGenDefaults: false,
+            // Auto-context assessment for the open settings modal:
+            // {max_context_tokens, declared_context_tokens} or null while
+            // unknown/unavailable (the template hides the button then).
+            modelSettingsAutoContext: null,
             reasoningParsers: [],
             aneTuning: {
                 tuningId: null,
@@ -375,6 +379,10 @@
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
             _clusterIncidentEpoch: '',
+            // Fabric Doctor (C3): one run at a time; the report renders as
+            // minimal check · state · evidence · fix rows until B4's panel.
+            clusterDoctor: null,
+            clusterDoctorRunning: false,
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -510,6 +518,19 @@
             clusterDeploymentsError: '',
             clusterActivationLoading: false,
             clusterActivationResult: null,
+            // B2: the server-owned Start Cluster job record. The Start button
+            // renders this, never local component state, so a browser reload
+            // re-attaches to a running job instead of showing a dead button.
+            clusterStartJob: null,
+            // Progress detail for the staging phase, read through the job's
+            // staging_job_id from the existing /stage/{job_id} endpoint.
+            clusterStartJobStaging: null,
+            // B4: the server-computed precondition rows behind the Start
+            // button. Refreshed on the 10 s discovery tick only — every row
+            // embeds SSH-backed evidence — never on the 2 s runtime poll.
+            clusterReadiness: null,
+            clusterReadinessLoading: false,
+            _clusterReadinessFetchedAt: 0,
             // What automatic tuning proposed after measuring the fabric. The
             // signed placement still wins when the proposal moves layers.
             clusterPlanChanges: null,
@@ -958,6 +979,9 @@
                         this.clusterStatus ? Promise.resolve() : this.loadClusterStatus(),
                         this.loadClusterDeployments(),
                         this.loadClusterJoinStatus(),
+                        // B2 reload safety: re-attach to a Start Cluster job
+                        // that is still running server-side.
+                        this.adoptRunningClusterStartJob(),
                         this.clusterDiscoveredPeers === null
                             ? this.discoverClusterPeers()
                             : Promise.resolve(),
@@ -1470,6 +1494,21 @@
                 this.stopClusterActivationProgress();
                 this.clusterActivationProgress = 'Checking compatibility…';
                 const refresh = async () => {
+                    const job = this.clusterStartJob;
+                    if (job?.job_id && !['ready', 'failed'].includes(job.phase)) {
+                        // B2: the server owns the job; render its record.
+                        await this.refreshClusterStartJob();
+                        if (this.clusterStartJob?.phase === 'activating') {
+                            await this.loadClusterRuntime();
+                        }
+                        if (this.clusterActivationLoading) {
+                            this.clusterActivationProgress =
+                                this.clusterStartJobPhaseText(this.clusterStartJob);
+                        }
+                        return;
+                    }
+                    // Manual-plan path (activateClusterProposal /
+                    // activateClusterDeployment): unchanged runtime polling.
                     await this.loadClusterRuntime();
                     if (this.clusterActivationLoading) {
                         this.clusterActivationProgress =
@@ -1516,8 +1555,134 @@
                 await Promise.all([
                     this.discoverClusterPeers(),
                     this.loadClusterJoinStatus(),
+                    // B4: precondition rows ride the slow tick. The server
+                    // caches the answer for 10 s, so this poll and B2's job
+                    // poll can never stampede SSH.
+                    this.loadClusterReadiness(),
                 ]);
                 await this.initializeClusterSetup({ preview: false });
+            },
+
+            // B4: one row per Start precondition, with live evidence and a
+            // fix. The server computes these; the panel only renders them.
+            async loadClusterReadiness() {
+                if (this.clusterReadinessLoading) return;
+                const hosts = [
+                    '127.0.0.1',
+                    ...this.clusterWorkerPeers()
+                        .map(peer => String(peer?.ssh || '').trim()),
+                ].filter(Boolean);
+                const model = this.clusterSelectedModel()?.model_path || '';
+                this.clusterReadinessLoading = true;
+                try {
+                    const query = new URLSearchParams({ hosts: hosts.join(',') });
+                    if (model) query.set('model', model);
+                    const response = await fetch(
+                        `/admin/api/cluster/readiness?${query}`
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    // A failed poll keeps the previous rows; their age makes
+                    // the staleness visible instead of blanking the panel.
+                    if (!response.ok) return;
+                    this.clusterReadiness = await response.json();
+                    this._clusterReadinessFetchedAt = Date.now();
+                } catch (error) {
+                    // Keep the last evidence; the age renders it stale-gray.
+                } finally {
+                    this.clusterReadinessLoading = false;
+                }
+            },
+
+            clusterReadinessRowLabel(id) {
+                return {
+                    ssh: 'Workers reachable',
+                    fabric: 'Fabric link',
+                    staging: 'Model staged',
+                    budget: 'Memory budget',
+                    strategy: 'Parallelism strategy',
+                }[id] || id;
+            },
+
+            clusterReadinessRowAgeSeconds(row) {
+                const base = Number(row?.evidence_age_s || 0);
+                const fetched = this._clusterReadinessFetchedAt || Date.now();
+                return Math.max(
+                    0, Math.round(base + (Date.now() - fetched) / 1000)
+                );
+            },
+
+            clusterReadinessRowAge(row) {
+                return `${this.clusterReadinessRowAgeSeconds(row)} s ago`;
+            },
+
+            // Design A.6's live-data rule: evidence older than 30 s renders
+            // stale-gray rather than pretending to be current.
+            clusterReadinessRowStale(row) {
+                return this.clusterReadinessRowAgeSeconds(row) > 30;
+            },
+
+            clusterReadinessFixLabel(row) {
+                return {
+                    reverify: 'Re-verify',
+                    doctor: 'Run Fabric Doctor',
+                    stage_details: 'Staging details',
+                    role_editor: 'Edit roles',
+                }[row?.fix?.kind] || 'Fix';
+            },
+
+            // Fix affordances dispatch to actions that already exist: the
+            // peer probe, the Fabric Doctor, staging details, the role
+            // editor. B4 adds no new repair machinery.
+            async applyClusterReadinessFix(row) {
+                const kind = row?.fix?.kind;
+                if (kind === 'reverify') {
+                    await Promise.all(
+                        this.clusterWorkerPeers()
+                            .map(peer => String(peer?.ssh || '').trim())
+                            .filter(Boolean)
+                            .map(async ssh => {
+                                try {
+                                    await fetch('/admin/api/cluster/peer-probe', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ ssh }),
+                                    });
+                                } catch (error) {
+                                    // The next readiness poll reports the outcome.
+                                }
+                            })
+                    );
+                    await this.loadClusterReadiness();
+                    return;
+                }
+                if (kind === 'doctor') {
+                    await this.runFabricDoctor();
+                    return;
+                }
+                if (kind === 'stage_details') {
+                    const jobId = row?.fix?.job_id;
+                    if (jobId) {
+                        try {
+                            const response = await fetch(
+                                `/admin/api/cluster/stage/${encodeURIComponent(jobId)}`
+                            );
+                            if (response.ok) {
+                                this.clusterStagingResult = await response.json();
+                            }
+                        } catch (error) {
+                            // Fall through to the planner card below.
+                        }
+                    }
+                    this.clusterShowSetupDetails = true;
+                    return;
+                }
+                if (kind === 'role_editor') {
+                    // The role and memory controls live on the planner card.
+                    this.clusterShowSetupDetails = true;
+                }
             },
 
             // Monotonic merge: the ?since= cursor means the server only ever
@@ -1594,6 +1759,65 @@
 
             clusterActiveIncidents() {
                 return (this.clusterIncidents || []).filter((incident) => !incident.dismissed_at);
+            },
+
+            // C3: run the Fabric Doctor as a server job and poll it to a
+            // verdict. The link is this Mac plus the first worker peer — the
+            // Doctor checks exactly one link at a time.
+            async runFabricDoctor() {
+                if (this.clusterDoctorRunning) return;
+                const peers = this.clusterWorkerPeers()
+                    .map(peer => String(peer?.ssh || '').trim())
+                    .filter(Boolean);
+                if (!peers.length) {
+                    this.clusterDoctor = {
+                        phase: 'failed',
+                        findings: [],
+                        verdict: '',
+                        error: 'Add a peer Mac first — the Doctor checks the link between two Macs.',
+                    };
+                    return;
+                }
+                this.clusterDoctorRunning = true;
+                this.clusterDoctor = { phase: 'queued', findings: [], verdict: '', error: '' };
+                try {
+                    const response = await fetch('/admin/api/cluster/doctor', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ hosts: ['127.0.0.1', peers[0]] }),
+                    });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const detail = await response.json().catch(() => ({}));
+                        throw new Error(detail?.detail || `Doctor start failed (${response.status})`);
+                    }
+                    const { job_id: jobId } = await response.json();
+                    for (let attempt = 0; attempt < 120; attempt += 1) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        const poll = await fetch(
+                            `/admin/api/cluster/doctor/${encodeURIComponent(jobId)}`
+                        );
+                        if (poll.status === 401) { window.location.href = '/admin'; return; }
+                        if (!poll.ok) continue;
+                        const job = await poll.json();
+                        this.clusterDoctor = job;
+                        if (job.phase === 'completed' || job.phase === 'failed') return;
+                    }
+                    this.clusterDoctor = {
+                        ...(this.clusterDoctor || {}),
+                        phase: 'failed',
+                        error: 'The Doctor run did not finish; check the incident feed.',
+                    };
+                } catch (error) {
+                    this.clusterDoctor = {
+                        phase: 'failed',
+                        findings: [],
+                        verdict: '',
+                        error: error?.message || 'Doctor run failed',
+                    };
+                } finally {
+                    this.clusterDoctorRunning = false;
+                }
             },
 
             clusterIncidentAge(ts) {
@@ -3518,9 +3742,98 @@
                 ) || null;
             },
 
-            clusterTensorParallelOptions() {
+            // Which parallelism modes this model can actually run (B5).
+            // Server verdicts win: /autoconfigure and /plan return a
+            // `strategies` map computed from the model profile's
+            // supports_tensor_parallel / supports_pipeline flags. Before any
+            // server response arrives, the catalogue fit's own flags fill in;
+            // with nothing known, both modes stay offered and the server's
+            // PlanningError remains the backstop.
+            clusterStrategySupport() {
+                const entry = (value, fallbackReason) => ({
+                    supported: value?.supported !== false,
+                    reason: value?.reason || fallbackReason || '',
+                });
+                const served = this.clusterAutoconfigure?.strategies
+                    || this.clusterPlan?.strategies;
+                if (served?.tensor || served?.pipeline) {
+                    return {
+                        tensor: entry(served.tensor),
+                        pipeline: entry(served.pipeline),
+                    };
+                }
+                const fit = this.clusterCatalogueFit(
+                    this.clusterPlanModelPath.trim()
+                );
+                if (fit) {
+                    return {
+                        tensor: entry(
+                            { supported: fit.supports_tensor_parallel !== false },
+                            'This architecture does not implement sharding in MLX-LM.',
+                        ),
+                        pipeline: entry(
+                            { supported: fit.supports_pipeline !== false },
+                            'This architecture has no MLX-LM pipeline forward path.',
+                        ),
+                    };
+                }
+                return {
+                    tensor: { supported: true, reason: '' },
+                    pipeline: { supported: true, reason: '' },
+                };
+            },
+
+            // Every mode the radio group renders, supported or not: an
+            // unsupported mode stays visible but disabled, with the server's
+            // reason inline (B5) — never a live option that 400s after the
+            // click. If nothing is reported supported (contradictory or stale
+            // data), degrade to offering both rather than a dead control.
+            clusterParallelismChoices() {
                 const nodes = Math.max(1, this.clusterPlanNodes.length);
-                return nodes > 1 ? [1, nodes] : [1];
+                if (nodes <= 1) {
+                    return [
+                        { size: 1, label: 'Pipeline only', supported: true, reason: '' },
+                    ];
+                }
+                const support = this.clusterStrategySupport();
+                const choices = [
+                    {
+                        size: 1,
+                        label: 'Pipeline only',
+                        supported: support.pipeline.supported,
+                        reason: support.pipeline.reason,
+                    },
+                    {
+                        size: nodes,
+                        label: `${nodes}-way tensor`,
+                        supported: support.tensor.supported,
+                        reason: support.tensor.reason,
+                    },
+                ];
+                if (!choices.some(choice => choice.supported)) {
+                    return choices.map(choice => (
+                        { ...choice, supported: true, reason: '' }
+                    ));
+                }
+                return choices;
+            },
+
+            clusterTensorParallelOptions() {
+                return this.clusterParallelismChoices()
+                    .filter(choice => choice.supported)
+                    .map(choice => choice.size);
+            },
+
+            // The helper line beside the radios: the disabled mode's reason
+            // when one is disabled, otherwise the usual explanation of the
+            // selected mode.
+            clusterParallelismHint() {
+                const unsupported = this.clusterParallelismChoices()
+                    .find(choice => !choice.supported);
+                if (unsupported) return unsupported.reason;
+                return Number(this.clusterPlanTensorParallelSize) > 1
+                    ? 'Every detected accelerator works on every token'
+                    : `Each of the ${this.clusterPlanNodes.length} detected accelerators holds different layers`;
             },
 
             // The catalogue fit is the FEWEST-node plan: a model that fits one
@@ -3546,37 +3859,23 @@
             },
 
             normalizeClusterTensorParallelSize() {
-                const options = this.clusterTensorParallelOptions();
-                const current = Number(this.clusterPlanTensorParallelSize);
-                // Snap an out-of-range value to the largest available degree
-                // (tensor parallelism) rather than 1 (pipeline) — several
+                // Guard against the status poll transiently reporting a single
+                // node: resetting to 1 there silently threw away a user's
+                // multi-way tensor choice every ~10s. Only correct a value the
+                // supported modes no longer include, and snap to the largest
+                // degree (tensor) rather than 1 (pipeline) — several
                 // architectures (VLMs) support tensor but not the MLX-LM
                 // pipeline forward path, so 1 would make the only valid plan
-                // fail. This must also fire when the cluster genuinely shrank
-                // to one node (options === [1]); leaving a stale multi-way
-                // size there sends /plan a world size that cannot divide. The
-                // transient-poll wipe this used to cause is prevented
-                // upstream: the poll skips resync mid-activation and only
-                // rebuilds the node set when it actually changed.
-                if (!options.includes(current)) {
-                    this.clusterPlanTensorParallelSize =
-                        options[options.length - 1];
-                    this.invalidateClusterPlan();
-                }
-                // tp=1 on a multi-node cluster means pipeline. For a model whose
-                // architecture cannot pipeline the only valid multi-node plan is
-                // full tensor; leaving 1 here guarantees a 400 from /plan on
-                // every preview.
-                const fit = this.clusterCatalogueFit(
-                    this.clusterPlanModelPath.trim()
-                );
-                if (
-                    options.length > 1
-                    && Number(this.clusterPlanTensorParallelSize) === 1
-                    && fit?.fits === true
-                    && fit.supports_pipeline === false
-                    && fit.supports_tensor_parallel === true
-                ) {
+                // fail. The old second pass that re-derived "cannot pipeline"
+                // from catalogue-fit flags here ([#2819] guesswork) is gone:
+                // clusterParallelismChoices() already excludes an unsupported
+                // mode from the live options using the server's `strategies`
+                // verdict, so the generic snap below covers it.
+                const choices = this.clusterParallelismChoices();
+                if (choices.length <= 1) return;
+                const options = this.clusterTensorParallelOptions();
+                const current = Number(this.clusterPlanTensorParallelSize);
+                if (options.length && !options.includes(current)) {
                     this.clusterPlanTensorParallelSize =
                         options[options.length - 1];
                     this.invalidateClusterPlan();
@@ -5179,6 +5478,37 @@
                 else this.loadClusterFabric();
             },
 
+            // C4 pre-warning: hosts whose configuration shows a full-tunnel
+            // VPN. Heuristic only — it never gates Start or promotes the
+            // ladder; the bound-connect probes stay the authority on the link.
+            clusterVpnWarnings() {
+                const hosts = this.clusterAutoconfigure?.fabric?.hosts
+                    || this.clusterFabric?.hosts
+                    || [];
+                const names = {
+                    warp: 'Cloudflare WARP',
+                    tailscale: 'Tailscale',
+                    globalprotect: 'GlobalProtect',
+                    anyconnect: 'Cisco AnyConnect',
+                };
+                return hosts
+                    .filter(entry => entry?.vpn?.full_tunnel)
+                    .map(entry => {
+                        const label = entry.host === '127.0.0.1'
+                            ? 'This Mac' : entry.host;
+                        const client = names[entry.vpn.client];
+                        return {
+                            host: entry.host,
+                            message: `${label} is on a corporate VPN that `
+                                + `captures all traffic`
+                                + `${client ? ` (${client})` : ''}. `
+                                + 'oMLX will pick link addresses the VPN '
+                                + 'ignores and verify the link end-to-end '
+                                + 'before use.',
+                        };
+                    });
+            },
+
             // Backend is a consequence of the cable, never a preference: the
             // fabric reader is the only thing that may name one, and it falls
             // back to the TCP ring out loud rather than by accident.
@@ -5238,9 +5568,9 @@
             // backend and preflight result from the peers we already know.
             // This remains useful on its own for advanced/manual planning;
             // startCluster() composes it with activation behind one click.
-            async autoconfigureCluster() {
-                if (this.clusterAutoconfigureLoading) return null;
-                const requestRevision = Number(this._clusterPlanRevision || 0);
+            // The one autoconfigure request shape, shared by the preview call
+            // below and by POST /start-jobs (B2) so the two can never drift.
+            clusterAutoconfigureRequestBody() {
                 const measuredNodes =
                     this.clusterAutoconfigure?.activation?.nodes || [];
                 const performanceByNode = new Map(
@@ -5248,65 +5578,72 @@
                         .filter(node => node?.node_id && node?.performance)
                         .map(node => [node.node_id, node.performance])
                 );
+                const nodes = this.clusterNodePayloads().map(node => ({
+                    ...node,
+                    ...(performanceByNode.has(node.node_id)
+                        ? { performance: performanceByNode.get(node.node_id) }
+                        : {}),
+                }));
+                const hosts = this.clusterClusterHostsPayload();
+                const body = {
+                    nodes,
+                    hosts,
+                    // `split_gib` used to be posted here and silently
+                    // dropped — ClusterAutoconfigureRequest never declared
+                    // it. The split now travels where the planner reads
+                    // it, as `max_weight_bytes` on the node itself.
+                    execution_profile: this.clusterExecutionProfile,
+                    prefer: this.clusterAutoconfigurePrefer,
+                    strategy: this.clusterStrategy,
+                    // Hand-entered addresses are an explicit routing
+                    // decision. Rediscovery here would replace them just
+                    // before activation and could put the collective back
+                    // on an unrelated mDNS/default route.
+                    detect_transports:
+                        hosts.length > 0 && !this.clusterIpsOverridden,
+                    auto_tune: this.clusterAutoTune,
+                    // Measure before staging so the signed layer placement
+                    // is the fast one. A post-staging re-plan can only report
+                    // a better split because the needed shards may be absent.
+                    measure_performance: this.clusterAutoTune,
+                    sampling_rank_only: this.clusterSamplingRankOnly,
+                    async_overlap: this.clusterAsyncOverlap,
+                    cache_affinity: this.clusterCacheAffinity,
+                    max_kv_size: this.clusterMaxKvSize === ''
+                        ? null
+                        : Number(this.clusterMaxKvSize),
+                    target_context_tokens: Number(
+                        this.clusterTargetContextTokens || 8192
+                    ),
+                    ring_connections_per_ip: Number(
+                        this.clusterRingConnectionsPerIp
+                    ),
+                };
+                if (this.clusterPlanMode === 'model') {
+                    body.model_path = this.clusterPlanModelPath.trim();
+                    body.model_source =
+                        this.clusterPlanModelSource || '127.0.0.1';
+                    if (this.clusterPlanModelSourcePython) {
+                        body.model_source_python =
+                            this.clusterPlanModelSourcePython;
+                    }
+                } else {
+                    body.model_size_bytes = Math.round(
+                        Number(this.clusterPlanModelSizeGiB) * (1024 ** 3)
+                    );
+                    body.layer_count = Number(this.clusterPlanLayerCount);
+                }
+                return body;
+            },
+
+            async autoconfigureCluster() {
+                if (this.clusterAutoconfigureLoading) return null;
+                const requestRevision = Number(this._clusterPlanRevision || 0);
+                const body = this.clusterAutoconfigureRequestBody();
                 this.clusterAutoconfigureLoading = true;
                 this.clusterAutoconfigureError = '';
                 this.clusterAutoconfigure = null;
                 try {
-                    const nodes = this.clusterNodePayloads().map(node => ({
-                        ...node,
-                        ...(performanceByNode.has(node.node_id)
-                            ? { performance: performanceByNode.get(node.node_id) }
-                            : {}),
-                    }));
-                    const hosts = this.clusterClusterHostsPayload();
-                    const body = {
-                        nodes,
-                        hosts,
-                        // `split_gib` used to be posted here and silently
-                        // dropped — ClusterAutoconfigureRequest never declared
-                        // it. The split now travels where the planner reads
-                        // it, as `max_weight_bytes` on the node itself.
-                        execution_profile: this.clusterExecutionProfile,
-                        prefer: this.clusterAutoconfigurePrefer,
-                        strategy: this.clusterStrategy,
-                        // Hand-entered addresses are an explicit routing
-                        // decision. Rediscovery here would replace them just
-                        // before activation and could put the collective back
-                        // on an unrelated mDNS/default route.
-                        detect_transports:
-                            hosts.length > 0 && !this.clusterIpsOverridden,
-                        auto_tune: this.clusterAutoTune,
-                        // Measure before staging so the signed layer placement
-                        // is the fast one. A post-staging re-plan can only report
-                        // a better split because the needed shards may be absent.
-                        measure_performance: this.clusterAutoTune,
-                        sampling_rank_only: this.clusterSamplingRankOnly,
-                        async_overlap: this.clusterAsyncOverlap,
-                        cache_affinity: this.clusterCacheAffinity,
-                        max_kv_size: this.clusterMaxKvSize === ''
-                            ? null
-                            : Number(this.clusterMaxKvSize),
-                        target_context_tokens: Number(
-                            this.clusterTargetContextTokens || 8192
-                        ),
-                        ring_connections_per_ip: Number(
-                            this.clusterRingConnectionsPerIp
-                        ),
-                    };
-                    if (this.clusterPlanMode === 'model') {
-                        body.model_path = this.clusterPlanModelPath.trim();
-                        body.model_source =
-                            this.clusterPlanModelSource || '127.0.0.1';
-                        if (this.clusterPlanModelSourcePython) {
-                            body.model_source_python =
-                                this.clusterPlanModelSourcePython;
-                        }
-                    } else {
-                        body.model_size_bytes = Math.round(
-                            Number(this.clusterPlanModelSizeGiB) * (1024 ** 3)
-                        );
-                        body.layer_count = Number(this.clusterPlanLayerCount);
-                    }
                     const response = await fetch('/admin/api/cluster/autoconfigure', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -5380,10 +5717,11 @@
                 }
             },
 
-            // The normal product path. Autoconfigure is the safety boundary:
-            // only its launch-ready response can reach /deployments, and the
-            // activation object is posted byte-for-byte as the server shaped
-            // it. A blocker therefore stops before any rank process starts.
+            // The normal product path. The whole link-setup → autoconfigure →
+            // staging → activation ladder now runs server-side as one
+            // persisted job (B2): this method only creates the job and then
+            // renders the server's record — so a reload mid-start re-attaches
+            // instead of losing the sequence.
             async startCluster() {
                 if (this.clusterLinkSetupLoading
                     || this.clusterAutoconfigureLoading
@@ -5391,6 +5729,7 @@
                     return;
                 }
                 this.clusterError = '';
+                this.clusterAutoconfigureError = '';
                 this.clusterActivationResult = null;
                 if (this.clusterPlanMode !== 'model'
                     || !this.clusterPlanModelPath.trim()) {
@@ -5403,48 +5742,187 @@
                         'Choose a worker before starting the cluster.';
                     return;
                 }
-                if (!await this.prepareCudaSupernodesForActivation()) return;
-                const linkStatus = await this.loadClusterLinkStatus();
-                if (linkStatus?.setup_available) {
-                    const ready = await this.prepareClusterLink();
-                    if (!ready) return;
-                }
-                if (!this.clusterLocalIp.trim() || !this.clusterPeerIp.trim()) {
-                    await this.loadClusterFabric();
-                }
-                if (!this.clusterLocalIp.trim() || !this.clusterPeerIp.trim()) {
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
                     this.clusterAutoconfigureError =
-                        this.clusterFabricError
-                        || 'The workers do not have a shared cluster address yet.';
+                        this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
                     return;
                 }
-                let proposal = await this.autoconfigureCluster();
-                if (!proposal) return;
-                if (proposal.fabric_ready === false) {
-                    this.clusterAutoconfigureError = proposal.fabric_blocker
-                        || 'The workers do not have a verified cluster route yet.';
-                    return;
-                }
-                if (proposal.staging && !proposal.staging.ready) {
-                    const staged = await this.stageClusterModel(proposal);
-                    if (!staged) return;
-                    proposal = await this.autoconfigureCluster();
-                    if (!proposal) return;
-                }
-                if (!proposal.ready_to_activate) {
-                    this.clusterAutoconfigureError = proposal.staging?.error
-                        || (proposal.staging && !proposal.staging.ready
-                            ? 'The model files could not be prepared on every worker.'
-                            : proposal.preflight)
-                        || 'Resolve the setup checks below, then try Start Cluster again.';
-                    return;
-                }
-                if (!proposal.activation || typeof proposal.activation !== 'object') {
+                try {
+                    const response = await fetch('/admin/api/cluster/start-jobs', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(this.clusterAutoconfigureRequestBody()),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(await this.clusterResponseError(
+                            response, 'Start Cluster failed'
+                        ));
+                    }
+                    this.adoptClusterStartJob(await response.json());
+                } catch (error) {
                     this.clusterAutoconfigureError =
-                        'Automatic setup did not return a safe activation request.';
+                        error?.message || 'Start Cluster failed';
+                }
+            },
+
+            // Render one server-owned job record and derive the loading flag
+            // from its phase, so the [#2819] poll guards in
+            // syncClusterNodesFromPeers() keep holding while a job runs.
+            adoptClusterStartJob(job) {
+                if (!job?.job_id) return;
+                this.clusterStartJob = job;
+                const running = !['ready', 'failed'].includes(job.phase);
+                this.clusterActivationLoading = running;
+                if (running) {
+                    this.startClusterActivationProgress();
+                }
+            },
+
+            // Reload safety: on cluster-tab init, re-attach to whatever job
+            // is still running instead of showing a dead Start button.
+            async adoptRunningClusterStartJob() {
+                if (this.clusterStartJob
+                    && !['ready', 'failed'].includes(this.clusterStartJob.phase)) {
                     return;
                 }
-                await this.activateClusterProposal(proposal.activation);
+                try {
+                    const response = await fetch('/admin/api/cluster/start-jobs');
+                    if (!response.ok) return;
+                    const payload = await response.json();
+                    const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+                    const running = jobs.find(job =>
+                        job && !['ready', 'failed'].includes(job.phase));
+                    if (running) this.adoptClusterStartJob(running);
+                } catch (error) {
+                    // Re-attach is opportunistic; the next poll tries again.
+                }
+            },
+
+            async refreshClusterStartJob() {
+                const job = this.clusterStartJob;
+                if (!job?.job_id) return;
+                let updated = null;
+                try {
+                    const response = await fetch(
+                        `/admin/api/cluster/start-jobs/${job.job_id}`
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) return;
+                    updated = await response.json();
+                } catch (error) {
+                    return;
+                }
+                const previousPhase = job.phase;
+                this.clusterStartJob = updated;
+                this.clusterActivationLoading =
+                    !['ready', 'failed'].includes(updated.phase);
+                if (updated.phase === 'staging' && updated.staging_job_id) {
+                    await this.loadClusterStartJobStaging(updated.staging_job_id);
+                }
+                if (previousPhase !== updated.phase
+                    && ['ready', 'failed'].includes(updated.phase)) {
+                    await this.finishClusterStartJob(updated);
+                }
+            },
+
+            async finishClusterStartJob(job) {
+                this.stopClusterActivationProgress();
+                this.clusterActivationProgress = '';
+                this.clusterActivationLoading = false;
+                this.clusterStartJobStaging = null;
+                if (job.phase === 'ready') {
+                    this.clusterActivationResult = job.result || null;
+                    this.clusterPlanChanges = job.result?.plan_changes || null;
+                    if (job.result?.plan) {
+                        this.clusterPlan = job.result.plan;
+                    }
+                    await this.loadClusterRuntime();
+                    await this.loadClusterDeployments();
+                } else {
+                    this.clusterError = job.error || 'Start Cluster failed';
+                }
+            },
+
+            async loadClusterStartJobStaging(stagingJobId) {
+                try {
+                    const response = await fetch(
+                        `/admin/api/cluster/stage/${stagingJobId}`
+                    );
+                    if (!response.ok) return;
+                    this.clusterStartJobStaging = await response.json();
+                } catch (error) {
+                    // Progress detail only; the phase text still renders.
+                }
+            },
+
+            clusterStartJobPhaseText(job) {
+                switch (job?.phase) {
+                    case 'queued':
+                        return 'Preparing…';
+                    case 'link_setup':
+                        return 'Configuring the cluster link…';
+                    case 'autoconfigure':
+                        return 'Checking every worker…';
+                    case 'staging': {
+                        const nodes = Object.values(
+                            this.clusterStartJobStaging?.nodes || {}
+                        );
+                        const copying = nodes.find(
+                            node => node.status === 'copying'
+                        );
+                        if (copying) {
+                            const total = Number(copying.bytes_total || 0);
+                            const percent = total > 0
+                                ? Math.min(100, Math.floor(
+                                    (Number(copying.bytes_completed || 0) / total)
+                                    * 100
+                                ))
+                                : 0;
+                            return `Staging model files (rank ${copying.rank}: ${percent}%)`;
+                        }
+                        return 'Staging model files…';
+                    }
+                    case 'activating':
+                        return this.clusterActivationProgressFromRuntime()
+                            || 'Launching…';
+                    case 'ready':
+                        return 'Ready';
+                    case 'failed':
+                        return 'Failed';
+                    default:
+                        return 'Starting cluster…';
+                }
+            },
+
+            // The Start button's label: the server's phase text while a job
+            // runs; the legacy loading flags cover the manual-plan path.
+            clusterStartButtonLabel() {
+                const job = this.clusterStartJob;
+                if (job && !['ready', 'failed'].includes(job.phase)) {
+                    return this.clusterStartJobPhaseText(job);
+                }
+                if (this.clusterLinkSetupLoading) {
+                    return this.clusterActivationProgress
+                        || 'Configuring Thunderbolt…';
+                }
+                if (this.clusterActivationLoading) {
+                    return this.clusterActivationProgress || 'Starting cluster…';
+                }
+                if (this.clusterAutoconfigureLoading) {
+                    return 'Checking every worker…';
+                }
+                return 'Start Cluster';
             },
 
             async activateClusterProposal(activation) {
@@ -5772,6 +6250,84 @@
                 return (this.clusterNodeRoles.find(r => r.key === key) || {}).summary || '';
             },
 
+            clusterRoleLabel(key) {
+                return (this.clusterNodeRoles.find(r => r.key === key) || {}).label
+                    || String(key || 'headless');
+            },
+
+            // The memory row's arithmetic (B5): physical, minus what the live
+            // ceiling already rules out, minus the role's reserve, equals what
+            // the planner may assign. Every number comes from the server's
+            // /node-budgets breakdown — nothing is derived client-side.
+            clusterBudgetBreakdownLine(node) {
+                const b = node?.budget_breakdown;
+                if (!b) return '';
+                const gib = value =>
+                    `${(Number(value || 0) / 1024 ** 3).toFixed(1)} GiB`;
+                const hard = Number(b.hard_limit || 0);
+                const physical = Number(b.physical_bytes || 0);
+                const parts = [];
+                if (physical > 0) {
+                    parts.push(`${gib(physical)} physical`);
+                    if (hard > 0 && physical > hard) {
+                        // Name the component that set the ceiling. `dynamic`
+                        // is reclaimable-based, not an app-by-app account, so
+                        // the copy says "right now" rather than pretending to
+                        // a per-app ledger.
+                        let why = 'kept back by the memory-guard tier';
+                        if (Number(b.metal_cap || 0) > 0
+                            && hard === Number(b.metal_cap)) {
+                            why = 'beyond what the GPU can address';
+                        }
+                        if (Number(b.dynamic || 0) > 0
+                            && hard === Number(b.dynamic)) {
+                            why = 'in use by other apps right now';
+                        }
+                        parts.push(`− ${gib(physical - hard)} ${why}`);
+                    }
+                } else if (hard > 0) {
+                    // Older peer or unknown physical: start from the measured
+                    // ceiling instead of inventing a physical number.
+                    parts.push(`${gib(hard)} safe ceiling`);
+                } else {
+                    parts.push(`${gib(node.capacity_bytes || 0)} measured ceiling`);
+                }
+                if (Number(b.reserve_bytes || 0) > 0) {
+                    parts.push(
+                        `− ${gib(b.reserve_bytes)} held back `
+                        + `(${this.clusterRoleLabel(b.role)})`
+                    );
+                }
+                parts.push(`= ${gib(b.usable_bytes)} for the cluster`);
+                return parts.join(' ');
+            },
+
+            clusterBudgetBindingLabel(node) {
+                const b = node?.budget_breakdown;
+                if (!b) return '';
+                return {
+                    role_reserve:
+                        `${this.clusterRoleLabel(b.role)} reserve is the binding limit`,
+                    dynamic_pressure:
+                        'Other apps’ memory use is the binding limit right now',
+                    metal_cap:
+                        'The GPU allocation cap is the binding limit',
+                }[b.binding] || '';
+            },
+
+            // Evidence age: the breakdown is a live reading, and a stale one
+            // must say so rather than impersonate the present.
+            clusterBudgetEvidenceAge(node) {
+                const at = Number(node?.budget_measured_at || 0);
+                if (!at) return '';
+                const seconds = Math.max(
+                    0, Math.round((Date.now() - at) / 1000)
+                );
+                if (seconds < 60) return `measured ${seconds}s ago`;
+                const minutes = Math.round(seconds / 60);
+                return `measured ${minutes} min ago`;
+            },
+
             // Ask each Mac what it can actually offer. Installed RAM overstates
             // a MacBook by ~20 GiB because the GPU cannot address it all, and a
             // plan built on that number is refused at load.
@@ -5809,6 +6365,12 @@
                             n => String(n.node_id || '').trim() === measured.node_id
                         );
                         if (!node || !measured.capacity_bytes) return;
+                        // The arithmetic behind the number (B5). Stored on
+                        // every poll — including drift-guarded ones — because
+                        // it explains the row without changing any plan input,
+                        // and its age is part of the evidence.
+                        node.budget_breakdown = measured.breakdown || null;
+                        node.budget_measured_at = Date.now();
                         const capacityGiB = Number(
                             (measured.capacity_bytes / gib).toFixed(2)
                         );
@@ -8080,8 +8642,36 @@
                 }
             },
 
+            // Best-effort: fetch the largest context that fits on this Mac
+            // for the model. Fire-and-forget from openModelSettings — a slow
+            // or failed fetch (e.g. a model never downloaded) must never
+            // block the modal; the Auto button just stays hidden.
+            async fetchModelAutoContext(modelId) {
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/auto_context`);
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (
+                        this.selectedModel
+                        && this.selectedModel.id === modelId
+                        && Number(data?.max_context_tokens) > 0
+                    ) {
+                        this.modelSettingsAutoContext = data;
+                    }
+                } catch (_) { /* advisory only */ }
+            },
+
+            // Clicking "Auto" is exactly typing the computed number in.
+            // No auto-vs-manual mode is persisted for local settings.
+            applyAutoContext() {
+                const tokens = Number(this.modelSettingsAutoContext?.max_context_tokens);
+                if (!Number.isFinite(tokens) || tokens <= 0) return;
+                this.modelSettings.max_context_window = tokens;
+            },
+
             async openModelSettings(model) {
                 this.profileError = '';
+                this.modelSettingsAutoContext = null;
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
                 this.editingProfile = null;
@@ -8116,6 +8706,8 @@
                     }
                 }
                 this.selectedModel = model;
+                // Deliberately not awaited: advisory, must never delay the modal.
+                if (!isDiffusion) this.fetchModelAutoContext(model.id);
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
