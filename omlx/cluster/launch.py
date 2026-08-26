@@ -40,6 +40,12 @@ from .staging import home_relative_model_path, validate_staged_model
 logger = logging.getLogger(__name__)
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
+# The complete set of event types a worker emits as fatal today
+# (inference_worker.py: launcher_lost, peer_lost). Matching on this instead
+# of "carries a reason or error key" means a future *informational* event
+# with one of those keys can no longer brick a healthy deployment by
+# accident. (§E2)
+_FATAL_EVENT_TYPES = frozenset({"launcher_lost", "peer_lost"})
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
@@ -1851,8 +1857,17 @@ class DistributedJobSupervisor:
                             rank = event.get("rank")
                             if isinstance(rank, int) and not isinstance(rank, bool):
                                 self.rank_ready_events[rank] = event
-                        elif event.get("reason") or event.get("error"):
+                        elif event.get("type") in _FATAL_EVENT_TYPES:
                             self.failure_event = event
+                        elif event.get("reason") or event.get("error"):
+                            # Not a recognized fatal type, but it looks like
+                            # one -- log it so a genuinely new fatal type
+                            # doesn't wedge a deployment in total silence.
+                            logger.warning(
+                                "cluster event carries reason/error but is "
+                                "not a recognized fatal type, ignoring: %r",
+                                event,
+                            )
                 self._condition.notify_all()
 
     def _wait_for_ready(self) -> dict[str, Any]:
