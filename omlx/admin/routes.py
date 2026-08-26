@@ -1946,6 +1946,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 or model_info.get("model_path") in referenced_drafts
                 or model_info.get("source_repo_id") in referenced_drafts
             ),
+            # Intrinsic drafter family ("mtp"/"assistant"/"dflash"/"draft");
+            # None for chat models and for drafts known only by reference.
+            "helper_kind": model_info.get("helper_kind"),
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
@@ -2731,6 +2734,18 @@ async def update_model_settings(
         # Also update the engine pool entry
         entry.is_pinned = request.is_pinned
     if request.is_default is not None:
+        if request.is_default and getattr(entry, "is_helper", False):
+            # Drafter checkpoints (MTP/Assistant/DFlash) can't serve requests
+            # standalone; a default pointing at one breaks bare API calls.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"'{model_id}' is a speculative-decoding drafter "
+                    f"({entry.helper_kind or 'draft'}) and cannot be the "
+                    "default model; set its target chat model as default "
+                    "instead."
+                ),
+            )
         current_settings.is_default = request.is_default
         if server_state:
             if request.is_default:

@@ -239,6 +239,14 @@ private struct LibrarySection: View {
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     CopyIconButton(value: m.id)
+                                    if m.isAttachableDrafter {
+                                        StatusPill(status: .custom(
+                                            color: theme.textSecondary,
+                                            label: String(localized: "models.library.badge.drafter",
+                                                          defaultValue: "Drafter",
+                                                          comment: "Badge on a library row marking the model as a speculative-decoding drafter that attaches to a chat model instead of loading standalone"),
+                                            fillBg: false))
+                                    }
                                 }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(11))

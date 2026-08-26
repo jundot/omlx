@@ -100,6 +100,22 @@
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
+    // Names a drafter's chat model may use: `name` with every "-MTP" /
+    // "-Assistant" token dropped, e.g. "...-27B-MTP-8bit" → "...-27B-8bit".
+    // Splitting on "-" keeps the "--" org/model separator of Hub-derived ids
+    // intact as an empty component, so rejoining reproduces it exactly.
+    // Mirrors candidateNames() in the Mac app's MtpDrafterPairing.
+    function drafterTargetNames(name) {
+        const tokens = name.split('-');
+        const stripped = tokens.filter((token) => {
+            const lower = token.toLowerCase();
+            return lower !== 'mtp' && lower !== 'assistant';
+        });
+        return stripped.length === tokens.length
+            ? new Set()
+            : new Set([stripped.join('-')]);
+    }
+
     function dashboard() {
         return {
             // Theme
@@ -6917,8 +6933,105 @@
                 }
             },
 
+            // MTP/Assistant drafter checkpoints can't serve requests
+            // standalone — the server rejects loading them as the main
+            // model, so "Load" attaches them to a chat model instead.
+            isAttachableDrafter(model) {
+                return !!model && (model.helper_kind === 'mtp' || model.helper_kind === 'assistant');
+            },
+
+            // Resolve the chat model a drafter should attach to. Priority:
+            // a chat model whose settings already reference the drafter as
+            // its VLM MTP draft model (prior manual configuration), then a
+            // name match with the drafter's "-MTP"/"-Assistant" token
+            // removed (model id first, Hub repo id second). Returns null
+            // when nothing or several different models match — the caller
+            // then points the user at manual attachment.
+            resolveDrafterTarget(drafter) {
+                const chatModels = (this.models || []).filter((model) => (
+                    !model.virtual && !model.is_helper && model.id !== drafter.id
+                ));
+
+                // Settings may reference the drafter by model id, on-disk
+                // path, or Hub repo id — the server accepts all three.
+                const refs = new Set(
+                    [drafter.id, drafter.model_path, drafter.source_repo_id].filter(Boolean)
+                );
+                const referenced = chatModels.filter((model) => {
+                    const draft = model.settings?.vlm_mtp_draft_model;
+                    return !!draft && refs.has(draft);
+                });
+                if (referenced.length === 1) return referenced[0];
+
+                const idCandidates = drafterTargetNames(drafter.id);
+                const idMatches = chatModels.filter((model) => idCandidates.has(model.id));
+                if (idMatches.length === 1) return idMatches[0];
+
+                if (drafter.source_repo_id) {
+                    const repoCandidates = drafterTargetNames(drafter.source_repo_id);
+                    const repoMatches = chatModels.filter((model) => (
+                        model.source_repo_id && repoCandidates.has(model.source_repo_id)
+                    ));
+                    if (repoMatches.length === 1) return repoMatches[0];
+                }
+                return null;
+            },
+
+            // Enable VLM MTP on the drafter's chat model with this drafter,
+            // then make sure the target ends up loaded. Changing load-time
+            // settings on a loaded model auto-unloads it server-side, and
+            // only pinned models auto-reload — so re-load it ourselves when
+            // the settings PUT reports it stayed unloaded.
+            async attachDrafter(drafter) {
+                const target = this.resolveDrafterTarget(drafter);
+                if (!target) {
+                    alert(window.t('js.error.drafter_no_target').replace('{id}', drafter.id));
+                    return;
+                }
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(target.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ vlm_mtp_enabled: true, vlm_mtp_draft_model: drafter.id }),
+                    });
+                    let data = null;
+                    if (response.ok) {
+                        data = await response.json().catch(() => ({}));
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    } else {
+                        const errData = await response.json().catch(() => ({}));
+                        alert(errData.detail || window.t('js.error.update_model_setting_failed'));
+                        return;
+                    }
+
+                    const needsLoad = (!target.loaded && !target.is_loading)
+                        || (data.auto_unloaded && !data.auto_reloaded);
+                    if (needsLoad) {
+                        target.is_loading = true;
+                        const loadResponse = await fetch(`/admin/api/models/${encodeURIComponent(target.id)}/load`, {
+                            method: 'POST',
+                        });
+                        if (loadResponse.status !== 401 && !loadResponse.ok) {
+                            const errData = await loadResponse.json().catch(() => ({}));
+                            alert(errData.detail || window.t('js.error.load_model_failed'));
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to attach drafter:', err);
+                    alert(window.t('js.error.load_model_failed'));
+                } finally {
+                    await this.loadModels();
+                }
+            },
+
             async loadModel(modelId) {
                 const model = this.models.find(m => m.id === modelId);
+                if (model && this.isAttachableDrafter(model)) {
+                    await this.attachDrafter(model);
+                    return;
+                }
                 if (model) model.is_loading = true;
                 try {
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/load`, {

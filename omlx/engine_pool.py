@@ -215,6 +215,7 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    helper_kind: str | None = None  # "mtp" | "assistant" | "dflash" | "draft"
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -734,6 +735,7 @@ class EnginePool:
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
+                    helper_kind=getattr(info, "helper_kind", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -926,6 +928,9 @@ class EnginePool:
         context = config.get("max_position_embeddings")
         if not isinstance(context, int) or context <= 0:
             context = None
+        from .model_discovery import helper_kind_for_config
+
+        helper_kind = helper_kind_for_config(config)
         self._entries[model_id] = EngineEntry(
             model_id=model_id,
             model_path=str(path),
@@ -935,6 +940,8 @@ class EnginePool:
             config_model_type=str(config.get("model_type") or ""),
             model_context_length=context,
             source_type="cluster",
+            is_helper=helper_kind is not None,
+            helper_kind=helper_kind,
         )
         logger.info(
             "Registered remote-sourced cluster model %s at %s",
@@ -1017,6 +1024,42 @@ class EnginePool:
             model_id,
             f"Model '{model_id}' is unavailable after a previous load failure: {detail}. "
             "Reload models after fixing the files to retry.",
+        )
+
+    def _raise_if_helper(self, model_id: str, entry: EngineEntry) -> None:
+        """Reject speculative-decoding drafters loaded as the main model.
+
+        Drafter checkpoints (MTP/Assistant/DFlash) are partial models that
+        only work attached to a compatible chat model through a speculative-
+        decoding path; loading one standalone dies deep inside the loader
+        with an opaque "Model type ... not supported". Fail fast with
+        actionable guidance instead. No load failure is cached: nothing
+        about the checkpoint's files is broken.
+        """
+        if not entry.is_helper:
+            return
+        kind = entry.helper_kind or "draft"
+        if kind == "dflash":
+            hint = (
+                "Attach it to a compatible chat model via Admin > Model "
+                "Settings > Speculative decoding > DFlash draft model."
+            )
+        elif kind in ("mtp", "assistant"):
+            hint = (
+                "Attach it to a compatible chat model via Admin > Model "
+                "Settings > Speculative decoding > VLM MTP drafter."
+            )
+        else:
+            hint = (
+                "Attach it to a compatible chat model as a speculative-"
+                "decoding draft via Admin > Model Settings."
+            )
+        raise ModelUnavailableError(
+            model_id,
+            f"Model '{model_id}' is a speculative-decoding drafter "
+            f"(model_type '{entry.config_model_type or kind}'), not a "
+            f"standalone chat model. {hint} Drafters can be hidden from "
+            "/v1/models via Settings > Hide helper models.",
         )
 
     def set_pinned(self, model_id: str, pinned: bool) -> bool:
@@ -1468,6 +1511,7 @@ class EnginePool:
 
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
+            self._raise_if_helper(model_id, entry)
 
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
@@ -2439,6 +2483,7 @@ class EnginePool:
         entry = self._entries[model_id]
         if entry.is_loading:
             raise ModelLoadingError(model_id)
+        self._raise_if_helper(model_id, entry)
 
         entry.is_loading = True
         entry.loading_started_at = time.monotonic()
@@ -3020,6 +3065,7 @@ class EnginePool:
                     ),
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
+                    "helper_kind": e.helper_kind,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,

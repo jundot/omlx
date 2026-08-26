@@ -84,6 +84,97 @@ def small_mock_model_dir(tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def helper_model_dir(tmp_path):
+    """Model dir with a chat model plus speculative drafter checkpoints."""
+    chat = tmp_path / "chat-model"
+    chat.mkdir()
+    (chat / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (chat / "model.safetensors").write_bytes(b"0" * 1024)
+
+    mtp = tmp_path / "chat-model-mtp"
+    mtp.mkdir()
+    (mtp / "config.json").write_text(json.dumps({"model_type": "qwen3_5_mtp"}))
+    (mtp / "model.safetensors").write_bytes(b"0" * 1024)
+
+    dflash = tmp_path / "chat-model-dflash"
+    dflash.mkdir()
+    (dflash / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["DFlashDraftModel"]})
+    )
+    (dflash / "model.safetensors").write_bytes(b"0" * 1024)
+
+    return tmp_path
+
+
+class TestHelperDrafterGuard:
+    """Speculative drafters must never be loaded as the main model; the pool
+    rejects them up front with actionable guidance instead of the loader's
+    opaque "Model type ... not supported"."""
+
+    def test_discovery_marks_helper_kind(self, helper_model_dir):
+        pool = _make_pool(ceiling=None)
+        pool.discover_models(str(helper_model_dir))
+
+        mtp = pool.get_entry("chat-model-mtp")
+        assert mtp.is_helper is True
+        assert mtp.helper_kind == "mtp"
+        dflash = pool.get_entry("chat-model-dflash")
+        assert dflash.is_helper is True
+        assert dflash.helper_kind == "dflash"
+        chat = pool.get_entry("chat-model")
+        assert chat.is_helper is False
+        assert chat.helper_kind is None
+
+        by_id = {m["id"]: m for m in pool.get_status()["models"]}
+        assert by_id["chat-model-mtp"]["helper_kind"] == "mtp"
+        assert by_id["chat-model"]["helper_kind"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_engine_rejects_mtp_helper_with_guidance(
+        self, helper_model_dir
+    ):
+        pool = _make_pool(ceiling=None)
+        pool.discover_models(str(helper_model_dir))
+
+        with pytest.raises(ModelUnavailableError) as excinfo:
+            await pool.get_engine("chat-model-mtp")
+
+        msg = str(excinfo.value)
+        assert "speculative-decoding drafter" in msg
+        assert "qwen3_5_mtp" in msg
+        assert "VLM MTP drafter" in msg
+        assert "Hide helper models" in msg
+        # The checkpoint is fine — no sticky load failure is cached.
+        entry = pool.get_entry("chat-model-mtp")
+        assert entry.load_failed is False
+        assert entry.is_loading is False
+
+    @pytest.mark.asyncio
+    async def test_load_engine_rejects_dflash_helper_with_guidance(
+        self, helper_model_dir
+    ):
+        pool = _make_pool(ceiling=None)
+        pool.discover_models(str(helper_model_dir))
+
+        with pytest.raises(ModelUnavailableError) as excinfo:
+            await pool._load_engine("chat-model-dflash")
+
+        msg = str(excinfo.value)
+        assert "speculative-decoding drafter" in msg
+        assert "DFlash draft model" in msg
+        entry = pool.get_entry("chat-model-dflash")
+        assert entry.load_failed is False
+        assert entry.is_loading is False
+
+    def test_raise_if_helper_ignores_chat_models(self, helper_model_dir):
+        pool = _make_pool(ceiling=None)
+        pool.discover_models(str(helper_model_dir))
+        entry = pool.get_entry("chat-model")
+        # No raise for ordinary chat models.
+        pool._raise_if_helper("chat-model", entry)
+
+
 class TestEnginePoolInit:
     """Tests for EnginePool initialization."""
 
