@@ -9,24 +9,31 @@ from .config import ModelConfig
 from .language import (
     DiskBackedQuantizedEmbedding,
     LanguageModel,
+    Qwen4ExpMTPModule,
     compile_hyper_connections,
     fuse_hyper_connection_projections,
+    get_mtp_runtime,
 )
 
-_TEXT_FIRST_IGNORED_PREFIXES = (
-    "mtp.",
-    "language_model.mtp.",
-    "model.mtp.",
-    "vision_tower.",
-)
+_MTP_PREFIXES = ("mtp.", "language_model.mtp.", "model.mtp.")
+_TEXT_FIRST_IGNORED_PREFIXES = ("vision_tower.",)
 _PLE_SHARD_FRAGMENT = ".ple.ple_embedding.ngram_embedding.shard_"
 
 
-def filter_text_first_weights(weights, *, drop_ple: bool = False):
+def filter_text_first_weights(
+    weights,
+    *,
+    drop_ple: bool = False,
+    mtp_checkpoint_prefix: str | None = None,
+):
     """Drop deferred towers and normalize the two observed PLE conv layouts."""
     filtered = []
     for name, value in weights:
         if name.startswith(_TEXT_FIRST_IGNORED_PREFIXES):
+            continue
+        if name.startswith(_MTP_PREFIXES) and not (
+            mtp_checkpoint_prefix and name.startswith(mtp_checkpoint_prefix)
+        ):
             continue
         if drop_ple and _PLE_SHARD_FRAGMENT in name:
             continue
@@ -58,6 +65,14 @@ class Model(Qwen3_5Model):
         self.config = config
         self.vision_tower = TextOnlyVisionTower()
         self.language_model = LanguageModel(config.text_config, config)
+        mtp_runtime = get_mtp_runtime()
+        if mtp_runtime.enabled:
+            mtp = Qwen4ExpMTPModule(config.text_config)
+            if mtp_runtime.checkpoint_prefix == "mtp.":
+                self.mtp = mtp
+                self.language_model.bind_mtp_owner(self)
+            else:
+                self.language_model.bind_mtp_module(mtp)
         self._disk_backed_ple = any(
             layer.ple is not None
             and isinstance(
@@ -68,8 +83,15 @@ class Model(Qwen3_5Model):
         )
 
     def load_weights(self, weights, strict=True):
+        mtp_runtime = get_mtp_runtime()
         result = super().load_weights(
-            filter_text_first_weights(weights, drop_ple=self._disk_backed_ple),
+            filter_text_first_weights(
+                weights,
+                drop_ple=self._disk_backed_ple,
+                mtp_checkpoint_prefix=(
+                    mtp_runtime.checkpoint_prefix if mtp_runtime.enabled else None
+                ),
+            ),
             strict=strict,
         )
         fuse_hyper_connection_projections(self)

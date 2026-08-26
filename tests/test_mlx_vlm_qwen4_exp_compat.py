@@ -677,7 +677,66 @@ def test_qwen4_exp_preload_dispatch_applies_vlm_compat(tmp_path, monkeypatch):
     maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
 
     apply_patch.assert_called_once_with()
-    configure_runtime.assert_called_once_with(str(tmp_path))
+    configure_runtime.assert_called_once_with(str(tmp_path), mtp_enabled=False)
+
+
+@pytest.mark.parametrize(
+    ("configured_depth", "expected_depth"),
+    [(None, 1), (2, 2)],
+)
+def test_qwen4_exp_preload_dispatch_arms_embedded_mtp(
+    tmp_path, monkeypatch, configured_depth, expected_depth
+):
+    import json
+
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {"model_type": "qwen4_exp_text"},
+                "vision_config": {"model_type": "qwen4_exp"},
+            }
+        )
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "language_model.mtp.fc_hidden.weight": "model.safetensors",
+                }
+            }
+        )
+    )
+    apply_compat = MagicMock(return_value=True)
+    configure_runtime = MagicMock(return_value="mmap")
+    apply_mtp = MagicMock(return_value=True)
+    set_active = MagicMock()
+    set_depth = MagicMock()
+    monkeypatch.setattr(compat, "apply_mlx_vlm_qwen4_exp_compat_patch", apply_compat)
+    monkeypatch.setattr(compat, "configure_qwen4_exp_runtime", configure_runtime)
+    monkeypatch.setattr(mlx_lm_mtp, "apply_mlx_lm_mtp_patch", apply_mtp)
+    monkeypatch.setattr(mlx_lm_mtp, "set_mtp_active", set_active)
+    monkeypatch.setattr(mlx_lm_mtp, "set_mtp_depth", set_depth)
+    settings = SimpleNamespace(
+        mtp_enabled=True,
+        mtp_num_draft_tokens=configured_depth,
+    )
+
+    maybe_apply_pre_load_patches(
+        str(tmp_path),
+        model_settings=settings,
+        for_vlm=True,
+    )
+
+    # The loader first clears the process-wide flag, then arms Qwen4 MTP.
+    assert set_active.call_args_list[-1].args == (True,)
+    set_depth.assert_called_once_with(expected_depth)
+    apply_mtp.assert_called_once_with()
+    configure_runtime.assert_called_once_with(str(tmp_path), mtp_enabled=True)
 
 
 def test_qwen4_exp_auto_ple_mode_uses_4bit_checkpoint_as_ram_boundary():
@@ -744,6 +803,236 @@ def test_text_first_weight_filter_drops_deferred_towers_and_optional_ple():
     assert [name for name, _ in filter_text_first_weights(weights, drop_ple=True)] == [
         "language_model.model.embed_tokens.weight",
     ]
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_prefix", "expected_prefix"),
+    [
+        ("mtp.", "mtp."),
+        ("language_model.mtp.", "language_model.mtp."),
+    ],
+)
+def test_text_first_weight_filter_keeps_only_configured_mtp_layout(
+    checkpoint_prefix,
+    expected_prefix,
+):
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import filter_text_first_weights
+
+    weights = [
+        ("mtp.fc_hidden.weight", object()),
+        ("language_model.mtp.fc_hidden.weight", object()),
+        ("vision_tower.blocks.0.attn.qkv.weight", object()),
+    ]
+
+    filtered = filter_text_first_weights(
+        weights,
+        mtp_checkpoint_prefix=checkpoint_prefix,
+    )
+
+    assert [name for name, _ in filtered] == [f"{expected_prefix}fc_hidden.weight"]
+
+
+def test_qwen4_mtp_runtime_detects_raw_and_nested_checkpoint_layouts(tmp_path):
+    import json
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+        configure_qwen4_exp_runtime,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import get_mtp_runtime
+
+    for prefix in ("mtp.", "language_model.mtp."):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        f"{prefix}fc_hidden.weight": "model.safetensors",
+                    }
+                }
+            )
+        )
+        configure_qwen4_exp_runtime(tmp_path, mtp_enabled=True)
+        runtime = get_mtp_runtime()
+        assert runtime.enabled is True
+        assert runtime.checkpoint_prefix == prefix
+
+
+def test_qwen4_mtp_fusion_matches_reference_equations():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpMTPModule
+
+    args = _tiny_qwen4_mtp_args()
+    module = Qwen4ExpMTPModule(args)
+    module.fc_embedding.weight = mx.eye(32)
+    module.fc_hidden.weight = mx.eye(32)
+    embedding_norm_weight = mx.linspace(-0.8, -0.2, 32)
+    hidden_norm_weight = mx.linspace(-0.6, 0.3, 64)
+    module.pre_fc_norm_embedding.weight = embedding_norm_weight
+    module.pre_fc_norm_hidden.weight = hidden_norm_weight
+    embedding = mx.arange(1, 33, dtype=mx.float32).reshape(1, 1, 32)
+    hidden = mx.arange(1, 65, dtype=mx.float32).reshape(1, 1, 64)
+
+    actual = module.fuse_inputs(embedding, hidden)
+    expected_embedding = embedding * mx.rsqrt(
+        mx.mean(embedding * embedding, axis=-1, keepdims=True) + args.rms_norm_eps
+    )
+    expected_embedding = expected_embedding * (1 + embedding_norm_weight)
+    expected_hidden = hidden * mx.rsqrt(
+        mx.mean(hidden * hidden, axis=-1, keepdims=True) + args.rms_norm_eps
+    )
+    expected_hidden = expected_hidden * (1 + hidden_norm_weight)
+    expected_hidden = expected_hidden.reshape(1, 1, 2, 32)
+    expected = (expected_embedding[..., None, :] + expected_hidden).reshape(1, 1, 64)
+
+    assert actual.shape == (1, 1, 64)
+    assert mx.allclose(actual, expected, atol=2e-3).item()
+
+
+def _tiny_qwen4_mtp_args():
+    from mlx_vlm.models.qwen4_exp import TextConfig
+
+    return TextConfig(
+        model_type="qwen4_exp_text",
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_expert_intermediate_size=16,
+        moe_intermediate_size=16,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        eos_token_id=63,
+        head_dim=16,
+        rope_parameters={
+            "rope_type": "default",
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+        full_attention_interval=1,
+        layer_types=["full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        ple_layer_ids=[],
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=8,
+        indexer_compress_ratio=4,
+    )
+
+
+def test_qwen4_mtp_head_prefill_and_decode_continue_qsa_cache():
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import (
+        QSAKVCache,
+        Qwen4ExpMTPModule,
+    )
+
+    args = _tiny_qwen4_mtp_args()
+    module = Qwen4ExpMTPModule(args)
+    embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+    cache = [QSAKVCache()]
+    hidden = mx.random.normal((1, 2, args.hc_count * args.hidden_size))
+    ids = mx.array([[10, 11]], dtype=mx.int32)
+
+    prefill, prefill_hc = module(hidden, ids, embeddings, cache)
+    decode, decode_hc = module(
+        mx.random.normal((1, 1, args.hc_count * args.hidden_size)),
+        mx.array([[12]], dtype=mx.int32),
+        embeddings,
+        cache,
+    )
+    mx.eval(prefill, prefill_hc, decode, decode_hc)
+
+    assert prefill.shape == (1, 2, args.hidden_size)
+    assert prefill_hc.shape == (1, 2, args.hc_count * args.hidden_size)
+    assert decode.shape == (1, 1, args.hidden_size)
+    assert decode_hc.shape == (1, 1, args.hc_count * args.hidden_size)
+    assert mx.all(mx.isfinite(prefill)).item()
+    assert mx.all(mx.isfinite(decode)).item()
+    assert cache[0].offset == 3
+    assert cache[0].indexer_offset == 3
+
+
+def test_qwen4_mtp_standard_prefill_primes_root_owned_head():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import (
+        LanguageModel,
+        Qwen4ExpMTPModule,
+    )
+
+    args = _tiny_qwen4_mtp_args()
+    args.num_hidden_layers = 2
+    args.layer_types = ["linear_attention", "full_attention"]
+    args.full_attention_interval = 2
+    outer_config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=59,
+    )
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    owner.mtp = Qwen4ExpMTPModule(args)
+    model = LanguageModel(args, config=outer_config)
+    model.bind_mtp_owner(owner)
+    cache = model.make_cache()
+
+    output = model(mx.array([[10, 11, 12, 13]], dtype=mx.int32), cache=cache)
+    mx.eval(output.logits)
+
+    ctx = prompt_priming._find_ctx(model)
+    try:
+        assert prompt_priming.prime_ctx_stats(model) == 3
+        assert ctx is not None
+        assert ctx.mtp_cache[0].offset == 3
+        assert ctx.mtp_cache[0].indexer_offset == 3
+    finally:
+        prompt_priming.drop_ctx(model)
 
 
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch):

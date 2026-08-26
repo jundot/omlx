@@ -622,12 +622,48 @@ def maybe_apply_pre_load_patches(
             configure_qwen4_exp_runtime,
         )
 
+        mtp_enabled = bool(
+            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
+        )
+        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+
+        # Qwen4 does not declare its draft head in config.json; the released
+        # checkpoints expose it only through mtp.* tensors. Arm the generic
+        # oMLX draft/verify loop explicitly when those tensors are present.
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_depth,
+        )
+
+        set_mtp_active(mtp_enabled and has_mtp_weights)
+        depth = (
+            getattr(model_settings, "mtp_num_draft_tokens", None)
+            if model_settings is not None
+            else None
+        )
+        # Depth 1 is the robust Qwen4 default: on real prose it is faster
+        # than the adaptive depth-3 path, while callers can still request a
+        # deeper chain for highly predictable output.
+        qwen4_mtp_depth = int(depth) if depth else 1
+        set_mtp_depth(qwen4_mtp_depth)
+        if mtp_enabled and has_mtp_weights and apply_mlx_lm_mtp_patch():
+            logger.info(
+                "Speculative backend selected for %s: native Qwen4 MTP "
+                "(max draft depth=%d)",
+                model_name,
+                qwen4_mtp_depth,
+            )
+
         if apply_mlx_vlm_qwen4_exp_compat_patch():
             logger.info(
                 "Qwen4-Exp mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
-        configure_qwen4_exp_runtime(model_name)
+        configure_qwen4_exp_runtime(
+            model_name,
+            mtp_enabled=mtp_enabled and has_mtp_weights,
+        )
 
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
@@ -784,7 +820,11 @@ def maybe_apply_pre_load_patches(
                             "load only)",
                             model_name,
                         )
-    elif model_settings is not None and getattr(model_settings, "mtp_enabled", False):
+    elif (
+        model_type != "qwen4_exp"
+        and model_settings is not None
+        and getattr(model_settings, "mtp_enabled", False)
+    ):
         logger.warning(
             "mtp_enabled=True for %s but model is incompatible "
             "(model_type=%r, mtp_heads=%s); MTP path will be inactive",

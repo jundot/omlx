@@ -8,6 +8,9 @@ import math
 import mmap
 import os
 import struct
+import weakref
+from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -33,6 +36,48 @@ _PRIME_1 = 10007
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+
+
+@dataclass(frozen=True)
+class Qwen4ExpMTPRuntime:
+    """Construction decision for the next Qwen4 model load."""
+
+    enabled: bool = False
+    checkpoint_prefix: str | None = None
+
+
+_MTP_RUNTIME = Qwen4ExpMTPRuntime()
+
+
+def configure_mtp_runtime(
+    model_path: str | Path,
+    *,
+    enabled: bool,
+) -> Qwen4ExpMTPRuntime:
+    """Detect the checkpoint's MTP layout without opening tensor payloads."""
+    global _MTP_RUNTIME
+
+    checkpoint_prefix = None
+    index_path = Path(model_path) / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text()).get("weight_map") or {}
+        except (OSError, ValueError):
+            weight_map = {}
+        for prefix in ("language_model.mtp.", "mtp."):
+            if any(name.startswith(prefix) for name in weight_map):
+                checkpoint_prefix = prefix
+                break
+
+    _MTP_RUNTIME = Qwen4ExpMTPRuntime(
+        enabled=bool(enabled and checkpoint_prefix),
+        checkpoint_prefix=checkpoint_prefix,
+    )
+    return _MTP_RUNTIME
+
+
+def get_mtp_runtime() -> Qwen4ExpMTPRuntime:
+    return _MTP_RUNTIME
 
 
 def resolve_ple_runtime_mode(
@@ -1041,6 +1086,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         cache=None,
         position_ids=None,
         ple_input_ids=None,
+        gdn_sink=None,
         target_verify: bool = False,
     ) -> mx.array:
         if self.ple is not None:
@@ -1059,6 +1105,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 mixed,
                 mask=conv_mask,
                 cache=cache,
+                gdn_sink=gdn_sink,
                 target_verify=target_verify,
             )
         else:
@@ -1104,7 +1151,7 @@ class Qwen4ExpModel(nn.Module):
         hidden_sink=None,
         gdn_sink=None,
     ) -> mx.array:
-        del mask, capture_layer_ids, hidden_sink
+        del mask, capture_layer_ids
         hidden_states = (
             self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         )
@@ -1123,8 +1170,26 @@ class Qwen4ExpModel(nn.Module):
                 cache=layer_cache,
                 position_ids=position_ids,
                 ple_input_ids=inputs,
+                gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
+        if inputs_embeds is None and gdn_sink is None:
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                from omlx.patches.mlx_lm_mtp import prompt_priming
+
+                if prompt_priming.capture_eligible(host, cache):
+                    prompt_priming.maybe_capture(
+                        host,
+                        inputs,
+                        hidden_states,
+                        cache,
+                    )
+        if hidden_sink is not None:
+            # Qwen4 MTP fuses the four residual streams, before the final
+            # mixer, with the embedding of the sampled target token.
+            hidden_sink.append(hidden_states)
         return self.hyper_connection_mixer(hidden_states)
 
 
@@ -1135,10 +1200,81 @@ class LanguageModel(Qwen3_5LanguageModel):
         self.config = config
         self.model_type = args.model_type
         self.model = Qwen4ExpModel(args)
+        self.model._omlx_mtp_prime_host = weakref.ref(self)
         self._rope_deltas = None
         self._position_ids = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def bind_mtp_owner(self, owner) -> None:
+        """Reference a root-level ``mtp`` module without registering it twice."""
+        self._omlx_qwen4_mtp_owner = weakref.ref(owner)
+        self._enable_mtp_decode_markers()
+
+    def bind_mtp_module(self, module) -> None:
+        self.mtp = module
+        self._enable_mtp_decode_markers()
+
+    def _enable_mtp_decode_markers(self) -> None:
+        from omlx.patches.mlx_lm_mtp import get_mtp_depth
+
+        self._omlx_mtp_decode_enabled = True
+        self._omlx_mtp_chain = True
+        self._omlx_mtp_depth = get_mtp_depth()
+        # The Qwen4 head owns a grouped pre-fusion norm over all HC streams.
+        self._omlx_mtp_head_prenorm = True
+
+    def get_mtp_module(self):
+        module = getattr(self, "mtp", None)
+        if module is not None:
+            return module
+        owner_ref = getattr(self, "_omlx_qwen4_mtp_owner", None)
+        owner = owner_ref() if owner_ref is not None else None
+        return getattr(owner, "mtp", None) if owner is not None else None
+
+    def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
+        return_hidden = bool(kwargs.get("return_hidden", False))
+        if return_hidden:
+            # The inherited wrapper appends the post-mixer 2560-wide output;
+            # force an internal capture so we can expose the 4x-wide HC state
+            # that the Qwen4 MTP fusion was trained to consume instead.
+            kwargs["capture_layer_ids"] = []
+        output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
+        if return_hidden and output.hidden_states:
+            output.hidden_states = [output.hidden_states[0]]
+        return output
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        mtp = self.get_mtp_module()
+        if mtp is None:
+            raise RuntimeError("Qwen4 MTP forward called without an attached head")
+        mtp_out, hc_hidden = mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+        )
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hc_hidden
+        return logits
+
+    def make_mtp_cache(self):
+        mtp = self.get_mtp_module()
+        return [QSAKVCache() for _ in mtp.layers] if mtp is not None else []
 
     def make_cache(self):
         return [
@@ -1169,6 +1305,21 @@ class GroupedRMSNorm(nn.Module):
         if self.group_size is not None:
             x = x.reshape(original_shape)
         return x * self.weight
+
+
+class GemmaRMSNorm(nn.Module):
+    """RMSNorm whose checkpoint weight is an offset from one."""
+
+    def __init__(self, dims: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.zeros((dims,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        x = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return (x * (1 + self.weight.astype(mx.float32))).astype(dtype)
 
 
 class GatedResidual(nn.Module):
@@ -1239,6 +1390,91 @@ class GatedResidual(nn.Module):
             return mixed
         injection = 2 * mx.sigmoid(block_injection / self.hc_count)
         return mixed, hyper_input, injection
+
+
+class Qwen4ExpMTPModule(nn.Module):
+    """One-layer Qwen4 draft head used by native speculative decoding.
+
+    Qwen4 keeps the four residual streams intact across MTP steps. The
+    sampled token embedding is projected once and added to each separately
+    projected stream, matching the SGLang day-zero reference implementation.
+    """
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.hc_count = args.hc_count
+        hc_hidden_size = self.hc_count * self.hidden_size
+        self.pre_fc_norm_embedding = GemmaRMSNorm(
+            self.hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
+            hc_hidden_size,
+            eps=args.rms_norm_eps,
+        )
+        self.fc_embedding = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+        self.fc_hidden = nn.Linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
+
+        mtp_args = copy(args)
+        mtp_args.num_hidden_layers = 1
+        mtp_args.layer_types = ["full_attention"]
+        mtp_args.full_attention_interval = 1
+        mtp_args.ple_layer_ids = []
+        self.layers = [Qwen4ExpDecoderLayer(mtp_args, layer_idx=0)]
+        self.hyper_connection_mixer = GatedResidual(
+            mtp_args,
+            use_combine=False,
+        )
+
+    def fuse_inputs(
+        self,
+        input_embeds: mx.array,
+        hidden_states: mx.array,
+    ) -> mx.array:
+        input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
+        original_shape = hidden_states.shape
+        decoder_view = self.pre_fc_norm_hidden(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            self.hc_count,
+            self.hidden_size,
+        )
+        encoder_inputs = self.fc_hidden(decoder_view)
+        return (input_embeds[..., None, :] + encoder_inputs).reshape(original_shape)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens,
+        cache=None,
+    ) -> tuple[mx.array, mx.array]:
+        hidden_states = self.fuse_inputs(
+            embed_tokens(next_token_ids),
+            hidden_states,
+        )
+        if cache is None:
+            cache = [None] * len(self.layers)
+        attention_mask = _create_qwen3_5_attention_mask(
+            hidden_states,
+            cache[0] if cache else None,
+        )
+        for layer, layer_cache in zip(self.layers, cache):
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                cache=layer_cache,
+                ple_input_ids=next_token_ids,
+            )
+        return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 def _can_fuse_hyper_connection(module: GatedResidual) -> bool:
@@ -1318,6 +1554,10 @@ Qwen4ExpTextGatedResidual = GatedResidual
 __all__ = [
     "GatedResidual",
     "GroupedRMSNorm",
+    "Qwen4ExpMTPModule",
+    "Qwen4ExpMTPRuntime",
     "Qwen4ExpTextGatedResidual",
     "Qwen4ExpTextRMSNorm",
+    "configure_mtp_runtime",
+    "get_mtp_runtime",
 ]

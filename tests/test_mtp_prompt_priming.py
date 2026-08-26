@@ -208,6 +208,22 @@ class TestCaptureFold:
 
 
 class TestCaptureSkips:
+    def test_indirect_root_owned_head_is_eligible(self):
+        """VLM checkpoints may keep ``mtp`` at the outer model root.
+
+        The inner language model deliberately exposes it through
+        ``get_mtp_module()`` without registering the same module twice. Prompt
+        priming must recognize that supported indirection.
+        """
+        head = object()
+        host = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            _omlx_mtp_chain=True,
+            get_mtp_module=lambda: head,
+        )
+
+        assert prompt_priming._host_eligible(host) is True
+
     def test_env_off_disables_capture(self, model, monkeypatch):
         monkeypatch.setenv("OMLX_MTP_PROMPT_PRIMING", "0")
         cache = _make_cache(model)

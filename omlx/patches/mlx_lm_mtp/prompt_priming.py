@@ -259,10 +259,15 @@ def drop_ctx(model: Any) -> None:
 
 
 def _host_eligible(host: Any) -> bool:
+    mtp_module = getattr(host, "mtp", None)
+    if mtp_module is None:
+        get_mtp_module = getattr(host, "get_mtp_module", None)
+        if callable(get_mtp_module):
+            mtp_module = get_mtp_module()
     return bool(
         getattr(host, "_omlx_mtp_decode_enabled", False)
         and getattr(host, "_omlx_mtp_chain", False)
-        and getattr(host, "mtp", None) is not None
+        and mtp_module is not None
     )
 
 
