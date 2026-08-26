@@ -17,11 +17,12 @@ also lifted to primary, no blanket disabled-text override, and the i18n key
 exists in every locale (English fallback, not translated here).
 """
 
-import json
 import re
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
+
+from omlx.admin.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "omlx/admin/templates"
@@ -137,7 +138,7 @@ def test_shortcuts_at_top_of_chat_settings():
 def test_i18n_key_present_in_all_locales():
     locales = ["en", "zh", "es", "fr", "ja", "ko", "pt-BR", "ru", "zh-TW"]
     for loc in locales:
-        data = json.loads((I18N / f"{loc}.json").read_text(encoding="utf-8"))
+        data = _load_locale(loc)
         assert "chat.enhanced_readability" in data, f"{loc} missing key"
         assert (
             data["chat.enhanced_readability"] == "Enhanced Readability"

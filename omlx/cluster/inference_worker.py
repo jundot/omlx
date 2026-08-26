@@ -1244,10 +1244,22 @@ def run_worker(args: argparse.Namespace) -> int:
         # memory and MLX failures into a generic rank-zero socket close.
         preserve_failure_marker = True
         with suppress(Exception):
-            marker.update(
-                "failed",
-                error=f"{type(exc).__name__}: {exc}"[:1000],
-            )
+            # error_type is a real field, not just baked into the `error`
+            # string — the coordinator's memory-failure recovery
+            # (cluster/launch.py's RankFailure, cluster/routes.py's
+            # _memory_squeezed_hosts) reads this field directly instead of
+            # regexing it back out of a formatted message. See
+            # docs/cluster-competing-model-eviction-redesign.md.
+            extra: dict[str, Any] = {
+                "error": f"{type(exc).__name__}: {exc}"[:1000],
+                "error_type": type(exc).__name__,
+            }
+            from omlx.exceptions import InsufficientMemoryError
+
+            if isinstance(exc, InsufficientMemoryError):
+                extra["required_bytes"] = exc.required
+                extra["current_bytes"] = exc.current
+            marker.update("failed", **extra)
         raise
     finally:
         marker.stop_heartbeat()

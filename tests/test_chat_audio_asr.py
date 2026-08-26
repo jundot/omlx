@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the chat ASR (transcription) UI wiring in chat.html."""
 
-import json
 from pathlib import Path
 
 import pytest
+
+from omlx.admin.routes import _load_locale
 
 I18N_DIR = Path(__file__).parent.parent / "omlx" / "admin" / "i18n"
 CHAT_TEMPLATE = (
@@ -69,8 +70,7 @@ class TestChatAsrI18n:
     @pytest.mark.parametrize("lang_file", ALL_LOCALES)
     def test_i18n_audio_keys_present(self, lang_file):
         """All ASR-related i18n keys exist in every language file."""
-        with open(I18N_DIR / lang_file, encoding="utf-8") as f:
-            translations = json.load(f)
+        translations = _load_locale(Path(lang_file).stem)
 
         for key in REQUIRED_AUDIO_KEYS:
             assert key in translations, f"Missing key '{key}' in {lang_file}"
