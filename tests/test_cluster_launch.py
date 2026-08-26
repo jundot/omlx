@@ -251,6 +251,70 @@ def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
     assert "CalledProcessError" not in detail
 
 
+def test_supervisor_status_snapshot_is_serialized_against_concurrent_drain_appends():
+    """§C2 deterministic repro: pause status()'s _stderr iteration exactly
+    mid-flight (via a deque subclass) and, from a second thread, perform a
+    real _drain-style append while paused.
+
+    If status() holds ``self._condition`` across the whole snapshot, the
+    append blocks until status() finishes -- no crash, no interleaving. If
+    it doesn't, the append lands mid-iteration and the real deque's own
+    mutation-during-iteration check raises ``RuntimeError`` -- which sits on
+    status()'s per-request call path and would fail an unrelated request.
+    A GIL-timing race (hammering both concurrently) is not reliable enough
+    to trust either way; this forces the interleaving instead of hoping for
+    it.
+    """
+
+    import collections
+    import threading
+    import time
+
+    paused = threading.Event()
+    resume = threading.Event()
+
+    class _PausingDeque(collections.deque):
+        def __iter__(self):
+            it = super().__iter__()
+            first = next(it)
+            paused.set()
+            assert resume.wait(timeout=5), "test deadlocked waiting for resume"
+            yield first
+            yield from it
+
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor._stderr = _PausingDeque(f"line {i}" for i in range(5))
+
+    status_result = {}
+
+    def _call_status():
+        try:
+            status_result["value"] = supervisor.status()
+        except BaseException as exc:  # noqa: BLE001 - captured for the assert
+            status_result["error"] = exc
+
+    status_thread = threading.Thread(target=_call_status)
+    status_thread.start()
+    assert paused.wait(timeout=5), "status() never reached mid-iteration"
+
+    append_thread = threading.Thread(
+        target=supervisor._drain,
+        args=(iter(["extra launcher line\n"]), supervisor._stderr, False),
+    )
+    append_thread.start()
+    # Give the append a moment to either land immediately (unfixed) or block
+    # on the lock status() holds (fixed) before letting status() resume.
+    time.sleep(0.05)
+    resume.set()
+
+    status_thread.join(timeout=5)
+    append_thread.join(timeout=5)
+
+    assert not status_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert "error" not in status_result, status_result.get("error")
+
+
 def test_supervisor_collects_every_rank_ready_event():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     for rank, node_id in enumerate(("local", "studio")):

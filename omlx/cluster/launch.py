@@ -2193,6 +2193,17 @@ class DistributedJobSupervisor:
 
     def status(self) -> DistributedJobStatus:
         process = self.process
+        # _drain (the launcher stderr reader thread) appends to _stderr and
+        # mutates rank_ready_events under self._condition; status() sits on
+        # the per-request path (_ensure_available et al.), so an unlocked
+        # snapshot here racing a burst of launcher stderr can raise
+        # "deque mutated during iteration" and fail an unrelated request (§C2).
+        with self._condition:
+            stderr_tail = tuple(self._stderr)[-20:]
+            ranks = tuple(
+                dict(self.rank_ready_events[rank])
+                for rank in sorted(self.rank_ready_events)
+            )
         return DistributedJobStatus(
             deployment_id=self.deployment.deployment_id,
             phase=self._phase,
@@ -2201,12 +2212,9 @@ class DistributedJobSupervisor:
             returncode=process.poll() if process is not None else None,
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
-            stderr_tail=tuple(self._stderr)[-20:],
+            stderr_tail=stderr_tail,
             failure_reason=self._failure_reason(),
-            ranks=tuple(
-                dict(self.rank_ready_events[rank])
-                for rank in sorted(self.rank_ready_events)
-            ),
+            ranks=ranks,
         )
 
     def __enter__(self) -> DistributedJobSupervisor:
