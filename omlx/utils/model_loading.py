@@ -382,6 +382,9 @@ def maybe_apply_pre_load_patches(
 
     Dispatches:
 
+    - The ``load_model`` replacement that accepts a pre-loaded config and
+      weight dict (mlx-lm #969), unconditionally. Architecture patches
+      register their config transforms and quantization methods with it.
     - DeepSeek V4 patch (PR 1192) when ``config.json`` declares a
       ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
@@ -427,6 +430,15 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+
+    # Model-independent: mlx-lm's load_model only reads a checkpoint off disk,
+    # so a rank holding a peer's weights in memory has no way to hand them
+    # over. This replacement takes an optional config and weight dict, and is
+    # also the single copy of the construction pipeline that the architecture
+    # patches below register into.
+    from ..patches.mlx_lm_load_model_inputs import install_load_model_inputs
+
+    install_load_model_inputs()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
     # around the defective M5 NAX kernels (issue #2267). Install is cheap
