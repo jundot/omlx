@@ -36,13 +36,21 @@ final class SecurityScreenVM {
         }
     }
 
-    func setupApiKey(key: String, confirm: String, client: OMLXClient) async -> Bool {
+    func setupApiKey(key: String, confirm: String, services: AppServices) async -> Bool {
         do {
-            _ = try await client.setupApiKey(key, confirm: confirm)
-            // Re-bootstrap the client so subsequent /admin/api/* calls auth
-            // with the new key.
-            client.configure(host: client.host, port: client.port, apiKey: key)
-            await load(client: client)
+            _ = try await services.client.setupApiKey(key, confirm: confirm)
+            // Route through AppServices.updateConfig (single source of
+            // truth, §F1) instead of calling client.configure(...) directly:
+            // that also re-bootstraps the client for subsequent /admin/api/*
+            // calls AND keeps every other consumer of AppServices.config
+            // current — the menubar stats poller, the web-dashboard
+            // auto-login URL, and applyServerEndpoint's own client.configure
+            // call on a later port/host change (which was reverting to this
+            // stale key before).
+            var updated = services.config
+            updated.apiKey = key
+            services.updateConfig(updated)
+            await load(client: services.client)
             return true
         } catch {
             self.lastError = error.omlxDescription
@@ -53,14 +61,16 @@ final class SecurityScreenVM {
     /// Unified write path for the editor row. Routes through /setup-api-key
     /// for first-time setup (server rejects the PATCH path when no key is
     /// configured) and through PATCH /global-settings for updates.
-    func applyApiKey(_ key: String, client: OMLXClient) async -> Bool {
+    func applyApiKey(_ key: String, services: AppServices) async -> Bool {
         if apiKeySet {
             do {
-                _ = try await client.updateGlobalSettings(
+                _ = try await services.client.updateGlobalSettings(
                     GlobalSettingsPatch(apiKey: key)
                 )
-                client.configure(host: client.host, port: client.port, apiKey: key)
-                await load(client: client)
+                var updated = services.config
+                updated.apiKey = key
+                services.updateConfig(updated)
+                await load(client: services.client)
                 return true
             } catch {
                 self.lastError = error.omlxDescription
@@ -72,7 +82,7 @@ final class SecurityScreenVM {
             // mirror the draft as the confirm so the server-side equality
             // check passes — typo protection lives in the field's own
             // show/copy affordances now, not in a duplicate input.
-            return await setupApiKey(key: key, confirm: key, client: client)
+            return await setupApiKey(key: key, confirm: key, services: services)
         }
     }
 

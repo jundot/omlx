@@ -22,6 +22,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_JS = ROOT / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+_EN_LOCALE_JSON = (ROOT / "omlx/admin/i18n/en.json").read_text(encoding="utf-8")
+_WINDOW_T_STUB = (
+    f"global.window = {{ _t: {_EN_LOCALE_JSON}, "
+    "t: function(key) { return this._t[key] !== undefined ? this._t[key] : key; } };"
+)
 
 _LIFTED = ("clusterQuickStatus",)
 
@@ -91,6 +96,7 @@ def _statuses() -> dict[str, dict]:
 
     methods = ",\n".join(_method_source(name) for name in _LIFTED)
     script = f"""
+{_WINDOW_T_STUB}
 const component = {{
 {_STUBS}
 {methods}

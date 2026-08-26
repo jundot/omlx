@@ -144,7 +144,7 @@ class TestListModelsSettings:
             patch.object(
                 admin_routes,
                 "_mtp_compat_for_model",
-                return_value=(False, None),
+                return_value=(False, None, False),
             ),
         ):
             result = asyncio.run(admin_routes.list_models(is_admin=True))

@@ -30,11 +30,25 @@
                                        class="w-24 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                             </div>
 
+                            <!-- Auto-refresh toggle: independent of the interval value below
+                                 (§B13) — previously the only way to pause was zeroing the
+                                 interval, which threw away the user's preferred cadence. -->
+                            <div class="flex items-center gap-2">
+                                <label class="text-sm text-neutral-600">{{ t('logs.auto_refresh_toggle_label') }}</label>
+                                <button type="button"
+                                        @click="toggleLogAutoRefresh()"
+                                        :class="logAutoRefreshEnabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                        class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                    <span :class="logAutoRefreshEnabled ? 'translate-x-5' : 'translate-x-0'"
+                                          class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                </button>
+                            </div>
+
                             <!-- Refresh interval input -->
                             <div class="flex items-center gap-2">
                                 <label class="text-sm text-neutral-600">{{ t('logs.refresh_label') }}</label>
                                 <input type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
-                                       @change="restartLogRefresh()"
+                                       @change="saveLogRefreshInterval()"
                                        class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                 <span class="text-sm text-neutral-400">{{ t('logs.refresh_unit') }}</span>
                             </div>
@@ -110,7 +124,7 @@
 
                     <!-- Stats -->
                     <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
-                        <span x-show="logLastUpdated" x-text="'Last updated: ' + logLastUpdated"></span>
+                        <span x-show="logLastUpdated" x-text="window.t('logs.last_updated_prefix') + logLastUpdated"></span>
                         <span x-show="logError" class="text-red-500" x-text="logError"></span>
                     </div>
                 </div>

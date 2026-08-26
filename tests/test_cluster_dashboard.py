@@ -13,6 +13,9 @@ def _read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text()
 
 
+en_locale = json.loads((ROOT / "omlx/admin/i18n/en.json").read_text(encoding="utf-8"))
+
+
 def test_dashboard_renders_cluster_partial():
     rendered = admin_routes.templates.get_template("dashboard.html").render()
 
@@ -101,8 +104,8 @@ def test_cuda_workers_join_from_a_gui_generated_one_time_command():
     assert "data-cluster-generate-cuda-join" in cluster
     assert "data-cluster-cuda-join-command" in cluster
     assert "data-cluster-joined-cuda-nodes" in cluster
-    assert "Add a CUDA worker" in cluster
-    assert "Generate a fresh command for the second CUDA worker" in cluster
+    assert "{{ t('cluster.cuda.heading') }}" in cluster
+    assert "Generate a fresh command for the second CUDA worker" in en_locale["cluster.cuda.join_hint"]
     assert "Server host is set to 0.0.0.0 in Settings" in javascript
     assert "async generateClusterCudaJoinCommand()" in javascript
     assert "async loadClusterJoinStatus()" in javascript
@@ -139,8 +142,8 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
-    assert "Coordinator · rank 0" in cluster
-    assert "Worker · rank " in cluster
+    assert "{{ t('cluster.nodes.coordinator_rank0') }}" in cluster
+    assert "Worker · rank {rank}" in en_locale["cluster.nodes.worker_rank"]
     assert "clusterPeerDisplayName()" in cluster
     assert "clusterTopologySummary()" in cluster
     assert "Physical peer detected" not in cluster
@@ -194,9 +197,9 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "data-cluster-quick-start" in cluster
     assert "data-cluster-topology" in cluster
     assert "data-cluster-neural-fabric" in cluster
-    assert "Your compute pool" in cluster
+    assert "{{ t('cluster.quick_start.pool_label') }}" in cluster
     assert "clusterPairTitle()" in cluster
-    assert "Change model" in cluster
+    assert "window.t('cluster.quick_start.change_model')" in cluster
     assert "data-cluster-model-picker" in cluster
     assert "data-cluster-primary-action" in cluster
     assert "data-cluster-live-summary" in cluster
@@ -204,8 +207,8 @@ def test_cluster_dashboard_leads_with_one_click_setup():
     assert "clusterLiveModelId()" in cluster
     assert "clusterPublicEndpoint()" in cluster
     assert "data-cluster-advanced-toggle" in cluster
-    assert "Diagnostics" in cluster
-    assert "Download diagnostic report" in cluster
+    assert "{{ t('cluster.diagnostics.toggle_label') }}" in cluster
+    assert "window.t('cluster.diagnostics.download_report')" in cluster
     assert "runClusterPrimaryAction()" in cluster
     assert cluster.count('@click="startCluster()"') >= 1
     assert "clusterShowModelPicker: false" in javascript
@@ -235,7 +238,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
         panel = cluster.split(technical_panel, 1)[0].rsplit("<div", 1)[1]
         assert 'x-show="clusterShowSetupDetails"' in panel
 
-    memory_heading = cluster.index("Memory each accelerator gives")
+    memory_heading = cluster.index("{{ t('cluster.budgets.heading') }}")
     memory_panel_prefix = cluster[max(0, memory_heading - 500) : memory_heading]
     assert 'x-show="clusterShowSetupDetails"' in memory_panel_prefix
     assert (
@@ -247,7 +250,7 @@ def test_cluster_dashboard_leads_with_one_click_setup():
 def test_cluster_model_search_keeps_the_icon_clear_of_the_text():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
 
-    assert cluster.count('placeholder="Search models across the pool"') == 2
+    assert cluster.count("placeholder=\"{{ t('cluster.model_picker.search_placeholder') }}\"") == 2
     assert cluster.count(
         "pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"
     ) == 2
@@ -258,7 +261,7 @@ def test_cluster_model_picker_uses_omlx_models_not_repository_directories():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
-    assert "Choose a downloaded model" in cluster
+    assert "{{ t('cluster.planner.choose_downloaded_model') }}" in cluster
     assert 'x-for="model in clusterModelOptions()"' in cluster
     assert "clusterCatalogueFit(model.model_path)" in cluster
     assert "Recommended for this pool" in javascript
@@ -276,7 +279,7 @@ def test_cluster_model_picker_uses_omlx_models_not_repository_directories():
     assert "clusterModelHostsLabel(model)" in cluster
     assert "this.clusterFriendlyMacName(location.node_id)" in javascript
     assert "(?:omlx\\s+on\\s+)?(?:mac\\s+)?studio" in javascript
-    assert "Search models across the pool" in cluster
+    assert "{{ t('cluster.model_picker.search_placeholder') }}" in cluster
     assert "model_source: model.model_source" in javascript
     assert "models," in javascript
     assert "model_dir: dir" not in javascript
@@ -300,9 +303,9 @@ def test_cluster_quick_start_shows_truthful_combined_memory():
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
     assert "data-cluster-memory-allowances" in cluster
-    assert "Pooled accelerator memory" in cluster
-    assert "Installed memory is shown separately" in cluster
-    assert "Splitting stays automatic" in cluster
+    assert "{{ t('cluster.fabric.pooled_memory_label') }}" in cluster
+    assert "Installed memory is shown separately" in en_locale["cluster.fabric.pooled_memory_hint"]
+    assert "Splitting stays automatic" in en_locale["cluster.fabric.pooled_memory_hint"]
     assert "clusterCombinedUsableMemoryGiB()" in javascript
     assert "clusterCombinedPhysicalMemoryGiB()" in javascript
     assert "clusterCombinedMemoryLabel()" in cluster
@@ -314,13 +317,13 @@ def test_cluster_model_setup_shows_context_and_per_node_kv_cost():
     css = _read("omlx/admin/static/css/dashboard.css")
 
     assert "data-cluster-context-planner" in cluster
-    assert "Context window" in cluster
+    assert "{{ t('cluster.context.window_label') }}" in cluster
     assert "clusterContextOptions()" in cluster
     assert "clusterContextMemoryNodes()" in cluster
-    assert "Weights" in cluster
-    assert "KV cache" in cluster
+    assert "{{ t('cluster.context.legend_weights') }}" in cluster
+    assert "{{ t('cluster.context.legend_kv') }}" in cluster
     assert "clusterSetAutomaticContext()" in cluster
-    assert "'Auto · ' + clusterTokens(" in cluster
+    assert "window.t('cluster.context.auto_prefix') + clusterTokens(" in cluster
     assert "async clusterSetTargetContext(tokens)" in javascript
     assert "async clusterSetAutomaticContext()" in javascript
     assert javascript.count("target_context_tokens: Number(") >= 4
@@ -381,19 +384,19 @@ def test_cluster_dashboard_groups_cuda_workers_and_shows_pooled_memory():
     javascript = _read("omlx/admin/static/js/dashboard.js")
     stylesheet = _read("omlx/admin/static/css/dashboard.css")
 
-    assert "Pooled accelerator memory" in cluster
+    assert "{{ t('cluster.fabric.pooled_memory_label') }}" in cluster
     assert "model-usable of" in javascript
     assert "clusterLogicalNodes()" in javascript
     assert "connectx-7-auto-pair" in javascript
     assert "Verified CUDA pair" in javascript
-    assert "ConnectX-7 verified" in cluster
-    assert "direct link not verified" in cluster
-    assert "Verify ConnectX" in cluster
+    assert "ConnectX-7 verified" in en_locale["cluster.fabric.supernode_verified"]
+    assert "direct link not verified" in en_locale["cluster.fabric.supernode_unverified"]
+    assert "window.t('cluster.fabric.verify_connectx')" in cluster
     assert "/admin/api/cluster/cuda-fabric/verify" in javascript
     assert "<title>NVIDIA CUDA</title>" in cluster
     assert "cluster-fabric-node--cuda" in stylesheet
     assert "cluster-fabric-node--supernode" in stylesheet
-    assert "Model shard balance" in cluster
+    assert "{{ t('cluster.shard.heading') }}" in cluster
     assert "clusterSetWeightTarget(" in cluster
 
 
@@ -402,7 +405,7 @@ def test_cluster_neural_fabric_uses_real_runtime_measurements():
     javascript = _read("omlx/admin/static/js/dashboard.js")
     stylesheet = _read("omlx/admin/static/css/dashboard.css")
 
-    assert "Neural fabric" in cluster
+    assert "{{ t('cluster.fabric.eyebrow') }}" in cluster
     assert "Ring latency" in javascript
     assert "collective_latency_seconds" in javascript
     assert "collective_bandwidth_bytes_per_second" in javascript
@@ -450,22 +453,28 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
-    assert "Open SSH setup in oMLX" in cluster
-    assert "Or run this in Terminal on this Mac" in cluster
-    assert "Don't have the oMLX SSH key yet?" in cluster
-    assert "Terminal SSH can work while oMLX cannot" in cluster
-    assert "Step 1 of 3" in cluster
-    assert "Step 2 of 3" in cluster
-    assert "Step 3 of 3" in cluster
-    assert "Repeat in the other direction" in cluster
+    assert "{{ t('cluster.error.open_ssh_setup') }}" in cluster
+    assert "{{ t('cluster.error.run_in_terminal') }}" in cluster
+    assert "{{ t('cluster.error.no_ssh_key_yet') }}" in cluster
+    assert "{{ t('cluster.pairing.terminal_ssh_heading') }}" in cluster
+    assert "{{ t('cluster.pairing.step1_of_3') }}" in cluster
+    assert "{{ t('cluster.pairing.step2_confirm_heading') }}" in cluster
+    assert "{{ t('cluster.pairing.step3_exchange_heading') }}" in cluster
+    assert "Repeat in the other direction" in en_locale["cluster.pairing.step3_exchange_hint"]
     assert "copyClusterPairingSecret()" in cluster
     assert "t('cluster.pairing.shared_secret')" in cluster
     assert "t('cluster.pairing.shared_secret_hint')" in cluster
     assert "data-cluster-ssh-setup" in cluster
     assert "openClusterPairingSetup()" in javascript
-    assert "Regenerating this key disconnects every paired worker" in javascript
+    assert "window.t('cluster.pairing.ssh_key_regenerate_confirm')" in javascript
     assert "?overwrite=true" in javascript
-    assert "Regenerating disconnects every paired worker" in cluster
+    assert "{{ t('cluster.pairing.regenerate_warning') }}" in cluster
+
+    assert (
+        en_locale["cluster.pairing.ssh_key_regenerate_confirm"]
+        == "Regenerating this key disconnects every paired worker. "
+        "You will need to exchange keys again on every Mac. Continue?"
+    )
 
 
 def test_every_dashboard_locale_names_cluster_tab():
@@ -483,6 +492,6 @@ def test_every_dashboard_locale_names_cluster_tab():
     }
 
     for locale_path in locale_dir.glob("*.json"):
-        locale = json.loads(locale_path.read_text())
+        locale = admin_routes._load_locale(locale_path.stem)
         missing = {key for key in required if not locale.get(key)}
         assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
