@@ -514,6 +514,14 @@ def assess_model_path(
     from omlx.model_discovery import _read_model_context_length
 
     root = Path(model_path)
+    # Some architectures are registered into mlx-lm by oMLX immediately before
+    # loading (MiniMax-M3 and DeepSeek-V4 are examples). Capability detection
+    # must inspect that registered module, not conclude from stock mlx-lm that
+    # the architecture can be neither pipelined nor sharded. The dispatchers
+    # are idempotent compatibility registrations and load no weights.
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(root))
     try:
         layout = inspect_safetensors_layout(root)
     except (PlanningError, OSError, ValueError) as exc:

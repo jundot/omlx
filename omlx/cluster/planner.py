@@ -111,6 +111,11 @@ class ModelLayout:
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
+    # Per-layer KV bytes reserved regardless of context length — DeepSeek-V4's
+    # sliding-window local cache is ``sliding_window * head_dim`` elements on
+    # every layer whether the prompt is one token or a million. None means
+    # the model has no fixed term, which is every architecture but DS4F.
+    kv_fixed_bytes_per_layer: int | None = None
     supports_tensor_parallel: bool = False
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
@@ -137,6 +142,11 @@ class ModelLayout:
             raise ValueError("tensor_parallel_kv_heads must be non-negative")
         if self.kv_bytes_per_token_per_layer < 0:
             raise ValueError("kv_bytes_per_token_per_layer must be non-negative")
+        if (
+            self.kv_fixed_bytes_per_layer is not None
+            and self.kv_fixed_bytes_per_layer < 0
+        ):
+            raise ValueError("kv_fixed_bytes_per_layer must be non-negative")
         if self.tensor_parallel_kv_heads == 0:
             object.__setattr__(
                 self, "tensor_parallel_kv_heads", self.tensor_parallel_heads
@@ -181,6 +191,7 @@ class ModelLayout:
             "supports_pipeline": self.supports_pipeline,
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
+            "kv_fixed_bytes_per_layer": self.kv_fixed_bytes_per_layer,
         }
 
     @classmethod
@@ -221,6 +232,11 @@ class ModelLayout:
                 ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
+                ),
+                kv_fixed_bytes_per_layer=(
+                    None
+                    if payload.get("kv_fixed_bytes_per_layer") is None
+                    else int(payload["kv_fixed_bytes_per_layer"])
                 ),
                 supports_tensor_parallel=bool(
                     payload.get("supports_tensor_parallel", False)
@@ -614,8 +630,20 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
 
     heads = _config_int(config, "num_attention_heads", 1)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
-    values = [heads, kv_heads]
+    # An MLA latent cache is not per-head: shard() leaves it whole on every
+    # member, so its (single) KV head count constrains nothing. Counting it
+    # anyway refused every TP degree for those architectures.
+    values = [heads]
+    if not _kv_cache_replicated_across_tp(config):
+        values.append(kv_heads)
     model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
+        # DS4F's shard() splits wq_b segment-interleaved (segments=o_groups),
+        # so each rank must get a whole number of heads per group: the
+        # per-group head count bounds the TP degree too.
+        o_groups = _config_int(config, "o_groups", 1)
+        if o_groups > 1 and heads % o_groups == 0:
+            values.append(heads // o_groups)
     if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
         values.extend(
             (
@@ -785,19 +813,52 @@ def _declares_pipeline(model_type: str, *, seen: frozenset[str] = frozenset()) -
     )
 
 
+def _deepseek_v4_compress_ratios(config: dict[str, Any]) -> tuple[int, ...] | None:
+    """A DeepSeek-V4 family's per-layer compress ratios, or None when invalid.
+
+    Mirrors the validation ``memory_monitor.make_prefill_memory_profile``
+    applies before trusting the same fields: one entry per hidden layer, each
+    a supported ratio. A config that fails this is not a layout the DS4F cache
+    math describes, so callers fall back to the generic path rather than
+    guess.
+    """
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type.startswith("deepseek_v4"):
+        return None
+    num_layers = _config_int(config, "num_hidden_layers", 0)
+    ratios = config.get("compress_ratios")
+    if (
+        num_layers <= 0
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return None
+    ratios = tuple(ratios[:num_layers])
+    if len(ratios) != num_layers or any(
+        ratio not in (0, 4, 128) for ratio in ratios
+    ):
+        return None
+    return ratios
+
+
 def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
     """Whether every tensor-parallel member holds this model's full KV cache.
 
     ``shard()`` splits attention heads, but an MLA latent cache is not
     per-head: GLM/DeepSeek-style layers store one compressed latent plus RoPE
-    key that every member of the group needs whole. Dividing that reservation
-    by the TP degree under-reserved each rank by exactly that factor.
+    key that every member of the group needs whole, and DeepSeek-V4's
+    single-head pooled caches are likewise never sharded (``wkv`` is
+    replicated). Dividing that reservation by the TP degree under-reserved
+    each rank by exactly that factor.
     """
 
-    return (
+    if (
         _config_int(config, "kv_lora_rank", 0) > 0
         and _config_int(config, "qk_rope_head_dim", 0) > 0
-    )
+    ):
+        return True
+    return _deepseek_v4_compress_ratios(config) is not None
 
 
 def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
@@ -815,6 +876,29 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
 
     # Stored cache is fp16/bf16 even when weights are quantised.
     dtype_size = 2
+
+    ratios = _deepseek_v4_compress_ratios(config)
+    if ratios is not None:
+        # Per-token growth comes from the pooled caches only — the
+        # sliding-window local term is fixed and charged separately via
+        # ``kv_fixed_bytes_per_layer``. Ratio-4 layers also carry an indexer
+        # pool of index_head_dim elements per pooled token.
+        head_dim = _config_int(config, "head_dim", 0)
+        index_head_dim = _config_int(config, "index_head_dim", 0)
+        if head_dim <= 0 or (4 in ratios and index_head_dim <= 0):
+            return 0
+        elements = sum(
+            head_dim // 4 + index_head_dim // 4
+            if ratio == 4
+            else head_dim // 128
+            if ratio == 128
+            else 0
+            for ratio in ratios
+        )
+        # The layout field is per layer and callers multiply by the layer
+        # count, so average the per-layer rates — rounding up, because a
+        # reservation must never under-count.
+        return -(-elements * dtype_size // len(ratios))
 
     if _kv_cache_replicated_across_tp(config):
         # One KV head holding latent + RoPE, not expanded K/V tensors.
@@ -837,6 +921,25 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     if kv_heads <= 0 or head_dim <= 0:
         return 0
     return kv_heads * head_dim * 2 * dtype_size
+
+
+def _kv_fixed_bytes_per_layer(config: dict[str, Any]) -> int | None:
+    """Per-layer KV bytes held regardless of context length, if any.
+
+    DeepSeek-V4 keeps a sliding-window local cache on every layer — a
+    constant ``sliding_window * head_dim`` elements whether the prompt is one
+    token or a million. Returns None for models without such a term so every
+    other layout's accounting is unchanged.
+    """
+
+    if _deepseek_v4_compress_ratios(config) is None:
+        return None
+    window = _config_int(config, "sliding_window", 0)
+    head_dim = _config_int(config, "head_dim", 0)
+    if window <= 0 or head_dim <= 0:
+        return None
+    # Stored cache is fp16/bf16 even when weights are quantised.
+    return window * head_dim * 2
 
 
 def _attention_head_count(model_path: Path) -> int:
@@ -1052,6 +1155,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             _model_config(root)
         ),
+        kv_fixed_bytes_per_layer=_kv_fixed_bytes_per_layer(_model_config(root)),
     )
 
 
@@ -1653,12 +1757,19 @@ def _kv_bytes_for_stage(
     KV is per layer, so a node reserves in proportion to the layers it carries.
     Under tensor parallelism the heads of each layer are split across the
     group, so each member holds its share — except an MLA latent cache, which
-    is not per-head and stays whole on every member.
+    is not per-head and stays whole on every member. A fixed per-layer term
+    (DeepSeek-V4's sliding-window local cache) is reserved on top, independent
+    of the context length.
     """
 
-    if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
+    if context_tokens <= 0:
         return 0
-    total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
+    fixed = (model.kv_fixed_bytes_per_layer or 0) * layer_count
+    total = (
+        model.kv_bytes_per_token_per_layer * layer_count * context_tokens + fixed
+    )
+    if total <= 0:
+        return 0
     if model.kv_replicated_across_tp:
         return total
     return total // max(1, tensor_parallel_size)
@@ -1702,7 +1813,8 @@ def _max_context_for_stage(
     )
     if per_token <= 0:
         return 0
-    spare = node.usable_bytes - weight_bytes
+    fixed = (model.kv_fixed_bytes_per_layer or 0) * layer_count
+    spare = node.usable_bytes - weight_bytes - fixed
     return max(0, spare // per_token)
 
 

@@ -1333,6 +1333,52 @@ def collect_kv_layer_specs(
     return full, specs, arrays
 
 
+def estimate_deepseek_v4_kv_bytes_per_token(
+    config: Any,
+    dtype_size: float,
+) -> float | None:
+    """Exact per-token KV growth for DeepSeek V4's pooled caches.
+
+    Every DS4F layer keeps a sliding-window local cache — a fixed footprint
+    priced separately through ``rotating_layer_specs`` — while ratio-4/128
+    layers add pooled caches that grow with context: ``head_dim / ratio``
+    latent elements per token, plus ``index_head_dim / ratio`` for the
+    indexer pool ratio-4 layers carry. The uniform
+    ``num_kv_heads * head_dim * 2`` formula over-counts this by more than an
+    order of magnitude. Returns None when the config is not a valid DS4F
+    description (same validation ``make_prefill_memory_profile`` applies), so
+    callers keep their generic fallback.
+    """
+
+    model_type = str(_cfg_get(config, "model_type", "") or "")
+    if not model_type.startswith("deepseek_v4"):
+        return None
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    ratios = _cfg_get(config, "compress_ratios")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return None
+    ratios = tuple(ratios[:num_layers])
+    if len(ratios) != num_layers or any(
+        ratio not in (0, 4, 128) for ratio in ratios
+    ):
+        return None
+    head_dim = _cfg_get(config, "head_dim")
+    if not _pos_int(head_dim):
+        return None
+    counts = Counter(ratios)
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    if counts[4] and not _pos_int(index_head_dim):
+        return None
+    elements = counts[4] * (
+        head_dim // 4 + (index_head_dim or 0) // 4
+    ) + counts[128] * (head_dim // 128)
+    return float(elements) * float(dtype_size)
+
+
 def estimate_mla_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
@@ -1500,6 +1546,12 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
             config, cache_list, dtype_size
         )
+        if kv_bytes_per_token is None:
+            # DeepSeek V4 has no kv_lora_rank: its pooled caches grow
+            # head_dim/ratio elements per token instead.
+            kv_bytes_per_token = estimate_deepseek_v4_kv_bytes_per_token(
+                config, dtype_size
+            )
 
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are

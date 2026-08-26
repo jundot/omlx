@@ -25,6 +25,7 @@ otherwise every rank enters the model collectives together.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,46 @@ logger = logging.getLogger(__name__)
 # mlx-lm's server prefills in 2048-token chunks; the transient attention peak
 # is set by the chunk, not the prompt.
 _DEFAULT_PREFILL_STEP = 2048
+
+
+def _kv_cache_replicated_layout(model: Any) -> bool:
+    """Whether every tensor-parallel member holds this model's full KV cache.
+
+    Mirrors the planner's ``_kv_cache_replicated_across_tp``: a GLM/DeepSeek
+    MLA latent cache (``kv_lora_rank`` + ``qk_rope_head_dim``) or a
+    DeepSeek-V4 pooled cache (valid ``compress_ratios``) is not per-head, so
+    ``shard()`` leaves it unsplit and each rank stores it whole.
+    """
+
+    config = getattr(model, "args", None) or getattr(model, "config", None)
+    if config is None:
+        return False
+
+    def _get(key: str) -> Any:
+        if isinstance(config, dict):
+            return config.get(key)
+        return getattr(config, key, None)
+
+    def _pos_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    if _pos_int(_get("kv_lora_rank")) and _pos_int(_get("qk_rope_head_dim")):
+        return True
+    model_type = _get("model_type")
+    if not isinstance(model_type, str) or not model_type.startswith("deepseek_v4"):
+        return False
+    num_layers = _get("num_hidden_layers")
+    ratios = _get("compress_ratios")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return False
+    ratios = tuple(ratios[:num_layers])
+    return len(ratios) == num_layers and all(
+        ratio in (0, 4, 128) for ratio in ratios
+    )
 
 
 def rank_monitor(
@@ -65,19 +106,28 @@ def rank_monitor(
     heads = int(getattr(monitor, "_num_attention_heads", 0) or kv_heads)
     dtype_size = float(getattr(monitor, "_dtype_size", 2) or 2)
     kv_override = getattr(monitor, "_kv_bytes_per_token_override", None)
+    # Preserve the sliding-window layer groups ``set_model_info_from_model``
+    # classified: re-setting model info below would otherwise drop them and
+    # charge a hybrid model's windowed layers as full linear caches.
+    rotating_specs = getattr(monitor, "_rotating_layer_specs", ())
 
     # Pipeline: this rank stores KV for its own layers only.
     stage_layers = int(layer_count) if layer_count else num_layers
     stage_layers = max(1, min(stage_layers, num_layers or stage_layers))
 
-    # Tensor parallel: heads are split across ranks, so both the KV this rank
-    # stores and the attention transient it computes shrink with the shard.
+    # Tensor parallel: attention heads — and the transient they compute —
+    # split across ranks. The KV cache splits too, except replicated
+    # MLA-style layouts (GLM/DeepSeek latent, DeepSeek-V4 pooled), where
+    # shard() divides heads but every member holds the whole cache: dividing
+    # that by the TP degree under-counts each rank by exactly that factor.
+    kv_replicated = _kv_cache_replicated_layout(model)
     tp = max(1, int(tensor_parallel_size))
     if tp > 1:
-        kv_heads = max(1, kv_heads // tp)
         heads = max(1, heads // tp)
-        if kv_override:
-            kv_override = float(kv_override) / tp
+        if not kv_replicated:
+            kv_heads = max(1, kv_heads // tp)
+            if kv_override:
+                kv_override = float(kv_override) / tp
 
     monitor.set_model_info(
         num_layers=num_layers or stage_layers,
@@ -87,6 +137,7 @@ def rank_monitor(
         num_attention_heads=heads,
         num_kv_cache_layers=stage_layers,
         kv_bytes_per_token=kv_override,
+        rotating_layer_specs=rotating_specs,
     )
     return monitor
 

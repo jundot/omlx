@@ -2437,7 +2437,12 @@ class Model(nn.Module):
                 group=group,
             )
             shard_inplace(layer.attn.wo_a, "sharded-to-all", group=group)
-            layer.attn.attn_sink = mx.split(layer.attn.attn_sink, N)[rank]
+            # wq_b shards segment-interleaved (segments=o_groups): rank r
+            # keeps slice r of *every* head group, not the contiguous r-th
+            # block of all heads. Slice the sinks the same way or each one
+            # gates the wrong head under TP.
+            sinks = layer.attn.attn_sink.reshape(self.args.o_groups, -1)
+            layer.attn.attn_sink = mx.split(sinks, N, axis=1)[rank].reshape(-1)
             layer.attn.n_heads //= N
 
             layer.ffn.sharding_group = group
