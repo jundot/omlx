@@ -51,8 +51,13 @@ def _js_called_paths() -> set[str]:
         path = match.group("path").split("?")[0]
         # Any interpolated segment stands for a path parameter.
         path = re.sub(r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path)
-        path = path.rstrip("/") if path not in ("", "/") else path
-        called.add(_PREFIX + path)
+        if path in ("", "/"):
+            # A bare prefix is a prefix test, not an endpoint call — the B6
+            # asset-version wrapper matches every cluster response with
+            # url.startsWith('/admin/api/cluster/'). Real calls always name
+            # a path segment after the prefix.
+            continue
+        called.add(_PREFIX + path.rstrip("/"))
     return called
 
 
@@ -230,6 +235,18 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test-only reset hook for the in-memory start-job store singleton
+        # (B2); production code never needs to reset it mid-process.
+        ("start_job.py", "reset_start_job_store"),
+        # Readiness-ladder primitives (transport readiness ladder, #B3),
+        # exposed ahead of the Fabric Doctor UI panels (fabric-doctor
+        # C2-C5) that read the ladder state and gate on fabric verification.
+        ("readiness.py", "is_fabric_verified"),
+        ("readiness.py", "link_ladder_state"),
+        # VPN full-tunnel remedy copy (VPN detection, C4), exposed ahead of
+        # the Fabric Doctor UI panel that will surface it alongside the
+        # pre-warning banner already wired into _note_full_tunnel_vpns.
+        ("vpn.py", "exclusion_instruction"),
     }
 
     sources = {

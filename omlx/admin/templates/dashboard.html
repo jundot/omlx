@@ -95,5 +95,10 @@
 {% block scripts %}
 <script src="{{ static('js/purify.min.js') }}"></script>
 <script src="{{ static('js/marked.umd.js') }}"></script>
+<!-- B6 asset-version handshake: the version this page was built with. Every
+     cluster API response carries the server's current version in the
+     X-Omlx-Asset-Version header; a mismatch means this page is a stale
+     cached bundle and must be reloaded. -->
+<script>window.OMLX_ASSET_VERSION = {{ asset_version() | tojson }};</script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}

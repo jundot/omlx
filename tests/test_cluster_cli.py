@@ -128,3 +128,131 @@ def test_cluster_unequal_plan_json_is_runnable():
         payload["assignments"][0]["layer_count"]
         > payload["assignments"][1]["layer_count"]
     )
+
+
+def test_cluster_doctor_help_is_exposed():
+    result = subprocess.run(
+        [sys.executable, "-m", "omlx.cli", "cluster", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert "doctor" in result.stdout
+
+
+def test_cluster_doctor_runs_with_stubbed_runner(monkeypatch):
+    """The CLI action drives run_fabric_doctor without touching real hosts."""
+
+    from types import SimpleNamespace
+
+    from omlx import cli
+    from omlx.cluster import doctor as doctor_module
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    seen = {}
+
+    def stub(hosts, **_):
+        seen["hosts"] = tuple(hosts)
+        return DoctorReport(
+            hosts=tuple(hosts),
+            findings=(
+                DoctorFinding(
+                    check_id="link_presence", state="pass", evidence="en3 up"
+                ),
+            ),
+            verdict="Fabric verified — every check passed.",
+        )
+
+    monkeypatch.setattr(doctor_module, "run_fabric_doctor", stub)
+    args = SimpleNamespace(
+        cluster_action="doctor", host=["peer.local"], json=True
+    )
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exit_code = cli.cluster_command(args)
+    assert exit_code == 0
+    # One --host means "this Mac plus that peer".
+    assert seen["hosts"] == ("127.0.0.1", "peer.local")
+    payload = json.loads(out.getvalue())
+    assert payload["verdict"] == "Fabric verified — every check passed."
+    assert payload["ok"] is True
+    assert payload["findings"][0]["check_id"] == "link_presence"
+
+
+def test_cluster_doctor_red_report_exits_nonzero(monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx import cli
+    from omlx.cluster import doctor as doctor_module
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    def stub(hosts, **_):
+        return DoctorReport(
+            hosts=tuple(hosts),
+            findings=(
+                DoctorFinding(
+                    check_id="subnet_collision",
+                    state="fail",
+                    evidence="WARP routes 10.0.0.0/8 through utun4",
+                    remedy="Run Fabric Doctor → Move link addresses.",
+                ),
+            ),
+            verdict="Fabric Doctor stopped at subnet_collision: collision",
+        )
+
+    monkeypatch.setattr(doctor_module, "run_fabric_doctor", stub)
+    args = SimpleNamespace(
+        cluster_action="doctor",
+        host=["a.local", "b.local"],
+        json=False,
+    )
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exit_code = cli.cluster_command(args)
+    captured = out.getvalue()
+    assert exit_code == 1
+    assert "FAIL" in captured
+    assert "subnet_collision" in captured
+    assert "Move link addresses" in captured
+    assert "Fabric Doctor stopped at subnet_collision" in captured
+
+
+def test_cluster_doctor_requires_a_host():
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    from omlx import cli
+
+    err = io.StringIO()
+    args = SimpleNamespace(cluster_action="doctor", host=None, json=False)
+    with contextlib.redirect_stderr(err):
+        assert cli.cluster_command(args) == 2
+    assert "--host" in err.getvalue()
+
+
+def test_cluster_status_explain_prints_the_precondition_rows():
+    """B4: `--explain` renders the same five rows the dashboard panel shows.
+
+    A bare local run (no workers, no model): nothing is broken, but Start
+    cannot proceed without a model, so the exit code says "not ready".
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-m", "omlx.cli", "cluster", "status", "--explain"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 1, result.stderr
+    for row_id in ("ssh", "fabric", "staging", "budget", "strategy"):
+        assert row_id in result.stdout
+    assert "ready: no" in result.stdout
+    assert "PASS" in result.stdout

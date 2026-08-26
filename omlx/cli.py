@@ -816,6 +816,51 @@ def cluster_command(args) -> int:
     import json
 
     action = getattr(args, "cluster_action", None)
+    if action == "status" and getattr(args, "explain", False):
+        # B4: the same precondition rows the dashboard panel renders,
+        # computed by the same code — locally, not over HTTP — so the CLI
+        # and the GUI can never tell different stories (design B.6).
+        import asyncio
+
+        from .cluster import routes as cluster_routes
+
+        hosts = [
+            host.strip()
+            for host in (args.hosts or "127.0.0.1").split(",")
+            if host.strip()
+        ]
+        try:
+            report = asyncio.run(
+                cluster_routes._cluster_readiness_report(
+                    hosts, (args.model or "").strip()
+                )
+            )
+        except ValueError as exc:
+            print(f"Cluster readiness error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            for row in report.get("rows", []):
+                print(
+                    f"{row['id']:<9} {row['state'].upper():<5} "
+                    f"{row['evidence']}"
+                )
+                fix = row.get("fix") or {}
+                if fix.get("kind") == "reverify":
+                    print(f"{'':<15} fix: re-verify the worker connection")
+                elif fix.get("kind") == "doctor":
+                    print(f"{'':<15} fix: run `omlx cluster doctor`")
+                elif fix.get("kind") == "stage_details":
+                    print(f"{'':<15} fix: stage the model to every worker")
+                elif fix.get("kind") == "role_editor":
+                    print(
+                        f"{'':<15} fix: adjust the role or memory budget "
+                        f"of {fix.get('node_id') or 'the named node'}"
+                    )
+            print(f"ready: {'yes' if report.get('ready') else 'no'}")
+        return 0 if report.get("ready") else 1
+
     if action == "status":
         from .cluster.probe import collect_cluster_status, format_cluster_status
 
@@ -889,6 +934,39 @@ def cluster_command(args) -> int:
             print(f"Checksum:    {result['ranks'][0]['checksum']}")
             print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
         return 0
+
+    if action == "doctor":
+        from .cluster.doctor import run_fabric_doctor
+
+        hosts = list(args.host or [])
+        if len(hosts) == 1:
+            # One endpoint given: the other end of the link is this Mac.
+            hosts = ["127.0.0.1", hosts[0]]
+        if len(hosts) != 2:
+            print(
+                "Fabric Doctor checks one link: pass --host PEER (this Mac "
+                "is the other end) or --host twice.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report = run_fabric_doctor(tuple(hosts))
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Fabric Doctor failed: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        else:
+            marks = {"pass": "ok  ", "fail": "FAIL", "skipped": "skip"}
+            for finding in report.findings:
+                print(
+                    f"{marks.get(finding.state, finding.state):<4} "
+                    f"{finding.check_id:<16} {finding.evidence}"
+                )
+                if finding.state == "fail" and finding.remedy:
+                    print(f"     -> {finding.remedy}")
+            print(report.verdict)
+        return 0 if report.ok else 1
 
     if action == "plan":
         import socket
@@ -971,7 +1049,7 @@ def cluster_command(args) -> int:
 
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, plan",
+        "collective-smoke, pipeline-smoke, doctor, plan",
         file=sys.stderr,
     )
     return 2
@@ -1334,6 +1412,32 @@ Example directory structure:
         action="store_true",
         help="Emit machine-readable JSON",
     )
+    cluster_status_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "Explain every Start Cluster precondition as pass/warn/fail "
+            "rows — the same rows the dashboard panel renders"
+        ),
+    )
+    cluster_status_parser.add_argument(
+        "--hosts",
+        metavar="SSH[,SSH…]",
+        default=None,
+        help=(
+            "Comma-separated SSH targets to evaluate with --explain "
+            "(default: this Mac only)"
+        ),
+    )
+    cluster_status_parser.add_argument(
+        "--model",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Model directory to evaluate staging, budget, and strategy "
+            "rows against (with --explain)"
+        ),
+    )
     cluster_smoke_parser = cluster_subparsers.add_parser(
         "worker-smoke",
         help="Run a real isolated worker ready/ping/shutdown round trip",
@@ -1375,6 +1479,27 @@ Example directory structure:
         help="Overall pipeline deadline in seconds (default: 30)",
     )
     cluster_pipeline_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_doctor_parser = cluster_subparsers.add_parser(
+        "doctor",
+        help=(
+            "Run the Fabric Doctor: ladder checks in order, stopping at the "
+            "first failure, each finding carrying diagnosis and fix"
+        ),
+    )
+    cluster_doctor_parser.add_argument(
+        "--host",
+        action="append",
+        metavar="SSH_HOST",
+        help=(
+            "A link endpoint; pass once for a peer (this Mac is the other "
+            "end) or twice for an explicit pair."
+        ),
+    )
+    cluster_doctor_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",
