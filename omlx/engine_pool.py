@@ -313,9 +313,20 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None:
             return None
-        return registry.get_for_model(entry.model_path)
+        if entry.engine_type == "batched":
+            return registry.get_for_model(entry.model_path)
+        if entry.engine_type == "vlm":
+            # A user-approved text-only deployment runs a VLM checkpoint's
+            # language model through DistributedBatchedEngine; the pinned
+            # mlx-lm rank loader drops the vision tower during sanitize.
+            # Without the explicit ``text_only`` opt-in the entry keeps
+            # failing closed exactly as before (#1261/#1426).
+            deployment = registry.get_for_model(entry.model_path)
+            if deployment is not None and deployment.text_only:
+                return deployment
+        return None
 
     def _entry_resident_size(self, entry: EngineEntry) -> int:
         """Return this process's planned weights, not the full cluster model."""
@@ -836,7 +847,9 @@ class EnginePool:
             ),
         )
 
-    def resolve_cluster_model_id(self, model_path: str) -> str:
+    def resolve_cluster_model_id(
+        self, model_path: str, *, text_only: bool = False
+    ) -> str:
         """Resolve one downloaded LLM path to its public oMLX model ID.
 
         Cluster deployments are keyed by canonical model path while the public
@@ -844,6 +857,12 @@ class EnginePool:
         those namespaces before it starts a launcher; guessing from the final
         path component can select the wrong model when multiple model roots
         contain the same directory name.
+
+        ``text_only`` is the deployment's explicit opt-in to serve a
+        VLM-shaped checkpoint as a text model: the caller has verified (at
+        activation, via the planner layout) that the pinned mlx-lm can shard
+        or pipeline its language model. Un-flagged VLM entries keep failing
+        closed.
         """
 
         candidate = Path(model_path).expanduser()
@@ -862,11 +881,19 @@ class EnginePool:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
         if entry.engine_type != "batched":
-            raise ValueError(
+            if text_only and entry.engine_type == "vlm":
+                return model_id
+            message = (
                 f"Model '{model_id}' is a {entry.model_type} model. "
                 "Distributed cluster inference currently supports text LLM "
                 "models only."
             )
+            if entry.engine_type == "vlm":
+                message += (
+                    " Re-deploy with the text-only option to run its "
+                    "language model across the cluster (vision disabled)."
+                )
+            raise ValueError(message)
         return model_id
 
     def register_cluster_model(
@@ -874,6 +901,7 @@ class EnginePool:
         model_path: str,
         *,
         estimated_size: int,
+        text_only: bool = False,
     ) -> tuple[str, bool]:
         """Register a staged remote model without advertising it as local.
 
@@ -900,11 +928,23 @@ class EnginePool:
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
             if entry.engine_type != "batched":
-                raise ValueError(
+                if text_only and entry.engine_type == "vlm":
+                    # The locally discovered VLM entry serves the text-only
+                    # deployment itself: _distributed_deployment_for_entry
+                    # routes it through DistributedBatchedEngine once the
+                    # registry record is active. No synthetic entry needed.
+                    return model_id, False
+                message = (
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
                     "before activating it as a text cluster model."
                 )
+                if entry.engine_type == "vlm":
+                    message += (
+                        " Or re-deploy with the text-only option to run its "
+                        "language model across the cluster (vision disabled)."
+                    )
+                raise ValueError(message)
             return model_id, False
 
         try:
@@ -1073,7 +1113,10 @@ class EnginePool:
             deployment = registry.get(model_id_or_alias)
             if deployment is not None:
                 try:
-                    return self.resolve_cluster_model_id(deployment.model)
+                    return self.resolve_cluster_model_id(
+                        deployment.model,
+                        text_only=deployment.text_only,
+                    )
                 except (ModelNotFoundError, ValueError):
                     # A stale registry record must not make unrelated model
                     # resolution fail. The normal not-found path below will
@@ -2687,9 +2730,12 @@ class EnginePool:
                         f"(fallback from DFlash)"
                     )
 
-                elif force_lm and entry.engine_type == "vlm":
+                elif deployment is None and force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model -- fall back to VLMBatchedEngine.
+                    # Never taken for a distributed text-only deployment: a
+                    # failed cluster start must raise, not quietly load the
+                    # whole model on this node.
                     logger.warning(
                         f"LM loading failed for VLM model {model_id} "
                         f"(force_lm=True), falling back to VLM engine: "
@@ -2725,8 +2771,11 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm":
-                    # VLM loading failed -- fall back to LLM (BatchedEngine)
+                elif deployment is None and entry.engine_type == "vlm":
+                    # VLM loading failed -- fall back to LLM (BatchedEngine).
+                    # Guarded on ``deployment is None``: a text-only cluster
+                    # start that fails must not relabel the entry as batched
+                    # and load the full checkpoint locally.
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
                         f"falling back to LLM: {start_error}"

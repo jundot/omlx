@@ -130,6 +130,61 @@
             </ul>
         </details>
 
+        <!-- C3: Fabric Doctor — the ladder checks in order, stopping at the
+             first red rung. Minimal check · state · evidence · fix rows;
+             B4 owns the full panel layout later. -->
+        <div class="mb-6 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+            <div class="flex items-center gap-2 px-4 py-2.5">
+                <i data-lucide="stethoscope" class="w-4 h-4 flex-shrink-0 text-neutral-500"></i>
+                <span class="text-sm font-semibold text-neutral-900">Fabric Doctor</span>
+                <span class="text-[10px] uppercase tracking-wider text-neutral-400"
+                      x-show="clusterDoctor" x-text="clusterDoctor?.phase"></span>
+                <button type="button"
+                        @click="runFabricDoctor()"
+                        :disabled="clusterDoctorRunning"
+                        class="ml-auto px-2.5 py-1 text-[11px] font-medium text-neutral-700 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50">
+                    Run Fabric Doctor
+                </button>
+            </div>
+            <template x-if="clusterDoctor && (clusterDoctor.findings || []).length">
+                <ul class="border-t border-neutral-200 divide-y divide-neutral-100">
+                    <template x-for="finding in clusterDoctor.findings" :key="finding.check_id">
+                        <li class="flex items-start gap-2.5 px-4 py-2 text-xs">
+                            <span class="mt-1 w-2 h-2 rounded-full flex-shrink-0"
+                                  :class="{
+                                      'bg-emerald-500': finding.state === 'pass',
+                                      'bg-red-500': finding.state === 'fail',
+                                      'bg-neutral-300': finding.state === 'skipped'
+                                  }"></span>
+                            <span class="font-mono text-neutral-500 w-32 flex-shrink-0"
+                                  x-text="finding.check_id"></span>
+                            <div class="min-w-0 flex-1">
+                                <div class="text-neutral-800 break-words" x-text="finding.evidence"></div>
+                                <div x-show="finding.state === 'fail' && finding.remedy"
+                                     class="text-neutral-500 mt-0.5" x-text="finding.remedy"></div>
+                            </div>
+                        </li>
+                    </template>
+                </ul>
+            </template>
+            <div x-show="clusterDoctor?.verdict" x-cloak
+                 class="border-t border-neutral-200 px-4 py-2 text-xs font-medium text-neutral-700"
+                 x-text="clusterDoctor?.verdict"></div>
+            <div x-show="clusterDoctor?.error" x-cloak
+                 class="border-t border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700"
+                 x-text="clusterDoctor?.error"></div>
+        </div>
+
+        <!-- C4: VPN pre-warning, shown before any fabric setup. A heuristic
+             read of the peer's configuration — it never gates Start; the
+             bound-connect probes remain the authority on the link. -->
+        <template x-for="warning in clusterVpnWarnings()" :key="'vpn-' + warning.host">
+            <div class="mb-6 flex items-start gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                <i data-lucide="shield-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                <span class="break-words" x-text="warning.message"></span>
+            </div>
+        </template>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -916,6 +971,16 @@
                              x-text="clusterStatus.transport.rdma.enabled
                                 ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
                                 : 'RDMA not enabled'"></div>
+                        {# Readiness-ladder copy (B3): the node's reason/remedy render
+                           verbatim until the collective is proven. #}
+                        <template x-if="clusterStatus.transport.readiness && clusterStatus.transport.readiness.state !== 'collective_ok'">
+                            <div class="text-xs mt-2 space-y-0.5">
+                                <div class="text-neutral-500"
+                                     x-text="clusterStatus.transport.readiness.reason"></div>
+                                <div class="text-neutral-400"
+                                     x-text="clusterStatus.transport.readiness.remedy"></div>
+                            </div>
+                        </template>
                     </div>
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
@@ -1896,11 +1961,9 @@
                                         :disabled="clusterLinkSetupLoading || clusterAutoconfigureLoading || clusterActivationLoading"
                                         class="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 whitespace-nowrap shrink-0">
                                     <i data-lucide="power" class="w-3.5 h-3.5"></i>
-                                    <span x-text="clusterLinkSetupLoading
-                                        ? (clusterActivationProgress || 'Configuring Thunderbolt…')
-                                        : (clusterActivationLoading
-                                            ? (clusterActivationProgress || 'Starting cluster…')
-                                            : (clusterAutoconfigureLoading ? 'Checking every worker…' : 'Start Cluster'))"></span>
+                                    <!-- B2: the label renders the server-owned
+                                         job's phase, so it survives reloads. -->
+                                    <span x-text="clusterStartButtonLabel()"></span>
                                 </button>
                             </div>
 

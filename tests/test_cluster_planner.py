@@ -666,3 +666,54 @@ def test_explicit_support_declaration_wins_over_vision_guard(monkeypatch):
     )
     config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 8}}
     assert planner._supports_pipeline(config) is True
+
+
+def test_nemotron_h_quant_group_divisors_cap_tp_degree():
+    """Quantized even-split row-parallel dims contribute their group counts.
+
+    The Nemotron-H MoE routed experts use a custom *uneven* split (29 groups),
+    so 29 must NOT appear as a strict divisor. But the shared-expert down_proj
+    (3712 / 64 = 58 groups) uses the even ``shard_inplace`` path, so 58 must be
+    present — capping the model at TP=2 for the quantization reason as well as
+    the ``num_key_value_heads=2`` reason.
+    """
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+    divisors = _tensor_parallel_divisors(config)
+
+    assert 58 in divisors, divisors  # shared down_proj even-split group count
+    assert 29 not in divisors, divisors  # routed fc2 handled by the uneven path
+    assert all(v % 2 == 0 for v in divisors)  # TP=2 stays viable
+    assert not all(v % 4 == 0 for v in divisors)  # TP=4 rejected (58 % 4 != 0)
+
+
+def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
+    """Without a quantization block there are no group-count constraints."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "n_groups": 8,
+        "moe_shared_expert_intermediate_size": 3712,
+    }
+    divisors = _tensor_parallel_divisors(config)
+    assert 58 not in divisors
+    assert set(divisors) == {32, 2, 64, 8}

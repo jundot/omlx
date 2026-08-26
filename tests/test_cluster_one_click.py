@@ -44,8 +44,21 @@ def _method_source(name: str) -> str:
     raise AssertionError(f"{name} has unbalanced braces in dashboard.js")
 
 
-def _run_one_click(proposal: dict, *, link_status: dict | None = None) -> dict:
-    """Execute the shipped orchestration with deterministic browser seams."""
+def _run_one_click(
+    job: dict,
+    *,
+    polled: dict | None = None,
+    post_status: int = 202,
+    post_detail: str = "",
+    entry: str = "startCluster",
+) -> dict:
+    """Execute the shipped B2 orchestration with deterministic browser seams.
+
+    The ladder itself (link setup, autoconfigure, staging, activation) runs
+    server-side since B2; the browser only creates the job and renders its
+    record. ``job`` is what ``POST /start-jobs`` (and the re-attach listing)
+    answers with; ``polled`` is the first ``GET /start-jobs/{id}`` response.
+    """
 
     node = shutil.which("node")
     if node is None:
@@ -59,11 +72,17 @@ def _run_one_click(proposal: dict, *, link_status: dict | None = None) -> dict:
             "stopClusterActivationProgress",
             "clusterWorkerPeers",
             "clusterClusterHostsPayload",
+            "clusterAutoconfigureRequestBody",
             "autoconfigureCluster",
             "prepareClusterLink",
             "prepareCudaSupernodesForActivation",
             "startCluster",
-            "activateClusterProposal",
+            "adoptClusterStartJob",
+            "adoptRunningClusterStartJob",
+            "refreshClusterStartJob",
+            "finishClusterStartJob",
+            "loadClusterStartJobStaging",
+            "clusterStartJobPhaseText",
         )
     )
     script = f"""
@@ -87,37 +106,34 @@ global.fetch = async (url, options = {{}}) => {{
       json: async () => ({{ jobs: [], warnings: [], launchers: [] }}),
     }};
   }}
-  if (url.endsWith('/autoconfigure')) {{
-    return {{ status: 200, ok: true, json: async () => input.proposal }};
+  if (url === '/admin/api/cluster/start-jobs' && options.method === 'POST') {{
+    if (input.postStatus !== 202) {{
+      return {{
+        status: input.postStatus,
+        ok: false,
+        json: async () => ({{ detail: input.postDetail }}),
+      }};
+    }}
+    return {{ status: 202, ok: true, json: async () => input.job }};
   }}
-  if (url.endsWith('/link-setup')) {{
+  if (url === '/admin/api/cluster/start-jobs') {{
     return {{
       status: 200,
       ok: true,
-      json: async () => ({{
-        state: 'rdma_ready',
-        ready: true,
-        setup_available: false,
-      }}),
+      json: async () => ({{ jobs: [input.job] }}),
     }};
   }}
-  if (url.endsWith('/deployments')) {{
-    return {{
-      status: 200,
-      ok: true,
-      json: async () => ({{
-        ok: true,
-        plan: {{ placement_signature: 'launched' }},
-        plan_changes: {{ changed: false }},
-      }}),
-    }};
+  if (url.includes('/start-jobs/')) {{
+    return {{ status: 200, ok: true, json: async () => input.polled }};
+  }}
+  if (url.includes('/stage/')) {{
+    return {{ status: 200, ok: true, json: async () => ({{ nodes: {{}} }}) }};
   }}
   throw new Error(`unexpected fetch ${{url}}`);
 }};
 const component = {{
   {methods},
   clusterNodePayloads() {{ return input.nodes; }},
-  adoptClusterFabric(fabric) {{ this.adoptedFabric = fabric; }},
   invalidateClusterPlan() {{ this.clusterPlan = null; }},
   async loadClusterDeployments() {{ deploymentLoads += 1; }},
   async clusterResponseError(_response, fallback) {{ return fallback; }},
@@ -132,6 +148,9 @@ const component = {{
   clusterActivationResult: null,
   clusterPlanChanges: null,
   clusterError: '',
+  clusterStartJob: null,
+  clusterStartJobStaging: null,
+  clusterIpsOverridden: false,
   clusterPeerSsh: 'studio.local',
   clusterSelectedPeers: [{{ ssh: 'studio.local', name: 'Mac Studio' }}],
   clusterPlanNodes: input.nodes,
@@ -142,10 +161,6 @@ const component = {{
     {{ host: 'studio.local', ips: ['10.0.0.2'], rdma: ['rdma0', null] }},
   ] }},
   clusterFabricError: '',
-  async loadClusterFabric() {{}},
-  async loadClusterLinkStatus() {{
-    return this.clusterLinkStatus || input.linkStatus;
-  }},
   clusterPlanMode: 'model',
   clusterPlanModelPath: '/models/qwen',
   clusterPlanTensorParallelSize: 1,
@@ -161,13 +176,19 @@ const component = {{
   clusterLastGoodConfig: null,
 }};
 (async () => {{
-  await component.startCluster();
+  await component[input.entry]();
+  // The poll refresh runs fire-and-forget on the mocked timer; drain the
+  // microtask queue so its fetches settle before the state is reported.
+  for (let index = 0; index < 50; index += 1) await Promise.resolve();
   process.stdout.write(JSON.stringify({{
     calls,
     deploymentLoads,
     autoconfigureError: component.clusterAutoconfigureError,
     activationResult: component.clusterActivationResult,
     clusterError: component.clusterError,
+    startJob: component.clusterStartJob,
+    activationLoading: component.clusterActivationLoading,
+    activationProgress: component.clusterActivationProgress,
   }}));
 }})().catch(error => {{
   console.error(error);
@@ -178,13 +199,11 @@ const component = {{
         [node, "-e", script],
         input=json.dumps(
             {
-                "proposal": proposal,
-                "linkStatus": link_status
-                or {
-                    "state": "rdma_ready",
-                    "ready": True,
-                    "setup_available": False,
-                },
+                "job": job,
+                "polled": polled if polled is not None else job,
+                "postStatus": post_status,
+                "postDetail": post_detail,
+                "entry": entry,
                 "nodes": [
                     {"node_id": "local", "capacity_bytes": 64 * 1024**3},
                     {"node_id": "studio", "capacity_bytes": 128 * 1024**3},
@@ -895,7 +914,7 @@ process.stdout.write(JSON.stringify({
 
 def test_manual_link_addresses_disable_transport_rediscovery():
     result = _run_dashboard_helpers(
-        ("autoconfigureCluster",),
+        ("clusterAutoconfigureRequestBody", "autoconfigureCluster"),
         """
 let posted = null;
 global.window = {
@@ -1334,7 +1353,7 @@ component.previewClusterWeightBalance = async () => {};
 
 def test_late_autoconfigure_failure_cannot_restore_an_invalidated_error():
     result = _run_dashboard_helpers(
-        ("autoconfigureCluster",),
+        ("clusterAutoconfigureRequestBody", "autoconfigureCluster"),
         """
 let completeRequest = null;
 global.window = {
@@ -2116,126 +2135,115 @@ def test_activation_progress_is_runtime_driven_not_timer_simulated():
     assert "setTimeout" not in source
 
 
-def test_one_click_posts_the_server_activation_payload_unchanged():
-    activation = {
+def _start_job_record(**overrides):
+    record = {
+        "job_id": "a" * 24,
+        "phase": "queued",
         "model_path": "/models/qwen",
-        "backend": "jaccl",
-        "nodes": [{"node_id": "local"}, {"node_id": "studio"}],
-        "hosts": [{"ssh": "127.0.0.1"}, {"ssh": "studio.local"}],
-        "preflight": True,
-        "tensor_parallel_size": 2,
-        "auto_tune": True,
-        "marker": "server-owned-payload",
+        "hosts": ["127.0.0.1", "studio.local"],
+        "attempt": 1,
+        "staging_job_id": None,
+        "superseded_by": None,
+        "incident_id": None,
+        "error": "",
+        "result": None,
     }
-    result = _run_one_click(
-        {
-            "ready_to_activate": True,
-            "activation": activation,
-            "fabric": None,
-            "tensor_parallel_size": 2,
-            "summary": "2-way tensor parallel",
-        }
+    record.update(overrides)
+    return record
+
+
+def test_one_click_posts_one_start_job_and_renders_its_ready_result():
+    """B2: the browser creates the job and renders the server's record.
+
+    The activation payload itself never passes through the browser any more —
+    the server-side ladder owns it (tests/test_cluster_start_job.py).
+    """
+
+    ready = _start_job_record(
+        phase="ready",
+        result={
+            "ok": True,
+            "plan": {"placement_signature": "launched"},
+            "plan_changes": {"changed": False},
+        },
     )
+    result = _run_one_click(_start_job_record(), polled=ready)
 
     operational = [
         call for call in result["calls"]
         if not call["url"].endswith("/runtime")
     ]
     assert [call["url"] for call in operational] == [
-        "/admin/api/cluster/autoconfigure",
-        "/admin/api/cluster/deployments",
+        "/admin/api/cluster/start-jobs",
+        "/admin/api/cluster/start-jobs/" + "a" * 24,
     ]
-    assert operational[1]["body"] == activation
-    assert any(call["url"].endswith("/runtime") for call in result["calls"])
+    posted = operational[0]["body"]
+    assert posted["model_path"] == "/models/qwen"
+    assert [node["node_id"] for node in posted["nodes"]] == ["local", "studio"]
     assert result["deploymentLoads"] == 1
     assert result["activationResult"]["ok"] is True
     assert result["clusterError"] == ""
+    assert result["activationLoading"] is False
 
 
-def test_one_click_never_posts_a_blocked_proposal():
+def test_a_refused_start_job_surfaces_the_error_and_adopts_nothing():
+    """The 409 (already running / manual activation in flight) reaches the
+    user; no phantom job is adopted, so the button stays live."""
+
     result = _run_one_click(
-        {
-            "ready_to_activate": False,
-            "activation": {"must_not": "launch"},
-            "fabric": None,
-            "tensor_parallel_size": 1,
-            "summary": "blocked",
-            "preflight": "Studio is missing mlx_vlm.",
-            "preflight_issues": [
-                {
-                    "node_id": "studio",
-                    "kind": "import_missing",
-                    "detail": "No module named mlx_vlm",
-                    "commands": ["pip install mlx-vlm"],
-                }
-            ],
-        }
+        _start_job_record(),
+        post_status=409,
+        post_detail="A Start Cluster job is already running for this model.",
     )
 
     assert [call["url"] for call in result["calls"]] == [
-        "/admin/api/cluster/autoconfigure"
+        "/admin/api/cluster/start-jobs"
     ]
+    assert result["startJob"] is None
     assert result["deploymentLoads"] == 0
     assert result["activationResult"] is None
-    assert result["autoconfigureError"] == "Studio is missing mlx_vlm."
+    assert result["autoconfigureError"] == "Start Cluster failed"
 
 
-def test_one_click_does_not_stage_or_launch_without_a_verified_fabric():
-    result = _run_one_click(
-        {
-            "ready_to_activate": False,
-            "fabric_ready": False,
-            "fabric_blocker": "worker 1 cannot reach worker 2",
-            "staging": {"ready": False},
-            "activation": {"must_not": "launch"},
-            "fabric": {"ok": False},
-            "tensor_parallel_size": 1,
-            "summary": "blocked fabric",
-        }
+def test_a_failed_job_lands_its_server_error_in_the_banner():
+    """A FAILED record carries the phase's error; the browser renders it and
+    releases the loading state so the button is usable again."""
+
+    failed = _start_job_record(
+        phase="failed",
+        error="worker 1 cannot reach worker 2",
     )
+    result = _run_one_click(_start_job_record(), polled=failed)
 
-    assert [call["url"] for call in result["calls"]] == [
-        "/admin/api/cluster/autoconfigure"
-    ]
-    assert result["deploymentLoads"] == 0
+    assert result["clusterError"] == "worker 1 cannot reach worker 2"
     assert result["activationResult"] is None
-    assert result["autoconfigureError"] == "worker 1 cannot reach worker 2"
+    assert result["deploymentLoads"] == 0
+    assert result["activationLoading"] is False
 
 
-def test_one_click_prepares_thunderbolt_then_continues_to_activation():
+def test_reload_reattaches_to_a_running_start_job():
+    """Failure #8's dead-button class: after a reload, cluster-tab init
+    adopts the non-terminal job and keeps rendering its phase."""
+
+    running = _start_job_record(
+        job_id="c" * 24,
+        phase="staging",
+        staging_job_id="d" * 24,
+    )
     result = _run_one_click(
-        {
-            "ready_to_activate": True,
-            "activation": {
-                "model_path": "/models/qwen",
-                "backend": "jaccl",
-                "nodes": [{"node_id": "local"}, {"node_id": "studio"}],
-                "hosts": [{"ssh": "127.0.0.1"}, {"ssh": "studio.local"}],
-            },
-            "fabric": None,
-            "tensor_parallel_size": 2,
-            "summary": "ready",
-        },
-        link_status={
-            "state": "rdma_needs_setup",
-            "ready": False,
-            "setup_available": True,
-        },
+        running,
+        polled=running,
+        entry="adoptRunningClusterStartJob",
     )
 
-    operational = [
-        call for call in result["calls"]
-        if not call["url"].endswith("/runtime")
-    ]
-    assert [call["url"] for call in operational] == [
-        "/admin/api/cluster/link-setup",
-        "/admin/api/cluster/autoconfigure",
-        "/admin/api/cluster/deployments",
-    ]
-    assert operational[0]["body"] == {
-        "hosts": ["127.0.0.1", "studio.local"]
-    }
-    assert result["activationResult"]["ok"] is True
+    assert result["startJob"]["job_id"] == "c" * 24
+    assert result["activationLoading"] is True
+    urls = [call["url"] for call in result["calls"]]
+    assert urls[0] == "/admin/api/cluster/start-jobs"
+    assert any(url.endswith("/start-jobs/" + "c" * 24) for url in urls)
+    # Staging progress reads through staging_job_id → /stage/{job_id}.
+    assert any("/stage/" in url for url in urls)
+    assert result["activationProgress"] == "Staging model files…"
 
 
 def test_probe_failures_back_off_instead_of_retrying_every_ten_seconds():

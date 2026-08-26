@@ -5,11 +5,26 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
 from omlx.cluster.enrollment import ClusterEnrollmentStore
+from omlx.cluster.start_job import reset_start_job_store
+
+
+@pytest.fixture(autouse=True)
+def _fresh_start_jobs():
+    """The B2 job store is a process-wide singleton; keep tests independent.
+
+    A leaked non-terminal job would 409 every later activation test, so the
+    store is reset around each test in this module.
+    """
+
+    reset_start_job_store()
+    yield
+    reset_start_job_store()
 from omlx.cluster.models import (
     ClusterStatus,
     RDMACapability,
@@ -152,7 +167,7 @@ class _ReadyClusterPool:
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
 
-    def resolve_cluster_model_id(self, model_path):
+    def resolve_cluster_model_id(self, model_path, *, text_only=False):
         assert model_path == self.model_path
         if self.remote_only and not self.cluster_registered:
             from omlx.exceptions import ModelNotFoundError
@@ -160,7 +175,7 @@ class _ReadyClusterPool:
             raise ModelNotFoundError(model_path, [])
         return self.model_id
 
-    def register_cluster_model(self, model_path, *, estimated_size):
+    def register_cluster_model(self, model_path, *, estimated_size, text_only=False):
         assert model_path == self.model_path
         assert estimated_size > 0
         self.cluster_registered = True
@@ -478,6 +493,8 @@ def test_cluster_peer_probe_route(monkeypatch):
 
 
 def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -487,8 +504,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(ssh=ssh, python=python_executable)
+            or AdmissionCeilingProbe(213 * gib + 123)
         ),
     )
 
@@ -525,6 +543,8 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
 def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -534,8 +554,8 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monk
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(ssh=ssh, python=python_executable) or AdmissionCeilingProbe(64 * gib)
         ),
     )
 
@@ -556,7 +576,7 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh: called.append(ssh),
+        lambda ssh, **kwargs: called.append(ssh),
     )
 
     response = _client().post(
@@ -574,6 +594,174 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     assert response.status_code == 400
     assert "invalid SSH target" in response.json()["detail"]
     assert called == []
+
+
+def test_peer_probe_results_teach_the_advertised_admin_port():
+    """C5: a capability probe deposits the peer's admin port for /node-budgets."""
+
+    routes._note_peer_admin_port(
+        {
+            "ok": True,
+            "ssh": "user@Studio.local",
+            "status": {"node": {"admin_port": 8123}},
+        }
+    )
+    try:
+        assert routes._advertised_admin_port("studio.local") == 8123
+        assert routes._advertised_admin_port("other@STUDIO.local") == 8123
+        # A payload without the field (older peer) teaches nothing.
+        routes._note_peer_admin_port(
+            {"ok": True, "ssh": "studio.local", "status": {"node": {}}}
+        )
+        assert routes._advertised_admin_port("studio.local") == 8123
+    finally:
+        with routes._PEER_ADMIN_PORTS_LOCK:
+            routes._PEER_ADMIN_PORTS.clear()
+
+
+def test_cluster_node_budgets_confess_a_dead_advertised_port(
+    monkeypatch, tmp_path
+):
+    """C5: fast-probe fallback keeps the ceiling and records one WARN."""
+
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
+    gib = 1024**3
+    store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(routes, "_PEER_ADMIN_PORTS", {"studio.local": 8123})
+    monkeypatch.setattr(routes, "_CEILING_FALLBACK_SEEN", set())
+    asked = {}
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(admin_port=admin_port)
+            or AdmissionCeilingProbe(
+                100 * gib,
+                fast_probe_ok=False,
+                fast_probe_error="port 8123: Connection refused",
+            )
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+
+    # The advertised port was threaded into the probe, and the slower
+    # computation's ceiling arrived whole.
+    assert response.status_code == 200
+    assert asked == {"admin_port": 8123}
+    assert response.json()["nodes"][0]["capacity_bytes"] == 100 * gib
+    incidents = [
+        incident
+        for incident in store.list()
+        if incident.state_code == "ceiling_fast_probe_fallback"
+    ]
+    assert len(incidents) == 1
+    assert incidents[0].severity == Severity.WARN
+    assert "fast ceiling probe unreachable on port 8123" in incidents[0].message
+    assert "slower local computation" in incidents[0].message
+
+    # The condition is standing: a second poll must not add a second WARN.
+    again = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+    assert again.status_code == 200
+    assert (
+        len(
+            [
+                incident
+                for incident in store.list()
+                if incident.state_code == "ceiling_fast_probe_fallback"
+            ]
+        )
+        == 1
+    )
+
+
+def test_fabric_drift_is_detected_and_confessed_once(monkeypatch, tmp_path):
+    """C5 watchdog: drifted ifconfig addressing becomes one WARN, not spam."""
+
+    from omlx.cluster import fabric_intent as fabric_intent_module
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.transport import HostInterfaces
+
+    hosts = ["127.0.0.1", "studio.local"]
+    store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(routes, "_FABRIC_DRIFT_SEEN", set())
+    try:
+        intent_store = fabric_intent_module.configure_fabric_intent(tmp_path)
+        intent_store.record(
+            subnet="172.16.99.0/24",
+            hosts=tuple(hosts),
+            chosen_by="auto",
+            reason="collision_free_default",
+            addressing="ifconfig",
+        )
+        # The addresses are gone (reboot), and nothing else collides.
+        interfaces = {
+            host: HostInterfaces(
+                host=host,
+                addresses=(),
+                rdma_interfaces=frozenset({"en1"}),
+                thunderbolt_interfaces=frozenset({"en1"}),
+            )
+            for host in hosts
+        }
+        monkeypatch.setattr(routes, "hostile_networks", lambda *a, **k: ())
+
+        drift = routes._detect_fabric_drift(hosts, interfaces)
+
+        assert drift is not None
+        assert drift["kind"] == "address_lost"
+        assert drift["addressing"] == "ifconfig"
+        assert drift["auto_restore"] is False
+
+        routes._note_fabric_drift({"drift": drift})
+        routes._note_fabric_drift({"drift": drift})  # standing condition
+
+        incidents = [
+            incident
+            for incident in store.list()
+            if incident.state_code == "fabric_drift"
+        ]
+        assert len(incidents) == 1
+        assert incidents[0].severity == Severity.WARN
+        assert "Fabric Doctor" in incidents[0].message
+
+        # An auto-restorable finding (networksetup) stays silent.
+        intent_store.record(
+            subnet="172.16.99.0/24",
+            hosts=tuple(hosts),
+            chosen_by="auto",
+            reason="collision_free_default",
+            addressing="networksetup",
+        )
+        restorable = routes._detect_fabric_drift(hosts, interfaces)
+        assert restorable is not None and restorable["auto_restore"] is True
+        routes._note_fabric_drift({"drift": restorable})
+        assert (
+            len(
+                [
+                    incident
+                    for incident in store.list()
+                    if incident.state_code == "fabric_drift"
+                ]
+            )
+            == 1
+        )
+    finally:
+        fabric_intent_module._configured_intent = None
 
 
 def test_cluster_plan_route_builds_unequal_pipeline():
@@ -2283,3 +2471,368 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+# --- Fabric Doctor job lifecycle (C3) -------------------------------------
+
+
+def _fake_doctor_report(hosts=("127.0.0.1", "studio.local")):
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    return DoctorReport(
+        hosts=tuple(hosts),
+        findings=(
+            DoctorFinding(
+                check_id="link_presence", state="pass", evidence="en3 up"
+            ),
+            DoctorFinding(
+                check_id="jaccl_probe",
+                state="pass",
+                evidence="two-rank JACCL handshake passed in 1.10s",
+            ),
+        ),
+        verdict="Fabric verified — every check passed.",
+        started_at=1.0,
+        finished_at=2.0,
+    )
+
+
+def _wait_for_doctor_phase(client, job_id, phases=("completed", "failed")):
+    import time as _time
+
+    for _ in range(100):
+        snapshot = client.get(f"/admin/api/cluster/doctor/{job_id}").json()
+        if snapshot.get("phase") in phases:
+            return snapshot
+        _time.sleep(0.05)
+    raise AssertionError(f"doctor job {job_id} never finished: {snapshot}")
+
+
+def test_doctor_job_lifecycle_records_incident(tmp_path, monkeypatch):
+    store = _incident_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes, "run_fabric_doctor", lambda hosts, **_: _fake_doctor_report(hosts)
+    )
+    client = _client()
+
+    response = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    )
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    assert job_id
+
+    snapshot = _wait_for_doctor_phase(client, job_id)
+    assert snapshot["phase"] == "completed"
+    assert snapshot["verdict"] == "Fabric verified — every check passed."
+    assert [item["check_id"] for item in snapshot["findings"]] == [
+        "link_presence",
+        "jaccl_probe",
+    ]
+    assert snapshot["findings"][0]["state"] == "pass"
+
+    recorded = store.list()
+    assert len(recorded) == 1
+    incident = recorded[0]
+    assert incident.state_code == "fabric_doctor"
+    assert incident.severity == "info"
+    assert incident.job_id == job_id
+    assert incident.message == "Fabric verified — every check passed."
+
+
+def test_doctor_red_run_records_error_incident(tmp_path, monkeypatch):
+    from omlx.cluster.doctor import DoctorFinding, DoctorReport
+
+    store = _incident_store(tmp_path, monkeypatch)
+    report = DoctorReport(
+        hosts=("127.0.0.1", "studio.local"),
+        findings=(
+            DoctorFinding(
+                check_id="subnet_collision",
+                state="fail",
+                evidence="WARP routes 10.0.0.0/8 through utun4",
+                diagnosis="the fabric subnet is captured by a VPN tunnel route",
+            ),
+            DoctorFinding(
+                check_id="jaccl_probe",
+                state="skipped",
+                evidence="skipped — subnet_collision failed first",
+            ),
+        ),
+        verdict=(
+            "Fabric Doctor stopped at subnet_collision: the fabric subnet "
+            "is captured by a VPN tunnel route"
+        ),
+    )
+    monkeypatch.setattr(routes, "run_fabric_doctor", lambda hosts, **_: report)
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    snapshot = _wait_for_doctor_phase(client, job_id)
+
+    assert snapshot["phase"] == "completed"
+    assert snapshot["verdict"].startswith(
+        "Fabric Doctor stopped at subnet_collision"
+    )
+    recorded = store.list()
+    assert len(recorded) == 1
+    assert recorded[0].severity == "error"
+    assert recorded[0].job_id == job_id
+
+
+def test_doctor_crash_marks_job_failed_with_incident(tmp_path, monkeypatch):
+    store = _incident_store(tmp_path, monkeypatch)
+
+    def explode(hosts, **_):
+        raise RuntimeError("probe machinery fell over")
+
+    monkeypatch.setattr(routes, "run_fabric_doctor", explode)
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    snapshot = _wait_for_doctor_phase(client, job_id)
+
+    assert snapshot["phase"] == "failed"
+    assert "probe machinery fell over" in snapshot["error"]
+    recorded = store.list()
+    assert len(recorded) == 1
+    assert recorded[0].state_code == "fabric_doctor_failed"
+    assert recorded[0].severity == "error"
+
+
+def test_doctor_rejects_bad_hosts_and_counts(monkeypatch):
+    client = _client()
+    assert (
+        client.post(
+            "/admin/api/cluster/doctor", json={"hosts": ["only-one"]}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/admin/api/cluster/doctor",
+            json={"hosts": ["ok.local", "-oProxyCommand=evil"]},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get("/admin/api/cluster/doctor/not-a-job-id").status_code == 404
+    )
+    assert (
+        client.get(f"/admin/api/cluster/doctor/{'0' * 24}").status_code == 404
+    )
+
+
+def test_doctor_report_lands_in_diagnostics(tmp_path, monkeypatch):
+    _incident_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes, "run_fabric_doctor", lambda hosts, **_: _fake_doctor_report(hosts)
+    )
+    monkeypatch.setattr(routes, "collect_cluster_status", lambda **_: _status())
+    monkeypatch.setattr(
+        routes, "read_runtime_markers", lambda: {"jobs": [], "warnings": []}
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            list=lambda: (),
+            to_dict=lambda: {"schema_version": 1, "deployments": []},
+        ),
+    )
+    client = _client()
+
+    job_id = client.post(
+        "/admin/api/cluster/doctor",
+        json={"hosts": ["127.0.0.1", "studio.local"]},
+    ).json()["job_id"]
+    _wait_for_doctor_phase(client, job_id)
+
+    bundle = client.get("/admin/api/cluster/diagnostics").json()
+    reports = [
+        job for job in bundle["fabric_doctor"] if job["job_id"] == job_id
+    ]
+    assert len(reports) == 1
+    assert reports[0]["phase"] == "completed"
+    assert reports[0]["verdict"] == "Fabric verified — every check passed."
+
+
+def _start_job_body(model_path):
+    """The autoconfigure request shape POST /start-jobs accepts (B2)."""
+
+    return {
+        "model_path": str(model_path),
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+            {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+        ],
+    }
+
+
+def test_start_job_post_returns_202_with_the_job_record(tmp_path, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(
+        routes,
+        "_schedule_start_job",
+        lambda job_id, request: scheduled.append(job_id),
+    )
+
+    client = _client()
+    response = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    )
+
+    assert response.status_code == 202
+    job = response.json()
+    assert job["job_id"]
+    assert job["phase"] == "queued"
+    assert job["attempt"] == 1
+    assert job["model_path"] == str(tmp_path / "model")
+    assert job["hosts"] == ["127.0.0.1", "studio.local"]
+    assert job["staging_job_id"] is None
+    assert job["superseded_by"] is None
+    assert job["result"] is None
+    assert scheduled == [job["job_id"]]
+
+    fetched = client.get(f"/admin/api/cluster/start-jobs/{job['job_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["job_id"] == job["job_id"]
+
+    listed = client.get("/admin/api/cluster/start-jobs")
+    assert listed.status_code == 200
+    assert listed.json()["jobs"][0]["job_id"] == job["job_id"]
+
+    missing = client.get("/admin/api/cluster/start-jobs/" + "f" * 24)
+    assert missing.status_code == 404
+
+
+def test_start_job_post_refuses_a_second_job_for_the_same_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    body = _start_job_body(tmp_path / "model")
+
+    first = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert first.status_code == 202
+
+    second = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert second.status_code == 409
+    assert first.json()["job_id"] in second.json()["detail"]
+
+    # A different model is a different job; the refusal is per model.
+    other = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "other-model"),
+    )
+    assert other.status_code == 202
+
+
+def test_start_job_post_refuses_while_a_manual_activation_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    monkeypatch.setattr(routes, "_SYNC_ACTIVATIONS_IN_FLIGHT", 1)
+
+    response = _client().post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    )
+    assert response.status_code == 409
+    assert "manual activation" in response.json()["detail"]
+
+
+def test_start_job_supersedes_the_previous_failed_attempt(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.start_job import get_start_job_store
+
+    incident_store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    body = _start_job_body(tmp_path / "model")
+
+    first = client.post("/admin/api/cluster/start-jobs", json=body).json()
+    failure = incident_store.record(
+        Severity.ERROR,
+        "coordinator",
+        "start_activation_failed",
+        "canary failed",
+        job_id=first["job_id"],
+    )
+    get_start_job_store().update(
+        first["job_id"], phase="failed", error="canary failed"
+    )
+
+    second = client.post("/admin/api/cluster/start-jobs", json=body)
+    assert second.status_code == 202
+    second_job = second.json()
+    assert second_job["attempt"] == 2
+
+    old = client.get(
+        f"/admin/api/cluster/start-jobs/{first['job_id']}"
+    ).json()
+    assert old["superseded_by"] == second_job["job_id"]
+
+    # The earlier attempt's incident is flagged, never deleted, and the
+    # replacement announced itself in the feed.
+    by_id = {item.id: item for item in incident_store.list()}
+    assert by_id[failure.id].superseded_by is not None
+    assert any(
+        item.state_code == "start_job_superseded"
+        and item.job_id == second_job["job_id"]
+        for item in incident_store.list()
+    )
+
+
+def test_legacy_deployments_post_is_refused_while_a_start_job_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        routes, "_schedule_start_job", lambda job_id, request: None
+    )
+    client = _client()
+    running = client.post(
+        "/admin/api/cluster/start-jobs",
+        json=_start_job_body(tmp_path / "model"),
+    ).json()
+
+    # The guard fires before any planning, so a shape-valid body suffices.
+    response = client.post(
+        "/admin/api/cluster/deployments",
+        json={
+            "model_path": str(tmp_path / "model"),
+            "backend": "ring",
+            "nodes": [
+                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+            ],
+            "hosts": [
+                {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
+                {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
+            ],
+            "approved_placement": "0" * 32,
+        },
+    )
+    assert response.status_code == 409
+    assert running["job_id"] in response.json()["detail"]
