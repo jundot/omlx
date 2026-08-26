@@ -331,18 +331,23 @@ def check_peers(
     A marker whose writing process is gone is treated as absent rather than
     stale. It is the debris of a crashed run, not evidence about this one, and
     calling it stale wedged every subsequent activation of the same model.
+
+    When a runtime heartbeat is required, the marker is read *before* the
+    separate SSH probe: a successful read already proves reachability, so the
+    probe only runs to tell "host down" from "marker problem" when the read
+    fails. On the healthy path this halves the SSH round trips per refresh.
     """
 
     local_root = Path(state_dir).expanduser()
     remote_root = Path(state_dir)
     health = []
     for rank, (node_id, ssh_target) in sorted(hosts_by_rank.items()):
-        reachable = probe(ssh_target)
         marker: dict[str, Any] | None = None
         process_live: bool | None = None
         marker_error = ""
         marker_clock = now
-        if reachable and require_heartbeat and deployment_id:
+        heartbeat_wanted = require_heartbeat and bool(deployment_id)
+        if heartbeat_wanted:
             name = f"{deployment_id}-rank-{rank}.json"
             if ssh_target in _LOOPBACK_TARGETS:
                 marker = read_marker(local_root / name)
@@ -351,6 +356,9 @@ def check_peers(
                 marker, process_live, marker_clock, marker_error = remote_reader(
                     ssh_target, str(remote_root / name)
                 )
+        reachable = marker is not None if heartbeat_wanted else False
+        if not reachable:
+            reachable = probe(ssh_target)
         age = marker_age_seconds(marker, now=marker_clock) if marker else None
         if not reachable:
             detail = f"{ssh_target} did not answer"

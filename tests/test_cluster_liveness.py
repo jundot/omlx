@@ -134,6 +134,58 @@ def test_a_remote_rank_without_a_local_marker_is_not_called_stale(tmp_path):
     assert remote.healthy is True
 
 
+def test_a_successful_marker_read_skips_the_separate_probe(tmp_path):
+    """C3: a marker read already proves reachability -- don't pay for both."""
+
+    _marker(tmp_path, "d", 0, age_seconds=0)
+    _marker(tmp_path, "d", 1, age_seconds=0)
+
+    def explode(_target):
+        raise AssertionError("probe_peer must not run when the marker read succeeded")
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=explode, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+
+    assert all(h.reachable for h in health)
+    assert all(h.healthy for h in health)
+
+
+def test_a_failed_marker_read_falls_back_to_the_probe(tmp_path):
+    """A marker problem on an otherwise-reachable Mac must not read as a cable pull."""
+
+    probed = []
+
+    def probe(target):
+        probed.append(target)
+        return True
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=probe, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "not found"),
+    )
+
+    assert probed == ["Studio.local"], "the fallback probe must still run"
+    assert health[0].reachable is True
+    assert "no observable runtime heartbeat" in health[0].detail
+
+
+def test_a_failed_marker_read_and_a_failed_probe_is_still_a_cable_pull(tmp_path):
+    """Both signals failing must still report host-down, not a marker problem."""
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=lambda _target: False, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "connection refused"),
+    )
+
+    assert health[0].reachable is False
+    assert "Studio.local did not answer" in health[0].detail
+
+
 def test_marker_age_survives_a_missing_or_broken_timestamp():
     assert marker_age_seconds({}) is None
     assert marker_age_seconds({"updated_at": "not-a-date"}) is None
