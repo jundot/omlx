@@ -20,7 +20,6 @@ When mlx-lm merges PR 1192 upstream this patch should be removed.
 
 from __future__ import annotations
 
-import glob
 import importlib.util
 import json
 import logging
@@ -146,7 +145,7 @@ def _build_patched_load_model() -> Callable:
                 "trust this model."
             )
 
-        weight_files = glob.glob(str(model_path / "model*.safetensors"))
+        weight_files = _utils.glob.glob(str(model_path / "model*.safetensors"))
 
         if not weight_files and strict:
             raise FileNotFoundError(f"No safetensors found in {model_path}")
