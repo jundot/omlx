@@ -1321,6 +1321,13 @@ class TestPiIntegration:
 
 
 class TestClaudeCodeIntegration:
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path):
+        # launch() writes ~/.omlx/claude_launch_settings.json (base URL pin);
+        # keep tests off the real HOME.
+        with patch("omlx.integrations.claude.Path.home", return_value=tmp_path):
+            yield tmp_path
+
     def test_get_command(self):
         cc = ClaudeCodeIntegration()
         cmd = cc.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
@@ -1367,7 +1374,7 @@ class TestClaudeCodeIntegration:
             # Falls back to the bare name so the os.execvpe error surfaces clearly.
             assert cc._find_claude_binary() == "claude"
 
-    def test_launch_sets_anthropic_env(self):
+    def test_launch_sets_anthropic_env(self, tmp_path):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1385,6 +1392,7 @@ class TestClaudeCodeIntegration:
         with (
             patch("omlx.integrations.claude.os.environ", base_env),
             patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch("omlx.integrations.claude.Path.home", return_value=tmp_path),
             patch.object(
                 ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
             ),
@@ -1791,7 +1799,7 @@ class TestClaudeCodeIntegration:
         assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
         assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
 
-    def test_launch_default_argv_has_no_extra(self):
+    def test_launch_default_argv_has_no_extra(self, tmp_path):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1807,10 +1815,19 @@ class TestClaudeCodeIntegration:
         ):
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
-        # No caller extra_args, but the launcher injects its own LSP denial.
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
+        # No caller extra_args, but the launcher injects its own LSP denial
+        # plus a --settings file that pins ANTHROPIC_BASE_URL against
+        # precedence from any user-configured proxy in ~/.claude/settings.json.
+        settings_path = str(tmp_path / ".omlx" / "claude_launch_settings.json")
+        assert captured["argv"] == [
+            "claude",
+            "--settings",
+            settings_path,
+            "--disallowedTools",
+            "LSP",
+        ]
 
-    def test_launch_forwards_extra_args(self):
+    def test_launch_forwards_extra_args(self, tmp_path):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1833,15 +1850,18 @@ class TestClaudeCodeIntegration:
                 )
             )
 
+        settings_path = str(tmp_path / ".omlx" / "claude_launch_settings.json")
         assert captured["argv"] == [
             "claude",
+            "--settings",
+            settings_path,
             "--disallowedTools",
             "LSP",
             "--resume",
             "abc123",
         ]
 
-    def test_launch_forwards_short_resume(self):
+    def test_launch_forwards_short_resume(self, tmp_path):
         cc = ClaudeCodeIntegration()
         captured = {}
 
@@ -1864,9 +1884,18 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP", "-r", "xyz"]
+        settings_path = str(tmp_path / ".omlx" / "claude_launch_settings.json")
+        assert captured["argv"] == [
+            "claude",
+            "--settings",
+            settings_path,
+            "--disallowedTools",
+            "LSP",
+            "-r",
+            "xyz",
+        ]
 
-    def test_launch_denies_lsp_by_default(self):
+    def test_launch_denies_lsp_by_default(self, tmp_path):
         """LSP's schema joins the tools array mid-session and re-prefills the
         whole conversation on a caching server (#2349); the launcher denies it
         so the tools array stays stable."""
@@ -1885,9 +1914,16 @@ class TestClaudeCodeIntegration:
         ):
             cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "LSP"]
+        settings_path = str(tmp_path / ".omlx" / "claude_launch_settings.json")
+        assert captured["argv"] == [
+            "claude",
+            "--settings",
+            settings_path,
+            "--disallowedTools",
+            "LSP",
+        ]
 
-    def test_launch_respects_user_disallowed_tools(self):
+    def test_launch_respects_user_disallowed_tools(self, tmp_path):
         """A caller-supplied --disallowedTools takes over: don't inject ours
         on top (would duplicate the flag / fight their choice)."""
         cc = ClaudeCodeIntegration()
@@ -1912,7 +1948,62 @@ class TestClaudeCodeIntegration:
                 )
             )
 
-        assert captured["argv"] == ["claude", "--disallowedTools", "Bash"]
+        settings_path = str(tmp_path / ".omlx" / "claude_launch_settings.json")
+        assert captured["argv"] == [
+            "claude",
+            "--settings",
+            settings_path,
+            "--disallowedTools",
+            "Bash",
+        ]
+
+    def test_launch_caller_settings_skips_injected_settings(self, tmp_path):
+        """A caller-supplied --settings takes over: don't fight it with ours."""
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    api_key="key",
+                    model="qwen3.5",
+                    extra_args=("--settings", "/custom/settings.json"),
+                )
+            )
+
+        assert captured["argv"] == [
+            "claude",
+            "--disallowedTools",
+            "LSP",
+            "--settings",
+            "/custom/settings.json",
+        ]
+
+    def test_launch_writes_settings_with_base_url(self, tmp_path):
+        cc = ClaudeCodeIntegration()
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe"),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        settings_path = tmp_path / ".omlx" / "claude_launch_settings.json"
+        data = json.loads(settings_path.read_text())
+        assert data == {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8000"}}
 
 
 class TestCopilotIntegration:
