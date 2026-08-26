@@ -30,7 +30,7 @@ from typing import Any
 
 from omlx.utils import hardware
 
-from .deployment import ClusterDeployment, validate_ssh_target
+from .deployment import ClusterDeployment, ClusterHost, validate_ssh_target
 from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
@@ -47,8 +47,36 @@ _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
 
 
+@dataclass(frozen=True)
+class RankFailure:
+    """One rank's structured failure evidence, read from its own marker.
+
+    Exists so recovery code (cluster/routes.py's memory-failure eviction)
+    can branch on real fields instead of regexing them back out of a
+    formatted string — see
+    docs/cluster-competing-model-eviction-redesign.md. `rank`/`node_id` come
+    straight from the marker/host, not reconstructed.
+    """
+
+    rank: int
+    node_id: str
+    error_type: str | None
+    error: str
+    required_bytes: int | None = None
+    current_bytes: int | None = None
+
+
 class DistributedLaunchError(RuntimeError):
     """Raised when a distributed job cannot become or remain ready."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rank_failures: tuple[RankFailure, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.rank_failures = rank_failures
 
 
 @dataclass(frozen=True)
@@ -1263,6 +1291,209 @@ def probe_remote_admission_ceiling(
     return ceiling
 
 
+# Runs on the peer under its own interpreter, like the probes above. It never
+# imports omlx (a cold import loads MLX and can blow the SSH timeout); the
+# peer's live server is reached over loopback instead, exactly the way the
+# ceiling probe reads /health. The unload endpoint requires the admin session
+# that server verifies, and its signing secret is persisted in the same
+# settings.json this login account owns — SSH access to the Mac is already
+# admin access, so minting the cookie here grants nothing new. The script
+# always exits 0 with a one-line JSON report; per-model problems are carried
+# inside it so one refusal cannot hide what else was freed.
+#
+# Unlike the original version of this script, there is no fallback to
+# guessed conventional ports (8000, 9000): the peer reads its own
+# authoritative settings.json for the port it's actually configured to
+# serve on, and if that can't be determined the script reports the failure
+# instead of sending a signed admin request to a guessed port (see
+# docs/cluster-competing-model-eviction-redesign.md §3.4 — guessing a
+# destination for an authenticated destructive request is the same class of
+# fragility as the string-regex this feature was reworked to remove).
+_REMOTE_LOCAL_EVICTION = r"""
+import json, os, urllib.error, urllib.parse, urllib.request
+
+result = {
+    "server_reachable": False,
+    "evicted": [],
+    "draining": [],
+    "skipped_pinned": [],
+    "errors": [],
+}
+
+def emit():
+    print(json.dumps(result))
+    raise SystemExit(0)
+
+def base_path():
+    env_value = os.environ.get("OMLX_BASE_PATH")
+    if env_value:
+        return os.path.expanduser(env_value)
+    bootstrap = os.path.expanduser("~/Library/Application Support/oMLX/base-path")
+    try:
+        with open(bootstrap, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        raw = ""
+    return os.path.expanduser(raw) if raw else os.path.expanduser("~/.omlx")
+
+settings = {}
+try:
+    with open(
+        os.path.join(base_path(), "settings.json"), encoding="utf-8"
+    ) as handle:
+        settings = json.load(handle)
+except Exception as exc:
+    result["errors"].append("settings.json unreadable: %s" % exc)
+
+port = None
+try:
+    configured = int((settings.get("server") or {}).get("port") or 0)
+    if configured > 0:
+        port = configured
+except (TypeError, ValueError):
+    pass
+if port is None:
+    result["errors"].append("no configured server port in settings.json")
+    emit()
+
+cookie = ""
+secret = os.environ.get("OMLX_SECRET_KEY") or (settings.get("auth") or {}).get(
+    "secret_key"
+)
+if secret:
+    try:
+        from itsdangerous import URLSafeTimedSerializer
+
+        token = URLSafeTimedSerializer(secret).dumps(
+            {"admin": True, "remember": False}
+        )
+        cookie = "omlx_admin_session=" + token
+    except Exception as exc:
+        result["errors"].append("session token failed: %s" % exc)
+
+def call(path, method, timeout):
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (port, path), method=method
+    )
+    if cookie:
+        request.add_header("Cookie", cookie)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+models = None
+try:
+    models = call("/admin/api/models", "GET", 5).get("models") or []
+except urllib.error.HTTPError as exc:
+    # The server answered but refused the request; 401 means the persisted
+    # secret is not the one the live server signs with.
+    result["errors"].append("GET /admin/api/models: HTTP %d" % exc.code)
+    result["server_reachable"] = True
+    emit()
+except Exception as exc:
+    result["errors"].append("port %d unreachable: %s" % (port, exc))
+    emit()
+result["server_reachable"] = True
+
+for model in models:
+    if not isinstance(model, dict) or not model.get("loaded"):
+        continue
+    if model.get("virtual") or model.get("is_loading"):
+        continue
+    if model.get("source_type") == "cluster":
+        continue
+    model_id = str(model.get("id") or "")
+    if not model_id:
+        continue
+    if model.get("pinned"):
+        result["skipped_pinned"].append(model_id)
+        continue
+    path = "/admin/api/models/%s/unload" % urllib.parse.quote(model_id, safe="")
+    try:
+        payload = call(path, "POST", 30)
+    except urllib.error.HTTPError as exc:
+        result["errors"].append("%s: HTTP %d" % (model_id, exc.code))
+        continue
+    except Exception as exc:
+        result["errors"].append("%s: %s" % (model_id, exc))
+        continue
+    if isinstance(payload, dict) and payload.get("status") == "unloading":
+        result["draining"].append(model_id)
+    else:
+        result["evicted"].append(model_id)
+
+emit()
+"""
+
+
+def evict_remote_local_models(
+    ssh_target: str,
+    *,
+    python_executable: str | None = None,
+    timeout: float = 60.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Unload every unpinned standalone model the peer's own server has loaded.
+
+    A cluster rank that dies of ``InsufficientMemoryError`` may have been
+    competing for unified memory with a model the peer's independent oMLX
+    server loaded through its normal path; retrying without freeing that model
+    only fails again at a higher ceiling. The coordinator has no HTTP route to
+    a peer, but it has the same host-key-verified SSH every probe uses, and
+    the peer's admin API is one loopback call away from there. Pinned models
+    are reported, never evicted. Cluster shard ranks are separate worker
+    processes, not engine-pool entries, so they cannot be touched here.
+    """
+
+    def _evict(executable: str) -> subprocess.CompletedProcess[str]:
+        return _run_cluster_ssh(
+            ssh_target,
+            shlex.join([executable, "-c", _REMOTE_LOCAL_EVICTION]),
+            timeout=timeout,
+            runner=runner,
+        )
+
+    attempted: str | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
+    if python_executable is not None:
+        attempted = _validate_python_executable(python_executable)
+        completed = _evict(attempted)
+    if completed is None or completed.returncode != 0:
+        # Same fallback discipline as the ceiling probe: a stale interpreter
+        # must trigger a search, not a silent give-up (#2680).
+        discovered = discover_remote_python_executable(
+            ssh_target,
+            preferred=attempted or sys.executable,
+            timeout=min(timeout, 8.0),
+            runner=runner,
+        )
+        if discovered != attempted:
+            completed = _evict(discovered)
+    if completed is None or completed.returncode != 0:
+        detail = (
+            (completed.stderr.strip() or completed.stdout.strip())
+            if completed is not None
+            else ""
+        )
+        raise DistributedLaunchError(
+            f"local-model eviction failed for {ssh_target}"
+            + (f": {detail[:500]}" if detail else "")
+        )
+    try:
+        lines = [
+            line for line in completed.stdout.strip().splitlines() if line.strip()
+        ]
+        payload = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise DistributedLaunchError(
+            f"{ssh_target} did not return an eviction report"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("evicted"), list):
+        raise DistributedLaunchError(
+            f"{ssh_target} returned an invalid eviction report"
+        )
+    return payload
+
+
 def probe_remote_host(
     ssh_target: str,
     *,
@@ -1869,7 +2100,10 @@ class DistributedJobSupervisor:
                     raise DistributedLaunchError("launcher disappeared")
                 returncode = process.poll()
                 if returncode is not None:
-                    raise DistributedLaunchError(self._exit_detail(returncode))
+                    raise DistributedLaunchError(
+                        self._exit_detail(returncode),
+                        rank_failures=self._runtime_failures(),
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
@@ -1918,7 +2152,10 @@ class DistributedJobSupervisor:
             process = self.process
             if process is None or process.poll() is not None:
                 code = None if process is None else process.returncode
-                raise DistributedLaunchError(self._exit_detail(code))
+                raise DistributedLaunchError(
+                    self._exit_detail(code),
+                    rank_failures=self._runtime_failures(),
+                )
             try:
                 with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
                     return
@@ -2134,6 +2371,62 @@ class DistributedJobSupervisor:
         suffix = f": {detail}" if detail else ""
         return f"distributed launcher exited with code {returncode}{suffix}"
 
+    def _read_rank_marker(self, rank: int, host: ClusterHost) -> dict[str, Any] | None:
+        """Read one rank's marker, local or over SSH, validated against this
+        exact deployment/plan/rank. Shared by `_runtime_failures` and
+        anything else that needs a single rank's persisted status.
+        """
+        filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
+        if host.ssh in _LOOPBACK_TARGETS:
+            marker = read_marker(Path(self.state_dir).expanduser() / filename)
+        else:
+            remote_root = self.state_dir.rstrip("/") or "."
+            marker, _, _, _ = read_remote_marker(
+                host.ssh,
+                f"{remote_root}/{filename}",
+            )
+        if not isinstance(marker, dict):
+            return None
+        if (
+            marker.get("deployment_id") != self.deployment.deployment_id
+            or marker.get("plan_hash") != self.deployment.plan_hash
+            or marker.get("rank") != rank
+        ):
+            return None
+        return marker
+
+    def _runtime_failures(self) -> tuple[RankFailure, ...]:
+        """Structured counterpart to `_runtime_failure_reason` — same marker
+        read, same phase filter, but returns real fields (rank, node_id,
+        error_type, size info) instead of one joined string. Recovery code
+        that needs to act on *which* node failed *how* should use this, not
+        parse `_runtime_failure_reason`'s output.
+        """
+        failures: list[RankFailure] = []
+        for rank, host in enumerate(self.deployment.hosts):
+            marker = self._read_rank_marker(rank, host)
+            if marker is None or marker.get("phase") not in {
+                "failed",
+                "peer_lost",
+                "launcher_lost",
+            }:
+                continue
+            error = marker.get("error")
+            if not (isinstance(error, str) and error.strip()):
+                continue
+            error_type = marker.get("error_type")
+            failures.append(
+                RankFailure(
+                    rank=rank,
+                    node_id=host.node_id,
+                    error_type=error_type if isinstance(error_type, str) else None,
+                    error=error.strip(),
+                    required_bytes=marker.get("required_bytes"),
+                    current_bytes=marker.get("current_bytes"),
+                )
+            )
+        return tuple(failures)
+
     def _runtime_failure_reason(self) -> str | None:
         """Recover the rank exception MLX's SSH cleanup can otherwise hide.
 
@@ -2143,39 +2436,11 @@ class DistributedJobSupervisor:
         the useful exception in its own bounded marker, so prefer that evidence
         when it belongs to this exact deployment and plan.
         """
-
-        failures: list[str] = []
-        for rank, host in enumerate(self.deployment.hosts):
-            filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
-            if host.ssh in _LOOPBACK_TARGETS:
-                marker = read_marker(
-                    Path(self.state_dir).expanduser() / filename
-                )
-            else:
-                remote_root = self.state_dir.rstrip("/") or "."
-                marker, _, _, _ = read_remote_marker(
-                    host.ssh,
-                    f"{remote_root}/{filename}",
-                )
-            if not isinstance(marker, dict):
-                continue
-            if (
-                marker.get("deployment_id") != self.deployment.deployment_id
-                or marker.get("plan_hash") != self.deployment.plan_hash
-                or marker.get("rank") != rank
-                or marker.get("phase") not in {
-                    "failed",
-                    "peer_lost",
-                    "launcher_lost",
-                }
-            ):
-                continue
-            error = marker.get("error")
-            if isinstance(error, str) and error.strip():
-                failures.append(
-                    f"rank {rank} ({host.node_id}): {error.strip()}"
-                )
-        return "; ".join(failures)[:_LOG_LINE_LIMIT] or None
+        failures = self._runtime_failures()
+        joined = "; ".join(
+            f"rank {f.rank} ({f.node_id}): {f.error}" for f in failures
+        )
+        return joined[:_LOG_LINE_LIMIT] or None
 
     def _failure_reason(self) -> str | None:
         event = self.failure_event

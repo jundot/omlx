@@ -9,6 +9,27 @@
             </p>
         </div>
 
+        <!-- Off by default: a server-initiated unload of a model you loaded
+             locally on a peer Mac is a decision you opt into, not a default
+             behavior. See docs/cluster-competing-model-eviction-redesign.md. -->
+        <div class="mb-6 rounded-xl border border-neutral-200 bg-white overflow-hidden">
+            <div class="flex items-center justify-between gap-3 px-4 py-3">
+                <div class="min-w-0">
+                    <div class="text-sm font-medium text-neutral-800">Free up memory automatically on failed activation</div>
+                    <p class="text-xs text-neutral-500 mt-0.5">
+                        When a cluster rank fails to start for lack of memory, automatically unload models you loaded locally on the peer Mac(s) that ran out of room, then note it in the error so you know a retry is worth trying.
+                    </p>
+                </div>
+                <button type="button"
+                        @click="saveClusterAutoEvict(!globalSettings.cluster.auto_evict_competing_local_models)"
+                        :class="globalSettings.cluster.auto_evict_competing_local_models ? 'bg-black' : 'bg-neutral-200'"
+                        class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black flex-shrink-0">
+                    <span :class="globalSettings.cluster.auto_evict_competing_local_models ? 'translate-x-5' : 'translate-x-0'"
+                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                </button>
+            </div>
+        </div>
+
         <!-- Errors. The raw message stays visible — it is what you paste into a
              bug report — but the actionable version leads. -->
         <div x-show="clusterDisplayedError()" x-cloak

@@ -161,9 +161,13 @@ final class PerformanceScreenVM {
                 return
             }
         }
-        // Initial cache blocks: empty = leave alone, non-empty must parse.
+        // Initial cache blocks: empty = explicit null (clear back to
+        // server-default), non-empty must parse to a positive integer.
+        // Mirrors idleTimeout's PatchOptionalInt pattern above — previously
+        // this was a plain Int? with "empty = leave alone" semantics, which
+        // meant there was no way to actually clear a previously-set value.
         let initTrimmed = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
-        var initBlocks: Int? = nil
+        var initBlocksPatch: PatchOptionalInt = .null
         if !initTrimmed.isEmpty {
             guard let n = Int(initTrimmed), n > 0 else {
                 self.lastError = String(localized: "performance.error.initial_blocks_invalid",
@@ -171,7 +175,7 @@ final class PerformanceScreenVM {
                                         comment: "Performance screen error when initial cache blocks input is invalid")
                 return
             }
-            initBlocks = n
+            initBlocksPatch = .value(n)
         }
         let tier = canonicalMemoryGuardTier(memoryGuardTier)
         let customCeiling = parsedMemoryGuardCustomCeiling
@@ -222,8 +226,15 @@ final class PerformanceScreenVM {
         if scd != loadedSsdCacheDir { patch.ssdCacheDir = scd }
         let scm = trim(ssdCacheMaxSize)
         if scm != loadedSsdCacheMaxSize { patch.ssdCacheMaxSize = scm }
-        if initBlocks != loadedInitialCacheBlocks, let n = initBlocks {
-            patch.initialCacheBlocks = n
+        // initialCacheBlocks: empty = clear (.null), positive int = set
+        // (.value). Only send when it actually changed, like idleTimeout.
+        switch initBlocksPatch {
+        case .null where loadedInitialCacheBlocks != nil:
+            patch.initialCacheBlocks = .null
+        case .value(let n) where n != loadedInitialCacheBlocks:
+            patch.initialCacheBlocks = .value(n)
+        default:
+            break
         }
 
         isSaving = true
@@ -250,7 +261,12 @@ final class PerformanceScreenVM {
             self.loadedHotCacheMaxSize = hcm
             self.loadedSsdCacheDir = scd
             self.loadedSsdCacheMaxSize = scm
-            if let n = initBlocks { self.loadedInitialCacheBlocks = n }
+            switch initBlocksPatch {
+            case .null:
+                self.loadedInitialCacheBlocks = nil
+            case .value(let n):
+                self.loadedInitialCacheBlocks = n
+            }
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
