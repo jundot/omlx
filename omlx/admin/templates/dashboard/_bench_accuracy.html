@@ -47,7 +47,7 @@
                                         <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
-                                    <span class="text-sm text-neutral-600" x-text="accEnableThinking ? '{{ t('acc_bench.config.thinking_on') }}' : '{{ t('acc_bench.config.thinking_off') }}'"></span>
+                                    <span class="text-sm text-neutral-600" x-text="accEnableThinking ? window.t('acc_bench.config.thinking_on') : window.t('acc_bench.config.thinking_off')"></span>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.thinking_hint') }}</p>
                             </div>
@@ -92,7 +92,7 @@
                                                 <span :class="accSamplingProfile === 'model_settings' ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
-                                            <span class="text-sm text-neutral-600" x-text="accSamplingProfile === 'model_settings' ? '{{ t('acc_bench.config.sampling_model') }}' : '{{ t('acc_bench.config.sampling_deterministic') }}'"></span>
+                                            <span class="text-sm text-neutral-600" x-text="accSamplingProfile === 'model_settings' ? window.t('acc_bench.config.sampling_model') : window.t('acc_bench.config.sampling_deterministic')"></span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.sampling_hint') }}</p>
                                     </div>
@@ -270,7 +270,7 @@
                                 <div class="flex items-center gap-2">
                                     <span class="text-xs font-medium text-neutral-400 uppercase" x-text="accCurrentModel"></span>
                                     <span class="text-neutral-300">·</span>
-                                    <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || 'Preparing...'"></span>
+                                    <span class="text-sm font-medium text-neutral-700" x-text="accProgress?.message || window.t('bench.accuracy.preparing')"></span>
                                 </div>
                                 <div class="flex items-center gap-3">
                                     <span class="text-xs text-neutral-400" x-text="accProgress?.bench_current && accProgress?.bench_total ? (accProgress.bench_current + ' / ' + accProgress.bench_total) : ''"></span>
@@ -287,7 +287,7 @@
                                      :style="'width: ' + (accProgress?.bench_total ? (accProgress.bench_current / accProgress.bench_total * 100) : 0) + '%'"></div>
                             </div>
                             <div class="flex items-center gap-2 mt-2">
-                                <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? ('Running: ' + accProgress.benchmark.toUpperCase()) : ''"></span>
+                                <span class="text-xs text-neutral-400" x-text="accProgress?.benchmark ? (window.t('bench.accuracy.running_prefix') + accProgress.benchmark.toUpperCase()) : ''"></span>
                                 <span class="text-xs text-neutral-300">·</span>
                                 <span class="text-xs text-neutral-400" x-text="(accProgress?.current || 0) + ' / ' + (accProgress?.total || 0) + ' benchmarks'"></span>
                             </div>
@@ -435,7 +435,7 @@
                                             @click="r._showCategories = !r._showCategories"
                                             class="text-xs text-neutral-500 hover:text-neutral-700 flex items-center gap-1 transition-colors">
                                         <i data-lucide="chevron-right" class="w-3 h-3 transition-transform" :class="r._showCategories ? 'rotate-90' : ''"></i>
-                                        <span x-text="r._showCategories ? '{{ t('acc_bench.results.hide_categories') }}' : '{{ t('acc_bench.results.show_categories') }}'"></span>
+                                        <span x-text="r._showCategories ? window.t('acc_bench.results.hide_categories') : window.t('acc_bench.results.show_categories')"></span>
                                     </button>
                                     <!-- Download raw results -->
                                     <div class="relative" x-data="{ dlOpen: false }">
@@ -488,7 +488,7 @@
                         <button @click="accShowText = !accShowText"
                                 class="flex items-center gap-2 text-sm text-neutral-500 hover:text-neutral-700 transition-colors mb-3">
                             <i data-lucide="file-text" class="w-4 h-4"></i>
-                            <span x-text="accShowText ? '{{ t('acc_bench.results.hide_text') }}' : '{{ t('acc_bench.results.show_text') }}'"></span>
+                            <span x-text="accShowText ? window.t('acc_bench.results.hide_text') : window.t('acc_bench.results.show_text')"></span>
                         </button>
                         <div x-show="accShowText" x-transition class="relative">
                             <textarea id="accTextarea" readonly

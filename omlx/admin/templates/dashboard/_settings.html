@@ -178,7 +178,7 @@
                                             <div class="flex items-center justify-between p-3 bg-neutral-50 rounded-xl border border-neutral-100">
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2">
-                                                        <span class="text-sm font-medium text-neutral-700" x-text="sk.name || '{{ t('settings.auth.sub_keys_unnamed') }}'"></span>
+                                                        <span class="text-sm font-medium text-neutral-700" x-text="sk.name || window.t('settings.auth.sub_keys_unnamed')"></span>
                                                     </div>
                                                     <div class="flex items-center gap-2 mt-1">
                                                         <code class="text-xs text-neutral-400 font-mono" x-text="showSubKeys[sk.key] ? sk.key : sk.key.substring(0, 4) + '••••••••'"></code>
@@ -325,7 +325,7 @@
                                             <div class="flex items-center gap-2">
                                                 <input type="text" x-model="globalSettings.model.model_dirs[index]"
                                                        class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs"
-                                                       :placeholder="index === 0 ? '{{ t('settings.model.placeholder_primary') }}' : '{{ t('settings.model.placeholder_additional') }}'">
+                                                       :placeholder="index === 0 ? window.t('settings.model.placeholder_primary') : window.t('settings.model.placeholder_additional')">
                                                 <button @click="if (globalSettings.model.model_dirs.length > 1) globalSettings.model.model_dirs.splice(index, 1)"
                                                         class="flex-shrink-0 p-1.5 rounded-lg transition-colors"
                                                         :class="globalSettings.model.model_dirs.length > 1 ? 'text-neutral-400 hover:text-red-500 hover:bg-red-50' : 'text-neutral-200 cursor-not-allowed'">
@@ -574,7 +574,7 @@
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.idle_timeout_desc') }}</p>
                                     </div>
                                     <select x-model="idleTimeoutValue"
-                                            @change="globalSettings.idle_timeout.idle_timeout_seconds = idleTimeoutValue === '' ? null : Number(idleTimeoutValue); saveGlobalSettings()"
+                                            @change="saveIdleTimeout(idleTimeoutValue)"
                                             class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">{{ t('settings.model.idle_timeout_none') }}</option>
                                         <option value="900">{{ t('settings.model.idle_timeout_15m') }}</option>
@@ -649,7 +649,7 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
                                     </div>
-                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="{{ t('settings.generation.no_limit_placeholder') }}"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -752,41 +752,41 @@
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
-                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Network</span>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
                                 </div>
                                 <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
-                                    Live
+                                    {{ t('settings.network.live_badge') }}
                                 </span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTP Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.http_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.http_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">HTTPS Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Example: http://proxy.company.com:8080</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.https_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.proxy_example_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.https_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">No Proxy</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Comma-separated hosts to bypass proxy</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.no_proxy') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.no_proxy_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.no_proxy"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
-                                        <label class="text-sm text-neutral-700">CA Bundle</label>
-                                        <p class="text-xs text-neutral-400 mt-0.5">Path to PEM file for corporate TLS interception</p>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.network.ca_bundle') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.network.ca_bundle_hint') }}</p>
                                     </div>
                                     <input type="text" x-model="globalSettings.network.ca_bundle"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
@@ -1047,10 +1047,10 @@
                                 <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
                                    data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
                                 <span x-text="restartServer.status === 'restarting'
-                                               ? '{{ t('settings.server.restart_button_restarting') }}'
+                                               ? window.t('settings.server.restart_button_restarting')
                                                : (restartServer.status === 'waiting'
-                                                   ? '{{ t('settings.server.restart_button_waiting') }}'
-                                                   : '{{ t('settings.server.restart_button') }}')"></span>
+                                                   ? window.t('settings.server.restart_button_waiting')
+                                                   : window.t('settings.server.restart_button'))"></span>
                             </button>
                             <button
                                 @click="saveGlobalSettings"
@@ -1449,7 +1449,7 @@
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
+                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')">
                                                 <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
@@ -1583,10 +1583,11 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="openModelSettings(model)"
-                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    :disabled="modelSettingsLoadingId === model.id"
+                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                                                     :title="window.t('settings.models.table.sampling_settings_tooltip')"
                                                 >
-                                                    <i data-lucide="settings" class="w-4 h-4"></i>
+                                                    <i data-lucide="settings" class="w-4 h-4" :class="modelSettingsLoadingId === model.id && 'animate-spin'"></i>
                                                 </button>
                                             </template>
                                             <template x-if="model.virtual">

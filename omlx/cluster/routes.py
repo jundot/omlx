@@ -55,6 +55,7 @@ from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    evict_remote_local_models,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
@@ -3107,6 +3108,194 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+# RankFailure.error_type values (see cluster/launch.py, set from
+# type(exc).__name__ where a rank marker is written) that mean "this rank
+# failed for lack of memory, evicting a competing local model might let a
+# retry succeed." An allow-list rather than a single comparison: extend this
+# set, not the matching logic, when a new memory-shaped failure type needs
+# the same recovery. See docs/cluster-competing-model-eviction-redesign.md.
+_MEMORY_FAILURE_TYPES = frozenset({"InsufficientMemoryError"})
+
+
+def _auto_evict_enabled() -> bool:
+    """Whether ClusterSettings.auto_evict_competing_local_models is on.
+
+    Fails closed (False) on any error reading settings — notably,
+    get_settings() itself raises when init_settings() was never called
+    (worker-only installs, some test apps). That must never propagate out
+    of the DistributedLaunchError handler this gates and replace the
+    intended 503 with an unrelated 500 (see
+    docs/cluster-competing-model-eviction-redesign.md §4 addendum — a real
+    bug caught while implementing this, not a hypothetical).
+    """
+    try:
+        from omlx.settings import get_settings
+
+        return get_settings().cluster.auto_evict_competing_local_models
+    except Exception:  # noqa: BLE001 - fail closed, never mask the failure
+        return False
+
+
+def _memory_squeezed_hosts(
+    deployment: ClusterDeployment, exc: DistributedLaunchError
+) -> list[ClusterHost]:
+    """Hosts implicated in a memory-attributable activation failure.
+
+    Reads `exc.rank_failures` — real fields populated from each rank's own
+    marker — instead of parsing the formatted error string. A failure with
+    no rank_failures at all, or none whose error_type is in
+    _MEMORY_FAILURE_TYPES, returns an empty list: this deliberately does NOT
+    fall back to "evict everywhere," unlike the mechanism this replaces —
+    guessing blast radius on a destructive action is the same class of
+    fragility as the regex it replaces.
+    """
+    memory_failures = [
+        f for f in exc.rank_failures if f.error_type in _MEMORY_FAILURE_TYPES
+    ]
+    if not memory_failures:
+        return []
+    by_node_id = {host.node_id: host for host in deployment.hosts}
+    implicated: dict[str, ClusterHost] = {}
+    for failure in memory_failures:
+        host = by_node_id.get(failure.node_id)
+        if host is not None:
+            implicated[host.node_id] = host
+    return list(implicated.values())
+
+
+async def _evict_local_models_on_host(
+    host: ClusterHost, reason: str
+) -> dict[str, Any]:
+    """Free one node's standalone models; the coordinator needs no SSH hop."""
+
+    if not _local_ssh_target(host.ssh):
+        return await asyncio.to_thread(
+            evict_remote_local_models,
+            host.ssh,
+            python_executable=host.python_executable,
+        )
+    pool = _engine_pool()
+    outcome: dict[str, Any] = {
+        "evicted": [],
+        "draining": [],
+        "skipped_pinned": [],
+        "errors": [],
+    }
+    for model_id in list(pool.get_loaded_model_ids()):
+        entry = pool.get_entry(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or getattr(entry, "source_type", "") == "cluster"
+        ):
+            continue
+        if entry.is_pinned:
+            outcome["skipped_pinned"].append(model_id)
+            continue
+        try:
+            unloaded = await pool.request_unload(model_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - collect, never mask
+            outcome["errors"].append(f"{model_id}: {exc}")
+            continue
+        (outcome["evicted"] if unloaded else outcome["draining"]).append(model_id)
+    return outcome
+
+
+async def _evict_competing_local_models(
+    deployment: ClusterDeployment | None, exc: DistributedLaunchError
+) -> str:
+    """After a memory-attributed launch failure, free the implicated Macs.
+
+    A standalone model loaded through a node's own server competes with the
+    cluster rank admitted onto the same unified memory, and every retry then
+    fails at a higher ceiling because the competitor keeps growing. Evict it
+    on exactly the nodes the failure names, so the very next retry is made
+    against the memory the plan was admitted for. This never raises and never
+    replaces the original failure — it appends what was freed so the operator
+    knows a retry is now worth making. Pinned models are left loaded.
+
+    Only called when ClusterSettings.auto_evict_competing_local_models is
+    enabled — see the call site in activate_cluster_deployment.
+    """
+
+    detail = str(exc)
+    if deployment is None:
+        return detail
+    hosts = _memory_squeezed_hosts(deployment, exc)
+    if not hosts:
+        return detail
+    reason = (
+        f"cluster activation of {deployment.deployment_id} "
+        "failed for lack of memory"
+    )
+    freed: list[str] = []
+    pending: list[str] = []
+    pinned: list[str] = []
+    problems: list[str] = []
+    for host in hosts:
+        try:
+            outcome = await _evict_local_models_on_host(host, reason)
+        except Exception as exc2:  # noqa: BLE001 - recovery must not mask
+            problems.append(f"{host.node_id}: {exc2}")
+            continue
+        freed.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("evicted") or []
+        )
+        pending.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("draining") or []
+        )
+        pinned.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("skipped_pinned") or []
+        )
+        problems.extend(
+            f"{host.node_id}: {error}" for error in outcome.get("errors") or []
+        )
+    notes: list[str] = []
+    if freed:
+        notes.append(
+            "oMLX unloaded the competing local model(s) "
+            f"{', '.join(freed)}; retry the activation."
+        )
+    if pending:
+        notes.append(
+            f"{', '.join(pending)} will unload once active requests "
+            "finish; retry the activation after that."
+        )
+    if pinned:
+        notes.append(
+            f"Pinned model(s) {', '.join(pinned)} were left loaded; unpin or "
+            "unload them if the retry still runs out of memory."
+        )
+    if problems:
+        notes.append(
+            "Local-model eviction could not complete everywhere: "
+            + "; ".join(problems)
+        )
+    if not notes:
+        notes.append(
+            "No competing local models were loaded on the implicated node(s)."
+        )
+    if freed or pending or pinned:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.WARN,
+            "activation_memory_recovery",
+            " ".join(notes),
+            deployment_id=deployment.deployment_id,
+        )
+    if problems:
+        await asyncio.to_thread(
+            _record_cluster_incident,
+            Severity.WARN,
+            "activation_memory_recovery_failed",
+            "Local-model eviction after the memory failure did not complete: "
+            + "; ".join(problems),
+            deployment_id=deployment.deployment_id,
+        )
+    return detail + "\n" + " ".join(notes)
+
+
 @router.post("/deployments")
 async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     """Recompute, preflight, eagerly load, and prove one distributed model."""
@@ -3334,14 +3523,32 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
+        detail = str(exc)
         await asyncio.to_thread(
             _record_cluster_incident,
             Severity.ERROR,
             "activation_launch_failed",
-            str(exc),
+            detail,
             deployment_id=deployment.deployment_id if deployment else None,
         )
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # Opt-in (ClusterSettings.auto_evict_competing_local_models, off by
+        # default) — a server-initiated unload of a model the user loaded
+        # locally on a peer Mac is a product decision the user turns on, not
+        # a default behavior. See
+        # docs/cluster-competing-model-eviction-redesign.md.
+        if _auto_evict_enabled():
+            try:
+                detail = await _evict_competing_local_models(deployment, exc)
+            except Exception:  # noqa: BLE001 - recovery must never mask the failure
+                await asyncio.to_thread(
+                    _record_cluster_incident,
+                    Severity.WARN,
+                    "activation_memory_recovery_failed",
+                    "Local-model eviction after the memory failure crashed; "
+                    "the implicated nodes may still hold a competing model.",
+                    deployment_id=deployment.deployment_id if deployment else None,
+                )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except ModelNotFoundError as exc:
         await asyncio.to_thread(
             _record_cluster_incident,

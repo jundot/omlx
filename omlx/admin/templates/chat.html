@@ -3706,13 +3706,13 @@
                 }
                 const prefilling = (modelData.prefilling || []).find(p => p.request_id === rid);
                 if (prefilling) {
-                    const speed = prefilling.speed
-                        || (prefilling.processed && prefilling.total
-                            ? (prefilling.processed / Math.max(prefilling.total, 1)) * 100
-                            : 0);
+                    // No percent-of-total fallback here: that's a completion
+                    // percentage, not a tok/s rate, and it flowed straight
+                    // into avg_prefill_tps below, showing e.g. "45 tok/s"
+                    // when prefilling was actually just 45% done.
                     return {
                         phase: 'prefilling',
-                        speed,
+                        speed: prefilling.speed || 0,
                         prompt_tokens: prefilling.prompt_tokens || 0,
                     };
                 }
@@ -3849,14 +3849,24 @@
                 this.cancelStreamTransport(this.getStreamSession(chatId, false));
             },
 
+            // Shared by ensureStatsPollingForCurrentChat and startStatsPolling
+            // (§B12) — the only actually-duplicated logic between them, kept
+            // as a small helper rather than merging the two functions:
+            // ensureStatsPollingForCurrentChat is a conditional resume (bails
+            // if the current chat isn't streaming), startStatsPolling is an
+            // unconditional stream-start with its own recentStats reset for
+            // a specific chatId (possibly not the current one) — different
+            // preconditions and call sites, not safe to fold into one.
+            _ensureStatsInterval() {
+                if (!this.statsInterval) {
+                    this.statsInterval = setInterval(() => this.fetchStats(), 200);
+                }
+            },
+
             ensureStatsPollingForCurrentChat() {
                 if (!this.isCurrentChatStreaming()) return;
-                if (this.statsInterval) {
-                    this.fetchStats();
-                    return;
-                }
                 this.fetchStats();
-                this.statsInterval = setInterval(() => this.fetchStats(), 200);
+                this._ensureStatsInterval();
             },
 
             toggleCurrentStreamTimeline() {
@@ -4990,9 +5000,7 @@
     },
 
     startStatsPolling(chatId = this.currentChatId) {
-        if (!this.statsInterval) {
-            this.statsInterval = setInterval(() => this.fetchStats(), 200);
-        }
+        this._ensureStatsInterval();
         this.fetchStats();
         if (chatId === this.currentChatId) {
             this.recentStats = {
@@ -5135,7 +5143,7 @@
     // ===== PROFILE Tab: Add New Profile =====
 
     addNewPromptProfile() {
-        let baseName = 'New Profile';
+        let baseName = window.t('chat.new_profile_default_name');
         let counter = 1;
         let name = baseName;
         while (this.promptProfiles.some(p => p.name === name)) {
@@ -5687,7 +5695,7 @@
                 }
             }
             if (finalText == null && !stream.streamingContent) {
-                throw new Error('Transcription stream ended without a result');
+                throw new Error(window.t('chat.error.transcription_stream_ended'));
             }
             chatSession.messages.push({
                 id: stream.targetMessageId,
@@ -6740,6 +6748,10 @@
 
     deleteMessage(index) {
         if (this.isCurrentChatStreaming()) return;
+        // sliceBeforeMessage truncates the whole tail (this message and
+        // everything after it), not just the one row the "Delete from here"
+        // label targets — confirm before doing something that destructive.
+        if (!confirm(window.t('chat.confirm_delete_message'))) return;
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
         const chatId = this.currentChatId;
@@ -6816,7 +6828,7 @@
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
-        const branchName = 'Branch of ' + (originalChat?.title || this.untitledChatTitle());
+        const branchName = window.t('chat.branch_of_prefix') + (originalChat?.title || this.untitledChatTitle());
 
         const branchId = 'chat_' + Date.now();
         const branchMessages = session.messages.slice(0, index + 1).map(msg => this.cloneData(msg));
@@ -7522,7 +7534,7 @@
                 const wandIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4V2"/><path d="M15 16v-2"/><path d="M8 9h2"/><path d="M20 9h2"/><path d="M17.8 11.8 19 13"/><path d="M15 9h.01"/><path d="M17.8 6.2 19 5"/><path d="m3 21 9-9"/><path d="M12.2 6.2 11 5"/></svg>';
                 const renderBtn = document.createElement('button');
                 renderBtn.className = 'svg-render-btn';
-                renderBtn.innerHTML = wandIcon + ' Render';
+                renderBtn.innerHTML = wandIcon + ' ' + window.t('chat.codeblock.render');
                 renderBtn.onclick = (e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -7534,7 +7546,7 @@
                         preview.remove();
                         pre.style.display = '';
                         if (copyBtn) copyBtn.style.display = '';
-                        renderBtn.innerHTML = wandIcon + ' Render';
+                        renderBtn.innerHTML = wandIcon + ' ' + window.t('chat.codeblock.render');
                         return;
                     }
                     const sanitized = DOMPurify.sanitize(rawText, {
@@ -7548,7 +7560,7 @@
                     pre.style.display = 'none';
                     if (copyBtn) copyBtn.style.display = 'none';
                     wrapper.appendChild(preview);
-                    renderBtn.innerHTML = '\u2190 Back';
+                    renderBtn.innerHTML = '\u2190 ' + window.t('chat.codeblock.back');
                 };
                 btnRow.appendChild(renderBtn);
             }
@@ -7557,13 +7569,13 @@
             const copyIcon = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
             const copyBtn = document.createElement('button');
             copyBtn.className = 'code-copy-btn';
-            copyBtn.innerHTML = copyIcon + ' Copy';
+            copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copy');
             copyBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 this._copyText(codeBlock.textContent).then(() => {
-                    copyBtn.innerHTML = copyIcon + ' Copied!';
-                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' Copy', 2000);
+                    copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copied');
+                    setTimeout(() => copyBtn.innerHTML = copyIcon + ' ' + window.t('chat.codeblock.copy'), 2000);
                 });
             };
             btnRow.appendChild(copyBtn);

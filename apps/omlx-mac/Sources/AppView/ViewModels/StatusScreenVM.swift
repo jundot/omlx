@@ -77,7 +77,7 @@ final class StatusScreenVM {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.tick()
+                await self.tick(clearsError: false)
                 try? await Task.sleep(for: .seconds(5))
             }
         }
@@ -89,13 +89,27 @@ final class StatusScreenVM {
         metrics.stop()
     }
 
-    private func tick() async {
+    /// Blank the last-known stats when the server leaves running-like state
+    /// (§F6) — without this, `stats` stays frozen at its last successful poll
+    /// forever, since the poll loop's own failures don't touch it (see
+    /// `clearsError` above). Mirrors `MenubarMetricsStore.markServerStopped()`.
+    func clearOnServerStopped() {
+        stats = nil
+        lastError = nil
+    }
+
+    /// `clearsError`: the 5s poll loop (below) must not touch `lastError` —
+    /// it was wiping a clearStats/clearSsdCache/clearHotCache failure within
+    /// that window (§G2). Those three action methods call this right after
+    /// their own successful request, where touching lastError is legitimate
+    /// action-triggered feedback, not a poll clobbering it.
+    private func tick(clearsError: Bool = true) async {
         guard let client else { return }
         do {
             self.stats = try await client.getStats(scope: scope)
-            self.lastError = nil
+            if clearsError { self.lastError = nil }
         } catch {
-            self.lastError = error.omlxDescription
+            if clearsError { self.lastError = error.omlxDescription }
         }
     }
 
