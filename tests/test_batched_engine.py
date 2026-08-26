@@ -322,6 +322,51 @@ class TestBatchedEngineInitialization:
         assert engine._loaded is False
         inner_engine.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_stop_releases_ane_state_before_dropping_model(self):
+        """stop() releases ANE banks while the model is still reachable."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        model = object()
+        events = []
+        engine._model = model
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._engine.engine.close.side_effect = lambda: events.append("close")
+
+        def release_ane_state(value):
+            events.append(("release", value is model, engine._model is model))
+            return 2, 4
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=release_ane_state,
+        ):
+            await engine.stop()
+
+        assert events == ["stop", "close", ("release", True, True)]
+        assert engine._model is None
+
+    @pytest.mark.asyncio
+    async def test_stop_continues_when_ane_state_release_fails(self):
+        """An optional ANE release failure does not block wrapper teardown."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = object()
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock()
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=RuntimeError("native release unavailable"),
+        ):
+            await engine.stop()
+
+        assert engine._model is None
+        assert engine._engine is None
+
 
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""

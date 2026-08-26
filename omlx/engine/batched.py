@@ -667,6 +667,29 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+
+        # ANE procedure banks retain native mapped weights and IOSurfaces on
+        # the model modules. Release them after the engine has stopped, but
+        # before dropping the wrapper's model reference, so unload does not
+        # depend on a later GC pass to reclaim the ANE allocation.
+        if self._model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                released, programs = release_qwen35_ane_prefill(self._model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on engine stop",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                # ANE is optional; a release failure must not prevent the
+                # normal wrapper teardown from clearing all other references.
+                logger.warning(
+                    "ANE prefill state release failed during stop", exc_info=True
+                )
         _clear_teardown_references(
             self,
             none_attrs=(
