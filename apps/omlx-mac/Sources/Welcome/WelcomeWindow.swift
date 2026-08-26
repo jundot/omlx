@@ -131,6 +131,11 @@ final class WelcomeViewModel: ObservableObject {
     @Published var lastError: String?
     @Published var isStarting: Bool = false
     @Published var startCompleted: Bool = false
+    /// Non-fatal notice shown on the completion step when `setupServerApiKey`
+    /// genuinely failed (not the benign "server already had a key" case) —
+    /// the server did start successfully, so this doesn't block completion,
+    /// but the user needs a pointer back to Security to finish auth setup (§G7).
+    @Published var apiKeyWarning: String?
 
     var onFinish: ((AppConfig, ServerProcess?) -> Void)?
     var onOpenDashboard: (() -> Void)?
@@ -372,7 +377,7 @@ final class WelcomeViewModel: ObservableObject {
         try? await Task.sleep(for: .milliseconds(500))
         await waitUntilHealthyOrTimeout(proc: proc, timeout: 8)
 
-        _ = await setupServerApiKey(client: services.client, key: trimmedKey)
+        await applyServerApiKey(client: services.client, key: trimmedKey)
 
         startCompleted = true
         step = .complete
@@ -396,7 +401,15 @@ final class WelcomeViewModel: ObservableObject {
         return true
     }
 
-    private func setupServerApiKey(client: OMLXClient, key: String) async -> Bool {
+    private enum ApiKeySetupOutcome {
+        case applied
+        /// The server already had a key set (setup-api-key returns 400 for
+        /// this) — benign by design, not a failure to warn about.
+        case alreadySet
+        case failed
+    }
+
+    private func setupServerApiKey(client: OMLXClient, key: String) async -> ApiKeySetupOutcome {
         // Try setup-api-key (fresh install). When the server already has a
         // key set, the endpoint returns 400 — we swallow that and let
         // `OMLXClient`'s 401 auto-login handle the next authenticated call.
@@ -404,9 +417,31 @@ final class WelcomeViewModel: ObservableObject {
         // explicit login round-trip here.
         do {
             _ = try await client.setupApiKey(key, confirm: key)
-            return true
+            return .applied
+        } catch OMLXClientError.http(400, _) {
+            return .alreadySet
         } catch {
-            return false
+            return .failed
+        }
+    }
+
+    /// Applies the API key, with one bounded retry on genuine failure —
+    /// first-run is exactly when the 8s health-wait above is most likely to
+    /// have expired before the server was truly ready, so a single ~2.5s
+    /// retry converts the common "just missed it" case into silent success
+    /// instead of a warning the user has to manually resolve later (§G7).
+    private func applyServerApiKey(client: OMLXClient, key: String) async {
+        var outcome = await setupServerApiKey(client: client, key: key)
+        if outcome == .failed {
+            try? await Task.sleep(for: .milliseconds(2500))
+            outcome = await setupServerApiKey(client: client, key: key)
+        }
+        if outcome == .failed {
+            apiKeyWarning = String(
+                localized: "welcome.warning.api_key_not_applied",
+                defaultValue: "API key setup didn't apply — you can set it again from Settings → Security.",
+                comment: "Welcome wizard: non-fatal notice on the completion step when setupServerApiKey failed after a retry"
+            )
         }
     }
 
@@ -700,6 +735,13 @@ private struct WelcomeCompleteBody: View {
                     .font(.omlxText(12, weight: .medium))
                     .foregroundStyle(WelcomeStyle.faint)
                     .padding(.top, 4)
+                if let warning = vm.apiKeyWarning {
+                    Text(warning)
+                        .font(.omlxText(12, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 4)
+                }
             }
             Spacer(minLength: 40)
         }
