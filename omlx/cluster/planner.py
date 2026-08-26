@@ -513,6 +513,24 @@ def _tensor_layer_index(name: str) -> int | None:
     return None
 
 
+def _text_only_excluded_tensor(name: str) -> bool:
+    """A tensor a text-only distributed deployment of a VLM never loads.
+
+    The vision tower and MTP draft heads are dropped by mlx-lm's ``sanitize``
+    when the checkpoint is served text-only, and their names collide with the
+    decoder-layer pattern — ``vision_tower.blocks.N`` lands on decoder layer N
+    and ``language_model.mtp.layers.0`` on layer 0 — so counting their bytes
+    inflates the wrong stages. Only applied to VLM checkpoints (see
+    ``inspect_safetensors_layout``); pure-text models keep every tensor.
+    """
+
+    from omlx.utils.model_loading import _VLM_VISION_PREFIXES
+
+    if name.startswith(_VLM_VISION_PREFIXES):
+        return True
+    return ".mtp." in name or name.startswith("mtp.")
+
+
 def _activation_bytes_per_token(model_path: Path) -> int:
     """Best-effort FP16/BF16 hidden-state size used by the link cost model."""
 
@@ -956,6 +974,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     if not root.is_dir():
         raise PlanningError(f"model path is not a directory: {root}")
 
+    # A VLM checkpoint only ever runs distributed text-only, so exclude the
+    # vision tower and MTP heads it will not load from the layer/fixed sizing.
+    from omlx.model_discovery import _has_vision_subconfig
+
+    text_only_vlm = _has_vision_subconfig(_model_config(root))
+
     fixed_bytes = 0
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
@@ -987,6 +1011,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
+            # Validate every tensor (dedup + overlap above), but do not size the
+            # vision/MTP families a text-only VLM deployment never loads.
+            if text_only_vlm and _text_only_excluded_tensor(name):
+                continue
             layer_index = _tensor_layer_index(name)
             if layer_index is None:
                 fixed_bytes += tensor_bytes

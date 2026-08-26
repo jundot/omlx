@@ -1138,13 +1138,39 @@ def probe_remote_system_host(
     }
 
 
+@dataclass(frozen=True)
+class AdmissionCeilingProbe:
+    """One remote ceiling reading, with an honest account of how it was read.
+
+    ``ceiling_bytes`` is the same number the probe has always returned. The
+    confession fields exist because the fast /health path used to fail
+    silently: ``fast_probe_ok`` is False when the peer's admin API did not
+    answer and the slower in-process computation produced the ceiling, and
+    ``fast_probe_error`` carries the last error the fast path saw so the
+    caller can record it (design rule: fallbacks confess).
+
+    ``breakdown`` carries the peer's ``ceiling_breakdown()`` components
+    (``static``/``dynamic``/``metal_cap``/``hard_limit``) when the peer is new
+    enough to report them (B5); ``None`` means an older peer or a malformed
+    reply, and the caller renders the ceiling alone rather than guessing.
+    Appended last with a default so existing positional constructions keep
+    working.
+    """
+
+    ceiling_bytes: int
+    fast_probe_ok: bool = True
+    fast_probe_error: str = ""
+    breakdown: dict[str, int] | None = None
+
+
 def probe_remote_admission_ceiling(
     ssh_target: str,
     *,
     python_executable: str | None = None,
+    admin_port: int = 0,
     timeout: float = 8.0,
     runner: SSHRunner = subprocess.run,
-) -> int:
+) -> AdmissionCeilingProbe:
     """Read only the peer's live memory ceiling, without a hardware rescan.
 
     The full capability probe invokes ``system_profiler`` and transport tools;
@@ -1159,37 +1185,67 @@ def probe_remote_admission_ceiling(
     page oscillated between ready and Needs Attention (#2680).  With no known
     interpreter, or when the known one has stopped working, discover the peer's
     own instead.
+
+    ``admin_port`` is the port the peer itself advertised in its
+    ``ClusterStatus`` (C5). When known, the fast /health path targets exactly
+    that port — no guessing, and a miss is a real "the advertised port is
+    dead" signal the caller should confess. 0 (an older peer, or a status
+    that has not been read yet) preserves the legacy behavior: try the
+    coordinator's own configured port, then 9000.
     """
 
     # Ask the peer's live server first: one HTTP round trip instead of a cold
-    # `import omlx` (which imports MLX and can blow the SSH timeout). Peers
-    # conventionally run the coordinator's port; 9000 is kept as a legacy
-    # candidate for mixed setups. Hardcoding 9000 alone left the fast path dead
-    # on every cluster serving on the (default) port 8000.
-    try:
-        from omlx.settings import get_settings
+    # `import omlx` (which imports MLX and can blow the SSH timeout). With no
+    # advertised port, peers conventionally run the coordinator's port; 9000
+    # is kept as a legacy candidate for mixed setups. Hardcoding 9000 alone
+    # left the fast path dead on every cluster serving on the (default) port
+    # 8000.
+    if admin_port > 0:
+        ports: tuple[int, ...] = (int(admin_port),)
+    else:
+        try:
+            from omlx.settings import get_settings
 
-        local_port = int(get_settings().server.port)
-    except Exception:
-        local_port = 8000
-    ports = tuple(dict.fromkeys((local_port, 9000)))
+            local_port = int(get_settings().server.port)
+        except Exception:
+            local_port = 8000
+        ports = tuple(dict.fromkeys((local_port, 9000)))
+    # The script's JSON keeps `admission_ceiling_bytes` top-level so an older
+    # coordinator parsing this reply still finds the number; the fast-probe
+    # confession fields ride alongside it. `breakdown` (B5) carries the
+    # ceiling_breakdown() components behind the ceiling: the fast path reads
+    # them from the same /health reply (an older peer's /health omits the key
+    # and breakdown stays null — the coordinator then renders the ceiling
+    # alone), the slow path computes them alongside the ceiling it already
+    # needed.
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
+        "breakdown=None\n"
+        "fast_error=''\n"
         f"for port in {ports!r}:\n"
         "    try:\n"
         "        with urllib.request.urlopen("
         "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
         "            health=json.load(response)\n"
-        "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
+        "        pool=health.get('engine_pool') or {}\n"
+        "        ceiling=int(pool.get('final_ceiling',0))\n"
         "        if ceiling>0:\n"
+        "            components=pool.get('ceiling_breakdown')\n"
+        "            if isinstance(components,dict):\n"
+        "                breakdown=components\n"
         "            break\n"
-        "    except Exception:\n"
-        "        pass\n"
+        "        fast_error='port %d answered without a ceiling'%port\n"
+        "    except Exception as exc:\n"
+        "        fast_error='port %d: %s'%(port,exc)\n"
+        "fast_ok=ceiling>0\n"
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
-        "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
-        "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
+        "    breakdown=ceiling_breakdown()\n"
+        "    ceiling=int(breakdown.get('hard_limit',0))\n"
+        "print(json.dumps({'admission_ceiling_bytes':ceiling,"
+        "'fast_probe_ok':fast_ok,'fast_probe_error':fast_error,"
+        "'breakdown':breakdown}))"
     )
 
     def _read(executable: str) -> subprocess.CompletedProcess[str]:
@@ -1260,7 +1316,228 @@ def probe_remote_admission_ceiling(
         raise DistributedLaunchError(
             f"{ssh_target} did not report an oMLX memory ceiling"
         )
-    return ceiling
+    # The breakdown is advisory (B5): a missing key is an older peer and a
+    # malformed one is a reply-shape surprise — both degrade to the
+    # ceiling-only path the probe has always offered, never to an exception.
+    raw_breakdown = payload.get("breakdown")
+    breakdown: dict[str, int] | None = None
+    if isinstance(raw_breakdown, dict):
+        try:
+            breakdown = {
+                str(key): int(value) for key, value in raw_breakdown.items()
+            }
+        except (TypeError, ValueError):
+            breakdown = None
+    return AdmissionCeilingProbe(
+        ceiling_bytes=ceiling,
+        # Missing fields default to a clean fast path: the script is ours,
+        # so absence means an unexpected reply shape, not a probed failure.
+        fast_probe_ok=bool(payload.get("fast_probe_ok", True)),
+        fast_probe_error=str(payload.get("fast_probe_error") or ""),
+        breakdown=breakdown,
+    )
+
+
+# Runs on the peer under its own interpreter, like the probes above. It never
+# imports omlx (a cold import loads MLX and can blow the SSH timeout); the
+# peer's live server is reached over loopback instead, exactly the way the
+# ceiling probe reads /health. The unload endpoint requires the admin session
+# that server verifies, and its signing secret is persisted in the same
+# settings.json this login account owns — SSH access to the Mac is already
+# admin access, so minting the cookie here grants nothing new. The script
+# always exits 0 with a one-line JSON report; per-model problems are carried
+# inside it so one refusal cannot hide what else was freed.
+_REMOTE_LOCAL_EVICTION = r"""
+import json, os, urllib.error, urllib.parse, urllib.request
+
+result = {
+    "server_reachable": False,
+    "evicted": [],
+    "draining": [],
+    "skipped_pinned": [],
+    "errors": [],
+}
+
+def emit():
+    print(json.dumps(result))
+    raise SystemExit(0)
+
+def base_path():
+    env_value = os.environ.get("OMLX_BASE_PATH")
+    if env_value:
+        return os.path.expanduser(env_value)
+    bootstrap = os.path.expanduser("~/Library/Application Support/oMLX/base-path")
+    try:
+        with open(bootstrap, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        raw = ""
+    return os.path.expanduser(raw) if raw else os.path.expanduser("~/.omlx")
+
+settings = {}
+try:
+    with open(
+        os.path.join(base_path(), "settings.json"), encoding="utf-8"
+    ) as handle:
+        settings = json.load(handle)
+except Exception as exc:
+    result["errors"].append("settings.json unreadable: %s" % exc)
+
+ports = []
+try:
+    configured = int((settings.get("server") or {}).get("port") or 0)
+    if configured > 0:
+        ports.append(configured)
+except (TypeError, ValueError):
+    pass
+for fallback in (8000, 9000):
+    if fallback not in ports:
+        ports.append(fallback)
+
+cookie = ""
+secret = os.environ.get("OMLX_SECRET_KEY") or (settings.get("auth") or {}).get(
+    "secret_key"
+)
+if secret:
+    try:
+        from itsdangerous import URLSafeTimedSerializer
+
+        token = URLSafeTimedSerializer(secret).dumps(
+            {"admin": True, "remember": False}
+        )
+        cookie = "omlx_admin_session=" + token
+    except Exception as exc:
+        result["errors"].append("session token failed: %s" % exc)
+
+def call(port, path, method, timeout):
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (port, path), method=method
+    )
+    if cookie:
+        request.add_header("Cookie", cookie)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+models = None
+port = None
+for candidate in ports:
+    try:
+        models = call(candidate, "/admin/api/models", "GET", 5).get("models") or []
+        port = candidate
+        break
+    except urllib.error.HTTPError as exc:
+        # The server answered but refused the request; 401 means the persisted
+        # secret is not the one the live server signs with.
+        result["errors"].append(
+            "port %d GET /admin/api/models: HTTP %d" % (candidate, exc.code)
+        )
+        result["server_reachable"] = True
+        break
+    except Exception:
+        continue
+if models is None:
+    # No server means no standalone model can be resident either.
+    emit()
+result["server_reachable"] = True
+
+for model in models:
+    if not isinstance(model, dict) or not model.get("loaded"):
+        continue
+    if model.get("virtual") or model.get("is_loading"):
+        continue
+    if model.get("source_type") == "cluster":
+        continue
+    model_id = str(model.get("id") or "")
+    if not model_id:
+        continue
+    if model.get("pinned"):
+        result["skipped_pinned"].append(model_id)
+        continue
+    path = "/admin/api/models/%s/unload" % urllib.parse.quote(model_id, safe="")
+    try:
+        payload = call(port, path, "POST", 30)
+    except urllib.error.HTTPError as exc:
+        result["errors"].append("%s: HTTP %d" % (model_id, exc.code))
+        continue
+    except Exception as exc:
+        result["errors"].append("%s: %s" % (model_id, exc))
+        continue
+    if isinstance(payload, dict) and payload.get("status") == "unloading":
+        result["draining"].append(model_id)
+    else:
+        result["evicted"].append(model_id)
+
+emit()
+"""
+
+
+def evict_remote_local_models(
+    ssh_target: str,
+    *,
+    python_executable: str | None = None,
+    timeout: float = 60.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Unload every unpinned standalone model the peer's own server has loaded.
+
+    A cluster rank that dies of ``InsufficientMemoryError`` may have been
+    competing for unified memory with a model the peer's independent oMLX
+    server loaded through its normal path; retrying without freeing that model
+    only fails again at a higher ceiling. The coordinator has no HTTP route to
+    a peer, but it has the same host-key-verified SSH every probe uses, and
+    the peer's admin API is one loopback call away from there. Pinned models
+    are reported, never evicted. Cluster shard ranks are separate worker
+    processes, not engine-pool entries, so they cannot be touched here.
+    """
+
+    def _evict(executable: str) -> subprocess.CompletedProcess[str]:
+        return _run_cluster_ssh(
+            ssh_target,
+            shlex.join([executable, "-c", _REMOTE_LOCAL_EVICTION]),
+            timeout=timeout,
+            runner=runner,
+        )
+
+    attempted: str | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
+    if python_executable is not None:
+        attempted = _validate_python_executable(python_executable)
+        completed = _evict(attempted)
+    if completed is None or completed.returncode != 0:
+        # Same fallback discipline as the ceiling probe: a stale interpreter
+        # must trigger a search, not a silent give-up (#2680).
+        discovered = discover_remote_python_executable(
+            ssh_target,
+            preferred=attempted or sys.executable,
+            timeout=min(timeout, 8.0),
+            runner=runner,
+        )
+        if discovered != attempted:
+            completed = _evict(discovered)
+    if completed is None or completed.returncode != 0:
+        detail = (
+            (completed.stderr.strip() or completed.stdout.strip())
+            if completed is not None
+            else ""
+        )
+        raise DistributedLaunchError(
+            f"local-model eviction failed for {ssh_target}"
+            + (f": {detail[:500]}" if detail else "")
+        )
+    try:
+        lines = [
+            line for line in completed.stdout.strip().splitlines() if line.strip()
+        ]
+        payload = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise DistributedLaunchError(
+            f"{ssh_target} did not return an eviction report"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("evicted"), list):
+        raise DistributedLaunchError(
+            f"{ssh_target} returned an invalid eviction report"
+        )
+    return payload
 
 
 def probe_remote_host(

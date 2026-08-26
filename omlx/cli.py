@@ -890,6 +890,39 @@ def cluster_command(args) -> int:
             print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
         return 0
 
+    if action == "doctor":
+        from .cluster.doctor import run_fabric_doctor
+
+        hosts = list(args.host or [])
+        if len(hosts) == 1:
+            # One endpoint given: the other end of the link is this Mac.
+            hosts = ["127.0.0.1", hosts[0]]
+        if len(hosts) != 2:
+            print(
+                "Fabric Doctor checks one link: pass --host PEER (this Mac "
+                "is the other end) or --host twice.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report = run_fabric_doctor(tuple(hosts))
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Fabric Doctor failed: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        else:
+            marks = {"pass": "ok  ", "fail": "FAIL", "skipped": "skip"}
+            for finding in report.findings:
+                print(
+                    f"{marks.get(finding.state, finding.state):<4} "
+                    f"{finding.check_id:<16} {finding.evidence}"
+                )
+                if finding.state == "fail" and finding.remedy:
+                    print(f"     -> {finding.remedy}")
+            print(report.verdict)
+        return 0 if report.ok else 1
+
     if action == "plan":
         import socket
 
@@ -971,7 +1004,7 @@ def cluster_command(args) -> int:
 
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, plan",
+        "collective-smoke, pipeline-smoke, doctor, plan",
         file=sys.stderr,
     )
     return 2
@@ -1375,6 +1408,27 @@ Example directory structure:
         help="Overall pipeline deadline in seconds (default: 30)",
     )
     cluster_pipeline_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_doctor_parser = cluster_subparsers.add_parser(
+        "doctor",
+        help=(
+            "Run the Fabric Doctor: ladder checks in order, stopping at the "
+            "first failure, each finding carrying diagnosis and fix"
+        ),
+    )
+    cluster_doctor_parser.add_argument(
+        "--host",
+        action="append",
+        metavar="SSH_HOST",
+        help=(
+            "A link endpoint; pass once for a peer (this Mac is the other "
+            "end) or twice for an explicit pair."
+        ),
+    )
+    cluster_doctor_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",

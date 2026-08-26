@@ -14,7 +14,7 @@ import secrets
 import shlex
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -184,6 +184,15 @@ def _extract_tb_link_speed(ssh_hostname: str) -> int | None:
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _FAST_KINDS = {"thunderbolt", "rdma"}
+# ``ibv_devinfo`` answers in well under a second on a healthy device; the only
+# time it blocks is when the RDMA device is bound to a wedged Thunderbolt link
+# (a downed cable/controller). A 30s cap turned that into a 30s hang per device
+# on exactly the failure the caller most needs to report quickly. 15s keeps the
+# SSH connect allowance (10s, this file's convention) intact and adds only a
+# few seconds of slack for a command that normally returns near-instantly —
+# still half the worst case, and the caller gets a fast, actionable failure
+# instead of a long silent hang.
+_RDMA_PROBE_TIMEOUT = 15
 
 
 def _rdma_devices(ssh_hostname: str) -> list[str]:
@@ -424,7 +433,12 @@ _RDMA_STATES = (
 
 @dataclass(frozen=True)
 class LinkStatus:
-    """What the fabric can actually do right now, and how to fix it."""
+    """What the fabric can actually do right now, and how to fix it.
+
+    ``ladder`` is the ``TransportState`` rung this evidence supports (a plain
+    string to keep this module import-light); ``reason``/``remedy`` are the
+    copy the CLI and GUI render verbatim beside it.
+    """
 
     state: str
     title: str
@@ -435,6 +449,9 @@ class LinkStatus:
     commands: tuple[str, ...] = ()
     doc_url: str = ""
     setup_available: bool = False
+    ladder: str = ""
+    reason: str = ""
+    remedy: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,6 +464,9 @@ class LinkStatus:
             "commands": list(self.commands),
             "doc_url": self.doc_url,
             "setup_available": self.setup_available,
+            "ladder": self.ladder,
+            "reason": self.reason,
+            "remedy": self.remedy,
         }
 
 
@@ -487,6 +507,15 @@ def classify_link(
             backend="ring",
             ready=True,
             link_label=label or "Ethernet / Wi-Fi",
+            ladder="enabled_no_peer",
+            reason=(
+                "No Thunderbolt link was found between these Macs, so the "
+                "fast fabric does not exist yet."
+            ),
+            remedy=(
+                "Connect a Thunderbolt 5 cable between the Macs, then detect "
+                "the link again."
+            ),
         )
 
     hosts = list(rdma_devices)
@@ -512,6 +541,16 @@ def classify_link(
                 "rdma_ctl enable",
             ),
             doc_url="https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt",
+            ladder="disabled",
+            reason=(
+                f"RDMA is switched off in the operating system on "
+                f"{', '.join(without_devices)}."
+            ),
+            remedy=(
+                "On each listed Mac: enter macOS Recovery, run `rdma_ctl "
+                "enable` in Utilities → Terminal, restart, then detect the "
+                "link again."
+            ),
         )
 
     inactive = [h for h in hosts if not active_ports.get(h)]
@@ -529,6 +568,15 @@ def classify_link(
             backend="jaccl-ring",
             ready=False,
             link_label=label,
+            ladder="peer_linked_config_pending",
+            reason=(
+                f"RDMA is enabled but no Thunderbolt port reports an active "
+                f"RDMA link on {', '.join(inactive)}."
+            ),
+            remedy=(
+                "Reseat the cable, wake both Macs, and detect the link again "
+                "— RDMA needs Thunderbolt 5 on both ends."
+            ),
         )
 
     unrouted = [h for h in hosts if not port_ips.get(h)]
@@ -547,6 +595,15 @@ def classify_link(
             link_label=label,
             doc_url="https://github.com/ml-explore/mlx/discussions/3481",
             setup_available=True,
+            ladder="peer_linked_config_pending",
+            reason=(
+                "The active Thunderbolt ports have no IP address, so the RDMA "
+                "queue pairs cannot be established."
+            ),
+            remedy=(
+                "Press Start Cluster — oMLX will configure and verify the "
+                "link after administrator approval."
+            ),
         )
 
     return LinkStatus(
@@ -560,6 +617,17 @@ def classify_link(
         backend="jaccl",
         ready=True,
         link_label=label,
+        # Per-host evidence proves addressing and routing, not two-ended
+        # reachability — that rung belongs to assess_link's bound connect.
+        ladder="routed",
+        reason=(
+            "Every Mac has an active, routable RDMA port; reachability "
+            "between them has not been proven yet."
+        ),
+        remedy=(
+            "Press Start — activation verifies the link before launching — "
+            "or run Fabric Doctor to prove it now."
+        ),
     )
 
 
@@ -576,8 +644,18 @@ def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
         ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RDMA_PROBE_TIMEOUT,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"RDMA port probe for {ssh_hostname} did not respond within "
+            f"{_RDMA_PROBE_TIMEOUT}s — the Thunderbolt link is most likely "
+            "down (reseat the cable or wake both Macs and try again)."
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"RDMA port probe failed for {ssh_hostname}: {exc}"
@@ -744,35 +822,27 @@ def _remote_gui_authorize(host: str, shell_command: str) -> None:
             remote(["/bin/rm", "-rf", "--", *paths])
 
 
-def _authorized_ifconfig(host: str, interface: str, address: str) -> None:
-    """Assign one fixed link address through the native macOS auth dialog.
+def _netmask_for_prefix(prefix_length: int) -> str:
+    """Dotted netmask for a prefix length, refusing anything unusable."""
 
-    The API deliberately accepts no command text. Interface and address are
-    discovered server-side, validated here, and converted to one fixed
-    ``ifconfig`` invocation. A remote peer opens the same macOS authorization
-    dialog in its signed-in GUI session through the already-paired SSH link.
+    try:
+        return str(ipaddress.ip_network(f"0.0.0.0/{int(prefix_length)}").netmask)
+    except (TypeError, ValueError) as exc:
+        raise LinkSetupError(
+            f"Refusing an invalid netmask prefix: {prefix_length!r}"
+        ) from exc
+
+
+def _run_authorized(host: str, shell_command: str) -> None:
+    """Run one fixed, already-validated command behind the macOS auth dialog.
+
+    A remote peer opens the dialog in its signed-in GUI session through the
+    already-paired SSH link; the local host uses plain ``osascript``.
     """
 
-    if not _INTERFACE_NAME.fullmatch(interface):
-        raise LinkSetupError(f"Refusing an invalid interface name: {interface!r}")
-    try:
-        parsed_address = ipaddress.IPv4Address(address)
-    except ValueError as exc:
-        raise LinkSetupError(f"Refusing an invalid link address: {address!r}") from exc
     if host.startswith("-") or not host.strip():
         raise LinkSetupError(f"Refusing an invalid peer hostname: {host!r}")
 
-    shell_command = shlex.join(
-        [
-            "/sbin/ifconfig",
-            interface,
-            "inet",
-            str(parsed_address),
-            "netmask",
-            "255.255.255.0",
-            "up",
-        ]
-    )
     apple_script = (
         f"do shell script {json.dumps(shell_command)} with administrator privileges"
     )
@@ -821,8 +891,200 @@ def _authorized_ifconfig(host: str, interface: str, address: str) -> None:
     )
 
 
-def configure_link(hosts: list[str] | tuple[str, ...]) -> LinkStatus:
-    """Prepare an active RDMA link entirely behind the GUI's Start button."""
+def _authorized_ifconfig(
+    host: str, interface: str, address: str, *, prefix_length: int = 24
+) -> None:
+    """Assign one fixed link address through the native macOS auth dialog.
+
+    The API deliberately accepts no command text. Interface and address are
+    discovered server-side, validated here, and converted to one fixed
+    ``ifconfig`` invocation. An ``ifconfig`` assignment is not owned by any
+    network service, so it does not survive a reboot — callers record
+    ``addressing="ifconfig"`` in the fabric intent so the watchdog knows to
+    re-apply it.
+    """
+
+    if not _INTERFACE_NAME.fullmatch(interface):
+        raise LinkSetupError(f"Refusing an invalid interface name: {interface!r}")
+    try:
+        parsed_address = ipaddress.IPv4Address(address)
+    except ValueError as exc:
+        raise LinkSetupError(f"Refusing an invalid link address: {address!r}") from exc
+
+    shell_command = shlex.join(
+        [
+            "/sbin/ifconfig",
+            interface,
+            "inet",
+            str(parsed_address),
+            "netmask",
+            _netmask_for_prefix(prefix_length),
+            "up",
+        ]
+    )
+    _run_authorized(host, shell_command)
+
+
+# Network service names macOS itself creates ("Thunderbolt Bridge", "Wi-Fi")
+# and the renamed ones seen in the field ("EXO Thunderbolt 2") are short and
+# printable; anything else is refused before it can reach a privileged shell.
+_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,63}$")
+
+
+def _authorized_networksetup(
+    host: str,
+    service: str,
+    address: str,
+    mask: str,
+    *,
+    create_hardware_port: str | None = None,
+) -> None:
+    """Assign one fixed service-owned address through the native auth dialog.
+
+    Unlike raw ``ifconfig``, a ``networksetup -setmanual`` assignment is
+    written into the system configuration, so it survives reboots and
+    interface renumbering — the durability C2 is after. Inputs are validated
+    exactly like ``_authorized_ifconfig``'s: no free text reaches the
+    privileged command. When the service does not exist yet,
+    ``create_hardware_port`` folds ``-createnetworkservice`` into the same
+    shell command, so the user sees a single admin prompt.
+    """
+
+    if not _SERVICE_NAME.fullmatch(service):
+        raise LinkSetupError(
+            f"Refusing an invalid network service name: {service!r}"
+        )
+    try:
+        parsed_address = ipaddress.IPv4Address(address)
+    except ValueError as exc:
+        raise LinkSetupError(f"Refusing an invalid link address: {address!r}") from exc
+    try:
+        # A non-contiguous or garbage mask raises rather than widening the net.
+        parsed_mask = ipaddress.ip_network(f"0.0.0.0/{mask}").netmask
+    except (TypeError, ValueError) as exc:
+        raise LinkSetupError(f"Refusing an invalid netmask: {mask!r}") from exc
+
+    set_manual = shlex.join(
+        [
+            "/usr/sbin/networksetup",
+            "-setmanual",
+            service,
+            str(parsed_address),
+            str(parsed_mask),
+        ]
+    )
+    shell_command = set_manual
+    if create_hardware_port is not None:
+        if not _SERVICE_NAME.fullmatch(create_hardware_port):
+            raise LinkSetupError(
+                f"Refusing an invalid hardware port name: {create_hardware_port!r}"
+            )
+        create = shlex.join(
+            [
+                "/usr/sbin/networksetup",
+                "-createnetworkservice",
+                service,
+                create_hardware_port,
+            ]
+        )
+        shell_command = f"{create} && {set_manual}"
+    _run_authorized(host, shell_command)
+
+
+def _recorded_intent(hosts: Iterable[str]):
+    """The stored fabric intent for exactly this pair, or None.
+
+    None is also the answer when the store is not configured (CLI paths, unit
+    tests) or when the record names a different pair — a leftover intent from
+    another topology must never steer this one.
+    """
+
+    from .fabric_intent import get_fabric_intent
+
+    try:
+        store = get_fabric_intent()
+    except RuntimeError:
+        return None
+    intent = store.current()
+    if intent is None or frozenset(intent.hosts) != frozenset(hosts):
+        return None
+    return intent
+
+
+def _record_intent(
+    hosts: Iterable[str],
+    network: ipaddress.IPv4Network,
+    *,
+    chosen_by: str,
+    reason: str,
+    addressing: str,
+) -> None:
+    """Best-effort intent write: a failed record must not fail a ready link."""
+
+    from .fabric_intent import get_fabric_intent
+
+    try:
+        store = get_fabric_intent()
+    except RuntimeError:
+        return
+    with suppress(OSError, ValueError):
+        store.record(
+            subnet=str(network),
+            hosts=tuple(hosts),  # type: ignore[arg-type]
+            chosen_by=chosen_by,
+            reason=reason,
+            addressing=addressing,
+        )
+
+
+def _apply_link_address(
+    host: str,
+    interface: str,
+    address: str,
+    *,
+    prefix_length: int,
+    prefer_service: bool,
+) -> str:
+    """Assign one link address, returning the mechanism actually used.
+
+    ``"networksetup"`` means the address is service-owned and survives reboot;
+    ``"ifconfig"`` means it drifts on reboot and the recorded intent is what
+    the watchdog (C5) re-applies. Service addressing is opt-in: the two-Mac
+    rig's recon confirmed each Thunderbolt port maps to its own service, but
+    ``-setmanual`` has not yet been validated against a live RDMA link there
+    (the peer's service config was still DHCP while the interface carried the
+    fabric address), so the empirically proven ``ifconfig`` path stays the
+    default until the spike's write-half lands.
+    """
+
+    if prefer_service:
+        service = _interface_service(host, interface)
+        if service:
+            _authorized_networksetup(
+                host, service, address, _netmask_for_prefix(prefix_length)
+            )
+            return "networksetup"
+    _authorized_ifconfig(host, interface, address, prefix_length=prefix_length)
+    return "ifconfig"
+
+
+def configure_link(
+    hosts: list[str] | tuple[str, ...],
+    *,
+    prefer_service_addressing: bool = False,
+) -> LinkStatus:
+    """Prepare an active RDMA link entirely behind the GUI's Start button.
+
+    Address selection is a three-tier decision, most-respectful first:
+
+    1. an existing subnet on either endpoint that passes the collision check
+       is kept — user and Doctor choices are respected;
+    2. a recorded ``FabricIntent`` that passes the collision check is
+       re-applied — a good choice survives reboots and re-runs;
+    3. ``choose_fabric_subnet`` picks a fresh collision-checked range, and the
+       choice is recorded as intent only after ``assess_link`` confirms the
+       link actually became ready.
+    """
 
     if len(hosts) != 2:
         raise LinkSetupError(
@@ -854,21 +1116,95 @@ def configure_link(hosts: list[str] | tuple[str, ...]) -> LinkStatus:
     except RuntimeError as exc:
         raise LinkSetupError(str(exc)) from exc
 
-    # Reuse the subnet already present on either endpoint. Otherwise choose a
-    # private point-to-point range. Rank order makes retries deterministic.
+    # Local import: vpn.py imports this module for its probing plumbing.
+    # Its reads only enrich this selection — every route a utun claims is
+    # hostile, and a range a VPN provably excludes ranks first. The bound
+    # connect in assess_link below stays the authority on the result.
+    from .vpn import detect_vpn, hostile_networks
+
+    probed: dict[str, HostInterfaces] = {}
+    for host in hosts:
+        with suppress(RuntimeError, OSError, subprocess.SubprocessError):
+            probed[host] = probe_host_interfaces(host)
+    hostile = hostile_networks(hosts, interfaces=probed)
+    # The link's own current addressing is in ``hostile`` too (it sits on an
+    # interface); it is not a collision with itself, so tiers 1 and 2 check
+    # candidates against everything *else* the two Macs carry or route.
+    own_networks = {
+        ipaddress.ip_network(f"{address}/24", strict=False)
+        for address in current_ips.values()
+        if address
+    }
+    collision_set = tuple(net for net in hostile if net not in own_networks)
+
+    def collides(candidate: ipaddress.IPv4Network) -> bool:
+        return any(candidate.overlaps(net) for net in collision_set)
+
+    # Tier 1: keep an existing, collision-free subnet found on either endpoint.
+    network: ipaddress.IPv4Network | None = None
+    reason = "collision_free_default"
+    record_after_success = False
     existing = next((value for value in current_ips.values() if value), None)
-    network = ipaddress.ip_network(f"{existing or '10.0.1.1'}/24", strict=False)
+    if existing:
+        candidate = ipaddress.ip_network(f"{existing}/24", strict=False)
+        if not collides(candidate):
+            network = candidate
+
+    # Tier 2: re-apply a recorded intent that still passes the collision check.
+    if network is None:
+        intent = _recorded_intent(hosts)
+        if intent is not None:
+            with suppress(ValueError):
+                candidate = ipaddress.ip_network(intent.subnet)
+                if not collides(candidate):
+                    network = candidate
+
+    # Tier 3: choose fresh; the choice becomes the new intent only after the
+    # post-addressing assess_link below confirms the link is actually ready.
+    if network is None:
+        preferred = tuple(
+            excluded
+            for host in hosts
+            for excluded in detect_vpn(
+                host, interfaces=probed.get(host)
+            ).exclusion_networks
+        )
+        network = choose_fabric_subnet(hostile, preferred=preferred)
+        if any(network.subnet_of(net) for net in preferred):
+            reason = "vpn_exclusion"
+        record_after_success = True
+
+    addressing_used: set[str] = set()
     for rank, host in enumerate(hosts):
-        if current_ips[host]:
+        current = current_ips[host]
+        if current and ipaddress.IPv4Address(current) in network:
             continue
         target = str(network.network_address + rank + 1)
-        _authorized_ifconfig(host, active_ports[host] or "", target)
+        addressing_used.add(
+            _apply_link_address(
+                host,
+                active_ports[host] or "",
+                target,
+                prefix_length=network.prefixlen,
+                prefer_service=prefer_service_addressing,
+            )
+        )
 
     configured = assess_link(hosts)
     if not configured.ready:
         raise LinkSetupError(
             "macOS accepted the link setup, but the Thunderbolt addresses did "
             "not become routable. Check both Macs are awake and try again."
+        )
+    if record_after_success:
+        _record_intent(
+            hosts,
+            network,
+            chosen_by="auto",
+            reason=reason,
+            addressing=(
+                "networksetup" if addressing_used == {"networksetup"} else "ifconfig"
+            ),
         )
     return configured
 
@@ -889,6 +1225,9 @@ def assess_link(
             detail="Add a peer Mac to check the link between them.",
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="No peer Macs are configured, so there is no link to assess.",
+            remedy="Add a peer Mac to check the link between them.",
         )
 
     try:
@@ -911,6 +1250,9 @@ def assess_link(
             ),
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="The peer's RDMA state could not be read over SSH.",
+            remedy="Fix the SSH connection and detect the link again.",
         )
     thunderbolt = any(
         getattr(t, "kind", "") in _FAST_KINDS for t in transports
@@ -963,6 +1305,17 @@ def assess_link(
                 backend="jaccl",
                 ready=True,
                 link_label=label or "Thunderbolt RDMA",
+                # The bound connect proved both ends, which is what earns the
+                # REACHABLE rung; bandwidth verification comes later.
+                ladder="reachable",
+                reason=(
+                    "Both Macs answered on their fabric addresses in both "
+                    "directions."
+                ),
+                remedy=(
+                    "Nothing to fix — press Start; the fabric bandwidth check "
+                    "runs during activation."
+                ),
             )
         if status.state == "rdma_ready" and shared is not None and shared.ok:
             return LinkStatus(
@@ -976,6 +1329,15 @@ def assess_link(
                 backend="ring",
                 ready=True,
                 link_label="Ethernet / Wi-Fi",
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt RDMA addresses did not form the usable "
+                    "route; a TCP route was verified instead."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to re-address the Thunderbolt link if "
+                    "you want the RDMA path; the TCP ring works meanwhile."
+                ),
             )
         if status.state == "rdma_ready" and (shared is None or not shared.ok):
             reason = (
@@ -994,6 +1356,17 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label or "Thunderbolt",
+                # Addressed and routed per-host, but the bound connect failed:
+                # the ladder honestly stops below REACHABLE.
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt addresses are configured but did not "
+                    "answer a bound connect between the Macs."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to check the static addresses and "
+                    "routes on both Macs."
+                ),
             )
         if status.ready and (shared is None or not shared.ok):
             reason = (
@@ -1012,6 +1385,12 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label,
+                ladder="unavailable",
+                reason="No route between the Macs could be verified.",
+                remedy=(
+                    "Run Fabric Doctor, or check the network addresses and "
+                    "routes on both Macs."
+                ),
             )
     return status
 
@@ -1035,6 +1414,82 @@ _UNROUTABLE_NETWORKS = (
     ipaddress.ip_network("169.254.0.0/16"),
 )
 
+# Point-to-point fabric subnet candidates, in preference order. 172.16.0.0/12
+# leads because corporate full-tunnel VPNs (e.g. Cloudflare WARP) commonly
+# *exclude* it from the tunnel, so a fabric addressed here survives a VPN that
+# would otherwise swallow a 10.x link — the real incident that motivated this:
+# an auto-assigned 10.0.1.x link was silently eaten by WARP while ping/SSH over
+# the LAN kept working. 192.168.0.0/16 is deliberately absent (usual home LAN).
+# Each candidate is a /24; the two hosts take .1 and .2.
+_FABRIC_SUBNET_CANDIDATES = tuple(
+    ipaddress.ip_network(f"172.16.{block}.0/24") for block in range(99, 116)
+) + tuple(ipaddress.ip_network(f"10.{block}.99.0/24") for block in range(90, 100))
+
+
+def choose_fabric_subnet(
+    occupied: Iterable[ipaddress.IPv4Network],
+    *,
+    candidates: Sequence[ipaddress.IPv4Network] = _FABRIC_SUBNET_CANDIDATES,
+    preferred: Sequence[ipaddress.IPv4Network] = (),
+) -> ipaddress.IPv4Network:
+    """Pick a point-to-point fabric /24 that collides with nothing in use.
+
+    ``occupied`` is every network the two Macs already carry or route (their
+    interface addresses, and ideally their routing tables). A candidate that
+    overlaps any of them is skipped. The preference order puts VPN-excludable
+    ranges first so the fabric survives a full-tunnel VPN; the empirical
+    reachability check after addressing (``assess_link``) remains the authority
+    on whether the chosen link actually carries traffic.
+
+    ``preferred`` are ranges a detected VPN provably excludes from its tunnel
+    (``vpn.VPNProfile.exclusions``): candidates contained in one rank before
+    the rest of the static order — the incident's 172.16.99.x trick,
+    systematized. A wrong exclusion read cannot poison the choice, because a
+    preferred candidate still has to pass the same collision check, and an
+    empty ``preferred`` leaves today's order untouched.
+    """
+
+    occupied = tuple(occupied)
+    ordered = tuple(candidates)
+    if preferred:
+        preferred = tuple(preferred)
+
+        def excluded(candidate: ipaddress.IPv4Network) -> bool:
+            return any(candidate.subnet_of(net) for net in preferred)
+
+        ordered = tuple(
+            candidate for candidate in ordered if excluded(candidate)
+        ) + tuple(candidate for candidate in ordered if not excluded(candidate))
+    for candidate in ordered:
+        if not any(candidate.overlaps(net) for net in occupied):
+            return candidate
+    raise LinkSetupError(
+        "Could not find a free private subnet for the Thunderbolt link — every "
+        "candidate range already overlaps a network in use on one of the Macs."
+    )
+
+
+def _occupied_networks(
+    hosts: Iterable[str],
+) -> tuple[ipaddress.IPv4Network, ...]:
+    """Every routable network the given hosts already carry on any interface.
+
+    Used to keep an auto-chosen fabric subnet from colliding with a real LAN or
+    VPN range on either Mac. Probe failures are non-fatal: a subnet we cannot
+    prove free is still better than the old hardcoded default.
+    """
+
+    nets: set[ipaddress.IPv4Network] = set()
+    for host in hosts:
+        try:
+            interfaces = probe_host_interfaces(host)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            continue
+        for addr in interfaces.addresses:
+            with suppress(ValueError):
+                nets.add(addr.network)
+    return tuple(nets)
+
 # Which shared link to prefer when hosts have several. RDMA over Thunderbolt
 # beats plain Thunderbolt beats whatever else routes.
 _LINK_KIND_RANK = {"rdma": 3, "thunderbolt": 2, "ethernet": 1}
@@ -1046,6 +1501,13 @@ _IFCONFIG_HEADER = re.compile(
 )
 _HARDWARE_PORT = re.compile(r"^Hardware Port:\s*(?P<port>.+)$")
 _HARDWARE_DEVICE = re.compile(r"^Device:\s*(?P<device>\S+)$")
+# networksetup -listnetworkserviceorder: "(3) EXO Thunderbolt 2" followed by
+# "(Hardware Port: Thunderbolt 2, Device: en2)". A disabled service prints
+# "(*)" in place of its order number.
+_SERVICE_ORDER_ENTRY = re.compile(r"^\((?P<order>\d+|\*)\)\s+(?P<service>.+)$")
+_SERVICE_ORDER_PORT = re.compile(
+    r"^\(Hardware Port:\s*(?P<port>[^,]+),\s*Device:\s*(?P<device>[^)]*)\)$"
+)
 
 
 @dataclass(frozen=True)
@@ -1194,6 +1656,82 @@ def parse_thunderbolt_interfaces(output: str) -> frozenset[str]:
                 interfaces.add(match.group("device"))
             port = ""
     return frozenset(interfaces)
+
+
+def parse_hardware_ports(output: str) -> dict[str, str]:
+    """BSD device → hardware-port name, from ``-listallhardwareports``.
+
+    ``networksetup -listallhardwareports`` names the hardware port
+    ("Thunderbolt 2") behind every BSD device but never the *service*: on the
+    two-Mac rig the services over these ports are renamed ("EXO Thunderbolt
+    1/2/3"), so the service name has to be joined in from
+    ``-listnetworkserviceorder`` (``parse_network_services``). Mapping through
+    the hardware-port name rather than a cached BSD device is what survives
+    interface renumbering (the en6→en4 case above).
+    """
+
+    ports: dict[str, str] = {}
+    port = ""
+    for raw in output.splitlines():
+        line = raw.strip()
+        match = _HARDWARE_PORT.match(line)
+        if match is not None:
+            port = match.group("port").strip()
+            continue
+        match = _HARDWARE_DEVICE.match(line)
+        if match is not None and port:
+            ports[match.group("device")] = port
+            port = ""
+    return ports
+
+
+def parse_network_services(output: str) -> dict[str, str]:
+    """Hardware-port name → service name, from ``-listnetworkserviceorder``.
+
+    Keyed by hardware port, not BSD device: the Device this listing shows is
+    the service's cached binding and goes stale when interfaces renumber. A
+    disabled service (order printed as ``*``) cannot apply an address and is
+    skipped.
+    """
+
+    services: dict[str, str] = {}
+    pending: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        match = _SERVICE_ORDER_PORT.match(line)
+        if match is not None:
+            if pending:
+                services[match.group("port").strip()] = pending
+            pending = None
+            continue
+        match = _SERVICE_ORDER_ENTRY.match(line)
+        if match is not None:
+            pending = (
+                None
+                if match.group("order") == "*"
+                else match.group("service").strip()
+            )
+    return services
+
+
+def _interface_service(host: str, interface: str) -> str | None:
+    """The network service owning a BSD interface, joined by hardware port.
+
+    None when the interface has no service of its own — e.g. a Thunderbolt
+    Bridge member — which is exactly when the caller must fall back to raw
+    ``ifconfig`` addressing.
+    """
+
+    ports = parse_hardware_ports(
+        _read(host, ["networksetup", "-listallhardwareports"])
+    )
+    port = ports.get(interface)
+    if not port:
+        return None
+    services = parse_network_services(
+        _read(host, ["networksetup", "-listnetworkserviceorder"])
+    )
+    return services.get(port)
 
 
 def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
@@ -1479,18 +2017,38 @@ def _route_interface(output: str) -> str:
     return ""
 
 
+# A TCP connect *bound to the fabric source IP*. Proves the route AND that the
+# peer's SSH service answers over that exact path — the check that separates
+# "cable works" from "a VPN/firewall on that Mac swallows inbound TCP". ICMP and
+# route lookups can both pass while TCP is dropped (the incident's exact shape:
+# LAN ping/SSH fine, peer->coordinator on the fabric refused).
+_BOUND_CONNECT_SCRIPT = (
+    "import socket,sys\n"
+    "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+    "source_address=(sys.argv[1],0))\n"
+    "s.close()"
+)
+
+
 def verify_link_reachability(
     link: SharedLink,
     *,
     runner: LinkCommandRunner | None = None,
 ) -> tuple[bool, str]:
-    """Prove both endpoints route and answer over the selected interfaces.
+    """Prove both endpoints route and answer TCP over the selected interfaces.
 
     Sharing a subnet is only a candidate. Macs can retain stale addresses on
     old Thunderbolt interfaces, and two unreachable interfaces can therefore
-    look like a perfect point-to-point link. The route must name the selected
-    interface in both directions and one bounded ICMP probe must succeed from
-    each endpoint before the address enters a hostfile.
+    look like a perfect point-to-point link. In each direction the route must
+    name the selected interface *and* a TCP connection bound to the fabric
+    source IP must succeed. TCP is the success criterion, not ping: a VPN or
+    firewall (org policy "all interfaces") can pass ICMP and route lookups while
+    refusing inbound TCP, which is exactly how the fabric silently failed.
+
+    Ping is kept only as a post-failure diagnostic, to tell "firewall drops TCP"
+    (route + ping fine, TCP refused) from "host down" (nothing answers). Worst
+    case on a fully dead link is ~3 bounded commands x 2 directions; acceptable
+    for an explicit, user-initiated check.
     """
 
     source, peer = link.source, link.peer
@@ -1500,25 +2058,12 @@ def verify_link_reachability(
     directions = ((source, peer), (peer, source))
     for local, remote in directions:
         route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
-        selected = _route_interface(route.stdout) if route.returncode == 0 else ""
-        if selected != local.interface:
-            # Linux does not implement macOS's ``route -n get`` form. Binding
-            # a TCP connection to the candidate source address proves both the
-            # route and that the peer's SSH service answers on that exact path,
-            # without needing a platform-specific interface command.
-            script = (
-                "import socket,sys\n"
-                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
-                "source_address=(sys.argv[1],0))\n"
-                "s.close()"
-            )
-            if route.returncode != 0:
-                bound = run(
-                    local.host,
-                    ("python3", "-c", script, local.address, remote.address),
-                )
-                if bound.returncode == 0:
-                    continue
+        route_available = route.returncode == 0
+        selected = _route_interface(route.stdout) if route_available else ""
+        # macOS names the egress interface; a mismatch means no route over our
+        # fabric interface. Linux lacks this ``route -n get`` form (returncode
+        # != 0) — there the bound connect below is the sole proof.
+        if route_available and selected != local.interface:
             detail = (
                 f"route uses {selected}"
                 if selected
@@ -1528,13 +2073,26 @@ def verify_link_reachability(
                 f"{local.host} cannot use {local.interface} to reach "
                 f"{remote.address}: {detail}."
             )
+        bound = run(
+            local.host,
+            ("python3", "-c", _BOUND_CONNECT_SCRIPT, local.address, remote.address),
+        )
+        if bound.returncode == 0:
+            continue
+        # TCP failed. Ping is only a diagnostic to name the likely cause.
         ping = run(
             local.host,
             ("/sbin/ping", "-n", "-c", "1", "-W", "1000", remote.address),
         )
-        if ping.returncode != 0:
+        if ping.returncode == 0:
             return False, (
-                f"{local.host} routes {remote.address} over {local.interface}, "
-                "but the peer did not answer on that address."
+                f"{remote.host} cannot accept connections on the Thunderbolt "
+                "link (a firewall or VPN on that Mac applies to all "
+                f"interfaces): {local.host} reached {remote.address} by ping "
+                "but the bound TCP connection was refused."
             )
+        return False, (
+            f"{local.host} routes {remote.address} over {local.interface}, "
+            f"but {remote.host} did not answer on that address (no TCP, no ping)."
+        )
     return True, link.reason

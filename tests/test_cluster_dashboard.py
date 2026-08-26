@@ -440,9 +440,15 @@ def test_tensor_parallel_controls_are_derived_from_detected_node_count():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
-    assert 'x-for="size in clusterTensorParallelOptions()"' in cluster
+    # B5: the radios render every mode but gate support through the server's
+    # `strategies` verdict — an unsupported mode is disabled with the reason
+    # inline, never a live option that 400s after the click.
+    assert 'x-for="choice in clusterParallelismChoices()"' in cluster
+    assert ':disabled="!choice.supported"' in cluster
+    assert "clusterParallelismChoices()" in javascript
     assert "clusterTensorParallelOptions()" in javascript
-    assert "nodes > 1 ? [1, nodes] : [1]" in javascript
+    assert "clusterStrategySupport()" in javascript
+    assert "clusterAutoconfigure?.strategies" in javascript
     assert '<option value="4">' not in cluster
 
 
