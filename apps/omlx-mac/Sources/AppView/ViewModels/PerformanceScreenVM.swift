@@ -13,6 +13,7 @@ final class PerformanceScreenVM {
     var prefillMemoryGuard: Bool = false
     var memoryGuardTier: String = "balanced"
     var memoryGuardCustomCeilingText: String = ""
+    var maxLoadedModelsText: String = ""
     var idleTimeoutText: String = ""
     var modelFallback: Bool = false
 
@@ -32,6 +33,7 @@ final class PerformanceScreenVM {
     private(set) var loadedPrefillMemoryGuard: Bool = false
     private(set) var loadedMemoryGuardTier: String = "balanced"
     private(set) var loadedMemoryGuardCustomCeilingGb: Double = 0
+    private(set) var loadedMaxLoadedModels: Int? = nil
     private(set) var loadedIdleTimeoutSeconds: Int? = nil
     private(set) var loadedModelFallback: Bool = false
     private(set) var loadedCacheEnabled: Bool = true
@@ -58,6 +60,7 @@ final class PerformanceScreenVM {
             || prefillMemoryGuard != loadedPrefillMemoryGuard
             || canonicalMemoryGuardTier(memoryGuardTier) != loadedMemoryGuardTier
             || parsedMemoryGuardCustomCeiling != loadedMemoryGuardCustomCeilingGb
+            || canonicalMaxLoadedModels != loadedMaxLoadedModels
             || parsedIdleTimeout != loadedIdleTimeoutSeconds
             || modelFallback != loadedModelFallback
             || cacheEnabled != loadedCacheEnabled
@@ -92,6 +95,15 @@ final class PerformanceScreenVM {
                 let customGb = mem.memoryGuardCustomCeilingGb ?? 0
                 self.memoryGuardCustomCeilingText = customGb > 0 ? trimDouble(customGb) : ""
                 self.loadedMemoryGuardCustomCeilingGb = customGb
+            }
+            // Max loaded models: nil (unset/unlimited) renders as an empty
+            // field, matching the idle timeout row.
+            if let maxLoaded = s.scheduler?.maxLoadedModels {
+                self.maxLoadedModelsText = String(maxLoaded)
+                self.loadedMaxLoadedModels = maxLoaded
+            } else {
+                self.maxLoadedModelsText = ""
+                self.loadedMaxLoadedModels = nil
             }
             if let model = s.model {
                 self.modelFallback = model.modelFallback ?? false
@@ -161,6 +173,19 @@ final class PerformanceScreenVM {
                 return
             }
         }
+        // Max loaded models: empty = unlimited (.null), non-empty must be
+        // an integer >= 1 (the server rejects 0 and negatives).
+        let maxLoadedTrimmed = maxLoadedModelsText.trimmingCharacters(in: .whitespaces)
+        var maxLoadedPatch: PatchOptionalInt = .null
+        if !maxLoadedTrimmed.isEmpty {
+            guard let n = Int(maxLoadedTrimmed), n >= 1 else {
+                self.lastError = String(localized: "performance.error.max_loaded_models_invalid",
+                                        defaultValue: "Max Loaded Models must be a positive integer (or empty for unlimited).",
+                                        comment: "Performance screen error when max loaded models input is invalid")
+                return
+            }
+            maxLoadedPatch = .value(n)
+        }
         // Initial cache blocks: empty = leave alone, non-empty must parse.
         let initTrimmed = initialCacheBlocksText.trimmingCharacters(in: .whitespaces)
         var initBlocks: Int? = nil
@@ -202,6 +227,16 @@ final class PerformanceScreenVM {
         if customCeiling != loadedMemoryGuardCustomCeilingGb {
             patch.memoryGuardCustomCeilingGb = customCeiling
         }
+        // maxLoadedModels: empty = unlimited (.null), >= 1 = set (.value).
+        // Only send when it actually changed, like the other fields.
+        switch maxLoadedPatch {
+        case .null where loadedMaxLoadedModels != nil:
+            patch.maxLoadedModels = .null
+        case .value(let n) where n != loadedMaxLoadedModels:
+            patch.maxLoadedModels = .value(n)
+        default:
+            break
+        }
         // idleTimeout: empty/0 = disable (.null), >= 60 = set (.value).
         // Only send when it actually changed, like the other fields.
         switch idlePatch {
@@ -238,6 +273,12 @@ final class PerformanceScreenVM {
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
             self.loadedMemoryGuardTier = tier
             self.loadedMemoryGuardCustomCeilingGb = customCeiling
+            switch maxLoadedPatch {
+            case .null:
+                self.loadedMaxLoadedModels = nil
+            case .value(let n):
+                self.loadedMaxLoadedModels = n
+            }
             switch idlePatch {
             case .null:
                 self.loadedIdleTimeoutSeconds = nil
@@ -281,6 +322,15 @@ final class PerformanceScreenVM {
     private var parsedMemoryGuardCustomCeiling: Double {
         let t = memoryGuardCustomCeilingText.trimmingCharacters(in: .whitespaces)
         return t.isEmpty ? 0 : (Double(t) ?? -1)
+    }
+
+    /// Empty field = unlimited (nil); non-empty parses as Int. An invalid
+    /// non-numeric value parses as nil and surfaces as the save error.
+    private var canonicalMaxLoadedModels: Int? {
+        let t = maxLoadedModelsText.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return nil }
+        guard let n = Int(t) else { return nil }
+        return n >= 1 ? n : nil
     }
 
     private func trim(_ s: String) -> String {

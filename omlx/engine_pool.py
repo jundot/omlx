@@ -55,6 +55,14 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+# How long _wait_for_loaded_model_slot() parks (outside the pool lock)
+# while the max_loaded_models cap is full and every loaded model is
+# busy. A loaded model is usually busy only for the duration of the
+# request that triggered its load; if it is still busy after this, the
+# load proceeds best-effort with a warning (same posture as the
+# all-pinned case).
+LOADED_MODEL_CAP_EVICTION_WAIT_TIMEOUT = 300.0
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
@@ -1386,6 +1394,10 @@ class EnginePool:
         """
         Get or load engine for the specified model.
 
+        If the max_loaded_models residency cap is reached and every loaded
+        model is temporarily busy, waits for an eviction slot first
+        (_wait_for_loaded_model_slot) before attempting the load.
+
         This method implements pre-load memory checking:
         1. Check if model is already loaded -> return immediately
         2. Check if model is too large for memory limit -> raise error
@@ -1411,6 +1423,18 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        # Respect the scheduler's max_loaded_models limit (maximum number
+        # of model engines resident in memory at once). If the limit is
+        # set and the pool is at the limit with every loaded model busy,
+        # wait for a model to become evictable before loading below. When
+        # the limit is unset (None/0 = unlimited) there is nothing to
+        # wait for, so the helper is skipped entirely. The unlocked read
+        # is safe: a concurrent setting change is at worst applied on the
+        # next call, and the helper re-checks the value under the pool
+        # lock anyway.
+        if self._scheduler_config.max_loaded_models:
+            await self._wait_for_loaded_model_slot(model_id)
+
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
@@ -1468,6 +1492,40 @@ class EnginePool:
 
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
+
+            # Count-based cap on concurrently resident models
+            # (max_loaded_models): before admitting this load, evict the
+            # least recently used loaded models (reusing the memory-guard
+            # victim selection: non-pinned, not in use, no active
+            # requests) until the pool is below the cap. None/0 =
+            # unlimited: skip entirely and let the memory-ceiling
+            # admission below do its usual work. The target model is not
+            # loaded yet, so it is not counted against the cap.
+            max_loaded = self._scheduler_config.max_loaded_models
+            if (
+                max_loaded is not None
+                and max_loaded > 0
+                and self.loaded_model_count >= max_loaded
+            ):
+                while self.loaded_model_count >= max_loaded:
+                    victim = self._find_lru_victim()
+                    if victim is None:
+                        # Every loaded model is pinned, in use, or has
+                        # active requests: best-effort posture, same as the
+                        # memory guard when the ceiling is disabled.
+                        logger.warning(
+                            f"max_loaded_models={max_loaded} already reached "
+                            f"while loading '{model_id}' but no loaded model "
+                            "can be evicted (all pinned, in use, or have "
+                            "active requests); proceeding with the load "
+                            "anyway."
+                        )
+                        break
+                    logger.info(
+                        f"Evicting '{victim}' to make room for '{model_id}' "
+                        f"(max_loaded_models={max_loaded})"
+                    )
+                    await self._unload_engine(victim)
 
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
@@ -1757,6 +1815,74 @@ class EnginePool:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
+
+    async def _wait_for_loaded_model_slot(self, model_id: str) -> None:
+        """Wait outside the pool lock for a free residency slot.
+
+        Called at the top of get_engine(), before the pool lock is
+        acquired. It only matters when model_id still needs a fresh load
+        and the max_loaded_models cap is full. If every loaded model is
+        temporarily busy — usually the request that triggered its own
+        load is still running on it — park here until one drains. The
+        pool lock must not be held while waiting: a busy model's lease
+        release (release_engine) needs the same lock, so holding it
+        would deadlock the drain.
+
+        Returns as soon as any of these holds: the model is already
+        loaded (no slot needed), the cap was removed/raised, the pool is
+        below the cap, a victim is evictable, every loaded model is
+        pinned (the load path proceeds best-effort with its own
+        warning), or the wait times out (same fallback).
+        """
+        timeout = LOADED_MODEL_CAP_EVICTION_WAIT_TIMEOUT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        wait_logged = False
+        max_loaded = 0
+        busy_candidates: list[str] = []
+        while True:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if entry is not None and entry.engine is not None:
+                    return  # Already loaded: no new residency slot needed.
+                max_loaded = self._scheduler_config.max_loaded_models
+                if max_loaded is None or max_loaded <= 0:
+                    return
+                if self.loaded_model_count < max_loaded:
+                    return
+                if self._find_lru_victim() is not None:
+                    return  # The load path evicts it under the lock.
+                busy_candidates = [
+                    mid
+                    for mid, e in self._entries.items()
+                    if e.engine is not None and not e.is_pinned
+                ]
+            if not busy_candidates:
+                # Every loaded model is pinned: the load path proceeds
+                # best-effort with its own warning.
+                return
+            if not wait_logged:
+                wait_logged = True
+                logger.info(
+                    "max_loaded_models=%d reached while loading '%s'; "
+                    "waiting for %s to become evictable (timeout %.0fs)...",
+                    max_loaded,
+                    model_id,
+                    " or ".join(repr(m) for m in busy_candidates),
+                    timeout,
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Timed out after %.0fs waiting for a loaded model to "
+                    "become evictable (max_loaded_models=%d, loading "
+                    "'%s'); proceeding with the load anyway.",
+                    timeout,
+                    max_loaded,
+                    model_id,
+                )
+                return
+            await asyncio.sleep(min(0.1, remaining))
 
     async def _unload_other_dflash_engines(self, model_id: str) -> None:
         """Unload other idle DFlash engines before starting a new one.

@@ -210,6 +210,23 @@ private struct MemoryLifecycleSection: View {
                 ceilingPreviewRow
             }
             Row(
+                label: String(localized: "performance.memory.max_loaded_models",
+                              defaultValue: "Max Loaded Models",
+                              comment: "Row label for max loaded models field"),
+                sublabel: String(localized: "performance.memory.max_loaded_models.sub",
+                                  defaultValue: "Keep at most N models in memory; loading another evicts the least recently used idle one. Empty = unlimited (memory guard only).",
+                                  comment: "Sublabel for max loaded models")
+            ) {
+                TextInput(
+                    text: $vm.maxLoadedModelsText,
+                    placeholder: String(localized: "performance.memory.max_loaded_models.placeholder",
+                                        defaultValue: "unlimited",
+                                        comment: "Placeholder for the max loaded models field when unlimited"),
+                    mono: true,
+                    width: 110
+                )
+            }
+            Row(
                 label: String(localized: "performance.memory.idle_timeout",
                               defaultValue: "Idle Timeout",
                               comment: "Row label for idle timeout field"),

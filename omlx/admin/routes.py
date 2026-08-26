@@ -269,6 +269,9 @@ class GlobalSettingsRequest(BaseModel):
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     decode_fairness: bool | None = None
+    # Cap on concurrently resident models. Explicit null resets to
+    # unlimited; omitted key leaves the current value untouched.
+    max_loaded_models: int | None = None
 
     # Cache settings
     cache_enabled: bool | None = None
@@ -3497,6 +3500,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
+            "max_loaded_models": global_settings.scheduler.max_loaded_models,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -3932,6 +3936,37 @@ async def update_global_settings(
         runtime_applied.append("decode_fairness")
         logger.info(
             f"Decode fairness {'enabled' if enabled else 'disabled'}"
+        )
+
+    # Apply max loaded models cap (Live): None = unlimited (explicit null
+    # resets), integer >= 1 = evict LRU idle models on load once the pool
+    # reaches the cap. An omitted key is a no-op.
+    if "max_loaded_models" in request.model_fields_set:
+        value = request.max_loaded_models
+        if value is not None and value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid max_loaded_models: must be null (unlimited) or "
+                    "an integer >= 1"
+                ),
+            )
+        global_settings.scheduler.max_loaded_models = (
+            None if value is None else int(value)
+        )
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            # Loads from now on read the pool's stored config, so mirror
+            # the live value there (same gap as chunked_prefill had).
+            pool_config = getattr(pool, "_scheduler_config", None)
+            if pool_config is not None:
+                pool_config.max_loaded_models = global_settings.scheduler.max_loaded_models
+        runtime_applied.append("max_loaded_models")
+        logger.info(
+            f"Max loaded models set to "
+            f"{global_settings.scheduler.max_loaded_models or 'unlimited'}"
         )
 
     if request.hot_cache_max_size is not None:

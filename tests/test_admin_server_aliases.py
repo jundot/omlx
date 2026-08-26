@@ -988,3 +988,118 @@ class TestUpdateGlobalSettingsGdnSidecarStateDtype:
         assert gs.cache.gdn_ssd_pending_max_size == "512MB"
         assert gs.cache.gdn_sidecar_state_dtype == "fp32"
         gs.save.assert_not_called()
+
+
+class TestGlobalSettingsMaxLoadedModels:
+    """GET/PATCH coverage for the scheduler max_loaded_models cap."""
+
+    def test_get_reports_max_loaded_models(self):
+        gs = GlobalSettings()
+        gs.scheduler.max_loaded_models = 2
+
+        memory_info = {
+            "total_bytes": 16 * 1024**3,
+            "total_formatted": "16GB",
+            "auto_limit_formatted": "10GB",
+            "available_bytes": 8 * 1024**3,
+            "omlx_phys_footprint_bytes": 2 * 1024**3,
+            "free_memory_bytes": 4 * 1024**3,
+            "inactive_memory_bytes": 2 * 1024**3,
+            "active_memory_bytes": 2 * 1024**3,
+            "iogpu_wired_limit_bytes": 0,
+            "omlx_wired_limit_request_bytes": 0,
+        }
+        disk_info = {"total_bytes": 100 * 1024**3, "total_formatted": "100GB"}
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "get_system_memory_info", return_value=memory_info),
+            patch.object(admin_routes, "get_ssd_disk_info", return_value=disk_info),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["scheduler"]["max_loaded_models"] == 2
+        gs.scheduler.max_loaded_models = None
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "get_system_memory_info", return_value=memory_info),
+            patch.object(admin_routes, "get_ssd_disk_info", return_value=disk_info),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        assert result["scheduler"]["max_loaded_models"] is None
+
+    @staticmethod
+    def _make_patch_settings(max_loaded_models):
+        gs = GlobalSettings()
+        gs.scheduler.max_loaded_models = max_loaded_models
+        gs.save = MagicMock()
+        return gs
+
+    def test_patch_sets_cap_and_mirrors_to_pool(self):
+        gs = self._make_patch_settings(None)
+        pool_config = SimpleNamespace(max_loaded_models=None)
+        pool = SimpleNamespace(_scheduler_config=pool_config)
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(max_loaded_models=2)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "max_loaded_models" in result["runtime_applied"]
+        assert gs.scheduler.max_loaded_models == 2
+        assert pool_config.max_loaded_models == 2
+        gs.save.assert_called_once()
+
+    def test_patch_null_resets_to_unlimited(self):
+        gs = self._make_patch_settings(3)
+        pool_config = SimpleNamespace(max_loaded_models=3)
+        pool = SimpleNamespace(_scheduler_config=pool_config)
+        server_state = SimpleNamespace(engine_pool=pool)
+        # Explicit None in the request = "reset to unlimited" (the key is
+        # present in the JSON body, so model_fields_set contains it).
+        request = GlobalSettingsRequest(max_loaded_models=None)
+        assert "max_loaded_models" in request.model_fields_set
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert "max_loaded_models" in result["runtime_applied"]
+        assert gs.scheduler.max_loaded_models is None
+        assert pool_config.max_loaded_models is None
+
+    def test_patch_omitted_key_leaves_cap_unchanged(self):
+        gs = self._make_patch_settings(3)
+        request = GlobalSettingsRequest()
+        assert "max_loaded_models" not in request.model_fields_set
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.scheduler.max_loaded_models == 3
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_patch_rejects_zero_and_negative_with_400(self, bad):
+        gs = self._make_patch_settings(None)
+        request = GlobalSettingsRequest(max_loaded_models=bad)
+
+        with _patched_global_settings(gs), pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "max_loaded_models" in exc_info.value.detail
+        gs.save.assert_not_called()

@@ -10528,6 +10528,102 @@
         }
       }
     },
+    "performance.memory.max_loaded_models" : {
+      "comment" : "Row label for max loaded models field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Loaded Models"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Макс. число загруженных моделей"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大已加载模型数"
+          }
+        }
+      }
+    },
+    "performance.memory.max_loaded_models.sub" : {
+      "comment" : "Sublabel for max loaded models",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep at most N models in memory; loading another evicts the least recently used idle one. Empty = unlimited (memory guard only)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Держать в памяти не более N моделей; при загрузке другой модели сначала высвобождается наименее недавно использованная. Пусто = без лимита (только защитник памяти)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "内存中最多保留 N 个模型；加载其他模型时，会先卸载最久未使用的空闲模型。留空 = 不限制（仅内存保护）。"
+          }
+        }
+      }
+    },
+    "performance.memory.max_loaded_models.placeholder" : {
+      "comment" : "Placeholder for the max loaded models field when unlimited",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "unlimited"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "без лимита"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "不限制"
+          }
+        }
+      }
+    },
+    "performance.error.max_loaded_models_invalid" : {
+      "comment" : "Performance screen error when max loaded models input is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Loaded Models must be a positive integer (or empty for unlimited)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Макс. число загруженных моделей должно быть положительным целым числом (или пустым для безлимитного режима)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大已加载模型数必须是正整数（或留空表示不限制）。"
+          }
+        }
+      }
+    },
     "performance.memory.idle_timeout" : {
       "comment" : "Row label for idle timeout field",
       "extractionState" : "manual",

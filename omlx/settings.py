@@ -285,6 +285,11 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Cap on concurrently resident model engines. When a new model load
+    # would exceed the cap, the least recently used loaded (non-pinned,
+    # idle) model is evicted first. None = unlimited (only the memory
+    # guard drives eviction).
+    max_loaded_models: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -305,12 +310,18 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        max_loaded_models = data.get("max_loaded_models")
+        if max_loaded_models == 0:
+            # Legacy/round-trip tolerance: 0 has no meaning now that None
+            # is the unlimited sentinel, so normalize it away.
+            max_loaded_models = None
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            max_loaded_models=max_loaded_models,
         )
 
 
@@ -1526,6 +1537,15 @@ class GlobalSettings:
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
             )
+        if (
+            self.scheduler.max_loaded_models is not None
+            and self.scheduler.max_loaded_models < 1
+        ):
+            errors.append(
+                f"Invalid max_loaded_models: "
+                f"{self.scheduler.max_loaded_models} (must be null/unlimited "
+                "or an integer >= 1)"
+            )
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -1690,6 +1710,7 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            max_loaded_models=self.scheduler.max_loaded_models,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

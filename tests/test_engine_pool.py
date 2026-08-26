@@ -982,6 +982,196 @@ class TestEnginePoolLRU:
         assert victim == "model-a"
 
 
+class TestEnginePoolMaxLoadedModels:
+    """Tests for the count-based max_loaded_models eviction on load."""
+
+    @pytest.fixture
+    def pool(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        return pool
+
+    @staticmethod
+    def _make_engine_mock():
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        engine.has_active_requests.return_value = False
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_second_load_evicts_oldest(self, pool):
+        """With max_loaded_models=1, loading B evicts loaded A first."""
+        pool._scheduler_config.max_loaded_models = 1
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+        ):
+            await pool.get_engine("model-a")
+            # Force model-a to be the stale one.
+            pool._entries["model-a"].last_access = 100.0
+            engine_b = await pool.get_engine("model-b")
+
+        assert engine_b is mock_b
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 1
+
+    @pytest.mark.asyncio
+    async def test_eviction_skips_pinned_models(self, pool, small_mock_model_dir):
+        """Pinned models are never evicted; the cap still binds after them."""
+        # Two more discovered models so the cap has to bite twice.
+        for mid in ("model-c", "model-d"):
+            pool._entries[mid] = EngineEntry(
+                model_id=mid,
+                model_path=str(small_mock_model_dir / "model-a"),
+                model_type="llm",
+                engine_type="batched",
+                estimated_size=1024,
+            )
+
+        mocks = [self._make_engine_mock() for _ in range(4)]
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=list(mocks)
+        ):
+            # Start unlimited so a, b, c all load, then arm the cap.
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            await pool.get_engine("model-c")
+            pool._scheduler_config.max_loaded_models = 2
+            pool._entries["model-a"].last_access = 100.0
+            pool._entries["model-a"].is_pinned = True
+            pool._entries["model-b"].last_access = 200.0
+            pool._entries["model-c"].last_access = 300.0
+            await pool.get_engine("model-d")
+
+        # a (pinned) and d (new) remain; b then c were evicted LRU-first.
+        assert pool._entries["model-a"].engine is mocks[0]
+        assert pool._entries["model-b"].engine is None
+        assert pool._entries["model-c"].engine is None
+        assert pool._entries["model-d"].engine is mocks[3]
+        assert pool.loaded_model_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_pinned_load_proceeds_without_eviction(self, pool):
+        """When every loaded model is pinned, the load proceeds anyway."""
+        pool._scheduler_config.max_loaded_models = 1
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+        ):
+            await pool.get_engine("model-a")
+            pool._entries["model-a"].is_pinned = True
+            await pool.get_engine("model-b")
+
+        # Best-effort: both resident, cap not enforced.
+        assert pool._entries["model-a"].engine is mock_a
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 2
+
+    @pytest.mark.asyncio
+    async def test_busy_model_evicted_after_it_drains(self, pool):
+        """Busy loaded model blocks the cap check until its lease drains.
+
+        Reproduces the report: use A (its request loads A), use B while A's
+        request is still running. B must wait for A to become idle and then
+        evict A instead of loading both.
+        """
+        pool._scheduler_config.max_loaded_models = 1
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+        ):
+            await pool.get_engine("model-a")
+            # A is serving the request that loaded it: not evictable yet.
+            pool._entries["model-a"].in_use = 1
+
+            async def drain_a():
+                await asyncio.sleep(0.3)
+                pool._entries["model-a"].in_use = 0
+
+            drain_task = asyncio.create_task(drain_a())
+            engine_b = await pool.get_engine("model-b")
+            await drain_task
+
+        assert engine_b is mock_b
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 1
+
+    @pytest.mark.asyncio
+    async def test_busy_wait_timeout_proceeds_best_effort(self, pool):
+        """If the busy model never drains, the cap falls back to best-effort."""
+        pool._scheduler_config.max_loaded_models = 1
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with (
+            patch(
+                "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+            ),
+            patch(
+                "omlx.engine_pool.LOADED_MODEL_CAP_EVICTION_WAIT_TIMEOUT", 0.3
+            ),
+        ):
+            await pool.get_engine("model-a")
+            pool._entries["model-a"].in_use = 1  # stays busy forever
+            await pool.get_engine("model-b")
+
+        # Best-effort after timeout: both resident.
+        assert pool._entries["model-a"].engine is mock_a
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cap_removed_live_while_waiting(self, pool):
+        """Raising/removing the cap while B waits lets both loads proceed."""
+        pool._scheduler_config.max_loaded_models = 1
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+        ):
+            await pool.get_engine("model-a")
+            pool._entries["model-a"].in_use = 1
+
+            async def lift_cap():
+                await asyncio.sleep(0.2)
+                pool._scheduler_config.max_loaded_models = None
+
+            lift_task = asyncio.create_task(lift_cap())
+            await pool.get_engine("model-b")
+            await lift_task
+
+        assert pool._entries["model-a"].engine is mock_a
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_limit_disables_count_eviction(self, pool):
+        """max_loaded_models unset (None = unlimited): two models coexist."""
+        assert pool._scheduler_config.max_loaded_models is None
+
+        mock_a = self._make_engine_mock()
+        mock_b = self._make_engine_mock()
+        with patch(
+            "omlx.engine_pool.BatchedEngine", side_effect=[mock_a, mock_b]
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+
+        assert pool._entries["model-a"].engine is mock_a
+        assert pool._entries["model-b"].engine is mock_b
+        assert pool.loaded_model_count == 2
+
+
 class TestEnginePoolDFlashIsolation:
     """Tests for DFlash process-global runtime isolation."""
 
