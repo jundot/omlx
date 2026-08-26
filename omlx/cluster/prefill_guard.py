@@ -178,11 +178,19 @@ class RankPrefillGuard:
         the model collective and hang. Instead, every rank measures its own
         resident slice, exchanges a one-hot rejection vote, and raises before
         model execution if any rank refused the prompt.
+
+        Any local exception -- not just the expected
+        ``PrefillMemoryExceededError`` -- must still cast this rank's vote
+        before propagating: an unexpected error (a malformed monitor field, a
+        stripped-worker import error) that raised straight out of ``check()``
+        would otherwise skip the collective entirely, leaving peer ranks
+        blocked in ``all_sum`` forever (§A2).
         """
 
         from omlx.exceptions import PrefillMemoryExceededError
 
         local_error: PrefillMemoryExceededError | None = None
+        local_exc: Exception | None = None
         try:
             self.check(
                 num_prompt_tokens,
@@ -192,6 +200,8 @@ class RankPrefillGuard:
             )
         except PrefillMemoryExceededError as exc:
             local_error = exc
+        except Exception as exc:  # noqa: BLE001 - re-raised below, after voting
+            local_exc = exc
 
         if mx_module is None:
             import mlx.core as collective_mx
@@ -201,13 +211,15 @@ class RankPrefillGuard:
         group = collective_mx.distributed.init()
         world_size = int(group.size())
         if world_size <= 1:
+            if local_exc is not None:
+                raise local_exc
             if local_error is not None:
                 raise local_error
             return
 
         rank = int(group.rank())
         votes = [0] * world_size
-        if local_error is not None:
+        if local_error is not None or local_exc is not None:
             votes[rank] = 1
         agreed_votes = collective_mx.distributed.all_sum(
             collective_mx.array(votes)
@@ -217,6 +229,8 @@ class RankPrefillGuard:
         ]
         if not rejecting_ranks:
             return
+        if local_exc is not None:
+            raise local_exc
         if local_error is not None:
             raise local_error
 

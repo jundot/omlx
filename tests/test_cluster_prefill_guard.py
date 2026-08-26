@@ -157,6 +157,54 @@ def test_collective_admission_allows_every_rank_to_continue():
     )
 
 
+def test_unexpected_local_exception_still_casts_a_vote_before_reraising(
+    monkeypatch,
+):
+    """A2: an exception from check() other than PrefillMemoryExceededError
+    (a malformed monitor field, a stripped-worker import error) must still
+    cast this rank's rejection vote before propagating -- skipping the
+    collective here leaves peer ranks blocked in all_sum forever."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+
+    captured_votes = {}
+
+    class _RecordingMX(_CollectiveMX):
+        def all_sum(self, value):
+            captured_votes["value"] = list(value)
+            return super().all_sum(value)
+
+    mx = _RecordingMX(rank=0, votes=[1, 0])
+
+    with pytest.raises(TypeError, match="malformed monitor field"):
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert captured_votes["value"] == [1, 0]
+
+
+def test_unexpected_local_exception_on_single_node_reraises_without_a_collective(
+    monkeypatch,
+):
+    """world_size==1 skips the collective entirely; the original exception
+    must still surface (not get swallowed or replaced)."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+    mx = _CollectiveMX(rank=0, votes=[0])
+
+    with pytest.raises(TypeError, match="malformed monitor field"):
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+
 def test_an_unreadable_model_disables_the_guard():
     guard = RankPrefillGuard(rank_monitor(object()), rank=0, ceiling_bytes=8 * GiB)
     assert not guard.active
