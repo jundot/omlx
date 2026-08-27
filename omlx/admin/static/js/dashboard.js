@@ -121,11 +121,11 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
@@ -6665,6 +6665,7 @@
                 const s = this.globalSettings;
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
+                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
@@ -6707,6 +6708,7 @@
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
+                            max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
                             hide_helper_models: this.globalSettings.model.hide_helper_models,
@@ -6726,6 +6728,8 @@
                             ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
+                            hot_cache_write_through: this.globalSettings.cache.hot_cache_write_through,
+                            ane_compile_cache: this.globalSettings.cache.ane_compile_cache,
                             gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
                             gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
                             gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
@@ -7818,11 +7822,16 @@
             aneTuningRecommendationText() {
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation) return '';
+                const measured = recommendation.processing_tps !== null
+                    && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
                 const speedup = Number(recommendation.speedup_percent || 0);
                 const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
+                const speedSuffix = measured
+                    ? ` · ${speed} prompt tok/s · ${speedupText}`
+                    : '';
                 if (!recommendation.enabled) {
-                    return `GPU only · ${speed} prompt tok/s · ${speedupText}`;
+                    return `GPU only${speedSuffix}`;
                 }
                 const parts = [
                     `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
@@ -7846,7 +7855,7 @@
                         `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
                     );
                 }
-                return `${parts.join(' · ')} · ${speed} prompt tok/s · ${speedupText}`;
+                return `${parts.join(' · ')}${speedSuffix}`;
             },
 
             aneTuningResultText(result) {

@@ -56,6 +56,26 @@ def _make_cache(model):
     return make_prompt_cache(model)
 
 
+def _make_batch_cache(model):
+    """The cache shape every request takes through ``BatchGenerator``.
+
+    ``PromptProcessingBatch.__init__`` merges the per-request caches
+    (mlx-lm ``_merge_caches``), so even a single request runs on ``Batch*``
+    entries whose ``offset`` is a 1-element ``mx.array`` rather than an int.
+    """
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+
+    batched = []
+    for c in _make_cache(model):
+        if isinstance(c, KVCache):
+            batched.append(BatchKVCache.merge([c]))
+        else:
+            if isinstance(c, ArraysCache):
+                c.left_padding = mx.array([0])
+            batched.append(c)
+    return batched
+
+
 def _tokens(n, seed=0):
     mx.random.seed(seed)
     return mx.random.randint(0, TINY_CONFIG["vocab_size"], (n,)).astype(mx.uint32)
@@ -220,6 +240,22 @@ class TestCaptureSkips:
             pass
         assert prompt_priming.prime_ctx_stats(model) is None
 
+    def test_batch_forward_drops_pending_ctx(self, model):
+        """A B>1 forward advances the anchor without capture seeing its
+        tokens, so a later singleton chunk could read as contiguous across
+        it. The pending timeline must not survive one."""
+        tokens = _tokens(12, seed=31)
+        cache = _make_cache(model)
+        _chunked_prefill(model, cache, tokens[:6], [6])
+        assert prompt_priming.prime_ctx_stats(model) == 5
+        prompt_priming.maybe_capture(
+            model,
+            mx.zeros((2, 3), dtype=mx.uint32),
+            mx.zeros((2, 3, TINY_CONFIG["hidden_size"])),
+            cache,
+        )
+        assert prompt_priming.prime_ctx_stats(model) is None
+
     def test_offset_rewind_invalidates_and_restarts(self, model):
         tokens = _tokens(12, seed=4)
         cache = _make_cache(model)
@@ -332,6 +368,130 @@ class TestCaptureSkips:
         assert prompt_priming.prime_ctx_stats(model) is not None
         prompt_priming.drop_ctx(model)
         assert prompt_priming.prime_ctx_stats(model) is None
+
+
+class TestBatchCacheAnchor:
+    """Batch caches expose ``offset`` as a 1-element array even at B==1.
+
+    The anchor probe used to require a plain int, so it found no anchor on
+    any ``BatchGenerator`` prefill and capture bailed silently — priming
+    never activated in the batch engine (#3079).
+    """
+
+    def test_anchor_unwraps_size_one_array_offset(self):
+        from mlx_lm.models.cache import BatchKVCache
+
+        entry = BatchKVCache([0])
+        assert type(entry.offset) is not int
+        anchor = prompt_priming._anchor([entry])
+        assert anchor is not None
+        assert anchor.offset == 0
+
+    def test_anchor_finds_batch_sub_cache_in_container(self):
+        """DeepSeek-V4 / GLM-5.2 wrap their layer caches in a CacheList."""
+        from mlx_lm.models.cache import BatchKVCache, CacheList
+
+        anchor = prompt_priming._anchor([CacheList(BatchKVCache([0]))])
+        assert anchor is not None
+        assert anchor.offset == 0
+
+    def test_anchor_skips_multi_row_batch_offset(self):
+        """A real B>1 cache has a vector offset: no singleton timeline to
+        anchor on, so capture must find nothing rather than guess a row."""
+        from mlx_lm.models.cache import BatchKVCache
+
+        assert prompt_priming._anchor([BatchKVCache([0, 0])]) is None
+
+    def test_anchor_view_tracks_the_live_offset(self):
+        from mlx_lm.models.cache import BatchKVCache
+
+        entry = BatchKVCache([0])
+        anchor = prompt_priming._anchor([entry])
+        entry.offset = entry.offset + 7
+        assert anchor.offset == 7
+
+    def test_batch_cache_prefill_primes_end_to_end(self, strict_model):
+        """Legacy single-head activation over the batch-engine cache shape:
+        capture through the seam, matching the one-shot oracle fold."""
+        model = strict_model
+        n = 9
+        tokens = _tokens(n, seed=32)
+        main_tok = _tokens(1, seed=33)
+        cache = _make_batch_cache(model)
+        _chunked_prefill(model, cache, tokens, [6, 3])
+        assert prompt_priming.prime_ctx_stats(model) == n - 1
+
+        model(main_tok[None, :], cache=cache, return_hidden=True)
+        primed = prompt_priming.take_primed(model, cache, main_tok)
+        assert primed is not None
+        mtp_cache, hist_offset = primed
+        assert hist_offset == n
+        assert mtp_cache[0].offset == n
+        assert prompt_priming._find_ctx(model) is None
+
+        ref_cache = _reference_head_cache(model, tokens, extra_tok=main_tok)
+        mx.eval([c.state for c in mtp_cache])
+        for (k, v), (rk, rv) in zip(_kv_entries(mtp_cache), _kv_entries(ref_cache)):
+            assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
+            assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
+
+
+class TestHookFallthrough:
+    """``mtp_take_primed`` is registered on the class but answered by only
+    some builds: the DeepSeek-V4 patch registers it unconditionally and
+    returns None for everything that is not DSpark. Taking that None as the
+    final answer made the generic seam unreachable, so priming was
+    structurally dead for legacy single-head MTP models (#3079).
+    """
+
+    def _prefill_and_activate(self, model, n=9, seed=34):
+        tokens = _tokens(n, seed=seed)
+        main_tok = _tokens(1, seed=seed + 1)
+        cache = _make_cache(model)
+        _chunked_prefill(model, cache, tokens, [6, 3])
+        assert prompt_priming.prime_ctx_stats(model) == n - 1
+        # Activation forward runs with return_hidden=True: capture skips it.
+        model(main_tok[None, :], cache=cache, return_hidden=True)
+        return cache, main_tok, n
+
+    def _register_hook(self, model, monkeypatch, hook):
+        monkeypatch.setattr(
+            type(model), "mtp_take_primed", hook, raising=False
+        )
+
+    def test_declining_hook_falls_through_to_generic_seam(
+        self, model, monkeypatch
+    ):
+        self._register_hook(model, monkeypatch, lambda self, cache, tok: None)
+        cache, main_tok, n = self._prefill_and_activate(model)
+        primed = prompt_priming.take_primed(model, cache, main_tok)
+        assert primed is not None
+        assert primed[1] == n
+        assert prompt_priming._find_ctx(model) is None
+
+    def test_owning_hook_result_is_returned(self, model, monkeypatch):
+        """A hook that answers owns the whole seam: its result passes
+        through and the generic context is left for it to manage."""
+        sentinel = (["head-cache"], 123)
+        self._register_hook(
+            model, monkeypatch, lambda self, cache, tok: sentinel
+        )
+        cache, main_tok, _ = self._prefill_and_activate(model)
+        assert prompt_priming.take_primed(model, cache, main_tok) is sentinel
+        assert prompt_priming._find_ctx(model) is not None
+
+    def test_fallthrough_ignores_foreign_ctx(self, model, monkeypatch):
+        """Hosts that share the slot (inkling's sliding-window context) pop
+        it before declining. If one ever forgets, the generic seam must not
+        adopt a context it did not build."""
+
+        class _ForeignCtx:
+            pass
+
+        self._register_hook(model, monkeypatch, lambda self, cache, tok: None)
+        cache, main_tok, _ = self._prefill_and_activate(model)
+        setattr(model, prompt_priming._CTX_ATTR, _ForeignCtx())
+        assert prompt_priming.take_primed(model, cache, main_tok) is None
 
 
 class TestActivationHandoff:

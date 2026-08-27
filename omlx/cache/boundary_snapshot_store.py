@@ -34,6 +34,7 @@ from .paged_ssd_cache import (
     HAS_MLX,
     _encode_shape,
     _extract_tensor_bytes,
+    _fsync_parent_dir,
     _has_zero_dim,
     _restore_tensor_from_bytes,
     _write_safetensors_no_mx,
@@ -977,6 +978,7 @@ class BoundarySnapshotSSDStore:
                     )
                     return False
                 os.replace(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
                 wrote_file = True
                 if self._is_cancelled(pw_key[0]):
                     with suppress(OSError):
@@ -1131,6 +1133,7 @@ class BoundarySnapshotSSDStore:
                 )
                 return
             os.rename(str(temp_path), str(file_path))
+            _fsync_parent_dir(file_path)
 
             # Cleanup may race with a queued write; remove any late file.
             if self._is_cancelled(pw_key[0]):

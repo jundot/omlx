@@ -54,6 +54,7 @@ def _has_cli_overrides(args) -> bool:
         "host",
         "log_level",
         "sse_keepalive_mode",
+        "max_audio_upload_size",
         "max_concurrent_requests",
         "embedding_batch_size",
         "memory_guard",
@@ -61,6 +62,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_dir",
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
+        "hot_cache_write_through",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -108,6 +110,12 @@ def serve_command(args):
 
     # Initialize global settings first (to get log_level from file if not specified)
     settings = init_settings(base_path=args.base_path, cli_args=args)
+
+    # The native ANE compile-cache gate reads this env var once, at the first
+    # compile, so it must be exported before any engine loads. setdefault
+    # keeps an explicit env override authoritative.
+    if settings.cache.ane_compile_cache:
+        os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
     # Register TRACE level (5) — includes full message content
     TRACE = 5
@@ -304,6 +312,13 @@ def serve_command(args):
             scheduler_config.hot_cache_max_size = hot_cache_max_bytes
         else:
             scheduler_config.hot_cache_max_size = 0
+
+        # Write-through: explicit CLI flag > settings file (already mapped by
+        # settings.to_scheduler_config()).
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            scheduler_config.hot_cache_write_through = bool(
+                args.hot_cache_write_through
+            )
 
         if args.no_cache:
             print(
@@ -1056,6 +1071,15 @@ Example directory structure:
         "OpenClaw / WorkBuddy; 'comment' emits the legacy ': keep-alive' SSE "
         "comment; 'off' disables keepalive entirely",
     )
+    serve_parser.add_argument(
+        "--max-audio-upload-size",
+        type=str,
+        default=None,
+        help="Maximum audio upload size for /v1/audio/transcriptions and "
+        "/v1/audio/process (e.g. '100MB', '500MB'). Overrides the value "
+        "in settings.json (built-in default: 100MB). Uploads are buffered "
+        "in memory, so this is also a per-request RAM cap",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
@@ -1104,6 +1128,13 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
+    )
+    serve_parser.add_argument(
+        "--hot-cache-write-through",
+        action="store_true",
+        default=None,
+        help="Persist every hot-cache block to SSD immediately (write-through). "
+        "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
     )
     serve_parser.add_argument(
         "--no-cache",

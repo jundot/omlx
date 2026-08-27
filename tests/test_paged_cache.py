@@ -641,9 +641,41 @@ class TestPagedCacheManager:
             parent_hash = block.block_hash
 
         # Find shared prefix for same tokens
-        shared_ids, remaining = manager.find_shared_prefix(tokens1)
+        shared_ids, shared_hashes, remaining = manager.find_shared_prefix(tokens1)
         assert len(shared_ids) == 2
+        assert len(shared_hashes) == 2
+        assert all(h is not None for h in shared_hashes)
         assert remaining == []
+        # Each returned hash matches its block's actual stored hash, and
+        # is usable directly with acquire_cached_block (A2): the caller no
+        # longer has to trust membership alone via increment_ref.
+        for block_id, expected_hash in zip(shared_ids, shared_hashes):
+            block = manager.allocated_blocks[block_id]
+            assert expected_hash == block.block_hash
+            acquired = manager.acquire_cached_block(block_id, expected_hash)
+            assert acquired is not None
+            assert acquired.block_id == block_id
+
+    def test_find_shared_prefix_hash_mismatch_is_rejected_by_acquire(self):
+        """A2 regression: acquire_cached_block must refuse a block whose
+        hash no longer matches what find_shared_prefix observed -- the
+        TOCTOU case where the block was reassigned to different content
+        between the lookup and the caller taking a reference."""
+        manager = PagedCacheManager(block_size=4, max_blocks=100, initial_blocks=100)
+
+        tokens1 = [1, 2, 3, 4]
+        block = manager.get_new_blocks(1)[0]
+        manager.register_block_hash(block, tokens1, None)
+
+        shared_ids, shared_hashes, _ = manager.find_shared_prefix(tokens1)
+        assert len(shared_ids) == 1
+        stale_hash = shared_hashes[0]
+
+        # Simulate a concurrent eviction + reallocation for different
+        # content between the lookup and the caller's acquire.
+        block.block_hash = b"different-content-hash-______"
+
+        assert manager.acquire_cached_block(shared_ids[0], stale_hash) is None
 
     def test_fork_block_table(self):
         """Test forking a block table (COW)."""
@@ -795,14 +827,6 @@ class TestPagedCacheManager:
         evictable = manager.get_evictable_blocks(3)
         # Should get blocks from free queue in LRU order
         assert len(evictable) <= 3
-
-    def test_handle_memory_pressure(self):
-        """Test handling memory pressure."""
-        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
-
-        # Should return True when enough blocks available
-        result = manager.handle_memory_pressure(5)
-        assert result is True
 
     def test_allocate_blocks_for_tokens(self):
         """Test allocating blocks for a given number of tokens."""

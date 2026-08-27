@@ -260,6 +260,9 @@ class TestServeCommandOptions:
         )
         assert "--max-concurrent-requests" in result.stdout
         assert "--embedding-batch-size" in result.stdout
+        assert "--max-audio-upload-size" in result.stdout
+        assert "settings.json" in result.stdout
+        assert "Default: 100MB" not in result.stdout
 
     def test_serve_has_cache_options(self):
         """Test that serve command has cache options."""
@@ -933,6 +936,7 @@ class TestServeCommandFunctions:
             "port": port,
             "log_level": None,
             "sse_keepalive_mode": None,
+            "max_audio_upload_size": None,
             "max_concurrent_requests": None,
             "embedding_batch_size": None,
             "memory_guard": None,
@@ -986,6 +990,7 @@ class TestServeCommandFunctions:
         settings.mcp = SimpleNamespace(config_path=None)
         settings.cache = SimpleNamespace(
             enabled=False,
+            ane_compile_cache=False,
             get_ssd_cache_dir=lambda base_path: tmp_path / "cache",
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
             get_hot_cache_max_size_bytes=lambda: 0,
@@ -1214,6 +1219,7 @@ class TestHasCliOverrides:
             "host": None,
             "log_level": None,
             "sse_keepalive_mode": None,
+            "max_audio_upload_size": None,
             "max_concurrent_requests": None,
             "embedding_batch_size": None,
             "memory_guard": None,
@@ -1290,6 +1296,7 @@ class TestHasCliOverrides:
         ("field", "value"),
         [
             ("sse_keepalive_mode", "off"),
+            ("max_audio_upload_size", "250MB"),
             ("max_concurrent_requests", 2),
             ("paged_ssd_cache_dir", "/tmp/cache"),
             ("paged_ssd_cache_max_size", "2GB"),

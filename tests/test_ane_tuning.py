@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from omlx.admin import ane_tuning
+from omlx.custom_kernels.qwen35_prefill import fast
 from omlx.model_settings import ModelSettings
+
+_REAL_BANK_COMPILER_AVAILABLE = fast.qwen35_ane_bank_compiler_available
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +20,11 @@ def _clear_runs(monkeypatch):
     monkeypatch.setattr(
         ane_tuning, "_restore_speed_priority", lambda pool, previous: None
     )
+    # run_tuning preflights the compiler probes; the pipeline tests here drive
+    # a mocked measurement stack on runners without the extension, so pretend
+    # the compiler exists. Unavailable-path tests re-stub the probes.
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "qwen35_ane_bank_compiler_available", lambda: True)
     yield
     ane_tuning._runs.clear()
 
@@ -936,3 +944,65 @@ def test_settings_for_candidate_disables_dflash():
 
     assert settings.dflash_enabled is False
     assert base.dflash_enabled is True
+
+
+def test_settings_for_candidate_disables_specprefill():
+    """Tuner measurement must prefill the full prompt, never sparse.
+
+    SpecPrefill compresses the measurement prompt below the compiled ANE
+    tile width, so the ANE never executes and the idle guard aborts the run.
+    """
+    from omlx.model_settings import ModelSettings
+
+    base = ModelSettings(
+        specprefill_enabled=True, specprefill_draft_model="draft-model"
+    )
+    request = ane_tuning.ANETuningRequest(model_id="m")
+    candidate = ane_tuning._Candidate("GPU only", False)
+
+    settings = ane_tuning._settings_for_candidate(base, request, candidate)
+
+    assert settings.specprefill_enabled is False
+    assert base.specprefill_enabled is True
+
+
+def test_unavailable_bank_compiler_yields_gpu_only_verdict(monkeypatch):
+    """#3044: a machine without the private ANE runtime/bank compiler must get
+    a completed GPU-only verdict up front — not a failed run after the
+    bank-split ladder, and with no model loads or unloads along the way."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: False)
+    monkeypatch.setattr(fast, "qwen35_ane_bank_compiler_available", lambda: False)
+
+    run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="m"))
+    pool = MagicMock()
+    asyncio.run(ane_tuning.run_tuning(run, pool))
+
+    assert run.status == "completed"
+    assert run.phase == "completed"
+    assert run.error_message == ""
+    assert run.recommendation is not None
+    assert run.recommendation["enabled"] is False
+    assert run.recommendation["gdn_enabled"] is False
+    assert all(result["state"] == "skipped" for result in run.results)
+    assert "ANE prefill is not usable here" in run.message
+    # The verdict must not have touched the engine pool at all: the model
+    # that was serving before the tuner ran stays exactly as it was.
+    assert pool.mock_calls == []
+
+
+def test_bank_compiler_available_matches_serving_probe(monkeypatch):
+    """The tuner guard and qwen35_ane_compile_linear_bank's own gate must
+    agree: a False probe is exactly the condition under which the compile
+    call raises."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: False)
+    monkeypatch.setattr(
+        fast, "qwen35_ane_bank_compiler_available", _REAL_BANK_COMPILER_AVAILABLE
+    )
+    assert fast.qwen35_ane_bank_compiler_available() is False
+    with pytest.raises(RuntimeError, match="procedure-bank compiler"):
+        fast.qwen35_ane_compile_linear_bank([], 2048, 0)

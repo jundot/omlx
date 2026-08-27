@@ -17102,6 +17102,54 @@
         }
       }
     },
+    "server.advanced.max_audio_upload_size" : {
+      "comment" : "Advanced row label for the audio upload size limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Audio Upload Size"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер загрузки аудио"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频上传大小"
+          }
+        }
+      }
+    },
+    "server.advanced.max_audio_upload_size.sub" : {
+      "comment" : "Sublabel describing the audio upload size limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum file size accepted by audio transcription and processing endpoints. Higher values can increase memory use for concurrent requests."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер файла для расшифровки и обработки аудио. Большие значения могут увеличить использование памяти при одновременных запросах."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频转录和处理接口接受的最大文件大小。较大的值可能会增加并发请求的内存使用量。"
+          }
+        }
+      }
+    },
     "server.advanced.sse_keepalive" : {
       "comment" : "Advanced row label for the SSE keep-alive mode picker",
       "extractionState" : "manual",
@@ -17338,6 +17386,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "OpenAI 兼容"
+          }
+        }
+      }
+    },
+    "server.error.audio_upload_size_invalid" : {
+      "comment" : "Server screen error when the audio upload size is invalid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximum Audio Upload Size must be a positive value such as 100MB or 1GB."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Максимальный размер загрузки аудио должен быть положительным значением, например 100MB или 1GB."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频上传大小必须是正值，例如 100MB 或 1GB。"
           }
         }
       }

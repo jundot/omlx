@@ -1,4 +1,5 @@
 import logging
+import re
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,34 @@ def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
 
     assert "first->cancel_ticket(first_ticket);" in helper
     assert source.count("begin_ane_ticket_pair(") == 3
+
+
+def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
+    """A thread-constructor failure must leave every unowned ticket guarded."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+    fused = source.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[1]
+
+    assert "void transfer_ticket0() noexcept" in source
+    assert "void transfer_ticket1() noexcept" in source
+    assert dual.index("std::thread([model0") < dual.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert dual.index("std::thread([model1") < dual.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert fused.index("std::thread([model =") < fused.index(
+        "ane_guard.transfer_ticket0();"
+    )
+    assert fused.index("std::thread([model1 =") < fused.index(
+        "ane_guard.transfer_ticket1();"
+    )
+    assert source.count("ane_guard.transfer_ticket0();") == 2
+    assert source.count("ane_guard.transfer_ticket1();") == 2
 
 
 @pytest.fixture(autouse=True)
@@ -793,6 +822,147 @@ def test_bank_chunk_spans_respects_byte_cap():
     assert ane_patch._bank_chunk_spans(weights, 1 << 30) == [(0, 4)]
 
 
+def test_ane_bank_memory_headroom_ok_math(monkeypatch):
+    """Regression for a live jetsam kill: process phys_footprint climbed to
+    48.3GB on a 48GB machine across a bounded 4-attempt retry ladder, each
+    attempt individually dropping its own references but racing the ANE
+    driver's asynchronous device-mapping release. The gate compares against
+    total system memory (the same ledger jetsam uses), not oMLX's own
+    configured ceiling, since it has to work even before any ceiling has
+    propagated."""
+    import omlx.utils.hardware as hardware
+    import omlx.utils.proc_memory as proc_memory
+
+    gib = 1024**3
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 48 * gib)
+
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: int(30 * gib))
+    assert ane_patch._ane_bank_memory_headroom_ok() is True  # 62.5% < 70%
+
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: int(34 * gib))
+    assert ane_patch._ane_bank_memory_headroom_ok() is False  # ~70.8% >= 70%
+
+    # total==0 (measurement unavailable): default to allowing the attempt.
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 0)
+    assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_headroom_ok_defaults_true_on_error(monkeypatch):
+    import omlx.utils.hardware as hardware
+
+    def boom():
+        raise RuntimeError("sysctl unavailable")
+
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", boom)
+    assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_footprint_snapshot_reports_measured_bytes(monkeypatch):
+    """The skip-warning log needs the actual measured numbers, not just the
+    fixed threshold constant, so a future "why is ANE slow on this box" is
+    answerable from one log line."""
+    import omlx.utils.hardware as hardware
+    import omlx.utils.proc_memory as proc_memory
+
+    gib = 1024**3
+    monkeypatch.setattr(proc_memory, "get_phys_footprint", lambda: 34 * gib)
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 48 * gib)
+
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (34 * gib, 48 * gib)
+
+
+def test_ane_bank_memory_footprint_snapshot_defaults_zero_on_error(monkeypatch):
+    import omlx.utils.hardware as hardware
+
+    def boom():
+        raise RuntimeError("sysctl unavailable")
+
+    monkeypatch.setattr(hardware, "get_total_memory_bytes", boom)
+    assert ane_patch._ane_bank_memory_footprint_snapshot() == (0, 0)
+
+
+def test_bank_split_ladder_stops_retrying_when_headroom_runs_out(monkeypatch):
+    """The circuit breaker must stop issuing further compile attempts (not
+    just refuse to start) once memory tightens mid-ladder -- this is what
+    actually prevents a jetsam kill, since a machine can have headroom for
+    the first attempt but not the later, smaller-but-still-compounding
+    ones."""
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
+    calls = []
+
+    def compile_span(start, stop):
+        calls.append((start, stop))
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    headroom_calls = []
+
+    def headroom_ok():
+        headroom_calls.append(True)
+        return len(headroom_calls) == 1  # only the first attempt has headroom
+
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
+
+    result = ane_patch._bank_split_ladder([4, 4, 4, 4], compile_span)
+
+    assert result is None
+    assert calls == [(0, 4)]  # only the first (monolithic) attempt ran
+    assert len(headroom_calls) == 2  # gate checked before attempt 1 and 2
+
+
+def test_bank_split_ladder_settles_between_failed_attempts(monkeypatch):
+    """A failed attempt must give the ANE driver's asynchronous device
+    -mapping release a moment before the next attempt's headroom check
+    measures phys_footprint -- otherwise the check races the driver and can
+    under- or over-react to memory that hasn't actually been freed yet."""
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    sleeps = []
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda s: sleeps.append(s))
+    gc_calls = []
+    monkeypatch.setattr(ane_patch.gc, "collect", lambda: gc_calls.append(True))
+
+    def compile_span(start, stop):
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    ane_patch._bank_split_ladder([4, 4, 4, 4], compile_span)
+
+    assert len(gc_calls) >= 1
+    assert sleeps and all(s == ane_patch._ANE_BANK_RETRY_SETTLE_SECONDS for s in sleeps)
+
+
+def test_compile_single_banks_stops_retrying_when_headroom_runs_out(monkeypatch):
+    """Same circuit breaker, applied to the not-yet-refactored single-ANE
+    calibration path (which has its own inline copy of the retry ladder)."""
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
+    calls = []
+
+    def compile_bank(weights, sequence_length, ane_instance):
+        calls.append(len(weights))
+        raise RuntimeError("ANE procedure bank load failed: 0x20004")
+
+    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+
+    headroom_calls = []
+
+    def headroom_ok():
+        headroom_calls.append(True)
+        return len(headroom_calls) == 1
+
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", headroom_ok)
+    monkeypatch.setattr(
+        ane_patch, "_ane_bank_memory_footprint_snapshot", lambda: (0, 0)
+    )
+
+    weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(4)]
+    result = ane_patch._compile_single_banks(weights, 2048)
+
+    assert result is None
+    assert calls == [4]
+    assert len(headroom_calls) == 2
+
+
 def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
     weights = [mx.zeros((4, 4), dtype=mx.int8) for _ in range(3)]
     calls = []
@@ -803,6 +973,7 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
     monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
     result = ane_patch._compile_single_banks(weights, 2048)
 
@@ -822,6 +993,8 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -873,6 +1046,8 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -906,6 +1081,8 @@ def test_enable_env_cap_forces_split_banks(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     compiled = []
 
     def compile_bank(weights, sequence_length, ane_instance):
@@ -938,6 +1115,8 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
 
     def compile_bank(weights, sequence_length, ane_instance):
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
@@ -2287,6 +2466,7 @@ def test_prefill_status_reports_configured_layers():
     assert ane_patch.qwen35_ane_prefill_status(model) == {
         "attempted": True,
         "configured": True,
+        "shed": False,
         "mlp_layers": 12,
         "gdn_layers": 4,
         "dual_ane_layers": 8,
@@ -2546,6 +2726,8 @@ def _builder_test_setup(monkeypatch, builders):
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
+    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(
         fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
     )
@@ -2653,6 +2835,92 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
 
 
 # --- fused bank streaming + CPU warm helper (post-#2935 follow-up) ---
+
+
+def _dual_ane_down_mlp():
+    return SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(128, 1024, bias=False, group_size=128, bits=4),
+        up_proj=nn.QuantizedLinear(128, 1024, bias=False, group_size=128, bits=4),
+        down_proj=nn.QuantizedLinear(1024, 128, bias=False, group_size=128, bits=4),
+    )
+
+
+def _dual_ane_down_config():
+    # hidden=1024 (gate/up out_features); per_ane=128, total_ane=256,
+    # cpu_hidden=128, gpu_start=384 -- all multiples of 128, and
+    # hidden - gpu_start = 640 is also a multiple of 128, so
+    # _prepare_fused_down_for_bank's validity gate passes.
+    return ane_patch._AnePrefillConfig(
+        1,
+        0.5,
+        8,
+        dual_ane=True,
+        cpu_fraction=0.125,
+        ane_down_fraction=0.125,
+        fused_down=True,
+    )
+
+
+def test_prepare_fused_down_for_bank_only_dequantizes_consumed_down_columns(
+    monkeypatch,
+):
+    """C3: dense_down used to dequantize down_proj's ENTIRE packed weight,
+    even though only columns [0:gpu_start] are ever consumed below
+    (down0/down1/cpu_down_weight) -- the [gpu_start:hidden] suffix was
+    computed and immediately discarded, a pure-waste ~0.5GB/layer fp32
+    transient. The down dequantize call must now receive only the
+    gpu_start-wide packed slice, not the full matrix.
+    See docs/qwen35-hardening-and-optimization.md C3."""
+    mlp = _dual_ane_down_mlp()
+    config = _dual_ane_down_config()
+    real_dequantize = mx.dequantize
+    captured_shapes = []
+
+    def spy_dequantize(w, *args, **kwargs):
+        captured_shapes.append(tuple(w.shape))
+        return real_dequantize(w, *args, **kwargs)
+
+    monkeypatch.setattr(ane_patch.mx, "dequantize", spy_dequantize)
+
+    result = ane_patch._prepare_fused_down_for_bank(mlp, config)
+    assert result is not None
+
+    # down's dequantize call is issued first, before any gate/up dense_rows
+    # calls. It must only see the gpu_start-wide packed slice (384 // 8 =
+    # 48 columns), not the full 1024 // 8 = 128 columns of down_proj's
+    # packed weight.
+    full_packed_width = mlp.down_proj.weight.shape[1]
+    assert full_packed_width == 128
+    assert captured_shapes[0][1] == 48
+    assert captured_shapes[0][1] < full_packed_width
+
+
+def test_prepare_fused_down_for_bank_sliced_dequant_matches_full_dequant():
+    """Correctness check for the C3 optimization: dequantizing only the
+    consumed prefix of the down matrix must be bit-identical to the old
+    dequantize-the-whole-thing-then-slice behavior, not merely faster."""
+    mlp = _dual_ane_down_mlp()
+    config = _dual_ane_down_config()
+
+    result = ane_patch._prepare_fused_down_for_bank(mlp, config)
+    assert result is not None
+    state, (gate0, up0, down0, gate1, up1, down1) = result
+
+    down = mlp.down_proj
+    reference = mx.dequantize(
+        down.weight, down.scales, down.biases, group_size=128, bits=4
+    ).astype(mx.float32)
+    per_ane, total_ane, gpu_start = 128, 256, 384
+    assert bool(mx.array_equal(down0, mx.contiguous(reference[:, :per_ane])))
+    assert bool(
+        mx.array_equal(down1, mx.contiguous(reference[:, per_ane:total_ane]))
+    )
+    assert bool(
+        mx.array_equal(
+            state.cpu_down_weight,
+            mx.contiguous(reference[:, total_ane:gpu_start]).astype(mx.float16),
+        )
+    )
 
 
 class _RecorderFusedBankBuilder:
@@ -2791,3 +3059,265 @@ def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
     ane_patch._warm_cpu_sharing_path(64, [mlp], [gdn])
 
     assert calls == [("mlp", (1, 64, 32)), ("gdn", (1, 64, 32))]
+
+# --- opt-in reuse of Apple ANE compiled programs ---
+
+
+_ANE_MM_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+)
+
+
+@pytest.fixture(scope="module")
+def ane_mm() -> str:
+    return _ANE_MM_PATH.read_text(encoding="utf-8")
+
+
+def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
+    gate = re.search(r"bool ane_compile_cache_enabled\(\) \{.*?\n\}", ane_mm, re.S)
+    assert gate, "ane_compile_cache_enabled() is absent from qwen35_ane.mm"
+    assert 'getenv("OMLX_QWEN35_ANE_COMPILE_CACHE")' in gate.group()
+    assert 'strcmp(value, "1") == 0' in gate.group()
+
+
+def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
+    """Individual linear, single fused SwiGLU/down, linear banks, and fused
+    banks use one instance-aware cache/fallback implementation."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 5
+    assert ane_mm.count("model, identifier, ane_instance") == 4
+    assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
+
+
+def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
+    """A cache-rooted path that resolves elsewhere must be left alone, while
+    the historical temp path still deletes directly."""
+    body = re.search(
+        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
+        ane_mm,
+        re.S,
+    )
+    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
+    assert "ANE compile cache cleanup skipped" in body.group()
+    assert "stringByResolvingSymlinksInPath" in body.group()
+
+
+def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
+    """Never unlink a lock path while waiters may hold its old inode open.
+
+    Recreating the pathname would establish a second lock domain and allow
+    two processes to mutate the same staging directory concurrently.
+    """
+    assert "NSString *ane_compile_cache_lock_path(NSString *entry_directory)" in ane_mm
+    assert ane_mm.count("ane_compile_cache_lock_path(") == 2
+    assert "unlink(ane_compile_cache_lock_path" not in ane_mm
+    assert "Never unlink this path" in ane_mm
+
+
+def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
+    """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
+    assert "persistent_" not in ane_mm
+    assert ane_mm.count("remove_ane_staging_directory(directory_)") == 2
+    assert "ScopedAneCacheLock cache_lock(directory);" in ane_mm
+    assert "ANE compile cache cleanup deferred" in ane_mm
+    assert "NSTemporaryDirectory()" in ane_mm
+
+
+def test_compile_cache_hit_restores_without_recompiling(ane_mm):
+    assert "@selector(setModelURL:)" in ane_mm
+    assert "@selector(compiledModelExists)" in ane_mm
+    assert re.search(r"if \(!restored\) \{\s*compile_fresh\(\);\s*\}", ane_mm)
+
+
+def test_compile_cache_hit_load_failure_invalidates_then_compiles_once(ane_mm):
+    assert "ANE compile cache fallback" in ane_mm
+    assert ane_mm.count("compile_fresh();") == 2
+    assert ane_mm.count("@selector(loadWithQoS:options:error:)") == 2
+
+
+def test_compile_cache_path_is_stable_per_os_and_instance(ane_mm):
+    assert "NSCachesDirectory" in ane_mm
+    assert 'stringByAppendingPathComponent:@"v1"' in ane_mm
+    assert "operatingSystemVersionString" in ane_mm
+    assert re.search(r'@"%@\.i%d"', ane_mm)
+    assert "fileURLWithPath:directory" in ane_mm
+
+
+def test_compile_cache_serializes_cross_process_writers(ane_mm):
+    assert "#include <sys/file.h>" in ane_mm
+    assert re.search(r"flock\(.*LOCK_EX", ane_mm)
+    assert "Hold the entry lock from probe through load" in ane_mm
+
+
+def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
+    assert "ANE compile cache unavailable" in ane_mm
+    assert "temporary" in ane_mm
+
+def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
+    for event in ("hit", "miss", "fallback"):
+        assert f'@"oMLX: ANE compile cache {event}' in ane_mm
+
+def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
+    """A suspended holder must not hang later loads: non-blocking flock with a
+    deadline, failing open to the temp path on timeout."""
+    assert "LOCK_EX | LOCK_NB" in ane_mm
+    assert "kAneCacheLockTimeout" in ane_mm
+    assert "ANE compile cache lock acquisition timed out" in ane_mm
+
+
+def test_compile_cache_staging_delete_resolves_symlinks(ane_mm):
+    """The cache-root prefix check must compare resolved paths so a symlink
+    under the root cannot redirect the delete outside it."""
+    assert "stringByResolvingSymlinksInPath" in ane_mm
+
+class _ReleasableModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Linear(4, 4)
+        self.gdn = nn.Linear(4, 4)
+
+
+class _NativeHandle:
+    """Weakref-able stand-in for a compiled AneLinearModel."""
+
+
+def test_release_latches_modules_drops_states_and_zeroes_counters():
+    import gc
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    model.mlp._omlx_ane_prefill_state = SimpleNamespace(model=handle)
+    model.gdn._omlx_ane_gdn_state = SimpleNamespace(model=_NativeHandle())
+    model._omlx_ane_mlp_prefill_count = 1
+    model._omlx_ane_gdn_prefill_count = 1
+    model._omlx_ane_dual_prefill_count = 1
+    model._omlx_ane_resident_program_count = 2
+
+    released, programs = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    assert (released, programs) == (2, 2)
+    assert model.mlp._omlx_ane_prefill_state is None
+    assert model.gdn._omlx_ane_gdn_state is None
+    # The latch is what stops the dispatch sites from lazily recompiling a
+    # missing state -- without it the release would be a slow no-op.
+    assert model.mlp._omlx_ane_prefill_failed is True
+    assert model.gdn._omlx_ane_gdn_failed is True
+    # The dropped state held the last reference: the native handle dies with
+    # it, which is what actually returns the mapped bank memory.
+    assert ref() is None
+    status = ane_patch.qwen35_ane_prefill_status(model)
+    assert status["attempted"] is True
+    assert status["configured"] is False
+    assert status["shed"] is True
+    assert status["resident_programs"] == 0
+
+
+def test_release_is_idempotent_and_noop_without_slices():
+    model = _ReleasableModel()
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+    model.mlp._omlx_ane_prefill_state = SimpleNamespace(model=_NativeHandle())
+    ane_patch.release_qwen35_ane_prefill(model)
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
+# --- dashboard toggle for the compile cache ---
+
+
+def test_compile_cache_setting_round_trips_and_defaults_off():
+    """The advanced-settings toggle must persist in settings.json and stay
+    off for installs that predate it."""
+    from omlx.settings import CacheSettings
+
+    cache = CacheSettings(ane_compile_cache=True)
+    assert CacheSettings.from_dict(cache.to_dict()).ane_compile_cache is True
+
+    assert CacheSettings.from_dict({}).ane_compile_cache is False
+    assert CacheSettings().ane_compile_cache is False
+
+
+def test_compile_cache_setting_exports_the_native_env_gate(monkeypatch):
+    """serve exports the env var the native gate reads once at the first
+    compile; an explicit env override wins."""
+    import os
+
+    source = (
+        Path(__file__).resolve().parents[1] / "omlx/cli.py"
+    ).read_text(encoding="utf-8")
+    assert 'os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")' in source
+
+    monkeypatch.delenv("OMLX_QWEN35_ANE_COMPILE_CACHE", raising=False)
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "1"
+
+    monkeypatch.setenv("OMLX_QWEN35_ANE_COMPILE_CACHE", "0")
+    os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
+    assert os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] == "0"
+
+
+# --- below-floor GDN fraction is explained, not silent (#2899, #2905) ---
+
+
+def _floor_gdn(z_outputs: int, qkv_outputs: int):
+    return SimpleNamespace(
+        in_proj_z=SimpleNamespace(weight=SimpleNamespace(shape=(z_outputs, 1))),
+        in_proj_qkv=SimpleNamespace(weight=SimpleNamespace(shape=(qkv_outputs, 1))),
+    )
+
+
+def test_min_viable_gdn_fraction_tracks_the_alignment():
+    """Single-ANE slices align to 64, dual to 128, so the same model has a
+    different floor in each mode."""
+    gdn = _floor_gdn(512, 1536)
+
+    assert ane_patch._min_viable_gdn_fraction(gdn, 128) == 0.25
+    total = 2048
+    assert (int(total * 0.25) // 128) * 128 >= 512
+    assert (int(total * 0.15) // 128) * 128 < 512
+
+    # A 64-aligned slice reaches z at the same 0.25 here, but the rule is
+    # evaluated against the requested alignment, not a fixed 128.
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 64) == 0.15625
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) == 0.1875
+
+    # z alone larger than the whole projection can never engage
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None
+
+
+def test_warn_gdn_below_floor_names_the_floor(monkeypatch, caplog):
+    model = SimpleNamespace(modules=lambda: [_floor_gdn(512, 1536)])
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda module: True)
+
+    with caplog.at_level(logging.WARNING):
+        ane_patch._warn_gdn_below_floor(model, True, 0, 0.15, True)
+
+    assert "0.150" in caplog.text and "0.250" in caplog.text
+
+
+def test_warn_gdn_below_floor_stays_quiet_when_the_fraction_is_viable(
+    monkeypatch, caplog
+):
+    """Only a below-floor fraction gets the warning: a 0 count from a compile
+    failure or from GDN being off has its own reporting."""
+    model = SimpleNamespace(modules=lambda: [_floor_gdn(512, 1536)])
+    monkeypatch.setattr(ane_patch, "_eligible_gdn", lambda module: True)
+
+    with caplog.at_level(logging.WARNING):
+        ane_patch._warn_gdn_below_floor(model, True, 0, 0.45, True)
+        ane_patch._warn_gdn_below_floor(model, False, 0, 0.15, True)
+        ane_patch._warn_gdn_below_floor(model, True, 12, 0.15, True)
+
+    assert "floor" not in caplog.text
+
+
+def test_tuner_floor_delegates_to_the_patch_rule():
+    """One implementation of the bank rule, so the tuner grid clamp and the
+    enable-path warning cannot disagree."""
+    from omlx.admin import ane_tuning
+    from omlx.patches import qwen35_ane_prefill as patch
+
+    gdn = _floor_gdn(512, 1536)
+    assert ane_tuning._min_viable_gdn_fraction(
+        patch, gdn, 128
+    ) == patch._min_viable_gdn_fraction(gdn, 128)

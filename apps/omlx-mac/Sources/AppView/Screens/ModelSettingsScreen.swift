@@ -1763,10 +1763,10 @@ private struct ExperimentalSection: View {
         _ recommendation: ANETuningRecommendationDTO
     ) -> String {
         if !recommendation.enabled {
-            return String(
-                format: "GPU-only recommended (%.1f tok/s)",
-                recommendation.processingTps
-            )
+            guard let tps = recommendation.processingTps else {
+                return "GPU-only recommended"
+            }
+            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
         var parts = [
@@ -1789,12 +1789,12 @@ private struct ExperimentalSection: View {
         if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
             parts.append("Pad tails ≥\(threshold)")
         }
-        return String(
-            format: "%@ · %.1f tok/s (%+.1f%%)",
-            parts.joined(separator: " · "),
-            recommendation.processingTps,
-            recommendation.speedupPercent
-        )
+        let summary = parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps,
+              let speedup = recommendation.speedupPercent else {
+            return summary
+        }
+        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
     }
 
     private func aneCandidateResultText(
