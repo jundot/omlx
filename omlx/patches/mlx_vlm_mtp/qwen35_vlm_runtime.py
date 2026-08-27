@@ -314,6 +314,19 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         is accepted and discarded — the mlx-vlm path uses post-hoc
         ``rollback_speculative_cache`` instead of a confirmed/draft split.
         """
+        if getattr(self, "_omlx_mtp_owns_hidden_capture", False):
+            # This wrap lands on the shared qwen3_5 LanguageModel class, so
+            # every subclass inherits it process-wide - including qwen4_exp,
+            # whose Lightning MTP head takes the un-mixed hyper-connection
+            # streams and therefore drives its own capture against the stock
+            # base. Rewriting that subclass's capture_layer_ids below handed
+            # its head the mixed trunk hidden instead: "Qwen4 Lightning MTP
+            # expects hidden shape [batch, tokens, hc_count * hidden_size]" on
+            # every request, once any qwen3_5-family MTP model had been loaded
+            # earlier in the same process (#3212, #3220).
+            kwargs.pop("n_confirmed", None)
+            return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
+
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)

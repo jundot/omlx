@@ -746,3 +746,60 @@ def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
         from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
 
         configure_ple_runtime(compute, mode="resident")
+
+
+def _tiny_mtp_language_model():
+    """Tiny qwen4_exp text model with a Lightning MTP head bound to it."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
+
+    class _MTPOwner:  # weakref-able stand-in for the outer Model
+        pass
+
+    model = LanguageModel(config.text_config, config)
+    owner = _MTPOwner()
+    owner.mtp = Qwen4ExpMTPModule(config.text_config)
+    model.bind_mtp_owner(owner)
+    return config, model, owner
+
+
+def test_qwen4_lightning_mtp_hidden_survives_dense_qwen35_runtime_patch():
+    """A qwen3_5-family MTP load must not repoint qwen4's hidden capture.
+
+    The dense runtime patch installs its ``__call__`` on the shared qwen3_5
+    ``LanguageModel``, so it reaches every subclass in the process. Qwen4's
+    head fuses the un-mixed hyper-connection streams; handed the mixed trunk
+    hidden it raised "Qwen4 Lightning MTP expects hidden shape [batch, tokens,
+    hc_count * hidden_size]" on every request until the server restarted
+    (#3212, #3220).
+    """
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    for _ in range(2):
+        config, model, _owner = _tiny_mtp_language_model()
+        text = config.text_config
+        expected_width = text.hc_count * text.hidden_size
+
+        out = model(
+            mx.array([[2, 3, 4]], dtype=mx.int32),
+            cache=model.make_cache(),
+            return_hidden=True,
+        )
+        hidden = out.hidden_states[-1]
+        mx.eval(hidden)
+        assert hidden.shape == (1, 3, expected_width)
+
+        logits, head_hidden = model.mtp_forward(
+            hidden[:, -1:],
+            mx.array([[7]], dtype=mx.uint32),
+            model.make_mtp_cache(),
+            return_hidden=True,
+            logits_keep=1,
+        )
+        mx.eval(logits, head_hidden)
+        assert logits.shape == (1, 1, text.vocab_size)
+        assert head_hidden.shape == (1, 1, expected_width)
+
+        # Second pass runs with a Qwen3.5/3.6-family MTP model's runtime
+        # patch already installed process-wide, as a model switch leaves it.
+        apply_mlx_vlm_mtp_runtime_patch()

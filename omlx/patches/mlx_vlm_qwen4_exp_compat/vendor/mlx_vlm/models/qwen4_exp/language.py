@@ -1723,6 +1723,14 @@ class Qwen4ExpMTPModule(nn.Module):
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    # Lightning MTP here fuses the un-mixed hyper-connection streams
+    # (hc_count * hidden_size), not the mixed trunk hidden every other Qwen
+    # head takes, so ``__call__`` below runs its own capture against the
+    # STOCK base implementation. The dense qwen3_5 MTP runtime patch
+    # rewrites ``capture_layer_ids`` on that shared base class for the whole
+    # process; this marker keeps it off this subclass.
+    _omlx_mtp_owns_hidden_capture = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
