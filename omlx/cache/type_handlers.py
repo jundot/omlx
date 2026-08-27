@@ -1451,6 +1451,55 @@ def _deserialize_qsa_positions(position_ids: Any) -> Any:
     return position_ids.transpose(1, 0, 2)
 
 
+def _normalize_qsa_position_states(position_states: list[Any]) -> list[Any]:
+    """Promote mixed text/MRoPE QSA positions to [B, 3, S].
+
+    Qwen4 represents text positions as [B, S] and MRoPE positions as
+    [3, B, S]. Serialization stores those as [B, 1, S] and [B, 3, S]
+    respectively. The model's indexer cache promotes the text form by
+    broadcasting it across all three MRoPE coordinates when the two forms
+    meet, so block reconstruction must perform the equivalent operation
+    before concatenating along the sequence axis.
+    """
+    if not position_states:
+        return position_states
+
+    batch_size = None
+    channels: set[int] = set()
+    for position_state in position_states:
+        if not hasattr(position_state, "ndim") or position_state.ndim != 3:
+            shape = getattr(position_state, "shape", None)
+            raise ValueError(
+                "Serialized QSA position IDs must be [B, C, S], "
+                f"got {shape}."
+            )
+        current_batch, current_channels, _ = position_state.shape
+        if current_channels not in (1, 3):
+            raise ValueError(
+                "Serialized QSA position IDs require 1 text channel or 3 "
+                f"MRoPE channels, got {position_state.shape}."
+            )
+        if batch_size is None:
+            batch_size = current_batch
+        elif current_batch != batch_size:
+            raise ValueError(
+                "Serialized QSA position IDs must have a consistent batch "
+                f"dimension, got {batch_size} and {current_batch}."
+            )
+        channels.add(current_channels)
+
+    # Preserve both homogeneous paths without introducing broadcast views.
+    if len(channels) == 1:
+        return position_states
+
+    return [
+        mx.broadcast_to(state, (state.shape[0], 3, state.shape[2]))
+        if state.shape[1] == 1
+        else state
+        for state in position_states
+    ]
+
+
 class Qwen4QSAKVCacheHandler(CacheTypeHandler):
     """Handler for Qwen4 QSA caches with raw index keys and positions."""
 
@@ -1544,6 +1593,8 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
                     grouped[index].append(element)
         concatenated = []
         for info, elements in zip(self.get_state_axis_info(), grouped):
+            if info.name == "index_position_ids":
+                elements = _normalize_qsa_position_states(elements)
             concatenated.append(
                 mx.concatenate(elements, axis=info.sequence_axis) if elements else None
             )
