@@ -5642,10 +5642,20 @@ def _steered_classifier_model(request) -> str | None:
         )
         return None
 
-    tier_model = getattr(
-        claude_code, f"{claude_code.classifier_model_tier}_model", None
-    )
-    return tier_model or None
+    tier_models = {
+        "opus": claude_code.opus_model,
+        "sonnet": claude_code.sonnet_model,
+        "haiku": claude_code.haiku_model,
+    }
+    tier_model = tier_models.get(claude_code.classifier_model_tier)
+    if not tier_model:
+        logger.warning(
+            "Classifier steering is enabled but tier '%s' has no model "
+            "configured; not steering this request",
+            claude_code.classifier_model_tier,
+        )
+        return None
+    return tier_model
 
 
 @app.post("/v1/messages")

@@ -455,6 +455,15 @@ class TestSteeredClassifierModel:
         result = self._call(_request(_classifier_payload()), server)
         assert result is None
 
+    def test_enabled_but_tier_model_unset_logs_warning(self, monkeypatch, caplog):
+        server = self._server_state_with(monkeypatch, steer=True, tier="opus")
+        with caplog.at_level("WARNING", logger="omlx.server"):
+            self._call(_request(_classifier_payload()), server)
+        assert any(
+            "opus" in record.message and "no model" in record.message
+            for record in caplog.records
+        )
+
     def test_enabled_but_not_a_classifier_request_returns_none(self, monkeypatch):
         server = self._server_state_with(
             monkeypatch, steer=True, haiku_model="local-haiku-4bit"
