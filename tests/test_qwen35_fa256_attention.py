@@ -48,8 +48,10 @@ def _install_fake_vlm_base(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fresh_fa256_patch(monkeypatch):
     import omlx.patches.qwen35_fa256_attention as patch
+    from omlx import memory_monitor
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
+    memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
     # Pin the NAX auto-gate off so apply/route behavior stays identical on
     # M5-family test machines; the NAX gating tests override this locally.
     monkeypatch.setattr(patch, "is_nax_available", lambda: False)
@@ -68,6 +70,7 @@ def _fresh_fa256_patch(monkeypatch):
     monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
+    memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
 def test_route_gate_is_qwen_fa256_only():
@@ -137,6 +140,13 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
             patch._DEFAULT_DISPATCH_BUDGET,
         )
     ]
+
+    from omlx import memory_monitor
+
+    routes = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS[256]
+    assert any(
+        route.min_query_len == 16 and route.min_kv_len == 16 for route in routes
+    )
 
     q_decode, _, _ = _qkv(1, 32)
     assert (
@@ -223,9 +233,8 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
 
 def test_apply_skips_on_nax_gpu(monkeypatch):
-    # On NAX GPUs stock SDPA's unfused head_dim-256 prefill runs its matmuls
-    # on the tensor units and beats the pre-NAX steel kernel (M5 Max report:
-    # 4k pp 828 -> 400 tok/s), so the auto mode must not install the patch.
+    # MLX 0.32.2 has a native NAX split-D fused path for head-dim-256 causal
+    # prefill, so the auto mode must not replace it with the pre-NAX kernel.
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "is_nax_available", lambda: True)

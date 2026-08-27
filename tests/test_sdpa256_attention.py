@@ -2,7 +2,7 @@
 """Tests for the head_dim=256 long-context prefill SDPA patch.
 
 Covers (without needing the full Qwen3.6 model):
-  - the flash kernel matches mx.fast.scaled_dot_product_attention numerically
+  - the forced native kernel matches default MLX SDPA numerically
     (square causal, chunked-prefill non-square causal, and decode shapes);
   - the route gate engages only for head_dim=256 / qL>1 / causal / long kv;
   - the patched SDPA passes through unchanged for non-256 / decode / short kv;
@@ -10,7 +10,7 @@ Covers (without needing the full Qwen3.6 model):
     registered, and stays O(L^2) otherwise;
   - memory-aware routing (issue #2204): with a headroom provider registered
     the route prefers the faster unfused fallback whenever its transient
-    fits, and falls back to always-tiled without headroom info.
+    fits, and falls back to forced fused without headroom info.
 """
 
 import logging
@@ -82,6 +82,24 @@ def test_flash_sdpa256_memory_is_sub_quadratic():
     assert peaks[1] < 6 * peaks[0]
 
 
+def test_metal_bounded_path_forces_mlx0322_fused_kernel(monkeypatch):
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    calls = []
+
+    def fake_sdpa(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", fake_sdpa)
+    q, k, v = object(), object(), object()
+    assert sdpa256._flash_sdpa256(q, k, v, SCALE_256, "causal") is q
+    assert calls == [
+        {"scale": SCALE_256, "mask": "causal", "force_fused": True}
+    ]
+
+
 # --- route gate ----------------------------------------------------------
 
 
@@ -95,7 +113,7 @@ def test_should_route_gate():
     qd, kd, _ = _qkv(1, 16384)
     assert sdpa256._should_route(qd, kd, None, "causal", None) is False
     # decode-shaped multi-row (MTP verify, qL = 1 + depth <= 9) -> stock path;
-    # the per-tile eval sync collapses long-context MTP tok/s (issue #2127)
+    # tiny-query fused routing is already handled by MLX's vector kernel
     for q_len in (2, 4, 9, 15):
         qv, kv, _ = _qkv(q_len, 16384)
         assert sdpa256._should_route(qv, kv, None, "causal", None) is False
@@ -214,6 +232,35 @@ def test_estimator_switches_to_ol_when_registered():
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
+def test_estimator_keeps_registered_route_thresholds_independent():
+    """Two bounded kernels must not create coverage neither one provides."""
+    from omlx import memory_monitor as mm
+
+    monitor = mm.MemoryMonitor.__new__(mm.MemoryMonitor)
+    monitor._head_dim = 256
+    monitor._num_attention_heads = 24
+    monitor._num_kv_heads = 4
+    monitor._score_dtype_size = 2
+
+    mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+    mm.register_tiled_prefill_head_dim(
+        256, min_query_len=16, min_kv_len=8192, kv_tile=1024
+    )
+    mm.register_tiled_prefill_head_dim(
+        256, min_query_len=64, min_kv_len=2048, kv_tile=512
+    )
+    try:
+        # q=16 / kv=2048 satisfies one threshold from each registration but
+        # neither complete route, so the estimate must remain quadratic.
+        estimate = monitor._estimate_sdpa_activation_bytes(16, 2048)
+        assert estimate == mm.estimate_unfused_sdpa_call_bytes(
+            24, 16, 2048, 256, 2
+        )
+        assert monitor._estimate_sdpa_activation_bytes(64, 2048) < estimate * 4
+    finally:
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
 def test_unfused_call_bytes_shared_with_guard_estimator():
     """The route gate and the guard must price the unfused path identically:
     the guard's unfused branch is the shared module function."""
@@ -268,7 +315,7 @@ def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
     need = estimate_unfused_sdpa_call_bytes(24, 2048, 16384, 256, q.dtype.size)
     owner.value = need
     assert sdpa256._should_route(q, k, None, "causal", None) is False
-    # ...one byte short -> tiled.
+    # ...one byte short -> forced fused.
     owner.value = need - 1
     assert sdpa256._should_route(q, k, None, "causal", None) is True
 
@@ -328,19 +375,19 @@ def test_parse_force_tiled_env(monkeypatch):
     assert sdpa256._parse_force_tiled_env() is False
 
 
-# --- tiled-route engagement logging (issue #2283) --------------------------
+# --- bounded-route engagement logging (issue #2283) ------------------------
 
 
 def _tiled_log_records(caplog):
     return [
         r
         for r in caplog.records
-        if r.levelname == "INFO" and "tiled" in r.getMessage()
+        if r.levelname == "INFO" and "memory-bounded path" in r.getMessage()
     ]
 
 
 def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
-    """Guard-off servers land on the tiled path silently (issue #2283); the
+    """Guard-off servers land on forced fused silently (issue #2283); the
     first engagement must say so at INFO, repeats must stay quiet."""
     sdpa256 = _sdpa256_provider_reset
     q, k, _ = _qkv(2048, 16384)
@@ -415,7 +462,7 @@ def test_scheduler_headroom_provider_math():
 
     fake = _Fake()
     # Nothing propagated yet: guard state is unknown, so the negative
-    # sentinel keeps the tiled default even though the flag reads False.
+    # sentinel keeps the bounded default even though the flag reads False.
     assert Scheduler._sdpa256_unfused_headroom(fake) == -1
 
     # Enforcer has spoken and the guard is explicitly off: the user opted
@@ -472,8 +519,8 @@ def test_unguarded_fast_path_logs_once(caplog):
 
 def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
     """Constructing a Scheduler must wire the provider (the production seam:
-    a rename that silently skips registration would revert #2204 to
-    always-tiled)."""
+    a rename that silently skips registration would revert #2204 to an
+    unbounded default)."""
     from unittest.mock import MagicMock
 
     from omlx.scheduler import Scheduler, SchedulerConfig
@@ -493,7 +540,7 @@ def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
     bound = ref()
     assert bound is not None
     assert bound.__self__ is scheduler
-    # Ceiling not propagated yet -> negative sentinel keeps the tiled default.
+    # Ceiling not propagated yet -> negative sentinel keeps the bounded default.
     assert bound() == -1
 
 

@@ -42,6 +42,7 @@ from typing import Any, Callable, Generator, List, Optional, Set, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_vlm.speculative import common as _vlm_common
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 
 # The round loops dispatch their target-verify and cache-rollback forwards
@@ -49,7 +50,6 @@ from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 # thread-local stream — a different object from mlx-lm's generation_stream
 # and from the per-engine stream. Draining the MTP work means draining this
 # one, resolved on the thread that advances the round loop.
-from mlx_vlm.speculative.common import generation_stream as _vlm_generation_stream
 
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
@@ -62,8 +62,17 @@ except Exception:  # pragma: no cover - compatibility with older mlx-vlm
     def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
         return None
 
+from ..patches.mlx_vlm_mlx0322_compat import (
+    apply_mlx_vlm_mlx0322_compat_patch,
+)
 from ..utils.metal_sync import _sync_and_clear_cache
 from ..utils.model_loading import materialize_lazy_state
+
+# MLX 0.32.2 changed mx.random.state from a mutable list to an in-place state
+# proxy. Reload/rebind the already-imported speculative module with the narrow
+# mlx-vlm PR #1949 backport, then retain its replacement thread-local stream.
+apply_mlx_vlm_mlx0322_compat_patch()
+_vlm_generation_stream = _vlm_common.generation_stream
 
 logger = logging.getLogger(__name__)
 

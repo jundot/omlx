@@ -1925,8 +1925,8 @@ class Scheduler:
         self._fixed_state_measure_armed: bool = False
         self._fixed_state_recorded: bool = False
         # Let the sdpa256 head_dim-256 prefill route ask for live guard
-        # headroom so it only takes the slow O(L) tiled pass when the faster
-        # unfused fallback would not fit (issue #2204). Weakly held; harmless
+        # headroom so it only forces bounded native SDPA when the faster
+        # unfused default would not fit (issue #2204). Weakly held; harmless
         # when the patch is never applied.
         set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
 
@@ -3854,11 +3854,10 @@ class Scheduler:
         same target the adaptive prefill throttle enforces (hard ceiling x
         headroom safety, clamped by the abort cap). Negative when the
         ceiling is unknown (enforcer not propagated yet), which tells the
-        sdpa256 route to keep its memory-safe tiled default. When the guard
+        sdpa256 route to keep its memory-bounded default. When the guard
         is explicitly disabled there is no ceiling to respect: the user
         opted out of memory management, so the route gets unbounded
-        headroom and keeps the unfused fast path instead of pinning
-        guard-off servers to the ~2x-slower tiled pass (#2283). Called from
+        headroom and keeps the unfused fast path (#2283). Called from
         the route gate on the MLX step thread mid-prefill, where refreshing
         the active-memory sample is safe (issue #2204)."""
         hard_cap = self._memory_hard_limit_bytes
@@ -3871,7 +3870,7 @@ class Scheduler:
                         "prefill keeps the unfused fast path with no memory "
                         "ceiling (long-context OOM protection off). Enable "
                         "the memory guard or set OMLX_SDPA256_TILED=1 for "
-                        "the memory-safe tiled path."
+                        "the memory-bounded path."
                     )
                 return _SDPA256_UNBOUNDED_HEADROOM
             return -1

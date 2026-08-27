@@ -77,9 +77,9 @@ contiguous-layer and physical-memory checks may adjust or refuse.
 ## Current platform reality
 
 This design no longer depends on treating CUDA support as an unofficial MLX
-experiment. [MLX 0.32.0 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
+experiment. [MLX 0.32.2 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
 including Linux ARM wheels relevant to DGX Spark. oMLX already pins
-`mlx==0.32.0` in this branch.
+`mlx==0.32.2` in this branch.
 
 MLX provides several distributed transports:
 

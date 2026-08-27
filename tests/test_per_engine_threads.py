@@ -250,20 +250,14 @@ class TestPerEngineExecutor:
 
             engine.close()
 
-    def test_close_clears_compile_cache_then_shuts_down(self):
-        """Normal path (compile-cache clear available): close() clears the
-        worker thread's MLX thread_local compile cache (so ~CompilerCache is a
-        no-op at thread exit) and then shuts the executor down normally."""
-        import omlx.engine_core as ec
-
+    def test_close_reclaims_then_shuts_down_worker(self):
+        """MLX 0.32.2 workers shut down normally after final reclaim."""
         mock_model = MagicMock()
         mock_model.model_type = "test"
         mock_tokenizer = MagicMock()
         mock_tokenizer.eos_token_id = 0
 
         with patch("omlx.engine_core.get_registry") as mock_registry, patch(
-            "omlx.engine_core.compile_cache_clear_available", return_value=True
-        ), patch("omlx.engine_core.clear_thread_compile_cache") as mock_clear, patch(
             "omlx.engine_core._final_engine_thread_reclaim"
         ) as mock_reclaim:
             mock_registry.return_value.acquire.return_value = True
@@ -280,45 +274,15 @@ class TestPerEngineExecutor:
 
             mock_model.release_resources.side_effect = lambda: events.append("release")
             mock_reclaim.side_effect = reclaim_side_effect
-            mock_clear.side_effect = lambda: events.append("compile")
             engine.close()
 
-            # Memory is reclaimed after dropping engine refs, then the compile
-            # cache is cleared on the worker thread before thread shutdown.
+            # Memory is reclaimed after dropping engine refs, then MLX 0.32.2
+            # can tear the worker down without a private cache-clear symbol.
             mock_model.release_resources.assert_called_once_with()
             mock_reclaim.assert_called_once_with(engine._mlx_stream)
-            mock_clear.assert_called()
-            assert events == ["release", "reclaim", "compile"]
+            assert events == ["release", "reclaim"]
             assert engine._mlx_executor is None
             assert executor._shutdown
-            assert executor not in ec._immortal_mlx_executors
-
-    def test_close_keeps_executor_alive_when_clear_unavailable(self):
-        """Fallback (clear symbol unresolvable, e.g. a future MLX rename):
-        close() must NOT exit the worker thread, since that would run MLX's
-        thread_local ~CompilerCache and crash for @mx.compile models. The
-        executor + stream are pinned immortal for the process lifetime."""
-        import omlx.engine_core as ec
-
-        mock_model = MagicMock()
-        mock_model.model_type = "test"
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.eos_token_id = 0
-
-        with patch("omlx.engine_core.get_registry") as mock_registry, patch(
-            "omlx.engine_core.compile_cache_clear_available", return_value=False
-        ):
-            mock_registry.return_value.acquire.return_value = True
-
-            engine = EngineCore(mock_model, mock_tokenizer)
-            executor = engine._mlx_executor
-            stream = engine._mlx_stream
-            engine.close()
-
-            assert engine._mlx_executor is None
-            assert not executor._shutdown
-            assert executor in ec._immortal_mlx_executors
-            assert stream in ec._immortal_mlx_streams
 
 
 class TestConcurrentStreamIsolation:

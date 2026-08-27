@@ -44,10 +44,6 @@ from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
-from .utils.compile_cache import (
-    clear_thread_compile_cache,
-    compile_cache_clear_available,
-)
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
 
@@ -80,17 +76,6 @@ def _raise_request_output_error(output: RequestOutput) -> None:
 
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
-
-# Fallback only: used when the MLX compile-cache clear symbol is unavailable
-# (see omlx/utils/compile_cache.py). In that case a per-engine MLX worker
-# thread cannot exit safely (its thread_local ~CompilerCache would free
-# @mx.compile graphs' Python objects without the GIL -> crash), so close()
-# keeps the executor + stream alive here for the process lifetime instead of
-# shutting the thread down. With the clear symbol present (the normal path)
-# these stay empty and the worker threads shut down normally.
-_immortal_mlx_executors: list = []
-_immortal_mlx_streams: list = []
-
 
 def _final_engine_thread_reclaim(stream: Any) -> None:
     """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
@@ -1233,35 +1218,12 @@ class EngineCore:
                     exc_info=True,
                 )
 
-            # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
-            # this worker thread exits with a non-empty cache, ~CompilerCache
-            # frees the cached graphs' Python objects from a thread-exit handler
-            # WITHOUT the GIL -> "PyThreadState_Get: GIL is released" crash for
-            # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
-            # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
-            # held) before the thread is torn down so the destructor runs on an
-            # empty cache, then request shutdown without waiting indefinitely.
-            # See utils/compile_cache.py.
-            if compile_cache_clear_available():
-                try:
-                    self._mlx_executor.submit(clear_thread_compile_cache).result(
-                        timeout=FATAL_TEARDOWN_TIMEOUT_S
-                    )
-                except concurrent.futures.TimeoutError:
-                    fatal_exit(
-                        f"Engine teardown timed out after "
-                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while clearing "
-                        f"MLX compile cache for engine {self._engine_id}"
-                    )
-                except RuntimeError:
-                    pass
-                self._mlx_executor.shutdown(wait=False)
-            else:
-                # Fallback: the clear symbol is unavailable, so do NOT exit the
-                # worker thread (that would run the unsafe destructor). Keep it
-                # alive for the process lifetime via the module-global registry.
-                _immortal_mlx_executors.append(self._mlx_executor)
-                _immortal_mlx_streams.append(self._mlx_stream)
+            # MLX 0.32.2 acquires the GIL before compiled AttachedData is
+            # destroyed at thread exit (ml-explore/mlx #4391), so per-engine
+            # workers can shut down normally. The former private-symbol cache
+            # clear cannot be called on 0.32.2: its C++ signature now requires
+            # the cache instance.
+            self._mlx_executor.shutdown(wait=False)
             self._mlx_executor = None
 
         logger.debug(f"Engine {self._engine_id} closed")
