@@ -841,6 +841,19 @@ class TestDFlashCompatibility:
         assert compatible is False
         assert "config.json" in reason
 
+    def test_non_object_json_is_incompatible(self, tmp_path):
+        """A config.json that's valid JSON but not an object (e.g. an admin
+        pointed dflash_draft_model at an unrelated file) must not raise --
+        cfg.get() only exists on a dict."""
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        (tmp_path / "config.json").write_text(json.dumps([1, 2, 3]))
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is False
+        assert "config.json" in reason
+
     def test_gemma4_top_level_is_compatible(self, tmp_path):
         try:
             from omlx.engine.dflash import is_dflash_compatible

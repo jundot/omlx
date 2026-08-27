@@ -766,6 +766,31 @@
                                         <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
                                     </div>
                                 </div>
+
+                                <!-- Classifier steering -->
+                                <div class="mt-4 pt-4 border-t border-neutral-100 flex items-start justify-between gap-4">
+                                    <div>
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('status.claude_code.steer_classifier_requests') }}</span>
+                                        <p class="mt-0.5 text-xs text-neutral-400">{{ t('status.claude_code.steer_classifier_requests_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.claude_code.steer_classifier_requests = !globalSettings.claude_code.steer_classifier_requests; saveClaudeCodeSettings()"
+                                            :class="globalSettings.claude_code.steer_classifier_requests ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                            class="relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors">
+                                        <span :class="globalSettings.claude_code.steer_classifier_requests ? 'translate-x-5' : 'translate-x-0'"
+                                              class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"></span>
+                                    </button>
+                                </div>
+                                <div x-show="globalSettings.claude_code.steer_classifier_requests" x-cloak class="mt-3">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1.5">{{ t('status.claude_code.classifier_model_tier') }}</label>
+                                    <select x-model="globalSettings.claude_code.classifier_model_tier"
+                                            @change="saveClaudeCodeSettings()"
+                                            class="w-full sm:w-1/3 px-3 py-2 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+                                        <option value="opus">{{ t('status.claude_code.opus_tier') }}</option>
+                                        <option value="sonnet">{{ t('status.claude_code.sonnet_tier') }}</option>
+                                        <option value="haiku">{{ t('status.claude_code.haiku_tier') }}</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                     </div>

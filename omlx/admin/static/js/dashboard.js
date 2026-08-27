@@ -131,7 +131,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, steer_classifier_requests: false, classifier_model_tier: 'haiku' },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -8803,6 +8803,8 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_steer_classifier_requests: this.globalSettings.claude_code.steer_classifier_requests,
+                            claude_code_classifier_model_tier: this.globalSettings.claude_code.classifier_model_tier,
                         }),
                     });
                     if (!response.ok) {

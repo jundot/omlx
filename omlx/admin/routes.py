@@ -317,6 +317,8 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
+    claude_code_steer_classifier_requests: bool | None = None
+    claude_code_classifier_model_tier: str | None = None
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -4315,6 +4317,18 @@ async def update_global_settings(
         claude_code_changed = True
     if "claude_code_haiku_model" in request.model_fields_set:
         global_settings.claude_code.haiku_model = request.claude_code_haiku_model
+        claude_code_changed = True
+    # steer_classifier_requests / classifier_model_tier: like mode, these have
+    # no null state — is-not-None is correct here, not model_fields_set.
+    if request.claude_code_steer_classifier_requests is not None:
+        global_settings.claude_code.steer_classifier_requests = (
+            request.claude_code_steer_classifier_requests
+        )
+        claude_code_changed = True
+    if request.claude_code_classifier_model_tier is not None:
+        global_settings.claude_code.classifier_model_tier = (
+            request.claude_code_classifier_model_tier
+        )
         claude_code_changed = True
 
     if claude_code_changed:

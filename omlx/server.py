@@ -70,6 +70,7 @@ from .api.anthropic_models import (
     TokenCountResponse,
 )
 from .api.anthropic_utils import (
+    classifier_envelope_drift,
     convert_anthropic_to_internal,
     convert_anthropic_to_internal_harmony,
     convert_anthropic_tools_to_internal,
@@ -83,6 +84,7 @@ from .api.anthropic_utils import (
     create_message_stop_event,
     create_text_delta_event,
     create_thinking_delta_event,
+    is_auto_mode_classifier_request,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -5565,6 +5567,87 @@ async def stream_anthropic_messages(
     yield create_message_stop_event()
 
 
+def _apply_auto_mode_classifier_thinking(
+    request, merged_ct_kwargs: dict, forced_keys: set
+) -> None:
+    """Disable thinking when this is Claude Code's auto-mode safety classifier.
+
+    Detection is best-effort and sits on the hot path of every ``/v1/messages``
+    request, so a bug in it must never take down an unrelated one. On failure
+    this degrades to "not the classifier" — the behavior before the workaround
+    existed — instead of propagating out to a 500. The warning is what keeps
+    that from being a silent failure.
+    """
+    try:
+        if not is_auto_mode_classifier_request(request):
+            return
+    except Exception:
+        logger.warning(
+            "Auto-mode classifier detection failed; treating this as a normal "
+            "request",
+            exc_info=True,
+        )
+        return
+
+    if "enable_thinking" in forced_keys:
+        return
+    merged_ct_kwargs["enable_thinking"] = False
+
+    try:
+        drift = classifier_envelope_drift(request)
+    except Exception:
+        logger.warning("Auto-mode classifier drift check failed", exc_info=True)
+        return
+
+    if drift:
+        logger.warning(
+            "Auto-mode classifier matched on the system marker but its "
+            "envelope drifted (%s); disabling thinking anyway. Claude Code "
+            "may have changed the request format.",
+            "; ".join(drift),
+        )
+    else:
+        logger.info(
+            "Auto-mode classifier detected; disabling thinking for this request"
+        )
+
+
+def _steered_classifier_model(request) -> str | None:
+    """Model id to serve this request with instead of ``request.model``, or
+    ``None`` to leave the request untouched (#2).
+
+    Off by default (``steer_classifier_requests``). When enabled, a request
+    matching Claude Code's auto-mode Bash safety-classifier predicate (#1) is
+    served with the configured tier's model instead of whatever the active
+    session requested — the classifier's own reply is discarded by Claude
+    Code either way, so which model actually answers it doesn't need to
+    track the chat model.
+
+    Detection sits on the hot path of every ``/v1/messages`` request and
+    must degrade to "don't steer" on any failure, exactly like
+    ``_apply_auto_mode_classifier_thinking`` — steering an unrelated request
+    to a small model on a detection bug is worse than not steering at all.
+    """
+    claude_code = getattr(_server_state.global_settings, "claude_code", None)
+    if claude_code is None or not claude_code.steer_classifier_requests:
+        return None
+
+    try:
+        if not is_auto_mode_classifier_request(request):
+            return None
+    except Exception:
+        logger.warning(
+            "Auto-mode classifier detection failed; not steering this request",
+            exc_info=True,
+        )
+        return None
+
+    tier_model = getattr(
+        claude_code, f"{claude_code.classifier_model_tier}_model", None
+    )
+    return tier_model or None
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
@@ -5604,10 +5687,16 @@ async def create_anthropic_message(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        # Steering must be decided before engine acquisition — it changes
+        # which model gets loaded, not just how the response is shaped (#2).
+        steered_model = _steered_classifier_model(request)
+        engine = await get_engine_for_model(steered_model or request.model, lease=lease)
 
         # Use the exact model selected by the pool, including fallback.
-        resolved_model = _serving_model_id(lease, request.model)
+        # request.model stays what the caller asked for — the response still
+        # echoes it below, matching model_fallback's existing precedent of
+        # never surfacing a server-side substitution to the client.
+        resolved_model = _serving_model_id(lease, steered_model or request.model)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5628,6 +5717,19 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
+        else:
+            # Claude Code's auto-mode Bash safety classifier sends no thinking
+            # field at all, so a reasoning model would fall through to its own
+            # default and reason past Claude Code's ~35-45s deadline. The
+            # request is then cancelled and the user sees "model is temporarily
+            # unavailable" (#1). Treat it as if the client had asked for
+            # thinking to be disabled — same path, same forced-key precedence,
+            # no new behavior. Reaching the `else` at all is the safety
+            # property: a request that states its own thinking preference took
+            # the branch above and can never be reclassified here.
+            _apply_auto_mode_classifier_thinking(
+                request, merged_ct_kwargs, forced_keys
+            )
 
         _entry = get_engine_pool().get_entry(resolved_model)
 
