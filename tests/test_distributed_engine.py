@@ -1210,3 +1210,117 @@ async def test_peer_health_refresh_logs_even_when_the_probe_breaks(monkeypatch, 
         assert any("peer health refresh took" in m for m in caplog.messages)
     finally:
         await engine._client.aclose()
+
+
+# --- §C1/2.3: SSH green, fabric down -- a different failure than a dead rank.
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_when_ssh_is_up_but_the_data_plane_is_down(
+    monkeypatch,
+):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda hosts, **kwargs: (SimpleNamespace(healthy=True),)
+    )
+    monkeypatch.setattr(
+        distributed,
+        "check_data_plane_reachability",
+        lambda ip: (False, "peer did not answer"),
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="fabric path to peer is down"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_does_not_check_the_data_plane_when_ssh_is_already_down(
+    monkeypatch,
+):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed,
+        "check_peers",
+        lambda hosts, **kwargs: (SimpleNamespace(healthy=False),),
+    )
+    monkeypatch.setattr(distributed, "describe_failure", lambda health: "rank 1 lost")
+    checked = []
+    monkeypatch.setattr(
+        distributed,
+        "check_data_plane_reachability",
+        lambda ip: checked.append(ip) or (False, "would fail if called"),
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="rank 1 lost"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert checked == [], "SSH already failing -- checking the fabric too is redundant"
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_ignores_an_inconclusive_data_plane_result(monkeypatch):
+    """No local subnet match, or anything else the check itself calls
+    unknown rather than failed, must not fail a serving cluster."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda hosts, **kwargs: (SimpleNamespace(healthy=True),)
+    )
+    monkeypatch.setattr(
+        distributed,
+        "check_data_plane_reachability",
+        lambda ip: (None, "no local interface shares a subnet"),
+    )
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_open_when_the_data_plane_probe_itself_breaks(
+    monkeypatch,
+):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda hosts, **kwargs: (SimpleNamespace(healthy=True),)
+    )
+
+    def broken(_ip):
+        raise OSError("route binary missing")
+
+    monkeypatch.setattr(distributed, "check_data_plane_reachability", broken)
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_never_checks_the_data_plane_against_its_own_ip(monkeypatch):
+    """Rank 0 is always the caller (ClusterDeployment guarantees hosts[0] is
+    127.0.0.1) -- its own hostfile IP is not a peer to check."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda hosts, **kwargs: (SimpleNamespace(healthy=True),)
+    )
+    checked = []
+    monkeypatch.setattr(
+        distributed,
+        "check_data_plane_reachability",
+        lambda ip: checked.append(ip) or (True, ""),
+    )
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert checked == ["10.0.0.2"]
+    finally:
+        await engine._client.aclose()

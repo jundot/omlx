@@ -19,6 +19,7 @@ import httpx
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
 from ..cluster.liveness import check_peers, describe_failure
+from ..cluster.transport import check_data_plane_reachability
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -1287,6 +1288,38 @@ class DistributedBatchedEngine(BatchedEngine):
             f"rank-zero backend returned HTTP {response.status_code}{suffix}"
         )
 
+    def _data_plane_failure_detail(self) -> str:
+        """This rank's outbound view of the fabric the collectives ride,
+        as opposed to the SSH control plane every check above uses (§C1).
+
+        Only rank 0 ever calls this -- it is the only rank that serves
+        requests, and ``ClusterDeployment`` guarantees it is always the
+        launcher-local process (``hosts[0].ssh == "127.0.0.1"``), so
+        there is always exactly one outbound view to take. Returns "" on
+        no evidence of a problem, including when the check is
+        inconclusive (no local subnet match, a probe error) -- an
+        ambiguous signal must not fail a serving cluster the way a
+        definite one does.
+        """
+
+        for rank, host in enumerate(self.deployment.hosts):
+            if rank == 0:
+                continue
+            for ip in host.ips:
+                try:
+                    ok, detail = check_data_plane_reachability(ip)
+                except Exception as exc:  # noqa: BLE001 - probe plumbing
+                    logger.warning(
+                        "data-plane probe failed for %s: %s", host.node_id, exc
+                    )
+                    continue
+                if ok is False:
+                    return (
+                        f"the fabric path to {host.node_id} is down "
+                        f"({detail}); SSH still answers"
+                    )
+        return ""
+
     async def _require_healthy_cluster(self) -> None:
         """Refuse a request the cluster cannot serve, before the 200 commits.
 
@@ -1334,11 +1367,21 @@ class DistributedBatchedEngine(BatchedEngine):
                         cached = (time.monotonic(), True, "")
                     else:
                         healthy = all(item.healthy for item in health)
-                        cached = (
-                            time.monotonic(),
-                            healthy,
-                            "" if healthy else describe_failure(health),
-                        )
+                        detail = "" if healthy else describe_failure(health)
+                        if healthy:
+                            # §C1: SSH is green, but the collectives ride a
+                            # different physical link (Thunderbolt/RDMA
+                            # hostfile IPs) -- only worth checking once SSH
+                            # itself already looks fine, or this would just
+                            # restate a problem already correctly diagnosed
+                            # above.
+                            data_plane_detail = await asyncio.to_thread(
+                                self._data_plane_failure_detail
+                            )
+                            if data_plane_detail:
+                                healthy = False
+                                detail = data_plane_detail
+                        cached = (time.monotonic(), healthy, detail)
                     # Phase 0.2: this blocks the request path on expiry (D1)
                     # and 1.4 halved its SSH cost on the healthy path (C3) --
                     # one line per refresh is enough to validate both against
