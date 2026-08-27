@@ -5,16 +5,18 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import shutil
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .performance import ExecutionSettings
 from .planner import PipelineAssignment
+from .prefill_guard import is_lockstep_safe, mark_lockstep_safe
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +72,14 @@ class RuntimeTelemetry:
         execution: ExecutionSettings | None = None,
         assignment: PipelineAssignment | None = None,
         heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        exit_process: Callable[[int], Any] = os._exit,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
         if heartbeat_interval < 0:
             raise ValueError("heartbeat_interval must be non-negative")
         self._marker = marker
+        self._exit_process = exit_process
         self._clock = clock
         self._publish_interval = publish_interval
         self._execution = execution
@@ -268,6 +272,44 @@ class RuntimeTelemetry:
             status = "failed" if failed else "completed"
             if self._finish_locked(request_id, now=now, status=status):
                 self._publish_locked(now, force=True)
+
+    def fail_stop_if_unilateral(
+        self, exc: BaseException, *, mx_module: Any | None = None
+    ) -> None:
+        """Terminate this rank's process on a unilateral generation failure.
+
+        Every liveness signal is thread-independent of generation (§A1): a
+        rank whose generation thread died, or is stuck in a mismatched
+        collective because a peer moved on without it, keeps publishing
+        healthy heartbeats forever. Converting a unilateral failure into
+        process death turns that undetectable wedge into the
+        already-handled process-death path (launcher teardown reads the
+        marker via ``_runtime_failure_reason``).
+
+        A no-op when ``exc`` is marked lockstep-safe -- every rank's
+        collectives already completed identically before it was raised, so
+        killing this rank would desync it from peers that are still fine
+        -- or when there is no cluster to desync in the first place
+        (``world_size <= 1``).
+        """
+
+        if is_lockstep_safe(exc):
+            return
+        try:
+            collective_mx = mx_module
+            if collective_mx is None:
+                import mlx.core as collective_mx
+            world_size = int(collective_mx.distributed.init().size())
+        except Exception:
+            world_size = 1
+        if world_size <= 1:
+            return
+        with suppress(Exception):
+            self._marker.update(
+                "failed",
+                error=f"{type(exc).__name__}: {exc}"[:1000],
+            )
+        self._exit_process(1)
 
     def mark_pending_uid(self, request_id: int) -> None:
         """Remember the queue request immediately preceding batch insertion."""
@@ -608,6 +650,13 @@ class _TelemetryQueue:
             elif isinstance(item, BaseException):
                 self._finished = True
                 self._telemetry.finish_request(self._request_id, failed=True)
+                # §A1/2.1: this item is whatever _serve_single or the
+                # batched loop's per-request try/except caught before
+                # rqueue.put(e) -- if it wasn't marked lockstep-safe, this
+                # rank's generation state is not provably in sync with its
+                # peers, and continuing to the next request risks the
+                # mismatched-collective wedge this hook exists to prevent.
+                self._telemetry.fail_stop_if_unilateral(item)
             elif hasattr(item, "prompt") and hasattr(item, "prompt_cache_count"):
                 prompt = getattr(item, "prompt", ())
                 cache_count = getattr(item, "prompt_cache_count", 0)
@@ -924,7 +973,16 @@ def install_server_telemetry(
             return _TelemetryQueue(response_queue, telemetry), *rest
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
-            tokenized = super()._tokenize(tokenizer, request, args)
+            try:
+                tokenized = super()._tokenize(tokenizer, request, args)
+            except Exception as exc:
+                # Same broadcast request, same tokenizer, on every rank: a
+                # tokenization failure here is deterministic and every rank
+                # reaches it identically, so lockstep survives. Without
+                # this mark, one malformed request would fail-stop the
+                # whole cluster instead of just rejecting the request
+                # (§A1/2.1).
+                raise mark_lockstep_safe(exc)
             if prefill_guard is None:
                 return tokenized
 
@@ -962,6 +1020,31 @@ def install_server_telemetry(
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
+
+        def _generate(self) -> None:
+            """The generation thread's actual target (``Thread(target=
+            self._generate)`` in the pinned MLX-LM). MLX-LM's own
+            per-request handlers (the batched tokenize try/except,
+            ``_serve_single``'s outer try/except) already catch and
+            ``rqueue.put`` most failures before they reach here -- what
+            escapes all the way out of ``_generate`` despite those is
+            something none of them caught: ``fetch_nearest_cache``
+            (which can contain the SSD boundary-agreement collective),
+            ``_make_state_machine``, ``insert_segments``,
+            ``_share_object`` unpickling, and similar. That is
+            unambiguously worse than a caught-and-voted rejection, so
+            fail-stop unconditionally rather than let the thread quietly
+            die -- on a worker that already looks like process death and
+            is handled; on rank 0 it previously left the HTTP server
+            running with no generation thread at all (§A1's asymmetric
+            batched-path outcome).
+            """
+
+            try:
+                super()._generate()
+            except Exception as exc:
+                telemetry.fail_stop_if_unilateral(exc, mx_module=mx)
+                raise
 
     original_stream_generate = mlx_server.stream_generate
 
