@@ -7,6 +7,7 @@ Anthropic/OpenAI message conversion paths.
 """
 
 import json
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -163,6 +164,35 @@ class TestTruncateToolResult:
         assert "<truncated " in result
         # The original JSON is broken, but the notice is cleanly separated
         assert "\n\n<truncated " in result
+
+    # -- generative coverage for the token-budget contract (#8) -------------
+
+    # No spaces/newlines/tabs inside a word: keeps WordTokenizer's word count an
+    # exact, predictable proxy for token count, isolating the budget contract
+    # from the line-boundary heuristic (already covered by the example tests
+    # above).
+    _word = st.text(
+        alphabet=st.characters(blacklist_characters=" \n\t", blacklist_categories=("Cs",)),
+        min_size=1,
+        max_size=8,
+    )
+
+    @given(st.lists(_word, max_size=25), st.integers(min_value=0, max_value=40))
+    def test_truncate_tool_result_respects_token_budget(self, words, max_tokens):
+        """Text within budget is returned unchanged; text over budget is
+        truncated to never exceed the budget."""
+        text = " ".join(words)
+        tokenizer = WordTokenizer()
+        total_tokens = len(tokenizer.encode(text))
+        result = truncate_tool_result(text, max_tokens=max_tokens, tokenizer=tokenizer)
+
+        if total_tokens <= max_tokens:
+            assert result == text
+        else:
+            assert "<truncated " in result
+            match = re.search(r'shown_tokens="(\d+)"', result)
+            assert match is not None
+            assert int(match.group(1)) <= max_tokens
 
 
 # =============================================================================
