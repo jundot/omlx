@@ -593,6 +593,14 @@ class EnginePool:
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
                 )
 
+        moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
+        add("moe_expert_offload_enabled", moe_offload_active)
+        if moe_offload_active:
+            add(
+                "moe_expert_offload_resident_fraction",
+                data.get("moe_expert_offload_resident_fraction", 0.25),
+            )
+
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
         )
@@ -1513,7 +1521,37 @@ class EnginePool:
                 admission_settings,
                 base_size=admission_size,
             )
+            # Expert offload shrinks the resident footprint before any
+            # weights allocate, so admit by the offload-adjusted estimate —
+            # otherwise the over-ceiling MoE checkpoints the feature exists
+            # for are rejected before it can run. Local loads only: a
+            # distributed shard's planned size must not be discounted by
+            # whole-checkpoint expert bytes. Applied AFTER the CPU-share
+            # adjustment above so both corrections compose (the estimate is a
+            # relative discount on the size passed in). Falls back to
+            # admission_size on any failure (never more permissive by
+            # accident).
+            if deployment is None and getattr(
+                admission_settings, "moe_expert_offload_enabled", False
+            ):
+                from .patches.moe_expert_offload import (
+                    estimate_offload_admission_bytes,
+                )
+
+                admission_size = estimate_offload_admission_bytes(
+                    entry.model_path,
+                    admission_size,
+                    float(
+                        getattr(
+                            admission_settings,
+                            "moe_expert_offload_resident_fraction",
+                            0.25,
+                        )
+                    ),
+                )
+
             admission_kind = "local shard" if deployment is not None else "model"
+
             ceiling = self._current_ceiling()
             best_effort = False
             if ceiling <= 0:
