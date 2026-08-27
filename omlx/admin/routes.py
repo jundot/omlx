@@ -138,6 +138,11 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    ngram_spec_enabled: bool | None = None
+    ngram_spec_match_len: int | None = None
+    ngram_spec_draft_max: int | None = None
+    ngram_spec_draft_min: int | None = None
+    ngram_spec_freq_rule: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -582,6 +587,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_ssd_cache"] = False
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
+    settings["ngram_spec_enabled"] = False
     settings["vlm_mtp_enabled"] = False
 
     unsupported_ct_kwargs = {
@@ -670,6 +676,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_block_size = None
     settings.dflash_verify_mode = None
     settings.mtp_enabled = False
+    settings.ngram_spec_enabled = False
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
@@ -726,8 +733,8 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
-            "gemma4, gemma4_unified)"
+            "(supported: qwen3_5*, qwen3_6*, qwen4_exp, deepseek_v4*, "
+            "glm_moe_dsa, gemma4, gemma4_unified)"
         )
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
@@ -2739,9 +2746,9 @@ async def update_model_settings(
                     detail=(
                         f"Model is not MTP-compatible (model_type={model_type!r}, "
                         f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
+                        "Lightning MTP requires a Qwen3.5/3.6, Qwen4-Exp, "
+                        "DeepSeek-V4, GLM-5.2, or merged-assistant Gemma 4 "
+                        "checkpoint with MTP heads."
                     ),
                 )
             if not _checkpoint_has_mtp_weights(entry.model_path):
@@ -2776,6 +2783,18 @@ async def update_model_settings(
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+        if not new_mtp_enabled:
+            ngram_after = (
+                bool(request.ngram_spec_enabled)
+                if "ngram_spec_enabled" in sent
+                else current_settings.ngram_spec_enabled
+            )
+            if ngram_after and not (
+                "ngram_spec_enabled" in sent and request.ngram_spec_enabled
+            ):
+                # MTP off sweeps the rider off too instead of tripping the
+                # __post_init__ mutex on the next settings load.
+                current_settings.ngram_spec_enabled = False
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -2821,6 +2840,44 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+
+    if "ngram_spec_enabled" in sent:
+        new_ngram = False if is_diffusion_model else bool(request.ngram_spec_enabled)
+        if new_ngram:
+            mtp_after = (
+                bool(request.mtp_enabled)
+                if "mtp_enabled" in sent
+                else current_settings.mtp_enabled
+            )
+            if not mtp_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "ngram_spec_enabled requires Lightning MTP: the n-gram "
+                        "drafter rides the MTP draft+verify cycle. Enable MTP "
+                        "first."
+                    ),
+                )
+        current_settings.ngram_spec_enabled = new_ngram
+    if "ngram_spec_match_len" in sent:
+        value = request.ngram_spec_match_len
+        current_settings.ngram_spec_match_len = (
+            int(value) if value is not None and value >= 2 else None
+        )
+    if "ngram_spec_draft_max" in sent:
+        value = request.ngram_spec_draft_max
+        # Verify width is memory-bound (k=16 sustains on 128GB with the
+        # resident-PLE Qwen4 checkpoint); clamp to the lab-proven 64 cap.
+        current_settings.ngram_spec_draft_max = (
+            min(int(value), 64) if value is not None and value >= 1 else None
+        )
+    if "ngram_spec_draft_min" in sent:
+        value = request.ngram_spec_draft_min
+        current_settings.ngram_spec_draft_min = (
+            int(value) if value is not None and value >= 1 else None
+        )
+    if "ngram_spec_freq_rule" in sent:
+        current_settings.ngram_spec_freq_rule = bool(request.ngram_spec_freq_rule)
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -7189,6 +7246,52 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
         # carries the external model name.
         "external": run.request.external is not None,
     }
+
+
+@router.post("/api/bench/spec-ab/start")
+async def start_spec_ab(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """A/B do n-gram lookup drafting: N runs com o drafter ligado, N desligado,
+    mesma carga de reescrita de código, média e desvio de tok/s por braço.
+    O toggle é global de processo lido a cada ciclo — os braços viram ao vivo,
+    sem recarregar o engine (plano v3, F1.3)."""
+    from . import spec_ab
+
+    body = await request.json()
+    model_id = body.get("model_id")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    state = _get_server_state()
+    gs = getattr(state, "global_settings", None)
+    port = getattr(getattr(gs, "server", None), "port", 8000)
+    api_key = getattr(getattr(gs, "auth", None), "api_key", "")
+    result = spec_ab.start(
+        model_id,
+        port,
+        api_key,
+        repeats=int(body.get("repeats") or 5),
+        max_tokens=int(body.get("max_tokens") or 400),
+        flip=str(body.get("flip") or "enabled"),
+        workload=str(body.get("workload") or "rewrite"),
+    )
+    if "error" in result:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@router.get("/api/bench/spec-ab/{run_id}/results")
+async def get_spec_ab_results(
+    run_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    from . import spec_ab
+
+    run = spec_ab.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="spec-ab run not found")
+    return run
 
 
 @router.post("/api/bench/start")

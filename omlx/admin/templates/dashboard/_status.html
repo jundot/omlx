@@ -331,6 +331,8 @@
                                                           x-text="(m.dflash.speculation.last.tokens_per_cycle || 0).toFixed(2) + ' ' + window.t('status.active_models.dflash_output_per_cycle')"></span>
                                                     <span x-show="!m.dflash.speculation.last.fallback_ar"
                                                           x-text="formatTokenCount(m.dflash.speculation.last.accepted_draft_tokens || 0) + ' ' + window.t('status.active_models.dflash_draft_tokens_last_request')"></span>
+                                                    <span x-show="m.dflash.speculation.last.ngram_served_cycles != null && (m.dflash.speculation.last.ngram_served_cycles + m.dflash.speculation.last.ngram_miss_cycles) > 0"
+                                                          x-text="window.t('status.active_models.ngram_share') + ' ' + m.dflash.speculation.last.ngram_served_cycles + '/' + (m.dflash.speculation.last.ngram_served_cycles + m.dflash.speculation.last.ngram_miss_cycles)"></span>
                                                     <span x-show="m.dflash.speculation.totals && m.dflash.speculation.totals.requests > 1"
                                                           x-text="formatDFlashSessionStats(m.dflash.speculation.totals)"></span>
                                                 </div>

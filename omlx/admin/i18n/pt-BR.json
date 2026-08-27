@@ -99,7 +99,7 @@
   "status.active_models.generating": "Gerando...",
   "status.active_models.unload": "Descarregar modelo",
   "status.active_models.enforcer_disabled": "Enforcer desativado",
-  "status.active_models.dflash_label": "DFlash",
+  "status.active_models.dflash_label": "Especulação",
   "status.active_models.dflash_fallback_ar": "fallback AR",
   "status.active_models.dflash_draft_share": "draft share",
   "status.active_models.dflash_accepted_draft_per_cycle": "accepted draft/cycle",
@@ -1130,5 +1130,15 @@
   "js.success.download_started": "Download iniciado: {repo_id}",
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
-  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP."
+  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP.",
+  "modal.model_settings.ngram_spec": "Palpites por cópia do histórico (n-gram)",
+  "modal.model_settings.ngram_spec_hint": "Copia palpites do próprio prompt e da saída quando os últimos tokens se repetem, com verificação sem perda. Acelera reescrita de código e loops de agente; sem match, cai no Lightning MTP.",
+  "modal.model_settings.ngram_spec_requires_mtp": "Exige o Lightning MTP: o palpite por cópia roda dentro do ciclo de verificação do MTP.",
+  "modal.model_settings.ngram_spec_match_len": "Janela de busca (tokens)",
+  "modal.model_settings.ngram_spec_draft_max": "Tamanho máximo do palpite",
+  "modal.model_settings.ngram_spec_draft_max_hint": "A largura da verificação é limitada pela memória; 16 é o padrão seguro em 128 GB. Valores maiores podem estourar a memória Metal em gerações longas.",
+  "modal.model_settings.ngram_spec_draft_min": "Tamanho mínimo do palpite",
+  "status.active_models.ngram_share": "ciclos por cópia",
+  "modal.model_settings.ngram_spec_freq_rule": "Palpite proporcional à repetição",
+  "modal.model_settings.ngram_spec_freq_rule_hint": "O tamanho da cópia segue quantas vezes o trecho se repetiu: visto 3+ vezes libera o palpite cheio, visto uma vez copia a metade. Desligado mantém a regra fixa por janela."
 }

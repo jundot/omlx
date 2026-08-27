@@ -67,6 +67,69 @@ def is_applied() -> bool:
     return _APPLIED
 
 
+_PROFILER_ARMED = False
+
+
+def _arm_layer_profiler() -> None:
+    """OMLX_PROFILE_LAYERS=1: time linear_attn / self_attn / mlp per call.
+
+    Diagnostic only (plan v4, F4.2 E2). A sync barrier per submodule call
+    makes decode much slower; only the RELATIVE shares are meaningful —
+    the same distortion as the ZMLX repro capsule this compares against.
+    State updates not depended on by the module output settle at the next
+    barrier, slightly shifting cost to the following module.
+    """
+    global _PROFILER_ARMED
+    import os
+    import time
+
+    if os.environ.get("OMLX_PROFILE_LAYERS") != "1" or _PROFILER_ARMED:
+        return
+    _PROFILER_ARMED = True
+
+    import mlx.core as mx
+    from mlx_vlm.models.qwen4_exp import language as _lang
+
+    acc: dict[str, list[float]] = {}
+
+    def _leaves(out):
+        if isinstance(out, mx.array):
+            return [out]
+        if isinstance(out, (tuple, list)):
+            return [a for x in out for a in _leaves(x)]
+        return []
+
+    def _wrap(cls, name):
+        orig = cls.__call__
+
+        def timed(self, *a, **k):
+            mx.synchronize()
+            t0 = time.perf_counter()
+            out = orig(self, *a, **k)
+            arrs = _leaves(out)
+            if arrs:
+                mx.eval(*arrs)
+            slot = acc.setdefault(name, [0.0, 0])
+            slot[0] += time.perf_counter() - t0
+            slot[1] += 1
+            if slot[1] % 480 == 0:
+                logger.info(
+                    "layer-profile: %s",
+                    " · ".join(
+                        f"{n} {v[0] * 1000 / v[1]:.3f} ms/call x{v[1]}"
+                        for n, v in sorted(acc.items())
+                    ),
+                )
+            return out
+
+        cls.__call__ = timed
+
+    _wrap(_lang.Qwen4ExpGatedDeltaNet, "linear_attn")
+    _wrap(_lang.Qwen4ExpAttention, "self_attn")
+    _wrap(_lang.Qwen3_5MoeSparseMoeBlock, "mlp")
+    logger.info("layer profiler armed (OMLX_PROFILE_LAYERS=1) — diagnostic only")
+
+
 def configure_qwen4_exp_runtime(
     model_path: str | Path,
     mode: str | None = None,
@@ -83,6 +146,7 @@ def configure_qwen4_exp_runtime(
     resolved = configure_ple_runtime(model_path, mode=mode)
     mtp_runtime = configure_mtp_runtime(model_path, enabled=mtp_enabled)
     logger.info("Qwen4-Exp PLE mode for %s: %s", model_path, resolved)
+    _arm_layer_profiler()
     if mtp_enabled and not mtp_runtime.enabled:
         logger.warning(
             "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "

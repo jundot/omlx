@@ -99,7 +99,7 @@
   "status.active_models.generating": "生成中...",
   "status.active_models.unload": "卸載模型",
   "status.active_models.enforcer_disabled": "記憶體強制管理已停用",
-  "status.active_models.dflash_label": "DFlash",
+  "status.active_models.dflash_label": "投機解碼",
   "status.active_models.dflash_fallback_ar": "fallback AR",
   "status.active_models.dflash_draft_share": "draft share",
   "status.active_models.dflash_accepted_draft_per_cycle": "accepted draft/cycle",
@@ -1130,5 +1130,15 @@
   "js.success.download_started": "已開始下載：{repo_id}",
   "js.success.settings_saved": "設定儲存成功",
   "settings.mcp.expose_tools": "向客戶端公開後端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。"
+  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。",
+  "modal.model_settings.ngram_spec": "N-gram Lookup Drafting",
+  "modal.model_settings.ngram_spec_hint": "Copy draft tokens from this request's own prompt and output when recent tokens repeat, verified losslessly. Speeds up code rewriting and agent loops; falls back to Lightning MTP when nothing matches.",
+  "modal.model_settings.ngram_spec_requires_mtp": "Requires Lightning MTP: the n-gram drafter rides the MTP draft+verify cycle.",
+  "modal.model_settings.ngram_spec_match_len": "Match window (tokens)",
+  "modal.model_settings.ngram_spec_draft_max": "Max draft length",
+  "modal.model_settings.ngram_spec_draft_max_hint": "Verify width is memory-bound; 16 is the safe default on 128 GB. Larger values can exhaust Metal memory on long generations.",
+  "modal.model_settings.ngram_spec_draft_min": "Min draft length",
+  "status.active_models.ngram_share": "history-copy cycles",
+  "modal.model_settings.ngram_spec_freq_rule": "Frequency-scaled copy length",
+  "modal.model_settings.ngram_spec_freq_rule_hint": "Copy length follows how often the recent tokens repeated: suffixes seen 3+ times buy the full draft, ones seen once are halved. Off keeps the fixed per-window rule."
 }

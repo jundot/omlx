@@ -657,6 +657,7 @@ def maybe_apply_pre_load_patches(
         # general Lightning MTP path.  A single MTP hidden layer can be
         # chained autoregressively, so default to the validated max depth 3.
         set_mtp_depth(int(depth) if depth else 3)
+        _configure_ngram_spec(model_settings)
         if mtp_active and not apply_mlx_lm_mtp_patch():
             logger.warning(
                 "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
@@ -745,6 +746,7 @@ def maybe_apply_pre_load_patches(
                 )
             else:
                 set_mtp_depth(3)
+            _configure_ngram_spec(model_settings)
             if mtp_enabled:
                 backend = (
                     "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
@@ -1104,6 +1106,36 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
     )
+
+
+def _configure_ngram_spec(model_settings: Any | None) -> None:
+    """Arm or disarm n-gram lookup drafting from per-model settings.
+
+    Called on both MTP activation branches (the qwen4_exp loader branch and
+    the generic whitelist branch) right after set_mtp_depth. With no settings
+    object the environment default (OMLX_NGRAM_SPEC=1) is left in charge so
+    ad-hoc runs keep working.
+    """
+    if model_settings is None:
+        return
+    from ..patches.mlx_lm_mtp import set_ngram_spec
+
+    set_ngram_spec(
+        bool(getattr(model_settings, "ngram_spec_enabled", False)),
+        getattr(model_settings, "ngram_spec_match_len", None),
+        getattr(model_settings, "ngram_spec_draft_max", None),
+        getattr(model_settings, "ngram_spec_draft_min", None),
+        getattr(model_settings, "ngram_spec_freq_rule", None),
+    )
+    from ..patches.mlx_lm_mtp import get_ngram_spec_params, is_ngram_spec_enabled
+
+    params = get_ngram_spec_params()
+    # tests stub the mtp module with MagicMock; only log over the real tuple
+    if is_ngram_spec_enabled() and isinstance(params, tuple) and len(params) == 4:
+        logger.info(
+            "n-gram drafter armed: match_len=%d draft_max=%d draft_min=%d "
+            "freq_rule=%s", *params,
+        )
 
 
 def load_text_model(
