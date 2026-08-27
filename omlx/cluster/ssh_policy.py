@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One non-interactive OpenSSH policy for every cluster subprocess.
+"""One non-interactive OpenSSH policy for every cluster subprocess, and one
+retrying way to actually run it.
 
 Cluster peers are commonly discovered through both Bonjour names and changing
 Thunderbolt IP addresses.  OpenSSH's default ``ask`` policy turns a harmless
@@ -15,6 +16,8 @@ second implicit IP check behind it.
 
 from __future__ import annotations
 
+import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -81,3 +84,38 @@ def apply_cluster_ssh_policy(
         ),
         *argv[1:],
     ]
+
+
+def run_ssh_retrying(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    attempts: int = 3,
+    delay: float = 0.5,
+) -> subprocess.CompletedProcess[str]:
+    """Run one subprocess, retrying a bounded few times on failure.
+
+    mDNS resolution for a ``.local`` peer is intermittently flaky — one
+    dropped multicast round trip should not be mistaken for a permanently
+    unreachable host. Every caller across this module's users is a read-only
+    remote query (interface/inventory/shard/layout probes), so retrying is
+    always safe. An exception raised by ``subprocess.run`` itself (the
+    ``ssh``/``scp`` binary missing, say) is folded into a failed
+    ``CompletedProcess`` the same as a nonzero exit, so callers only ever
+    need to check ``returncode``.
+    """
+
+    argv = list(argv)
+    result = subprocess.CompletedProcess(argv, 255, "", "")
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=timeout
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            result = subprocess.CompletedProcess(argv, 255, "", str(exc))
+        if result.returncode == 0:
+            return result
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    return result

@@ -14,13 +14,12 @@ import secrets
 import shlex
 import subprocess
 import threading
-import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
-from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
+from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options, run_ssh_retrying
 
 # Link speed thresholds for distinguishing TB4 from TB5
 _TB4_MAX_SPEED_GTBS = 40  # TB4 is up to 40 Gb/s
@@ -1222,14 +1221,12 @@ def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
     return tuple(addresses)
 
 
-def _read(ssh_hostname: str, command: list[str], *, attempts: int = 3) -> str:
+def _read(ssh_hostname: str, command: list[str]) -> str:
     """Run one read-only command on a host, returning "" when it cannot run.
 
-    mDNS resolution for a ``.local`` hostname is intermittently flaky — one
-    dropped multicast round trip used to be indistinguishable from "this host
-    genuinely has no addresses", surfacing as the confusing "has no routable
-    IPv4 address" report even though the peer answers fine a moment later.
-    Retry a bounded few times before treating the command as having failed.
+    Retries a bounded few times on failure — see ``run_ssh_retrying`` for why:
+    a single dropped mDNS round trip for a ``.local`` hostname used to be
+    indistinguishable from "this host has no addresses".
     """
 
     argv = list(command)
@@ -1240,18 +1237,8 @@ def _read(ssh_hostname: str, command: list[str], *, attempts: int = 3) -> str:
             ssh_hostname,
             *argv,
         ]
-    for attempt in range(attempts):
-        try:
-            result = subprocess.run(
-                argv, capture_output=True, text=True, check=False, timeout=30
-            )
-        except (OSError, subprocess.SubprocessError):
-            result = None
-        if result is not None and result.returncode == 0:
-            return result.stdout
-        if attempt < attempts - 1:
-            time.sleep(0.5)
-    return ""
+    result = run_ssh_retrying(argv, timeout=30)
+    return result.stdout if result.returncode == 0 else ""
 
 
 def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:

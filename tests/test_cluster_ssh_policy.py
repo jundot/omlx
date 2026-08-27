@@ -10,6 +10,7 @@ import pytest
 from omlx.cluster.ssh_policy import (
     apply_cluster_ssh_policy,
     cluster_ssh_options,
+    run_ssh_retrying,
 )
 from omlx.cluster.transport import _mlx_config_ssh_policy
 
@@ -76,3 +77,63 @@ def test_mlx_hard_coded_ssh_calls_are_wrapped_too():
     assert "CheckHostIP=no" in argv
     assert kwargs == {"capture_output": True}
     assert Config.run is run
+
+
+def test_run_ssh_retrying_recovers_from_one_dropped_mdns_round_trip(monkeypatch):
+    """A single dropped multicast round trip resolving a .local hostname
+    must not be mistaken for a permanently unreachable peer."""
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                argv, 255, "", "ssh: Could not resolve hostname"
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_ssh_retrying(["ssh", "peer.local", "true"], timeout=30)
+
+    assert result.returncode == 0
+    assert result.stdout == "ok\n"
+    assert len(calls) == 2
+
+
+def test_run_ssh_retrying_gives_up_after_exhausting_attempts(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 255, "", "ssh: Could not resolve hostname"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_ssh_retrying(["ssh", "peer.local", "true"], timeout=30, attempts=3)
+
+    assert result.returncode == 255
+    assert "Could not resolve hostname" in result.stderr
+    assert len(calls) == 3
+
+
+def test_run_ssh_retrying_folds_a_raised_exception_into_the_result(monkeypatch):
+    """A missing ssh binary (OSError) reads the same as a nonzero exit —
+    callers only ever need to check returncode."""
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+
+    def fake_run(argv, **_kwargs):
+        raise FileNotFoundError("no such file: ssh")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_ssh_retrying(["ssh", "peer.local", "true"], timeout=30, attempts=2)
+
+    assert result.returncode != 0
+    assert "no such file" in result.stderr
