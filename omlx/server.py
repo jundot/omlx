@@ -5655,6 +5655,13 @@ def _steered_classifier_model(request) -> str | None:
             claude_code.classifier_model_tier,
         )
         return None
+    logger.warning(
+        "Auto-mode classifier steering request for model=%s to tier '%s' "
+        "model=%s",
+        request.model,
+        claude_code.classifier_model_tier,
+        tier_model,
+    )
     return tier_model
 
 

@@ -450,6 +450,17 @@ class TestSteeredClassifierModel:
         result = self._call(_request(_classifier_payload()), server)
         assert result == "local-haiku-4bit"
 
+    def test_enabled_logs_steering_substitution(self, monkeypatch, caplog):
+        server = self._server_state_with(
+            monkeypatch, steer=True, tier="haiku", haiku_model="local-haiku-4bit"
+        )
+        with caplog.at_level("WARNING", logger="omlx.server"):
+            self._call(_request(_classifier_payload()), server)
+        assert any(
+            "haiku" in record.message and "local-haiku-4bit" in record.message
+            for record in caplog.records
+        )
+
     def test_enabled_but_tier_model_unset_returns_none(self, monkeypatch):
         server = self._server_state_with(monkeypatch, steer=True, tier="opus")
         result = self._call(_request(_classifier_payload()), server)
