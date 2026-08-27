@@ -123,6 +123,36 @@ class PeerLostError(RuntimeError):
     """A rank this deployment depends on is no longer answering."""
 
 
+def _run_retrying(
+    runner: Callable[..., Any],
+    argv: list[str],
+    *,
+    timeout: float,
+    attempts: int = 3,
+    delay: float = 0.5,
+) -> Any:
+    """Call ``runner`` a bounded few times, retrying on failure.
+
+    A single dropped mDNS round trip resolving a ``.local`` peer must not be
+    mistaken for that peer being gone. Every caller here is a read-only
+    liveness query, so retrying is always safe — even the case of a rank
+    that genuinely has no marker yet just takes a little longer to be
+    correctly reported that way, rather than being misread as unreachable.
+    """
+
+    result: Any = None
+    for attempt in range(attempts):
+        try:
+            result = runner(argv, capture_output=True, timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            result = subprocess.CompletedProcess(argv, 255, "", str(exc))
+        if getattr(result, "returncode", 1) == 0:
+            return result
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    return result
+
+
 def probe_peer(
     ssh_target: str,
     *,
@@ -133,20 +163,16 @@ def probe_peer(
 
     if ssh_target in _LOOPBACK_TARGETS:
         return True
-    try:
-        result = runner(
-            [
-                "ssh",
-                *cluster_ssh_options(connect_timeout=timeout),
-                ssh_target,
-                "true",
-            ],
-            capture_output=True,
-            timeout=timeout + 2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
+    result = _run_retrying(
+        runner,
+        [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=timeout),
+            ssh_target,
+            "true",
+        ],
+        timeout=timeout + 2,
+    )
     return getattr(result, "returncode", 1) == 0
 
 
@@ -205,20 +231,16 @@ def read_remote_marker(
             shlex.quote(path),
         )
     )
-    try:
-        result = runner(
-            [
-                "ssh",
-                *cluster_ssh_options(connect_timeout=timeout),
-                ssh_target,
-                command,
-            ],
-            capture_output=True,
-            timeout=timeout + 2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, None, None, str(exc)
+    result = _run_retrying(
+        runner,
+        [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=timeout),
+            ssh_target,
+            command,
+        ],
+        timeout=timeout + 2,
+    )
     if getattr(result, "returncode", 1) != 0:
         error = getattr(result, "stderr", b"")
         if isinstance(error, bytes):
