@@ -33,6 +33,30 @@ logger = logging.getLogger(__name__)
 # is set by the chunk, not the prompt.
 _DEFAULT_PREFILL_STEP = 2048
 
+_LOCKSTEP_SAFE_ATTR = "_omlx_lockstep_safe"
+
+
+def mark_lockstep_safe(exc: BaseException) -> BaseException:
+    """Mark that every rank's collectives completed identically before
+    ``exc`` was raised, so it is safe to treat as a per-request rejection
+    rather than fail-stop the rank (§A1's fail-stop hook in telemetry.py).
+
+    This has to be an instance mark, not a type check: ``check_collective``
+    re-raises the *original* local exception after voting, so its type
+    carries no information about whether the vote happened. A fixed
+    exception-type allowlist would treat an already-synced rejection whose
+    original exception happened to be, say, a ``TypeError`` as unilateral --
+    and fail-stop a rank that is actually still perfectly in sync with its
+    peers, which is worse than the bug this is fixing.
+    """
+
+    setattr(exc, _LOCKSTEP_SAFE_ATTR, True)
+    return exc
+
+
+def is_lockstep_safe(exc: BaseException) -> bool:
+    return bool(getattr(exc, _LOCKSTEP_SAFE_ATTR, False))
+
 
 def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
     """Read a field from a config that may be a dict or an attribute object.
@@ -253,9 +277,9 @@ class RankPrefillGuard:
         world_size = int(group.size())
         if world_size <= 1:
             if local_exc is not None:
-                raise local_exc
+                raise mark_lockstep_safe(local_exc)
             if local_error is not None:
-                raise local_error
+                raise mark_lockstep_safe(local_error)
             return
 
         rank = int(group.rank())
@@ -270,19 +294,24 @@ class RankPrefillGuard:
         ]
         if not rejecting_ranks:
             return
+        # Every raise from here on happens only after the vote collective
+        # above completed on every rank -- lockstep is intact regardless of
+        # which exception type is about to propagate.
         if local_exc is not None:
-            raise local_exc
+            raise mark_lockstep_safe(local_exc)
         if local_error is not None:
-            raise local_error
+            raise mark_lockstep_safe(local_error)
 
         rejecting = rejecting_ranks[0]
-        raise PrefillMemoryExceededError(
-            message=(
-                f"Cluster prefill rejected by rank {rejecting}: its local model "
-                "slice would exceed the host memory limit. Reduce context length "
-                "or free memory on that node."
-            ),
-            request_id=request_id,
+        raise mark_lockstep_safe(
+            PrefillMemoryExceededError(
+                message=(
+                    f"Cluster prefill rejected by rank {rejecting}: its local model "
+                    "slice would exceed the host memory limit. Reduce context length "
+                    "or free memory on that node."
+                ),
+                request_id=request_id,
+            )
         )
 
 

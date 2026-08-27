@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from omlx.cluster.prefill_guard import RankPrefillGuard, build_guard, rank_monitor
+from omlx.cluster.prefill_guard import (
+    RankPrefillGuard,
+    build_guard,
+    is_lockstep_safe,
+    rank_monitor,
+)
 from omlx.exceptions import PrefillMemoryExceededError
 
 GiB = 1024**3
@@ -280,6 +285,62 @@ def test_unexpected_local_exception_on_single_node_reraises_without_a_collective
 
     with pytest.raises(TypeError, match="malformed monitor field"):
         guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+
+# --- §A1/2.1: every exception check_collective raises is lockstep-safe. ----
+
+
+def test_a_peer_rejection_error_is_lockstep_safe():
+    """2.1's fail-stop hook must not kill a rank that voted and left the
+    request together with its peers -- only a genuinely unilateral failure."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    mx = _CollectiveMX(rank=0, votes=[0, 1])
+
+    with pytest.raises(PrefillMemoryExceededError) as excinfo:
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_an_unexpected_exception_after_the_vote_is_lockstep_safe(monkeypatch):
+    """The re-raised exception keeps its original type (TypeError here, not
+    PrefillMemoryExceededError) -- a type-based allowlist downstream would
+    miss this. The mark is instance-based specifically so it doesn't."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+    mx = _CollectiveMX(rank=0, votes=[1, 0])
+
+    with pytest.raises(TypeError) as excinfo:
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_bare_check_does_not_mark_but_check_collective_does():
+    """``check()`` has no notion of a cluster and never marks its raise --
+    only ``check_collective`` (world_size<=1 included: vacuously safe, no
+    peers to desync) does. 2.1's hook independently no-ops below world_size
+    2 anyway, but the mark should be correct on its own terms."""
+
+    guard = _guard(ceiling=4 * GiB)
+    with pytest.raises(PrefillMemoryExceededError) as bare:
+        guard.check(200_000, current_usage_bytes=3 * GiB)
+    assert not is_lockstep_safe(bare.value)
+
+    mx = _CollectiveMX(rank=0, votes=[0])
+    with pytest.raises(PrefillMemoryExceededError) as collective:
+        guard.check_collective(200_000, current_usage_bytes=3 * GiB, mx_module=mx)
+    assert is_lockstep_safe(collective.value)
+
+
+def test_an_unmarked_exception_is_not_lockstep_safe():
+    assert not is_lockstep_safe(RuntimeError("never went through check_collective"))
 
 
 def test_an_unreadable_model_disables_the_guard():
