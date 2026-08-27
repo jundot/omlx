@@ -178,6 +178,69 @@ instantiate_qwen35_q_affine_variants128(5);
 instantiate_qwen35_q_affine_variants128(6);
 instantiate_qwen35_q_affine_variants128(8);
 
+// Grouped affine suffix used by DeepSeek-V4 wo_a.  Inputs and outputs are
+// laid out [groups, M, K/N], while weights are the concatenated per-group
+// row blocks.  Keeping the group dimension explicit avoids a block-diagonal
+// weight (and the corresponding 8x memory/compute expansion for 8 groups).
+template <typename T>
+[[kernel]] void qwen35_q8_affine_grouped_qmm_t(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& groups [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 64;
+  constexpr int BK = 32;
+  constexpr int BN = 64;
+  constexpr int BK_padded = BK + 16 / sizeof(T);
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+
+  const uint group = tid.z;
+  if (group >= static_cast<uint>(groups)) {
+    return;
+  }
+  const device uint32_t* group_w = w + group * N * (K / 4);
+  const device T* group_scales = scales + group * N * (K / 64);
+  const device T* group_biases = biases + group * N * (K / 64);
+  const device T* group_x = x + group * M * K;
+  device T* group_y = y + group * M * N;
+  const uint3 local_tid(tid.x, tid.y, 0);
+  qmm_t_impl<T, 64, 8, true, BM, BK, BN>(
+      group_w,
+      group_scales,
+      group_biases,
+      group_x,
+      group_y,
+      Xs,
+      Ws,
+      K,
+      N,
+      M,
+      K,
+      local_tid,
+      lid,
+      simd_gid,
+      simd_lid);
+}
+
+instantiate_kernel(
+    "qwen35_q8_affine_grouped_qmm_t_float16_t_bm_64_bk_32_bn_64",
+    qwen35_q8_affine_grouped_qmm_t,
+    float16_t);
+instantiate_kernel(
+    "qwen35_q8_affine_grouped_qmm_t_bfloat16_t_bm_64_bk_32_bn_64",
+    qwen35_q8_affine_grouped_qmm_t,
+    bfloat16_t);
+
 instantiate_qwen35_moe_weighted_sum_tiled(float16_t, float, 8, 256);
 instantiate_qwen35_moe_weighted_sum_tiled(bfloat16_t, float, 8, 256);
 instantiate_qwen35_moe_weighted_sum_tiled(float16_t, float, 6, 256);

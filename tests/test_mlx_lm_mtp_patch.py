@@ -42,6 +42,17 @@ class TestApplyOrchestrator:
         import omlx.patches.mlx_lm_mtp as mtp  # noqa: F401
 
 
+def test_mtp_emitted_token_guard_rejects_collective_overflow():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_lm_mtp.batch_generator import _validated_emitted_token
+
+    row = mx.zeros((129280,))
+    assert _validated_emitted_token(129279, row) == 129279
+    with pytest.raises(RuntimeError, match=r"token=4294967295, vocabulary=129280"):
+        _validated_emitted_token(2**32 - 1, row)
+
+
 class TestCacheRollback:
     def test_arrays_cache_gains_rollback_slot(self):
         from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -67,6 +78,58 @@ class TestCacheRollback:
 
         assert pool._undo is None
         assert pool._undo_chain is False
+
+
+def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    before = bg.mtp_runtime_stats_snapshot() or {
+        "sequences": 0,
+        "tokens": 0,
+        "cycles": 0,
+        "accepted_draft_tokens": 0,
+        "drafted_tokens": 0,
+        "zero_depth_cycles": 0,
+        "depth_drafted": [],
+        "depth_accepted": [],
+        "timing_ms": {
+            "backbone": 0.0,
+            "mtp_head": 0.0,
+            "sampling": 0.0,
+            "cache_ops": 0.0,
+        },
+    }
+    stats = bg._MtpStats(
+        cycles=2,
+        accepts=3,
+        init_emits=2,
+        draft_emits=3,
+        bonus_emits=1,
+        verify_emits=1,
+        depth_drafted=[2, 2],
+        depth_accepted=[2, 1],
+        zero_cycles=1,
+        backbone_ms=4.0,
+        mtp_head_ms=2.0,
+        sample_ms=1.0,
+        cache_ops_ms=0.5,
+    )
+
+    bg._record_mtp_runtime_stats(stats, "length")
+    after = bg.mtp_runtime_stats_snapshot()
+
+    assert after is not None
+    assert after["sequences"] - before["sequences"] == 1
+    assert after["tokens"] - before["tokens"] == 7
+    assert after["cycles"] - before["cycles"] == 2
+    assert after["accepted_draft_tokens"] - before["accepted_draft_tokens"] == 3
+    assert after["drafted_tokens"] - before["drafted_tokens"] == 4
+    assert after["zero_depth_cycles"] - before["zero_depth_cycles"] == 1
+    assert after["last_finish_reason"] == "length"
+    assert after["acceptance_ratio"] == (
+        after["accepted_draft_tokens"] / after["drafted_tokens"]
+    )
+    assert after["tokens_per_cycle"] == after["tokens"] / after["cycles"]
 
 
 class TestMtpBoundaryCommit:
@@ -167,6 +230,36 @@ class TestMtpBoundaryCommit:
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
 
+    def test_distributed_coordinator_broadcasts_one_verify_packet(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        packets = []
+
+        class Coordinator:
+            is_coordinator = True
+            output_size = 32
+
+            @staticmethod
+            def gather_logits(value):
+                return value
+
+            @staticmethod
+            def sync_packet(packet, length):
+                assert tuple(packet.shape) == (length,)
+                values = [int(value) for value in packet.tolist()]
+                packets.append(values)
+                return values
+
+        monkeypatch.setattr(bg, "_mtp_vocab_coordinator", lambda _batch: Coordinator())
+        _batch, state, _cache = self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=0,
+            drafts=2,
+        )
+
+        assert packets == [[2, 20, 1, 2]]
+        assert [token for token, _lp, _source in state.queue] == [1, 2, 20]
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
@@ -243,6 +336,8 @@ class TestQwen35Model:
         assert hasattr(qwen3_5, "MTPDecoderLayer")
 
     def test_text_model_class_has_mtp_forward(self):
+        import inspect
+
         from mlx_lm.models.qwen3_5 import TextModel
 
         # Methods are attached unconditionally; the per-instance ``mtp``
@@ -250,6 +345,7 @@ class TestQwen35Model:
         assert hasattr(TextModel, "mtp_forward")
         assert hasattr(TextModel, "make_mtp_cache")
         assert hasattr(TextModel, "_omlx_mtp_patched")
+        assert "skip_lm_head" in inspect.signature(TextModel.__call__).parameters
 
     def test_set_mtp_active_toggles_module_flag(self):
         """The active-flag controls whether subsequent loads attach self.mtp."""
@@ -265,11 +361,52 @@ class TestQwen35Model:
             set_mtp_active(prev)
 
     def test_outer_model_pass_through_methods(self):
+        import inspect
+
         from mlx_lm.models.qwen3_5 import Model
 
         assert hasattr(Model, "mtp_forward")
         assert hasattr(Model, "make_mtp_cache")
         assert hasattr(Model, "_omlx_mtp_patched")
+        assert "skip_lm_head" in inspect.signature(Model.__call__).parameters
+
+    def test_text_model_skip_lm_head_preserves_hidden_forward(self, monkeypatch):
+        import mlx.core as mx
+
+        from mlx_lm.models.qwen3_5 import TextModel
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        calls = {"model": 0, "head": 0}
+
+        class Backbone:
+            @staticmethod
+            def norm(value):
+                return value + 1
+
+            def __call__(self, inputs, cache, input_embeddings=None, n_confirmed=0):
+                calls["model"] += 1
+                return mx.zeros((1, 4, 8))
+
+        def head(_value):
+            calls["head"] += 1
+            return mx.zeros((1, 4, 16))
+
+        fake = SimpleNamespace(
+            model=Backbone(),
+            args=SimpleNamespace(tie_word_embeddings=False),
+            lm_head=head,
+        )
+        monkeypatch.setattr(prompt_priming, "maybe_capture", lambda *args: None)
+
+        result = TextModel.__call__(
+            fake,
+            mx.zeros((1, 4), dtype=mx.uint32),
+            cache=[],
+            skip_lm_head=True,
+        )
+
+        assert result is None
+        assert calls == {"model": 1, "head": 0}
 
     def test_decoder_layer_omits_n_confirmed_when_zero(self):
         """DFlash replaces linear_attn.__call__ with a hook that has no
@@ -1601,6 +1738,70 @@ class TestBatchGeneratorDispatch:
             assert batch_generator._is_mtp_eligible(singleton) is False
         finally:
             set_mtp_active(prior_active)
+
+    def test_standard_multirow_step_temporarily_restores_fused_ds4_attention(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        attentions = [
+            SimpleNamespace(_omlx_decode_consistent=True) for _ in range(3)
+        ]
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(attn=attention) for attention in attentions]
+            ),
+        )
+        batch = SimpleNamespace(model=model, uids=[1, 2])
+        seen = []
+
+        result = batch_generator._standard_multirow_next(
+            batch,
+            lambda: seen.append(
+                [attention._omlx_decode_consistent for attention in attentions]
+            )
+            or "ok",
+        )
+
+        assert result == "ok"
+        assert seen == [[False, False, False]]
+        assert [attention._omlx_decode_consistent for attention in attentions] == [
+            True,
+            True,
+            True,
+        ]
+
+    def test_standard_singleton_step_keeps_mtp_decode_consistency(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        attention = SimpleNamespace(_omlx_decode_consistent=True)
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            model=SimpleNamespace(layers=[SimpleNamespace(attn=attention)]),
+        )
+        batch = SimpleNamespace(model=model, uids=[1])
+
+        batch_generator._standard_multirow_next(
+            batch,
+            lambda: attention._omlx_decode_consistent,
+        )
+
+        assert attention._omlx_decode_consistent is True
+
+    def test_single_lane_allows_mtp_with_queued_but_unadmitted_request(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        batch_gen = SimpleNamespace(
+            completion_batch_size=1,
+            _generation_batch=SimpleNamespace(uids=[7]),
+            _prompt_batch=[],
+            _currently_processing=[],
+            _unprocessed_sequences=[object()],
+        )
+
+        assert batch_generator._batch_generator_allows_mtp_activation(batch_gen)
+
+        batch_gen._prompt_batch = [object()]
+        assert not batch_generator._batch_generator_allows_mtp_activation(batch_gen)
 
     def test_singleton_recovery_clears_marker_when_cache_compact(self):
         # A batch that shrinks back to one row with no residual left padding

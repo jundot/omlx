@@ -266,6 +266,37 @@ mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, false>;
 template [[host_name("mma_dsa_indexer_score_bfloat16_boundary")]] [[kernel]]
 decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>)
 mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>;
+// Default-off DS4 prefill candidate.  The 64x64 output tile, 128-thread
+// threadgroup, 16KB resident K panel, MMA reduction order, and head reduction
+// order are unchanged.  Repartitioning the four simdgroups from WM2xWN2 to
+// WM4xWN1 makes each Q fragment belong to one simdgroup instead of two, so the
+// device Q loads are halved; the corresponding B fragments are reread from
+// fast threadgroup memory.  Keep separate host names so the qualified WM2xWN2
+// production route remains byte-for-byte available for physical A/B gates.
+template [[host_name("mma_dsa_indexer_score_bfloat16_wm4_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 4, 1, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 64, 64, 4, 1, 64, 128, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_wm4_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 4, 1, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 64, 64, 4, 1, 64, 128, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_d48_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, false>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_d48_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, true>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm16_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm16_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm32_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm32_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, true>;
 )MMADSA";
 
 } // namespace omlx::glm_kernels

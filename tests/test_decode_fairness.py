@@ -7,12 +7,14 @@ prefill is force-chunked, chunks are capped, and each chunk accrues a
 decode time debt that must be repaid before the next chunk runs.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from omlx.decode_activity import get_decode_activity
 from omlx.scheduler import (
+    _CONTENDED_CHUNK_FLOOR,
     _CONTENDED_PREFILL_CHUNK,
     Scheduler,
     SchedulerConfig,
@@ -30,9 +32,14 @@ def _quiet_decode_activity():
     get_prefill_tracker().clear()
 
 
-def _make_scheduler(**config_kwargs) -> Scheduler:
-    model = MagicMock()
-    model.layers = []
+def _make_scheduler(
+    model=None, model_type: str | None = None, **config_kwargs
+) -> Scheduler:
+    if model is None:
+        model = MagicMock()
+        model.layers = []
+    if model_type is not None:
+        model.model_type = model_type
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     config = SchedulerConfig(
@@ -149,6 +156,30 @@ class TestContendedChunkCap:
         get_decode_activity().publish("other-engine", 1)
         assert s._contended_prefill_cap() == _CONTENDED_PREFILL_CHUNK
 
+    @pytest.mark.parametrize(
+        ("decode_rows", "expected_quantum"),
+        ((1, 512), (2, 256), (4, 128)),
+    )
+    def test_b1_b2_b4_decode_rows_scale_prompt_quantum(
+        self, decode_rows, expected_quantum
+    ):
+        s = _make_scheduler()
+        s.running = {f"r{row}": MagicMock() for row in range(decode_rows)}
+
+        budget = s._mixed_batch_budget()
+
+        assert budget.active_decode_rows == decode_rows
+        assert budget.decode_row_budget == s.config.completion_batch_size
+        assert budget.prompt_row_budget == 1
+        assert budget.prompt_token_budget == expected_quantum
+        assert s._contended_prefill_cap() == expected_quantum
+
+    def test_other_engine_row_count_scales_quantum(self):
+        s = _make_scheduler()
+        get_decode_activity().publish("other-engine", 4)
+        assert s._active_decode_rows() == 4
+        assert s._contended_prefill_cap() == 128
+
     def test_no_cap_when_fairness_disabled(self):
         s = _make_scheduler(decode_fairness=False)
         s.running = {"r1": MagicMock()}
@@ -183,6 +214,108 @@ class TestQwen35PrefillFloor:
         assert s._prefill_step_size_for_progress(0, 100000) == 2048
 
 
+class TestDS4PrefillFloor:
+    """DeepSeek V4 chunk floor under the same headroom probe as qwen3_5.
+
+    The probe reads total system RAM via omlx.settings.get_system_memory and
+    grants the 4096 floor at >= 64 GiB; it is patched in every test here so
+    the suite is deterministic on any machine.
+    """
+
+    @staticmethod
+    def _patch_system_memory(monkeypatch, gib: int):
+        monkeypatch.setattr(
+            "omlx.settings.get_system_memory", lambda: gib * 1024**3
+        )
+
+    def test_probe_grants_floor_with_headroom(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        assert s._qwen35_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 4096
+
+    def test_probe_grants_floor_for_mtp_variant(self, monkeypatch):
+        # The MTP sibling model_type shares the deepseek_v4 prefix.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4_mtp")
+        assert s._ds4_prefill_floor == 4096
+
+    def test_probe_denies_floor_without_headroom(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 32)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_probe_failure_leaves_default_2048(self, monkeypatch):
+        def _boom():
+            raise OSError("no sysconf")
+
+        monkeypatch.setattr("omlx.settings.get_system_memory", _boom)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_probe_falls_back_to_config_model_type(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        model = MagicMock()
+        model.layers = []
+        model.model_type = ""  # force the model.config.model_type fallback
+        model.config.model_type = "deepseek_v4"
+        s = _make_scheduler(model=model)
+        assert s._ds4_prefill_floor == 4096
+
+    def test_qwen35_probe_unchanged(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="qwen3_5_moe")
+        assert s._qwen35_prefill_floor == 4096
+        assert s._ds4_prefill_floor == 0
+        self._patch_system_memory(monkeypatch, 32)
+        s = _make_scheduler(model_type="qwen3_5_moe")
+        assert s._qwen35_prefill_floor == 0
+        assert s._ds4_prefill_floor == 0
+
+    def test_other_families_unaffected(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        for model_type in ("deepseek_v3", "deepseek_v32", "glm4_moe", "llama"):
+            s = _make_scheduler(model_type=model_type)
+            assert s._ds4_prefill_floor == 0, model_type
+            assert s._qwen35_prefill_floor == 0, model_type
+            assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_floor_is_a_floor_not_a_cap(self, monkeypatch):
+        # A larger configured step size is left alone.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4", prefill_step_size=8192)
+        assert s._prefill_step_size_for_progress(0, 100000) == 8192
+
+    def test_contended_cap_still_wins(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        s.running = {"r1": MagicMock()}
+        assert (
+            s._prefill_step_size_for_progress(0, 100000)
+            == _CONTENDED_PREFILL_CHUNK
+        )
+
+    def test_contended_cap_shrinks_below_floor_to_contended_floor(
+        self, monkeypatch
+    ):
+        # Slow measured prefill tps -> stall-target cap bottoms out at
+        # _CONTENDED_CHUNK_FLOOR (256), well below the 4096 family floor.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        s.running = {"r1": MagicMock()}
+        s._prefill_tps_best = 100.0
+        assert s._contended_prefill_cap() == _CONTENDED_CHUNK_FLOOR
+        assert (
+            s._prefill_step_size_for_progress(0, 100000)
+            == _CONTENDED_CHUNK_FLOOR
+        )
+
+
 class TestAdaptiveChunkCap:
     """Contended chunks are sized by stall time x measured prefill tps."""
 
@@ -213,11 +346,11 @@ class TestAdaptiveChunkCap:
         s._prefill_tps_best = 100.0
         assert s._contended_prefill_cap() == 256
 
-    def test_cap_ceils_at_step_size_for_fast_prefill(self):
+    def test_cap_never_returns_to_full_chunk_for_fast_prefill(self):
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
         s._prefill_tps_best = 100000.0
-        assert s._contended_prefill_cap() == 2048
+        assert s._contended_prefill_cap() == _CONTENDED_PREFILL_CHUNK
 
     def test_decode_rate_sampling_solo_vs_contended(self):
         from omlx.prefill_progress import get_prefill_tracker
@@ -325,6 +458,95 @@ class TestStepGating:
         with patch.object(s, "_schedule_waiting", return_value=([], [])):
             s.step()
         assert get_decode_activity().others_decoding("someone-else")
+
+
+class TestMixedPrefillBudgets:
+    @staticmethod
+    def _request(request_id):
+        return SimpleNamespace(request_id=request_id)
+
+    @pytest.mark.parametrize(
+        ("decode_rows", "quantum"),
+        ((1, 512), (2, 256), (4, 128)),
+    )
+    def test_b1_b2_b4_runs_one_prompt_row_then_round_robins(
+        self, decode_rows, quantum
+    ):
+        s = _make_scheduler()
+        s.running = {f"d{row}": MagicMock() for row in range(decode_rows)}
+        requests = [self._request(f"p{row}") for row in range(4)]
+        states = {
+            request.request_id: SimpleNamespace(
+                request_id=request.request_id,
+                tokens_processed=0,
+            )
+            for request in requests
+        }
+        s.prefilling.extend(requests)
+        s._prefill_states.update(states)
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += quantum
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["p0"]
+        assert [request.request_id for request in s.prefilling] == [
+            "p1",
+            "p2",
+            "p3",
+            "p0",
+        ]
+
+    @pytest.mark.parametrize("decode_rows", (1, 2, 4))
+    def test_cancelled_prefill_row_does_not_consume_mixed_budget(
+        self, decode_rows
+    ):
+        s = _make_scheduler()
+        s.running = {f"d{row}": MagicMock() for row in range(decode_rows)}
+        cancelled = self._request("cancelled")
+        live = self._request("live")
+        live_state = SimpleNamespace(request_id="live", tokens_processed=0)
+        s.prefilling.extend((cancelled, live))
+        s._prefill_states["live"] = live_state
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += 128
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["live"]
+        assert [request.request_id for request in s.prefilling] == ["live"]
+
+    def test_idle_turn_keeps_all_prompt_rows_and_wide_quantum(self):
+        s = _make_scheduler()
+        requests = [self._request(f"p{row}") for row in range(4)]
+        for request in requests:
+            s._prefill_states[request.request_id] = SimpleNamespace(
+                request_id=request.request_id,
+                tokens_processed=0,
+            )
+        s.prefilling.extend(requests)
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += s.config.prefill_step_size
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["p0", "p1", "p2", "p3"]
+        assert s._mixed_batch_budget().prompt_row_budget == 0
 
 
 class TestAdmissionDeferral:

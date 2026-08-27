@@ -1,0 +1,67 @@
+{
+  "contract_version": 2,
+  "date": "2026-08-23",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 2,
+  "shape": {
+    "batch": 1,
+    "rows": 1024,
+    "hidden": 4096,
+    "ratio": 4
+  },
+  "storage": {
+    "canonical_bank_bytes": 27459584,
+    "requantized": false,
+    "steady_state_duplicate_weight_bytes": 0,
+    "fallback_module_views_array_equal": true
+  },
+  "rejected_m5_three_dispatch_schedule": {
+    "speedup": 1.1122983448564845,
+    "projection_array_equal": [true, true, false, false, true, true],
+    "reason": "N=2048 changes M5 BF16 main-compressor reduction geometry"
+  },
+  "hosts": {
+    "m3_ultra": {
+      "architecture": "applegpu_g15d",
+      "dispatches": 3,
+      "qkv": "stock MLX grouped MXFP8",
+      "main_compressors": "grouped BF16",
+      "index_compressors": "grouped BF16",
+      "projection_array_equal": [true, true, true, true, true, true],
+      "fallback_views_array_equal": [true, true, true, true, true, true],
+      "median_ms": {
+        "reference": 2.458979,
+        "candidate": 2.33125
+      },
+      "speedup": 1.0547899195710455
+    },
+    "m5_max": {
+      "architecture": "applegpu_g17s",
+      "dispatches": 4,
+      "qkv": "NAX variant 5 BM128/BK64/BN64/WM4/WN2",
+      "main_compressors": "separate BF16",
+      "index_compressors": "grouped BF16",
+      "projection_array_equal": [true, true, true, true, true, true],
+      "fallback_views_array_equal": [true, true, true, true, true, true],
+      "median_ms": {
+        "reference": 1.007271,
+        "candidate": 0.951896
+      },
+      "speedup": 1.0581733718809618
+    }
+  },
+  "gate": {
+    "minimum_speedup_each_host": 1.05,
+    "all_six_slices_array_equal": true,
+    "original_storage_preserved": true,
+    "single_node_and_tp2_rank_local": true,
+    "collectives_changed": 0,
+    "passed": true
+  },
+  "outcome": {
+    "implemented": true,
+    "cluster_default_enabled": false,
+    "rollback_env": "OMLX_DSV4_QKV_BUNDLE_PREFILL",
+    "reason": "Component gate passed; full cold-prefill TP2 A/B remains required before default-on promotion."
+  }
+}

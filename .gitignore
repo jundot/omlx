@@ -104,6 +104,23 @@ packaging/_export/
 packaging/_build/
 *.dmg
 
+# Apple signing/notarization credentials and temporary keychains
+*.p12
+*.pfx
+*.p8
+*.cer
+*.crt
+*.pem
+*.jks
+*.keystore
+*.provisionprofile
+*.mobileprovision
+*.keychain
+*.keychain-db
+AuthKey_*.p8
+.env.*
+!.env.example
+
 # Generated engine commit metadata (build-time artifact)
 omlx/_engine_commits.json
 

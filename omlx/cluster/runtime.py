@@ -16,11 +16,23 @@ from .performance import ExecutionSettings, NodePerformanceProfile
 _MAX_MARKERS = 64
 _MAX_MARKER_BYTES = 64 * 1024
 _PHASES = {"loading", "ready", "peer_lost", "launcher_lost", "failed"}
-_LOAD_STAGES = {"initializing", "loading_weights", "validating", "ready"}
+_LOAD_STAGES = {
+    "initializing",
+    "initializing_full_replica",
+    "loading_weights",
+    "materializing_fixed",
+    "materializing_layers",
+    "tensor_ready",
+    "weights_resident",
+    "validating",
+    "warming_prefill_shape",
+    "ready",
+}
 _BACKENDS = {"ring", "jaccl", "jaccl-ring"}
 _REQUEST_STATES = {"running", "completed", "failed", "cancelled"}
 _MAX_COUNTER = 2**63 - 1
 _RUNTIME_STALE_AFTER_SECONDS = 45.0
+_MAX_ACTIVE_REQUEST_METRICS = 64
 
 
 def _process_is_live(pid: int) -> bool:
@@ -81,6 +93,7 @@ def _validated_assignments(
     value: Any,
     *,
     world_size: int,
+    full_replicas: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) != world_size:
         raise ValueError("runtime shard map must contain every rank")
@@ -160,6 +173,14 @@ def _validated_assignments(
     if len(tensor_sizes) != 1:
         raise ValueError("runtime tensor parallel sizes disagree")
     tensor_size = tensor_sizes.pop()
+    if full_replicas:
+        ranges = {(item["start_layer"], item["end_layer"]) for item in assignments}
+        if tensor_size != 1 or len(ranges) != 1:
+            raise ValueError("runtime full-replica assignments disagree")
+        start_layer, _end_layer = ranges.pop()
+        if start_layer != 0:
+            raise ValueError("runtime full-replica assignment must start at layer zero")
+        return sorted(assignments, key=lambda item: item["rank"])
     if world_size % tensor_size:
         raise ValueError("runtime tensor parallel size does not divide world size")
     stage_ranges: list[tuple[int, int]] = []
@@ -180,6 +201,81 @@ def _validated_assignments(
             raise ValueError("runtime shard layer ranges must be contiguous")
         cursor = end_layer
     return sorted(assignments, key=lambda item: item["rank"])
+
+
+def _validated_request_metrics(
+    current: Any,
+    *,
+    label: str,
+    require_request_id: bool,
+) -> dict[str, Any]:
+    if not isinstance(current, dict) or current.get("status") not in _REQUEST_STATES:
+        raise ValueError(f"{label} metrics are invalid")
+    request = {"status": current["status"]}
+    request_id = current.get("request_id")
+    if require_request_id or request_id is not None:
+        request["request_id"] = _nonnegative_int(
+            request_id,
+            f"{label} request_id",
+        )
+    for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
+        request[key] = _nonnegative_int(current.get(key), f"{label} {key}")
+    if request["cached_tokens"] > request["prompt_tokens"]:
+        raise ValueError("runtime cached token count exceeds prompt tokens")
+    for key in (
+        "elapsed_seconds",
+        "prefill_tps",
+        "decode_tps",
+        "end_to_end_tps",
+    ):
+        request[key] = _nonnegative_float(current.get(key), f"{label} {key}")
+    request["ttft_seconds"] = _nonnegative_float(
+        current.get("ttft_seconds"),
+        f"{label} ttft_seconds",
+        optional=True,
+    )
+    progress = current.get("prefill_progress")
+    if progress is not None:
+        if not isinstance(progress, dict):
+            raise ValueError("runtime prefill progress is invalid")
+        active = progress.get("active")
+        if not isinstance(active, bool):
+            raise ValueError("runtime prefill progress active flag is invalid")
+        validated_progress = {
+            "active": active,
+            "processed": _nonnegative_int(
+                progress.get("processed"),
+                f"{label} prefill processed",
+            ),
+            "total": _nonnegative_int(
+                progress.get("total"),
+                f"{label} prefill total",
+            ),
+            "speed": _nonnegative_float(
+                progress.get("speed"),
+                f"{label} prefill speed",
+            ),
+            # Added after the first live cluster release. Old rank markers only
+            # have ``speed`` (the latest chunk), so retain compatibility while
+            # giving new dashboards a stable end-to-end running average.
+            "average_speed": _nonnegative_float(
+                progress.get("average_speed", progress.get("speed")),
+                f"{label} prefill average speed",
+            ),
+            "eta": _nonnegative_float(
+                progress.get("eta"),
+                f"{label} prefill eta",
+                optional=True,
+            ),
+            "elapsed": _nonnegative_float(
+                progress.get("elapsed"),
+                f"{label} prefill elapsed",
+            ),
+        }
+        if validated_progress["processed"] > validated_progress["total"]:
+            raise ValueError("runtime prefill progress exceeds its total")
+        request["prefill_progress"] = validated_progress
+    return request
 
 
 def _validated_metrics(value: Any) -> dict[str, Any]:
@@ -205,6 +301,43 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         value.get("aggregate_decode_tps", 0.0),
         "metrics aggregate_decode_tps",
     )
+    result["average_request_decode_tps"] = _nonnegative_float(
+        value.get("average_request_decode_tps", 0.0),
+        "metrics average_request_decode_tps",
+    )
+    result["aggregate_wall_tps"] = _nonnegative_float(
+        value.get("aggregate_wall_tps", 0.0),
+        "metrics aggregate_wall_tps",
+    )
+
+    active_details = value.get("active_request_metrics")
+    if active_details is not None:
+        if (
+            not isinstance(active_details, list)
+            or len(active_details) > _MAX_ACTIVE_REQUEST_METRICS
+        ):
+            raise ValueError("runtime active-request metrics are invalid")
+        requests = [
+            _validated_request_metrics(
+                item,
+                label="active-request metrics",
+                require_request_id=True,
+            )
+            for item in active_details
+        ]
+        if any(item["status"] != "running" for item in requests):
+            raise ValueError("runtime active-request metric is not running")
+        request_ids = [item["request_id"] for item in requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("runtime active-request IDs are not unique")
+        truncated = _nonnegative_int(
+            value.get("active_request_metrics_truncated", 0),
+            "metrics active_request_metrics_truncated",
+        )
+        if len(requests) + truncated != result["active_requests"]:
+            raise ValueError("runtime active-request metric count is inconsistent")
+        result["active_request_metrics"] = requests
+        result["active_request_metrics_truncated"] = truncated
 
     cache = value.get("cache")
     if cache is not None:
@@ -239,6 +372,52 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         if hit_rate is None or hit_rate > 1:
             raise ValueError("runtime cache hit rate is out of range")
         validated_cache["hit_rate"] = hit_rate
+
+        tier_keys = ("ssd_enabled", "memory", "ssd")
+        if any(key in cache for key in tier_keys):
+            if not all(key in cache for key in tier_keys):
+                raise ValueError("runtime cache tier metrics are incomplete")
+            ssd_enabled = cache["ssd_enabled"]
+            if not isinstance(ssd_enabled, bool):
+                raise ValueError("runtime cache SSD enabled flag is invalid")
+            validated_cache["ssd_enabled"] = ssd_enabled
+            for tier in ("memory", "ssd"):
+                raw_tier = cache[tier]
+                if not isinstance(raw_tier, dict):
+                    raise ValueError(f"runtime cache {tier} tier is invalid")
+                validated_cache[tier] = {
+                    key: _nonnegative_int(
+                        raw_tier.get(key),
+                        f"cache metrics {tier} {key}",
+                    )
+                    for key in ("entries", "bytes", "hits")
+                }
+                if tier == "ssd":
+                    for key in (
+                        "max_bytes",
+                        "capacity_bytes",
+                        "evictions",
+                        "capacity_drops",
+                        "pending_bytes",
+                        "pending_max_bytes",
+                        "write_failures",
+                    ):
+                        if key in raw_tier:
+                            validated_cache[tier][key] = _nonnegative_int(
+                                raw_tier.get(key),
+                                f"cache metrics {tier} {key}",
+                            )
+            memory_tier = validated_cache["memory"]
+            ssd_tier = validated_cache["ssd"]
+            if (
+                memory_tier["entries"] + ssd_tier["entries"]
+                != validated_cache["entries"]
+                or memory_tier["bytes"] + ssd_tier["bytes"] != validated_cache["bytes"]
+                or memory_tier["hits"] + ssd_tier["hits"] != validated_cache["hits"]
+            ):
+                raise ValueError("runtime cache tier totals are inconsistent")
+            if not ssd_enabled and any(ssd_tier.values()):
+                raise ValueError("runtime cache SSD tier is populated while disabled")
         result["cache"] = validated_cache
 
     pipeline = value.get("pipeline")
@@ -312,71 +491,102 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             )
         result["stage"] = validated_stage
 
+    mtp = value.get("mtp")
+    if mtp is not None:
+        if not isinstance(mtp, dict):
+            raise ValueError("runtime MTP metrics are invalid")
+        validated_mtp: dict[str, Any] = {}
+        for key in (
+            "sequences",
+            "tokens",
+            "cycles",
+            "accepted_draft_tokens",
+            "drafted_tokens",
+            "zero_depth_cycles",
+        ):
+            validated_mtp[key] = _nonnegative_int(mtp.get(key), f"MTP metrics {key}")
+        if validated_mtp["accepted_draft_tokens"] > validated_mtp["drafted_tokens"]:
+            raise ValueError("runtime MTP accepted count exceeds drafted count")
+        for key in ("acceptance_ratio", "tokens_per_cycle"):
+            validated_mtp[key] = _nonnegative_float(mtp.get(key), f"MTP metrics {key}")
+        if validated_mtp["acceptance_ratio"] > 1:
+            raise ValueError("runtime MTP acceptance ratio is out of range")
+        depth_drafted = mtp.get("depth_drafted")
+        depth_accepted = mtp.get("depth_accepted")
+        if (
+            not isinstance(depth_drafted, list)
+            or not isinstance(depth_accepted, list)
+            or len(depth_drafted) != len(depth_accepted)
+            or len(depth_drafted) > 8
+        ):
+            raise ValueError("runtime MTP depth metrics are invalid")
+        validated_mtp["depth_drafted"] = [
+            _nonnegative_int(item, "MTP depth drafted") for item in depth_drafted
+        ]
+        validated_mtp["depth_accepted"] = [
+            _nonnegative_int(item, "MTP depth accepted") for item in depth_accepted
+        ]
+        if any(
+            accepted > drafted
+            for accepted, drafted in zip(
+                validated_mtp["depth_accepted"],
+                validated_mtp["depth_drafted"],
+            )
+        ):
+            raise ValueError("runtime MTP depth accepted count exceeds drafted count")
+        timing = mtp.get("timing_ms")
+        if not isinstance(timing, dict):
+            raise ValueError("runtime MTP timing metrics are invalid")
+        validated_mtp["timing_ms"] = {
+            key: _nonnegative_float(timing.get(key), f"MTP timing {key}")
+            for key in ("backbone", "mtp_head", "sampling", "cache_ops")
+        }
+        finish_reason = mtp.get("last_finish_reason")
+        if not isinstance(finish_reason, str):
+            raise ValueError("runtime MTP finish reason is invalid")
+        validated_mtp["last_finish_reason"] = finish_reason[:64]
+        result["mtp"] = validated_mtp
+
+    phase_split = value.get("phase_split")
+    if phase_split is not None:
+        if not isinstance(phase_split, dict):
+            raise ValueError("runtime phase-split metrics are invalid")
+        result["phase_split"] = {
+            "handoffs_completed": _nonnegative_int(
+                phase_split.get("handoffs_completed"),
+                "phase handoffs completed",
+            ),
+            "last_handoff_bytes": _nonnegative_int(
+                phase_split.get("last_handoff_bytes"),
+                "phase handoff bytes",
+            ),
+            "last_handoff_arrays": _nonnegative_int(
+                phase_split.get("last_handoff_arrays"),
+                "phase handoff arrays",
+            ),
+            "last_handoff_seconds": _nonnegative_float(
+                phase_split.get("last_handoff_seconds"),
+                "phase handoff seconds",
+            ),
+            "last_handoff_bytes_per_second": _nonnegative_float(
+                phase_split.get("last_handoff_bytes_per_second"),
+                "phase handoff bandwidth",
+            ),
+            "queue_depth": _nonnegative_int(
+                phase_split.get("queue_depth"),
+                "phase queue depth",
+            ),
+        }
+
     current = value.get("last_request")
     if current is None:
         result["last_request"] = None
         return result
-    if not isinstance(current, dict) or current.get("status") not in _REQUEST_STATES:
-        raise ValueError("runtime last-request metrics are invalid")
-    request = {"status": current["status"]}
-    for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
-        request[key] = _nonnegative_int(current.get(key), f"metrics {key}")
-    if request["cached_tokens"] > request["prompt_tokens"]:
-        raise ValueError("runtime cached token count exceeds prompt tokens")
-    for key in (
-        "elapsed_seconds",
-        "prefill_tps",
-        "decode_tps",
-        "end_to_end_tps",
-    ):
-        request[key] = _nonnegative_float(current.get(key), f"metrics {key}")
-    request["ttft_seconds"] = _nonnegative_float(
-        current.get("ttft_seconds"),
-        "metrics ttft_seconds",
-        optional=True,
+    result["last_request"] = _validated_request_metrics(
+        current,
+        label="last-request metrics",
+        require_request_id=False,
     )
-    progress = current.get("prefill_progress")
-    if progress is not None:
-        if not isinstance(progress, dict):
-            raise ValueError("runtime prefill progress is invalid")
-        active = progress.get("active")
-        if not isinstance(active, bool):
-            raise ValueError("runtime prefill progress active flag is invalid")
-        validated_progress = {
-            "active": active,
-            "processed": _nonnegative_int(
-                progress.get("processed"),
-                "metrics prefill processed",
-            ),
-            "total": _nonnegative_int(
-                progress.get("total"),
-                "metrics prefill total",
-            ),
-            "speed": _nonnegative_float(
-                progress.get("speed"),
-                "metrics prefill speed",
-            ),
-            # Added after the first live cluster release. Old rank markers only
-            # have ``speed`` (the latest chunk), so retain compatibility while
-            # giving new dashboards a stable end-to-end running average.
-            "average_speed": _nonnegative_float(
-                progress.get("average_speed", progress.get("speed")),
-                "metrics prefill average speed",
-            ),
-            "eta": _nonnegative_float(
-                progress.get("eta"),
-                "metrics prefill eta",
-                optional=True,
-            ),
-            "elapsed": _nonnegative_float(
-                progress.get("elapsed"),
-                "metrics prefill elapsed",
-            ),
-        }
-        if validated_progress["processed"] > validated_progress["total"]:
-            raise ValueError("runtime prefill progress exceeds its total")
-        request["prefill_progress"] = validated_progress
-    result["last_request"] = request
     return result
 
 
@@ -426,6 +636,21 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
             and _marker_is_fresh(payload["updated_at"])
         ),
     }
+    serving_mode = payload.get("serving_mode", "sharded")
+    if serving_mode not in {"sharded", "disaggregated"}:
+        raise ValueError("runtime marker has an invalid serving mode")
+    marker["serving_mode"] = serving_mode
+    if serving_mode == "disaggregated":
+        prefill_rank = _nonnegative_int(payload.get("prefill_rank"), "prefill rank")
+        decode_rank = _nonnegative_int(payload.get("decode_rank"), "decode rank")
+        if (
+            world_size != 2
+            or {prefill_rank, decode_rank} != set(range(world_size))
+            or prefill_rank == decode_rank
+        ):
+            raise ValueError("runtime phase ownership is invalid")
+        marker["prefill_rank"] = prefill_rank
+        marker["decode_rank"] = decode_rank
     error = payload.get("error")
     if error is not None:
         if not isinstance(error, str):
@@ -458,6 +683,7 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
         marker["assignments"] = _validated_assignments(
             assignments,
             world_size=world_size,
+            full_replicas=serving_mode == "disaggregated",
         )
         local = marker["assignments"][rank]
         if (
@@ -540,8 +766,25 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
                 "active": active,
                 "reason": reason[:500],
             }
-        optional = capabilities.get("pipeline_prefill_overlap")
-        if optional is not None:
+        for key in (
+            "pipeline_prefill_overlap",
+            "rank_zero_logits",
+            "prefill_logits_skip",
+            "prefill_allocator_reuse",
+            "vocab_parallel_sampling",
+            "sparse_indexer_row_parallel",
+            "sparse_indexer_decode_owner",
+            "sparse_indexer_native_topk",
+            "asymmetric_tensor_parallel",
+            "deepseek_v4_fused_decode_attention",
+            "deepseek_ane_prefill",
+            "deepseek_v4_adaptive_prefill",
+            "deepseek_v4_prefill_yield",
+            "deepseek_v4_prefill_async",
+        ):
+            optional = capabilities.get(key)
+            if optional is None:
+                continue
             if not isinstance(optional, dict):
                 raise ValueError("runtime optimization capability is invalid")
             enabled = optional.get("enabled")
@@ -553,7 +796,7 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
                 or not isinstance(reason, str)
             ):
                 raise ValueError("runtime optimization capability is invalid")
-            safe_capabilities["pipeline_prefill_overlap"] = {
+            safe_capabilities[key] = {
                 "enabled": enabled,
                 "active": active,
                 "reason": reason[:500],
@@ -577,7 +820,18 @@ def read_runtime_markers(
 
     jobs: list[dict[str, Any]] = []
     warnings: list[str] = []
-    candidates = [path for path in entries if path.name.endswith(".json")]
+    # The runtime directory also owns launch manifests and one-shot control
+    # files. They are JSON by design but are not rank markers; parsing them as
+    # such produced persistent false warnings in the dashboard after every
+    # cancellation, unload, or reboot.
+    control_suffixes = ("-cancel.json", "-cancel-ack.json", "-serve.json")
+    candidates = [
+        path
+        for path in entries
+        if path.name.endswith(".json")
+        and not path.name.startswith("launch-")
+        and not path.name.endswith(control_suffixes)
+    ]
     if len(candidates) > _MAX_MARKERS:
         warnings.append(f"runtime marker limit exceeded; showing first {_MAX_MARKERS}")
     for path in candidates[:_MAX_MARKERS]:

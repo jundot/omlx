@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from .staging import DEFAULT_REMOTE_PYTHON, run_remote_python
+from .staging import run_remote_python
 
 _REMOTE_MODEL_INVENTORY_SNIPPET = (
     "import json;"
@@ -33,7 +33,7 @@ _CLUSTER_MODEL_TYPES = {"llm", "vlm"}
 def remote_model_inventory(
     ssh_target: str,
     *,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 120.0,
 ) -> list[dict[str, Any]]:
     """Return the peer's discoverable LLM/VLM models without loading them."""

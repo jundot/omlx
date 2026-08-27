@@ -345,8 +345,14 @@ def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
 
 def test_sidecars_are_identified(tmp_path):
     root = _model(tmp_path / "m")
+    (root / "modeling_custom.py").write_text("CUSTOM_MODEL = True\n")
+    (root / "tokenizer.tiktoken").write_text("token 1\n")
+    (root / "chat_examples.jsonl").write_text('{"role":"user"}\n')
     names = sidecar_files(root)
     assert "config.json" in names and "tokenizer.json" in names
+    assert "modeling_custom.py" in names
+    assert "tokenizer.tiktoken" in names
+    assert "chat_examples.jsonl" in names
     assert not any(n.endswith(".safetensors") for n in names)
 
 

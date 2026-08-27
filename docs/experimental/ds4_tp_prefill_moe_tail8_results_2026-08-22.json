@@ -1,0 +1,75 @@
+{
+  "date": "2026-08-22",
+  "base_commit": "30a1f23a",
+  "device": "Apple M3 Ultra",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 20,
+  "rank": 0,
+  "shape": {
+    "tokens": 1024,
+    "routes": 6144,
+    "experts": 256,
+    "hidden": 4096,
+    "local_intermediate": 1024,
+    "block_rows": 32,
+    "microtile_rows": 8
+  },
+  "runs": [
+    {
+      "warmup": 2,
+      "cycles": 4,
+      "pair": {
+        "array_equal": true,
+        "candidate_median_ms": 6.826041,
+        "baseline_median_ms": 8.423063,
+        "speedup": 1.2339602120760773
+      },
+      "down": {
+        "array_equal": true,
+        "candidate_median_ms": 3.5206875,
+        "baseline_median_ms": 4.1275,
+        "speedup": 1.1723562514423673
+      },
+      "composed": {
+        "array_equal": true,
+        "candidate_median_ms": 10.061708,
+        "baseline_median_ms": 11.9325005,
+        "speedup": 1.1859319014227008
+      }
+    },
+    {
+      "warmup": 3,
+      "cycles": 8,
+      "pair": {
+        "array_equal": true,
+        "candidate_median_ms": 7.039542,
+        "baseline_median_ms": 8.1241455,
+        "speedup": 1.1540730206595828
+      },
+      "down": {
+        "array_equal": true,
+        "candidate_median_ms": 3.6505005,
+        "baseline_median_ms": 4.3038125,
+        "speedup": 1.1789650487652308
+      },
+      "composed": {
+        "array_equal": true,
+        "candidate_median_ms": 9.945646,
+        "baseline_median_ms": 12.1346665,
+        "speedup": 1.2200983726949461
+      }
+    }
+  ],
+  "gate": {
+    "minimum_composed_speedup": 1.05,
+    "all_boundaries_array_equal": true,
+    "both_runs_passed": true
+  },
+  "decision": {
+    "isolated_m3_gate": "pass",
+    "production_dispatch_default": "off",
+    "m5_binary_synced": false,
+    "m5_measurement": "pending",
+    "tp2_full_model_gate": "pending"
+  }
+}

@@ -1172,3 +1172,249 @@ instantiate_deepseek_mxfp4_expert(bfloat16_t, 16, 32, 32, 1, 2);
 instantiate_deepseek_mxfp4_expert(bfloat16_t, 32, 32, 32, 1, 2);
 instantiate_deepseek_mxfp4_expert(bfloat16_t, 16, 64, 32, 1, 2);
 instantiate_deepseek_mxfp4_expert(bfloat16_t, 32, 64, 32, 1, 2);
+
+// Decode-only full routed-MoE path.  Unlike the block-list kernels above,
+// this path keeps the original token layout and specializes the one-token /
+// tiny-row regime where every selected expert owns only one route.  A single
+// simdgroup produces two output rows.  Its K walk deliberately mirrors MLX's
+// fp_qmv_fast lane mapping (16 values per lane, 512 values per iteration) so
+// each individual projection retains the stock accumulation topology.
+//
+// The pair kernel computes gate and up together and writes only the activated
+// intermediate.  The down kernel consumes all six routed rows, applies route
+// weights after each down projection (the existing oMLX order), and emits the
+// already-reduced token row.  Both kernels are exposed only through an opt-in
+// primitive until full-model parity and throughput gates pass.
+
+template <typename T>
+inline T deepseek_decode_sigmoid(T x) {
+  auto y = 1 / (1 + metal::exp(metal::abs(x)));
+  return (x < 0) ? T(y) : T(1 - y);
+}
+
+template <typename T, int ROWS>
+[[kernel]] void deepseek_mxfp4_pair_swiglu_decode(
+    const device T* x [[buffer(0)]],
+    const device uint32_t* up_w [[buffer(1)]],
+    const device uint8_t* up_scales [[buffer(2)]],
+    const device uint32_t* gate_w [[buffer(3)]],
+    const device uint8_t* gate_scales [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* activated [[buffer(6)]],
+    const constant int& routes [[buffer(7)]],
+    const constant int& topk [[buffer(8)]],
+    const constant int& experts [[buffer(9)]],
+    const constant int& N [[buffer(10)]],
+    const constant int& K [[buffer(11)]],
+    const constant float& activation_limit [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr int group_size = 32;
+  constexpr int bits = 4;
+  constexpr int values_per_lane = 16;
+  constexpr int k_step = values_per_lane * SIMD_SIZE;
+
+  const int route = int(tid.y);
+  const int first_row = int(tid.x) * ROWS;
+  if (route >= routes || first_row >= N) {
+    return;
+  }
+  const uint32_t expert = indices[route];
+  if (expert >= uint32_t(experts)) {
+    return;
+  }
+
+  const int token = route / topk;
+  const size_t packed_per_row = size_t(K) / 8;
+  const size_t scales_per_row = size_t(K) / group_size;
+  float up_sum[ROWS] = {0.0f};
+  float gate_sum[ROWS] = {0.0f};
+  float x_lane[values_per_lane];
+
+  for (int k = 0; k < K; k += k_step) {
+    const device T* x_ptr =
+        x + size_t(token) * K + k + size_t(simd_lane) * values_per_lane;
+    load_vector<T, float, values_per_lane>(x_ptr, x_lane);
+
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      const int output_row = first_row + row;
+      if (output_row >= N) {
+        continue;
+      }
+      const size_t matrix_row = size_t(expert) * N + output_row;
+      const size_t value_offset =
+          matrix_row * packed_per_row + size_t(k) / 8 + size_t(simd_lane) * 2;
+      const size_t scale_offset = matrix_row * scales_per_row +
+          size_t(k) / group_size + size_t(simd_lane) / 2;
+
+      const float up_scale =
+          dequantize_scale<float, group_size>(up_scales[scale_offset]);
+      const float gate_scale =
+          dequantize_scale<float, group_size>(gate_scales[scale_offset]);
+      up_sum[row] += qdot<float, values_per_lane, bits>(
+          reinterpret_cast<const device uint8_t*>(up_w + value_offset),
+          x_lane,
+          up_scale);
+      gate_sum[row] += qdot<float, values_per_lane, bits>(
+          reinterpret_cast<const device uint8_t*>(gate_w + value_offset),
+          x_lane,
+          gate_scale);
+    }
+  }
+
+#pragma unroll
+  for (int row = 0; row < ROWS; ++row) {
+    const int output_row = first_row + row;
+    if (output_row >= N) {
+      continue;
+    }
+    const float up_reduced = simd_sum(up_sum[row]);
+    const float gate_reduced = simd_sum(gate_sum[row]);
+    if (simd_lane == 0) {
+      // Preserve the materialized gather_qmm dtype boundary before the
+      // LimitedSwiGLU epilogue.
+      T up = T(up_reduced);
+      T gate = T(gate_reduced);
+      if (activation_limit > 0.0f) {
+        gate = T(min(float(gate), activation_limit));
+        up = T(clamp(float(up), -activation_limit, activation_limit));
+      }
+      activated[size_t(route) * N + output_row] =
+          T((gate * deepseek_decode_sigmoid(gate)) * up);
+    }
+  }
+}
+
+template <typename T, int ROWS, int TOPK>
+[[kernel]] void deepseek_mxfp4_down_score_sum_decode(
+    const device T* activated [[buffer(0)]],
+    const device uint32_t* down_w [[buffer(1)]],
+    const device uint8_t* down_scales [[buffer(2)]],
+    const device uint32_t* indices [[buffer(3)]],
+    const device float* scores [[buffer(4)]],
+    device T* output [[buffer(5)]],
+    const constant int& tokens [[buffer(6)]],
+    const constant int& experts [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& K [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+  constexpr int group_size = 32;
+  constexpr int bits = 4;
+  constexpr int values_per_lane = 16;
+  constexpr int k_step = values_per_lane * SIMD_SIZE;
+
+  const int token = int(tid.y);
+  const int first_row = int(tid.x) * ROWS;
+  if (token >= tokens || first_row >= N) {
+    return;
+  }
+
+  const size_t packed_per_row = size_t(K) / 8;
+  const size_t scales_per_row = size_t(K) / group_size;
+  T total[ROWS] = {T(0)};
+
+#pragma unroll
+  for (int slot = 0; slot < TOPK; ++slot) {
+    const int route = token * TOPK + slot;
+    const uint32_t expert = indices[route];
+    float route_sum[ROWS] = {0.0f};
+    float x_lane[values_per_lane];
+
+    if (expert < uint32_t(experts)) {
+      for (int k = 0; k < K; k += k_step) {
+        const int lane_k = k + int(simd_lane) * values_per_lane;
+        if (lane_k >= K) {
+          continue;
+        }
+        const device T* x_ptr =
+            activated + size_t(route) * K + lane_k;
+        load_vector<T, float, values_per_lane>(x_ptr, x_lane);
+
+#pragma unroll
+        for (int row = 0; row < ROWS; ++row) {
+          const int output_row = first_row + row;
+          if (output_row >= N) {
+            continue;
+          }
+          const size_t matrix_row = size_t(expert) * N + output_row;
+          const size_t value_offset =
+              matrix_row * packed_per_row + size_t(lane_k) / 8;
+          const size_t scale_offset = matrix_row * scales_per_row +
+              size_t(lane_k) / group_size;
+          const float scale =
+              dequantize_scale<float, group_size>(down_scales[scale_offset]);
+          route_sum[row] += qdot<float, values_per_lane, bits>(
+              reinterpret_cast<const device uint8_t*>(down_w + value_offset),
+              x_lane,
+              scale);
+        }
+      }
+    }
+
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      const int output_row = first_row + row;
+      if (output_row >= N) {
+        continue;
+      }
+      const float reduced = simd_sum(route_sum[row]);
+      if (simd_lane == 0) {
+        // Match the existing route-output cast, score cast, multiply, then
+        // ordered top-k reduction rather than commuting scores into the down
+        // projection.
+        const T weighted = T(T(reduced) * T(scores[route]));
+        total[row] = T(total[row] + weighted);
+      }
+    }
+  }
+
+  if (simd_lane == 0) {
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) {
+      const int output_row = first_row + row;
+      if (output_row < N) {
+        output[size_t(token) * N + output_row] = total[row];
+      }
+    }
+  }
+}
+
+#define instantiate_deepseek_mxfp4_full_decode(type)                          \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_pair_swiglu_decode_" #type,                            \
+      deepseek_mxfp4_pair_swiglu_decode,                                      \
+      type,                                                                    \
+      2)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_pair_swiglu_decode_" #type "_r1",                     \
+      deepseek_mxfp4_pair_swiglu_decode,                                      \
+      type,                                                                    \
+      1)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_pair_swiglu_decode_" #type "_r4",                     \
+      deepseek_mxfp4_pair_swiglu_decode,                                      \
+      type,                                                                    \
+      4)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_down_score_sum_decode_" #type,                         \
+      deepseek_mxfp4_down_score_sum_decode,                                   \
+      type,                                                                    \
+      2,                                                                       \
+      6)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_down_score_sum_decode_" #type "_r1",                 \
+      deepseek_mxfp4_down_score_sum_decode,                                   \
+      type,                                                                    \
+      1,                                                                       \
+      6)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_down_score_sum_decode_" #type "_r4",                 \
+      deepseek_mxfp4_down_score_sum_decode,                                   \
+      type,                                                                    \
+      4,                                                                       \
+      6)
+
+instantiate_deepseek_mxfp4_full_decode(float16_t);
+instantiate_deepseek_mxfp4_full_decode(bfloat16_t);

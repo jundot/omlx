@@ -86,6 +86,26 @@ def apply_generate_patch() -> bool:
             return [BatchKVCache(left_padding) for _ in model.layers]
 
     _gen._make_cache = _patched_make_cache
+
+    # ``BatchRotatingKVCache.merge`` normally initializes its host ``_offset``
+    # from the retained physical window length. That is sufficient for generic
+    # batched masking, but wrong for a singleton restored prefix: the public
+    # per-row offset may be 4096 while the rotating window holds only 128 rows.
+    # DS4's exact B1 WSDPA/native-mask route intentionally consumes the host
+    # scalar to avoid synchronizing the public MLX vector on every layer. Keep
+    # the absolute scalar for the singleton; real multi-row batches retain the
+    # upstream physical-length behavior and their vector ABI.
+    original_rotating_merge = BatchRotatingKVCache.merge
+
+    def _merge_rotating_with_absolute_singleton(cls, caches):
+        merged = original_rotating_merge(caches)
+        if len(caches) == 1 and type(getattr(caches[0], "offset", None)) is int:
+            merged._offset = int(caches[0].offset)
+        return merged
+
+    BatchRotatingKVCache.merge = classmethod(
+        _merge_rotating_with_absolute_singleton
+    )
     _PATCHED = True
     logger.info("mlx_lm.generate._make_cache replaced (PoolingCache aware)")
     return True

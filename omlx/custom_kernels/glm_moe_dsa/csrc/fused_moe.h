@@ -87,4 +87,17 @@ mx::array deepseek_mxfp4_gather_qmm_expert(
     int variant = 0,
     mx::StreamOrDevice s = {});
 
+mx::array deepseek_mxfp4_full_decode(
+    const mx::array& x,
+    const mx::array& up_weight,
+    const mx::array& up_scales,
+    const mx::array& gate_weight,
+    const mx::array& gate_scales,
+    const mx::array& down_weight,
+    const mx::array& down_scales,
+    const mx::array& indices,
+    const mx::array& scores,
+    float activation_limit,
+    mx::StreamOrDevice s = {});
+
 } // namespace omlx::glm_kernels

@@ -1,0 +1,58 @@
+{
+  "date": "2026-08-22",
+  "device": "Apple M3 Ultra",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 2,
+  "tokens": 1024,
+  "classic_best_variant": {
+    "variant": 1,
+    "bm": 64,
+    "bk": 32,
+    "bn": 32,
+    "all_tested_boundaries_array_equal": true
+  },
+  "rank0_24_heads": {
+    "projection_bucket_ms": 10.585104,
+    "input_grouping_speedup": 1.060413,
+    "full_grouped_bucket_speedup": 1.015161,
+    "classic_speedups": {
+      "q_b": 1.054289,
+      "o_a": 1.089777,
+      "o_b": 1.060171
+    },
+    "projected_classic_bucket_ms": 10.042854,
+    "projected_classic_bucket_speedup": 1.053994
+  },
+  "rank1_shape_40_heads": {
+    "projection_bucket_ms": 12.761417,
+    "input_grouping_speedup": 1.019398,
+    "full_grouped_bucket_speedup": 1.010503,
+    "classic_speedups": {
+      "q_b": 1.101781,
+      "o_a": 1.080523,
+      "o_b": 1.121235
+    },
+    "projected_classic_bucket_ms": 11.684376,
+    "projected_classic_bucket_speedup": 1.092178
+  },
+  "external_exact_controls": {
+    "main_plus_index_q_b": {"m3": 1.003, "m5": 1.001},
+    "gate_up_width2560": {"m3": 1.005, "m5": 1.034},
+    "five_bf16_compressors": {"speedup": 1.121, "array_equal": false}
+  },
+  "nax": {
+    "stock_variant": "BM64/BN64/BK64/WM2/WN2",
+    "compiled_variants": 10,
+    "local_device_available": false,
+    "m5_measurement": "O-A variant 0 confirmed exact and promotable",
+    "promoted_default_off_shape": [1, 8, 1024, 2560],
+    "environment": "OMLX_DSV4_NAX_OA_PREFILL"
+  },
+  "gate": {
+    "minimum_projection_bucket_speedup": 1.30,
+    "classic_passed": false,
+    "production_dispatch": false
+  },
+  "server_stopped_or_replanned": false,
+  "remote_touched": false
+}

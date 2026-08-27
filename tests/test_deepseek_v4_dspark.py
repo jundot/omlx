@@ -119,6 +119,79 @@ def test_dspark_wins_over_legacy_nextn_discriminator(dsv4):
     assert len(model.mtp) == 3
     assert all(isinstance(stage, dsv4.DSparkBlock) for stage in model.mtp)
     assert not any(isinstance(stage, dsv4.MTPBlock) for stage in model.mtp)
+    assert model._omlx_tensor_auxiliary_modules() == tuple(model.mtp)
+    assert model._omlx_tensor_vocab_modules() == (
+        (model.mtp[-1].markov_head, "markov_w2"),
+    )
+    assert all(
+        layer.attn._omlx_decode_consistent for layer in model.model.layers
+    )
+
+
+def test_dspark_non_mtp_decode_uses_fused_attention(dsv4, monkeypatch):
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    set_mtp_active(False)
+    model = dsv4.Model(_tiny_config(dsv4))
+    attention = model.model.layers[0].attn
+    assert attention._omlx_decode_consistent is False
+
+    calls = []
+
+    def exact(q, *_args, **_kwargs):
+        calls.append("exact")
+        return mx.zeros_like(q)
+
+    def fused(q, *_args, **_kwargs):
+        calls.append("fused")
+        return mx.zeros_like(q)
+
+    monkeypatch.setattr(dsv4, "exact_attention", exact)
+    monkeypatch.setattr(dsv4, "scaled_dot_product_attention", fused)
+    mx.eval(attention(mx.zeros((1, 1, 8), dtype=mx.bfloat16)))
+    assert calls == ["fused"]
+
+    attention._omlx_decode_consistent = True
+    calls.clear()
+    mx.eval(attention(mx.zeros((1, 1, 8), dtype=mx.bfloat16)))
+    assert calls == ["exact"]
+
+
+def test_dspark_markov_projection_matches_lm_head_vocab_shard(
+    dsv4, monkeypatch
+):
+    from omlx.cluster.tensor_strategies import (
+        _shard_auxiliary_vocab_heads,
+        _shard_output_head,
+    )
+    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
+
+    class RankOne:
+        @staticmethod
+        def rank():
+            return 1
+
+        @staticmethod
+        def size():
+            return 2
+
+    set_mtp_active(True)
+    set_mtp_depth(3)
+    try:
+        model = dsv4.Model(_tiny_config(dsv4))
+    finally:
+        set_mtp_active(False)
+
+    monkeypatch.setenv("OMLX_CLUSTER_VOCAB_PARALLEL", "on")
+    assert _shard_output_head(model, RankOne(), mx)
+    assert _shard_auxiliary_vocab_heads(model, RankOne(), mx) == 1
+    model.lm_head._omlx_gather_vocab_logits = False
+    model.mtp[-1].markov_head.markov_w2._omlx_gather_vocab_logits = False
+
+    bias, _embedding = model.dspark_markov(mx.array([7], dtype=mx.uint32))
+    assert model.lm_head.weight.shape[0] == 16
+    assert model.mtp[-1].markov_head.markov_w2.weight.shape[0] == 16
+    assert bias.shape == (1, 16)
 
 
 def test_dspark_target_tap_and_parallel_draft_shapes(dsv4):
@@ -495,9 +568,32 @@ def test_dspark_head_gemv_matches_promoted_fp32_projection(rows):
         assert mx.allclose(actual, expected, rtol=0, atol=4e-5).item()
 
 
+def test_dspark_head_gemv_gathers_a_vocab_parallel_local_projection():
+    from omlx.patches.deepseek_v4.verify_qmv import dspark_head_gemv
+
+    mx.random.seed(58)
+    module = nn.Linear(512, 4096, bias=False)
+    module.weight = mx.random.normal((4096, 512), dtype=mx.bfloat16)
+    inputs = mx.random.normal((1, 2, 512), dtype=mx.bfloat16)
+    gathered = []
+
+    def gather(local):
+        gathered.append(local.shape)
+        return mx.concatenate([local, local], axis=-1)
+
+    module._gather_logits = gather
+    output = dspark_head_gemv(module, inputs)
+    mx.eval(output)
+
+    assert gathered == [(1, 2, 4096)]
+    assert output.shape == (1, 2, 8192)
+    assert mx.array_equal(output[..., :4096], output[..., 4096:]).item()
+
+
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
 def test_verify_exact_multi_qmv_matches_decode_rows(rows):
     from mlx_lm.models.mla import MultiLinear
+
     from omlx.patches.deepseek_v4.verify_qmv import exact_verify_multi_qmv
 
     mx.random.seed(59 + rows)
@@ -587,6 +683,52 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
 
     assert mx.array_equal(actual_scores, expected_scores).item()
     assert mx.array_equal(actual_values, expected_values).item()
+
+
+@pytest.mark.parametrize("heads", [24, 32, 40, 64])
+def test_dspark_rowwise_gemm_supports_tensor_parallel_head_counts(heads):
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if not fast.has_symbol("dspark_rowwise_gemm"):
+        pytest.skip("native DSpark rowwise GEMM is unavailable")
+
+    mx.random.seed(97 + heads)
+    rows, width, length = 3, 512, 128
+    queries = mx.random.normal((rows, heads, width), dtype=mx.bfloat16)
+    keys = mx.random.normal((rows, length, width), dtype=mx.bfloat16)
+    expected_scores = mx.concatenate(
+        [
+            queries[row : row + 1] @ keys[row : row + 1].swapaxes(-1, -2)
+            for row in range(rows)
+        ]
+    )
+    try:
+        actual_scores = fast.dspark_rowwise_gemm(queries, keys, True)
+    except ValueError:
+        if heads != 64:
+            pytest.skip("native extension needs rebuild for TP-local heads")
+        raise
+
+    weights = mx.random.normal((rows, heads, length), dtype=mx.bfloat16)
+    expected_values = mx.concatenate(
+        [
+            weights[row : row + 1] @ keys[row : row + 1]
+            for row in range(rows)
+        ]
+    )
+    actual_values = fast.dspark_rowwise_gemm(weights, keys, False)
+    mx.eval(expected_scores, actual_scores, expected_values, actual_values)
+
+    # Metal 4/NAX on M5 can choose a different but BF16-equivalent reduction
+    # order from this custom row-wise kernel (typically 1-6 differing values
+    # in 9K-98K outputs). Require BF16 numerical parity, not cross-GPU bitwise
+    # identity with the stock matmul implementation.
+    assert mx.allclose(
+        actual_scores, expected_scores, rtol=1e-2, atol=1e-3
+    ).item()
+    assert mx.allclose(
+        actual_values, expected_values, rtol=1e-2, atol=1e-3
+    ).item()
 
 
 @pytest.mark.parametrize("rows", [2, 3, 5])
@@ -741,6 +883,48 @@ def test_dspark_indexer_batches_adjacent_pool_lengths(dsv4):
     )
 
 
+def test_dspark_ragged_verify_topk_runs_each_row_at_its_exact_width(
+    dsv4,
+    monkeypatch,
+):
+    query_rows = mx.zeros((3, 2, 1, 4), dtype=mx.float32)
+    local_rows = [
+        mx.zeros((1, 1, 8, 4), dtype=mx.bfloat16) for _index in range(3)
+    ]
+    pooled_rows = [
+        mx.zeros((1, width, 4), dtype=mx.bfloat16)
+        for width in (511, 512, 513)
+    ]
+    topk_rows = [
+        mx.arange(width, dtype=mx.uint32)[None, None]
+        for width in (511, 512, 512)
+    ]
+    calls = []
+
+    def row_attention(query, local, pooled, topk, *_args, **_kwargs):
+        calls.append((query.shape[0], local.shape[2], pooled.shape[1], topk.shape[-1]))
+        return query + mx.array(float(topk.shape[-1]), dtype=query.dtype)
+
+    monkeypatch.setattr(dsv4, "_sparse_pooled_attention", row_attention)
+    result = dsv4._ragged_verify_sparse_attention(
+        query_rows,
+        local_rows,
+        pooled_rows,
+        topk_rows,
+        4**-0.5,
+        mx.zeros((2,), dtype=mx.bfloat16),
+        decode_consistent=True,
+    )
+    mx.eval(result)
+
+    assert calls == [
+        (1, 8, 511, 511),
+        (2, 8, 513, 512),
+    ]
+    assert result.shape == query_rows.shape
+    assert result[:, 0, 0, 0].tolist() == [511.0, 512.0, 512.0]
+
+
 @pytest.mark.parametrize("key_length", [156, 512, 640, 1024])
 @pytest.mark.parametrize("rows", [2, 3, 6])
 def test_dspark_attention_matches_stock_m1_fallback(dsv4, key_length, rows):
@@ -853,6 +1037,7 @@ def test_vectorized_verify_ring_snapshots_match_m1_updates(dsv4, batch_cache):
 @pytest.mark.parametrize("batch_cache", [False, True])
 def test_vectorized_verify_ring_rollback_matches_accepted_prefix(dsv4, batch_cache):
     from mlx_lm.models.cache import BatchRotatingKVCache
+
     from omlx.patches.mlx_lm_mtp.cache_rollback import set_undo_armed
 
     def make_cache():

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import math
 import os
 import re
 import signal
@@ -13,14 +15,26 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract
+from ..utils.prefill_warmup import (
+    MAX_PREFILL_SHAPE_WARMUP_TOKENS as _MAX_PREFILL_SHAPE_WARMUP_TOKENS,
+)
+from ..utils.prefill_warmup import (
+    run_prefill_shape_warmup as _run_prefill_shape_warmup,
+)
+from .control_plane import RankControlPlane
+from .deployment import (
+    decode_worker_contract,
+    decode_worker_path_map,
+    decode_worker_speculation,
+)
+from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -29,7 +43,15 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
-from .performance import ExecutionSettings
+from .parallel_groups import (
+    install_pipeline_group_routing,
+    split_parallel_groups,
+)
+from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    DeepseekAnePrefillSettings,
+    ExecutionSettings,
+)
 from .pipeline_compat import (
     install_pipeline_compatibility,
     pipeline_assignment_is_honored,
@@ -42,12 +64,166 @@ from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 
+logger = logging.getLogger(__name__)
+
+_FATAL_GENERATION_EXIT_CODE = 70
+
 
 def _emit_event(payload: dict[str, Any]) -> None:
     print(
         _EVENT_PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":")),
         flush=True,
     )
+
+
+@contextmanager
+def _trace_collectives(
+    mx: Any,
+    group: Any,
+    *,
+    state_dir: str | Path,
+    deployment_id: str,
+) -> Any:
+    """Record rank-local distributed call order without changing execution.
+
+    This is an operator-only diagnostic for the hardest failure class: both
+    ranks are alive, but one constructs a different collective graph and the
+    peer eventually reports a lost completion.  JACCL can only report the
+    native operation that timed out; this trace adds the Python call sequence,
+    tensor shape, thread, and call site needed to distinguish a transport loss
+    from rank-state divergence.  It is disabled by default and restores every
+    MLX function on exit.
+    """
+
+    enabled = os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0").strip().lower()
+    if enabled not in {"1", "true", "on", "yes"}:
+        yield None
+        return
+
+    rank = int(group.rank())
+    path = (
+        Path(state_dir).expanduser() / f"{deployment_id}-collectives-rank-{rank}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    names = ("all_sum", "all_gather", "send", "recv_like")
+    originals = {
+        name: getattr(mx.distributed, name)
+        for name in names
+        if hasattr(mx.distributed, name)
+    }
+    lock = threading.Lock()
+    sequence = 0
+    started = time.monotonic()
+
+    def wrap(name: str, original: Any) -> Any:
+        @wraps(original)
+        def traced(*args: Any, **kwargs: Any) -> Any:
+            nonlocal sequence
+            value = args[0] if args else kwargs.get("value")
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", None)
+            caller = sys._getframe(1)
+            with lock:
+                sequence += 1
+                record = {
+                    "seq": sequence,
+                    "rank": rank,
+                    "op": name,
+                    "shape": list(shape) if shape is not None else None,
+                    "dtype": str(dtype) if dtype is not None else None,
+                    "thread": threading.current_thread().name,
+                    "caller": (
+                        f"{Path(caller.f_code.co_filename).name}:"
+                        f"{caller.f_lineno}:{caller.f_code.co_name}"
+                    ),
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                with path.open("a", encoding="utf-8") as trace:
+                    trace.write(json.dumps(record, sort_keys=True) + "\n")
+            return original(*args, **kwargs)
+
+        return traced
+
+    path.write_text("", encoding="utf-8")
+    for name, original in originals.items():
+        setattr(mx.distributed, name, wrap(name, original))
+    try:
+        yield path
+    finally:
+        for name, original in originals.items():
+            setattr(mx.distributed, name, original)
+
+
+def _wait_for_serve_release(
+    state_dir: str | Path,
+    deployment_id: str,
+    plan_hash: str,
+    world_size: int,
+    *,
+    timeout: float = 1800.0,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> None:
+    """Wait for the supervisor to confirm that every rank finished loading.
+
+    Ranks cannot use a JACCL collective as this barrier: the first Mac may be
+    fully wired while a smaller peer is still materializing layers, and an
+    early all-reduce then times out and destroys an otherwise healthy load.
+    Every rank publishes ``rank_ready`` first; the supervisor observes all of
+    them and atomically writes this local release marker on every host. The
+    timeout matches the supervisor's default load deadline: asymmetric Macs
+    can finish materializing very large shards minutes apart without the
+    faster rank aborting a healthy load at the old two-minute boundary.
+    """
+
+    path = Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
+    deadline = float(clock()) + max(0.0, float(timeout))
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and payload.get("deployment_id") == deployment_id
+            and payload.get("plan_hash") == plan_hash
+            and payload.get("world_size") == world_size
+        ):
+            return
+        remaining = deadline - float(clock())
+        if remaining <= 0:
+            raise TimeoutError(
+                "supervisor did not release all loaded ranks into serving"
+            )
+        sleep(min(0.05, remaining))
+
+
+def _planned_prefill_shape_warmup_tokens(
+    optimizations: Any,
+    *,
+    tensor_parallel_size: int,
+) -> int:
+    """Return a bounded, adapter-qualified prefill shape to compile at load.
+
+    Runtime optimizations own the model/schedule detection.  The worker only
+    consumes their machine-readable shape after the supervisor has released
+    every loaded rank, which keeps this distributed forward from becoming an
+    unsafe load barrier.  Unknown models and old optimization providers have
+    no shape metadata and therefore remain unchanged.
+    """
+
+    if tensor_parallel_size <= 1 or not isinstance(optimizations, dict):
+        return 0
+    capability = optimizations.get("deepseek_v4_adaptive_prefill")
+    if not isinstance(capability, dict) or capability.get("active") is not True:
+        return 0
+    raw = capability.get("shape_warmup_tokens", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    if not 1 <= raw <= _MAX_PREFILL_SHAPE_WARMUP_TOKENS:
+        return 0
+    return raw
 
 
 def _cross_thread_generation_stream(mx: Any) -> Any:
@@ -66,6 +242,20 @@ def _cross_thread_generation_stream(mx: Any) -> Any:
     return stream
 
 
+def _fatal_generation_thread_exit() -> None:
+    """Terminate a rank whose sole generation thread has crashed.
+
+    mlx-lm's private server does not propagate an exception escaping
+    ``ResponseGenerator._generate`` back to its HTTP/main thread.  Leaving the
+    process alive is worse than exiting: requests hang, the marker continues
+    to look superficially live, and peers discover the loss only after the
+    watchdog deadline.  A dedicated exit code lets mlx.launch and the oMLX
+    supervisor fail the deployment immediately.
+    """
+
+    os._exit(_FATAL_GENERATION_EXIT_CODE)
+
+
 @contextmanager
 def _bind_generation_thread_stream(
     response_generator_type: Any,
@@ -79,7 +269,17 @@ def _bind_generation_thread_stream(
     @wraps(original_generate)
     def generate_on_rank_stream(instance: Any) -> Any:
         mx.set_default_stream(stream)
-        return original_generate(instance)
+        try:
+            return original_generate(instance)
+        except Exception:
+            logger.critical(
+                "Fatal exception escaped the distributed generation thread; "
+                "terminating rank with exit code %d",
+                _FATAL_GENERATION_EXIT_CODE,
+                exc_info=True,
+            )
+            _fatal_generation_thread_exit()
+            raise
 
     response_generator_type._generate = generate_on_rank_stream
     try:
@@ -431,6 +631,191 @@ def _distributed_model_type(model_path: str | Path) -> str:
     return str(model_type or "").strip().lower()
 
 
+def _apply_distributed_mtp_decode_concurrency(
+    args: argparse.Namespace,
+    *,
+    mtp_enabled: bool,
+) -> int:
+    """Use the throughput-optimal DS4 lane until batched DSpark MTP exists."""
+
+    requested = max(1, int(args.decode_concurrency))
+    if not mtp_enabled or not _distributed_model_type(args.model).startswith(
+        "deepseek_v4"
+    ):
+        return requested
+    try:
+        limit = int(os.environ.get("OMLX_DSV4_MTP_DECODE_CONCURRENCY", "1"))
+    except ValueError:
+        limit = 1
+    limit = max(1, limit)
+    effective = min(requested, limit)
+    if effective != requested:
+        logger.info(
+            "DS4 distributed MTP decode concurrency capped %d -> %d: "
+            "singleton speculation currently outperforms standard B2/B4",
+            requested,
+            effective,
+        )
+        args.decode_concurrency = effective
+    prompt_requested = max(1, int(getattr(args, "prompt_concurrency", 1)))
+    if prompt_requested > effective:
+        logger.info(
+            "DS4 distributed MTP prompt concurrency capped %d -> %d to "
+            "match the decode lane",
+            prompt_requested,
+            effective,
+        )
+        args.prompt_concurrency = effective
+    microbatch_requested = max(
+        1, int(getattr(args, "pipeline_microbatch_size", 1))
+    )
+    if microbatch_requested > effective:
+        logger.info(
+            "DS4 distributed MTP pipeline microbatch capped %d -> %d to "
+            "match the decode lane",
+            microbatch_requested,
+            effective,
+        )
+        args.pipeline_microbatch_size = effective
+    return effective
+
+
+def _configure_distributed_mtp(
+    model_path: str | Path,
+    *,
+    enabled: bool,
+    depth: int | None,
+    tensor_parallel_size: int,
+    pipeline_stages: int = 1,
+) -> int | None:
+    """Validate and install the rank-identical speculative depth contract."""
+
+    if not enabled:
+        return None
+    if tensor_parallel_size < 2:
+        raise RuntimeError("distributed MTP currently requires pure tensor parallelism")
+    if pipeline_stages != 1:
+        raise RuntimeError(
+            "distributed MTP is not yet validated for hybrid TP x pipeline"
+        )
+    model_type = _distributed_model_type(model_path)
+    if not model_type.startswith("deepseek_v4"):
+        raise RuntimeError(
+            "distributed MTP is not validated for model type "
+            f"{model_type or 'unknown'!r}"
+        )
+    # Qualification gate for coordinated adaptive depth. The MTP runtime
+    # broadcasts rank zero's selected depth before building every draft chain
+    # (and broadcasts its exit decision before parking), so heterogeneous
+    # local timing estimates cannot change the collective sequence. Keep the
+    # signed fixed-depth profile as the production default until the adaptive
+    # path clears a physical multi-rank throughput/parity gate.
+    adaptive = os.environ.get(
+        "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    lockstep = os.environ.get(
+        "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if adaptive or lockstep:
+        os.environ.pop("OMLX_MTP_FIXED_DEPTH", None)
+        return None
+    fixed_depth = depth or 3
+    os.environ["OMLX_MTP_FIXED_DEPTH"] = str(fixed_depth)
+    return fixed_depth
+
+
+def _configure_tensor_shard_weights(
+    assignments: Sequence[PipelineAssignment],
+    *,
+    rank: int,
+    tensor_parallel_size: int,
+) -> tuple[int, ...]:
+    """Publish this rank's signed asymmetric TP partition to model adapters."""
+
+    component_overrides = (
+        "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
+        "OMLX_TP_MOE_SHARD_WEIGHTS",
+    )
+    configured_overrides = tuple(
+        name for name in component_overrides if os.environ.get(name, "").strip()
+    )
+    for name in component_overrides:
+        os.environ.pop(name, None)
+    if configured_overrides:
+        logger.warning(
+            "Ignoring unsigned tensor-component shard overrides (%s); "
+            "the signed worker plan controls rank ownership",
+            ", ".join(configured_overrides),
+        )
+
+    if tensor_parallel_size < 2:
+        os.environ.pop("OMLX_TP_SHARD_WEIGHTS", None)
+        return (1,)
+    stage = rank // tensor_parallel_size
+    start = stage * tensor_parallel_size
+    group = sorted(
+        assignments[start : start + tensor_parallel_size],
+        key=lambda item: item.tensor_parallel_rank,
+    )
+    if (
+        len(group) != tensor_parallel_size
+        or [item.tensor_parallel_rank for item in group]
+        != list(range(tensor_parallel_size))
+        or len({(item.start_layer, item.end_layer) for item in group}) != 1
+    ):
+        raise RuntimeError("tensor-parallel shard-weight group is inconsistent")
+    weights = tuple(int(item.tensor_parallel_shard_weight) for item in group)
+    if any(weight < 1 for weight in weights):
+        raise RuntimeError("tensor-parallel shard weights must be positive")
+    # The plan is the admission/memory contract, so it wins over a stale shell
+    # value. A different runtime split could retain more weights than approved.
+    os.environ["OMLX_TP_SHARD_WEIGHTS"] = ",".join(map(str, weights))
+    return weights
+
+
+def _configure_indexer_decode_owner(
+    profiles: Sequence[Any],
+    *,
+    rank: int,
+    tensor_parallel_size: int,
+) -> int | None:
+    """Choose the fastest measured TP member for DS4 decode top-k work."""
+
+    requested = (
+        os.environ.get("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto").strip().lower()
+    )
+    if requested in {"false", "no", "off", "disabled"}:
+        os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = "off"
+        return None
+    if tensor_parallel_size < 2:
+        os.environ.pop("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", None)
+        return None
+    if requested != "auto":
+        try:
+            owner = int(requested)
+        except ValueError as exc:
+            raise RuntimeError(
+                "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK must be auto, off, or a rank"
+            ) from exc
+        if not 0 <= owner < tensor_parallel_size:
+            raise RuntimeError(
+                "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK is outside the TP group"
+            )
+        os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = str(owner)
+        return owner
+    stage = rank // tensor_parallel_size
+    start = stage * tensor_parallel_size
+    group = list(profiles[start : start + tensor_parallel_size])
+    owner = 0
+    if len(group) == tensor_parallel_size:
+        owner = max(
+            range(tensor_parallel_size),
+            key=lambda item: group[item].decode_weight_bytes_per_second,
+        )
+    os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = str(owner)
+    return owner
+
+
 def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) -> str:
     """Install the normal oMLX model protocol on this distributed rank."""
 
@@ -448,6 +833,19 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
 
 
 def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
+    deepseek_ane = DeepseekAnePrefillSettings(
+        enabled=args.deepseek_ane_prefill,
+        sequence_length=args.deepseek_ane_sequence_length,
+        tail_padding_min_tokens=args.deepseek_ane_tail_padding_min_tokens,
+        down_enabled=args.deepseek_ane_down,
+        down_fraction=args.deepseek_ane_down_fraction,
+        wo_a_enabled=args.deepseek_ane_wo_a,
+        wo_a_fraction=args.deepseek_ane_wo_a_fraction,
+        cpu_enabled=args.deepseek_ane_cpu,
+        cpu_fraction=args.deepseek_ane_cpu_fraction,
+        cpu_threads=args.deepseek_ane_cpu_threads,
+        cpu_shared_resource=args.deepseek_ane_cpu_shared_resource,
+    )
     return ExecutionSettings(
         profile=args.execution_profile,
         auto_tune=args.auto_tune,
@@ -460,33 +858,200 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         pipeline_microbatch_size=args.pipeline_microbatch_size,
         cache_affinity=args.cache_affinity,
         prompt_cache_ssd=args.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
+        deepseek_ane_prefill=deepseek_ane,
     )
+
+
+def _enable_distributed_deepseek_ane_prefill(
+    model: Any,
+    settings: DeepseekAnePrefillSettings,
+) -> int:
+    """Install PR #3059 on one already-sharded rank, fail-soft per rank."""
+
+    if not settings.enabled:
+        return 0
+    model_type = next(
+        (
+            str(value)
+            for value in (
+                getattr(model, "model_type", None),
+                getattr(getattr(model, "args", None), "model_type", None),
+                getattr(getattr(model, "config", None), "model_type", None),
+            )
+            if isinstance(value, str) and value
+        ),
+        "",
+    )
+    if not model_type.startswith("deepseek_v4"):
+        logger.warning(
+            "Ignoring DeepSeek ANE execution settings for model type %r",
+            model_type,
+        )
+        return 0
+    try:
+        from omlx.patches.deepseek_v4.ane_prefill import (
+            enable_deepseek_v4_ane_prefill,
+        )
+
+        return int(
+            enable_deepseek_v4_ane_prefill(
+                model,
+                sequence_length=settings.sequence_length,
+                tail_padding_min_tokens=settings.tail_padding_min_tokens,
+                down_enabled=settings.down_enabled,
+                down_fraction=settings.down_fraction,
+                wo_a_enabled=settings.wo_a_enabled,
+                wo_a_fraction=settings.wo_a_fraction,
+                cpu_fraction=(settings.cpu_fraction if settings.cpu_enabled else 0.0),
+                cpu_threads=settings.cpu_threads,
+                cpu_shared_resource=settings.cpu_shared_resource,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "DeepSeek ANE prefill could not be enabled on this rank; "
+            "continuing with the exact GPU path",
+            exc_info=True,
+        )
+        return 0
 
 
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
-    Kept beside the runtime markers and scoped by deployment and rank, so two
-    deployments never read each other's snapshots and a rank only ever loads its
-    own layer slice.
+    Kept under the normal oMLX SSD cache root and scoped by deployment, signed
+    plan and rank, so model switching preserves one clearable cache location
+    while a changed tensor split can never restore another shard layout.
     """
 
     if not args.prompt_cache_ssd:
         return None
-    root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
-    return str(root / f"{args.deployment_id}-rank-{rank}")
+    root = Path(
+        os.environ.get(
+            "OMLX_CLUSTER_PROMPT_CACHE_ROOT",
+            "~/.omlx/cache/cluster-prompt-snapshots",
+        )
+    ).expanduser()
+    plan_hash = str(getattr(args, "plan_hash", "") or "unplanned")
+    return str(root / args.deployment_id / plan_hash / f"rank-{rank}")
+
+
+def _release_metal_memory(reason: str) -> None:
+    """Best-effort Metal release before a force-exit.
+
+    Ported from ThunderMLX's ``clear_mlx_cache`` (run_with_watchdog.py), the
+    fix for "176 GB wired with no owning process": ``clear_cache()`` alone only
+    drops the Metal *cache pool* — the wired model weights stay stranded in
+    kernel wired memory when ``os._exit`` skips every finally/atexit handler.
+    ``set_wired_limit(0)`` unwires the model allocation so the OS reclaims it
+    on process death. Every step is guarded: a rank whose MLX import or Metal
+    queue is already broken must still reach its exit.
+    """
+
+    try:
+        import mlx.core as mx
+    except Exception:
+        # MLX never imported (or unimportable): nothing is wired, nothing to do.
+        return
+    try:
+        # Unwire first: this is what actually releases the memory the weights
+        # hold. A safe no-op when nothing is wired.
+        mx.set_wired_limit(0)
+    except Exception as exc:
+        logger.warning("set_wired_limit(0) failed (%s): %s", reason, exc)
+    with suppress(Exception):
+        mx.clear_cache()
+    metal = getattr(mx, "metal", None)
+    metal_clear = getattr(metal, "clear_cache", None)
+    if metal_clear is not None:
+        with suppress(Exception):
+            metal_clear()
 
 
 def _install_signal_handlers() -> None:
-    def interrupt(_signum: int, _frame: Any) -> None:
+    def hard_exit(signum: int, _frame: Any) -> None:
+        # The Metal release hung on a wedged GPU queue; the cleanup path must
+        # not itself stall the SIGKILL escalation waiting behind it.
+        name = signal.Signals(signum).name
+        sys.stderr.write(f"[RANK] {name} while releasing Metal memory; hard-exiting\n")
+        sys.stderr.flush()
+        os._exit(128 + signum)
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        name = signal.Signals(signum).name
+        # Release wired Metal memory while the rank can still do it itself —
+        # the coordinator escalates a wedged rank from SIGTERM to SIGKILL, and
+        # a SIGKILL cannot unwire anything (ThunderMLX's TERM/INT handlers in
+        # run_with_watchdog.py, alarm escape hatch included). The graceful
+        # KeyboardInterrupt path is unchanged for a rank that answers promptly.
+        try:
+            signal.signal(signal.SIGALRM, hard_exit)
+            signal.alarm(
+                int(os.environ.get("OMLX_CLUSTER_SIGNAL_CLEAR_TIMEOUT", "10") or "10")
+            )
+        except Exception:
+            pass
+        _release_metal_memory(f"rank received {name}")
+        with suppress(Exception):
+            signal.alarm(0)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+
+
+def _write_cancel_request(
+    state_dir: str,
+    deployment_id: str,
+    reason: str,
+    *,
+    plan_hash: str | None = None,
+) -> None:
+    """Ask this rank's telemetry to force-cancel in-flight requests.
+
+    Best effort and silent on failure: the file is consumed by the rank's
+    telemetry heartbeat, which cancels through ``BatchGenerator.remove`` at
+    a batch step boundary shared with peer ranks. Writing it before a
+    watchdog exit lets in-flight work unwind instead of being severed
+    mid-collective.
+    """
+
+    try:
+        root = Path(state_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{deployment_id}-cancel.json"
+        epoch = int(time.time() * 1000)
+        # Reused deployment IDs can leave an old control file behind. Keep
+        # epochs strictly monotonic even if that file came from a clock jump;
+        # the new worker treats the existing epoch as its startup watermark.
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            previous_epoch = existing.get("epoch") if isinstance(existing, dict) else 0
+            if isinstance(previous_epoch, int) and not isinstance(previous_epoch, bool):
+                epoch = max(epoch, previous_epoch + 1)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "deployment_id": deployment_id,
+            "epoch": epoch,
+            "scope": "all",
+            "reason": reason,
+        }
+        if plan_hash:
+            payload["plan_hash"] = plan_hash
+        temporary = path.with_name(path.name + ".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("Could not write the rank cancel request: %s", exc)
 
 
 def _watch_launcher_parent(
@@ -494,10 +1059,14 @@ def _watch_launcher_parent(
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
+    watched_marker_path: Any = None,
+    marker_stale_after: float = 45.0,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
     exit_process: Any = os._exit,
     emit_event: Any = _emit_event,
+    on_abort: Any = None,
+    release_memory: Any = _release_metal_memory,
 ) -> None:
     """Fail fast if MLX's launcher exits without reaping this rank.
 
@@ -505,23 +1074,75 @@ def _watch_launcher_parent(
     after its main thread handles SIGTERM. The launcher is the lifetime owner
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
+
+    Two conditions are watched: the parent pid changing (the original check),
+    and — when ``watched_marker_path`` is configured — a launcher- or
+    coordinator-maintained lease file going stale for ``marker_stale_after``
+    seconds, which catches a launcher that is alive but wedged (its ranks
+    would otherwise wait in a collective forever). ``os._exit`` stays the
+    last resort: ``on_abort`` fires first so in-flight requests can be
+    cancelled at a step boundary, and ``release_memory`` unwires the rank's
+    Metal allocations before the process disappears — ``os._exit`` skips
+    every finally/atexit handler, and a skipped release strands wired memory
+    until the Mac is rebooted.
     """
 
+    watched = Path(watched_marker_path).expanduser() if watched_marker_path else None
+    watched_once = False
     while True:
         wait(poll_interval)
-        if get_parent_pid() == parent_pid:
+        reason = None
+        if get_parent_pid() != parent_pid:
+            current_parent = get_parent_pid()
+            reason = (
+                f"rank launcher parent changed from {parent_pid} to "
+                f"{current_parent}; the rank cannot safely continue"
+            )
+        elif watched is not None and marker_stale_after > 0:
+            try:
+                age = time.time() - watched.stat().st_mtime
+                watched_once = True
+            except OSError:
+                age = None
+            # A lease that never appeared yet is not stale; the launcher may
+            # still be starting. Once it exists, it must stay fresh.
+            if age is not None and age > marker_stale_after:
+                reason = (
+                    f"launcher lease {watched} is stale ({age:.1f}s > "
+                    f"{marker_stale_after:.1f}s); the launcher is wedged"
+                )
+            elif age is None and watched_once:
+                reason = (
+                    f"launcher lease {watched} disappeared after activation; "
+                    "the coordinator no longer owns this rank"
+                )
+        if reason is None:
             continue
-        current_parent = get_parent_pid()
-        reason = (
-            f"rank launcher parent changed from {parent_pid} to "
-            f"{current_parent}; the rank cannot safely continue"
-        )
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
         # failure to "heartbeat missing" with no explanation.
-        marker.update("launcher_lost", error=reason)
-        emit_event({"type": "launcher_lost", "reason": reason})
+        try:
+            marker.update("launcher_lost", error=reason)
+        except Exception:
+            # Diagnostics are secondary to releasing an orphaned rank. A
+            # read-only/full state directory must not disable the watchdog.
+            logger.warning("Launcher watchdog marker update failed", exc_info=True)
+        if on_abort is not None:
+            try:
+                on_abort(reason)
+            except Exception:
+                logger.warning("Launcher watchdog abort stage failed", exc_info=True)
+        try:
+            emit_event({"type": "launcher_lost", "reason": reason})
+        except Exception:
+            # The coordinator's pipe is expected to be gone in the exact
+            # failure this watchdog handles; BrokenPipe must not prevent exit.
+            logger.warning("Launcher watchdog event emission failed", exc_info=True)
+        try:
+            release_memory(f"launcher watchdog exit: {reason}")
+        except Exception:
+            logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
 
@@ -592,13 +1213,32 @@ def _start_peer_watchdog(
     def on_lost(reason: str) -> None:
         marker.update("peer_lost", error=reason)
         _emit_event({"type": "peer_lost", "reason": reason})
+        # Unwire and release Metal memory before the force-exit: os._exit
+        # skips every finally/atexit handler, and a skipped release strands
+        # the rank's wired allocation until the Mac is rebooted.
+        with suppress(Exception):
+            _release_metal_memory(f"peer watchdog exit: {reason}")
         os._exit(1)
 
+    def on_abort(reason: str) -> None:
+        # The cancel file is consumed by this rank's telemetry heartbeat,
+        # which cancels in-flight requests through BatchGenerator.remove at
+        # a batch step boundary shared with every rank — never mid-collective.
+        _write_cancel_request(
+            state_dir,
+            deployment_id,
+            f"peer watchdog aborting before teardown: {reason}",
+            plan_hash=marker.payload.get("plan_hash"),
+        )
+
+    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
+        on_abort=on_abort,
+        abort_grace=abort_grace,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -607,10 +1247,53 @@ def _start_peer_watchdog(
     return watchdog
 
 
-def _start_launcher_watchdog(marker: RuntimeMarker, parent_pid: int) -> None:
+def _start_launcher_watchdog(
+    marker: RuntimeMarker,
+    parent_pid: int,
+    *,
+    state_dir: str | None = None,
+    launcher_lease: str | None = None,
+    rank: int = 0,
+) -> None:
+    # Rank zero is local by deployment invariant, so it can watch the
+    # coordinator-owned lease without SSH traffic. Remote ranks follow rank
+    # zero through the peer watchdog. The environment fallback keeps manual
+    # worker launches compatible with the original opt-in surface.
+    automatic_lease = str(launcher_lease or "").strip()
+    manual_lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
+    lease = automatic_lease or manual_lease
+    if rank != 0 and automatic_lease:
+        # The automatic path lives on the coordinator Mac. A manual per-rank
+        # environment override remains supported for operators who mirror
+        # their own leases to every host.
+        lease = manual_lease
+    try:
+        lease_stale_after = float(
+            os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE_TIMEOUT", "30.0") or "30.0"
+        )
+    except ValueError:
+        lease_stale_after = 30.0
+    if not math.isfinite(lease_stale_after) or lease_stale_after <= 0:
+        lease_stale_after = 30.0
+    deployment_id = str(marker.payload.get("deployment_id") or "")
+
+    def on_abort(reason: str) -> None:
+        if state_dir and deployment_id:
+            _write_cancel_request(
+                state_dir,
+                deployment_id,
+                reason,
+                plan_hash=marker.payload.get("plan_hash"),
+            )
+
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
+        kwargs={
+            "watched_marker_path": lease or None,
+            "marker_stale_after": lease_stale_after,
+            "on_abort": on_abort,
+        },
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -632,6 +1315,7 @@ def _runtime_assignment(
         "headroom_bytes": assignment.headroom_bytes,
         "tensor_parallel_rank": assignment.tensor_parallel_rank,
         "tensor_parallel_size": assignment.tensor_parallel_size,
+        "tensor_parallel_shard_weight": assignment.tensor_parallel_shard_weight,
         "sharded_weight_bytes": assignment.sharded_weight_bytes,
     }
     if assignment.predicted_stage_seconds is not None:
@@ -666,9 +1350,9 @@ def _validate_loaded_stage(
         and start in (None, 0)
         and end in (None, len(layers))
     )
-    if (
-        not expected_complete_tensor_stage
-        and (start, end) != (assignment.start_layer, assignment.end_layer)
+    if not expected_complete_tensor_stage and (start, end) != (
+        assignment.start_layer,
+        assignment.end_layer,
     ):
         raise RuntimeError(
             "loaded model pipeline range does not match the approved plan: "
@@ -957,9 +1641,21 @@ def run_worker(args: argparse.Namespace) -> int:
     plan_hash, assignments, performance_profiles, tensor_parallel_size = (
         decode_worker_contract(args.plan)
     )
+    mtp_enabled, mtp_num_draft_tokens = decode_worker_speculation(args.plan)
+    _apply_distributed_mtp_decode_concurrency(args, mtp_enabled=mtp_enabled)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
-    group = mx.distributed.init(backend=init_backend, strict=True)
+    jaccl_lease = (
+        acquire_jaccl_communicator_lease(
+            deployment_id=args.deployment_id,
+            state_dir=args.state_dir,
+        )
+        if init_backend == "jaccl"
+        else None
+    )
+    from .jaccl_side_channel import init_cluster_group
+
+    group = init_cluster_group(mx, backend=init_backend, strict=True)
     rank = group.rank()
     world_size = group.size()
     if world_size != len(assignments):
@@ -967,8 +1663,35 @@ def run_worker(args: argparse.Namespace) -> int:
             f"runtime world size {world_size} does not match plan size "
             f"{len(assignments)}"
         )
+    parallel_groups = split_parallel_groups(group, tensor_parallel_size)
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
+    tensor_shard_weights = _configure_tensor_shard_weights(
+        assignments,
+        rank=rank,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    indexer_decode_owner = _configure_indexer_decode_owner(
+        performance_profiles,
+        rank=rank,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+
+    # Cluster v2: a deployment may give each node its own absolute model path.
+    # The rank's path comes from the signed contract's path_map; nodes without
+    # an entry keep the shared --model argument, the pre-v2 behavior.
+    path_map = decode_worker_path_map(args.plan)
+    if path_map:
+        rank_model_path = path_map.get(assignments[rank].node_id)
+        if rank_model_path and rank_model_path != args.model:
+            args.model = rank_model_path
+    mtp_fixed_depth = _configure_distributed_mtp(
+        args.model,
+        enabled=mtp_enabled,
+        depth=mtp_num_draft_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_stages=parallel_groups.pipeline_stages,
+    )
 
     marker = RuntimeMarker(
         state_dir=args.state_dir,
@@ -984,10 +1707,20 @@ def run_worker(args: argparse.Namespace) -> int:
         "loading",
         load_stage="initializing",
         launcher_parent_pid=launcher_parent_pid,
+        mtp_enabled=mtp_enabled,
+        mtp_fixed_depth=mtp_fixed_depth,
+        tensor_parallel_shard_weights=list(tensor_shard_weights),
+        indexer_decode_owner_rank=indexer_decode_owner,
     )
     marker.start_heartbeat()
     _install_signal_handlers()
-    _start_launcher_watchdog(marker, launcher_parent_pid)
+    _start_launcher_watchdog(
+        marker,
+        launcher_parent_pid,
+        state_dir=args.state_dir,
+        launcher_lease=args.launcher_lease,
+        rank=rank,
+    )
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
@@ -1058,7 +1791,13 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        maybe_apply_pre_load_patches(
+            args.model,
+            model_settings=SimpleNamespace(
+                mtp_enabled=mtp_enabled,
+                mtp_num_draft_tokens=mtp_num_draft_tokens,
+            ),
+        )
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1096,6 +1835,12 @@ def run_worker(args: argparse.Namespace) -> int:
                     tensor_parallel_size=tensor_parallel_size,
                 )
             )
+            # MLX-LM understands separate pipeline/tensor groups, but its CLI
+            # exposes only one global either/or switch. The signed oMLX rank
+            # map is authoritative, so replace that provisional choice before
+            # the first weight is read.
+            provider.pipeline_group = parallel_groups.pipeline
+            provider.tensor_group = parallel_groups.tensor
             # Load synchronously on every rank so a "ready" event means the
             # complete distributed graph and weights are resident.
             #
@@ -1103,28 +1848,35 @@ def run_worker(args: argparse.Namespace) -> int:
             # it is checked again against what the rank actually holds, all the
             # way through the load. A rank that overruns dies here rather than
             # taking the Mac with it.
-            with watch_rank_load(
-                load_budget,
-                rank=rank,
-                node_id=getattr(assignment, "node_id", ""),
-                on_sample=lambda observed: marker.update(
-                    "loading",
-                    load_stage="loading_weights",
-                    load_memory_bytes=observed,
+            with (
+                watch_rank_load(
+                    load_budget,
+                    rank=rank,
+                    node_id=getattr(assignment, "node_id", ""),
+                    on_sample=lambda observed: marker.update(
+                        "loading",
+                        load_stage="loading_weights",
+                        load_memory_bytes=observed,
+                    ),
                 ),
-            ), install_progressive_loader(
-                mlx_server,
-                progress=lambda progress: marker.update(
-                    "loading",
-                    load_stage=progress.get("phase", "materializing_layers"),
-                    **{
-                        key: value
-                        for key, value in progress.items()
-                        if key != "phase"
-                    },
+                install_progressive_loader(
+                    mlx_server,
+                    progress=lambda progress: marker.update(
+                        "loading",
+                        load_stage=progress.get("phase", "materializing_layers"),
+                        **{
+                            key: value
+                            for key, value in progress.items()
+                            if key != "phase"
+                        },
+                    ),
                 ),
             ):
                 provider.load_default()
+                _enable_distributed_deepseek_ane_prefill(
+                    provider.model,
+                    execution.deepseek_ane_prefill,
+                )
             protocol = _install_distributed_model_protocol(
                 provider.tokenizer,
                 args.model,
@@ -1143,13 +1895,21 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
-            with install_runtime_optimizations(
-                provider.model,
-                group,
-                execution,
-                batchable=provider.is_batchable,
-                pipeline_parallel=tensor_parallel_size == 1,
-            ) as optimizations:
+            model_group = parallel_groups.pipeline or parallel_groups.tensor or group
+            with (
+                install_pipeline_group_routing(
+                    provider.model,
+                    (parallel_groups.pipeline if parallel_groups.hybrid else None),
+                    mx_module=mx,
+                ),
+                install_runtime_optimizations(
+                    provider.model,
+                    model_group,
+                    execution,
+                    batchable=provider.is_batchable,
+                    pipeline_parallel=parallel_groups.pipeline_stages > 1,
+                ) as optimizations,
+            ):
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1167,6 +1927,13 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    mtp_enabled=mtp_enabled,
+                    mtp_fixed_depth=mtp_fixed_depth,
+                    pipeline_stages=parallel_groups.pipeline_stages,
+                    pipeline_stage=parallel_groups.pipeline_stage,
+                    tensor_parallel_rank=parallel_groups.tensor_rank,
+                    tensor_parallel_shard_weights=list(tensor_shard_weights),
+                    indexer_decode_owner_rank=indexer_decode_owner,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1187,7 +1954,41 @@ def run_worker(args: argparse.Namespace) -> int:
                         "headroom_bytes": assignment.headroom_bytes,
                     }
                 )
+                _wait_for_serve_release(
+                    args.state_dir,
+                    args.deployment_id,
+                    plan_hash,
+                    world_size,
+                )
+                warmup_tokens = _planned_prefill_shape_warmup_tokens(
+                    optimizations,
+                    tensor_parallel_size=tensor_parallel_size,
+                )
+                if warmup_tokens:
+                    marker.update(
+                        "ready",
+                        load_stage="warming_prefill_shape",
+                        prefill_shape_warmup={
+                            "active": True,
+                            "tokens": warmup_tokens,
+                        },
+                    )
+                    warmup_report = _run_prefill_shape_warmup(
+                        mx,
+                        provider.model,
+                        tokens=warmup_tokens,
+                        max_kv_size=args.max_kv_size,
+                    )
+                    marker.update(
+                        "ready",
+                        load_stage="ready",
+                        prefill_shape_warmup=warmup_report,
+                    )
                 if rank == 0:
+                    # ``ready`` is the supervisor's post-warmup barrier. It
+                    # used to be emitted beside ``rank_ready`` before the
+                    # serve-release gate, causing the listener watchdog to
+                    # mistake a healthy first Metal compile for a hung rank.
                     _emit_event(
                         {
                             "type": "ready",
@@ -1200,27 +2001,54 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                control_context = (
+                    RankControlPlane(
+                        rank=rank,
+                        world_size=world_size,
+                        host=args.control_host,
+                        port=args.control_port,
+                        token=args.control_token,
+                    )
+                    if args.control_host and args.control_port and args.control_token
+                    else nullcontext(None)
+                )
                 with (
+                    control_context as control_plane,
+                    _trace_collectives(
+                        mx,
+                        group,
+                        state_dir=args.state_dir,
+                        deployment_id=args.deployment_id,
+                    ),
                     install_server_telemetry(
                         marker,
                         execution=execution,
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
+                        ssd_cache_persistent=bool(args.prompt_cache_ssd),
+                        ssd_write_behind=bool(args.prompt_cache_ssd),
+                        ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
                             rank=rank,
                             node_id=getattr(assignment, "node_id", ""),
-                            layer_count=(
-                                assignment.end_layer - assignment.start_layer
-                            ),
+                            start_layer=assignment.start_layer,
+                            layer_count=(assignment.end_layer - assignment.start_layer),
                             tensor_parallel_size=assignment.tensor_parallel_size,
+                            tensor_parallel_shard_weight=(
+                                tensor_shard_weights[assignment.tensor_parallel_rank]
+                            ),
+                            tensor_parallel_shard_weight_total=sum(
+                                tensor_shard_weights
+                            ),
                             memory_guard_tier=guard_tier,
                             # The attention peak is set by the prefill chunk, so the
                             # guard has to size it from the step this server will
                             # really use, not from mlx-lm's 2048 default.
                             prefill_step_size=args.prefill_step_size,
                         ),
+                        control_plane=control_plane,
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,
@@ -1253,6 +2081,8 @@ def run_worker(args: argparse.Namespace) -> int:
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()
+        if jaccl_lease is not None:
+            jaccl_lease.close()
     return 0
 
 
@@ -1301,6 +2131,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="~/.omlx/cluster/runtime",
         help="Local state directory shown by the oMLX GUI on each node",
     )
+    parser.add_argument(
+        "--launcher-lease",
+        default="",
+        help=(
+            "Coordinator-owned lifetime lease. Rank zero exits if this stops "
+            "refreshing; remote ranks follow through peer liveness."
+        ),
+    )
+    parser.add_argument("--control-host", default="")
+    parser.add_argument("--control-port", type=int, default=0)
+    parser.add_argument("--control-token", default="")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--execution-profile",
@@ -1317,8 +2158,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--cache-affinity", action="store_true")
     parser.add_argument("--prompt-cache-ssd", action="store_true")
+    parser.add_argument(
+        "--prompt-cache-ssd-max-bytes",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    )
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
+    parser.add_argument("--deepseek-ane-prefill", action="store_true")
+    parser.add_argument("--deepseek-ane-sequence-length", type=int, default=4096)
+    parser.add_argument("--deepseek-ane-tail-padding-min-tokens", type=int, default=0)
+    parser.add_argument(
+        "--deepseek-ane-down",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--deepseek-ane-down-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--deepseek-ane-wo-a",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--deepseek-ane-wo-a-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--deepseek-ane-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--deepseek-ane-cpu-fraction", type=float, default=0.125)
+    parser.add_argument("--deepseek-ane-cpu-threads", type=int, default=12)
+    parser.add_argument(
+        "--deepseek-ane-cpu-shared-resource",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)
     parser.add_argument(
         "--tuning-reason",
@@ -1335,6 +2208,17 @@ def main(argv: list[str] | None = None) -> int:
     args.model = str(Path(args.model).expanduser())
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
+    control_values = (
+        bool(args.control_host),
+        bool(args.control_port),
+        bool(args.control_token),
+    )
+    if any(control_values) and not all(control_values):
+        raise SystemExit(
+            "--control-host, --control-port and --control-token are required together"
+        )
+    if args.control_port and not 1 <= args.control_port <= 65535:
+        raise SystemExit("--control-port must be between 1 and 65535")
     for name in (
         "decode_concurrency",
         "prompt_concurrency",

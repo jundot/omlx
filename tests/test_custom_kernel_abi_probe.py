@@ -109,6 +109,29 @@ class _NoScoresExt:
     """A build without dsa_indexer_scores at all."""
 
 
+class _NAXScoreExt(_FoldAwareExt):
+    """Rebuilt score binding plus optional-metallib diagnostics."""
+
+    def dsa_indexer_scores(self, *args, **kwargs):
+        raise AssertionError("probe must not call the kernel")
+
+    dsa_indexer_scores.__doc__ = (
+        "dsa_indexer_scores(queries: array, keys: array, weights: array, "
+        "causal: bool = True, unused_causal_prefix_topk: int = 0, "
+        "skip_causal_future_store: bool = False, causal_q_offset: int = -1, "
+        "mask_ratio: int = 0, mask_q_offset: int = 0, stream: None = None, "
+        "use_nax: bool = False)"
+    )
+
+    @staticmethod
+    def dsa_indexer_nax_kernels_built():
+        return True
+
+    @staticmethod
+    def dsa_indexer_nax_runtime_active():
+        return True
+
+
 def test_mask_fold_probe_detects_fold_aware_build():
     assert glm_fast._probe_mask_fold(_FoldAwareExt()) is True
 
@@ -120,6 +143,13 @@ def test_mask_fold_probe_rejects_pre_fold_build():
 def test_mask_fold_probe_handles_missing_symbol_and_ext():
     assert glm_fast._probe_mask_fold(_NoScoresExt()) is False
     assert glm_fast._probe_mask_fold(None) is False
+
+
+def test_nax_score_probe_requires_new_kwarg_and_diagnostics():
+    assert glm_fast._probe_nax_score(_NAXScoreExt()) is True
+    assert glm_fast._probe_nax_score(_FoldAwareExt()) is False
+    assert glm_fast._probe_nax_score(_NoScoresExt()) is False
+    assert glm_fast._probe_nax_score(None) is False
 
 
 def test_pre_fold_build_keeps_historical_call_signature(monkeypatch):
@@ -190,3 +220,58 @@ def test_fold_aware_build_receives_mask_kwargs(monkeypatch):
     )
     assert seen.get("mask_ratio") == 4
     assert seen.get("mask_q_offset") == 256
+
+
+def test_nax_aware_build_receives_capability_gated_hint(monkeypatch):
+    import mlx.core as mx
+
+    seen = {}
+
+    def new_scores(queries, keys, weights, **kwargs):
+        seen.update(kwargs)
+        return mx.zeros(
+            (queries.shape[0], 1, queries.shape[2], keys.shape[2]),
+            dtype=queries.dtype,
+        )
+
+    fake = type(
+        "E",
+        (),
+        {
+            "dsa_indexer_scores": staticmethod(new_scores),
+            "dsa_indexer_nax_kernels_built": staticmethod(lambda: True),
+            "dsa_indexer_nax_runtime_active": staticmethod(lambda: True),
+        },
+    )()
+    monkeypatch.setattr(glm_fast, "_ext", fake)
+    monkeypatch.setattr(glm_fast, "_EXT_MASK_FOLD", True)
+    monkeypatch.setattr(glm_fast, "_EXT_NAX_SCORE", True)
+    from omlx.custom_kernels import nax
+
+    monkeypatch.setattr(nax, "is_nax_available", lambda: True)
+
+    q = mx.zeros((1, 64, 16, 128), dtype=mx.bfloat16)
+    keys = mx.zeros((1, 1, 513, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((1, 16, 64), dtype=mx.bfloat16)
+    glm_fast.dsa_indexer_scores(
+        q,
+        keys,
+        weights,
+        causal=False,
+        mask_ratio=4,
+        mask_q_offset=2048,
+        use_nax=True,
+    )
+    assert seen["use_nax"] is True
+
+    monkeypatch.setattr(nax, "is_nax_available", lambda: False)
+    glm_fast.dsa_indexer_scores(
+        q,
+        keys,
+        weights,
+        causal=False,
+        mask_ratio=4,
+        mask_q_offset=2048,
+        use_nax=True,
+    )
+    assert seen["use_nax"] is False

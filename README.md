@@ -6,8 +6,8 @@
   </picture>
 </p>
 
-<h1 align="center">oMLX</h1>
-<p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
+<h1 align="center">oMLX Fusion</h1>
+<p align="center"><b>High-performance inference for one Mac or a cluster of Macs</b><br>Universal model serving, continuous batching, tiered caching, and distributed MLX execution.</p>
 
 <p align="center">
 <a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
@@ -42,6 +42,16 @@
 
 ---
 
+> [!IMPORTANT]
+> **oMLX Fusion is the performance and clustering development fork of
+> [oMLX](https://github.com/jundot/omlx).** Development releases are
+> prereleases for testers. Current work covers progressive shard loading,
+> signed heterogeneous tensor placement, JACCL/Thunderbolt RDMA, distributed
+> cancellation and cache lifecycle, and model-specific kernels that also
+> accelerate single-Mac serving. See the
+> [benchmark provenance rules](docs/benchmark-provenance.md) before comparing
+> throughput numbers.
+
 <p align="center">
   <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
 </p>
@@ -54,7 +64,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
+Download a signed development `.dmg` from [oMLX Fusion Releases](https://github.com/jonathan308/omlx-fusion/releases), drag it to Applications, and approve the prerelease warning. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
 
 ### Homebrew
 
@@ -81,8 +91,8 @@ brew install jundot/omlx/omlx --HEAD --with-custom-kernel
 ### From Source
 
 ```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
+git clone https://github.com/jonathan308/omlx-fusion.git
+cd omlx-fusion
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 
@@ -166,19 +176,20 @@ Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, 
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
 </p>
 
-### Experimental Multi-Mac Inference
+### Cluster v2 Multi-Mac Inference
 
-Source builds can split one downloaded language model across unequal-memory Macs
-using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
-dashboard handles read-only peer discovery, strict SSH/runtime verification,
-byte-aware unequal shard planning, measured compute/link rebalancing,
-headroom-aware execution tuning, activation, and a live shard/performance map
-on both Macs. Interactive, balanced, and throughput profiles expose coalesced
-batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
-and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
-security boundaries, current limitations, and the physical-hardware validation
-checklist.
+The Cluster v2 Beta candidate discovers and pairs Macs, verifies Thunderbolt
+RDMA or an explicit TCP fallback, inventories and stages a model, recommends
+tensor/pipeline placement, signs the exact shard plan, and serves it through the
+normal APIs and dashboard. Tensor ranks retain only their tensor slices in
+memory; pipeline ranks retain only their layer ranges. Per-node model paths,
+progressive loading, memory guards, tiered rank caches, targeted cancellation,
+orphan recovery, continuous batching, independent request metrics and signed
+replanning are part of the same lifecycle.
+
+See [Distributed inference across Macs](docs/distributed-cluster.md) for setup
+and security boundaries, and the [Cluster v2 Beta contract](docs/cluster-v2-beta.md)
+for the complete feature-PR evidence and release gates.
 
 ### Vision-Language Models
 

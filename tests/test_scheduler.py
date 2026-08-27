@@ -3416,6 +3416,220 @@ class TestPeriodicClearGating:
         assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
 
 
+class TestDecodeClearGating:
+    """Tests for the pressure-gated decode-time Metal cache clear.
+
+    The every-1024-decode-tokens clear in step() must only pay the synced
+    GPU drain when the MLX buffer pool is actually under pressure; the
+    1024-token counter must still drive the check cadence either way.
+    """
+
+    def _decode_scheduler(self, mock_model, mock_tokenizer, tokens_per_step):
+        """Scheduler whose mocked BatchGenerator decodes tokens_per_step/step."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._schedule_waiting = MagicMock(return_value=([], []))
+        scheduler._process_batch_responses = MagicMock(return_value=([], set()))
+        scheduler._cleanup_finished = MagicMock()
+        scheduler.running = {"running": MagicMock()}
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [
+            MagicMock()
+        ] * tokens_per_step
+        return scheduler
+
+    def test_decode_clear_skipped_when_cache_below_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Low-pressure decode runs thousands of tokens with zero clears.
+
+        The pre-change behaviour drained the GPU pipeline every 1024 decode
+        tokens unconditionally; with the pool well under the threshold the
+        clear must never fire, but the pressure check must still run at
+        every 1024-token boundary.
+        """
+        scheduler = self._decode_scheduler(mock_model, mock_tokenizer, 1024)
+        scheduler._memory_limit_bytes = 0  # → use absolute 2 GiB threshold
+
+        # 1 GiB cached, well under the 2 GiB threshold
+        with (
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=1 * 1024**3
+            ) as cache_mem,
+        ):
+            for _ in range(5):  # 5120 decode tokens, 5 check boundaries
+                scheduler.step()
+
+        clear.assert_not_called()
+        assert cache_mem.call_count == 5
+        assert scheduler._tokens_since_clear_cache == 0
+
+    def test_decode_clear_fires_above_threshold_via_synced_clear(
+        self, mock_model, mock_tokenizer
+    ):
+        """Pressured decode still gets the clear at the same 1024 cadence,
+        and it still goes through _sync_and_clear_cache (the IOGPU /
+        #300/#888/#1106 invariant is not weakened)."""
+        scheduler = self._decode_scheduler(mock_model, mock_tokenizer, 1024)
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+
+        # 3 GiB cached, exceeds the 2 GiB threshold
+        with (
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=3 * 1024**3
+            ),
+        ):
+            for _ in range(3):
+                scheduler.step()
+
+        assert clear.call_args_list == [call(scheduler._stream)] * 3
+
+    def test_decode_clear_check_cadence_follows_token_counter(
+        self, mock_model, mock_tokenizer
+    ):
+        """Checks happen on 1024-token boundaries, not per step.
+
+        512 decode tokens per step means the pressure check only runs every
+        other step, and the counter keeps accumulating between boundaries.
+        """
+        scheduler = self._decode_scheduler(mock_model, mock_tokenizer, 512)
+        scheduler._memory_limit_bytes = 0
+
+        with (
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=1 * 1024**3
+            ) as cache_mem,
+        ):
+            for _ in range(4):  # 2048 tokens → exactly 2 boundaries
+                scheduler.step()
+
+        clear.assert_not_called()
+        assert cache_mem.call_count == 2
+        assert scheduler._tokens_since_clear_cache == 0
+
+
+class TestBatchGeneratorNextPatch:
+    """Tests for the reroute of mlx-lm's unsynced 512-step decode clear.
+
+    mlx-lm's BatchGenerator._next runs an UNSYNCED mx.clear_cache() every
+    512 decode steps — the race class from #300/#888/#1106. For omlx-owned
+    generators the patch must neutralise that clear and re-fire the cadence
+    through the synced, pressure-gated policy instead.
+    """
+
+    @staticmethod
+    def _fake_upstream_next(upstream_clears):
+        """Mirror the installed mlx-lm body: increment on decode, clear at % 512."""
+
+        def fake_next(self):
+            if len(self._generation_batch) > 0:
+                self._steps_counter += 1
+                if self._steps_counter % 512 == 0:
+                    upstream_clears.append(self._steps_counter)
+            return ["response"]
+
+        return fake_next
+
+    @staticmethod
+    def _generator(steps, threshold=None):
+        gen = SimpleNamespace(
+            _generation_batch=[object()],
+            _steps_counter=steps,
+            _stream=MagicMock(),
+        )
+        if threshold is not None:
+            gen._omlx_decode_clear_threshold_bytes = threshold
+        return gen
+
+    def test_boundary_clear_is_neutralised_and_refired_synced_under_pressure(self):
+        """At the 512 boundary with pressure: no unsynced clear, one synced."""
+        upstream_clears = []
+        gen = self._generator(steps=511, threshold=lambda: 2 * 1024**3)
+
+        with (
+            patch.object(
+                scheduler_module,
+                "_original_batch_generator_next",
+                self._fake_upstream_next(upstream_clears),
+            ),
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=3 * 1024**3
+            ),
+        ):
+            result = scheduler_module._patched_batch_generator_next(gen)
+
+        assert result == ["response"]
+        assert upstream_clears == []  # unsynced clear neutralised
+        assert clear.call_args_list == [call(gen._stream)]
+        assert gen._steps_counter == 512  # logical cadence preserved exactly
+
+    def test_boundary_clear_skipped_below_threshold(self):
+        """At the 512 boundary without pressure: neither clear fires."""
+        upstream_clears = []
+        gen = self._generator(steps=511, threshold=lambda: 2 * 1024**3)
+
+        with (
+            patch.object(
+                scheduler_module,
+                "_original_batch_generator_next",
+                self._fake_upstream_next(upstream_clears),
+            ),
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=1 * 1024**3
+            ),
+        ):
+            scheduler_module._patched_batch_generator_next(gen)
+
+        assert upstream_clears == []
+        clear.assert_not_called()
+        assert gen._steps_counter == 512
+
+    def test_non_boundary_step_passthrough(self):
+        """Off-boundary steps delegate untouched (no checks, no clears)."""
+        upstream_clears = []
+        gen = self._generator(steps=510, threshold=lambda: 2 * 1024**3)
+
+        with (
+            patch.object(
+                scheduler_module,
+                "_original_batch_generator_next",
+                self._fake_upstream_next(upstream_clears),
+            ),
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+            patch.object(
+                scheduler_module.mx, "get_cache_memory", return_value=3 * 1024**3
+            ) as cache_mem,
+        ):
+            scheduler_module._patched_batch_generator_next(gen)
+
+        assert upstream_clears == []
+        clear.assert_not_called()
+        cache_mem.assert_not_called()
+        assert gen._steps_counter == 511
+
+    def test_generator_without_provider_keeps_upstream_behaviour(self):
+        """Generators not created by omlx keep stock mlx-lm behaviour."""
+        upstream_clears = []
+        gen = self._generator(steps=511)  # no threshold provider attached
+
+        with (
+            patch.object(
+                scheduler_module,
+                "_original_batch_generator_next",
+                self._fake_upstream_next(upstream_clears),
+            ),
+            patch.object(scheduler_module, "_sync_and_clear_cache") as clear,
+        ):
+            scheduler_module._patched_batch_generator_next(gen)
+
+        assert upstream_clears == [512]  # upstream clear left alone
+        clear.assert_not_called()
+
+
 class TestExtractCacheStatesCacheList:
     """Tests for CacheList handling in _extract_cache_states."""
 
@@ -6057,6 +6271,79 @@ class TestStopStringOutputBuffer:
         assert streamed_text == "잠"
         assert outputs[-1].output_text == "잠"
         assert "�" not in streamed_text
+
+
+class TestOutputTokenIdsCopy:
+    """Regression: only the finished output carries the cumulative id list.
+
+    _process_batch_responses used to attach list(request.output_token_ids)
+    to every emitted RequestOutput — an O(n^2) copy over a single response.
+    Mid-stream outputs must stay empty; the finished output must carry the
+    complete cumulative list, matching the request state at finish.
+    """
+
+    @staticmethod
+    def _response(token, finish_reason=None):
+        return SimpleNamespace(
+            uid=99,
+            token=token,
+            finish_reason=finish_reason,
+            logprobs=None,
+            prompt_cache=None,
+        )
+
+    def _setup(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._get_detokenizer = lambda request_id: None
+        request = Request(
+            request_id="outcopy",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=[1, 2],
+            num_prompt_tokens=2,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+        return scheduler, request
+
+    def test_intermediate_outputs_do_not_copy_cumulative_ids(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler, request = self._setup(mock_model, mock_tokenizer)
+        responses = [
+            self._response(10),
+            self._response(11),
+            self._response(12),
+            self._response(13, finish_reason="length"),
+        ]
+
+        outputs = []
+        for response in responses:
+            step_outputs, _ = scheduler._process_batch_responses([response])
+            outputs.extend(step_outputs)
+
+        assert len(outputs) == 4
+        # Mid-stream outputs carry only the per-step delta, not the history.
+        assert all(output.output_token_ids == [] for output in outputs[:-1])
+        assert [output.new_token_ids for output in outputs] == [
+            [10],
+            [11],
+            [12],
+            [13],
+        ]
+        # The finished output carries the complete cumulative list as an
+        # owned copy (not an alias of the request's list).
+        assert outputs[-1].finished is True
+        assert (
+            outputs[-1].output_token_ids
+            == request.output_token_ids
+            == [10, 11, 12, 13]
+        )
+        assert outputs[-1].output_token_ids is not request.output_token_ids
 
 
 class TestTurboQuantMLAGuard:

@@ -1,0 +1,240 @@
+---
+name: Signed macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example, v0.6.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-macos-release
+  cancel-in-progress: false
+
+jobs:
+  build-unsigned-app:
+    name: Build unsigned arm64 app
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Validate tag and source version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || {
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG" || {
+            echo "tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          }
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' omlx/_version.py)
+          [[ -n "$version" && "v$version" == "$RELEASE_TAG" ]] || {
+            echo "tag $RELEASE_TAG does not match omlx version $version" >&2
+            exit 1
+          }
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Select release Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install host-side packaging tools
+        run: |
+          python -m pip install "pip==26.1.2"
+          python -m pip install \
+            "venvstacks==0.7.0" "cmake==4.4.2" "nanobind==2.13.0" \
+            "setuptools==80.10.2" "wheel==0.47.0"
+
+      - name: Build staged app with native kernels
+        env:
+          OMLX_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: apps/omlx-mac/Scripts/build.sh release --with-custom-kernel --rebuild-donor
+
+      - name: Confirm arm64 application output
+        run: |
+          set -euo pipefail
+          app=apps/omlx-mac/build/Stage/oMLX.app
+          test -d "$app"
+          test "$(lipo -archs "$app/Contents/MacOS/oMLX")" = arm64
+          actual_repo=$(/usr/libexec/PlistBuddy -c 'Print :OMLXReleaseRepository' "$app/Contents/Info.plist")
+          test "$actual_repo" = "${{ github.repository }}"
+
+      - name: Archive app without losing symlinks or extended attributes
+        run: |
+          mkdir -p release-input
+          ditto -c -k --keepParent --sequesterRsrc \
+            apps/omlx-mac/build/Stage/oMLX.app release-input/oMLX-unsigned.zip
+
+      - name: Upload unsigned app for the gated signing job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: unsigned-macos-app
+          path: release-input/oMLX-unsigned.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-notarize-release:
+    name: Sign, notarize, and draft release
+    needs: build-unsigned-app
+    runs-on: macos-26
+    timeout-minutes: 180
+    environment: macos-release
+    permissions:
+      contents: write
+    steps:
+      # Release tooling and entitlements come from the protected default
+      # branch, while the untrusted/tagged app payload comes from the prior
+      # secretless job.
+      - name: Check out trusted release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Select release Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Download unsigned app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: unsigned-macos-app
+          path: release-input
+
+      - name: Extract unsigned app
+        run: |
+          mkdir -p release-stage
+          ditto -x -k release-input/oMLX-unsigned.zip release-stage
+          test -d release-stage/oMLX.app
+
+      - name: Import Developer ID identity and prepare notary key
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in \
+            APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
+            APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD \
+            APPLE_NOTARY_API_KEY_P8_BASE64 \
+            APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID APPLE_TEAM_ID; do
+            [[ -n "${!name:-}" ]] || { echo "missing release credential: $name" >&2; exit 1; }
+          done
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || { echo "invalid APPLE_TEAM_ID" >&2; exit 1; }
+
+          keychain="$RUNNER_TEMP/omlx-release.keychain-db"
+          p12="$RUNNER_TEMP/developer-id-application.p12"
+          notary_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          {
+            echo "RELEASE_KEYCHAIN=$keychain"
+            echo "RELEASE_NOTARY_KEY=$notary_key"
+          } >> "$GITHUB_ENV"
+          keychain_password=$(openssl rand -hex 32)
+          echo "::add-mask::$keychain_password"
+
+          printf '%s' "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64" | /usr/bin/base64 --decode >"$p12"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | /usr/bin/base64 --decode >"$notary_key"
+          chmod 600 "$p12" "$notary_key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -f pkcs12 -x \
+            -P "$APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD" \
+            -T /usr/bin/codesign >/dev/null
+          rm -f "$p12"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$keychain_password" \
+            "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+
+          identities=$(security find-identity -v -p codesigning "$keychain")
+          identity=$(printf '%s\n' "$identities" | awk -v team="($APPLE_TEAM_ID)" \
+            '/Developer ID Application:/ && index($0, team) {print $2}')
+          count=$(printf '%s\n' "$identity" | sed '/^$/d' | wc -l | tr -d ' ')
+          [[ "$count" = 1 ]] || {
+            echo "expected exactly one Developer ID Application identity for APPLE_TEAM_ID" >&2
+            exit 1
+          }
+
+          echo "RELEASE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Sign, notarize, staple, and verify DMG
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          chmod +x scripts/release_macos_dmg.sh
+          scripts/release_macos_dmg.sh \
+            --app release-stage/oMLX.app \
+            --output-dir dist \
+            --identity "$RELEASE_SIGNING_IDENTITY" \
+            --team-id "$APPLE_TEAM_ID" \
+            --notary-key "$RELEASE_NOTARY_KEY" \
+            --notary-key-id "$APPLE_NOTARY_KEY_ID" \
+            --notary-issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --version "${RELEASE_TAG#v}"
+
+      - name: Upload verified workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: signed-notarized-macos-dmg
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Create or update draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null || true)
+          if [[ -n "$release_json" ]]; then
+            [[ "$(jq -r .draft <<<"$release_json")" = true ]] || {
+              echo "refusing to modify an already-published release" >&2
+              exit 1
+            }
+          else
+            prerelease=()
+            [[ "$RELEASE_TAG" =~ (a|b|rc|dev)[0-9]+$ ]] && prerelease=(--prerelease)
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --generate-notes --title "$RELEASE_TAG" "${prerelease[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256 --clobber
+
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          if [[ -n "${RELEASE_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$RELEASE_KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          rm -f "${RELEASE_NOTARY_KEY:-}" \
+            "$RUNNER_TEMP/developer-id-application.p12"

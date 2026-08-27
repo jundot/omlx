@@ -21,8 +21,29 @@
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
-            <!-- Cluster Main Tab -->
-            {% include "dashboard/_cluster.html" %}
+            <!-- Cluster Main Tab: v2 wizard, with the v1 console reachable as
+                 "Advanced (legacy)". clusterLegacyView lives on this wrapper
+                 scope so both partials can see it. -->
+            <div x-data="{ clusterLegacyView: false }">
+                {% include "dashboard/_cluster_v2.html" %}
+                <div x-show="mainTab === 'cluster' && clusterLegacyView" x-cloak
+                     data-cluster-legacy-view>
+                    <div class="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 animate-fade-in-up">
+                        <div class="min-w-0">
+                            <div class="text-xs font-semibold text-neutral-900">Advanced (legacy)</div>
+                            <div class="text-[10px] text-neutral-500 mt-0.5">
+                                The original cluster console — manual pairing, CUDA workers, diagnostics.
+                            </div>
+                        </div>
+                        <button type="button" @click="clusterLegacyView = false"
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 whitespace-nowrap">
+                            <i data-lucide="wand-sparkles" class="w-3.5 h-3.5"></i>
+                            Back to the guided setup
+                        </button>
+                    </div>
+                    {% include "dashboard/_cluster.html" %}
+                </div>
+            </div>
 
             <!-- Settings Main Tab -->
             {% include "dashboard/_settings.html" %}
@@ -95,5 +116,6 @@
 {% block scripts %}
 <script src="{{ static('js/purify.min.js') }}"></script>
 <script src="{{ static('js/marked.umd.js') }}"></script>
+<script src="{{ static('js/cluster_v2.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}

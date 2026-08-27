@@ -272,6 +272,93 @@ class TestBatchedEngineInitialization:
         assert engine._stream_interval == 1
         assert engine._enable_thinking is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requested_step", "expected_step"),
+        ((2048, 4096), (8192, 8192)),
+    )
+    async def test_ane_prefill_floors_scheduler_step_to_compiled_tile(
+        self, monkeypatch, requested_step, expected_step
+    ):
+        from omlx import engine_core
+        from omlx.engine.batched import BatchedEngine
+        from omlx.patches import qwen35_ane_prefill
+        from omlx.patches.deepseek_v4 import ane_prefill as deepseek_ane
+        from omlx.scheduler import SchedulerConfig
+        from omlx.utils import model_loading
+
+        captured = {}
+        scheduler = MagicMock()
+
+        class FakeAsyncEngineCore:
+            def __init__(self, *, model, tokenizer, config):
+                captured["config"] = config
+                self.engine = SimpleNamespace(
+                    start=AsyncMock(),
+                    scheduler=scheduler,
+                )
+
+        model = SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v4"))
+        monkeypatch.setattr(engine_core, "AsyncEngineCore", FakeAsyncEngineCore)
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: None)
+        monkeypatch.setattr(
+            model_loading, "maybe_apply_pre_load_patches", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            model_loading, "maybe_load_custom_quantization", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            model_loading,
+            "lm_load_compat",
+            lambda *a, **k: (model, object()),
+        )
+        monkeypatch.setattr(
+            model_loading,
+            "apply_post_load_transforms",
+            lambda value, settings: value,
+        )
+        monkeypatch.setattr(model_loading, "materialize_lazy_state", lambda value: None)
+        def fake_enable_deepseek(*args, **kwargs):
+            captured["deepseek_ane_kwargs"] = kwargs
+            return 1
+
+        monkeypatch.setattr(
+            deepseek_ane, "enable_deepseek_v4_ane_prefill", fake_enable_deepseek
+        )
+        monkeypatch.setattr(
+            qwen35_ane_prefill,
+            "configure_qwen35_ane_prefill_scheduler",
+            lambda *a, **k: None,
+        )
+
+        settings = SimpleNamespace(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_sequence_length=4096,
+            deepseek_ane_prefill_tail_padding_min_tokens=3000,
+            deepseek_ane_prefill_cpu_enabled=False,
+            qwen35_ane_prefill_enabled=False,
+            moe_gate_up_fusion_enabled=False,
+            qwen35_q4_mlp_prefill_enabled=False,
+            qwen35_moe_weighted_sum_enabled=False,
+            qwen35_ragged_decode_fallback_enabled=False,
+            sdpa256_prefill_enabled=False,
+            fa256_steel_prefill_enabled=False,
+        )
+        original_config = SchedulerConfig(prefill_step_size=requested_step)
+        engine = BatchedEngine(
+            model_name="deepseek-test",
+            scheduler_config=original_config,
+            model_settings=settings,
+        )
+
+        await engine.start()
+
+        effective = captured["config"].scheduler_config
+        assert effective.ane_prefill_block_size == 4096
+        assert effective.prefill_step_size == expected_step
+        assert original_config.prefill_step_size == requested_step
+        assert captured["deepseek_ane_kwargs"]["tail_padding_min_tokens"] == 3000
+
     def test_model_name_property(self):
         """Test model_name property."""
         from omlx.engine.batched import BatchedEngine

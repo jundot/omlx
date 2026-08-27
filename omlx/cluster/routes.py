@@ -8,6 +8,9 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
+import math
+import os
 import re
 import secrets
 import subprocess
@@ -18,7 +21,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
 from fastapi.responses import PlainTextResponse
@@ -37,13 +40,23 @@ from .autoconfigure import (
     preflight_issues,
     tp_groups_spanning_slow_links,
 )
+from .backends import (
+    MemberFabric,
+    members_from_host_records,
+    select_cluster_backend,
+)
 from .catalogue import ModelFit, assess_model, catalogue_for_cluster
 from .collective import (
     CollectiveSmokeError,
     run_local_collective_smoke,
     run_local_pipeline_smoke,
 )
-from .deployment import ClusterDeployment, ClusterHost, validate_ssh_target
+from .deployment import (
+    ClusterDeployment,
+    ClusterHost,
+    validate_model_path_map,
+    validate_ssh_target,
+)
 from .discovery import (
     discover_all_peers,
     record_peer_transports,
@@ -55,11 +68,14 @@ from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    DistributedTeardownError,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
+    resolve_remote_python,
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
+    stop_deployment_processes,
 )
 from .liveness import (
     PeerLostError,
@@ -73,10 +89,14 @@ from .model_inventory import (
     remote_model_inventory,
 )
 from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    DeepseekAnePrefillSettings,
     NodePerformanceProfile,
     execution_profile,
     tune_execution_settings,
 )
+from .parallel_groups import hybrid_group_split_supported
+from .disaggregated import build_full_replica_shard_plan
 from .planner import (
     LOCAL_NODE,
     NodeBudget,
@@ -84,18 +104,27 @@ from .planner import (
     ShardPlan,
     complete_model_layout,
     plan_hybrid,
+    plan_proportional_pipeline,
     plan_unequal_pipeline,
+    recommend_tensor_shard_weights,
     remote_model_layout,
     synthetic_model_layout,
 )
-from .probe import collect_cluster_status
-from .registry import get_cluster_registry
+from .probe import collect_cluster_status, detect_low_power_mode
+from .registry import get_cluster_registry, get_device_registry
+from .identity import get_node_identity
+from .replan import (
+    hosts_from_deployment,
+    nodes_from_deployment,
+    placement_view,
+    summarize_deployment,
+)
 from .runtime import read_runtime_markers
 from .staging import (
-    DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
     home_relative_model_path,
     index_shards,
+    model_identity_digest,
     model_staging_inventory,
     plan_staging,
     remote_file_sizes,
@@ -104,7 +133,15 @@ from .staging import (
     stage_files_from_source,
     stage_manifest,
 )
-from .strategy_benchmarks import get_strategy_benchmark_store
+from .strategy_benchmarks import context_bucket, get_strategy_benchmark_store
+from .tp_qualifications import (
+    TPLayoutQualification,
+    TPQualificationKey,
+    TPQualificationProvenance,
+    TPRateEvidence,
+    get_tp_layout_qualification_store,
+    node_fingerprints_from_statuses,
+)
 from .supervisor import run_worker_smoke
 from .transport import (
     LinkAuthorizationCancelledError,
@@ -125,6 +162,7 @@ from .worker_bundle import (
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
+logger = logging.getLogger(__name__)
 
 _get_engine_pool: Any | None = None
 
@@ -421,9 +459,25 @@ class ClusterPlanRequest(BaseModel):
     layer_count: int = Field(default=80, gt=0, le=2048)
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=1, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    # "balanced" runs the bottleneck-minimizing DP planner; "proportional"
+    # splits layers ∝ usable RAM with largest-remainder rounding (exo-style).
+    allocation: Literal["balanced", "proportional"] = "balanced"
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] = "sharded"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    # Process-lifetime prefix snapshots are a reuse optimization, not a cold
+    # prefill requirement. None/False keeps the bounded SSD write-behind tier
+    # out of the launch contract; True enables it explicitly on every rank.
+    prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
+    # Cluster v2: optional node_id → absolute model path on that node. Empty
+    # keeps the legacy same-absolute-path-on-every-node behavior.
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
 
 
 class ClusterHostRequest(BaseModel):
@@ -434,6 +488,24 @@ class ClusterHostRequest(BaseModel):
     ips: list[str] = Field(min_length=1, max_length=16)
     rdma: list[str | list[str] | None] = Field(default_factory=list, max_length=64)
     python_executable: str | None = Field(default=None, max_length=4096)
+
+
+class DeepseekAnePrefillRequest(BaseModel):
+    """Explicit per-rank DeepSeek-V4 hybrid prefill settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    sequence_length: int = Field(default=4096, ge=1024, le=16384, multiple_of=64)
+    tail_padding_min_tokens: int = Field(default=0, ge=0, le=16383)
+    down_enabled: bool = True
+    down_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    wo_a_enabled: bool = False
+    wo_a_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    cpu_enabled: bool = False
+    cpu_fraction: float = Field(default=0.125, ge=0.0, lt=0.5)
+    cpu_threads: int = Field(default=12, ge=0, le=64)
+    cpu_shared_resource: bool = True
 
 
 def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
@@ -464,6 +536,7 @@ class ClusterDeploymentRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
     preflight: Literal[True] = True
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    allocation: Literal["balanced", "proportional"] = "balanced"
     auto_tune: bool = True
     sampling_rank_only: bool = True
     async_overlap: bool = True
@@ -471,7 +544,24 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] = "sharded"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    # Server-issued ID of the exact hardware/runtime qualification used by the
+    # preview. Activation re-probes and resolves it again; arbitrary vectors
+    # never cross the public request schema.
+    tp_qualification_id: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
+    deepseek_ane_prefill: DeepseekAnePrefillRequest | None = None
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -479,6 +569,44 @@ class ClusterDeploymentRequest(BaseModel):
     # one dropped the role and the split cap without saying so. Activation is a
     # GUI workflow: callers must preview and name the placement they approve.
     approved_placement: str = Field(min_length=16, max_length=64)
+    # Cluster v2: node_id → absolute model path on that node. Nodes not listed
+    # load ``model_path`` — the pre-v2 shared-path behavior.
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
+
+
+class ClusterTPRateEvidenceRequest(BaseModel):
+    """Aggregated full-model rate evidence for one TP layout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefill_tokens_per_second: float = Field(gt=0.0, le=1e9)
+    decode_tokens_per_second: float = Field(gt=0.0, le=1e9)
+    samples: int = Field(ge=2, le=10_000)
+    output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ClusterTPLayoutQualificationRequest(BaseModel):
+    """Persist matched, parity-proven evidence for one asymmetric TP vector."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str = Field(min_length=1, max_length=4096)
+    backend: Literal["ring", "jaccl", "jaccl-ring"]
+    nodes: list[ClusterPlanNodeRequest] = Field(min_length=2, max_length=64)
+    hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
+    tensor_parallel_size: int = Field(ge=2, le=64)
+    target_context_tokens: int = Field(ge=1, le=1_048_576)
+    execution_profile: Literal["interactive", "balanced", "throughput"] = (
+        "balanced"
+    )
+    auto_tune: bool = True
+    sampling_rank_only: bool = True
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    shard_weights: list[int] = Field(min_length=2, max_length=64)
+    equal_control: ClusterTPRateEvidenceRequest
+    candidate: ClusterTPRateEvidenceRequest
+    reason: str = Field(default="matched full-model qualification", max_length=2000)
 
 
 class ClusterPeerProbeRequest(BaseModel):
@@ -561,6 +689,8 @@ def _node_budgets(
         performance = profiles[rank] if rank < len(profiles) else None
         if performance is None and node.performance is not None:
             performance = NodePerformanceProfile.from_dict(node.performance)
+        if performance is not None and not performance.promotable:
+            performance = None
         reserve_bytes = _reserve_bytes_for(node)
         # A target is a preference, not an admission override. The measured
         # budget or workstation role can legitimately shrink between the
@@ -646,9 +776,9 @@ def _model_and_nodes(request: ClusterPlanRequest):
             model = remote_model_layout(
                 validate_ssh_target(source),
                 model_path,
-                python_executable=(
-                    request.model_source_python or DEFAULT_REMOTE_PYTHON
-                ),
+                # None lets the peer's own interpreter be discovered over SSH
+                # (launch.resolve_remote_python); it is never assumed.
+                python_executable=request.model_source_python,
             )
         else:
             # A coordinator may retain only its previous pipeline stage.  Such
@@ -682,6 +812,7 @@ _PLACEMENT_FIELDS = (
     "memory_guard_tier",
     "tensor_parallel_rank",
     "tensor_parallel_size",
+    "tensor_parallel_shard_weight",
 )
 
 
@@ -699,7 +830,56 @@ def _placement_rows(plan: dict[str, Any]) -> list[dict[str, Any]]:
 def _placement_signature(plan: dict[str, Any]) -> str:
     """Identity of the plan a user approves, stable across cosmetic re-planning."""
 
-    payload = json.dumps(_placement_rows(plan), sort_keys=True, separators=(",", ":"))
+    rows: Any = _placement_rows(plan)
+    # A per-node path override changes what actually runs, so it is part of
+    # what the user approves. Folded in only when present, keeping signatures
+    # byte-identical to the legacy format for shared-path deployments.
+    path_map = plan.get("path_map")
+    if path_map:
+        rows = {"rows": rows, "path_map": path_map}
+    # Speculative execution changes both the worker graph and the weights that
+    # must be resident.  It is therefore part of the launch contract, not a
+    # cosmetic generation option.  Keep the legacy signature byte-identical
+    # when MTP is absent/default so existing non-MTP approvals remain valid.
+    mtp_enabled = bool(plan.get("mtp_enabled", False))
+    mtp_num_draft_tokens = plan.get("mtp_num_draft_tokens")
+    if mtp_enabled or mtp_num_draft_tokens is not None:
+        if isinstance(rows, dict):
+            rows = rows | {
+                "mtp_enabled": mtp_enabled,
+                "mtp_num_draft_tokens": mtp_num_draft_tokens,
+            }
+        else:
+            rows = {
+                "rows": rows,
+                "mtp_enabled": mtp_enabled,
+                "mtp_num_draft_tokens": mtp_num_draft_tokens,
+            }
+    # False is the latency-safe default and intentionally shares the legacy
+    # signature. Enabling distributed SSD snapshot write-behind is a material
+    # launch-mode change and must be explicitly approved.
+    if bool(plan.get("prompt_cache_ssd", False)):
+        cache_contract = {
+            "prompt_cache_ssd": True,
+            "prompt_cache_ssd_max_bytes": int(
+                plan.get("prompt_cache_ssd_max_bytes")
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            ),
+        }
+        if isinstance(rows, dict):
+            rows = rows | cache_contract
+        else:
+            rows = {"rows": rows, **cache_contract}
+    qualification = plan.get("tensor_parallel_qualification")
+    if qualification is not None:
+        if isinstance(rows, dict):
+            rows = rows | {"tensor_parallel_qualification": qualification}
+        else:
+            rows = {
+                "rows": rows,
+                "tensor_parallel_qualification": qualification,
+            }
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -763,27 +943,351 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
                 ),
             }
         )
+    settings: dict[str, dict[str, Any]] = {}
+    for field, default in (
+        ("path_map", {}),
+        ("mtp_enabled", False),
+        ("mtp_num_draft_tokens", None),
+        ("prompt_cache_ssd", False),
+        ("prompt_cache_ssd_max_bytes", DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES),
+        ("tensor_parallel_qualification", None),
+    ):
+        before = approved.get(field, default)
+        after = launched.get(field, default)
+        if before != after:
+            settings[field] = {"before": before, "after": after}
     return {
-        "changed": bool(ranks),
-        "reason": "automatic tuning re-planned from the measured link speeds",
+        "changed": bool(ranks or settings),
+        "reason": (
+            "launch settings changed"
+            if settings and not ranks
+            else "automatic tuning re-planned from the measured link speeds"
+        ),
         "approved_signature": _placement_signature(approved),
         "launched_signature": _placement_signature(launched),
         "ranks": ranks,
+        "settings": settings,
     }
 
 
-def _create_cluster_plan(request: ClusterPlanRequest):
-    if (
-        request.tensor_parallel_size > 1
-        and request.tensor_parallel_size != len(request.nodes)
+_QUALIFIED_TP_SHARD_WEIGHTS_ENV = "OMLX_TP_QUALIFIED_SHARD_WEIGHTS"
+_QUALIFIED_TP_MODEL_IDENTITY_ENV = "OMLX_TP_QUALIFIED_MODEL_IDENTITY"
+_EXPERIMENTAL_DISTRIBUTED_DSV4_ANE_ENV = (
+    "OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL"
+)
+
+
+class _UnpromotablePerformanceCalibration(ValueError):
+    """Synthetic measurements captured under a known throttled power state."""
+
+
+def _operator_qualified_tp_shard_weights(
+    *,
+    tensor_parallel_size: int,
+    node_count: int,
+    model_path: str | Path | None = None,
+) -> tuple[tuple[int, ...], ...] | None:
+    """Parse the coordinator-only experimental pure-TP shard override.
+
+    The setting is deliberately absent from every request schema: only the
+    operator controlling the coordinator process can qualify a vector.  It is
+    ignored for pipeline-only planning and rejected for hybrid topology.  The
+    planner still validates the model's exact shard-unit sum and memory fit;
+    workers never read this environment variable and derive their weights from
+    the signed rank assignments.
+    """
+
+    raw = os.environ.get(_QUALIFIED_TP_SHARD_WEIGHTS_ENV)
+    if raw is None or tensor_parallel_size <= 1:
+        return None
+    scope = os.environ.get(_QUALIFIED_TP_MODEL_IDENTITY_ENV, "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", scope) is None:
+        logger.warning(
+            "%s is ignored because %s is missing or invalid",
+            _QUALIFIED_TP_SHARD_WEIGHTS_ENV,
+            _QUALIFIED_TP_MODEL_IDENTITY_ENV,
+        )
+        return None
+    if model_path is None:
+        return None
+    root = Path(model_path).expanduser()
+    if not root.is_dir() or model_identity_digest(root) != scope:
+        return None
+    if tensor_parallel_size != node_count:
+        raise PlanningError(
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} is supported only for pure "
+            "tensor parallelism across every selected node"
+        )
+    value = raw.strip()
+    if not value or len(value) > 4096:
+        raise PlanningError(
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} must be a comma-separated "
+            "vector of positive integers"
+        )
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != tensor_parallel_size or any(
+        re.fullmatch(r"[1-9][0-9]*", part) is None for part in parts
     ):
         raise PlanningError(
-            "Tensor parallelism must use every detected node. Combining tensor "
-            "parallelism with multiple pipeline stages is not supported by the "
-            "pinned MLX model sharding path; choose 1 for pipeline-only or "
-            f"{len(request.nodes)} for one tensor-parallel stage."
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} must contain exactly "
+            f"{tensor_parallel_size} comma-separated positive integers in "
+            "rank order"
         )
+    weights = tuple(int(part) for part in parts)
+    logger.warning(
+        "%s is forcing experimental TP shard weights %s; this override "
+        "takes precedence over persisted exact-match qualifications",
+        _QUALIFIED_TP_SHARD_WEIGHTS_ENV,
+        weights,
+    )
+    return (weights,)
+
+
+def _qualification_statuses(
+    hosts: Sequence[ClusterHostRequest],
+) -> dict[str, dict[str, Any]]:
+    """Current exact runtime evidence in the posted rank order.
+
+    Qualification lookup is an optimization and callers decide whether an
+    unavailable peer is a warning or a hard activation failure.  This helper
+    itself stays strict: a partial result must never look like a match.
+    """
+
+    statuses: dict[str, dict[str, Any]] = {}
+    for host in hosts:
+        if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+            statuses[host.node_id] = {
+                "runtime_compatible": True,
+                "status": collect_cluster_status().to_dict(),
+            }
+            continue
+        statuses[host.node_id] = probe_remote_host(
+            host.ssh,
+            python_executable=host.python_executable or sys.executable,
+        )
+    return statuses
+
+
+def _tp_qualification_key(
+    *,
+    model_path: str,
+    nodes: Sequence[ClusterPlanNodeRequest],
+    statuses: dict[str, dict[str, Any]],
+    backend: str,
+    tensor_parallel_size: int,
+    target_context_tokens: int,
+    execution_profile_name: str,
+    auto_tune: bool,
+    sampling_rank_only: bool,
+    mtp_enabled: bool,
+    mtp_num_draft_tokens: int | None,
+) -> TPQualificationKey:
+    root = Path(model_path).expanduser()
+    if not root.is_dir():
+        raise ValueError("the complete model is unavailable for qualification")
+    ordered_statuses = []
+    for node in nodes:
+        status = statuses.get(node.node_id)
+        if not isinstance(status, dict):
+            raise ValueError(
+                f"runtime qualification evidence is unavailable for {node.node_id}"
+            )
+        ordered_statuses.append(status)
+    defaults = execution_profile(
+        execution_profile_name,
+        auto_tune=auto_tune,
+        sampling_rank_only=sampling_rank_only,
+    )
+    return TPQualificationKey(
+        model_identity=model_identity_digest(root),
+        nodes=node_fingerprints_from_statuses(
+            [node.node_id for node in nodes],
+            ordered_statuses,
+            backend=backend,
+        ),
+        backend=backend,
+        tensor_parallel_size=tensor_parallel_size,
+        context_bucket=context_bucket(target_context_tokens),
+        execution_profile=execution_profile_name,
+        microbatch_size=defaults.pipeline_microbatch_size,
+        decode_concurrency=defaults.decode_concurrency,
+        prompt_concurrency=defaults.prompt_concurrency,
+        prefill_step_size=defaults.prefill_step_size,
+        auto_tune=auto_tune,
+        mtp_enabled=mtp_enabled,
+        mtp_depth=(mtp_num_draft_tokens or 3) if mtp_enabled else None,
+    )
+
+
+def _resolve_tp_layout_qualification(
+    *,
+    model_path: str | None,
+    nodes: Sequence[ClusterPlanNodeRequest],
+    statuses: dict[str, dict[str, Any]] | None,
+    backend: str,
+    tensor_parallel_size: int,
+    target_context_tokens: int,
+    execution_profile_name: str,
+    auto_tune: bool,
+    sampling_rank_only: bool,
+    mtp_enabled: bool,
+    mtp_num_draft_tokens: int | None,
+    expected_qualification_id: str | None = None,
+    allow_persistent: bool = True,
+) -> tuple[
+    tuple[tuple[int, ...], ...] | None,
+    TPQualificationProvenance | None,
+    dict[str, Any],
+]:
+    """Environment override first, then one exact persisted record."""
+
+    override = _operator_qualified_tp_shard_weights(
+        tensor_parallel_size=tensor_parallel_size,
+        node_count=len(nodes),
+        model_path=model_path,
+    )
+    if override is not None:
+        provenance = TPQualificationProvenance.environment(override[0])
+        return (
+            override,
+            provenance,
+            {
+                "matched": True,
+                "source": "environment_override",
+                "qualification_id": provenance.qualification_id,
+                "shard_weights": list(override[0]),
+                "reason": provenance.reason,
+            },
+        )
+    if tensor_parallel_size <= 1:
+        return None, None, {
+            "matched": False,
+            "source": "not_applicable",
+            "reason": "tensor layout qualification requires tensor parallelism",
+        }
+    if tensor_parallel_size != len(nodes):
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "persisted layout qualification currently requires pure TP",
+        }
+    if not allow_persistent:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "the approved preview did not name a TP qualification",
+        }
+    if not model_path or statuses is None:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "complete model and live rank fingerprints are required",
+        }
+    try:
+        key = _tp_qualification_key(
+            model_path=model_path,
+            nodes=nodes,
+            statuses=statuses,
+            backend=backend,
+            tensor_parallel_size=tensor_parallel_size,
+            target_context_tokens=target_context_tokens,
+            execution_profile_name=execution_profile_name,
+            auto_tune=auto_tune,
+            sampling_rank_only=sampling_rank_only,
+            mtp_enabled=mtp_enabled,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
+        )
+        if (
+            expected_qualification_id is not None
+            and key.qualification_id != expected_qualification_id
+        ):
+            return None, None, {
+                "matched": False,
+                "source": "equal_fallback",
+                "qualification_id": key.qualification_id,
+                "reason": (
+                    "live model/hardware/runtime fingerprint no longer matches "
+                    "the approved qualification"
+                ),
+            }
+        store = get_tp_layout_qualification_store()
+        record = store.lookup(key)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": f"TP qualification unavailable: {exc}",
+        }
+    if record is None:
+        decision = store.decision(key)
+        if expected_qualification_id is not None:
+            decision["reason"] = (
+                "the approved TP qualification is missing, corrupt, "
+                "inexact, or no longer promotable"
+            )
+        return None, None, decision
+    if (
+        expected_qualification_id is not None
+        and record.qualification_id != expected_qualification_id
+    ):
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "qualification_id": record.qualification_id,
+            "reason": "the exact record differs from the approved qualification",
+        }
+    provenance = TPQualificationProvenance.from_record(record)
+    return (
+        (record.shard_weights,),
+        provenance,
+        store.decision(key),
+    )
+
+
+def _create_cluster_plan(
+    request: ClusterPlanRequest,
+    *,
+    qualified_tensor_shard_weights: tuple[tuple[int, ...], ...] | None = None,
+    tensor_parallel_qualification: TPQualificationProvenance | None = None,
+):
     model, nodes = _model_and_nodes(request)
+    if request.serving_mode == "disaggregated":
+        if request.tensor_parallel_size != 1:
+            raise PlanningError(
+                "phase-split serving uses complete replicas, not tensor shards"
+            )
+        if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+            raise PlanningError(
+                "phase-split serving does not yet support speculative decode"
+            )
+        if request.prefill_rank is None or request.decode_rank is None:
+            raise PlanningError(
+                "phase-split serving requires selected prefill and decode Macs"
+            )
+        plan = build_full_replica_shard_plan(
+            model,
+            nodes,
+            prefill_rank=request.prefill_rank,
+            decode_rank=request.decode_rank,
+            context_tokens=request.target_context_tokens,
+            workload_profile=request.execution_profile,
+        )
+        path_map = validate_model_path_map(
+            request.path_map,
+            tuple(node.node_id.strip() for node in request.nodes),
+        )
+        return replace(plan, path_map=path_map) if path_map else plan
+    if (
+        request.tensor_parallel_size > 1
+        and request.tensor_parallel_size < len(nodes)
+        and len(nodes) % request.tensor_parallel_size == 0
+        and model.source != "synthetic"
+        and not model.supports_pipeline
+    ):
+        raise PlanningError(
+            "hybrid TP x pipeline requires a model architecture with a "
+            "validated pipeline forward path"
+        )
     if (
         len(nodes) > 1
         and request.tensor_parallel_size == 1
@@ -800,9 +1304,32 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 f"across {len(nodes)} Macs."
             )
         raise PlanningError(detail)
+    path_map = validate_model_path_map(
+        request.path_map,
+        tuple(node.node_id.strip() for node in request.nodes),
+    )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
-        return plan_hybrid(
+        if request.allocation != "balanced":
+            raise PlanningError(
+                "RAM-proportional allocation is a pipeline-only rule; tensor "
+                "parallelism uses the hybrid planner (allocation='balanced')"
+            )
+        # The coordinator-only environment remains an explicit experimental
+        # escape hatch and takes precedence over a persisted record selected
+        # by the route.  It receives unqualified provenance so the plan and
+        # approval signature cannot present it as a proven layout.
+        override = _operator_qualified_tp_shard_weights(
+            tensor_parallel_size=request.tensor_parallel_size,
+            node_count=len(nodes),
+            model_path=request.model_path,
+        )
+        if override is not None:
+            qualified_tensor_shard_weights = override
+            tensor_parallel_qualification = (
+                TPQualificationProvenance.environment(override[0])
+            )
+        plan = plan_hybrid(
             model,
             nodes,
             tensor_parallel_size=request.tensor_parallel_size,
@@ -811,21 +1338,41 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+            tensor_parallel_qualification=tensor_parallel_qualification,
         )
-    return plan_unequal_pipeline(
-        model,
-        nodes,
-        workload_profile=request.execution_profile,
-        microbatch_size=(
-            request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
-        ),
-        context_tokens=request.target_context_tokens,
-    )
+    elif request.allocation == "proportional":
+        plan = plan_proportional_pipeline(
+            model,
+            nodes,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    else:
+        plan = plan_unequal_pipeline(
+            model,
+            nodes,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    if path_map:
+        plan = replace(plan, path_map=path_map)
+    return plan
 
 
 class ClusterAutoconfigureRequest(BaseModel):
     """Everything one-click activation needs; the server decides the rest."""
 
+    # Active-cluster membership changes keep the durable deployment identity
+    # while recomputing every rank/host/transport field. First-time setup omits
+    # this and receives the normal model+plan-derived ID.
+    deployment_id: str | None = Field(default=None, max_length=128)
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
     model_source_python: str | None = Field(default=None, max_length=4096)
@@ -835,7 +1382,9 @@ class ClusterAutoconfigureRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(default_factory=list, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     prefer: Literal["speed", "capacity"] = "speed"
-    strategy: Literal["auto", "tensor", "pipeline"] = "auto"
+    strategy: Literal["auto", "tensor", "pipeline", "disaggregated"] = "auto"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     detect_transports: bool = True
     preflight: bool = True
     auto_tune: bool = True
@@ -847,9 +1396,20 @@ class ClusterAutoconfigureRequest(BaseModel):
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    # Distributed workers always retain their bounded in-memory prompt LRU.
+    # Durable boundary snapshots add bounded detached state and SSD traffic,
+    # so one-click setup keeps them opt-in and carries the choice through the
+    # signed plan instead of silently changing memory/disk use at activation.
+    prompt_cache_ssd: bool = False
+    prompt_cache_ssd_max_bytes: int = Field(
+        default=DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+        gt=0,
+    )
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
 
 
 def _measured_link_profiles(
@@ -907,9 +1467,7 @@ def _staging_for(
                 if _local_ssh_target(source_host)
                 else validate_ssh_target(source_host)
             ),
-            source_python_executable=(
-                request.model_source_python or DEFAULT_REMOTE_PYTHON
-            ),
+            source_python_executable=request.model_source_python,
         )
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc), "ready": False}
@@ -1022,6 +1580,84 @@ def _resolve_fabric(
     }
 
 
+def _tp_layout_recommendation_payload(
+    model: Any,
+    nodes: list[NodeBudget],
+    plan: ShardPlan,
+    *,
+    workload_profile: str,
+    context_tokens: int,
+    qualification: TPQualificationProvenance | None,
+) -> dict[str, Any] | None:
+    """Describe a measured candidate without silently activating it."""
+
+    if plan.tensor_parallel_size <= 1 or plan.pipeline_stages != 1:
+        return None
+    assignments = sorted(plan.assignments, key=lambda item: item.rank)
+    current = tuple(
+        int(item.tensor_parallel_shard_weight or 1) for item in assignments
+    )
+    if qualification is not None:
+        persistent = qualification.source == "persistent"
+        return {
+            "state": "qualified" if persistent else "experimental",
+            "current_weights": list(current),
+            "recommended_weights": list(qualification.shard_weights),
+            "requires_qualification": not persistent,
+            "qualification_id": qualification.qualification_id,
+            "reason": qualification.reason,
+        }
+    try:
+        candidate = recommend_tensor_shard_weights(
+            model,
+            nodes,
+            workload_profile=workload_profile,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": f"shard recommendation unavailable: {exc}",
+        }
+    if candidate == current:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": "measured rank rates do not justify an asymmetric split",
+        }
+    try:
+        plan_hybrid(
+            model,
+            nodes,
+            tensor_parallel_size=plan.tensor_parallel_size,
+            workload_profile=workload_profile,
+            context_tokens=context_tokens,
+            qualified_tensor_shard_weights=(candidate,),
+        )
+    except PlanningError as exc:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": f"measured asymmetric candidate does not fit: {exc}",
+        }
+    return {
+        "state": "calibration_required",
+        "current_weights": list(current),
+        "recommended_weights": list(candidate),
+        "requires_qualification": True,
+        "reason": (
+            "synthetic rank rates nominate this vector; matched full-model "
+            "A/B and parity are required before activation"
+        ),
+    }
+
+
 @router.get("/fabric")
 async def cluster_fabric(hosts: str = Query(...)):
     """The addresses these Macs answer on, and the backend they allow.
@@ -1066,6 +1702,10 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         layer_count=request.layer_count,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        prompt_cache_ssd=request.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
@@ -1128,16 +1768,63 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             measurements = {}
 
     try:
-        choice = choose_parallelism(
-            model,
-            nodes,
-            transports=strategy_transports,
-            prefer=request.prefer,
-            strategy=request.strategy,
-            measurements=measurements,
-            workload_profile=request.execution_profile,
-            context_tokens=request.target_context_tokens,
-        )
+        if request.strategy == "disaggregated":
+            if request.prefill_rank is None or request.decode_rank is None:
+                raise PlanningError(
+                    "phase split requires selected prefill and decode Macs"
+                )
+            phase_plan = build_full_replica_shard_plan(
+                model,
+                nodes,
+                prefill_rank=request.prefill_rank,
+                decode_rank=request.decode_rank,
+                context_tokens=request.target_context_tokens,
+                workload_profile=request.execution_profile,
+            )
+            qualified_tensor_shard_weights = None
+            qualification_provenance = None
+            choice = SimpleNamespace(
+                plan=phase_plan,
+                tensor_parallel_size=1,
+                pipeline_stages=1,
+                reason=(
+                    "Each Mac holds a complete model replica. "
+                    f"Rank {request.prefill_rank} processes prompts and rank "
+                    f"{request.decode_rank} owns generation."
+                ),
+                warnings=(),
+            )
+        else:
+            qualified_tensor_shard_weights = (
+                _operator_qualified_tp_shard_weights(
+                    tensor_parallel_size=len(nodes),
+                    node_count=len(nodes),
+                    model_path=request.model_path,
+                )
+                if request.strategy != "pipeline"
+                else None
+            )
+            qualification_provenance = (
+                TPQualificationProvenance.environment(
+                    qualified_tensor_shard_weights[0]
+                )
+                if qualified_tensor_shard_weights is not None
+                else None
+            )
+            choice = choose_parallelism(
+                model,
+                nodes,
+                transports=strategy_transports,
+                prefer=request.prefer,
+                strategy=request.strategy,
+                measurements=measurements,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                hybrid_runtime_supported=hybrid_group_split_supported(
+                    provisional_backend
+                ),
+            )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1146,7 +1833,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     peer_statuses: dict[str, Any] = {}
     if request.preflight and request.hosts:
         for host in request.hosts:
-            if host.ssh in {"127.0.0.1", "localhost"}:
+            if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+                peer_statuses[host.node_id] = {
+                    "runtime_compatible": True,
+                    "status": collect_cluster_status().to_dict(),
+                }
                 continue
             try:
                 peer_statuses[host.node_id] = await asyncio.to_thread(
@@ -1196,18 +1887,30 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     # stage. Measured bandwidth is used where a node has been probed, so two
     # links of the same kind are not treated as interchangeable.
     link_profiles = _measured_link_profiles(request)
-    placement = order_hosts_for_topology(
-        [host.ssh for host in request.hosts],
-        transports,
-        choice.tensor_parallel_size,
-        link_profiles,
+    placement = (
+        SimpleNamespace(
+            hosts=tuple(requested_host_order),
+            warnings=(),
+            reason="phase roles retain the selected Mac order",
+        )
+        if request.strategy == "disaggregated"
+        else order_hosts_for_topology(
+            [host.ssh for host in request.hosts],
+            transports,
+            choice.tensor_parallel_size,
+            link_profiles,
+        )
     )
     warnings.extend(placement.warnings)
     placed_host_order = list(placement.hosts or requested_host_order)
-    grouped_host_order = _coalesce_verified_cuda_groups(
-        placed_host_order,
-        list(request.hosts),
-        list(request.nodes),
+    grouped_host_order = (
+        placed_host_order
+        if request.strategy == "disaggregated"
+        else _coalesce_verified_cuda_groups(
+            placed_host_order,
+            list(request.hosts),
+            list(request.nodes),
+        )
     )
     if grouped_host_order != placed_host_order:
         warnings.append(
@@ -1215,6 +1918,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         )
     ordered_hosts = list(request.hosts)
     ordered_request_nodes = list(request.nodes)
+    ordered_budgets = list(nodes)
     if grouped_host_order:
         by_ssh = {host.ssh: host for host in request.hosts}
         ordered_hosts = [by_ssh[ssh] for ssh in grouped_host_order if ssh in by_ssh]
@@ -1238,14 +1942,38 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # Host order defines rank order. Rebuild the plan against that exact
         # order so assignments, memory budgets and transport endpoints cannot
         # describe three different rank maps.
-        ordered_plan = plan_hybrid(
-            model,
-            ordered_budgets,
-            tensor_parallel_size=choice.tensor_parallel_size,
-            workload_profile=request.execution_profile,
-            context_tokens=request.target_context_tokens,
+        ordered_plan = (
+            build_full_replica_shard_plan(
+                model,
+                ordered_budgets,
+                prefill_rank=int(request.prefill_rank),
+                decode_rank=int(request.decode_rank),
+                context_tokens=request.target_context_tokens,
+                workload_profile=request.execution_profile,
+            )
+            if request.strategy == "disaggregated"
+            else plan_hybrid(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=(
+                    qualified_tensor_shard_weights
+                    if choice.tensor_parallel_size == len(ordered_budgets)
+                    else None
+                ),
+                tensor_parallel_qualification=(
+                    qualification_provenance
+                    if choice.tensor_parallel_size == len(ordered_budgets)
+                    else None
+                ),
+            )
         )
-        choice = replace(choice, plan=ordered_plan)
+        if request.strategy == "disaggregated":
+            choice.plan = ordered_plan
+        else:
+            choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
         [host.ssh for host in ordered_hosts],
         transports,
@@ -1300,13 +2028,78 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         else:
             fabric_blocker = fabric_error or "the cluster route could not be read"
 
+    # The final backend and rank order are now known.  Only here can an exact
+    # persisted heterogeneous layout be matched safely; a vector is rank
+    # ordered, so looking it up before topology placement would apply the
+    # right numbers to the wrong Macs.
+    (
+        qualified_tensor_shard_weights,
+        qualification_provenance,
+        qualification_decision,
+    ) = _resolve_tp_layout_qualification(
+        model_path=request.model_path,
+        nodes=ordered_request_nodes,
+        statuses=peer_statuses if peer_statuses else None,
+        backend=backend,
+        tensor_parallel_size=choice.tensor_parallel_size,
+        target_context_tokens=request.target_context_tokens,
+        execution_profile_name=request.execution_profile,
+        auto_tune=request.auto_tune,
+        sampling_rank_only=request.sampling_rank_only,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+    )
+    if choice.tensor_parallel_size > 1 and qualified_tensor_shard_weights is not None:
+        try:
+            qualified_plan = plan_hybrid(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                tensor_parallel_qualification=qualification_provenance,
+            )
+        except PlanningError as exc:
+            if (
+                qualification_provenance is not None
+                and qualification_provenance.source == "persistent"
+            ):
+                qualification_decision = {
+                    "matched": False,
+                    "source": "equal_fallback",
+                    "qualification_id": (
+                        qualification_provenance.qualification_id
+                    ),
+                    "reason": f"qualified layout no longer fits: {exc}",
+                }
+                qualified_tensor_shard_weights = None
+                qualification_provenance = None
+            else:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            choice = replace(choice, plan=qualified_plan)
+
     performance_probe: dict[str, Any] = {
         "ok": False,
-        "status": "disabled",
-        "reason": "automatic performance measurement disabled",
+        "status": (
+            "phase_probe_required"
+            if request.strategy == "disaggregated"
+            else "disabled"
+        ),
+        "reason": (
+            "phase split uses full-model prefill/decode calibration, not the "
+            "sharded synthetic placement probe"
+            if request.strategy == "disaggregated"
+            else "automatic performance measurement disabled"
+        ),
     }
     profiled_request_nodes = list(ordered_request_nodes)
-    existing_profiles = _request_performance_profiles(profiled_request_nodes)
+    existing_profiles = (
+        ()
+        if request.strategy == "disaggregated"
+        else _request_performance_profiles(profiled_request_nodes)
+    )
     if existing_profiles:
         # The first proposal carries these measurements into the post-staging
         # refresh. Reusing them avoids running the same distributed synthetic
@@ -1324,6 +2117,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         and request.auto_tune
         and request.model_path
         and len(activation_hosts) >= 2
+        and qualification_provenance is None
+        and request.strategy != "disaggregated"
     ):
         try:
             probe_execution = _execution_for_request(
@@ -1355,6 +2150,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 run_cluster_performance_probe,
                 probe_deployment,
             )
+            if performance_probe.get("promotable") is False:
+                raise _UnpromotablePerformanceCalibration(
+                    str(
+                        performance_probe.get("qualification_reason")
+                        or "Low Power Mode was enabled during calibration"
+                    )
+                )
             profiles = tuple(
                 NodePerformanceProfile.from_dict(profile)
                 for profile in performance_probe.get("profiles", ())
@@ -1376,6 +2178,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             optimized_plan = _build_performance_plan(
                 model,
                 measured_budgets,
+                model_path=request.model_path,
                 tensor_parallel_size=choice.tensor_parallel_size,
                 workload_profile=request.execution_profile,
                 microbatch_size=probe_execution.pipeline_microbatch_size,
@@ -1396,6 +2199,20 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             performance_probe["status"] = "applied_before_staging"
             performance_probe["plan_changed"] = performance_changes["changed"]
             performance_probe["plan_changes"] = performance_changes
+        except _UnpromotablePerformanceCalibration as exc:
+            profiled_request_nodes = list(ordered_request_nodes)
+            performance_probe = {
+                "ok": False,
+                "promotable": False,
+                "status": "power_limited",
+                "reason": str(exc)[:1000],
+                "plan_changed": False,
+            }
+            warnings.append(
+                "Low Power Mode is enabled on a calibration rank; synthetic "
+                "measurements were ignored for placement. Turn it off in "
+                "System Settings before recalibrating."
+            )
         except (DistributedLaunchError, OSError, PlanningError, ValueError) as exc:
             # First-run performance calibration is an optimization, not a
             # prerequisite. Keep the safe memory plan and say why. Profiles
@@ -1419,10 +2236,46 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     staging = await asyncio.to_thread(_staging_for, request, choice)
     staging_ready = staging is None or bool(staging.get("ready"))
 
-    plan_payload = _plan_with_signature(choice.plan.to_dict())
+    plan_contract = choice.plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        plan_contract.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+    # False deliberately retains the legacy placement signature. True is a
+    # material launch-mode choice because every rank creates a persistent,
+    # plan-scoped SSD snapshot store and must therefore be explicitly signed.
+    if request.prompt_cache_ssd:
+        plan_contract.update(
+            prompt_cache_ssd=True,
+            prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
+        )
+    plan_payload = _plan_with_signature(plan_contract)
     preflight_summary = describe_preflight(issues)
     if fabric_blocker:
         preflight_summary = f"Cluster link is not ready: {fabric_blocker}"
+    tp_layout_recommendation = _tp_layout_recommendation_payload(
+        model,
+        _node_budgets(profiled_request_nodes),
+        choice.plan,
+        workload_profile=request.execution_profile,
+        context_tokens=request.target_context_tokens,
+        qualification=qualification_provenance,
+    )
+    if qualification_decision.get("source") == "rejected_evidence":
+        tp_layout_recommendation = {
+            "state": "rejected",
+            "current_weights": [
+                int(item.tensor_parallel_shard_weight or 1)
+                for item in sorted(choice.plan.assignments, key=lambda row: row.rank)
+            ],
+            "recommended_weights": list(
+                qualification_decision.get("shard_weights") or []
+            ),
+            "requires_qualification": False,
+            "qualification_id": qualification_decision.get("qualification_id"),
+            "reason": qualification_decision.get("reason"),
+        }
     # Warning and blocker strings embed remote SSH stderr. Redact those and
     # only those: preflight issue commands are pasteable fixes that need their
     # user@host intact, and the activation block round-trips to /deployments.
@@ -1434,6 +2287,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "fabric_blocker": _redact_diagnostic(fabric_blocker),
         "tensor_parallel_size": choice.tensor_parallel_size,
         "pipeline_stages": choice.pipeline_stages,
+        "serving_mode": choice.plan.serving_mode,
+        "prefill_rank": choice.plan.prefill_rank,
+        "decode_rank": choice.plan.decode_rank,
         "summary": choice.reason,
         "link": describe_transports(transports),
         "placement": placement.reason,
@@ -1442,6 +2298,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             str(size): outcome.to_dict()
             for size, outcome in sorted(measurements.items())
         },
+        "tp_layout_qualification": qualification_decision,
+        "tp_layout_recommendation": tp_layout_recommendation,
         "performance_probe": performance_probe,
         "staging": staging,
         "strategies": STRATEGIES,
@@ -1449,12 +2307,17 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
         "preflight_issues": [asdict(issue) for issue in issues],
-        "ready_to_activate": not issues and staging_ready and fabric_ready,
+        "ready_to_activate": (
+            not any(issue.blocking for issue in issues)
+            and staging_ready
+            and fabric_ready
+        ),
         "warnings": _redact_diagnostic(warnings),
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
         # Ready to POST straight to /deployments once the user approves.
         "activation": {
+            "deployment_id": request.deployment_id,
             "model_path": request.model_path,
             "model_source": request.model_source,
             "model_source_python": request.model_source_python,
@@ -1464,12 +2327,25 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "sampling_rank_only": request.sampling_rank_only,
             "async_overlap": request.async_overlap,
             "cache_affinity": request.cache_affinity,
+            "prompt_cache_ssd": request.prompt_cache_ssd,
+            "prompt_cache_ssd_max_bytes": request.prompt_cache_ssd_max_bytes,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
+            "mtp_enabled": request.mtp_enabled,
+            "mtp_num_draft_tokens": request.mtp_num_draft_tokens,
+            "tp_qualification_id": (
+                qualification_provenance.qualification_id
+                if qualification_provenance is not None
+                and qualification_provenance.source == "persistent"
+                else None
+            ),
             "ring_connections_per_ip": (
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
             "tensor_parallel_size": choice.tensor_parallel_size,
+            "serving_mode": choice.plan.serving_mode,
+            "prefill_rank": choice.plan.prefill_rank,
+            "decode_rank": choice.plan.decode_rank,
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
             "preflight": True,
@@ -1585,19 +2461,28 @@ def _run_staging_job(
         portable_model_path = home_relative_model_path(deployment.model)
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
+            # Cluster v2: files land at the node's path_map entry when one
+            # exists (a peer-local absolute path); otherwise the peer's copy
+            # of the shared model, resolved in its OWN home from the ~-form.
+            path_override = deployment.path_map.get(host.node_id)
             if _local_ssh_target(host.ssh):
-                destination_dir = str(model_path)
+                destination_path = (
+                    Path(path_override) if path_override else model_path
+                )
+                destination_dir = str(destination_path)
                 present = (
                     {
                         path.name: path.stat().st_size
-                        for path in model_path.iterdir()
+                        for path in destination_path.iterdir()
                         if path.is_file()
                     }
-                    if model_path.is_dir()
+                    if destination_path.is_dir()
                     else {}
                 )
             else:
-                destination_dir = remote_model_dir(host.ssh, portable_model_path)
+                destination_dir = path_override or remote_model_dir(
+                    host.ssh, portable_model_path
+                )
                 present = remote_file_sizes(host.ssh, destination_dir)
             plan = plan_staging(
                 model_path,
@@ -1655,6 +2540,8 @@ def _run_staging_job(
                 name: (shard_sizes | sidecar_sizes)[name]
                 for name in needed
             }
+            # destination_dir is already path_map-aware (computed above), so
+            # pass it unconditionally.
             result = stage_files_from_source(
                 plan,
                 model_path=model_path,
@@ -1803,7 +2690,86 @@ async def cluster_status(route_to: str | None = None):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
+    return status.to_dict() | {"runtime_jobs": await cluster_runtime()}
+
+
+def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
+    """Make the coordinator's engine registry authoritative for GUI liveness.
+
+    Rank marker files survive crashes and are deliberately retained for
+    diagnostics. They therefore cannot, by themselves, prove that oMLX still
+    owns a loaded model. Keep markers live while their engine is loading or
+    loaded, but demote every detached marker so a stale file (or a reused PID)
+    cannot resurrect an unloaded model in the cluster tab.
+    """
+
+    loaded_deployments: set[str] = set()
+    loading_deployments: set[str] = set()
+    launchers: list[dict[str, Any]] = []
+    live_metrics: dict[str, dict[str, Any]] = {}
+
+    get_loaded = getattr(pool, "get_loaded_model_ids", None)
+    loaded_ids = get_loaded() if callable(get_loaded) else []
+    for model_id in loaded_ids:
+        entry = pool.get_entry(model_id)
+        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
+        if not callable(status):
+            continue
+        try:
+            launcher = status() | {"model_id": model_id}
+        except Exception:  # noqa: BLE001
+            continue
+        deployment_id = launcher.get("deployment_id")
+        if isinstance(deployment_id, str) and deployment_id:
+            loaded_deployments.add(deployment_id)
+            get_live_metrics = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live_metrics):
+                try:
+                    snapshot = get_live_metrics()
+                except Exception:  # noqa: BLE001
+                    snapshot = None
+                if isinstance(snapshot, dict) and isinstance(
+                    snapshot.get("metrics"), dict
+                ):
+                    live_metrics[deployment_id] = snapshot["metrics"]
+        launchers.append(launcher)
+
+    get_model_ids = getattr(pool, "get_model_ids", None)
+    if callable(get_model_ids):
+        try:
+            registry = get_cluster_registry()
+            for model_id in get_model_ids():
+                entry = pool.get_entry(model_id)
+                if entry is None or not getattr(entry, "is_loading", False):
+                    continue
+                deployment = registry.get_for_model(entry.model_path)
+                if deployment is not None:
+                    loading_deployments.add(deployment.deployment_id)
+        except (OSError, RuntimeError, ValueError):
+            # Ownership remains fail-closed: an unresolvable loading entry does
+            # not grant a marker permission to advertise a live model.
+            pass
+
+    for job in payload.get("jobs", []):
+        deployment_id = job.get("deployment_id")
+        if deployment_id in loaded_deployments:
+            job["ownership"] = "loaded"
+            if "metrics" not in job and deployment_id in live_metrics:
+                # A reversed Phase split hosts decode telemetry on the peer.
+                # Mirror the already-validated engine snapshot onto the local
+                # coordinator row so the dashboard keeps end-to-end rates.
+                job["metrics"] = live_metrics[deployment_id]
+        elif deployment_id in loading_deployments:
+            job["ownership"] = "loading"
+        else:
+            job["ownership"] = "detached"
+            job["live"] = False
+        for launcher in launchers:
+            if deployment_id == launcher.get("deployment_id"):
+                job["ranks"] = launcher.get("ranks", [])
+                job["endpoint"] = launcher.get("endpoint")
+                break
+    payload["launchers"] = launchers
 
 
 @router.get("/runtime")
@@ -1817,19 +2783,7 @@ async def cluster_runtime():
         pool = _engine_pool()
     except HTTPException:
         return payload
-    launchers: list[dict[str, Any]] = []
-    for model_id in pool.get_loaded_model_ids():
-        entry = pool.get_entry(model_id)
-        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
-        if not callable(status):
-            continue
-        launcher = status() | {"model_id": model_id}
-        launchers.append(launcher)
-        for job in payload.get("jobs", []):
-            if job.get("deployment_id") == launcher.get("deployment_id"):
-                job["ranks"] = launcher.get("ranks", [])
-                job["endpoint"] = launcher.get("endpoint")
-    payload["launchers"] = launchers
+    _reconcile_runtime_ownership(payload, pool)
     return payload
 
 
@@ -1967,7 +2921,12 @@ async def cluster_discover():
 
 @router.post("/pairing-token")
 async def cluster_pairing_token(request: ClusterPairingTokenRequest):
-    """Generate a pairing token for QR code exchange."""
+    """Generate a pairing token for QR code exchange.
+
+    Advanced (legacy): step 1 of the 3-step copy-paste relay. The cluster v2
+    wizard uses POST /api/cluster/pair/request + /pair/approve instead; this
+    endpoint is kept working unchanged for the legacy flow.
+    """
 
     from .discovery import generate_pairing_token
 
@@ -1982,7 +2941,11 @@ async def cluster_pairing_token(request: ClusterPairingTokenRequest):
 async def cluster_verify_pairing_token(
     request: ClusterPairingTokenVerificationRequest,
 ):
-    """Verify a pairing token received via QR code scan."""
+    """Verify a pairing token received via QR code scan.
+
+    Advanced (legacy): part of the 3-step copy-paste relay; superseded by the
+    cluster v2 code-based pairing flow but kept working unchanged.
+    """
 
     return {
         "valid": verify_pairing_token(
@@ -2232,7 +3195,12 @@ async def cluster_generate_ssh_key(
 async def cluster_generate_key_exchange_token(
     request: ClusterKeyExchangeTokenRequest,
 ):
-    """Generate a key exchange token for pairing with a peer."""
+    """Generate a key exchange token for pairing with a peer.
+
+    Advanced (legacy): step 3 of the copy-paste relay. Cluster v2 pairing
+    (POST /api/cluster/pair/approve) drives the same SSH TOFU primitives
+    programmatically; this endpoint remains for the manual flow.
+    """
 
     from .ssh_keys import generate_key_exchange_for_peer
 
@@ -2252,7 +3220,11 @@ async def cluster_generate_key_exchange_token(
 
 @router.post("/ssh-key/exchange")
 async def cluster_exchange_keys(request: ClusterKeyExchangeRequest):
-    """Exchange SSH keys with a peer using their exchange token."""
+    """Exchange SSH keys with a peer using their exchange token.
+
+    Advanced (legacy): step 3 of the copy-paste relay; kept working unchanged
+    alongside the cluster v2 code-based pairing flow.
+    """
 
     from .ssh_keys import exchange_keys_with_peer
 
@@ -2534,6 +3506,176 @@ async def cluster_pipeline_smoke(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _tp_layout_candidate_clears_promotion(
+    profile: str,
+    equal: ClusterTPRateEvidenceRequest,
+    candidate: ClusterTPRateEvidenceRequest,
+) -> tuple[bool, str]:
+    """Require a useful gain without hiding a material regression."""
+
+    prefill_ratio = (
+        candidate.prefill_tokens_per_second / equal.prefill_tokens_per_second
+    )
+    decode_ratio = (
+        candidate.decode_tokens_per_second / equal.decode_tokens_per_second
+    )
+    if profile == "throughput":
+        accepted = prefill_ratio >= 1.03 and decode_ratio >= 0.95
+    elif profile == "interactive":
+        accepted = decode_ratio >= 1.03 and prefill_ratio >= 0.95
+    else:
+        accepted = (
+            min(prefill_ratio, decode_ratio) >= 0.98
+            and math.sqrt(prefill_ratio * decode_ratio) >= 1.02
+        )
+    reason = (
+        f"prefill {prefill_ratio:.4f}x, decode {decode_ratio:.4f}x "
+        f"under the {profile} policy"
+    )
+    return accepted, reason
+
+
+@router.get("/tp-layout-qualifications")
+async def list_tp_layout_qualifications() -> dict[str, Any]:
+    """Return exact-match heterogeneous TP records and store health."""
+
+    try:
+        return get_tp_layout_qualification_store().to_dict()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/tp-layout-qualifications")
+async def qualify_tp_layout(
+    request: ClusterTPLayoutQualificationRequest,
+) -> dict[str, Any]:
+    """Promote one matched full-model A/B into the signed layout store."""
+
+    if request.tensor_parallel_size != len(request.nodes):
+        raise HTTPException(
+            status_code=400,
+            detail="TP layout qualification currently requires pure TP on every node",
+        )
+    node_ids = [node.node_id.strip() for node in request.nodes]
+    host_ids = [host.node_id.strip() for host in request.hosts]
+    if host_ids != node_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="qualification hosts must exactly match rank-ordered nodes",
+        )
+    if len(request.shard_weights) != request.tensor_parallel_size:
+        raise HTTPException(
+            status_code=400,
+            detail="qualification shard vector does not match TP size",
+        )
+    exact = request.equal_control.output_sha256 == request.candidate.output_sha256
+    accepted, performance_reason = _tp_layout_candidate_clears_promotion(
+        request.execution_profile,
+        request.equal_control,
+        request.candidate,
+    )
+    promotable = bool(exact and accepted)
+    if exact:
+        parity_sha256 = request.candidate.output_sha256
+        evidence_reason = performance_reason
+    else:
+        parity_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "equal": request.equal_control.output_sha256,
+                    "candidate": request.candidate.output_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        evidence_reason = (
+            "rejected because the candidate output hash differs from the "
+            f"matched equal control; {performance_reason}"
+        )
+    if exact and not accepted:
+        evidence_reason = (
+            f"rejected by TP promotion policy; {performance_reason}"
+        )
+
+    try:
+        _validate_cluster_hosts(request.hosts)
+        statuses = await asyncio.to_thread(
+            _qualification_statuses,
+            request.hosts,
+        )
+        key = _tp_qualification_key(
+            model_path=request.model_path,
+            nodes=request.nodes,
+            statuses=statuses,
+            backend=request.backend,
+            tensor_parallel_size=request.tensor_parallel_size,
+            target_context_tokens=request.target_context_tokens,
+            execution_profile_name=request.execution_profile,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+        model, budgets = _model_and_nodes(
+            ClusterPlanRequest(
+                model_path=request.model_path,
+                nodes=request.nodes,
+                execution_profile=request.execution_profile,
+                tensor_parallel_size=request.tensor_parallel_size,
+                target_context_tokens=request.target_context_tokens,
+                mtp_enabled=request.mtp_enabled,
+                mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+            )
+        )
+        # Validate adapter shard units and per-node memory fit before storing
+        # evidence. The exact record will be revalidated again at every use.
+        plan_hybrid(
+            model,
+            budgets,
+            tensor_parallel_size=request.tensor_parallel_size,
+            workload_profile=request.execution_profile,
+            context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=(tuple(request.shard_weights),),
+        )
+        record = TPLayoutQualification(
+            key=key,
+            shard_weights=tuple(request.shard_weights),
+            equal_control=TPRateEvidence(
+                request.equal_control.prefill_tokens_per_second,
+                request.equal_control.decode_tokens_per_second,
+                request.equal_control.samples,
+            ),
+            candidate=TPRateEvidence(
+                request.candidate.prefill_tokens_per_second,
+                request.candidate.decode_tokens_per_second,
+                request.candidate.samples,
+            ),
+            exact=exact,
+            parity_sha256=parity_sha256,
+            promotable=promotable,
+            reason=f"{request.reason.strip()}; {evidence_reason}",
+            qualified_at=datetime.now(UTC).isoformat(),
+        )
+        store = get_tp_layout_qualification_store()
+        await asyncio.to_thread(store.record, record)
+    except HTTPException:
+        raise
+    except (OSError, PlanningError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "state": "qualified" if record.promotable else "rejected",
+        "qualification_id": record.qualification_id,
+        "record_digest": record.record_digest,
+        "shard_weights": list(record.shard_weights),
+        "exact": record.exact,
+        "promotable": record.promotable,
+        "reason": record.reason,
+    }
+
+
 @router.post("/plan")
 async def cluster_plan(request: ClusterPlanRequest):
     """Plan explicit contiguous layers across rank-ordered node budgets."""
@@ -2545,7 +3687,63 @@ async def cluster_plan(request: ClusterPlanRequest):
     # The signature travels back with the plan so activation can prove it is
     # launching the thing that was shown here, and not a re-plan built from a
     # payload that quietly dropped the reserve, the cap or the role.
-    return _plan_with_signature(plan.to_dict())
+    payload = plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        payload.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+    if request.prompt_cache_ssd is not None:
+        payload["prompt_cache_ssd"] = request.prompt_cache_ssd
+        if request.prompt_cache_ssd:
+            payload["prompt_cache_ssd_max_bytes"] = int(
+                request.prompt_cache_ssd_max_bytes
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
+    return _plan_with_signature(payload)
+
+
+class ClusterBackendMemberRequest(BaseModel):
+    """One member's observed RDMA capability, from local or peer probes."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+    rdma_ctl_enabled: bool = False
+    rdma_devices: list[str] = Field(default_factory=list, max_length=16)
+
+
+class ClusterBackendSelectionRequest(BaseModel):
+    """Which collective backend should this exact member set use?"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    members: list[ClusterBackendMemberRequest] = Field(min_length=2, max_length=64)
+
+
+@router.post("/backend-selection")
+async def cluster_backend_selection(
+    request: ClusterBackendSelectionRequest,
+) -> dict[str, Any]:
+    """jaccl when rdma_ctl is enabled on ALL members, else the TCP ring.
+
+    The plan view renders this decision (including which members block JACCL)
+    before anyone approves a placement; the replan endpoint makes the same
+    call when asked for ``backend="auto"``.
+    """
+
+    try:
+        selection = select_cluster_backend(
+            tuple(
+                MemberFabric(
+                    node_id=member.node_id.strip(),
+                    rdma_ctl_enabled=member.rdma_ctl_enabled,
+                    rdma_devices=tuple(member.rdma_devices),
+                )
+                for member in request.members
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return selection.to_dict()
 
 
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
@@ -2566,10 +3764,39 @@ def _execution_for_request(
         auto_tune=request.auto_tune,
         sampling_rank_only=request.sampling_rank_only,
     )
+    deepseek_ane_request = getattr(request, "deepseek_ane_prefill", None)
+    deepseek_ane = DeepseekAnePrefillSettings.from_dict(
+        deepseek_ane_request.model_dump()
+        if deepseek_ane_request is not None
+        else None
+    )
+    distributed = len(assignments) > 1
+    experimental_distributed_ane = os.environ.get(
+        _EXPERIMENTAL_DISTRIBUTED_DSV4_ANE_ENV,
+        "0",
+    ).strip().lower() in {"1", "true", "on", "yes"}
+    distributed_ane_rejected = bool(
+        deepseek_ane.enabled
+        and distributed
+        and not experimental_distributed_ane
+    )
+    if distributed_ane_rejected:
+        # PR #3059 is physically qualified only on a single M3 Ultra. TP2
+        # uses a lockstep 1024-token DS4 kernel for long prompts; a 4096-tile
+        # provider never dispatches and adds fallback overhead, while a 1024
+        # provider made the heterogeneous ranks miss a collective deadline.
+        # Keep the normal cluster path exact and fast until a model/runtime/
+        # topology qualification proves one fixed shape on every rank.
+        deepseek_ane = DeepseekAnePrefillSettings()
     requested = replace(
         requested,
         async_overlap=request.async_overlap,
         cache_affinity=request.cache_affinity,
+        prompt_cache_ssd=bool(getattr(request, "prompt_cache_ssd", False)),
+        prompt_cache_ssd_max_bytes=(
+            getattr(request, "prompt_cache_ssd_max_bytes", None)
+            or requested.prompt_cache_ssd_max_bytes
+        ),
         # The context chosen beside the model is both a reservation and a
         # runtime ceiling. Without this fallback the planner could reserve
         # 256k while the server used an unrelated advanced default (or no
@@ -2581,12 +3808,39 @@ def _execution_for_request(
         ring_connections_per_ip=(
             request.ring_connections_per_ip or requested.ring_connections_per_ip
         ),
+        prefill_step_size=(
+            deepseek_ane.sequence_length
+            if deepseek_ane.enabled
+            else requested.prefill_step_size
+        ),
+        deepseek_ane_prefill=deepseek_ane,
     )
-    return tune_execution_settings(
+    tuned = tune_execution_settings(
         requested,
         assignments,
         backend=backend,
     )
+    if distributed_ane_rejected:
+        tuned = replace(
+            tuned,
+            tuning_reason=(
+                f"{tuned.tuning_reason}; DeepSeek ANE disabled because "
+                "distributed fixed-shape offload is not lockstep-qualified"
+            ),
+        )
+    if (
+        tuned.deepseek_ane_prefill.enabled
+        and tuned.prefill_step_size != tuned.deepseek_ane_prefill.sequence_length
+    ):
+        tuned = replace(
+            tuned,
+            deepseek_ane_prefill=DeepseekAnePrefillSettings(),
+            tuning_reason=(
+                f"{tuned.tuning_reason}; DeepSeek ANE disabled because the "
+                "memory tuner reduced the prefill step below its fixed tile"
+            ),
+        )
+    return tuned
 
 
 def _request_performance_profiles(
@@ -2604,6 +3858,8 @@ def _request_performance_profiles(
             raise ValueError(
                 "node performance profiles must match the activation rank order"
             )
+    if any(not profile.promotable for profile in profiles):
+        return ()
     return profiles
 
 
@@ -2627,11 +3883,57 @@ def _create_deployment(
         model_source_python=request.model_source_python,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        allocation=request.allocation,
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
+        serving_mode=request.serving_mode,
+        prefill_rank=request.prefill_rank,
+        decode_rank=request.decode_rank,
         target_context_tokens=request.target_context_tokens,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        prompt_cache_ssd=request.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
+        path_map=request.path_map,
     )
-    plan = _create_cluster_plan(plan_request)
+    qualified_tensor_shard_weights = None
+    qualification_provenance = None
+    if request.tp_qualification_id is not None:
+        try:
+            statuses = _qualification_statuses(request.hosts)
+        except (DistributedLaunchError, OSError, RuntimeError, ValueError) as exc:
+            raise PlanningError(
+                f"could not revalidate the approved TP qualification: {exc}"
+            ) from exc
+        (
+            qualified_tensor_shard_weights,
+            qualification_provenance,
+            qualification_decision,
+        ) = _resolve_tp_layout_qualification(
+            model_path=str(model_path),
+            nodes=request.nodes,
+            statuses=statuses,
+            backend=request.backend,
+            tensor_parallel_size=request.tensor_parallel_size,
+            target_context_tokens=request.target_context_tokens,
+            execution_profile_name=request.execution_profile,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+            expected_qualification_id=request.tp_qualification_id,
+        )
+        if qualification_provenance is None:
+            raise PlanningError(str(qualification_decision["reason"]))
+    plan = (
+        _create_cluster_plan(
+            plan_request,
+            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+            tensor_parallel_qualification=qualification_provenance,
+        )
+        if qualification_provenance is not None
+        else _create_cluster_plan(plan_request)
+    )
     execution = _execution_for_request(
         request,
         plan.assignments,
@@ -2641,13 +3943,37 @@ def _create_deployment(
         execution.pipeline_microbatch_size != requested_microbatch
     ):
         plan_request.pipeline_microbatch_size = execution.pipeline_microbatch_size
-        plan = _create_cluster_plan(plan_request)
+        plan = (
+            _create_cluster_plan(
+                plan_request,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                tensor_parallel_qualification=qualification_provenance,
+            )
+            if qualification_provenance is not None
+            else _create_cluster_plan(plan_request)
+        )
     if len(request.hosts) != len(request.nodes):
         raise ValueError("host count must match node budget count")
     node_ids = [node.node_id.strip() for node in request.nodes]
     host_ids = [host.node_id.strip() for host in request.hosts]
     if host_ids != node_ids:
         raise ValueError("rank-ordered host IDs must match node budget IDs")
+
+    host_rdma: list[Any] = [tuple(host.rdma) for host in request.hosts]
+    if request.backend != "ring" and any(not rdma for rdma in host_rdma):
+        # Clients (the cluster v2 wizard among them) legitimately activate
+        # without RDMA rows — they know the link exists, not the interface
+        # names, and only the live names survive macOS renumbering a
+        # Thunderbolt port. Derive the full matrix here, the same way the
+        # transports report does, or the ClusterDeployment constructor
+        # rejects the activation with nothing the user can act on.
+        interfaces = [probe_host_interfaces(host.ssh) for host in request.hosts]
+        matrix = build_rdma_matrix(interfaces)
+        if not matrix.ok:
+            raise ValueError(
+                f"cannot use the {request.backend} backend: {matrix.reason}"
+            )
+        host_rdma = [list(row) for row in matrix.rows]
 
     deployment = ClusterDeployment(
         deployment_id=(
@@ -2662,10 +3988,10 @@ def _create_deployment(
                 node_id=host.node_id.strip(),
                 ssh=host.ssh,
                 ips=tuple(host.ips),
-                rdma=tuple(host.rdma),
+                rdma=tuple(host_rdma[index]),
                 python_executable=host.python_executable,
             )
-            for host in request.hosts
+            for index, host in enumerate(request.hosts)
         ),
         assignments=plan.assignments,
         plan_hash=plan.plan_hash,
@@ -2673,14 +3999,37 @@ def _create_deployment(
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        serving_mode=request.serving_mode,
+        prefill_rank=request.prefill_rank,
+        decode_rank=request.decode_rank,
+        path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
+        tensor_parallel_qualification=getattr(
+            plan, "tensor_parallel_qualification", None
+        ),
     )
-    return deployment, plan.to_dict()
+    plan_payload = plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        plan_payload.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+    if request.prompt_cache_ssd is not None:
+        plan_payload["prompt_cache_ssd"] = request.prompt_cache_ssd
+        if request.prompt_cache_ssd:
+            plan_payload["prompt_cache_ssd_max_bytes"] = int(
+                request.prompt_cache_ssd_max_bytes
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
+    return deployment, plan_payload
 
 
 def _build_performance_plan(
     model: Any,
     nodes: list[NodeBudget],
     *,
+    model_path: str,
     tensor_parallel_size: int,
     workload_profile: str,
     microbatch_size: int,
@@ -2696,6 +4045,13 @@ def _build_performance_plan(
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
+            qualified_tensor_shard_weights=(
+                _operator_qualified_tp_shard_weights(
+                    tensor_parallel_size=tensor_parallel_size,
+                    node_count=len(nodes),
+                    model_path=model_path,
+                )
+            ),
         )
     return plan_unequal_pipeline(
         model,
@@ -2722,9 +4078,7 @@ def _performance_optimized_deployment(
         remote_model_layout(
             validate_ssh_target(source),
             deployment.model,
-            python_executable=(
-                request.model_source_python or DEFAULT_REMOTE_PYTHON
-            ),
+            python_executable=request.model_source_python,
         )
         if source
         and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
@@ -2738,6 +4092,7 @@ def _performance_optimized_deployment(
     plan = _build_performance_plan(
         model,
         nodes,
+        model_path=deployment.model,
         tensor_parallel_size=deployment.tensor_parallel_size,
         workload_profile=deployment.execution.profile,
         microbatch_size=deployment.execution.pipeline_microbatch_size,
@@ -2755,6 +4110,7 @@ def _performance_optimized_deployment(
         plan = _build_performance_plan(
             model,
             nodes,
+            model_path=deployment.model,
             tensor_parallel_size=deployment.tensor_parallel_size,
             workload_profile=execution.profile,
             microbatch_size=execution.pipeline_microbatch_size,
@@ -2849,6 +4205,10 @@ async def cluster_node_roles() -> dict[str, Any]:
                 "summary": role.summary,
                 "detail": role.detail,
                 "reserve_bytes": role.reserve_bytes,
+                # Clients rendering a usable budget (the cluster v2 wizard)
+                # compute reserve_for() from this pair rather than mirroring
+                # the constants by hand.
+                "reserve_fraction": role.reserve_fraction,
             }
             for role in ROLES.values()
         ],
@@ -2880,33 +4240,46 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
-        if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
-                host.ssh,
-                # No fallback to sys.executable: inside the packaged app that
-                # is a bundled interpreter which exists on the peer but cannot
-                # import oMLX, so every poll 503'd (#2680). Unknown means the
-                # probe discovers the peer's own interpreter.
-                python_executable=host.python_executable,
+        try:
+            if not _local_ssh_target(host.ssh):
+                capacity_bytes = await asyncio.to_thread(
+                    probe_remote_admission_ceiling,
+                    host.ssh,
+                    # No fallback to sys.executable: inside the packaged app that
+                    # is a bundled interpreter which exists on the peer but cannot
+                    # import oMLX, so every poll 503'd (#2680). Unknown means the
+                    # probe discovers the peer's own interpreter.
+                    python_executable=host.python_executable,
+                )
+                capacity_source = "admission_ceiling"
+            budget = await asyncio.to_thread(
+                suggest_budget,
+                role=request.roles.get(host.node_id, "headless"),
+                ssh_target=host.ssh,
+                capacity_bytes=capacity_bytes,
+                capacity_source=capacity_source,
             )
-            capacity_source = "admission_ceiling"
-        budget = await asyncio.to_thread(
-            suggest_budget,
-            role=request.roles.get(host.node_id, "headless"),
-            ssh_target=host.ssh,
-            capacity_bytes=capacity_bytes,
-            capacity_source=capacity_source,
-        )
+        except (DistributedLaunchError, OSError, RuntimeError, ValueError) as exc:
+            # One enrolled Mac that no longer runs oMLX must not fail the
+            # measurement of every other node: a whole-request 503 made the
+            # legacy dashboard retry on every poll. The node is reported in
+            # place, marked unusable with the reason, and the caller's skip of
+            # zero-capacity rows does the rest.
+            return {
+                "node_id": host.node_id,
+                "ssh": host.ssh,
+                "capacity_bytes": 0,
+                "reserve_bytes": 0,
+                "usable_bytes": 0,
+                "role": request.roles.get(host.node_id, "headless"),
+                "capacity_source": "unavailable",
+                "summary": "",
+                "unusable": True,
+                "error": str(exc),
+            }
         return {"node_id": host.node_id, "ssh": host.ssh, **budget.to_dict()}
 
-    try:
-        nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
-    except (DistributedLaunchError, OSError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not measure every Mac's usable model memory: {exc}",
-        ) from exc
+    nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
     return {"nodes": nodes}
 
 
@@ -2943,14 +4316,16 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
                 return host.node_id, "127.0.0.1", [], str(exc)
         try:
             validated = validate_ssh_target(target)
+            # An unknown interpreter is discovered on the peer (and cached
+            # per host), never assumed from one machine's checkout layout.
+            source_python = host.python_executable or await asyncio.to_thread(
+                resolve_remote_python, validated
+            )
             models = await asyncio.to_thread(
                 remote_model_inventory,
                 validated,
-                python_executable=(
-                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
-                ),
+                python_executable=source_python,
             )
-            source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
             models = [
                 dict(model, python_executable=source_python) for model in models
             ]
@@ -2990,11 +4365,45 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
     }
 
 
+def _requested_links_fast(nodes: list[ClusterPlanNodeRequest]) -> bool:
+    """Whether every requested peer sits on a fast (JACCL/Thunderbolt) link.
+
+    The catalogue's default tie-break prefers pipeline at equal width because
+    it survives slow links; when the paired registry shows every requested
+    peer is reachable over JACCL/Thunderbolt RDMA, tensor parallelism is the
+    better recommendation — it splits per-token compute across the group.
+    The coordinator's own row is not in the paired registry, so only
+    non-self node_ids are consulted. Unknown or unpaired peers fail closed:
+    pipeline stays the recommendation where tensor would crawl.
+    """
+
+    if len(nodes) < 2:
+        return False
+    try:
+        identity = get_node_identity()
+        registry = get_device_registry()
+    except RuntimeError:
+        return False
+    for node in nodes:
+        if node.node_id == identity.node_id:
+            continue
+        if not registry.is_paired(node.node_id):
+            return False
+        record = registry.get(node.node_id) or {}
+        caps = record.get("caps")
+        if not isinstance(caps, dict):
+            return False
+        if not (caps.get("jaccl") or caps.get("thunderbolt")):
+            return False
+    return True
+
+
 def _catalogue_for_candidates(
     candidates: list[ClusterCatalogueModelRequest],
     nodes: list[NodeBudget],
     *,
     workload_profile: str,
+    prefer_tensor: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -3006,9 +4415,7 @@ def _catalogue_for_candidates(
                 else remote_model_layout(
                     validate_ssh_target(source),
                     candidate.model_path,
-                    python_executable=(
-                        candidate.model_source_python or DEFAULT_REMOTE_PYTHON
-                    ),
+                    python_executable=candidate.model_source_python,
                 )
             )
             fit = assess_model(
@@ -3017,6 +4424,7 @@ def _catalogue_for_candidates(
                 model_id=candidate.id,
                 declared_context_tokens=candidate.model_context_length,
                 workload_profile=workload_profile,
+                prefer_tensor=prefer_tensor,
             )
         except (OSError, PlanningError, RuntimeError, ValueError) as exc:
             fit = ModelFit(
@@ -3057,6 +4465,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
     """
 
     nodes = _node_budgets(request.nodes)
+    prefer_tensor = _requested_links_fast(request.nodes)
 
     paths = [Path(item) for item in request.model_paths]
     if request.model_dir:
@@ -3078,6 +4487,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
             request.models,
             nodes,
             workload_profile=request.execution_profile,
+            prefer_tensor=prefer_tensor,
         )
     else:
         catalogue = await asyncio.to_thread(
@@ -3085,6 +4495,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
             paths,
             nodes,
             workload_profile=request.execution_profile,
+            prefer_tensor=prefer_tensor,
         )
         model_rows = [fit.to_dict() for fit in catalogue]
     runnable = [row for row in model_rows if row["fits"]]
@@ -3107,9 +4518,44 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/deployments")
-async def activate_cluster_deployment(request: ClusterDeploymentRequest):
-    """Recompute, preflight, eagerly load, and prove one distributed model."""
+def _live_jaccl_deployments(
+    *,
+    state_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Deployment IDs currently owning this Mac's JACCL/RDMA device."""
+
+    if state_dir is None:
+        state_dir = os.environ.get(
+            "OMLX_CLUSTER_STATE_DIR",
+            "~/.omlx/cluster/runtime",
+        )
+    runtime = read_runtime_markers(state_dir)
+    return tuple(
+        sorted(
+            {
+                str(job["deployment_id"])
+                for job in runtime.get("jobs", ())
+                if job.get("live") is True
+                and str(job.get("backend", "")).startswith("jaccl")
+            }
+        )
+    )
+
+
+async def _activate_and_report(
+    request: ClusterDeploymentRequest,
+) -> dict[str, Any]:
+    """Recompute, preflight, eagerly load, and prove one distributed model.
+
+    This is the single activation pipeline behind both ``POST /deployments``
+    (explicit approval of a previewed plan) and the approve phase of
+    ``POST /replan`` (one-action deactivate → re-plan → reload). The
+    deactivate half of a replan is exactly what this pipeline already does:
+    ``pool.prepare_cluster_reload`` unloads the resident engine under the
+    pool lock — quiescence-gated, and for distributed engines the supervisor's
+    *verified* teardown is the memory barrier — before the registry swap and
+    the eager reload below.
+    """
 
     plan_changes: dict[str, Any] = {
         "changed": False,
@@ -3123,6 +4569,35 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     deployment = None
     try:
         deployment, plan = await asyncio.to_thread(_create_deployment, request)
+        if (
+            deployment.tensor_parallel_size > 1
+            and deployment.tensor_parallel_size < deployment.world_size
+            and not hybrid_group_split_supported(deployment.backend)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The loaded MLX {deployment.distributed_init_backend} backend "
+                    "does not implement Group.split, so this TP x pipeline "
+                    "placement cannot launch safely. Install the oMLX MLX/JACCL "
+                    "subgroup runtime on every rank or choose pure TP/pipeline."
+                ),
+            )
+        live_jaccl = _live_jaccl_deployments()
+        other_jaccl = tuple(
+            item for item in live_jaccl if item != deployment.deployment_id
+        )
+        if deployment.backend.startswith("jaccl") and other_jaccl:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Thunderbolt RDMA is already owned by live deployment "
+                    f"{', '.join(other_jaccl)}. oMLX permits one JACCL "
+                    "communicator per Mac until Apple's driver passes the "
+                    "multi-communicator lost-completion soak. Deactivate or "
+                    "re-plan that deployment first."
+                ),
+            )
         # Before anything touches another Mac: is this the plan the user was
         # shown? Preview and activation posted different node objects for
         # months, and the second one dropped the split cap and the role, so the
@@ -3162,7 +4637,26 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             "status": "disabled",
             "reason": "automatic tuning disabled",
         }
-        if deployment.execution.auto_tune:
+        same_jaccl_is_live = (
+            deployment.backend.startswith("jaccl")
+            and deployment.deployment_id in live_jaccl
+        )
+        if deployment.execution.auto_tune and same_jaccl_is_live:
+            # A re-plan may reuse the deployment ID while its old engine is
+            # serving. Launching a second JACCL performance communicator before
+            # prepare_cluster_reload tears the first one down physically
+            # reproduces Apple's lost-completion failure. Keep the signed plan;
+            # the next cold activation can measure it safely.
+            performance_probe = {
+                "ok": False,
+                "status": "communicator_busy",
+                "reason": (
+                    "automatic tuning skipped because this deployment already "
+                    "owns the JACCL/RDMA device"
+                ),
+                "plan_changed": False,
+            }
+        elif deployment.execution.auto_tune:
             if deployment.performance_profiles:
                 # The one-click path measured these ranks before model staging
                 # and signed the resulting placement. Re-running a noisy probe
@@ -3184,6 +4678,13 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                         run_cluster_performance_probe,
                         deployment,
                     )
+                    if performance_probe.get("promotable") is False:
+                        raise _UnpromotablePerformanceCalibration(
+                            str(
+                                performance_probe.get("qualification_reason")
+                                or "Low Power Mode was enabled during calibration"
+                            )
+                        )
                     candidate_deployment, candidate_plan = await asyncio.to_thread(
                         _performance_optimized_deployment,
                         deployment,
@@ -3216,6 +4717,14 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     else:
                         deployment, plan = candidate_deployment, candidate_plan
                         performance_probe["status"] = "applied"
+                except _UnpromotablePerformanceCalibration as exc:
+                    performance_probe = {
+                        "ok": False,
+                        "promotable": False,
+                        "status": "power_limited",
+                        "reason": str(exc)[:1000],
+                        "plan_changed": False,
+                    }
                 except (DistributedLaunchError, OSError, ValueError) as exc:
                     # Benchmark failure must not make a memory-safe deployment
                     # unusable. Persist the exact memory-only fallback instead.
@@ -3253,31 +4762,34 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             "deployment",
             None,
         )
-        already_loaded = bool(
-            loaded_deployment is not None
-            and loaded_deployment.deployment_id == deployment.deployment_id
-            and loaded_deployment.plan_hash == deployment.plan_hash
-        )
+        # Every persisted deployment field that reaches a worker is part of
+        # runtime identity.  Comparing only plan/MTP let execution toggles
+        # (notably SSD snapshot write-behind) reuse an engine launched with a
+        # different contract.
+        already_loaded = loaded_deployment == deployment
         if not already_loaded:
             await pool.prepare_cluster_reload(model_id)
         await asyncio.to_thread(registry.upsert, deployment)
         try:
             engine = await pool.get_engine(model_id)
             active_deployment = getattr(engine, "deployment", None)
-            if (
-                active_deployment is None
-                or active_deployment.deployment_id != deployment.deployment_id
-                or active_deployment.plan_hash != deployment.plan_hash
-            ):
+            if active_deployment != deployment:
                 raise DistributedLaunchError(
                     "engine pool did not activate the approved distributed plan"
                 )
             canary = await engine.generate(
                 "__omlx_cluster_readiness__",
-                max_tokens=1,
+                # A one-token GenerationBatch still pipelines and then
+                # discards a successor graph. That terminal-only boundary can
+                # leave a peer inside its final JACCL all-reduce even though
+                # rank zero already produced a valid response. Four tokens
+                # exercise sustained synchronized decode and make readiness a
+                # stronger, representative proof.
+                max_tokens=4,
                 temperature=0.0,
                 top_p=1.0,
                 top_k=0,
+                _request_id="omlx-internal-readiness",
             )
             cluster_status = engine.cluster_status()
         except BaseException as exc:
@@ -3385,6 +4897,323 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     }
 
 
+@router.post("/deployments")
+async def activate_cluster_deployment(request: ClusterDeploymentRequest):
+    """Recompute, preflight, eagerly load, and prove one distributed model."""
+
+    return await _activate_and_report(request)
+
+
+class ClusterReplanRequest(BaseModel):
+    """One-action deactivate → re-plan → reload for a clustered model.
+
+    With no ``approved_placement`` this is a dry run: it renders the plan the
+    one-action call would launch, signed, with a diff against the running
+    placement. Posting that signature back performs the whole dance at once.
+
+    ``nodes``/``hosts``/``backend`` default to the current deployment's, so a
+    budget-only or context-only change needs no host details; a membership
+    change (a node joining or leaving the model) is expressed by posting the
+    new explicit ``nodes`` + ``hosts`` lists. ``path_map`` likewise defaults
+    to the current deployment's per-node paths so a replan does not silently
+    revert a heterogeneous-path cluster to same-path resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: str | None = Field(default=None, max_length=128)
+    model_path: str | None = Field(default=None, max_length=4096)
+    model_source: str | None = Field(default=None, max_length=255)
+    model_source_python: str | None = Field(default=None, max_length=4096)
+    backend: Literal["auto", "ring", "jaccl", "jaccl-ring"] | None = None
+    nodes: list[ClusterPlanNodeRequest] | None = Field(
+        default=None, min_length=2, max_length=64
+    )
+    hosts: list[ClusterHostRequest] | None = Field(
+        default=None, min_length=2, max_length=64
+    )
+    execution_profile: Literal["interactive", "balanced", "throughput"] = (
+        "balanced"
+    )
+    allocation: Literal["balanced", "proportional"] = "balanced"
+    auto_tune: bool = False
+    sampling_rank_only: bool = True
+    async_overlap: bool = True
+    cache_affinity: bool = True
+    max_kv_size: int | None = Field(default=None, gt=0)
+    ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
+    tensor_parallel_size: int | None = Field(default=None, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] | None = None
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
+    target_context_tokens: int | None = Field(
+        default=None, ge=1, le=1_048_576
+    )
+    mtp_enabled: bool | None = None
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
+    deepseek_ane_prefill: DeepseekAnePrefillRequest | None = None
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
+    approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
+
+
+_REPLAN_STEPS = (
+    "deactivate (quiescence-gated unload with verified teardown)",
+    "re-plan (recomputed server-side and pinned by signature)",
+    "reload (eager distributed load with readiness canary)",
+)
+
+
+@router.post("/replan")
+async def replan_cluster_deployment(request: ClusterReplanRequest):
+    """Collapse deactivate → re-plan → reload into one action.
+
+    The engine-pool quiescence gate (``prepare_cluster_reload``) refuses to
+    interrupt in-flight requests, and the distributed supervisor's verified
+    teardown is the memory barrier between the old world and the new one: if
+    teardown cannot be proven, the old registry record stays and the error
+    says what survived.
+    """
+
+    try:
+        registry = get_cluster_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    current: ClusterDeployment | None = None
+    if request.deployment_id:
+        current = await asyncio.to_thread(registry.get, request.deployment_id)
+        if current is None:
+            raise HTTPException(
+                status_code=404, detail="cluster deployment not found"
+            )
+    elif request.model_path:
+        current = await asyncio.to_thread(
+            registry.get_for_model, request.model_path
+        )
+
+    if current is None and not (
+        request.model_path and request.nodes and request.hosts
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "replan needs an existing deployment (deployment_id or a "
+                "model_path with a registered deployment) or an explicit "
+                "model_path together with nodes and hosts"
+            ),
+        )
+
+    derived: dict[str, bool] = {
+        "nodes": False,
+        "hosts": False,
+        "backend": False,
+        "path_map": False,
+    }
+    nodes = request.nodes
+    if nodes is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="nodes are required")
+        nodes = [
+            ClusterPlanNodeRequest(**payload)
+            for payload in nodes_from_deployment(current)
+        ]
+        derived["nodes"] = True
+    hosts = request.hosts
+    if hosts is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="hosts are required")
+        hosts = [
+            ClusterHostRequest(**payload)
+            for payload in hosts_from_deployment(current)
+        ]
+        derived["hosts"] = True
+    backend = request.backend
+    if backend is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="backend is required")
+        backend = current.backend
+        derived["backend"] = True
+    path_map = request.path_map
+    if path_map is None and current is not None and current.path_map:
+        # Per-node paths are part of the deployment contract: a replan that
+        # dropped them would silently revert workers to the coordinator's
+        # shared path. Carry them forward unless the caller overrides.
+        path_map = dict(current.path_map)
+        derived["path_map"] = True
+    if backend == "auto":
+        # rdma_ctl on every member → jaccl; any member without it pulls the
+        # whole cluster onto the TCP ring. Derived from the posted host
+        # records; launch preflight re-verifies the live state.
+        try:
+            selection = select_cluster_backend(members_from_host_records(hosts))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        backend_decision: dict[str, Any] = selection.to_dict()
+        backend = selection.backend
+    else:
+        backend_decision = {
+            "backend": backend,
+            "reason": "operator-selected backend",
+            "blockers": [],
+            "members": [
+                member.to_dict() for member in members_from_host_records(hosts)
+            ],
+        }
+    try:
+        _validate_cluster_hosts(hosts)
+        effective = ClusterDeploymentRequest(
+            deployment_id=request.deployment_id,
+            model_path=(request.model_path or (current.model if current else "")),
+            model_source=request.model_source,
+            model_source_python=request.model_source_python,
+            backend=backend,
+            nodes=nodes,
+            hosts=hosts,
+            execution_profile=request.execution_profile,
+            allocation=request.allocation,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            async_overlap=request.async_overlap,
+            cache_affinity=request.cache_affinity,
+            max_kv_size=request.max_kv_size,
+            ring_connections_per_ip=request.ring_connections_per_ip,
+            tensor_parallel_size=(
+                request.tensor_parallel_size
+                if request.tensor_parallel_size is not None
+                else current.tensor_parallel_size
+                if current is not None
+                else 1
+            ),
+            serving_mode=(
+                request.serving_mode
+                if request.serving_mode is not None
+                else current.serving_mode
+                if current is not None
+                else "sharded"
+            ),
+            prefill_rank=(
+                request.prefill_rank
+                if "prefill_rank" in request.model_fields_set
+                else current.prefill_rank
+                if current is not None
+                else None
+            ),
+            decode_rank=(
+                request.decode_rank
+                if "decode_rank" in request.model_fields_set
+                else current.decode_rank
+                if current is not None
+                else None
+            ),
+            target_context_tokens=(
+                request.target_context_tokens
+                if request.target_context_tokens is not None
+                else current.target_context_tokens
+                if current is not None
+                else 8192
+            ),
+            mtp_enabled=(
+                request.mtp_enabled
+                if request.mtp_enabled is not None
+                else current.mtp_enabled
+                if current is not None
+                else False
+            ),
+            mtp_num_draft_tokens=(
+                request.mtp_num_draft_tokens
+                if "mtp_num_draft_tokens" in request.model_fields_set
+                else current.mtp_num_draft_tokens
+                if current is not None
+                else None
+            ),
+            prompt_cache_ssd=(
+                request.prompt_cache_ssd
+                if "prompt_cache_ssd" in request.model_fields_set
+                else current.execution.prompt_cache_ssd
+                if current is not None
+                else False
+            ),
+            prompt_cache_ssd_max_bytes=(
+                request.prompt_cache_ssd_max_bytes
+                if "prompt_cache_ssd_max_bytes" in request.model_fields_set
+                else current.execution.prompt_cache_ssd_max_bytes
+                if current is not None
+                else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            ),
+            deepseek_ane_prefill=(
+                request.deepseek_ane_prefill
+                if "deepseek_ane_prefill" in request.model_fields_set
+                else DeepseekAnePrefillRequest(
+                    **current.execution.deepseek_ane_prefill.to_dict()
+                )
+                if current is not None
+                and current.execution.deepseek_ane_prefill.enabled
+                else None
+            ),
+            path_map=path_map,
+            # Not consulted by planning; activation re-checks the real one
+            # below. Preview callers do not have a signature yet.
+            approved_placement=request.approved_placement or ("0" * 16),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        deployment, plan = await asyncio.to_thread(_create_deployment, effective)
+    except (OSError, PlanningError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    signed_plan = _plan_with_signature(plan)
+    changes = (
+        _plan_changes(placement_view(current), plan)
+        if current is not None
+        else None
+    )
+
+    if request.approved_placement is None:
+        return {
+            "ok": True,
+            "mode": "preview",
+            "steps": list(_REPLAN_STEPS),
+            "derived": derived,
+            "current": (
+                summarize_deployment(current) if current is not None else None
+            ),
+            "changes": changes,
+            "deployment_id": deployment.deployment_id,
+            "backend": deployment.backend,
+            "backend_decision": backend_decision,
+            "plan": signed_plan,
+        }
+
+    if request.approved_placement.strip() != signed_plan["placement_signature"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This is not the plan the replan preview showed — the budgets, "
+                "roles or layer split changed in between. Preview again and "
+                f"approve what it shows. As posted, this request would place: "
+                f"{_describe_placement(plan)}."
+            ),
+        )
+
+    result = await _activate_and_report(effective)
+    return result | {
+        "mode": "applied",
+        "replan": {
+            "steps": list(_REPLAN_STEPS),
+            "derived": derived,
+            "backend_decision": backend_decision,
+            "previous": (
+                summarize_deployment(current) if current is not None else None
+            ),
+            "changes": changes,
+        },
+    }
+
+
 @router.delete("/deployments/{deployment_id}")
 async def deactivate_cluster_deployment(deployment_id: str):
     """Stop the resident cluster, then disable future distributed loads."""
@@ -3401,6 +5230,7 @@ async def deactivate_cluster_deployment(deployment_id: str):
             model_id = None
         if model_id is not None:
             await pool.prepare_cluster_reload(model_id)
+        await asyncio.to_thread(stop_deployment_processes, deployment)
         removed = await asyncio.to_thread(registry.remove, deployment_id)
         unregister = getattr(pool, "unregister_cluster_model", None)
         if model_id is not None and callable(unregister):
@@ -3421,4 +5251,111 @@ async def deactivate_cluster_deployment(deployment_id: str):
         "ok": True,
         "deployment_id": deployment_id,
         "stopped": True,
+    }
+
+
+@router.post("/deployments/{deployment_id}/unload")
+async def unload_cluster_deployment(deployment_id: str):
+    """Release resident ranks while keeping the signed deployment configured."""
+
+    registry = get_cluster_registry()
+    deployment = await asyncio.to_thread(registry.get, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="cluster deployment not found")
+    model_id = None
+    try:
+        pool = _engine_pool()
+        model_id = pool.resolve_cluster_model_id(deployment.model)
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.engine is not None:
+            await pool.prepare_cluster_reload(model_id)
+    except ModelNotFoundError:
+        # A configured deployment may legitimately be cold after restart.
+        # Keeping unload idempotent lets the dashboard recover without
+        # reconstructing EnginePool's private registration state.
+        model_id = None
+    except ModelBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The cluster is serving a request. It will not be interrupted; "
+                "unload it after the request finishes."
+            ),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        teardown = await asyncio.to_thread(stop_deployment_processes, deployment)
+    except (DistributedTeardownError, DistributedLaunchError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "deployment_id": deployment_id,
+        "model_id": model_id,
+        "stopped": True,
+        "configured": True,
+        "teardown": teardown,
+    }
+
+
+@router.post("/deployments/{deployment_id}/load")
+async def load_cluster_deployment(deployment_id: str):
+    """Load a configured deployment and prove all ranks with a short canary."""
+
+    registry = get_cluster_registry()
+    deployment = await asyncio.to_thread(registry.get, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="cluster deployment not found")
+    try:
+        pool = _engine_pool()
+        try:
+            model_id = pool.resolve_cluster_model_id(deployment.model)
+        except ModelNotFoundError:
+            register = getattr(pool, "register_cluster_model", None)
+            if not callable(register):
+                raise
+            estimated_size = sum(
+                assignment.planned_weight_bytes
+                for assignment in deployment.assignments
+            )
+            model_id, _ = register(
+                deployment.model,
+                estimated_size=estimated_size,
+            )
+        entry = pool.get_entry(model_id)
+        resident = getattr(entry, "engine", None) if entry is not None else None
+        if resident is not None and getattr(
+            resident, "runtime_failed_reason", None
+        ):
+            await pool.prepare_cluster_reload(model_id)
+        engine = await pool.get_engine(model_id)
+        if getattr(engine, "deployment", None) != deployment:
+            raise DistributedLaunchError(
+                "engine pool did not load the configured distributed plan"
+            )
+        canary = await engine.generate(
+            "__omlx_cluster_readiness__",
+            max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            _request_id="omlx-internal-readiness",
+        )
+        status = engine.cluster_status()
+    except ModelBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The model is already changing state; wait and try again.",
+        ) from exc
+    except (DistributedLaunchError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "deployment_id": deployment_id,
+        "model_id": model_id,
+        "loaded": True,
+        "canary_completion_tokens": canary.completion_tokens,
+        "ranks": status.get("ranks", []),
     }

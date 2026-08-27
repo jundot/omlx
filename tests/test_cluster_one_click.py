@@ -294,6 +294,57 @@ process.stdout.write(JSON.stringify(states));
     assert result["warning"]["tone"] == "amber"
 
 
+def test_unmeasurable_nodes_are_named_in_place_without_retry_spam():
+    """A legacy enrolled node without oMLX comes back marked unusable; the UI
+    names it once (measured flag set) instead of re-probing every poll."""
+
+    result = _run_dashboard_helpers(
+        ("measureClusterBudgets",),
+        """
+global.fetch = async () => ({
+  ok: true,
+  json: async () => ({ nodes: [
+    { node_id: 'node-a', capacity_bytes: 96 * (1024 ** 3),
+      reserve_bytes: 10 * (1024 ** 3), summary: '86 GiB automatic' },
+    { node_id: 'node-b', unusable: true, capacity_bytes: 0,
+      error: 'no interpreter that can import oMLX' },
+  ] }),
+});
+component.clusterPlanNodes = [
+  { node_id: 'node-a', capacity_gib: 96, reserve_gib: 10, role: 'headless' },
+  { node_id: 'node-b', capacity_gib: 64, reserve_gib: 7, role: 'headless' },
+];
+component.clusterBudgetsLoading = false;
+component.clusterBudgetsError = '';
+component.clusterBudgetHostsPayload = () => [
+  { ssh: '127.0.0.1' },
+  { ssh: 'node-b.local' },
+];
+component.clusterErrorMessage = detail => String(detail || 'Could not measure.');
+component.clusterManualMemoryAllowanceGiB = () => null;
+component.invalidateClusterPlan = () => {};
+(async () => {
+  await component.measureClusterBudgets();
+  process.stdout.write(JSON.stringify({
+    error: component.clusterBudgetsError,
+    measuredA: component.clusterPlanNodes[0].measured,
+    measuredB: component.clusterPlanNodes[1].measured,
+    flagged: component._clusterBudgetsMeasured === true,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    assert result["measuredA"] == "86 GiB automatic"
+    assert result["measuredB"] == "no interpreter that can import oMLX"
+    assert "node-b" in result["error"]
+    assert "no interpreter that can import oMLX" in result["error"]
+    assert result["flagged"] is True
+
+
 def test_manual_memory_allowance_survives_automatic_budget_refresh():
     result = _run_dashboard_helpers(
         (

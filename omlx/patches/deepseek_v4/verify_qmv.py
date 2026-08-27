@@ -295,14 +295,26 @@ _DENSE_FP32_SOURCE = _DENSE_SOURCE.replace(
 )
 
 
-@lru_cache(maxsize=1)
-def _kernel():
+@lru_cache(maxsize=3)
+def _kernel(results_per_simdgroup: int = 4):
+    if results_per_simdgroup not in (1, 2, 4):
+        raise ValueError("verify QMV result tile must be 1, 2, or 4")
+    source = _SOURCE
+    if results_per_simdgroup != 4:
+        source = source.replace(
+            "constexpr int RESULTS_PER_SIMDGROUP = 4;",
+            f"constexpr int RESULTS_PER_SIMDGROUP = {results_per_simdgroup};",
+        ).replace(
+            "constexpr int OUTPUTS_PER_THREADGROUP = 8;",
+            "constexpr int OUTPUTS_PER_THREADGROUP = "
+            f"{2 * results_per_simdgroup};",
+        )
     return mx.fast.metal_kernel(
-        name="omlx_deepseek_verify_qmv_exact",
+        name=f"omlx_deepseek_verify_qmv_exact_r{results_per_simdgroup}",
         input_names=["input", "weight", "scales", "biases"],
         output_names=["output"],
         header=_HEADER,
-        source=_SOURCE,
+        source=source,
         ensure_row_contiguous=True,
     )
 
@@ -329,14 +341,26 @@ def _dense_fp32_kernel():
     )
 
 
-@lru_cache(maxsize=1)
-def _multi_kernel():
+@lru_cache(maxsize=3)
+def _multi_kernel(results_per_simdgroup: int = 4):
+    if results_per_simdgroup not in (1, 2, 4):
+        raise ValueError("verify grouped QMV result tile must be 1, 2, or 4")
+    source = _MULTI_SOURCE
+    if results_per_simdgroup != 4:
+        source = source.replace(
+            "constexpr int RESULTS_PER_SIMDGROUP = 4;",
+            f"constexpr int RESULTS_PER_SIMDGROUP = {results_per_simdgroup};",
+        ).replace(
+            "constexpr int OUTPUTS_PER_THREADGROUP = 8;",
+            "constexpr int OUTPUTS_PER_THREADGROUP = "
+            f"{2 * results_per_simdgroup};",
+        )
     return mx.fast.metal_kernel(
-        name="omlx_deepseek_verify_multi_qmv_exact",
+        name=f"omlx_deepseek_verify_multi_qmv_exact_r{results_per_simdgroup}",
         input_names=["input", "weight", "scales"],
         output_names=["output"],
         header=_HEADER,
-        source=_MULTI_SOURCE,
+        source=source,
         ensure_row_contiguous=True,
     )
 
@@ -372,7 +396,24 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
     if biases is None:
         biases = module.scales
 
-    (output,) = _kernel()(
+    results_per_simdgroup = 4
+    if input_dims == 8192 and output_dims == 4096 and rows == 6:
+        try:
+            device_name = str(mx.device_info().get("device_name", ""))
+            if device_name == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+            elif device_name == "Apple M5 Max":
+                results_per_simdgroup = 2
+        except Exception:
+            pass
+    elif input_dims == 1024 and rows == 6 and output_dims in (12288, 20480):
+        try:
+            if str(mx.device_info().get("device_name", "")) == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+        except Exception:
+            pass
+
+    (output,) = _kernel(results_per_simdgroup)(
         inputs=[flat, module.weight, module.scales, biases],
         template=[
             ("T", inputs.dtype),
@@ -384,7 +425,7 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
         ],
         # mx.fast uses thread-grid dimensions. This is one (32, 2, 1)
         # threadgroup for each eight output rows.
-        grid=(32, output_dims // 4, 1),
+        grid=(32, output_dims // results_per_simdgroup, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[(rows, output_dims)],
         output_dtypes=[inputs.dtype],
@@ -393,6 +434,50 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
     if "bias" in module:
         output = output + module.bias
     return output
+
+
+def exact_verify_mxfp8_bank(
+    weight: mx.array,
+    scales: mx.array,
+    inputs: mx.array,
+) -> mx.array:
+    """Apply the prepared DS4 Q-A/raw-KV bank with target-row reductions."""
+
+    input_dims = int(inputs.shape[-1])
+    rows = int(inputs.size) // input_dims
+    output_dims = int(scales.shape[0])
+    if (
+        weight.ndim != 2
+        or scales.ndim != 2
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.uint8
+        or inputs.dtype not in (mx.bfloat16, mx.float16)
+        or not 2 <= rows <= 6
+        or input_dims != 4096
+        or output_dims != 1536
+        or int(weight.shape[0]) != output_dims
+        or int(weight.shape[1]) * 4 != input_dims
+        or int(scales.shape[1]) * 32 != input_dims
+    ):
+        raise ValueError("DS4 verify MXFP8 bank has an unsupported shape")
+    flat = inputs.reshape(rows, input_dims)
+    results_per_simdgroup = 1
+    (output,) = _kernel(results_per_simdgroup)(
+        inputs=[flat, weight, scales, scales],
+        template=[
+            ("T", inputs.dtype),
+            ("M", rows),
+            ("K", input_dims),
+            ("N", output_dims),
+            ("GS", 32),
+            ("MXFP8", True),
+        ],
+        grid=(32, output_dims // results_per_simdgroup, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, output_dims)],
+        output_dtypes=[inputs.dtype],
+    )
+    return output.reshape((*inputs.shape[:-1], output_dims))
 
 
 def pair_eligible(module_a, module_b, inputs: mx.array) -> bool:
@@ -481,7 +566,20 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
     rows = int(inputs.size) // (groups * input_dims)
     output_dims = int(module.scales.shape[1])
     grouped = inputs.reshape(groups, rows, input_dims)
-    (output,) = _multi_kernel()(
+    results_per_simdgroup = 4
+    if groups == 8 and rows == 6 and output_dims == 1024 and input_dims in (
+        1536,
+        2560,
+    ):
+        try:
+            device_name = str(mx.device_info().get("device_name", ""))
+            if device_name == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+            elif device_name == "Apple M5 Max":
+                results_per_simdgroup = 2
+        except Exception:
+            pass
+    (output,) = _multi_kernel(results_per_simdgroup)(
         inputs=[grouped, module.weight, module.scales],
         template=[
             ("T", inputs.dtype),
@@ -490,7 +588,7 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
             ("N", output_dims),
             ("GS", int(module.group_size)),
         ],
-        grid=(32, groups * output_dims // 4, 1),
+        grid=(32, groups * output_dims // results_per_simdgroup, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[(groups, rows, output_dims)],
         output_dtypes=[inputs.dtype],
@@ -572,6 +670,9 @@ def dspark_head_gemv(module, inputs: mx.array) -> mx.array:
     output = output.reshape((*inputs.shape[:-1], output_dims))
     if "bias" in module:
         output = output + module.bias.astype(mx.float32)
+    gather = getattr(module, "_gather_logits", None)
+    if callable(gather):
+        output = gather(output)
     return output
 
 

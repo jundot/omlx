@@ -23,11 +23,23 @@ mx::array dsa_indexer_scores(
     // to the mx.where pass it replaces.
     int mask_ratio = 0,
     int mask_q_offset = 0,
-    mx::StreamOrDevice s = {});
+    mx::StreamOrDevice s = {},
+    // Prefer the optional M5/NAX score kernel for its deliberately narrow
+    // DS4-Flash prefill domain (bf16, B=1, H=64, D=128, weights [B,L,H],
+    // non-causal, ratio-4 pooled mask, L>=16). Every other configuration and
+    // any NAX library/pipeline load failure stays on the Steel kernel above.
+    bool use_nax = false);
+
+// Availability diagnostics for the optional, separately compiled NAX
+// metallib. Hardware eligibility is checked by the Python dispatch through
+// the shared mirror of metal::is_nax_available(); these helpers distinguish a
+// source-compatible/stale extension from one that actually ships the kernel.
+bool dsa_indexer_nax_kernels_built();
+bool dsa_indexer_nax_runtime_active();
 
 // v25 M2 from-scratch MMA score kernel (zero-per-head-barrier structure,
 // ~1.37x over the Steel kernel on M2 Ultra, bit-exact). Serves ONLY:
-// bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal. Callers must
+// bf16, H=64, D in {48,128}, weights rank 3 ([B, L, H]), non-causal. Callers must
 // gate on those and fall back to dsa_indexer_scores otherwise. mask_ratio/
 // mask_q_offset carry the same fused pooled-ratio mask semantics as
 // dsa_indexer_scores.
@@ -37,7 +49,10 @@ mx::array dsa_indexer_scores_mma(
     const mx::array& weights,
     int mask_ratio = 0,
     int mask_q_offset = 0,
-    mx::StreamOrDevice s = {});
+    mx::StreamOrDevice s = {},
+    // Default-off physical A/B candidate for the exact DS4 D=128 prefill
+    // domain. The production WM2xWN2 route remains the default.
+    bool use_wm4_wn1 = false);
 
 mx::array dsa_topk_indices(
     const mx::array& scores,
@@ -49,6 +64,10 @@ mx::array dsa_topk_indices(
 mx::array dspark_fp32_topk_indices(
     const mx::array& scores,
     int topk = 512,
+    mx::StreamOrDevice s = {});
+
+mx::array ds4_router_topk_indices(
+    const mx::array& scores,
     mx::StreamOrDevice s = {});
 
 // DC-1: fused DECODE indexer scan. One kernel computes the head-summed indexer

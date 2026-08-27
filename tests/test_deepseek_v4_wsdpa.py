@@ -66,13 +66,13 @@ def _reference_attention(
     return mx.stack(head_outputs)[None].astype(mx.bfloat16)
 
 
-def _inputs(q_len, offset, window, pooled_len, ratio, trim=0):
+def _inputs(q_len, offset, window, pooled_len, ratio, trim=0, heads=64):
     mx.random.seed(7)
     kv_len = offset + q_len - trim
-    q = (mx.random.normal((1, 64, q_len, 512)) * 0.25).astype(mx.bfloat16)
+    q = (mx.random.normal((1, heads, q_len, 512)) * 0.25).astype(mx.bfloat16)
     kv = (mx.random.normal((1, 1, kv_len, 512)) * 0.25).astype(mx.bfloat16)
     pooled = (mx.random.normal((1, pooled_len, 512)) * 0.25).astype(mx.bfloat16)
-    sinks = (mx.random.normal((64,)) * 0.1).astype(mx.bfloat16)
+    sinks = (mx.random.normal((heads,)) * 0.1).astype(mx.bfloat16)
     scale = 1.0 / math.sqrt(512)
     mx.eval(q, kv, pooled, sinks)
     return q, kv, pooled, sinks, scale, offset, window, ratio
@@ -82,6 +82,7 @@ def _reset_wsdpa(monkeypatch):
     from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
 
     monkeypatch.setattr(wsdpa, "_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_TP_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False, raising=False)
@@ -166,6 +167,82 @@ def test_wsdpa_topk_route_activates_only_after_output_evaluates(monkeypatch):
     assert wsdpa.wsdpa_prefill_route_active(topk=True)
 
 
+@pytest.mark.parametrize("heads", (24, 32, 40))
+def test_wsdpa_tp_requires_measured_width_and_respects_rollback(
+    monkeypatch, heads
+):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    q = mx.zeros((1, heads, 8, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 8, 512), dtype=mx.bfloat16)
+    sinks = mx.zeros((heads,), dtype=mx.bfloat16)
+
+    # M5 regressed at M=512, so the production threshold remains 1024.
+    assert wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1) is None
+
+    monkeypatch.setattr(wsdpa, "_TP_MIN_QUERY", 1)
+    monkeypatch.setattr(
+        wsdpa,
+        "_get_kernel",
+        lambda: lambda **kwargs: [mx.zeros((heads, 8, 512), dtype=mx.bfloat16)],
+    )
+    assert wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1) is not None
+
+    monkeypatch.setattr(wsdpa, "_TP_ENABLED", False)
+    assert wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1) is None
+
+
+@pytest.mark.parametrize(
+    ("heads", "groups"), ((64, 16), (40, 10), (32, 8), (24, 6))
+)
+def test_wsdpa_dispatch_grid_tracks_tp_head_count(monkeypatch, heads, groups):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    monkeypatch.setattr(wsdpa, "_TP_MIN_QUERY", 1)
+    captured = {}
+
+    def kernel(**kwargs):
+        captured.update(kwargs)
+        return [mx.zeros((heads, 5, 512), dtype=mx.bfloat16)]
+
+    monkeypatch.setattr(wsdpa, "_get_kernel", lambda: kernel)
+    q = mx.zeros((1, heads, 5, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 5, 512), dtype=mx.bfloat16)
+    sinks = mx.zeros((heads,), dtype=mx.bfloat16)
+
+    out = wsdpa.wsdpa_prefill(q, kv, None, sinks, 1.0, 0, 128, 1)
+
+    assert out is not None
+    assert captured["grid"] == (groups * 128, 5, 1)
+    assert captured["output_shapes"] == [(heads, 5, 512)]
+
+
+@pytest.mark.parametrize(("heads", "groups"), ((40, 10), (32, 8), (24, 6)))
+def test_wsdpa_topk_dispatch_grid_tracks_tp_head_count(
+    monkeypatch, heads, groups
+):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    monkeypatch.setattr(wsdpa, "_TP_MIN_QUERY", 1)
+    captured = {}
+
+    def kernel(**kwargs):
+        captured.update(kwargs)
+        return [mx.zeros((heads, 5, 512), dtype=mx.bfloat16)]
+
+    monkeypatch.setattr(wsdpa, "_get_topk_kernel", lambda: kernel)
+    q = mx.zeros((1, heads, 5, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 5, 512), dtype=mx.bfloat16)
+    pooled = mx.zeros((1, 3, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 5, 2), dtype=mx.uint32)
+    sinks = mx.zeros((heads,), dtype=mx.bfloat16)
+
+    out = wsdpa.wsdpa_topk_prefill(
+        q, kv, pooled, topk, sinks, 1.0, 0, 128, 4
+    )
+
+    assert out is not None
+    assert captured["grid"] == (groups * 128, 5, 1)
+    assert captured["output_shapes"] == [(heads, 5, 512)]
+
+
 def test_wsdpa_topk_first_evaluation_failure_keeps_route_inactive(monkeypatch):
     wsdpa = _reset_wsdpa(monkeypatch)
     q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
@@ -236,6 +313,30 @@ def test_wsdpa_prefill_matches_explicit_reference(monkeypatch):
 
 
 @requires_metal
+@pytest.mark.parametrize("heads", (24, 32, 40))
+def test_wsdpa_tp_prefill_matches_explicit_reference(monkeypatch, heads):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    monkeypatch.setattr(wsdpa, "_TP_MIN_QUERY", 1)
+    args = _inputs(
+        q_len=5,
+        offset=7,
+        window=4,
+        pooled_len=3,
+        ratio=4,
+        heads=heads,
+    )
+
+    out = wsdpa.wsdpa_prefill(*args)
+    ref = _reference_attention(*args)
+
+    assert out is not None
+    mx.eval(out, ref)
+    assert out.shape == ref.shape == (1, heads, 5, 512)
+    assert out.dtype == mx.bfloat16
+    assert _max_abs(out, ref) < 8e-3
+
+
+@requires_metal
 def test_wsdpa_topk_prefill_matches_explicit_reference(monkeypatch):
     wsdpa = _reset_wsdpa(monkeypatch)
     q, kv, pooled, sinks, scale, offset, window, ratio = _inputs(
@@ -267,6 +368,45 @@ def test_wsdpa_topk_prefill_matches_explicit_reference(monkeypatch):
     assert out is not None
     mx.eval(out, ref)
     assert out.shape == ref.shape
+    assert out.dtype == mx.bfloat16
+    assert _max_abs(out, ref) < 8e-3
+
+
+@requires_metal
+@pytest.mark.parametrize("heads", (24, 32, 40))
+def test_wsdpa_tp_topk_prefill_matches_explicit_reference(monkeypatch, heads):
+    wsdpa = _reset_wsdpa(monkeypatch)
+    monkeypatch.setattr(wsdpa, "_TP_MIN_QUERY", 1)
+    q, kv, pooled, sinks, scale, offset, window, ratio = _inputs(
+        q_len=6,
+        offset=11,
+        window=5,
+        pooled_len=5,
+        ratio=4,
+        heads=heads,
+    )
+    topk = mx.array(
+        [
+            [0, 1, 2],
+            [0, 1, 2],
+            [0, 1, 2],
+            [0, 1, 3],
+            [1, 2, 3],
+            [1, 2, 4],
+        ],
+        dtype=mx.uint32,
+    )[None]
+
+    out = wsdpa.wsdpa_topk_prefill(
+        q, kv, pooled, topk, sinks, scale, offset, window, ratio
+    )
+    ref = _reference_attention(
+        q, kv, pooled, sinks, scale, offset, window, ratio, topk=topk
+    )
+
+    assert out is not None
+    mx.eval(out, ref)
+    assert out.shape == ref.shape == (1, heads, 6, 512)
     assert out.dtype == mx.bfloat16
     assert _max_abs(out, ref) < 8e-3
 

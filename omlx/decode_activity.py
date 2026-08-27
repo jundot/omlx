@@ -60,11 +60,16 @@ class DecodeActivityRegistry:
 
     def others_decoding(self, key: str, ttl_s: float = 2.5) -> bool:
         """True when another engine published a live decode within *ttl_s*."""
+        return self.other_decode_rows(key, ttl_s) > 0
+
+    def other_decode_rows(self, key: str, ttl_s: float = 2.5) -> int:
+        """Sum live decode rows published by every other engine."""
         now = time.monotonic()
         with self._lock:
-            return any(
-                other != key and (now - ts) < ttl_s
-                for other, (ts, _count) in self._active.items()
+            return sum(
+                count
+                for other, (ts, count) in self._active.items()
+                if other != key and (now - ts) < ttl_s
             )
 
     def clear(self) -> None:

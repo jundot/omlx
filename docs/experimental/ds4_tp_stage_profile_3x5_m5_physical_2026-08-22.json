@@ -1,0 +1,852 @@
+{
+  "barrier_overhead_ns": 17000,
+  "claims": {
+    "collective_time_is_modeled": true,
+    "distributed_critical_path_directly_measured": false,
+    "interpretation": "Use the bottleneck rank's category mix; do not add concurrent rank walls. Re-run this same harness on each physical rank to locate the distributed critical path.",
+    "production_instrumentation_installed": false,
+    "rank_local_compute_is_measured": true,
+    "remote_host_touched": false
+  },
+  "collective_model": {
+    "activation_all_sum_calls": 86.0,
+    "activation_ms": 118.93811096774193,
+    "activation_payload_bytes": 8388608.0,
+    "indexer_all_gather_calls": 21.0,
+    "indexer_ms": 4.181628387096774,
+    "indexer_payload_bytes_per_rank": 1048576.0,
+    "total_ms": 123.11973935483871
+  },
+  "device": {
+    "architecture": "applegpu_g17s",
+    "device_name": "Apple M5 Max",
+    "max_buffer_length": 86586540032,
+    "max_recommended_working_set_size": 115448725504,
+    "memory_size": 137438953472,
+    "resource_limit": 499000
+  },
+  "layer_reports": {
+    "0": {
+      "compress_ratio": 0,
+      "median_components_ms": {
+        "attention_projections": 7.420625,
+        "indexer": 0.0,
+        "misc": 2.762999999999998,
+        "routed_moe_down": 1.728541,
+        "routed_moe_pair": 4.500584
+      },
+      "median_projection_details_ms": {
+        "compressor_gate": 0.0,
+        "compressor_wkv": 0.0,
+        "indexer_compressor_gate": 0.0,
+        "indexer_compressor_wkv": 0.0,
+        "indexer_q": 0.0,
+        "indexer_weights": 0.0,
+        "o_a": 3.430125,
+        "o_b": 1.61425,
+        "q_a": 1.089125,
+        "q_b": 1.065375,
+        "raw_wkv": 0.288333
+      },
+      "median_total_ms": 16.455209,
+      "samples": [
+        {
+          "calls": {
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 7.420625,
+            "indexer": 0.0,
+            "misc": 2.762999999999998,
+            "routed_moe_down": 1.697834,
+            "routed_moe_pair": 4.464374
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.0,
+            "compressor_wkv": 0.0,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 3.392875,
+            "o_b": 1.621541,
+            "q_a": 1.099584,
+            "q_b": 1.01475,
+            "raw_wkv": 0.291875
+          },
+          "total_ms": 16.345833
+        },
+        {
+          "calls": {
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 7.470625999999999,
+            "indexer": 0.0,
+            "misc": 2.7233329999999984,
+            "routed_moe_down": 1.736083,
+            "routed_moe_pair": 4.556208
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.0,
+            "compressor_wkv": 0.0,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 3.441334,
+            "o_b": 1.61425,
+            "q_a": 1.060042,
+            "q_b": 1.068625,
+            "raw_wkv": 0.286375
+          },
+          "total_ms": 16.48625
+        },
+        {
+          "calls": {
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 7.478083,
+            "indexer": 0.0,
+            "misc": 2.7817919999999994,
+            "routed_moe_down": 1.69475,
+            "routed_moe_pair": 4.500584
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.0,
+            "compressor_wkv": 0.0,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 3.431875,
+            "o_b": 1.583166,
+            "q_a": 1.089125,
+            "q_b": 1.065375,
+            "raw_wkv": 0.308542
+          },
+          "total_ms": 16.455209
+        },
+        {
+          "calls": {
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 7.374042,
+            "indexer": 0.0,
+            "misc": 2.7102500000000003,
+            "routed_moe_down": 1.728541,
+            "routed_moe_pair": 4.483334
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.0,
+            "compressor_wkv": 0.0,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 3.430125,
+            "o_b": 1.579916,
+            "q_a": 1.092792,
+            "q_b": 0.983042,
+            "raw_wkv": 0.288167
+          },
+          "total_ms": 16.296167
+        },
+        {
+          "calls": {
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 7.414458,
+            "indexer": 0.0,
+            "misc": 2.765918000000001,
+            "routed_moe_down": 1.772958,
+            "routed_moe_pair": 4.5475
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.0,
+            "compressor_wkv": 0.0,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 3.380792,
+            "o_b": 1.629875,
+            "q_a": 1.046708,
+            "q_b": 1.06875,
+            "raw_wkv": 0.288333
+          },
+          "total_ms": 16.500834
+        }
+      ]
+    },
+    "2": {
+      "compress_ratio": 4,
+      "median_components_ms": {
+        "attention_projections": 17.009375,
+        "indexer": 0.946,
+        "misc": 2.782626000000004,
+        "routed_moe_down": 1.698333,
+        "routed_moe_pair": 4.5455
+      },
+      "median_projection_details_ms": {
+        "compressor_gate": 0.321542,
+        "compressor_wkv": 0.337042,
+        "indexer_compressor_gate": 0.208667,
+        "indexer_compressor_wkv": 0.209959,
+        "indexer_q": 0.333542,
+        "indexer_weights": 0.1905,
+        "o_a": 12.282042,
+        "o_b": 1.650708,
+        "q_a": 1.050083,
+        "q_b": 1.066625,
+        "raw_wkv": 0.286791
+      },
+      "median_total_ms": 27.074625,
+      "samples": [
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "indexer_compressor_gate": 1,
+            "indexer_compressor_wkv": 1,
+            "indexer_q": 1,
+            "indexer_weights": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 17.206334,
+            "indexer": 0.976166,
+            "misc": 2.728625000000001,
+            "routed_moe_down": 1.698333,
+            "routed_moe_pair": 4.5455
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.315417,
+            "compressor_wkv": 0.340333,
+            "indexer_compressor_gate": 0.224083,
+            "indexer_compressor_wkv": 0.230875,
+            "indexer_q": 0.333542,
+            "indexer_weights": 0.187666,
+            "o_a": 12.448792,
+            "o_b": 1.655167,
+            "q_a": 1.096958,
+            "q_b": 1.066625,
+            "raw_wkv": 0.283042
+          },
+          "total_ms": 27.154958
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "indexer_compressor_gate": 1,
+            "indexer_compressor_wkv": 1,
+            "indexer_q": 1,
+            "indexer_weights": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 16.865666,
+            "indexer": 0.925792,
+            "misc": 2.891459000000001,
+            "routed_moe_down": 5.303,
+            "routed_moe_pair": 4.553666
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.318583,
+            "compressor_wkv": 0.337042,
+            "indexer_compressor_gate": 0.199125,
+            "indexer_compressor_wkv": 0.206208,
+            "indexer_q": 0.334875,
+            "indexer_weights": 0.185584,
+            "o_a": 12.282042,
+            "o_b": 1.610875,
+            "q_a": 1.016375,
+            "q_b": 1.018416,
+            "raw_wkv": 0.282333
+          },
+          "total_ms": 30.539583
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "indexer_compressor_gate": 1,
+            "indexer_compressor_wkv": 1,
+            "indexer_q": 1,
+            "indexer_weights": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 17.008916,
+            "indexer": 0.946,
+            "misc": 2.7264170000000014,
+            "routed_moe_down": 1.736583,
+            "routed_moe_pair": 4.544042
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.321542,
+            "compressor_wkv": 0.339416,
+            "indexer_compressor_gate": 0.208667,
+            "indexer_compressor_wkv": 0.207875,
+            "indexer_q": 0.338958,
+            "indexer_weights": 0.1905,
+            "o_a": 12.264917,
+            "o_b": 1.625208,
+            "q_a": 1.033833,
+            "q_b": 1.09325,
+            "raw_wkv": 0.33075
+          },
+          "total_ms": 26.961958
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "indexer_compressor_gate": 1,
+            "indexer_compressor_wkv": 1,
+            "indexer_q": 1,
+            "indexer_weights": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 17.077873999999998,
+            "indexer": 0.941584,
+            "misc": 2.8003750000000025,
+            "routed_moe_down": 1.696625,
+            "routed_moe_pair": 4.558167
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.325125,
+            "compressor_wkv": 0.322334,
+            "indexer_compressor_gate": 0.206042,
+            "indexer_compressor_wkv": 0.209959,
+            "indexer_q": 0.329375,
+            "indexer_weights": 0.196208,
+            "o_a": 12.251458,
+            "o_b": 1.7285,
+            "q_a": 1.050083,
+            "q_b": 1.069416,
+            "raw_wkv": 0.330958
+          },
+          "total_ms": 27.074625
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "indexer_compressor_gate": 1,
+            "indexer_compressor_wkv": 1,
+            "indexer_q": 1,
+            "indexer_weights": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 17.009375,
+            "indexer": 0.970249,
+            "misc": 2.782626000000004,
+            "routed_moe_down": 1.64775,
+            "routed_moe_pair": 4.50625
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.323667,
+            "compressor_wkv": 0.329,
+            "indexer_compressor_gate": 0.234625,
+            "indexer_compressor_wkv": 0.213416,
+            "indexer_q": 0.330666,
+            "indexer_weights": 0.191542,
+            "o_a": 12.292917,
+            "o_b": 1.650708,
+            "q_a": 1.06525,
+            "q_b": 1.061042,
+            "raw_wkv": 0.286791
+          },
+          "total_ms": 26.91625
+        }
+      ]
+    },
+    "3": {
+      "compress_ratio": 128,
+      "median_components_ms": {
+        "attention_projections": 8.781167,
+        "indexer": 0.0,
+        "misc": 2.669792000000001,
+        "routed_moe_down": 5.025958,
+        "routed_moe_pair": 12.213792
+      },
+      "median_projection_details_ms": {
+        "compressor_gate": 0.244917,
+        "compressor_wkv": 0.253042,
+        "indexer_compressor_gate": 0.0,
+        "indexer_compressor_wkv": 0.0,
+        "indexer_q": 0.0,
+        "indexer_weights": 0.0,
+        "o_a": 4.2905,
+        "o_b": 1.602542,
+        "q_a": 1.053792,
+        "q_b": 1.062875,
+        "raw_wkv": 0.285833
+      },
+      "median_total_ms": 28.815291,
+      "samples": [
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 8.90175,
+            "indexer": 0.0,
+            "misc": 2.828541999999999,
+            "routed_moe_down": 5.035833,
+            "routed_moe_pair": 12.173792
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.252542,
+            "compressor_wkv": 0.300125,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 4.28375,
+            "o_b": 1.614917,
+            "q_a": 1.097625,
+            "q_b": 1.069041,
+            "raw_wkv": 0.28375
+          },
+          "total_ms": 28.939917
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 8.737832000000001,
+            "indexer": 0.0,
+            "misc": 2.650126,
+            "routed_moe_down": 5.017708,
+            "routed_moe_pair": 12.213792
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.248708,
+            "compressor_wkv": 0.253042,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 4.363,
+            "o_b": 1.599333,
+            "q_a": 1.010583,
+            "q_b": 0.976791,
+            "raw_wkv": 0.286375
+          },
+          "total_ms": 28.619458
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 8.834332999999999,
+            "indexer": 0.0,
+            "misc": 2.720333,
+            "routed_moe_down": 4.9475,
+            "routed_moe_pair": 12.068292
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.2445,
+            "compressor_wkv": 0.255334,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 4.278708,
+            "o_b": 1.602542,
+            "q_a": 1.104541,
+            "q_b": 1.062875,
+            "raw_wkv": 0.285833
+          },
+          "total_ms": 28.570458
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 8.781167,
+            "indexer": 0.0,
+            "misc": 2.669792000000001,
+            "routed_moe_down": 5.025958,
+            "routed_moe_pair": 12.412875
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.241333,
+            "compressor_wkv": 0.25075,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 4.2905,
+            "o_b": 1.542709,
+            "q_a": 1.045917,
+            "q_b": 1.1155,
+            "raw_wkv": 0.294458
+          },
+          "total_ms": 28.889792
+        },
+        {
+          "calls": {
+            "compressor_gate": 1,
+            "compressor_wkv": 1,
+            "o_a": 1,
+            "o_b": 1,
+            "q_a": 1,
+            "q_b": 1,
+            "raw_wkv": 1,
+            "routed_moe_down": 1,
+            "routed_moe_pair": 2
+          },
+          "components_ms": {
+            "attention_projections": 8.781001,
+            "indexer": 0.0,
+            "misc": 2.644082000000001,
+            "routed_moe_down": 5.080083,
+            "routed_moe_pair": 12.310125
+          },
+          "projection_details_ms": {
+            "compressor_gate": 0.244917,
+            "compressor_wkv": 0.249542,
+            "indexer_compressor_gate": 0.0,
+            "indexer_compressor_wkv": 0.0,
+            "indexer_q": 0.0,
+            "indexer_weights": 0.0,
+            "o_a": 4.332708,
+            "o_b": 1.644042,
+            "q_a": 1.053792,
+            "q_b": 0.975625,
+            "raw_wkv": 0.280375
+          },
+          "total_ms": 28.815291
+        }
+      ]
+    }
+  },
+  "model": "/Users/jonathanspangler/.lmstudio/models/Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "observed_attribution": {
+    "amdahl": [
+      {
+        "categories": [
+          "attention_projections"
+        ],
+        "component": "attention_projections",
+        "infinite_ceiling_tps": 1105.9952906615813,
+        "required_speedup_for_target": 7.16079228238259,
+        "target_possible_alone": true,
+        "tps_at_2x": 801.7333657373312,
+        "wall_fraction": 0.4314984834845997
+      },
+      {
+        "categories": [
+          "routed_moe_pair"
+        ],
+        "component": "routed_moe_pair",
+        "infinite_ceiling_tps": 866.9727254627201,
+        "required_speedup_for_target": null,
+        "target_possible_alone": false,
+        "tps_at_2x": 728.8972977351982,
+        "wall_fraction": 0.2747638056728731
+      },
+      {
+        "categories": [
+          "routed_moe_down"
+        ],
+        "component": "routed_moe_down",
+        "infinite_ceiling_tps": 706.4896223833656,
+        "required_speedup_for_target": null,
+        "target_possible_alone": false,
+        "tps_at_2x": 665.3623525118309,
+        "wall_fraction": 0.1100223130258336
+      },
+      {
+        "categories": [
+          "indexer"
+        ],
+        "component": "indexer",
+        "infinite_ceiling_tps": 638.7580173305031,
+        "required_speedup_for_target": null,
+        "target_possible_alone": false,
+        "tps_at_2x": 633.7195771348219,
+        "wall_fraction": 0.01565227685483597
+      },
+      {
+        "categories": [
+          "collectives"
+        ],
+        "component": "collectives",
+        "infinite_ceiling_tps": 680.1805663223498,
+        "required_speedup_for_target": null,
+        "target_possible_alone": false,
+        "tps_at_2x": 653.4602775471155,
+        "wall_fraction": 0.0755984055827621
+      },
+      {
+        "categories": [
+          "misc"
+        ],
+        "component": "misc",
+        "infinite_ceiling_tps": 692.8215471673319,
+        "required_speedup_for_target": null,
+        "target_possible_alone": false,
+        "tps_at_2x": 659.2381331755623,
+        "wall_fraction": 0.09246471537909547
+      },
+      {
+        "categories": [
+          "routed_moe_pair",
+          "routed_moe_down"
+        ],
+        "component": "routed_moe_total",
+        "infinite_ceiling_tps": 1022.0185517759354,
+        "required_speedup_for_target": 28.40563612774512,
+        "target_possible_alone": true,
+        "tps_at_2x": 778.5470485103075,
+        "wall_fraction": 0.3847861186987067
+      },
+      {
+        "categories": [
+          "attention_projections",
+          "routed_moe_pair",
+          "routed_moe_down",
+          "indexer"
+        ],
+        "component": "kernel_hotset",
+        "infinite_ceiling_tps": 3741.2133988794535,
+        "required_speedup_for_target": 1.8058226936008048,
+        "target_possible_alone": true,
+        "tps_at_2x": 1076.5856548612528,
+        "wall_fraction": 0.8319368790381424
+      },
+      {
+        "categories": [
+          "attention_projections",
+          "routed_moe_pair",
+          "routed_moe_down",
+          "indexer",
+          "collectives"
+        ],
+        "component": "kernel_hotset_plus_collectives",
+        "infinite_ceiling_tps": 6799.999301594677,
+        "required_speedup_for_target": 1.6922305875995562,
+        "target_possible_alone": true,
+        "tps_at_2x": 1151.0852316759986,
+        "wall_fraction": 0.9075352846209045
+      }
+    ],
+    "attributed_ms": {
+      "attention_projections": 702.7394349008049,
+      "collectives": 123.11973935483871,
+      "indexer": 25.491334530428194,
+      "misc": 150.58825076053463,
+      "routed_moe_down": 179.18259516898914,
+      "routed_moe_pair": 447.48097367679577
+    },
+    "baseline_tps": 628.76,
+    "fractions": {
+      "attention_projections": 0.4314984834845997,
+      "collectives": 0.0755984055827621,
+      "indexer": 0.01565227685483597,
+      "misc": 0.09246471537909547,
+      "routed_moe_down": 0.1100223130258336,
+      "routed_moe_pair": 0.2747638056728731
+    },
+    "isolated_compute_ms": {
+      "attention_projections": 547.6614649999999,
+      "indexer": 19.866,
+      "misc": 117.3569860000001,
+      "routed_moe_down": 139.641235,
+      "routed_moe_pair": 348.73250799999994
+    },
+    "isolated_to_observed_scale": 1.2831639248176883,
+    "observed_wall_ms": 1628.6023283923914,
+    "optimization_scenarios": [
+      {
+        "projected_tps": 1062.349955335071,
+        "scenario": "attention_2x_and_routed_moe_2x",
+        "speedups": {
+          "attention_projections": 2.0,
+          "routed_moe_down": 2.0,
+          "routed_moe_pair": 2.0
+        }
+      },
+      {
+        "fixed_speedups": {
+          "attention_projections": 2.0
+        },
+        "required_group_speedup": 1.6781243107520483,
+        "scenario": "attention_2x_then_required_routed_moe"
+      },
+      {
+        "fixed_speedups": {
+          "routed_moe_down": 2.0,
+          "routed_moe_pair": 2.0
+        },
+        "required_group_speedup": 1.7078798674433102,
+        "scenario": "routed_moe_2x_then_required_attention"
+      },
+      {
+        "fixed_speedups": {
+          "collectives": "infinite"
+        },
+        "required_group_speedup": 1.5678393640313197,
+        "scenario": "hide_collectives_then_required_attention_and_moe"
+      }
+    ],
+    "target_tps": 1000.0,
+    "tokens": 1024
+  },
+  "projection_detail": true,
+  "ratio_counts": {
+    "0": 2,
+    "128": 20,
+    "4": 21
+  },
+  "representative_stage_compute_ms": {
+    "attention_projections": 547.6614649999999,
+    "indexer": 19.866,
+    "misc": 117.3569860000001,
+    "routed_moe_down": 139.641235,
+    "routed_moe_pair": 348.73250799999994
+  },
+  "representative_stage_projection_ms": {
+    "compressor_gate": 11.650722,
+    "compressor_wkv": 12.138722,
+    "indexer_compressor_gate": 4.382007,
+    "indexer_compressor_wkv": 4.409139,
+    "indexer_q": 7.004382,
+    "indexer_weights": 4.0005,
+    "o_a": 350.593132,
+    "o_b": 69.944208,
+    "q_a": 45.305833,
+    "q_b": 45.787375,
+    "raw_wkv": 12.315937000000002
+  },
+  "schema_version": 1,
+  "scope": "isolated_rank_local_real_layer_forward",
+  "shape": {
+    "element_bytes": 2,
+    "head_dim": 512,
+    "heads": 64,
+    "hidden": 4096,
+    "index_topk": 512,
+    "intermediate": 2048,
+    "layers": 43,
+    "local_heads": 40,
+    "local_intermediate": 1280,
+    "local_units": 5,
+    "o_groups": 8,
+    "prefix_tokens": 8192,
+    "rank": 1,
+    "ratio4_layers": 21,
+    "route_rows": 6144,
+    "shard_weights": [
+      3,
+      5
+    ],
+    "tokens": 1024,
+    "topk": 6
+  }
+}

@@ -5,6 +5,8 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -107,9 +109,96 @@ def _approval_for(payload: dict) -> str:
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            prompt_cache_ssd=payload.get("prompt_cache_ssd"),
         )
     )
     return routes._placement_signature(plan.to_dict())
+
+
+def test_operator_qualified_tp_weights_are_default_absent(monkeypatch):
+    monkeypatch.delenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", raising=False)
+
+    assert (
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=2,
+            node_count=2,
+        )
+        is None
+    )
+
+
+def test_operator_qualified_tp_weights_parse_one_pure_stage(monkeypatch, tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3, 5")
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "a" * 64)
+
+    assert routes._operator_qualified_tp_shard_weights(
+        tensor_parallel_size=2,
+        node_count=2,
+        model_path=model,
+    ) == ((3, 5),)
+
+
+@pytest.mark.parametrize(
+    ("value", "tensor_parallel_size", "node_count", "match"),
+    [
+        ("3,nope", 2, 2, "must contain exactly"),
+        ("3", 2, 2, "must contain exactly"),
+        ("3,0", 2, 2, "must contain exactly"),
+        ("3,5", 2, 3, "supported only for pure tensor parallelism"),
+    ],
+)
+def test_operator_qualified_tp_weights_reject_unsafe_shapes(
+    monkeypatch,
+    value,
+    tensor_parallel_size,
+    node_count,
+    match,
+    tmp_path,
+):
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", value)
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "a" * 64)
+
+    with pytest.raises(routes.PlanningError, match=match):
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=tensor_parallel_size,
+            node_count=node_count,
+            model_path=model,
+        )
+
+
+def test_operator_qualified_tp_weights_are_ignored_for_pipeline(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3,5")
+
+    assert (
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=1,
+            node_count=2,
+        )
+        is None
+    )
+
+
+def test_operator_qualified_tp_weights_ignore_other_models(monkeypatch, tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "b" * 64)
+
+    assert (
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=2,
+            node_count=2,
+            model_path=model,
+        )
+        is None
+    )
 
 
 class _ReadyClusterEngine:
@@ -210,6 +299,20 @@ def _install_ready_pool(
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    pool.verified_teardowns = []
+    monkeypatch.setattr(
+        routes,
+        "stop_deployment_processes",
+        lambda deployment: (
+            pool.verified_teardowns.append(deployment.deployment_id)
+            or {
+                "verified": True,
+                "deployment_id": deployment.deployment_id,
+                "ranks_checked": deployment.world_size,
+                "manifest_retired": False,
+            }
+        ),
+    )
     return pool
 
 
@@ -316,6 +419,7 @@ def test_link_setup_route_reports_cancelled_native_authorization(monkeypatch):
 
 
 def test_cluster_runtime_route_is_lightweight(monkeypatch):
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
     monkeypatch.setattr(
         routes,
         "read_runtime_markers",
@@ -326,6 +430,111 @@ def test_cluster_runtime_route_is_lightweight(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["jobs"][0]["phase"] == "ready"
+
+
+def test_cluster_runtime_demotes_detached_live_marker(monkeypatch):
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: [],
+        get_model_ids=lambda: [],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "stale-model",
+                    "rank": 0,
+                    "phase": "ready",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is False
+    assert payload["jobs"][0]["ownership"] == "detached"
+    assert payload["launchers"] == []
+
+
+def test_cluster_runtime_keeps_owned_marker_live(monkeypatch):
+    engine = SimpleNamespace(
+        cluster_status=lambda: {
+            "deployment_id": "loaded-model",
+            "endpoint": "http://127.0.0.1:5000",
+            "ranks": [{"rank": 0}],
+        }
+    )
+    entry = SimpleNamespace(engine=engine, is_loading=False)
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: ["public-model"],
+        get_model_ids=lambda: ["public-model"],
+        get_entry=lambda model_id: entry,
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "loaded-model",
+                    "rank": 0,
+                    "phase": "ready",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is True
+    assert payload["jobs"][0]["ownership"] == "loaded"
+    assert payload["jobs"][0]["ranks"] == [{"rank": 0}]
+    assert payload["launchers"][0]["model_id"] == "public-model"
+
+
+def test_cluster_runtime_preserves_inflight_load_marker(monkeypatch):
+    deployment = SimpleNamespace(deployment_id="loading-model")
+    entry = SimpleNamespace(
+        engine=None,
+        is_loading=True,
+        model_path="/models/loading",
+    )
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: [],
+        get_model_ids=lambda: ["public-model"],
+        get_entry=lambda model_id: entry,
+    )
+    registry = SimpleNamespace(get_for_model=lambda model: deployment)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "get_cluster_registry", lambda: registry)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "loading-model",
+                    "rank": 0,
+                    "phase": "loading",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is True
+    assert payload["jobs"][0]["ownership"] == "loading"
 
 
 def test_cluster_diagnostics_bundles_and_redacts_local_evidence(monkeypatch):
@@ -522,7 +731,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     assert studio["capacity_bytes"] < 223 * gib
 
 
-def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
+def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(
+    monkeypatch,
+):
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
     gib = 1024**3
@@ -576,6 +787,86 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     assert called == []
 
 
+def test_cluster_node_roles_expose_the_reserve_rules_clients_mirrored():
+    """The wizard renders usable budgets client-side; reserve_bytes and
+    reserve_fraction are what keep that math identical to node_role.py."""
+
+    from omlx.cluster.node_role import DEFAULT_ROLE, ROLES
+
+    response = _client().get("/admin/api/cluster/node-roles")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default"] == DEFAULT_ROLE
+    by_key = {role["key"]: role for role in payload["roles"]}
+    assert set(by_key) == set(ROLES)
+    for key, role in ROLES.items():
+        assert by_key[key]["label"] == role.label
+        assert by_key[key]["reserve_bytes"] == role.reserve_bytes
+        assert by_key[key]["reserve_fraction"] == role.reserve_fraction
+
+
+def test_cluster_node_budgets_report_an_unmeasurable_node_in_place(monkeypatch):
+    """A legacy enrolled Mac that no longer runs oMLX must not 503 the whole
+    request — the other nodes still measure, and the dead one is named."""
+
+    from omlx.cluster.launch import DistributedLaunchError
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        "omlx.cluster.node_role._enforcer_ceiling_bytes",
+        lambda: 100 * gib,
+    )
+
+    def fake_probe(ssh, *, python_executable):
+        raise DistributedLaunchError(
+            f"memory ceiling probe failed for {ssh}; "
+            "no interpreter that can import oMLX was found"
+        )
+
+    monkeypatch.setattr(routes, "probe_remote_admission_ceiling", fake_probe)
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [
+                {"node_id": "node-a", "ssh": "127.0.0.1"},
+                {"node_id": "node-b", "ssh": "node-b.local"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    node_a, node_b = response.json()["nodes"]
+    assert node_a["capacity_bytes"] == 100 * gib
+    assert "unusable" not in node_a
+    assert node_b["unusable"] is True
+    assert node_b["capacity_bytes"] == 0
+    assert node_b["usable_bytes"] == 0
+    assert "no interpreter that can import oMLX" in node_b["error"]
+
+
+def test_cluster_node_budgets_503_contract_is_gone_for_probe_failures(monkeypatch):
+    """The whole-request 503 made the legacy dashboard retry every poll."""
+
+    from omlx.cluster.launch import DistributedLaunchError
+
+    def fake_probe(ssh, *, python_executable):
+        raise DistributedLaunchError(f"memory ceiling probe failed for {ssh}")
+
+    monkeypatch.setattr(routes, "probe_remote_admission_ceiling", fake_probe)
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={"hosts": [{"node_id": "node-b", "ssh": "node-b.local"}]},
+    )
+
+    assert response.status_code == 200
+    (node,) = response.json()["nodes"]
+    assert node["unusable"] is True
+    assert "memory ceiling probe failed" in node["error"]
+
+
 def test_cluster_plan_route_builds_unequal_pipeline():
     gib = 1024**3
 
@@ -608,9 +899,10 @@ def test_cluster_plan_route_builds_unequal_pipeline():
     assert payload["assignments"][0]["layer_count"] == 54
     assert payload["assignments"][1]["node_id"] == "mobile"
     assert payload["assignments"][1]["layer_count"] == 26
-    assert [
-        item["memory_guard_tier"] for item in payload["assignments"]
-    ] == ["aggressive", "safe"]
+    assert [item["memory_guard_tier"] for item in payload["assignments"]] == [
+        "aggressive",
+        "safe",
+    ]
 
 
 def test_cluster_plan_route_requires_exactly_one_model_source():
@@ -723,7 +1015,174 @@ def test_selected_context_is_the_runtime_kv_ceiling():
     assert execution.max_kv_size == 262144
 
 
-def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch):
+def _deepseek_ane_execution_request(*, auto_tune: bool):
+    return SimpleNamespace(
+        execution_profile="balanced",
+        auto_tune=auto_tune,
+        sampling_rank_only=True,
+        async_overlap=True,
+        cache_affinity=True,
+        prompt_cache_ssd=True,
+        prompt_cache_ssd_max_bytes=20 * 1024**3,
+        max_kv_size=None,
+        target_context_tokens=262144,
+        ring_connections_per_ip=None,
+        deepseek_ane_prefill=routes.DeepseekAnePrefillRequest(
+            enabled=True,
+            sequence_length=4096,
+            down_fraction=0.5,
+            wo_a_enabled=False,
+            cpu_enabled=False,
+        ),
+    )
+
+
+def test_deepseek_ane_execution_contract_aligns_fixed_prefill_tile():
+    execution = routes._execution_for_request(
+        _deepseek_ane_execution_request(auto_tune=False),
+        [SimpleNamespace(headroom_bytes=32 * 1024**3)],
+        backend="jaccl",
+    )
+
+    assert execution.prefill_step_size == 4096
+    assert execution.deepseek_ane_prefill.enabled is True
+    assert execution.deepseek_ane_prefill.wo_a_enabled is False
+
+
+def test_deepseek_ane_disables_when_memory_tuner_reduces_tile():
+    execution = routes._execution_for_request(
+        _deepseek_ane_execution_request(auto_tune=True),
+        [SimpleNamespace(headroom_bytes=3 * 1024**3)],
+        backend="jaccl",
+    )
+
+    assert execution.prefill_step_size == 512
+    assert execution.deepseek_ane_prefill.enabled is False
+    assert "reduced the prefill step" in execution.tuning_reason
+
+
+def test_deepseek_ane_defaults_off_for_distributed_deployment(monkeypatch):
+    monkeypatch.delenv("OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL", raising=False)
+    request = _deepseek_ane_execution_request(auto_tune=False)
+    request.tensor_parallel_size = 2
+
+    execution = routes._execution_for_request(
+        request,
+        [
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+        ],
+        backend="jaccl",
+    )
+
+    assert execution.deepseek_ane_prefill.enabled is False
+    assert "not lockstep-qualified" in execution.tuning_reason
+
+
+def test_deepseek_ane_distributed_experiment_requires_operator_opt_in(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL", "1")
+    request = _deepseek_ane_execution_request(auto_tune=False)
+    request.tensor_parallel_size = 2
+
+    execution = routes._execution_for_request(
+        request,
+        [
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+        ],
+        backend="jaccl",
+    )
+
+    assert execution.deepseek_ane_prefill.enabled is True
+    assert execution.prefill_step_size == 4096
+
+
+def test_measured_asymmetric_tp_candidate_requires_full_model_calibration():
+    from omlx.cluster.performance import NodePerformanceProfile
+    from omlx.cluster.planner import ModelLayout, NodeBudget, plan_hybrid
+
+    def profile(node_id, rank, rate):
+        return NodePerformanceProfile(
+            node_id=node_id,
+            rank=rank,
+            decode_weight_bytes_per_second=rate,
+            prefill_weight_bytes_per_second=rate,
+            collective_latency_seconds=0.001,
+            collective_bandwidth_bytes_per_second=10_000,
+            backend="jaccl",
+            measured_at="2026-08-24T12:00:00+00:00",
+            samples=5,
+        )
+
+    model = ModelLayout(
+        source="recommendation",
+        fixed_weight_bytes=100,
+        layer_weight_bytes=(8_000, 8_000),
+        tensor_parallel_heads=8,
+        tensor_parallel_divisors=(8,),
+        tensor_parallel_shard_units=8,
+        supports_tensor_parallel=True,
+    )
+    nodes = [
+        NodeBudget(
+            "m3",
+            1_000_000,
+            rank=0,
+            performance=profile("m3", 0, 100.0),
+        ),
+        NodeBudget(
+            "m5",
+            1_000_000,
+            rank=1,
+            performance=profile("m5", 1, 200.0),
+        ),
+    ]
+    equal = plan_hybrid(model, nodes, tensor_parallel_size=2)
+
+    payload = routes._tp_layout_recommendation_payload(
+        model,
+        nodes,
+        equal,
+        workload_profile="balanced",
+        context_tokens=8192,
+        qualification=None,
+    )
+
+    assert payload is not None
+    assert payload["state"] == "calibration_required"
+    assert payload["current_weights"] == [4, 4]
+    assert payload["recommended_weights"] == [3, 5]
+    assert payload["requires_qualification"] is True
+
+
+def test_low_power_synthetic_profile_cannot_shape_node_budget():
+    node = routes.ClusterPlanNodeRequest(
+        node_id="m5-max",
+        capacity_bytes=128 * 1024**3,
+        reserve_bytes=8 * 1024**3,
+        performance={
+            "node_id": "m5-max",
+            "rank": 0,
+            "decode_weight_bytes_per_second": 100.0,
+            "prefill_weight_bytes_per_second": 200.0,
+            "collective_latency_seconds": 0.001,
+            "collective_bandwidth_bytes_per_second": 10_000.0,
+            "backend": "jaccl",
+            "measured_at": "2026-08-22T00:00:00+00:00",
+            "samples": 5,
+            "source": "synthetic_mlx_probe",
+            "promotable": False,
+            "qualification_reason": "Low Power Mode was enabled",
+        },
+    )
+
+    budget = routes._node_budgets([node])[0]
+
+    assert budget.performance is None
+    assert routes._request_performance_profiles([node]) == ()
+
+
+def test_cluster_plan_route_signs_hybrid_tp_pipeline_placement(monkeypatch):
     gib = 1024**3
 
     from omlx.cluster.planner import ModelLayout
@@ -736,6 +1195,8 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
             fixed_weight_bytes=1 * gib,
             layer_weight_bytes=(2 * gib,) * 80,
             tensor_parallel_heads=32,
+            supports_tensor_parallel=True,
+            supports_pipeline=True,
         ),
     )
 
@@ -769,8 +1230,78 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
         },
     )
 
+    assert response.status_code == 200, response.text
+    plan = response.json()
+    assert plan["tensor_parallel_size"] == 2
+    assert plan["pipeline_stages"] == 2
+    assert len(plan["assignments"]) == 4
+    assert (
+        len({(row["start_layer"], row["end_layer"]) for row in plan["assignments"]})
+        == 2
+    )
+
+
+def test_live_jaccl_ownership_ignores_dead_and_ring_markers(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda _state_dir: {
+            "jobs": [
+                {"deployment_id": "live-b", "backend": "jaccl", "live": True},
+                {"deployment_id": "live-a", "backend": "jaccl-ring", "live": True},
+                {"deployment_id": "tcp", "backend": "ring", "live": True},
+                {"deployment_id": "dead", "backend": "jaccl", "live": False},
+                {"deployment_id": "live-a", "backend": "jaccl", "live": True},
+            ],
+            "warnings": [],
+        },
+    )
+
+    assert routes._live_jaccl_deployments(state_dir="ignored") == (
+        "live-a",
+        "live-b",
+    )
+
+
+def test_cluster_plan_route_rejects_explicit_tp_for_unsupported_model(monkeypatch):
+    gib = 1024**3
+
+    from omlx.cluster.planner import ModelLayout
+
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1 * gib,
+            layer_weight_bytes=(2 * gib,) * 8,
+            tensor_parallel_heads=32,
+            supports_tensor_parallel=False,
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": "/models/unsupported",
+            "nodes": [
+                {
+                    "node_id": "studio",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+                {
+                    "node_id": "mobile",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+            ],
+            "tensor_parallel_size": 2,
+        },
+    )
+
     assert response.status_code == 400
-    assert "must use every detected node" in response.json()["detail"]
+    assert "does not support tensor parallelism" in response.json()["detail"]
 
 
 def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch):
@@ -823,28 +1354,28 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     )
 
     body = {
-            "deployment_id": "nemotron-pool",
-            "model_path": str(model_path),
-            "backend": "jaccl",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["192.168.5.1"],
-                    "rdma": [None, "rdma_en5"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["192.168.5.2"],
-                    "rdma": ["rdma_en5", None],
-                },
-            ],
-        }
+        "deployment_id": "nemotron-pool",
+        "model_path": str(model_path),
+        "backend": "jaccl",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["192.168.5.1"],
+                "rdma": [None, "rdma_en5"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["192.168.5.2"],
+                "rdma": ["rdma_en5", None],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -865,15 +1396,32 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert pool.reloads == 1
     assert len(payload["preflight"]) == 2
     assert payload["performance_probe"]["status"] in {"applied", "placement_locked"}
-    assert (
-        payload["plan"]["placement_signature"]
-        == body["approved_placement"]
-    )
+    assert payload["plan"]["placement_signature"] == body["approved_placement"]
     assert payload["deployment"]["execution"]["profile"] == "balanced"
 
     listed = _client().get("/admin/api/cluster/deployments")
     assert listed.status_code == 200
     assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
+
+    unloaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/unload"
+    )
+    assert unloaded.status_code == 200, unloaded.json()
+    assert unloaded.json()["configured"] is True
+    assert unloaded.json()["stopped"] is True
+    assert unloaded.json()["teardown"]["verified"] is True
+    assert pool.verified_teardowns == ["nemotron-pool"]
+    assert pool.entry.engine is None
+    assert routes.get_cluster_registry().get("nemotron-pool") is not None
+
+    loaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/load"
+    )
+    assert loaded.status_code == 200, loaded.json()
+    assert loaded.json()["loaded"] is True
+    assert loaded.json()["canary_completion_tokens"] == 1
+    assert len(loaded.json()["ranks"]) == 2
+    assert pool.entry.engine is not None
 
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200
@@ -915,26 +1463,26 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     )
 
     body = {
-            "deployment_id": "fallback-pool",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "fallback-pool",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -974,27 +1522,27 @@ def test_cluster_activation_rolls_back_when_canary_fails(tmp_path, monkeypatch):
     )
 
     body = {
-            "deployment_id": "canary-failure",
-            "model_path": str(model_path),
-            "backend": "ring",
-            "auto_tune": False,
-            "nodes": [
-                {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
-                {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "large",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "small",
-                    "ssh": "studio.local",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "deployment_id": "canary-failure",
+        "model_path": str(model_path),
+        "backend": "ring",
+        "auto_tune": False,
+        "nodes": [
+            {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
+            {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "large",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "small",
+                "ssh": "studio.local",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -1022,25 +1570,25 @@ def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
     )
 
     body = {
-            "model_path": str(tmp_path / "model"),
-            "backend": "ring",
-            "nodes": [
-                {"node_id": "local", "capacity_bytes": 10},
-                {"node_id": "peer", "capacity_bytes": 10},
-            ],
-            "hosts": [
-                {
-                    "node_id": "local",
-                    "ssh": "127.0.0.1",
-                    "ips": ["10.0.0.1"],
-                },
-                {
-                    "node_id": "peer",
-                    "ssh": "peer.local; bad",
-                    "ips": ["10.0.0.2"],
-                },
-            ],
-        }
+        "model_path": str(tmp_path / "model"),
+        "backend": "ring",
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 10},
+            {"node_id": "peer", "capacity_bytes": 10},
+        ],
+        "hosts": [
+            {
+                "node_id": "local",
+                "ssh": "127.0.0.1",
+                "ips": ["10.0.0.1"],
+            },
+            {
+                "node_id": "peer",
+                "ssh": "peer.local; bad",
+                "ips": ["10.0.0.2"],
+            },
+        ],
+    }
     body["approved_placement"] = _approval_for(body)
     response = _client().post("/admin/api/cluster/deployments", json=body)
 
@@ -1192,9 +1740,7 @@ def test_pairing_token_route_authenticates_with_the_shared_secret():
     assert rejected.json() == {"valid": False}
 
 
-def test_cuda_join_command_is_single_use_pinned_and_not_cached(
-    monkeypatch, tmp_path
-):
+def test_cuda_join_command_is_single_use_pinned_and_not_cached(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1226,9 +1772,10 @@ def test_cuda_join_command_is_single_use_pinned_and_not_cached(
     assert payload["controller_key_fingerprint"] == fingerprint
     assert payload["single_use"] is True
     assert payload["expires_at"] - payload["created_at"] == 30 * 60
-    assert '"join_key":' not in _enrollment_client().get(
-        "/admin/api/cluster/join-status"
-    ).text
+    assert (
+        '"join_key":'
+        not in _enrollment_client().get("/admin/api/cluster/join-status").text
+    )
 
 
 def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
@@ -1242,9 +1789,7 @@ def test_cuda_join_command_only_accepts_a_private_ipv4_controller():
         assert "controller" in response.json()["detail"]
 
 
-def test_cuda_worker_claim_replay_and_completion_fail_closed(
-    monkeypatch, tmp_path
-):
+def test_cuda_worker_claim_replay_and_completion_fail_closed(monkeypatch, tmp_path):
     from omlx.cluster import ssh_keys
 
     store = ClusterEnrollmentStore(tmp_path)
@@ -1342,9 +1887,10 @@ def test_cuda_worker_completion_refuses_a_forged_host_fingerprint(
             fingerprint=ssh_keys.ssh_public_key_fingerprint(controller_key),
         ),
     )
-    worker_key = "ssh-ed25519 " + base64.b64encode(
-        b"worker-host-key-material-long-enough"
-    ).decode()
+    worker_key = (
+        "ssh-ed25519 "
+        + base64.b64encode(b"worker-host-key-material-long-enough").decode()
+    )
     raw_key, _ = store.issue_join_key(
         controller_url="http://10.42.0.10:8000",
         source_digest="b" * 64,
@@ -2037,8 +2583,7 @@ def test_cuda_fabric_verification_is_a_gui_api_and_uses_live_peer_facts(monkeypa
         ("192.168.100.2", "192.168.101.2"),
     ]
     assert all(
-        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0")
-        for host in captured["hosts"]
+        host.interfaces == ("enp1s0f0np0", "enp2s0f0np0") for host in captured["hosts"]
     )
 
 
@@ -2283,3 +2828,194 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Activation derives the RDMA matrix clients cannot know.
+#
+# The cluster v2 wizard knows the Thunderbolt link exists but not the
+# interface names — and only the live names survive macOS renumbering a
+# port. A jaccl activation with empty host.rdma rows used to die inside the
+# ClusterDeployment constructor with nothing the user could act on.
+# ---------------------------------------------------------------------------
+
+
+def _fake_plan(node_ids, layers=8):
+    from omlx.cluster.planner import PipelineAssignment
+
+    class _Plan:
+        plan_hash = "a" * 64
+
+        def __init__(self):
+            self.assignments = tuple(
+                PipelineAssignment(
+                    node_id=node_id,
+                    rank=index,
+                    start_layer=0,
+                    end_layer=layers,
+                    layer_weight_bytes=1024,
+                    fixed_weight_bytes=0,
+                    reserve_bytes=0,
+                    capacity_bytes=1 << 40,
+                )
+                for index, node_id in enumerate(node_ids)
+            )
+
+        def to_dict(self):
+            return {"assignments": [], "plan_hash": self.plan_hash}
+
+    return _Plan()
+
+
+def _activation_request(backend):
+    return routes.ClusterDeploymentRequest(
+        model_path="/tmp/model",
+        backend=backend,
+        approved_placement="x" * 16,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="studio",
+                capacity_bytes=1 << 40,
+                role="workstation",
+                memory_guard_tier="balanced",
+                accelerator="metal",
+            ),
+            routes.ClusterPlanNodeRequest(
+                node_id="m5",
+                capacity_bytes=1 << 40,
+                role="headless",
+                memory_guard_tier="balanced",
+                accelerator="metal",
+            ),
+        ],
+        hosts=[
+            routes.ClusterHostRequest(
+                node_id="studio", ssh="127.0.0.1", ips=["10.0.1.1"]
+            ),
+            routes.ClusterHostRequest(node_id="m5", ssh="m5.local", ips=["10.0.1.2"]),
+        ],
+    )
+
+
+def test_activation_fills_the_rdma_matrix_when_hosts_ship_without_one(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_host_interfaces",
+        lambda host: {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 24)], rdma={"en4"}
+            ),
+            "m5.local": _interfaces(
+                "m5.local", [("en5", "10.0.1.2", 24)], rdma={"en5"}
+            ),
+        }[host],
+    )
+
+    deployment, _ = routes._create_deployment(_activation_request("jaccl"))
+
+    assert deployment.hosts[0].rdma == (None, "rdma_en4")
+    assert deployment.hosts[1].rdma == ("rdma_en5", None)
+
+
+def test_activation_names_the_matrix_blocker_instead_of_crashing(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_host_interfaces",
+        lambda host: {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 24)], rdma={"en4"}
+            ),
+            # The peer never turned RDMA on — the matrix cannot exist.
+            "m5.local": _interfaces("m5.local", [("en5", "10.0.1.2", 24)]),
+        }[host],
+    )
+
+    with pytest.raises(ValueError, match="cannot use the jaccl backend"):
+        routes._create_deployment(_activation_request("jaccl"))
+
+
+def test_ring_activation_never_probes_for_rdma(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+
+    def forbidden(host):
+        raise AssertionError("ring backend must not probe RDMA interfaces")
+
+    monkeypatch.setattr(routes, "probe_host_interfaces", forbidden)
+
+    deployment, _ = routes._create_deployment(_activation_request("ring"))
+    assert deployment.hosts[0].rdma == ()
+
+
+def test_activation_persists_mtp_launch_contract(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    request = _activation_request("ring").model_copy(
+        update={"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    )
+
+    deployment, plan = routes._create_deployment(request)
+
+    assert deployment.mtp_enabled is True
+    assert deployment.mtp_num_draft_tokens == 3
+    assert plan["mtp_enabled"] is True
+    assert plan["mtp_num_draft_tokens"] == 3
+    assert deployment.execution.prompt_cache_ssd is False
+
+
+def test_mtp_launch_contract_changes_placement_signature():
+    plan = _fake_plan(["studio", "m5"]).to_dict()
+    legacy_signature = routes._placement_signature(plan)
+
+    assert routes._placement_signature(plan | {"mtp_enabled": False}) == (
+        legacy_signature
+    )
+    assert (
+        routes._placement_signature(
+            plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+        )
+        != legacy_signature
+    )
+    assert routes._placement_signature(
+        plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 2}
+    ) != routes._placement_signature(
+        plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    )
+
+
+def test_distributed_ssd_snapshots_are_explicit_and_signed(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    baseline, baseline_plan = routes._create_deployment(_activation_request("ring"))
+    snapshots, snapshot_plan = routes._create_deployment(
+        _activation_request("ring").model_copy(
+            update={
+                "prompt_cache_ssd": True,
+                "prompt_cache_ssd_max_bytes": 7 * 1024**3,
+            }
+        )
+    )
+
+    assert baseline.execution.prompt_cache_ssd is False
+    assert "prompt_cache_ssd" not in baseline_plan
+    assert snapshots.execution.prompt_cache_ssd is True
+    assert snapshots.execution.prompt_cache_ssd_max_bytes == 7 * 1024**3
+    assert snapshot_plan["prompt_cache_ssd"] is True
+    assert snapshot_plan["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
+    assert routes._placement_signature(snapshot_plan) != (
+        routes._placement_signature(baseline_plan)
+    )
+    assert routes._placement_signature(snapshot_plan) != routes._placement_signature(
+        snapshot_plan | {"prompt_cache_ssd_max_bytes": 8 * 1024**3}
+    )

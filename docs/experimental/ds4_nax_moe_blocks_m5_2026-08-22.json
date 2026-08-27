@@ -1,0 +1,324 @@
+{
+  "all_boundaries_array_equal": true,
+  "checkpoint_shards": [
+    "model-00015.safetensors",
+    "model-00016.safetensors"
+  ],
+  "device": {
+    "architecture": "applegpu_g17s",
+    "device_name": "Apple M5 Max",
+    "max_buffer_length": 86586540032,
+    "max_recommended_working_set_size": 115448725504,
+    "memory_size": 137438953472,
+    "resource_limit": 499000
+  },
+  "gate": {
+    "composed_speedup": 1.5130903329828254,
+    "minimum_composed_speedup": 1.45,
+    "passed": true,
+    "production_dispatch": false
+  },
+  "kernel": {
+    "bk": 64,
+    "bm": 32,
+    "bn": 64,
+    "input_dtype": "bfloat16",
+    "output_dtype": "bfloat16",
+    "symbol": "deepseek_mxfp4_gather_qmm_blocks_nax",
+    "wm": 1,
+    "wn": 2
+  },
+  "layer": 20,
+  "model": "/Users/jonathanspangler/.lmstudio/models/Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "parity": {
+    "composed_sorted_down_bf16": {
+      "array_equal": true,
+      "elements": 25165824,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "down_fixed_input_bf16": {
+      "array_equal": true,
+      "elements": 25165824,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "gate_bf16": {
+      "array_equal": true,
+      "elements": 7864320,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "limited_swiglu_bf16": {
+      "array_equal": true,
+      "elements": 7864320,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "restored_route_rows_bf16": {
+      "array_equal": true,
+      "elements": 25165824,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "score_reduced_local_output_bf16": {
+      "array_equal": true,
+      "elements": 4194304,
+      "max_abs": 0.0,
+      "mismatches": 0
+    },
+    "up_bf16": {
+      "array_equal": true,
+      "elements": 7864320,
+      "max_abs": 0.0,
+      "mismatches": 0
+    }
+  },
+  "rank": 1,
+  "shape": {
+    "block_meta": [
+      448,
+      3
+    ],
+    "down_weight": [
+      256,
+      4096,
+      160
+    ],
+    "experts": 256,
+    "hidden": 4096,
+    "local_intermediate": 1280,
+    "routes": 6144,
+    "tokens": 1024,
+    "up_gate_weight": [
+      256,
+      1280,
+      512
+    ]
+  },
+  "shard_weights": [
+    3,
+    5
+  ],
+  "structural_work": {
+    "active_experts": 256,
+    "candidate_bm": 32,
+    "candidate_expert_blocks": 256,
+    "candidate_row_equivalents": 8192,
+    "max_routes_per_expert": 24,
+    "min_routes_per_active_expert": 24,
+    "routes": 6144,
+    "row_work_ratio": 2.5,
+    "stock_bm": 64,
+    "stock_expert_segments": 320,
+    "stock_global_tiles": 96,
+    "stock_row_equivalents": 20480,
+    "weight_segment_ratio": 1.25
+  },
+  "timings": {
+    "composed_routed_projection": {
+      "baseline": {
+        "max_ms": 13.70375,
+        "mean_ms": 13.5084505625,
+        "median_ms": 13.490146,
+        "min_ms": 13.398125
+      },
+      "baseline_samples_ms": [
+        13.438375,
+        13.4745,
+        13.626625,
+        13.513083,
+        13.486167,
+        13.494125,
+        13.4185,
+        13.46175,
+        13.475459,
+        13.523625,
+        13.70375,
+        13.547833,
+        13.398125,
+        13.56375,
+        13.4525,
+        13.557042
+      ],
+      "candidate": {
+        "max_ms": 9.014167,
+        "mean_ms": 8.9179714375,
+        "median_ms": 8.915624999999999,
+        "min_ms": 8.83825
+      },
+      "candidate_samples_ms": [
+        8.879334,
+        8.905917,
+        8.939375,
+        8.911083,
+        8.897792,
+        8.892167,
+        8.920167,
+        8.961084,
+        8.95275,
+        8.922541,
+        8.83825,
+        8.934,
+        8.909792,
+        8.886291,
+        8.922833,
+        9.014167
+      ],
+      "speedup": 1.5130903329828254
+    },
+    "down_fixed_input": {
+      "baseline": {
+        "max_ms": 4.494292,
+        "mean_ms": 4.4562916875,
+        "median_ms": 4.4519165,
+        "min_ms": 4.434709
+      },
+      "baseline_samples_ms": [
+        4.4805,
+        4.467375,
+        4.437208,
+        4.453375,
+        4.443875,
+        4.460083,
+        4.459125,
+        4.444833,
+        4.434709,
+        4.440917,
+        4.453625,
+        4.450458,
+        4.447125,
+        4.486083,
+        4.447084,
+        4.494292
+      ],
+      "candidate": {
+        "max_ms": 3.203708,
+        "mean_ms": 3.12967175,
+        "median_ms": 3.134583,
+        "min_ms": 3.064708
+      },
+      "candidate_samples_ms": [
+        3.099292,
+        3.127583,
+        3.142208,
+        3.203708,
+        3.117666,
+        3.143791,
+        3.104958,
+        3.147167,
+        3.100542,
+        3.064708,
+        3.136,
+        3.135666,
+        3.129834,
+        3.1335,
+        3.140417,
+        3.147708
+      ],
+      "speedup": 1.4202579737081455
+    },
+    "pair": {
+      "baseline": {
+        "max_ms": 9.354583,
+        "mean_ms": 9.241072875,
+        "median_ms": 9.229979,
+        "min_ms": 9.150542
+      },
+      "baseline_samples_ms": [
+        9.181,
+        9.180375,
+        9.229833,
+        9.311542,
+        9.230125,
+        9.354583,
+        9.150542,
+        9.267667,
+        9.301541,
+        9.319584,
+        9.221,
+        9.2055,
+        9.291041,
+        9.232833,
+        9.171458,
+        9.208542
+      ],
+      "candidate": {
+        "max_ms": 5.959667,
+        "mean_ms": 5.9194635625,
+        "median_ms": 5.9148125,
+        "min_ms": 5.849792
+      },
+      "candidate_samples_ms": [
+        5.903958,
+        5.956167,
+        5.9305,
+        5.929459,
+        5.954458,
+        5.906458,
+        5.91525,
+        5.949792,
+        5.913125,
+        5.94375,
+        5.959667,
+        5.849792,
+        5.914375,
+        5.9075,
+        5.890375,
+        5.886791
+      ],
+      "speedup": 1.5604854760822935
+    },
+    "pair_plus_limited_swiglu": {
+      "baseline": {
+        "max_ms": 9.359584,
+        "mean_ms": 9.28136975,
+        "median_ms": 9.286417,
+        "min_ms": 9.175375
+      },
+      "baseline_samples_ms": [
+        9.343916,
+        9.359584,
+        9.284917,
+        9.318667,
+        9.175375,
+        9.293083,
+        9.336708,
+        9.249333,
+        9.281625,
+        9.280916,
+        9.287459,
+        9.201917,
+        9.293958,
+        9.216833,
+        9.29225,
+        9.285375
+      ],
+      "candidate": {
+        "max_ms": 6.066875,
+        "mean_ms": 5.9924061875,
+        "median_ms": 5.9911665,
+        "min_ms": 5.9385
+      },
+      "candidate_samples_ms": [
+        6.014083,
+        5.974208,
+        5.955875,
+        5.94075,
+        5.992375,
+        5.966416,
+        5.998834,
+        5.9385,
+        6.064333,
+        6.00825,
+        5.970583,
+        5.9655,
+        6.001334,
+        5.989958,
+        6.066875,
+        6.030625
+      ],
+      "speedup": 1.550018180933546
+    }
+  }
+}

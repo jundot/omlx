@@ -484,6 +484,7 @@ def _patch_text_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        skip_lm_head: bool = False,
     ):
         hidden = self.model(
             inputs,
@@ -501,6 +502,12 @@ def _patch_text_model(q35: Any) -> None:
                 prompt_priming.maybe_capture(self, inputs, normed, cache)
             except Exception:
                 logger.debug("MTP prompt-priming capture failed", exc_info=True)
+        if skip_lm_head:
+            # Chunked prefill discards every chunk's logits and scores the
+            # boundary in the first decode step. Preserve recurrent-cache and
+            # prompt-priming side effects above, but do not project [B,T,H]
+            # through Qwen3.8's 248k-token head on every 2K chunk.
+            return None
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(normed)
         else:
@@ -753,6 +760,7 @@ def _patch_outer_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        skip_lm_head: bool = False,
     ):
         return self.language_model(
             inputs,
@@ -760,6 +768,7 @@ def _patch_outer_model(q35: Any) -> None:
             input_embeddings=input_embeddings,
             return_hidden=return_hidden,
             n_confirmed=n_confirmed,
+            skip_lm_head=skip_lm_head,
         )
 
     def mtp_forward(

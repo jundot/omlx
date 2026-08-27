@@ -400,7 +400,7 @@ mx::array dspark_rowwise_gemm(
     throw std::invalid_argument("DSpark rowwise GEMM requires Metal.");
   }
   if (lhs.ndim() != 3 || rhs.ndim() != 3 || lhs.shape(0) != rhs.shape(0) ||
-      lhs.shape(1) != 64 || lhs.dtype() != rhs.dtype() ||
+      lhs.shape(1) < 1 || lhs.shape(1) > 64 || lhs.dtype() != rhs.dtype() ||
       (lhs.dtype() != float16 && lhs.dtype() != bfloat16 &&
        lhs.dtype() != float32) ||
       (lhs.dtype() == float32 && !transpose_rhs) ||

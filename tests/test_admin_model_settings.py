@@ -4,6 +4,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 import omlx.server  # noqa: F401 - ensure server module is imported first
 from omlx.admin import routes as admin_routes
@@ -246,4 +247,183 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             pool,
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_depth_change_reloads_active_mtp_engine():
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=5),
+    )
+
+    assert settings.mtp_num_draft_tokens == 5
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")
+
+
+def test_mtp_draft_depth_api_bounds():
+    assert (
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=1).mtp_num_draft_tokens
+        == 1
+    )
+    assert (
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8).mtp_num_draft_tokens
+        == 8
+    )
+    with pytest.raises(ValidationError):
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=0)
+    with pytest.raises(ValidationError):
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=9)
+
+
+def test_guided_grammar_disabled_sentinel_from_older_clients_is_unset():
+    """Dashboards older than the null-fix send guided_grammar=0 when the
+    toggle is off; that must not 422 the entire settings save."""
+    from omlx.admin.routes import ModelSettingsRequest
+
+    assert ModelSettingsRequest(guided_grammar=0).guided_grammar is None
+    assert ModelSettingsRequest(guided_grammar=False).guided_grammar is None
+    # Real grammars and explicit empty strings pass through unchanged.
+    assert ModelSettingsRequest(guided_grammar="start: x").guided_grammar == "start: x"
+    assert ModelSettingsRequest(guided_grammar="").guided_grammar == ""
+    # Truthy non-strings are still a client error, not a silent coercion.
+    import pytest
+
+    with pytest.raises(Exception):
+        ModelSettingsRequest(guided_grammar=42)
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_settings_are_persisted():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            deepseek_ane_prefill_enabled=True,
+            deepseek_ane_prefill_sequence_length=4096,
+            deepseek_ane_prefill_tail_padding_min_tokens=3000,
+            deepseek_ane_prefill_down_enabled=False,
+            deepseek_ane_prefill_down_fraction=0.625,
+            deepseek_ane_prefill_wo_a_enabled=False,
+            deepseek_ane_prefill_wo_a_fraction=0.25,
+            deepseek_ane_prefill_cpu_enabled=True,
+            deepseek_ane_prefill_cpu_fraction=0.125,
+            deepseek_ane_prefill_cpu_threads=12,
+            deepseek_ane_prefill_cpu_shared_resource=True,
+        ),
+    )
+
+    assert settings.deepseek_ane_prefill_enabled is True
+    assert settings.deepseek_ane_prefill_sequence_length == 4096
+    assert settings.deepseek_ane_prefill_tail_padding_min_tokens == 3000
+    assert settings.deepseek_ane_prefill_down_enabled is False
+    assert settings.deepseek_ane_prefill_down_fraction == 0.625
+    assert settings.deepseek_ane_prefill_wo_a_enabled is False
+    assert settings.deepseek_ane_prefill_wo_a_fraction == 0.25
+    assert settings.deepseek_ane_prefill_cpu_enabled is True
+    assert settings.deepseek_ane_prefill_cpu_fraction == 0.125
+    assert settings.deepseek_ane_prefill_cpu_threads == 12
+    assert settings.deepseek_ane_prefill_cpu_shared_resource is True
+    assert result["requires_reload"] is False
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_other_model_families():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+
+    with pytest.raises(admin_routes.HTTPException, match="DeepSeek-V4"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(deepseek_ane_prefill_enabled=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_invalid_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="multiple of 64"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_sequence_length=4000
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_tail_threshold_at_block_size():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="less than"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_tail_padding_min_tokens=4096
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_invalid_cpu_settings():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="CPU fraction"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_cpu_fraction=0.5
+            ),
+        )
+    with pytest.raises(admin_routes.HTTPException, match="worker count"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_cpu_threads=65
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_ane_prefill_rejects_invalid_projection_fractions():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v4"
+
+    with pytest.raises(admin_routes.HTTPException, match="shared-down"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_down_fraction=1.0
+            ),
+        )
+    with pytest.raises(admin_routes.HTTPException, match="wo_a"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(
+                deepseek_ane_prefill_wo_a_fraction=0.0
+            ),
         )

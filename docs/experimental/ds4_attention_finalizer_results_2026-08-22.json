@@ -1,0 +1,74 @@
+{
+  "date": "2026-08-22",
+  "device": "Apple M3 Ultra",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 2,
+  "tokens": 1024,
+  "offset": 8192,
+  "all_boundaries_array_equal": true,
+  "all_storage_bits_equal": true,
+  "exceptional_signed_zero_inf_nan_bits_equal": true,
+  "parity_frequency_families": ["local_base10000", "compressed_yarn_base160000"],
+  "parity_offsets": [0, 8192],
+  "max_abs": 0.0,
+  "results": [
+    {
+      "heads": 24,
+      "q_current_ms": 1.98175,
+      "q_candidate_ms": 1.0097295,
+      "q_speedup": 1.962654354458298,
+      "kv_current_ms": 1.061396,
+      "kv_candidate_ms": 1.0477085,
+      "kv_speedup": 1.01306422540239,
+      "combined_current_ms": 1.8459375,
+      "combined_candidate_ms": 1.1115835,
+      "combined_speedup": 1.6606377298691462,
+      "removed_intermediate_traffic_mib": 50.0
+    },
+    {
+      "heads": 32,
+      "q_current_ms": 1.8073125,
+      "q_candidate_ms": 1.012354,
+      "q_speedup": 1.7852574297133217,
+      "kv_current_ms": 1.0069375,
+      "kv_candidate_ms": 1.008958,
+      "kv_speedup": 0.9979974389419579,
+      "combined_current_ms": 1.9557705,
+      "combined_candidate_ms": 1.0051045,
+      "combined_speedup": 1.9458379700817179,
+      "removed_intermediate_traffic_mib": 66.0
+    },
+    {
+      "heads": 40,
+      "q_current_ms": 1.8788955,
+      "q_candidate_ms": 1.0066875,
+      "q_speedup": 1.8664138573291118,
+      "kv_current_ms": 0.990896,
+      "kv_candidate_ms": 0.991458,
+      "kv_speedup": 0.9994331580359431,
+      "combined_current_ms": 1.8836875,
+      "combined_candidate_ms": 1.0242915,
+      "combined_speedup": 1.8390150655355435,
+      "removed_intermediate_traffic_mib": 82.0
+    }
+  ],
+  "rank0_confirmation": {
+    "heads": 24,
+    "cycles": 12,
+    "combined_current_ms": 1.683104,
+    "combined_candidate_ms": 1.019854,
+    "combined_speedup": 1.650338185661869,
+    "saved_ms_per_layer": 0.66325,
+    "saved_ms_43_layers": 28.51975,
+    "projected_tps_if_fully_critical": 639.9669703477532
+  },
+  "gate": {
+    "minimum_combined_speedup": 1.1,
+    "passed": true,
+    "production_dispatch": "default_off",
+    "environment": "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
+    "m5_measurement": "pending"
+  },
+  "server_touched": false,
+  "remote_touched": false
+}

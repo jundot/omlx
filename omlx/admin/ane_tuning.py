@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hardware-local, profile-guided Qwen ANE/CPU/GPU workload tuning.
+"""Hardware-local ANE/CPU/GPU workload tuning for Qwen and DeepSeek.
 
 Exploratory points run against one representative real MLP and GDN layer.
 Their heterogeneous ANE widths are packed into a small temporary procedure
 bank, so only the predicted winner is eagerly compiled across the full model.
-Persisted model settings are never changed by a tuning run.
+DeepSeek-V4 uses synthetic tensors with the exact production projection
+shapes, avoiding a >96 GiB checkpoint load during normal tuning. Persisted
+model settings are never changed by a tuning run.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator
 
@@ -42,6 +44,7 @@ _REFINE_SLOT = 5
 
 class ANETuningRequest(BaseModel):
     model_id: str
+    model_family: Literal["qwen", "deepseek_v4"] = "qwen"
     sequence_length: int = 2048
     repeats: int = 2
     allow_cpu: bool = True
@@ -50,6 +53,7 @@ class ANETuningRequest(BaseModel):
     allow_ane_gdn: bool = True
     allow_cpu_gdn: bool = True
     allow_cpu_shared_resource: bool = True
+    verify_full_model: bool = False
 
     @field_validator("sequence_length")
     @classmethod
@@ -80,6 +84,10 @@ class _Candidate:
     fused_down: bool = False
     cpu_threads: int | None = None
     stage: str = "verification"
+    deepseek_down_enabled: bool | None = None
+    deepseek_down_fraction: float | None = None
+    deepseek_wo_a_enabled: bool | None = None
+    deepseek_wo_a_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +179,22 @@ def _gdn_fraction_grid() -> list[float]:
     return [0.35, 0.40, 0.45, 0.50, 0.53, 0.56, 0.60]
 
 
+_CALIBRATION_CPU_THREADS = 8
+
+
+def _cpu_thread_grid() -> list[int]:
+    # Keep the bounded shape search independent of saved model settings.
+    return [6, 8, 10, 12, 14, 16]
+
+
+def _deepseek_down_fraction_grid() -> list[float]:
+    return [0.25, 0.375, 0.50, 0.625, 0.75]
+
+
+def _deepseek_wo_a_fraction_grid() -> list[float]:
+    return [0.25, 0.50, 0.75]
+
+
 def _planned_rows() -> list[_Candidate]:
     return [
         _Candidate("GPU only", False),
@@ -182,15 +206,52 @@ def _planned_rows() -> list[_Candidate]:
     ]
 
 
+def _deepseek_planned_rows(verify_full_model: bool) -> list[_Candidate]:
+    rows = [
+        _Candidate("Projection GPU baseline", False, stage="shape calibration"),
+        _Candidate("Shared expert ANE/GPU", True, stage="shape calibration"),
+        _Candidate("Shared down ANE/GPU", True, stage="shape calibration"),
+        _Candidate("Grouped wo_a ANE/GPU", True, stage="shape calibration"),
+        _Candidate("Query ANE/GPU", True, stage="shape calibration"),
+        _Candidate("Query CPU share", True, stage="shape calibration"),
+        _Candidate("CPU worker calibration", True, stage="shape calibration"),
+        _Candidate("Shape-model recommendation", True, stage="recommendation"),
+    ]
+    if verify_full_model:
+        rows.extend(
+            [
+                _Candidate("Full-model GPU baseline", False),
+                _Candidate("Full-model recommendation", True),
+                _Candidate("Profile-refined recommendation", True),
+            ]
+        )
+    return rows
+
+
 def create_run(request: ANETuningRequest) -> ANETuningRun:
     fractions = _fraction_grid()
-    planned = _planned_rows()
+    if request.model_family == "deepseek_v4":
+        planned = _deepseek_planned_rows(request.verify_full_model)
+    else:
+        planned = _planned_rows()
     run = ANETuningRun(
         tuning_id=str(uuid.uuid4()),
         request=request,
         fractions=fractions,
         results=[_empty_result(candidate) for candidate in planned],
     )
+    if request.model_family == "deepseek_v4":
+        cpu_points = len(_cpu_fraction_grid()) if request.allow_cpu else 1
+        worker_points = len(_cpu_thread_grid()) if request.allow_cpu else 1
+        # Three persistent shape builds, shared gate/up, down and grouped
+        # fraction searches, and two query shapes for every CPU-share/worker
+        # point. GPU timing is folded into each projection trial.
+        run.total = 14 + cpu_points * 2 + worker_points * 2
+        if request.verify_full_model:
+            run.total += 3
+        _runs[run.tuning_id] = run
+        return run
+
     # This is an upper bound until the loaded checkpoint tells us whether CPU
     # sharing and GDN are eligible. The live snapshot is reduced afterwards.
     cpu_gate_points = (
@@ -235,6 +296,7 @@ def run_snapshot(run: ANETuningRun) -> dict[str, Any]:
     return {
         "tuning_id": run.tuning_id,
         "model_id": run.request.model_id,
+        "model_family": run.request.model_family,
         "status": run.status,
         "phase": run.phase,
         "message": run.message,
@@ -269,6 +331,10 @@ def _empty_result(candidate: _Candidate) -> dict[str, Any]:
         "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
         "fused_down": candidate.fused_down,
         "cpu_threads": candidate.cpu_threads,
+        "down_enabled": candidate.deepseek_down_enabled,
+        "down_fraction": candidate.deepseek_down_fraction,
+        "wo_a_enabled": candidate.deepseek_wo_a_enabled,
+        "wo_a_fraction": candidate.deepseek_wo_a_fraction,
         "state": "pending",
         "processing_tps": None,
         "latency_ms": None,
@@ -417,6 +483,49 @@ async def _measure_result_slot(
 
 def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Candidate):
     settings = replace(base)
+    if request.model_family == "deepseek_v4":
+        settings.deepseek_ane_prefill_enabled = candidate.enabled
+        settings.deepseek_ane_prefill_sequence_length = request.sequence_length
+        # DeepSeek's bounded tuner measures exact shapes only. Do not carry a
+        # stale tail crossover into its candidates or recommendation.
+        settings.deepseek_ane_prefill_tail_padding_min_tokens = 0
+        settings.deepseek_ane_prefill_down_enabled = (
+            candidate.deepseek_down_enabled is not False
+        )
+        settings.deepseek_ane_prefill_down_fraction = float(
+            candidate.deepseek_down_fraction
+            if candidate.deepseek_down_fraction is not None
+            else 0.65
+        )
+        settings.deepseek_ane_prefill_wo_a_enabled = (
+            candidate.deepseek_wo_a_enabled is not False
+        )
+        settings.deepseek_ane_prefill_wo_a_fraction = float(
+            candidate.deepseek_wo_a_fraction
+            if candidate.deepseek_wo_a_fraction is not None
+            else 0.5
+        )
+        settings.deepseek_ane_prefill_cpu_enabled = bool(
+            candidate.cpu_enabled and request.allow_cpu
+        )
+        settings.deepseek_ane_prefill_cpu_fraction = (
+            float(candidate.cpu_fraction or 0.0)
+            if candidate.cpu_enabled and request.allow_cpu
+            else 0.0
+        )
+        if candidate.cpu_threads is not None:
+            settings.deepseek_ane_prefill_cpu_threads = candidate.cpu_threads
+        settings.deepseek_ane_prefill_cpu_shared_resource = bool(
+            request.allow_cpu
+            and request.allow_cpu_shared_resource
+            and getattr(base, "deepseek_ane_prefill_cpu_shared_resource", True)
+        )
+        if hasattr(settings, "qwen35_ane_prefill_enabled"):
+            settings.qwen35_ane_prefill_enabled = False
+        if hasattr(settings, "dflash_enabled"):
+            settings.dflash_enabled = False
+        return settings
+
     settings.qwen35_ane_prefill_enabled = candidate.enabled
     settings.qwen35_ane_prefill_fused_down = bool(
         candidate.enabled and candidate.fused_down
@@ -538,6 +647,49 @@ def _ane_is_active(engine: Any) -> bool:
     )
 
 
+def _ane_trace_config(
+    engine: Any,
+    settings: Any,
+    request: ANETuningRequest,
+    candidate: _Candidate,
+) -> dict[str, Any] | None:
+    if not candidate.enabled:
+        return None
+    model = getattr(engine, "_model", None)
+    if request.model_family == "deepseek_v4":
+        return {
+            "sequence_length": request.sequence_length,
+            "profile_layers": {
+                "deepseek_mlp": int(
+                    getattr(model, "_omlx_ane_mlp_prefill_count", 0) or 0
+                ),
+                "deepseek_down": int(
+                    getattr(model, "_omlx_ane_down_prefill_count", 0) or 0
+                ),
+                "deepseek_attention_input": int(
+                    getattr(model, "_omlx_ane_attention_input_prefill_count", 0)
+                    or 0
+                ),
+                "deepseek_query": int(
+                    getattr(model, "_omlx_ane_query_prefill_count", 0) or 0
+                ),
+                "deepseek_wo_a": int(
+                    getattr(model, "_omlx_ane_wo_a_prefill_count", 0) or 0
+                ),
+            },
+            "active": _ane_is_active(engine),
+        }
+    return {
+        "sequence_length": request.sequence_length,
+        "mlp_layers": int(settings.qwen35_ane_prefill_max_layers),
+        "gdn_layers": (
+            int(settings.qwen35_ane_prefill_gdn_max_layers)
+            if candidate.gdn_enabled
+            else 0
+        ),
+    }
+
+
 async def _measure_candidate(
     run: ANETuningRun,
     engine_pool: Any,
@@ -551,8 +703,9 @@ async def _measure_candidate(
         runtime_settings=settings,
     )
     if candidate.enabled and not _ane_is_active(engine):
+        family = "DeepSeek" if run.request.model_family == "deepseek_v4" else "Qwen"
         raise RuntimeError(
-            "The ANE candidate loaded, but no eligible Qwen MLP/GDN layers were compiled"
+            f"The ANE candidate loaded, but no eligible {family} layers were compiled"
         )
 
     tokenizer = engine.tokenizer
@@ -610,18 +763,8 @@ async def _measure_candidate(
                 prompt=prompt,
                 max_tokens=2,
                 pp_len=measure_length,
-                ane_trace_config=(
-                    {
-                        "sequence_length": run.request.sequence_length,
-                        "mlp_layers": int(settings.qwen35_ane_prefill_max_layers),
-                        "gdn_layers": (
-                            int(settings.qwen35_ane_prefill_gdn_max_layers)
-                            if candidate.gdn_enabled
-                            else 0
-                        ),
-                    }
-                    if candidate.enabled
-                    else None
+                ane_trace_config=_ane_trace_config(
+                    engine, settings, run.request, candidate
                 ),
             )
             samples.append(float(metrics["processing_tps"]))
@@ -680,6 +823,10 @@ async def _measure_candidate(
         "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
         "fused_down": candidate.fused_down,
         "cpu_threads": candidate.cpu_threads,
+        "down_enabled": candidate.deepseek_down_enabled,
+        "down_fraction": candidate.deepseek_down_fraction,
+        "wo_a_enabled": candidate.deepseek_wo_a_enabled,
+        "wo_a_fraction": candidate.deepseek_wo_a_fraction,
         "processing_tps": round(statistics.median(samples), 2),
         "samples": [round(value, 2) for value in samples],
         "_profile": profile,
@@ -807,6 +954,91 @@ def _profile_refinement(
         gdn_fraction=gdn_fraction,
         cpu_gdn_fraction=cpu_gdn_fraction,
     )
+
+
+def _deepseek_profile_refinement(
+    candidate: _Candidate,
+    result: dict[str, Any],
+    projection_gpu_ms: dict[str, float],
+) -> _Candidate:
+    """Drop queue-bound DeepSeek offloads and rebalance surviving splits.
+
+    The exact-shape tuner supplies an isolated full-GPU time for down and
+    grouped wo_a. Full-model output completion includes the input-pack and
+    queue barriers that a shape probe cannot reproduce, so an offload that no
+    longer clears the same 1% threshold is safer on GPU. Surviving projections
+    use branch completion rates for one bounded split correction.
+    """
+    profile = result.get("_profile") or {}
+    changes: dict[str, Any] = {"label": "Profile-refined recommendation"}
+    projections = (
+        (
+            "deepseek_down",
+            "deepseek_down_enabled",
+            "deepseek_down_fraction",
+            _deepseek_down_fraction_grid(),
+        ),
+        (
+            "deepseek_wo_a",
+            "deepseek_wo_a_enabled",
+            "deepseek_wo_a_fraction",
+            _deepseek_wo_a_fraction_grid(),
+        ),
+    )
+    for category, enabled_attr, fraction_attr, grid in projections:
+        if getattr(candidate, enabled_attr) is False:
+            continue
+        values = profile.get(category) or {}
+        operations = float(
+            values.get("successful_operations", 0.0)
+            or values.get("operations", 0.0)
+            or 0.0
+        )
+        if operations <= 0:
+            continue
+        gpu_baseline = float(projection_gpu_ms.get(category, 0.0) or 0.0)
+        output_ms = (
+            float(values.get("output_completion_ns", 0.0)) / operations / 1e6
+        )
+        if gpu_baseline > 0 and output_ms >= gpu_baseline * 0.99:
+            changes[enabled_attr] = False
+            continue
+
+        fraction = float(getattr(candidate, fraction_attr) or 0.0)
+        gpu_fraction = 1.0 - fraction
+        ane_time = max(
+            float(values.get("ane0_eval_ns", 0.0)),
+            float(values.get("ane1_eval_ns", 0.0)),
+        ) / operations
+        gpu_time = float(values.get("gpu_completion_ns", 0.0)) / operations
+        balanced = _balanced_fractions(
+            [fraction, gpu_fraction],
+            [ane_time, gpu_time],
+            [grid, [gpu_fraction]],
+        )
+        if balanced is not None:
+            changes[fraction_attr] = balanced[0]
+
+    query = profile.get("deepseek_query") or {}
+    query_operations = float(
+        query.get("successful_operations", 0.0)
+        or query.get("operations", 0.0)
+        or 0.0
+    )
+    cpu_fraction = float(candidate.cpu_fraction or 0.0)
+    if query_operations > 0 and candidate.cpu_enabled and cpu_fraction > 0:
+        gpu_fraction = 0.5 - cpu_fraction
+        cpu_time = float(query.get("cpu_completion_ns", 0.0)) / query_operations
+        gpu_time = float(query.get("gpu_completion_ns", 0.0)) / query_operations
+        if cpu_time > 0 and gpu_time > 0 and gpu_fraction > 0:
+            cpu_rate = cpu_fraction / cpu_time
+            gpu_rate = gpu_fraction / gpu_time
+            target = 0.5 * cpu_rate / (cpu_rate + gpu_rate)
+            refined_cpu = _nearest(target, _cpu_fraction_grid())
+            changes["cpu_fraction"] = refined_cpu
+            changes["cpu_enabled"] = refined_cpu > 0
+
+    return replace(candidate, **changes)
 
 
 def _loaded_model(engine: Any) -> Any:
@@ -1984,7 +2216,815 @@ def _calibrate_components_sync(
     )
 
 
+@dataclass
+class _DeepseekShapeState:
+    name: str
+    out_features: int
+    weight: Any
+    x: Any
+    gpu_weight: Any
+    gpu_scales: Any
+    ane0: Any
+    ane1: Any
+    ane_rows: int
+
+
+@dataclass
+class _DeepseekGroupedShapeState:
+    groups: int
+    out_per_group: int
+    weight: Any
+    x: Any
+    gpu_weights: list[Any]
+    gpu_scales: list[Any]
+    ane0: Any
+    ane1: Any
+    suffix_weight: Any
+    suffix_scales: Any
+    suffix_biases: Any
+    ane_rows: int
+
+
+def _deepseek_time(factory: Callable[[], Any], repeats: int) -> float:
+    """Median wall time for an already-compiled DeepSeek projection."""
+    import mlx.core as mx
+
+    for _ in range(2):
+        mx.eval(factory())
+    mx.synchronize()
+    samples: list[float] = []
+    for _ in range(max(3, repeats)):
+        started = time.perf_counter()
+        mx.eval(factory())
+        mx.synchronize()
+        samples.append((time.perf_counter() - started) * 1000.0)
+    return statistics.median(samples)
+
+
+def _deepseek_prepare_shape(
+    fast: Any,
+    name: str,
+    out_features: int,
+    in_features: int,
+    sequence_length: int,
+    ane_fraction: float = 0.5,
+) -> _DeepseekShapeState:
+    """Build one exact-shape synthetic projection using bounded memory."""
+    import mlx.core as mx
+
+    weight = mx.random.normal((out_features, in_features)).astype(mx.bfloat16)
+    x = mx.random.normal((1, sequence_length, in_features)).astype(mx.bfloat16)
+    gpu_weight, gpu_scales = mx.quantize(
+        weight, group_size=32, bits=8, mode="mxfp8"
+    )
+    per_instance = int(out_features * ane_fraction / 2 // 128) * 128
+    ane_rows = 2 * per_instance
+    if per_instance < 128 or out_features - ane_rows < 64:
+        raise RuntimeError(f"DeepSeek shape {name} cannot satisfy ANE alignment")
+    dense = weight.astype(mx.float32)
+    dense0 = mx.contiguous(dense[:per_instance])
+    dense1 = mx.contiguous(dense[per_instance:ane_rows])
+    mx.eval(weight, x, gpu_weight, gpu_scales, dense0, dense1)
+    ane0 = fast.qwen35_ane_compile_linear(dense0, sequence_length, 1)
+    ane1 = fast.qwen35_ane_compile_linear(dense1, sequence_length, 2)
+    return _DeepseekShapeState(
+        name,
+        out_features,
+        weight,
+        x,
+        gpu_weight,
+        gpu_scales,
+        ane0,
+        ane1,
+        ane_rows,
+    )
+
+
+def _deepseek_prepare_grouped_shape(
+    fast: Any,
+    sequence_length: int,
+    ane_fraction: float,
+    *,
+    groups: int = 8,
+    out_per_group: int = 1024,
+    in_per_group: int = 4096,
+) -> _DeepseekGroupedShapeState:
+    """Build the compact grouped wo_a shape used by the production backend."""
+    import mlx.core as mx
+
+    weight = mx.random.normal((groups, out_per_group, in_per_group)).astype(
+        mx.bfloat16
+    )
+    x = mx.random.normal(
+        (1, groups, sequence_length, in_per_group)
+    ).astype(mx.bfloat16)
+    quantized = [
+        mx.quantize(weight[group], group_size=32, bits=8, mode="mxfp8")
+        for group in range(groups)
+    ]
+    gpu_weights = [value[0] for value in quantized]
+    gpu_scales = [value[1] for value in quantized]
+    per_instance = int(out_per_group * ane_fraction / 2 // 128) * 128
+    ane_rows = 2 * per_instance
+    if per_instance < 128 or out_per_group - ane_rows < 64:
+        raise RuntimeError("DeepSeek grouped wo_a cannot satisfy ANE alignment")
+
+    dense0 = mx.contiguous(
+        mx.concatenate([weight[group, :per_instance] for group in range(groups)])
+        .astype(mx.float32)
+    )
+    dense1 = mx.contiguous(
+        mx.concatenate(
+            [weight[group, per_instance:ane_rows] for group in range(groups)]
+        ).astype(mx.float32)
+    )
+    suffix = mx.contiguous(
+        mx.concatenate([weight[group, ane_rows:] for group in range(groups)])
+    )
+    suffix_weight, suffix_scales, suffix_biases = mx.quantize(
+        suffix, group_size=64, bits=8
+    )
+    suffix_weight = mx.contiguous(suffix_weight)
+    suffix_scales = mx.contiguous(suffix_scales.astype(x.dtype))
+    suffix_biases = mx.contiguous(suffix_biases.astype(x.dtype))
+    mx.eval(
+        weight,
+        x,
+        *gpu_weights,
+        *gpu_scales,
+        dense0,
+        dense1,
+        suffix_weight,
+        suffix_scales,
+        suffix_biases,
+    )
+    ane0 = fast.qwen35_ane_compile_linear_grouped(
+        dense0, sequence_length, 1, groups
+    )
+    ane1 = fast.qwen35_ane_compile_linear_grouped(
+        dense1, sequence_length, 2, groups
+    )
+    return _DeepseekGroupedShapeState(
+        groups,
+        out_per_group,
+        weight,
+        x,
+        gpu_weights,
+        gpu_scales,
+        ane0,
+        ane1,
+        suffix_weight,
+        suffix_scales,
+        suffix_biases,
+        ane_rows,
+    )
+
+
+def _deepseek_gpu_ms(state: _DeepseekShapeState, repeats: int) -> float:
+    import mlx.core as mx
+
+    return _deepseek_time(
+        lambda: mx.quantized_matmul(
+            state.x,
+            state.gpu_weight,
+            state.gpu_scales,
+            None,
+            transpose=True,
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+        ),
+        repeats,
+    )
+
+
+def _deepseek_grouped_gpu_ms(
+    state: _DeepseekGroupedShapeState, repeats: int
+) -> float:
+    import mlx.core as mx
+
+    def factory() -> Any:
+        return mx.concatenate(
+            [
+                mx.quantized_matmul(
+                    state.x[:, group],
+                    state.gpu_weights[group],
+                    state.gpu_scales[group],
+                    None,
+                    transpose=True,
+                    group_size=32,
+                    bits=8,
+                    mode="mxfp8",
+                )
+                for group in range(state.groups)
+            ],
+            axis=-1,
+        )
+
+    return _deepseek_time(factory, repeats)
+
+
+def _deepseek_grouped_hybrid_ms(
+    fast: Any, state: _DeepseekGroupedShapeState, repeats: int
+) -> float:
+    return _deepseek_time(
+        lambda: fast.qwen35_ane_dual_grouped_affine_qmm_t(
+            state.x,
+            state.suffix_weight,
+            state.suffix_scales,
+            state.suffix_biases,
+            state.ane0,
+            state.ane1,
+            state.groups,
+            8,
+            8,
+            64,
+        ),
+        repeats,
+    )
+
+
+def _deepseek_hybrid_ms(
+    fast: Any,
+    state: _DeepseekShapeState,
+    cpu_fraction: float,
+    cpu_threads: int,
+    cpu_shared_resource: bool,
+    repeats: int,
+) -> float:
+    """Time the same dual-ANE/CPU/GPU primitive used by DeepSeek prefill."""
+    import mlx.core as mx
+
+    cpu_rows = int(state.out_features * cpu_fraction // 64) * 64
+    gpu_start = state.ane_rows + cpu_rows
+    gpu_rows = state.out_features - gpu_start
+    if gpu_rows < 64 or gpu_rows % 64:
+        raise RuntimeError(
+            f"DeepSeek shape {state.name} cannot satisfy CPU/GPU alignment"
+        )
+    cpu_weight = (
+        mx.contiguous(state.weight[state.ane_rows:gpu_start].astype(mx.float16))
+        if cpu_rows
+        else None
+    )
+    suffix_weight, suffix_scales, suffix_biases = mx.quantize(
+        mx.contiguous(state.weight[gpu_start:]), group_size=64, bits=8
+    )
+    suffix_weight = mx.contiguous(suffix_weight)
+    suffix_scales = mx.contiguous(suffix_scales.astype(state.x.dtype))
+    suffix_biases = mx.contiguous(suffix_biases.astype(state.x.dtype))
+    arrays = [suffix_weight, suffix_scales, suffix_biases]
+    if cpu_weight is not None:
+        arrays.append(cpu_weight)
+    mx.eval(*arrays)
+
+    if cpu_weight is None:
+        return _deepseek_time(
+            lambda: fast.qwen35_ane_dual_affine_qmm_t(
+                state.x,
+                suffix_weight,
+                suffix_scales,
+                suffix_biases,
+                state.ane0,
+                state.ane1,
+                8,
+                8,
+                64,
+            ),
+            repeats,
+        )
+    return _deepseek_time(
+        lambda: fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+            state.x,
+            cpu_weight,
+            suffix_weight,
+            suffix_scales,
+            suffix_biases,
+            state.ane0,
+            state.ane1,
+            8,
+            8,
+            64,
+            1,
+            cpu_threads,
+            cpu_shared_resource,
+        ),
+        repeats,
+    )
+
+
+def _deepseek_complete_result(
+    run: ANETuningRun,
+    slot: int,
+    *,
+    detail: str,
+    latency_ms: float,
+    baseline_ms: float,
+    cpu_fraction: float = 0.0,
+    cpu_threads: int | None = None,
+) -> None:
+    _complete_phase(
+        run,
+        slot,
+        detail=detail,
+        latency_ms=latency_ms,
+        mlp_fraction=0.5,
+        cpu_enabled=cpu_fraction > 0,
+        cpu_fraction=cpu_fraction,
+        cpu_threads=cpu_threads,
+    )
+    result = run.results[slot]
+    result["processing_tps"] = round(
+        run.request.sequence_length * 1000.0 / latency_ms, 2
+    )
+    result["speedup_percent"] = round((baseline_ms / latency_ms - 1.0) * 100.0, 2)
+
+
+def _deepseek_shape_tuning_sync(run: ANETuningRun) -> dict[str, Any]:
+    """Calibrate DeepSeek without loading checkpoint weights."""
+    import mlx.core as mx
+
+    from ..custom_kernels.qwen35_prefill import fast
+
+    required = (
+        "qwen35_ane_compile_linear",
+        "qwen35_ane_dual_affine_qmm_t",
+    )
+    if not fast.qwen35_ane_available() or any(
+        not fast.has_symbol(symbol) for symbol in required
+    ):
+        raise RuntimeError("The native ANE/CPU shared runtime is unavailable")
+
+    cpu_runtime_available = fast.has_symbol(
+        "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+    )
+    cpu_shared = bool(
+        run.request.allow_cpu_shared_resource and cpu_runtime_available
+    )
+    if cpu_shared and hasattr(fast, "qwen35_cpu_shared_resource_available"):
+        cpu_shared = bool(fast.qwen35_cpu_shared_resource_available())
+
+    shapes = (
+        ("shared gate/up", 4096, 4096),
+        ("query", 32768, 1024),
+        ("stacked query", 40960, 1024),
+    )
+    states: list[_DeepseekShapeState] = []
+    gpu_times: list[float] = []
+    _set_phase_running(run, 0, "Building exact DeepSeek projection shapes…")
+    for name, out_features, in_features in shapes:
+        run.message = f"Compiling {name} shape without loading the checkpoint…"
+        state = _deepseek_prepare_shape(
+            fast,
+            name,
+            out_features,
+            in_features,
+            run.request.sequence_length,
+        )
+        states.append(state)
+        gpu_times.append(_deepseek_gpu_ms(state, run.request.repeats))
+        run.current += 1
+
+    _set_phase_running(run, 1, "Measuring shared expert on ANE/GPU…")
+    shared_ms = _deepseek_hybrid_ms(
+        fast, states[0], 0.0, 0, False, run.request.repeats
+    )
+    run.current += 1
+
+    _set_phase_running(run, 2, "Searching shared-down ANE shares…")
+    down_trials: list[tuple[float, float, float, float]] = []
+    for fraction in _deepseek_down_fraction_grid():
+        state = _deepseek_prepare_shape(
+            fast,
+            "shared down",
+            4096,
+            2048,
+            run.request.sequence_length,
+            fraction,
+        )
+        gpu_ms = _deepseek_gpu_ms(state, run.request.repeats)
+        hybrid_ms = _deepseek_hybrid_ms(
+            fast, state, 0.0, 0, False, run.request.repeats
+        )
+        down_trials.append((hybrid_ms / gpu_ms, fraction, gpu_ms, hybrid_ms))
+        run.current += 1
+        del state
+        mx.clear_cache()
+    down_ratio, down_fraction, down_gpu_ms, down_measured_ms = min(down_trials)
+    down_enabled = down_ratio < 0.99
+    down_ms = down_gpu_ms * down_ratio if down_enabled else down_gpu_ms
+
+    _set_phase_running(run, 3, "Searching grouped wo_a ANE shares…")
+    grouped_available = all(
+        fast.has_symbol(symbol)
+        for symbol in (
+            "qwen35_ane_compile_linear",
+            "qwen35_ane_dual_grouped_affine_qmm_t",
+        )
+    )
+    wo_a_trials: list[tuple[float, float, float, float]] = []
+    if grouped_available:
+        for fraction in _deepseek_wo_a_fraction_grid():
+            state = _deepseek_prepare_grouped_shape(
+                fast, run.request.sequence_length, fraction
+            )
+            gpu_ms = _deepseek_grouped_gpu_ms(state, run.request.repeats)
+            hybrid_ms = _deepseek_grouped_hybrid_ms(
+                fast, state, run.request.repeats
+            )
+            wo_a_trials.append((hybrid_ms / gpu_ms, fraction, gpu_ms, hybrid_ms))
+            run.current += 1
+            del state
+            mx.clear_cache()
+    else:
+        run.current += len(_deepseek_wo_a_fraction_grid())
+    if wo_a_trials:
+        wo_a_ratio, wo_a_fraction, wo_a_gpu_ms, wo_a_measured_ms = min(
+            wo_a_trials
+        )
+        wo_a_enabled = wo_a_ratio < 0.99
+        wo_a_ms = wo_a_gpu_ms * wo_a_ratio if wo_a_enabled else wo_a_gpu_ms
+    else:
+        wo_a_fraction = 0.5
+        wo_a_gpu_ms = 0.0
+        wo_a_measured_ms = 0.0
+        wo_a_enabled = False
+        wo_a_ms = 0.0
+
+    baseline_ms = sum(gpu_times) + down_gpu_ms + wo_a_gpu_ms
+    _deepseek_complete_result(
+        run,
+        0,
+        detail="Exact-shape GPU projection baseline, including down and wo_a",
+        latency_ms=baseline_ms,
+        baseline_ms=baseline_ms,
+    )
+    shared_total_ms = shared_ms + sum(gpu_times[1:]) + down_gpu_ms + wo_a_gpu_ms
+    _deepseek_complete_result(
+        run,
+        1,
+        detail=f"Shared gate/up · ANE 50% · GPU 50% ({shared_ms:.2f} ms)",
+        latency_ms=shared_total_ms,
+        baseline_ms=baseline_ms,
+    )
+    _deepseek_complete_result(
+        run,
+        2,
+        detail=(
+            f"ANE {down_fraction:.1%} · {down_measured_ms:.2f} ms"
+            if down_enabled
+            else "GPU retained; no split cleared the 1% gain threshold"
+        ),
+        latency_ms=shared_ms + sum(gpu_times[1:]) + down_ms + wo_a_gpu_ms,
+        baseline_ms=baseline_ms,
+    )
+    run.results[2].update(
+        down_enabled=down_enabled,
+        down_fraction=down_fraction,
+    )
+    _deepseek_complete_result(
+        run,
+        3,
+        detail=(
+            f"ANE {wo_a_fraction:.1%} · {wo_a_measured_ms:.2f} ms"
+            if wo_a_enabled
+            else (
+                "GPU retained; grouped runtime unavailable"
+                if not grouped_available
+                else "GPU retained; no split cleared the 1% gain threshold"
+            )
+        ),
+        latency_ms=shared_ms + sum(gpu_times[1:]) + down_ms + wo_a_ms,
+        baseline_ms=baseline_ms,
+    )
+    run.results[3].update(
+        wo_a_enabled=wo_a_enabled,
+        wo_a_fraction=wo_a_fraction,
+    )
+
+    _set_phase_running(run, 4, "Measuring query projections on ANE/GPU…")
+    query_no_cpu = [
+        _deepseek_hybrid_ms(
+            fast, state, 0.0, 0, False, run.request.repeats
+        )
+        for state in states[1:]
+    ]
+    run.current += 2
+    ane_gpu_ms = shared_ms + down_ms + wo_a_ms + sum(query_no_cpu)
+    _deepseek_complete_result(
+        run,
+        4,
+        detail="Query shapes · ANE 50% · GPU 50%",
+        latency_ms=ane_gpu_ms,
+        baseline_ms=baseline_ms,
+    )
+
+    cpu_allowed = (
+        run.request.allow_cpu
+        and cpu_runtime_available
+        and run.request.sequence_length >= 4096
+    )
+    cpu_fractions = _cpu_fraction_grid() if cpu_allowed else [0.0]
+    _set_phase_running(run, 5, "Searching DeepSeek query CPU shares…")
+    fraction_results: list[tuple[float, float]] = []
+    for fraction in cpu_fractions:
+        query_ms = sum(
+            _deepseek_hybrid_ms(
+                fast,
+                state,
+                fraction,
+                _CALIBRATION_CPU_THREADS,
+                cpu_shared,
+                run.request.repeats,
+            )
+            for state in states[1:]
+        )
+        run.current += 2
+        total_ms = shared_ms + down_ms + wo_a_ms + query_ms
+        fraction_results.append((total_ms, fraction))
+        best_ms, best_fraction = min(fraction_results)
+        _preview_phase(
+            run,
+            5,
+            detail=f"Current best · CPU {best_fraction:.1%}",
+            latency_ms=best_ms,
+            cpu_enabled=best_fraction > 0,
+            cpu_fraction=best_fraction,
+        )
+    fraction_ms, best_fraction = min(fraction_results)
+    # Require a real margin over ANE/GPU so measurement noise cannot turn CPU
+    # sharing on. At 2K CPU is excluded before this search by design.
+    if fraction_ms >= ane_gpu_ms * 0.99:
+        best_fraction = 0.0
+        fraction_ms = ane_gpu_ms
+    _deepseek_complete_result(
+        run,
+        5,
+        detail=(
+            f"CPU {best_fraction:.1%} · ANE 50% · "
+            f"GPU {1.0 - 0.5 - best_fraction:.1%}"
+            if best_fraction
+            else (
+                "CPU excluded below 4K"
+                if run.request.allow_cpu and run.request.sequence_length < 4096
+                else (
+                    "CPU sharing is unavailable in this native runtime"
+                    if run.request.allow_cpu and not cpu_runtime_available
+                    else "CPU did not clear the 1% gain threshold"
+                )
+            )
+        ),
+        latency_ms=fraction_ms,
+        baseline_ms=baseline_ms,
+        cpu_fraction=best_fraction,
+        cpu_threads=_CALIBRATION_CPU_THREADS,
+    )
+
+    _set_phase_running(run, 6, "Calibrating CPU workers…")
+    best_threads = _CALIBRATION_CPU_THREADS
+    worker_ms = fraction_ms
+    if best_fraction:
+        worker_results: list[tuple[float, int]] = []
+        for threads in _cpu_thread_grid():
+            query_ms = sum(
+                _deepseek_hybrid_ms(
+                    fast,
+                    state,
+                    best_fraction,
+                    threads,
+                    cpu_shared,
+                    run.request.repeats,
+                )
+                for state in states[1:]
+            )
+            run.current += 2
+            worker_results.append(
+                (shared_ms + down_ms + wo_a_ms + query_ms, threads)
+            )
+        worker_ms, best_threads = min(worker_results)
+        worker_detail = f"{best_threads} workers"
+    else:
+        worker_detail = "Skipped because CPU offload was not selected"
+    _deepseek_complete_result(
+        run,
+        6,
+        detail=worker_detail,
+        latency_ms=worker_ms,
+        baseline_ms=baseline_ms,
+        cpu_fraction=best_fraction,
+        cpu_threads=best_threads,
+    )
+
+    winner_ms = min(worker_ms, ane_gpu_ms)
+    if winner_ms >= baseline_ms * 0.99:
+        enabled = False
+        winner_ms = baseline_ms
+        best_fraction = 0.0
+    else:
+        enabled = True
+        if worker_ms >= ane_gpu_ms * 0.99:
+            best_fraction = 0.0
+            winner_ms = ane_gpu_ms
+    _deepseek_complete_result(
+        run,
+        7,
+        detail=(
+            "Enable exact-shape DeepSeek ANE offload"
+            if enabled
+            else "Keep GPU-only prompt processing"
+        ),
+        latency_ms=winner_ms,
+        baseline_ms=baseline_ms,
+        cpu_fraction=best_fraction,
+        cpu_threads=best_threads,
+    )
+    run.results[7].update(
+        down_enabled=bool(enabled and down_enabled),
+        down_fraction=down_fraction,
+        wo_a_enabled=bool(enabled and wo_a_enabled),
+        wo_a_fraction=wo_a_fraction,
+    )
+
+    if hasattr(mx, "clear_cache"):
+        mx.clear_cache()
+    projection_tps = run.request.sequence_length * 1000.0 / winner_ms
+    return {
+        "model_family": "deepseek_v4",
+        "enabled": enabled,
+        "cpu_enabled": bool(enabled and best_fraction > 0),
+        "cpu_fraction": best_fraction,
+        "cpu_threads": best_threads,
+        "cpu_shared_resource": cpu_shared,
+        "down_enabled": bool(enabled and down_enabled),
+        "down_fraction": down_fraction,
+        "wo_a_enabled": bool(enabled and wo_a_enabled),
+        "wo_a_fraction": wo_a_fraction,
+        "projection_gpu_ms": {
+            "deepseek_down": down_gpu_ms,
+            "deepseek_wo_a": wo_a_gpu_ms,
+        },
+        "processing_tps": round(projection_tps, 2),
+        "speedup_percent": round((baseline_ms / winner_ms - 1.0) * 100.0, 2),
+        "sequence_length": run.request.sequence_length,
+        "tail_padding_min_tokens": 0,
+        "full_model_verified": False,
+        "measurement_scope": "exact_projection_shapes",
+    }
+
+
+async def _run_deepseek_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    """Run bounded shape tuning, optionally followed by a huge model load."""
+    from omlx.engine_core import get_mlx_executor
+
+    previous_speed_priority = _pin_speed_priority(engine_pool)
+    try:
+        loop = asyncio.get_running_loop()
+        run.recommendation = await loop.run_in_executor(
+            get_mlx_executor(), _deepseek_shape_tuning_sync, run
+        )
+
+        if run.request.verify_full_model:
+            settings_manager = getattr(engine_pool, "_settings_manager", None)
+            if settings_manager is None:
+                raise RuntimeError("Model settings are unavailable")
+            base_settings = settings_manager.get_settings(run.request.model_id)
+            run.phase = "unloading"
+            run.message = "Unloading models for opt-in full-model verification…"
+            for model_id in list(engine_pool.get_loaded_model_ids()):
+                await engine_pool._unload_engine(model_id)
+
+            baseline_candidate = _Candidate("Full-model GPU baseline", False)
+            baseline = await _measure_candidate(
+                run, engine_pool, base_settings, baseline_candidate
+            )
+            baseline.update(state="completed", stage="verification")
+            run.results[8] = {**run.results[8], **baseline}
+            run.current += 1
+
+            recommendation = run.recommendation
+            candidate = _Candidate(
+                "Full-model recommendation",
+                bool(recommendation["enabled"]),
+                cpu_enabled=bool(recommendation["cpu_enabled"]),
+                cpu_fraction=float(recommendation["cpu_fraction"]),
+                cpu_threads=int(recommendation["cpu_threads"]),
+                deepseek_down_enabled=bool(recommendation["down_enabled"]),
+                deepseek_down_fraction=float(recommendation["down_fraction"]),
+                deepseek_wo_a_enabled=bool(recommendation["wo_a_enabled"]),
+                deepseek_wo_a_fraction=float(recommendation["wo_a_fraction"]),
+            )
+            measured = await _measure_candidate(
+                run, engine_pool, base_settings, candidate
+            )
+            measured.update(state="completed", stage="verification")
+            measured["speedup_percent"] = round(
+                (measured["processing_tps"] / baseline["processing_tps"] - 1.0)
+                * 100.0,
+                2,
+            )
+            run.results[9] = {**run.results[9], **measured}
+            run.current += 1
+
+            refined_candidate = _deepseek_profile_refinement(
+                candidate,
+                measured,
+                recommendation.get("projection_gpu_ms") or {},
+            )
+            if refined_candidate == replace(
+                candidate, label="Profile-refined recommendation"
+            ):
+                refined = {
+                    **measured,
+                    "label": refined_candidate.label,
+                    "samples": list(measured["samples"]),
+                }
+            else:
+                refined = await _measure_candidate(
+                    run, engine_pool, base_settings, refined_candidate
+                )
+            refined.update(state="completed", stage="verification")
+            refined["speedup_percent"] = round(
+                (refined["processing_tps"] / baseline["processing_tps"] - 1.0)
+                * 100.0,
+                2,
+            )
+            run.results[10] = {**run.results[10], **refined}
+            run.current += 1
+
+            best_candidate, best_result = max(
+                ((candidate, measured), (refined_candidate, refined)),
+                key=lambda item: item[1]["processing_tps"],
+            )
+            if best_result["speedup_percent"] < 1.0:
+                recommendation.update(
+                    enabled=False,
+                    cpu_enabled=False,
+                    cpu_fraction=0.0,
+                    down_enabled=False,
+                    wo_a_enabled=False,
+                    processing_tps=baseline["processing_tps"],
+                    speedup_percent=0.0,
+                )
+            else:
+                recommendation.update(
+                    cpu_enabled=best_candidate.cpu_enabled,
+                    cpu_fraction=float(best_candidate.cpu_fraction or 0.0),
+                    down_enabled=best_candidate.deepseek_down_enabled is not False,
+                    down_fraction=float(
+                        best_candidate.deepseek_down_fraction or 0.65
+                    ),
+                    wo_a_enabled=best_candidate.deepseek_wo_a_enabled is not False,
+                    wo_a_fraction=float(
+                        best_candidate.deepseek_wo_a_fraction or 0.5
+                    ),
+                    processing_tps=best_result["processing_tps"],
+                    speedup_percent=best_result["speedup_percent"],
+                )
+            recommendation["full_model_verified"] = True
+            recommendation["measurement_scope"] = "full_model"
+
+        run.status = "completed"
+        run.phase = "completed"
+        run.current = run.total
+        run.message = "DeepSeek tuning complete"
+    except asyncio.CancelledError:
+        run.status = "cancelled"
+        run.phase = "cancelled"
+        run.message = "Tuning cancelled"
+        running = next(
+            (result for result in run.results if result["state"] == "running"), None
+        )
+        if running is not None:
+            running["state"] = "cancelled"
+            running["error"] = "Cancelled by user"
+        run.termination_reason = (
+            f"Cancelled by user after {run.current} of {run.total} tests completed."
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("DeepSeek ANE tuning failed for %s", run.request.model_id)
+        run.status = "error"
+        run.phase = "error"
+        run.error_message = _exception_reason(exc)
+        running = next(
+            (result for result in run.results if result["state"] == "running"), None
+        )
+        if running is not None:
+            running["state"] = "failed"
+            running["error"] = run.error_message
+        run.termination_reason = (
+            f"Stopped after {run.current} of {run.total} tests: "
+            f"{run.error_message}"
+        )
+        run.message = "DeepSeek tuning stopped early"
+    finally:
+        _restore_speed_priority(engine_pool, previous_speed_priority)
+
+
 async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    if run.request.model_family == "deepseek_v4":
+        await _run_deepseek_tuning(run, engine_pool)
+        return
+
     # The serve path skips ANE gracefully when the private runtime is
     # missing, but the tuner used to find out only deep inside the
     # bank-split ladder — failing the run and leaving the model unloaded

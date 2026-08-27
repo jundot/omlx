@@ -121,6 +121,8 @@ def test_model_settings_feature_labels_use_i18n_keys():
     assert "{{ t('modal.model_settings.reasoning_parser') }}" in modal_html
     assert "{{ t('modal.model_settings.specprefill') }}" in modal_html
     assert "{{ t('modal.model_settings.dflash') }}" in modal_html
+    assert "{{ t('modal.model_settings.mtp_draft_depth') }}" in modal_html
+    assert "{{ t('modal.model_settings.mtp_draft_depth_hint') }}" in modal_html
     assert "{{ t('status.active_models.dflash_label') }}" in status_html
 
     assert ">Reasoning Parser</label>" not in modal_html
@@ -136,6 +138,8 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.reasoning_parser",
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
+        "modal.model_settings.mtp_draft_depth",
+        "modal.model_settings.mtp_draft_depth_hint",
         "status.active_models.dflash_label",
         "modal.model_settings.qwen_ane",
         "modal.model_settings.qwen_ane_hint",
@@ -166,6 +170,11 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_preparing",
         "modal.model_settings.qwen_ane_tune_test",
         "modal.model_settings.qwen_ane_tune_throughput",
+        "modal.model_settings.deepseek_ane",
+        "modal.model_settings.deepseek_ane_hint",
+        "modal.model_settings.deepseek_ane_cache_hint",
+        "modal.model_settings.deepseek_ane_cpu",
+        "modal.model_settings.deepseek_ane_cpu_hint",
         "modal.model_settings.qwen_ane_tail_padding",
     }
 
@@ -202,6 +211,17 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     assert 'placeholder="0.53"' in html
     assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
+
+
+def test_mtp_draft_depth_is_wired_through_dashboard():
+    html = _model_settings_template()
+    script = _dashboard_script()
+
+    assert 'x-model.number="modelSettings.mtp_num_draft_tokens"' in html
+    assert 'min="1" max="8" step="1"' in html
+    assert "'mtp_num_draft_tokens'" in script
+    assert "mtp_num_draft_tokens: s.mtp_num_draft_tokens ?? 3" in script
+    assert "mtp_num_draft_tokens: this.modelSettings.mtp_enabled" in script
 
 
 def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
@@ -260,6 +280,28 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "recommendation.cpu_shared_resource" in script
     assert "if (result?.processing_tps === null" in script
     assert "result?.latency_ms !== null" in script
+
+
+def test_deepseek_ane_tuner_is_bounded_by_default_and_full_model_is_opt_in():
+    html = _model_settings_template()
+    script = _dashboard_script()
+
+    assert "startANETuning('deepseek_v4')" in html
+    assert 'x-model="aneTuningOverrides.verifyDeepseekFullModel"' in html
+    assert "deepseek_ane_tune_verify_hint" in html
+    assert "model_family: modelFamily" in script
+    assert "verify_full_model: deepseek" in script
+    assert "deepseek_ane_prefill_enabled: !!recommendation.enabled" in script
+    assert "deepseek_ane_prefill_tail_padding_min_tokens" in html
+    assert "deepseek_ane_prefill_tail_padding_min_tokens: Number(" in script
+    assert "validateDeepseekAneSettings()" in script
+    assert "DeepSeek ANE tail padding threshold must be zero" in script
+    assert "deepseek_ane_prefill_cpu_fraction: Number(" in script
+    assert "deepseek_ane_prefill_down_enabled:" in script
+    assert "deepseek_ane_prefill_down_fraction: Number(" in script
+    assert "deepseek_ane_prefill_wo_a_enabled:" in script
+    assert "deepseek_ane_prefill_wo_a_fraction: Number(" in script
+    assert "recommendation.model_family === 'deepseek_v4'" in script
 
 
 def test_qwen_ane_arbitrary_inputs_are_validated_before_save():

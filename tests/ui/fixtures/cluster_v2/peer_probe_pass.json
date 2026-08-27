@@ -1,0 +1,25 @@
+{
+  "_comment": "POST /admin/api/cluster/peer-probe happy-path response; drives the SSH and rdma_ctl check rows.",
+  "ssh_reachable": true,
+  "status": {
+    "node": {
+      "hostname": "studio-2",
+      "accelerator": "metal",
+      "chip_name": "M3 Ultra",
+      "physical_memory_bytes": 549755813888,
+      "distributed_backends": ["jaccl", "ring"]
+    },
+    "runtime": {
+      "python_executable": "/Users/dev/omlx/.venv/bin/python",
+      "omlx_version": "0.6.1",
+      "runtime_compatible": true
+    },
+    "transport": {
+      "rdma": {
+        "devices": ["rdma0", "rdma1"],
+        "addresses": {"rdma0": "169.254.10.2", "rdma1": "169.254.20.2"},
+        "network_interfaces": {"rdma0": "bridge100", "rdma1": "bridge101"}
+      }
+    }
+  }
+}

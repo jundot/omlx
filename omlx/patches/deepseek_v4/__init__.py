@@ -137,18 +137,67 @@ def _probe_native_indexer_kernels() -> None:
     into a long prefill. Surface availability (and the rebuild fix) once at
     patch time instead.
     """
+    probe_error: Exception | None = None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        import mlx.core as mx
 
-        have = glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
-            "dsa_topk_indices"
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.patches.deepseek_v4.indexer_dispatch import (
+            disable_native_indexer,
+            mark_native_indexer_proven,
+            native_indexer_available,
         )
-    except Exception:
+
+        have = native_indexer_available()
+        if have:
+            # Tiny real dispatch, not a symbol-only ABI check.  P=513 crosses
+            # the DS4 top-512 eligibility boundary while keeping the probe
+            # below 100 KiB.  Evaluating both outputs catches stale metallibs
+            # and command-buffer failures before admission relies on the fused
+            # path's low-memory shape.
+            queries = mx.zeros((1, 64, 2, 128), dtype=mx.bfloat16)
+            keys = mx.zeros((1, 1, 513, 128), dtype=mx.bfloat16)
+            weights = mx.zeros((1, 2, 64), dtype=mx.bfloat16)
+            scores = glm_fast.dsa_indexer_scores(
+                queries,
+                keys,
+                weights,
+                causal=False,
+            )
+            indices = glm_fast.dsa_topk_indices(
+                scores,
+                512,
+                bucketed=False,
+            )
+            mx.eval(scores, indices)
+            if tuple(scores.shape) != (1, 1, 2, 513) or tuple(indices.shape) != (
+                1,
+                1,
+                2,
+                512,
+            ):
+                raise RuntimeError("native indexer probe returned an invalid shape")
+            mark_native_indexer_proven()
+            del indices, scores, weights, keys, queries
+            mx.clear_cache()
+    except Exception as exc:
         have = False
+        probe_error = exc
+        try:
+            disable_native_indexer()
+        except Exception:
+            pass
     if have:
         logger.info(
-            "deepseek_v4: native indexer kernels available "
+            "deepseek_v4: native indexer kernels runtime-proven "
             "(dsa_indexer_scores/dsa_topk_indices)"
+        )
+    elif probe_error is not None:
+        logger.warning(
+            "deepseek_v4: native indexer runtime probe failed; the indexer "
+            "and long-context admission will use the conservative MLX "
+            "fallback: %s",
+            probe_error,
         )
     else:
         logger.warning(

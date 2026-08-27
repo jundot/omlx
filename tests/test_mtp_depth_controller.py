@@ -14,7 +14,36 @@ duty bound on heavy models.
 import math
 import random
 
-from omlx.patches.mlx_lm_mtp.batch_generator import _DepthController
+from omlx.patches.mlx_lm_mtp.batch_generator import (
+    _DepthController,
+    _LockstepAcceptanceDepthController,
+)
+
+
+def test_lockstep_acceptance_controller_has_no_warmup_or_clock_input():
+    controller = _LockstepAcceptanceDepthController(5)
+    assert controller.cur == 5
+    controller.observe(5, 2, 999999.0)
+    assert controller.cur == 3
+    controller.observe(3, 3, 0.001)
+    assert controller.cur == 4
+    controller.observe(4, 4, 123.0, time_sample=False)
+    assert controller.cur == 5
+    controller.observe(5, 0, 1.0)
+    assert controller.cur == 1
+    assert not controller.should_exit()
+
+
+def test_lockstep_acceptance_controller_replays_identically_on_every_rank():
+    left = _LockstepAcceptanceDepthController(5)
+    right = _LockstepAcceptanceDepthController(5)
+    accepted_counts = (5, 5, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5)
+    for cycle, accepted in enumerate(accepted_counts):
+        used = left.cur
+        accepted = min(accepted, used)
+        left.observe(used, accepted, cycle * 1000.0)
+        right.observe(used, accepted, cycle * 0.001)
+        assert left.cur == right.cur
 
 
 def _simulate(controller, cycles, p_by_depth, ms_by_depth, seed=0):

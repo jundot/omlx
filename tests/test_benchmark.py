@@ -2134,6 +2134,41 @@ class TestRunExternalBenchmark:
 
 
 class TestAneBenchmarkTrace:
+    def test_summary_accounts_for_padded_ane_tail_and_deepseek_categories(
+        self, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            summary = _log_ane_benchmark_trace(
+                pp_len=3001,
+                prefill_duration_s=1.0,
+                config={
+                    "sequence_length": 4096,
+                    "tail_padding_min_tokens": 2048,
+                    "profile_layers": {"deepseek_wo_a": 2},
+                },
+                profile={
+                    "deepseek_wo_a": {
+                        "operations": 2,
+                        "padded_operations": 2,
+                        "logical_tokens": 6000,
+                        "padded_tokens": 2192,
+                    }
+                },
+                scheduler_trace={"chunk_tokens": [3000]},
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        aggregate = next(m for m in messages if "[benchmark-ane-summary]" in m)
+        assert "full_ane_tiles=0" in aggregate
+        assert "padded_ane_tiles=1" in aggregate
+        assert "logical_padded_tokens=3000" in aggregate
+        assert "padding_tokens=1096" in aggregate
+        assert "gpu_tail_tokens=0" in aggregate
+        category = next(m for m in messages if "category=deepseek_wo_a" in m)
+        assert "expected_operations=2" in category
+        assert "padded_operations=2" in category
+        assert summary["expected_padded_shapes"] == 1
+
     def test_summary_reports_observed_scheduler_calls_not_implied_prompt_width(
         self, caplog
     ):

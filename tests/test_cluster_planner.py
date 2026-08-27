@@ -14,10 +14,54 @@ from omlx.cluster.planner import (
     apply_pipeline_assignment,
     inspect_safetensors_layout,
     plan_unequal_pipeline,
+    recommend_tensor_shard_weights,
     synthetic_model_layout,
 )
+from omlx.cluster.performance import NodePerformanceProfile
 
 GIB = 1024**3
+
+
+def _tp_profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
+    return NodePerformanceProfile(
+        node_id=node_id,
+        rank=rank,
+        decode_weight_bytes_per_second=rate,
+        prefill_weight_bytes_per_second=rate,
+        collective_latency_seconds=0.001,
+        collective_bandwidth_bytes_per_second=10_000,
+        backend="jaccl",
+        measured_at="2026-08-24T12:00:00+00:00",
+        samples=5,
+    )
+
+
+def test_tp_recommendation_nominates_but_does_not_activate_heterogeneous_rows():
+    model = ModelLayout(
+        source="recommendation",
+        fixed_weight_bytes=100,
+        layer_weight_bytes=(8_000, 8_000),
+        tensor_parallel_heads=8,
+        tensor_parallel_divisors=(8,),
+        tensor_parallel_shard_units=8,
+        supports_tensor_parallel=True,
+    )
+    nodes = [
+        NodeBudget(
+            "m3",
+            1_000_000,
+            rank=0,
+            performance=_tp_profile("m3", 0, 100.0),
+        ),
+        NodeBudget(
+            "m5",
+            1_000_000,
+            rank=1,
+            performance=_tp_profile("m5", 1, 200.0),
+        ),
+    ]
+
+    assert recommend_tensor_shard_weights(model, nodes) == (3, 5)
 
 
 def _write_safetensors(path, tensors):

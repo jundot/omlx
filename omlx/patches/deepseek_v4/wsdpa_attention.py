@@ -11,7 +11,9 @@ necessary FLOPs (measured 39-48 ms per layer-call at L=2048, head_dim=512).
 This module computes the identical math with a single fused Metal kernel that
 visits only visible rows (fp32 online softmax in fixed row order, sink in the
 denominator). Any setup/runtime failure permanently falls back to the stock
-path; OMLX_DSV4_WSDPA=0 disables the kernel outright.
+path; OMLX_DSV4_WSDPA=0 disables the kernel outright. TP=2's equal 32/32 and
+measured heterogeneous 40/24 head shards use the same kernel only for query
+widths >=1024; OMLX_DSV4_WSDPA_TP=0 is an independent rollback for that route.
 """
 
 import logging
@@ -22,6 +24,8 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _ENABLED = os.environ.get("OMLX_DSV4_WSDPA", "1") == "1"
+_TP_ENABLED = os.environ.get("OMLX_DSV4_WSDPA_TP", "1") == "1"
+_TP_MIN_QUERY = 1024
 _kernel = None
 _broken = False
 _ready = False
@@ -32,6 +36,18 @@ def _wsdpa_route_enabled(*, topk: bool = False) -> bool:
     if _broken or not _ENABLED:
         return False
     return not topk or _TOPK_ENABLED
+
+
+def _supported_head_shape(heads: int, query_tokens: int) -> bool:
+    """Exact DS4 full-head or validated TP2 WSDPA geometries."""
+
+    if heads == 64:
+        return True
+    return bool(
+        _TP_ENABLED
+        and heads in (24, 32, 40)
+        and query_tokens >= _TP_MIN_QUERY
+    )
 
 
 def wsdpa_prefill_route_active(*, topk: bool = False) -> bool:
@@ -60,7 +76,7 @@ _SOURCE = """
     // scalep: fp32  [1] = scale
     // out:    [H, L, D]  bf16
     //
-    // grid (16, L): gx = head-group (4 heads), gy = query row.
+    // grid (H/4, L): gx = head-group (4 heads), gy = query row.
     // threadgroup 128 threads = 4 simdgroups, one head per simdgroup.
     // No threadgroup staging: rows are read directly (L2-resident at these
     // sizes); zero barriers measurably beats staged variants (13.7 vs 17.3ms).
@@ -290,7 +306,7 @@ def wsdpa_prefill(
     if (
         q.dtype != mx.bfloat16
         or q.shape[0] != 1
-        or q.shape[1] != 64
+        or not _supported_head_shape(q.shape[1], q.shape[2])
         or q.shape[3] != 512
     ):
         return None
@@ -314,7 +330,7 @@ def wsdpa_prefill(
         scalep = mx.array([scale], dtype=mx.float32)
         out = kfn(
             inputs=[qc, kvc, pol, sinks, params, scalep],
-            grid=(16 * 128, q_len, 1),
+            grid=((heads // 4) * 128, q_len, 1),
             threadgroup=(128, 1, 1),
             output_shapes=[(heads, q_len, head_dim)],
             output_dtypes=[mx.bfloat16],
@@ -324,6 +340,12 @@ def wsdpa_prefill(
             # Evaluate the first dispatch inside this fallback boundary.
             mx.eval(out)
             _ready = True
+            logger.info(
+                "DSV4 WSDPA prefill active: heads=%s query_tokens=%s ratio=%s",
+                heads,
+                q_len,
+                ratio,
+            )
         return out[None]
     except Exception:
         _broken = True
@@ -353,7 +375,7 @@ def wsdpa_topk_prefill(
     if (
         q.dtype != mx.bfloat16
         or q.shape[0] != 1
-        or q.shape[1] != 64
+        or not _supported_head_shape(q.shape[1], q.shape[2])
         or q.shape[3] != 512
         or topk.dtype != mx.uint32
         or topk.ndim != 3
@@ -391,7 +413,7 @@ def wsdpa_topk_prefill(
                 params,
                 scalep,
             ],
-            grid=(16 * 128, q_len, 1),
+            grid=((heads // 4) * 128, q_len, 1),
             threadgroup=(128, 1, 1),
             output_shapes=[(heads, q_len, head_dim)],
             output_dtypes=[mx.bfloat16],
@@ -401,6 +423,14 @@ def wsdpa_topk_prefill(
             # that this independent top-k route is usable.
             mx.eval(out)
             _topk_ready = True
+            logger.info(
+                "DSV4 sparse WSDPA prefill active: heads=%s query_tokens=%s "
+                "ratio=%s topk=%s",
+                heads,
+                q_len,
+                ratio,
+                topk.shape[2],
+            )
         return out[None]
     except Exception:
         _broken = True

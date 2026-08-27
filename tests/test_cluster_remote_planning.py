@@ -338,18 +338,36 @@ def test_the_peer_is_given_the_path_and_not_a_command(monkeypatch):
     assert seen == hostile, "the peer must receive the path, not its output"
 
 
-def test_the_remote_interpreter_path_still_expands_on_the_peer(monkeypatch):
-    captured = {}
+def test_the_remote_interpreter_is_discovered_on_the_peer_not_assumed(monkeypatch):
+    """No built-in remote path may ship: one machine's checkout layout is
+    another peer's 404. With no carried interpreter, run_remote_python finds
+    the peer's own over SSH before running the snippet."""
+
+    from omlx.cluster import launch
+
+    monkeypatch.setattr(launch, "_RESOLVED_REMOTE_PYTHON", {})
+    captured = []
 
     def fake_subprocess_run(argv, **kwargs):
-        captured["command"] = argv[-1]
-        return _Completed(stdout="[]")
+        command = argv[-1]
+        captured.append(command)
+        if "import os,omlx" in command or "import sys,omlx" in command:
+            # Discovery probe: only the peer's own oMLX install answers.
+            if command.startswith("/opt/omlx/bin/python"):
+                return _Completed(stdout="/opt/omlx/bin/python\n")
+            return _Completed(returncode=127, stderr="not found")
+        return _Completed(stdout="1")
 
     monkeypatch.setattr(staging.subprocess, "run", fake_subprocess_run)
 
     staging.run_remote_python("studio", "print(1)", "/m", description="test")
 
-    assert captured["command"].startswith("~/omlx-distributed/.venv/bin/python -c ")
+    assert captured[-1].startswith("/opt/omlx/bin/python -c "), (
+        "the discovered, shell-quoted absolute path runs the snippet"
+    )
+    assert any("import os,omlx" in c or "import sys,omlx" in c for c in captured), (
+        "an unknown interpreter is discovered over SSH first"
+    )
 
 
 def _plan_cli(model_root, *extra):

@@ -841,7 +841,12 @@ def test_step_prefill_reclaims_before_first_guard():
         total_length=4,
     )
     ns = SimpleNamespace(
-        config=SimpleNamespace(prefill_step_size=2, model_name=""),
+        config=SimpleNamespace(
+            prefill_step_size=2,
+            completion_batch_size=1,
+            max_num_batched_tokens=2,
+            model_name="",
+        ),
         _stream="stream",
         _memory_limit_bytes=0,
         _glm_dsa_adaptive_prefill=None,
@@ -861,6 +866,9 @@ def test_step_prefill_reclaims_before_first_guard():
         "_prefill_step_size_for_progress",
         "_base_prefill_step_size",
         "_contended_prefill_cap",
+        "_active_decode_rows",
+        "_base_contended_prefill_quantum",
+        "_mixed_batch_budget",
         "_decode_contention",
         "_others_decoding",
         "_should_clear_after_chunk",

@@ -92,6 +92,26 @@ final class UpdateInstallerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: missingStaged.path))
     }
 
+    func testFailedUpdatedAppRelaunchRollsBackToPreviousBundle() throws {
+        let live = try makeBundle(name: "oMLX.app", marker: "old")
+        let staged = try makeBundle(
+            name: UpdateInstaller.stagedAppName,
+            marker: "new"
+        )
+
+        try UpdateInstaller.replaceAndRelaunch(
+            liveApp: live,
+            stagedApp: staged,
+            relaunchAction: { app in
+                if try self.marker(in: app) == "new" {
+                    throw CocoaError(.executableNotLoadable)
+                }
+            }
+        )
+        XCTAssertEqual(try marker(in: live), "old")
+        XCTAssertEqual(try marker(in: staged), "new")
+    }
+
     func testWaitForProcessExitObservesIndependentProcess() throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sleep")
@@ -102,6 +122,53 @@ final class UpdateInstallerTests: XCTestCase {
             UpdateInstaller.waitForProcessExit(
                 process.processIdentifier,
                 timeout: 2
+            )
+        )
+    }
+
+    func testUpdaterMountKeepsImageVerificationEnabled() {
+        let dmg = URL(fileURLWithPath: "/tmp/oMLX release.dmg")
+        let arguments = AppUpdater.mountArguments(dmg)
+
+        XCTAssertTrue(arguments.contains("-readonly"))
+        XCTAssertFalse(arguments.contains("-noverify"))
+        XCTAssertEqual(arguments.last, dmg.path)
+    }
+
+    func testUpdaterAssessesDiskImageAsPrimarySignature() {
+        let dmg = URL(fileURLWithPath: "/tmp/oMLX.dmg")
+        XCTAssertEqual(
+            AppUpdater.diskImageAssessmentArguments(dmg),
+            [
+                "--assess", "--type", "open", "--verbose=2",
+                "--context", "context:primary-signature", dmg.path,
+            ]
+        )
+    }
+
+    func testDeveloperIDRequirementPinsBundleTeamAndCertificateClass() throws {
+        let requirement = try AppUpdater.developerIDRequirement(
+            for: .init(bundleIdentifier: "app.omlx", teamIdentifier: "AB12CD34EF")
+        )
+
+        XCTAssertTrue(requirement.contains("identifier \"app.omlx\""))
+        XCTAssertTrue(requirement.contains("subject.OU] = \"AB12CD34EF\""))
+        XCTAssertTrue(requirement.contains("1.2.840.113635.100.6.1.13"))
+        XCTAssertTrue(requirement.contains("1.2.840.113635.100.6.2.6"))
+    }
+
+    func testDeveloperIDRequirementRejectsInjectedIdentityValues() {
+        XCTAssertThrowsError(
+            try AppUpdater.developerIDRequirement(
+                for: .init(
+                    bundleIdentifier: "app.omlx\" or true",
+                    teamIdentifier: "AB12CD34EF"
+                )
+            )
+        )
+        XCTAssertThrowsError(
+            try AppUpdater.developerIDRequirement(
+                for: .init(bundleIdentifier: "app.omlx", teamIdentifier: "not-a-team")
             )
         )
     }

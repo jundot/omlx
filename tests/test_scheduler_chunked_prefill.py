@@ -408,6 +408,83 @@ class TestMiniMaxM3AdaptiveChunkedPrefill:
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek V4 prefill floor (machine-probed 4096 chunk floor)
+# ---------------------------------------------------------------------------
+
+
+class TestDS4PrefillFloor:
+    """End-to-end chunked-prefill chunk sizes for the deepseek_v4 floor.
+
+    get_system_memory is patched in every test so the suite is deterministic
+    on any machine (the probe grants the floor at >= 64 GiB).
+    """
+
+    @staticmethod
+    def _patch_system_memory(monkeypatch, gib: int):
+        monkeypatch.setattr(
+            "omlx.settings.get_system_memory", lambda: gib * 1024**3
+        )
+
+    def test_ds4_prefill_chunk_floored_to_4096(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+
+        sched, model = _make_recording_scheduler("deepseek_v4")
+        assert sched._ds4_prefill_floor == 4096
+        req = _make_request("ds4", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_ds4_prefill_chunk_default_2048_without_headroom(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 32)
+
+        sched, model = _make_recording_scheduler("deepseek_v4")
+        assert sched._ds4_prefill_floor == 0
+        req = _make_request("ds4-small", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+    def test_ds4_floor_composes_with_block_boundary_clamp(self, monkeypatch):
+        """Paged-cache boundary snapshots still clamp chunks to the 2048 block.
+
+        With boundary_enabled + block_size=2048 (the PoolingCache paged-cache
+        configuration), a floored 4096 chunk is clamped to the next block
+        boundary, so snapshots fire exactly on boundaries. The floor only
+        lifts chunks in the non-paged path.
+        """
+        self._patch_system_memory(monkeypatch, 256)
+
+        sched, model = _make_recording_scheduler("deepseek_v4")
+        assert sched._ds4_prefill_floor == 4096
+        req = _make_request("ds4-boundary", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
+        state.boundary_enabled = True
+        state.block_size = 2048
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            with patch.object(
+                sched, "_emit_prefill_boundary_snapshot"
+            ) as emit:
+                done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+        emit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # reset() clears prefilling
 # ---------------------------------------------------------------------------
 

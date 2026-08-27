@@ -1,11 +1,11 @@
 // In-place auto-updater.
 //
-// Flow: download .dmg → hdiutil attach → copy the inner oMLX.app next to
-// the running bundle as `.oMLX-update.app` → hdiutil detach → on
-// confirmation, register a one-shot launchd worker that waits for our PID
-// to exit, atomically swaps the staged bundle into place, strips the
-// quarantine xattr, and `open`s the new bundle. No EdDSA signature check —
-// Apple's notarization stapled to the DMG is the trust boundary.
+// Flow: download .dmg → Gatekeeper-assess the notarized image → mount with
+// image verification enabled → validate the inner app's stapled ticket and
+// Developer ID requirement against the running app's team → copy it next to
+// the running bundle as `.oMLX-update.app` → validate the copy again → on
+// confirmation, atomically swap and relaunch. The downloaded payload never
+// becomes executable merely because it came from a GitHub release URL.
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk. A staged copy that's already on disk gets
@@ -13,6 +13,7 @@
 
 import AppKit
 import Foundation
+import Security
 
 @MainActor
 final class AppUpdater {
@@ -21,6 +22,7 @@ final class AppUpdater {
         case downloadFailed(String)
         case mountFailed(String)
         case appNotFoundInVolume
+        case verificationFailed(String)
         case stageFailed(String)
         case cancelled
 
@@ -31,6 +33,7 @@ final class AppUpdater {
             case .downloadFailed(let m): return "Download failed: \(m)"
             case .mountFailed(let m): return "Could not mount DMG: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
+            case .verificationFailed(let m): return "Update verification failed: \(m)"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
             case .cancelled: return "Update cancelled"
             }
@@ -143,6 +146,7 @@ final class AppUpdater {
 
         let mountPoint: URL
         do {
+            try Self.validateDiskImage(dmgPath)
             mountPoint = try mountDMG(at: dmgPath)
         } catch let err as UpdateError {
             onError(err); return
@@ -157,10 +161,16 @@ final class AppUpdater {
 
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
         do {
-            try stageApp(fromMount: mountPoint, to: stagedApp)
+            let identity = try Self.expectedUpdateIdentity()
+            let appInVolume = try findAppInVolume(mountPoint)
+            try Self.validateApplication(appInVolume, expected: identity)
+            try stageApp(appInVolume, to: stagedApp)
+            try Self.validateApplication(stagedApp, expected: identity)
         } catch let err as UpdateError {
+            try? FileManager.default.removeItem(at: stagedApp)
             onError(err); return
         } catch {
+            try? FileManager.default.removeItem(at: stagedApp)
             onError(.stageFailed(error.localizedDescription)); return
         }
 
@@ -290,10 +300,34 @@ final class AppUpdater {
 
     // MARK: - Mount / unmount
 
+    nonisolated static func diskImageAssessmentArguments(_ dmg: URL) -> [String] {
+        [
+            "--assess", "--type", "open", "--verbose=2",
+            "--context", "context:primary-signature", dmg.path,
+        ]
+    }
+
+    nonisolated static func mountArguments(_ dmg: URL) -> [String] {
+        ["attach", "-readonly", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+    }
+
+    private static func validateDiskImage(_ dmg: URL) throws {
+        let result = try runProcess(
+            "/usr/sbin/spctl",
+            args: diskImageAssessmentArguments(dmg)
+        )
+        guard result.status == 0 else {
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw UpdateError.verificationFailed(
+                detail.isEmpty ? "Gatekeeper rejected the disk image" : detail
+            )
+        }
+    }
+
     private func mountDMG(at dmg: URL) throws -> URL {
         let result = try runProcess(
             "/usr/bin/hdiutil",
-            args: ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+            args: Self.mountArguments(dmg)
         )
         guard result.status == 0 else {
             throw UpdateError.mountFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
@@ -324,8 +358,7 @@ final class AppUpdater {
 
     // MARK: - Stage
 
-    private func stageApp(fromMount mountPoint: URL, to stagedApp: URL) throws {
-        let appInVolume = try findAppInVolume(mountPoint)
+    private func stageApp(_ appInVolume: URL, to stagedApp: URL) throws {
         if FileManager.default.fileExists(atPath: stagedApp.path) {
             try FileManager.default.removeItem(at: stagedApp)
         }
@@ -351,13 +384,144 @@ final class AppUpdater {
         throw UpdateError.appNotFoundInVolume
     }
 
+    struct UpdateIdentity: Equatable {
+        let bundleIdentifier: String
+        let teamIdentifier: String
+    }
+
+    nonisolated static func developerIDRequirement(for identity: UpdateIdentity) throws -> String {
+        let bundleAllowed = CharacterSet.alphanumerics.union(
+            CharacterSet(charactersIn: ".-")
+        )
+        guard !identity.bundleIdentifier.isEmpty,
+              identity.bundleIdentifier.unicodeScalars.allSatisfy({ bundleAllowed.contains($0) })
+        else {
+            throw UpdateError.verificationFailed("invalid bundle identifier in trust policy")
+        }
+
+        let teamAllowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        guard identity.teamIdentifier.count == 10,
+              identity.teamIdentifier.unicodeScalars.allSatisfy({ teamAllowed.contains($0) })
+        else {
+            throw UpdateError.verificationFailed("invalid Developer Team ID in trust policy")
+        }
+
+        return "anchor apple generic"
+            + " and identifier \"\(identity.bundleIdentifier)\""
+            + " and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+            + " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+            + " and certificate leaf[subject.OU] = \"\(identity.teamIdentifier)\""
+    }
+
+    private static func expectedUpdateIdentity() throws -> UpdateIdentity {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier,
+              !bundleIdentifier.isEmpty
+        else {
+            throw UpdateError.verificationFailed("running app has no bundle identifier")
+        }
+
+        var dynamicCode: SecCode?
+        var status = SecCodeCopySelf(SecCSFlags(), &dynamicCode)
+        guard status == errSecSuccess, let dynamicCode else {
+            throw securityError("could not inspect the running app signature", status)
+        }
+
+        var staticCode: SecStaticCode?
+        status = SecCodeCopyStaticCode(dynamicCode, SecCSFlags(), &staticCode)
+        guard status == errSecSuccess, let staticCode else {
+            throw securityError("could not inspect the running app on disk", status)
+        }
+
+        var information: CFDictionary?
+        status = SecCodeCopySigningInformation(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &information
+        )
+        guard status == errSecSuccess,
+              let dictionary = information as? [CFString: Any],
+              let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier] as? String,
+              !teamIdentifier.isEmpty
+        else {
+            if status == errSecSuccess {
+                throw UpdateError.verificationFailed(
+                    "running app is not signed with a Developer ID team"
+                )
+            }
+            throw securityError("could not read the running app signing team", status)
+        }
+        return UpdateIdentity(
+            bundleIdentifier: bundleIdentifier,
+            teamIdentifier: teamIdentifier
+        )
+    }
+
+    private static func validateApplication(
+        _ application: URL,
+        expected identity: UpdateIdentity
+    ) throws {
+        let policy = try developerIDRequirement(for: identity)
+        var requirement: SecRequirement?
+        var status = SecRequirementCreateWithString(
+            policy as CFString,
+            SecCSFlags(),
+            &requirement
+        )
+        guard status == errSecSuccess, let requirement else {
+            throw securityError("could not construct the update trust policy", status)
+        }
+
+        var staticCode: SecStaticCode?
+        status = SecStaticCodeCreateWithPath(
+            application as CFURL,
+            SecCSFlags(),
+            &staticCode
+        )
+        guard status == errSecSuccess, let staticCode else {
+            throw securityError("downloaded app has no readable code signature", status)
+        }
+
+        let validationFlags = SecCSFlags(
+            rawValue: kSecCSCheckNestedCode
+                | kSecCSStrictValidate
+                | kSecCSCheckAllArchitectures
+                | kSecCSRestrictSymlinks
+        )
+        status = SecStaticCodeCheckValidity(staticCode, validationFlags, requirement)
+        guard status == errSecSuccess else {
+            throw securityError(
+                "downloaded app is not valid Developer ID code from the expected team",
+                status
+            )
+        }
+
+        let systemPolicy = try runProcess(
+            "/usr/bin/syspolicy_check",
+            args: ["distribution", application.path]
+        )
+        guard systemPolicy.status == 0 else {
+            let detail = systemPolicy.stderr.isEmpty
+                ? systemPolicy.stdout
+                : systemPolicy.stderr
+            throw UpdateError.verificationFailed(
+                detail.isEmpty
+                    ? "downloaded app failed Apple's distribution policy check"
+                    : detail
+            )
+        }
+    }
+
+    private static func securityError(_ message: String, _ status: OSStatus) -> UpdateError {
+        let detail = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
+        return .verificationFailed("\(message): \(detail)")
+    }
+
     // MARK: - Swap + relaunch (called from outside, right before terminate)
 
     /// Registers a one-shot launchd worker that:
     ///   1. waits for our PID to exit
     ///   2. replaces the running .app with the staged one
-    ///   3. strips com.apple.quarantine
-    ///   4. `open`s the replaced .app
+    ///   3. `open`s the replaced .app (with quarantine metadata preserved)
     /// Must be called immediately before `NSApp.terminate(nil)`.
     @discardableResult
     static func performSwapAndRelaunch() -> Bool {

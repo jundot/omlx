@@ -77,6 +77,20 @@ IBV_OUTPUT = """\
     rdma_en2         a2910a0a8bd8ac05
 """
 
+PMSET_NORMAL = """\
+Battery Power:
+ lowpowermode         0
+AC Power:
+ lowpowermode         0
+"""
+
+PMSET_LOW_POWER = """\
+Battery Power:
+ lowpowermode         1
+AC Power:
+ lowpowermode         1
+"""
+
 
 def _patch_hardware(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -122,6 +136,7 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
             "ibv_devices": (0, IBV_OUTPUT, ""),
             "ipconfig": (0, "169.254.42.1\n", ""),
             "system_profiler": (0, NO_PEER_THUNDERBOLT, ""),
+            "pmset": (0, PMSET_NORMAL, ""),
             "route": (
                 0,
                 "   route to: 198.51.100.197\n"
@@ -156,6 +171,12 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
     assert serialized["node"]["accelerator"] == "metal"
     assert serialized["node"]["accelerator_vendor"] == "apple"
     assert serialized["node"]["distributed_backends"] == ["ring", "jaccl"]
+    assert serialized["node"]["power"] == {
+        "source": "pmset",
+        "ac_low_power_mode": False,
+        "battery_low_power_mode": False,
+        "low_power_mode_enabled": False,
+    }
     assert serialized["transport"]["state"] == "enabled_no_peer"
     assert serialized["transport"]["rdma"]["enabled"] is True
     assert serialized["transport"]["rdma"]["addresses"]["rdma_en1"] == "169.254.42.1"
@@ -202,6 +223,38 @@ def test_parse_invalid_thunderbolt_payload_returns_no_ports():
         stdout="{not-json",
     )
     assert probe.parse_thunderbolt_ports(result) == ()
+
+
+def test_pmset_custom_parser_tracks_ac_and_battery_independently():
+    power = probe.parse_low_power_mode(
+        CommandResult(args=("pmset",), returncode=0, stdout=PMSET_LOW_POWER)
+    )
+
+    assert power.ac_low_power_mode is True
+    assert power.battery_low_power_mode is True
+    assert power.low_power_mode_enabled is True
+    assert power.source == "pmset"
+
+
+def test_collect_status_warns_without_changing_low_power_mode(monkeypatch):
+    _patch_hardware(monkeypatch)
+    runner = FakeRunner(
+        {
+            "rdma_ctl": (0, "disabled\n", ""),
+            "ibv_devices": (0, "", ""),
+            "system_profiler": (0, NO_PEER_THUNDERBOLT, ""),
+            "pmset": (0, PMSET_LOW_POWER, ""),
+        }
+    )
+
+    status = probe.collect_cluster_status(runner=runner)
+
+    assert status.power.low_power_mode_enabled is True
+    assert any("Low Power Mode" in warning for warning in status.warnings)
+    pmset_calls = [call for call in runner.calls if Path(call[0][0]).name == "pmset"]
+    assert len(pmset_calls) == 1
+    assert pmset_calls[0][0][1:] == ("-g", "custom")
+    assert pmset_calls[0][1] == 5.0
 
 
 def test_collect_status_does_not_advertise_an_ssh_user():

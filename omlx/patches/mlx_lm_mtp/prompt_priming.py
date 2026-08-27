@@ -89,10 +89,10 @@ def prime_window() -> int:
 
     Escape hatch for the head-cache memory cost of priming (one
     full-attention layer of KV over the folded span). The cap is measured
-    against the span actually folded this request — with a warm prefix cache
-    that is only the boundary remainder, not the full prompt — so a
-    long-context request with a small remainder still primes. A remainder
-    larger than the window runs unprimed.
+    against the span actually folded this request. A restored warm prefix does
+    not currently restore the MTP head cache, so its boundary remainder stays
+    deliberately unprimed regardless of size; treating that suffix as a full
+    prompt history would make speculative rollback incorrect.
     """
     try:
         return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
@@ -350,6 +350,14 @@ def maybe_capture(
             )
             return
     if ctx is None:
+        # A fresh priming history is valid only when this forward began at
+        # cache offset zero. Prefix-cache/SSD restores intentionally start at
+        # a nonzero offset; folding only their suffix would label a partial
+        # MTP-head history as complete and can corrupt later speculative cache
+        # rollback. Degrade to the established unprimed path until the MTP
+        # head cache itself is part of the persisted snapshot.
+        if offset_after != seq_len:
+            return
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return

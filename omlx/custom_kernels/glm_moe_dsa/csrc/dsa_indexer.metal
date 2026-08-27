@@ -59,20 +59,23 @@ instantiate_kernel(
 // ── DC-1: fused decode indexer scan ──────────────────────────────────────────
 // One thread per key position: score(key) = sum_h w_h * relu(q_h · k_key), fp32
 // accumulation throughout (strictly tighter than the bf16 op-chain it replaces).
-// The 32 query heads (8KB) + scaled weights live in threadgroup memory; K is
-// streamed exactly once; the [B,32,1,S] / relu / weighted / summed intermediates
-// of the unfused chain never exist.
+// The query heads (HEADS*DIM, 8KB at 32 heads / 16KB at 64) + scaled weights
+// live in threadgroup memory; K is streamed exactly once; the [B,H,1,S] / relu
+// / weighted / summed intermediates of the unfused chain never exist. The
+// weight pointer has its own type WT so fp32 weights can feed the fp32-score
+// configuration without quantizing the head weights (DeepSeek V4's reference
+// decode path keeps them in fp32).
 struct OMLXDSADecodeParams {
   int S;
   int64_t k_batch_stride; // elements
   int64_t k_row_stride;   // elements (last dim must be contiguous)
 };
 
-template <typename T, typename OutT, int HEADS, int DIM, int THREADS>
+template <typename T, typename OutT, typename WT, int HEADS, int DIM, int THREADS>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void dsa_decode_scores_kernel(
     const device T* Q [[buffer(0)]],
     const device T* K [[buffer(1)]],
-    const device T* W [[buffer(2)]],
+    const device WT* W [[buffer(2)]],
     device OutT* OUT [[buffer(3)]],
     const constant OMLXDSADecodeParams& params [[buffer(4)]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -86,7 +89,7 @@ template <typename T, typename OutT, int HEADS, int DIM, int THREADS>
   const int S = params.S;
   const device T* q_base = Q + size_t(b) * HEADS * DIM;
   const device T* k_base = K + size_t(b) * size_t(params.k_batch_stride);
-  const device T* w_base = W + size_t(b) * HEADS;
+  const device WT* w_base = W + size_t(b) * HEADS;
   device OutT* out_base = OUT + size_t(b) * size_t(S);
 
   threadgroup T qs[HEADS * DIM];
@@ -134,20 +137,32 @@ template <typename T, typename OutT, int HEADS, int DIM, int THREADS>
   out_base[key] = OutT(total);
 }
 
-#define instantiate_dsa_decode_scores(iname, itype, oname, otype, heads, dim, threads) \
+#define instantiate_dsa_decode_scores(iname, itype, oname, otype, wname, wtype, heads, dim, threads) \
   instantiate_kernel(                                                     \
-      "dsa_decode_scores_" #iname "_o" #oname "_h" #heads "_d" #dim       \
-      "_t" #threads,                                                      \
+      "dsa_decode_scores_" #iname "_o" #oname "_w" #wname "_h" #heads     \
+      "_d" #dim "_t" #threads,                                            \
       dsa_decode_scores_kernel,                                           \
       itype,                                                              \
       otype,                                                              \
+      wtype,                                                              \
       heads,                                                              \
       dim,                                                                \
       threads)
 
 // same-dtype scores (default: feeds the native 16-bit radix top-k) and fp32
 // scores (opt-in: selection then matches fp32 ground truth exactly).
-instantiate_dsa_decode_scores(float16, half, same, half, 32, 128, 256);
-instantiate_dsa_decode_scores(bfloat16, bfloat16_t, same, bfloat16_t, 32, 128, 256);
-instantiate_dsa_decode_scores(float16, half, f32, float, 32, 128, 256);
-instantiate_dsa_decode_scores(bfloat16, bfloat16_t, f32, float, 32, 128, 256);
+// 32 heads: GLM-MoE-DSA; weights always in the query dtype (wsame).
+instantiate_dsa_decode_scores(float16, half, same, half, same, half, 32, 128, 256);
+instantiate_dsa_decode_scores(bfloat16, bfloat16_t, same, bfloat16_t, same, bfloat16_t, 32, 128, 256);
+instantiate_dsa_decode_scores(float16, half, f32, float, same, half, 32, 128, 256);
+instantiate_dsa_decode_scores(bfloat16, bfloat16_t, f32, float, same, bfloat16_t, 32, 128, 256);
+// 64 heads: DeepSeek V4. The wf32 variants take fp32 head weights so the fused
+// scan reproduces the reference fp32 decode/verify path's weight precision
+// bit-for-bit (only the dot-product accumulation order differs); they pair
+// with fp32 score output.
+instantiate_dsa_decode_scores(float16, half, same, half, same, half, 64, 128, 256);
+instantiate_dsa_decode_scores(bfloat16, bfloat16_t, same, bfloat16_t, same, bfloat16_t, 64, 128, 256);
+instantiate_dsa_decode_scores(float16, half, f32, float, same, half, 64, 128, 256);
+instantiate_dsa_decode_scores(bfloat16, bfloat16_t, f32, float, same, bfloat16_t, 64, 128, 256);
+instantiate_dsa_decode_scores(float16, half, f32, float, f32, float, 64, 128, 256);
+instantiate_dsa_decode_scores(bfloat16, bfloat16_t, f32, float, f32, float, 64, 128, 256);

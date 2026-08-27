@@ -1,0 +1,57 @@
+{
+  "contract_version": 1,
+  "date": "2026-08-22",
+  "base_commit": "bcb3673c",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 20,
+  "shape": {
+    "tokens": 1024,
+    "routes": 6144,
+    "experts": 256,
+    "hidden": 4096,
+    "local_intermediate": 1024,
+    "bm": 32,
+    "bn": 32,
+    "bk": 32
+  },
+  "promotion_gate": {
+    "post_limited_swiglu_array_equal_vs_pair_concat": true,
+    "post_limited_swiglu_array_equal_vs_stock": true,
+    "minimum_speedup_vs_faster_baseline": 1.05,
+    "must_pass_both_hosts": true
+  },
+  "hosts": {
+    "m3_ultra_rank0": {
+      "candidate_vs_pair_concat_exact": true,
+      "candidate_vs_stock_exact": true,
+      "pair_concat_vs_stock_exact": true,
+      "candidate_max_abs": 0.0,
+      "median_ms": {
+        "shared_x": 8.209271,
+        "pair_concat": 8.017229,
+        "stock": 9.0914375
+      },
+      "speedup_vs_faster_baseline": 0.9766066926040082,
+      "passed": false
+    },
+    "m5_max_rank1": {
+      "candidate_vs_pair_concat_exact": true,
+      "candidate_vs_stock_exact": false,
+      "pair_concat_vs_stock_exact": false,
+      "candidate_vs_pair_concat_max_abs": 0.0,
+      "candidate_vs_stock_max_abs": 0.0078125,
+      "median_ms": {
+        "shared_x": 9.3694165,
+        "pair_concat": 9.306375,
+        "stock": 7.5408955
+      },
+      "speedup_vs_faster_baseline": 0.8048415288187903,
+      "passed": false
+    }
+  },
+  "outcome": {
+    "promoted": false,
+    "production_dispatch": false,
+    "reason": "Exact versus pair-concat on both hosts, but below 1.05x on both; M5 stock NAX is faster and not array-equal to the Steel pair-concat baseline."
+  }
+}

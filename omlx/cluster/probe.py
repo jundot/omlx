@@ -22,6 +22,7 @@ from omlx.utils import hardware
 
 from .models import (
     ClusterStatus,
+    PowerModeCapability,
     RDMACapability,
     RouteCapability,
     RuntimeCapability,
@@ -32,6 +33,7 @@ from .models import (
 _RDMA_CTL = "/usr/bin/rdma_ctl"
 _IBV_DEVICES = "/usr/bin/ibv_devices"
 _SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+_PMSET = "/usr/bin/pmset"
 _ROUTE = "/sbin/route"
 _IPCONFIG = "/usr/sbin/ipconfig"
 _IP = "/usr/sbin/ip"
@@ -172,6 +174,44 @@ def run_command(args: Sequence[str], *, timeout: float = 10.0) -> CommandResult:
 
 def _tool(name: str, fallback: str) -> str:
     return shutil.which(name) or fallback
+
+
+def parse_low_power_mode(result: CommandResult) -> PowerModeCapability:
+    """Parse bounded ``pmset -g custom`` output without changing power state."""
+
+    if not result.ok:
+        return PowerModeCapability(source="unavailable")
+    sections: dict[str, bool] = {}
+    current: str | None = None
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        header = re.fullmatch(r"(AC|Battery) Power:", line, re.IGNORECASE)
+        if header is not None:
+            current = header.group(1).lower()
+            continue
+        value = re.fullmatch(r"lowpowermode\s+([01])", line, re.IGNORECASE)
+        if current is not None and value is not None:
+            sections[current] = value.group(1) == "1"
+    return PowerModeCapability(
+        ac_low_power_mode=sections.get("ac"),
+        battery_low_power_mode=sections.get("battery"),
+        source="pmset" if sections else "unavailable",
+    )
+
+
+def detect_low_power_mode(
+    *,
+    runner: CommandRunner = run_command,
+) -> PowerModeCapability:
+    """Read the local macOS Low Power Mode configuration with a hard timeout."""
+
+    if platform.system().strip().lower() != "darwin":
+        return PowerModeCapability(source="unsupported")
+    result = runner(
+        [_tool("pmset", _PMSET), "-g", "custom"],
+        timeout=5.0,
+    )
+    return parse_low_power_mode(result)
 
 
 def parse_rdma_control(result: CommandResult) -> str:
@@ -439,6 +479,7 @@ def collect_cluster_status(
             timeout=15.0,
         )
     )
+    power = detect_low_power_mode(runner=runner)
 
     rdma_devices = parse_ibv_devices(devices_result)
     linux_rdma_links = parse_linux_rdma_links(rdma_result) if linux else {}
@@ -533,6 +574,18 @@ def collect_cluster_status(
             f"Route to {route.destination} uses {route.interface}, "
             "not an RDMA-capable interface."
         )
+    if power.low_power_mode_enabled:
+        enabled_for = []
+        if power.ac_low_power_mode:
+            enabled_for.append("AC Power")
+        if power.battery_low_power_mode:
+            enabled_for.append("Battery Power")
+        warnings.append(
+            "Low Power Mode is enabled for "
+            + " and ".join(enabled_for)
+            + "; synthetic performance calibration will not be used for "
+            "automatic placement until it is disabled in System Settings."
+        )
 
     accelerator = detect_accelerator_hardware()
     if accelerator.kind == "cuda":
@@ -583,6 +636,9 @@ def collect_cluster_status(
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
 
+    from .tp_qualifications import local_runtime_artifact_identifiers
+
+    artifact_identifiers = local_runtime_artifact_identifiers()
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
@@ -599,6 +655,8 @@ def collect_cluster_status(
             os_name=platform.system().lower() or "unknown",
             os_version=platform.release() or "unknown",
             python_executable=_advertised_python_executable(),
+            jaccl_identifier=artifact_identifiers["jaccl_identifier"],
+            kernel_identifier=artifact_identifiers["kernel_identifier"],
         ),
         transport_state=transport_state,
         rdma=RDMACapability(
@@ -616,6 +674,7 @@ def collect_cluster_status(
             ),
         ),
         thunderbolt_ports=ports,
+        power=power,
         route=route,
         admission_ceiling_bytes=admission_ceiling_bytes,
         warnings=tuple(warnings),
@@ -659,6 +718,16 @@ def format_cluster_status(status: ClusterStatus) -> str:
             f"MLX-LM {status.runtime.mlx_lm_version}"
         ),
         f"Transport:   {status.transport_state.value}",
+        (
+            "Power:       "
+            + (
+                "Low Power Mode enabled"
+                if status.power.low_power_mode_enabled
+                else "normal"
+                if status.power.source == "pmset"
+                else "unavailable"
+            )
+        ),
         (
             "RDMA:        "
             f"{status.rdma.control_status}"

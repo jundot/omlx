@@ -256,7 +256,7 @@ class TestCaptureSkips:
         )
         assert prompt_priming.prime_ctx_stats(model) is None
 
-    def test_offset_rewind_invalidates_and_restarts(self, model):
+    def test_offset_rewind_invalidates_without_partial_restart(self, model):
         tokens = _tokens(12, seed=4)
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens[:8], [8])
@@ -266,8 +266,17 @@ class TestCaptureSkips:
             if hasattr(c, "trim") and type(getattr(c, "offset", None)) is int:
                 c.trim(2)
         _chunked_prefill(model, cache, tokens[8:], [4])
-        # Restarted mid-prompt: only the new chunk's internal pairs.
-        assert prompt_priming.prime_ctx_stats(model) == 3
+        # A nonzero-offset suffix is not a complete head history. Falling back
+        # to unprimed MTP is safe; pretending the suffix began at zero is not.
+        assert prompt_priming.prime_ctx_stats(model) is None
+
+    def test_restored_prefix_does_not_start_partial_priming(self, model):
+        cache = _make_cache(model)
+        tokens = _tokens(12, seed=26)
+        with prompt_priming.suppress_capture():
+            _chunked_prefill(model, cache, tokens[:8], [8])
+        _chunked_prefill(model, cache, tokens[8:], [4])
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_window_cap_disables_long_prompts(self, model, monkeypatch):
         monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
@@ -275,22 +284,22 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
         assert prompt_priming.prime_ctx_stats(model) is None
 
-    def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
-        """A warm prefix cache leaves only a small remainder to fold; the
-        window must cap that folded span (the head-KV it exists to bound),
-        not the absolute prompt offset — otherwise every long-context
-        warm-cache request runs unprimed even when the remainder is tiny
-        (#2909)."""
+    def test_window_does_not_admit_partial_restored_history(self, model, monkeypatch):
+        """A small restored-prefix remainder must stay unprimed.
+
+        The MTP head cache is not part of the restored backbone snapshot yet;
+        folding only the suffix would label a partial history as complete.
+        """
         monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "6")
         tokens = _tokens(12, seed=8)
         cache = _make_cache(model)
         with prompt_priming.suppress_capture():
             _chunked_prefill(model, cache, tokens[:8], [8])
         assert prompt_priming.prime_ctx_stats(model) is None
-        # Remainder of 4 tokens at absolute offset 12: over the old
-        # absolute-offset guard (12 > 6), within the span guard (4 <= 6).
+        # A remainder of four tokens is within the nominal window, but starts
+        # at a nonzero cache offset and therefore cannot seed head history.
         _chunked_prefill(model, cache, tokens[8:], [4])
-        assert prompt_priming.prime_ctx_stats(model) == 3
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_window_overflow_stays_latched_across_small_chunks(
         self, model, monkeypatch
@@ -305,8 +314,7 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, tokens[8:], [3, 3, 3])
         assert prompt_priming.prime_ctx_stats(model) is None
         ctx = prompt_priming._find_ctx(model)
-        assert ctx is not None and ctx.window_exceeded
-        assert ctx.expected_offset == 17
+        assert ctx is None
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""

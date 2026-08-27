@@ -1,5 +1,6 @@
 #include "fused_moe.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -1084,6 +1085,204 @@ class DeepseekMxfp4GatherExpertPrimitive : public Primitive {
   int variant_;
 };
 
+class DeepseekMxfp4FullDecodePrimitive : public Primitive {
+ public:
+  explicit DeepseekMxfp4FullDecodePrimitive(Stream stream, float activation_limit)
+      : Primitive(stream), activation_limit_(activation_limit) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& up_weight,
+      const array& up_scales,
+      const array& gate_weight,
+      const array& gate_scales,
+      const array& down_weight,
+      const array& down_scales,
+      const array& indices,
+      const array& scores,
+      Stream s) {
+    if (s.device == Device::cpu) {
+      return true;
+    }
+    if (x.dtype() != float16 && x.dtype() != bfloat16) {
+      return true;
+    }
+    if (up_weight.dtype() != uint32 || gate_weight.dtype() != uint32 ||
+        down_weight.dtype() != uint32 || up_scales.dtype() != uint8 ||
+        gate_scales.dtype() != uint8 || down_scales.dtype() != uint8 ||
+        (indices.dtype() != uint32 && indices.dtype() != int32) ||
+        scores.dtype() != float32) {
+      return true;
+    }
+    if (x.ndim() < 2 || up_weight.ndim() != 3 || up_scales.ndim() != 3 ||
+        gate_weight.ndim() != 3 || gate_scales.ndim() != 3 ||
+        down_weight.ndim() != 3 || down_scales.ndim() != 3 ||
+        indices.ndim() < 1 || scores.shape() != indices.shape()) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(up_weight) ||
+        !row_contiguous(up_scales) || !row_contiguous(gate_weight) ||
+        !row_contiguous(gate_scales) || !row_contiguous(down_weight) ||
+        !row_contiguous(down_scales) || !row_contiguous(indices) ||
+        !row_contiguous(scores)) {
+      return true;
+    }
+
+    constexpr int group_size = 32;
+    constexpr int values_per_uint32 = 8;
+    constexpr int topk = 6;
+    const int K = x.shape(-1);
+    const int tokens = x.size() / K;
+    const int E = up_weight.shape(0);
+    const int I = up_weight.shape(1);
+    const int H = down_weight.shape(1);
+    if (K <= 0 || K % 512 != 0 || I <= 0 || I % 256 != 0 || H <= 0 ||
+        E <= 0 || indices.shape(-1) != topk ||
+        indices.size() != int64_t(tokens) * topk || x.size() != int64_t(tokens) * K) {
+      return true;
+    }
+    if (gate_weight.shape() != up_weight.shape() ||
+        gate_scales.shape() != up_scales.shape() ||
+        up_weight.shape(2) * values_per_uint32 != K ||
+        up_scales.shape(0) != E || up_scales.shape(1) != I ||
+        up_scales.shape(2) != K / group_size) {
+      return true;
+    }
+    if (down_weight.shape(0) != E ||
+        down_weight.shape(2) * values_per_uint32 != I ||
+        down_scales.shape(0) != E || down_scales.shape(1) != H ||
+        down_scales.shape(2) != I / group_size) {
+      return true;
+    }
+    return false;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "DeepseekMxfp4FullDecodePrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& up_weight = inputs[1];
+    const auto& up_scales = inputs[2];
+    const auto& gate_weight = inputs[3];
+    const auto& gate_scales = inputs[4];
+    const auto& down_weight = inputs[5];
+    const auto& down_scales = inputs[6];
+    const auto& indices = inputs[7];
+    const auto& scores = inputs[8];
+
+    const int K = x.shape(-1);
+    const int tokens = x.size() / K;
+    const int routes = indices.size();
+    constexpr int topk = 6;
+    const int E = up_weight.shape(0);
+    const int I = up_weight.shape(1);
+    const int H = down_weight.shape(1);
+
+    out.set_data(allocator::malloc(out.nbytes()));
+    array activated({routes, I}, x.dtype(), nullptr, {});
+    activated.set_data(allocator::malloc(activated.nbytes()));
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.add_temporary(activated);
+
+    // The 3:5 TP rank-0 slice has enough independent output rows to keep the
+    // measured M3 Ultra GPU occupied without coarsening two results into each
+    // simdgroup. Keep the established two-row tile on every other GPU/shape.
+    // The established shape/device choice remains the default.  The
+    // environment override is an isolated decode-kernel probe only; no
+    // model dispatch sets it, so production keeps the qualified schedule.
+    int result_rows =
+        I == 768 && d.get_architecture() == "applegpu_g15d" ? 1 : 2;
+    if (const char* override_rows = std::getenv("OMLX_DSV4_FULL_DECODE_ROWS")) {
+      const int requested = std::atoi(override_rows);
+      if (requested == 1 || requested == 2 || requested == 4) {
+        result_rows = requested;
+      }
+    }
+
+    std::string kname;
+    concatenate(
+        kname,
+        "deepseek_mxfp4_pair_swiglu_decode_",
+        glm_type_name(x.dtype()));
+    if (result_rows == 1) {
+      concatenate(kname, "_r1");
+    } else if (result_rows == 4) {
+      concatenate(kname, "_r4");
+    }
+    auto kernel = d.get_kernel(kname, lib);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_input_array(up_weight, 1);
+    compute_encoder.set_input_array(up_scales, 2);
+    compute_encoder.set_input_array(gate_weight, 3);
+    compute_encoder.set_input_array(gate_scales, 4);
+    compute_encoder.set_input_array(indices, 5);
+    compute_encoder.set_output_array(activated, 6);
+    compute_encoder.set_bytes(routes, 7);
+    compute_encoder.set_bytes(topk, 8);
+    compute_encoder.set_bytes(E, 9);
+    compute_encoder.set_bytes(I, 10);
+    compute_encoder.set_bytes(K, 11);
+    compute_encoder.set_bytes(activation_limit_, 12);
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size((I + result_rows - 1) / result_rows, routes, 1),
+        MTL::Size(32, 1, 1));
+
+    kname.clear();
+    concatenate(
+        kname,
+        "deepseek_mxfp4_down_score_sum_decode_",
+        glm_type_name(x.dtype()));
+    if (result_rows == 1) {
+      concatenate(kname, "_r1");
+    } else if (result_rows == 4) {
+      concatenate(kname, "_r4");
+    }
+    kernel = d.get_kernel(kname, lib);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(activated, 0);
+    compute_encoder.set_input_array(down_weight, 1);
+    compute_encoder.set_input_array(down_scales, 2);
+    compute_encoder.set_input_array(indices, 3);
+    compute_encoder.set_input_array(scores, 4);
+    compute_encoder.set_output_array(out, 5);
+    compute_encoder.set_bytes(tokens, 6);
+    compute_encoder.set_bytes(E, 7);
+    compute_encoder.set_bytes(H, 8);
+    compute_encoder.set_bytes(I, 9);
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size((H + result_rows - 1) / result_rows, tokens, 1),
+        MTL::Size(32, 1, 1));
+  }
+
+  DEFINE_NAME(DeepseekMxfp4FullDecodePrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const DeepseekMxfp4FullDecodePrimitive&>(other);
+    return activation_limit_ == rhs.activation_limit_;
+  }
+  auto state() const {
+    return std::make_tuple(activation_limit_);
+  }
+
+ private:
+  float activation_limit_;
+};
+
 } // namespace
 
 array glm_dsa_q8_vup_flat(
@@ -1606,6 +1805,63 @@ array deepseek_mxfp4_gather_qmm_expert(
       std::move(out_shape),
       x.dtype(),
       std::make_shared<DeepseekMxfp4GatherExpertPrimitive>(stream, variant),
+      std::move(inputs));
+}
+
+array deepseek_mxfp4_full_decode(
+    const array& x,
+    const array& up_weight,
+    const array& up_scales,
+    const array& gate_weight,
+    const array& gate_scales,
+    const array& down_weight,
+    const array& down_scales,
+    const array& indices,
+    const array& scores,
+    float activation_limit,
+    StreamOrDevice s /* = {} */) {
+  auto stream = to_stream(s);
+  if (DeepseekMxfp4FullDecodePrimitive::unsupported(
+          x,
+          up_weight,
+          up_scales,
+          gate_weight,
+          gate_scales,
+          down_weight,
+          down_scales,
+          indices,
+          scores,
+          stream)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.deepseek_mxfp4_full_decode] unsupported "
+        << "shape or dtype: x=" << x.shape() << " " << x.dtype()
+        << ", up=" << up_weight.shape() << ", gate=" << gate_weight.shape()
+        << ", down=" << down_weight.shape() << ", indices="
+        << indices.shape() << " " << indices.dtype() << ", scores="
+        << scores.shape() << " " << scores.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!std::isfinite(activation_limit) || activation_limit < 0.0f) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.deepseek_mxfp4_full_decode] activation_limit "
+        "must be finite and non-negative.");
+  }
+
+  std::vector<array> inputs = {
+      x,
+      up_weight,
+      up_scales,
+      gate_weight,
+      gate_scales,
+      down_weight,
+      down_scales,
+      indices,
+      scores};
+  return array(
+      x.shape(),
+      x.dtype(),
+      std::make_shared<DeepseekMxfp4FullDecodePrimitive>(
+          stream, activation_limit),
       std::move(inputs));
 }
 

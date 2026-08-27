@@ -85,6 +85,18 @@ def test_a_tensor_parallel_rank_is_charged_for_its_head_shard():
     )
 
 
+@pytest.mark.parametrize(("weight", "heads"), [(3, 24), (5, 40)])
+def test_an_asymmetric_tensor_parallel_rank_uses_its_exact_head_share(weight, heads):
+    rank = rank_monitor(
+        _Model(),
+        tensor_parallel_size=2,
+        tensor_parallel_shard_weight=weight,
+        tensor_parallel_shard_weight_total=8,
+    )
+
+    assert rank._num_attention_heads == heads
+
+
 def test_cached_tokens_are_not_charged_twice():
     """Prefix-cache hits are already resident; charging them over-rejects."""
 
@@ -113,9 +125,12 @@ class _CollectiveValue:
 
 
 class _CollectiveMX:
-    def __init__(self, *, rank, votes):
+    def __init__(self, *, rank, votes, detail="peer estimate unavailable"):
         self._rank = rank
         self._votes = votes
+        encoded = detail.encode("utf-8")
+        self._detail = [len(encoded), *encoded, *([0] * (1023 - len(encoded)))]
+        self._all_sum_calls = 0
         self.distributed = self
 
     def init(self):
@@ -131,14 +146,21 @@ class _CollectiveMX:
         return value
 
     def all_sum(self, _value):
-        return _CollectiveValue(self._votes)
+        self._all_sum_calls += 1
+        return _CollectiveValue(
+            self._votes if self._all_sum_calls == 1 else self._detail
+        )
 
 
 def test_peer_rejection_makes_an_accepting_rank_leave_before_model_execution():
     guard = _guard(ceiling=64 * GiB, rank=0)
-    mx = _CollectiveMX(rank=0, votes=[0, 1])
+    mx = _CollectiveMX(
+        rank=0,
+        votes=[0, 1],
+        detail="Prefill would require 12.5GB above the hard limit",
+    )
 
-    with pytest.raises(PrefillMemoryExceededError, match="rejected by rank 1"):
+    with pytest.raises(PrefillMemoryExceededError, match="12.5GB above"):
         guard.check_collective(
             2048,
             current_usage_bytes=1 * GiB,

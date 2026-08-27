@@ -4,6 +4,12 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "ds4_attention_finalizer.h"
+#include "ds4_prefill_moe_nax.h"
+#include "ds4_output_chain.h"
+#include "ds4_projection_qmm.h"
+#include "ds4_prefill_moe.h"
+#include "ds4_qkv_bundle.h"
 #include "deepseek_v4_sparse_attention.h"
 #include "dspark_gemm.h"
 #include "dspark_qmv.h"
@@ -41,7 +47,14 @@ NB_MODULE(_ext, m) {
       "causal_q_offset"_a = -1,
       "mask_ratio"_a = 0,
       "mask_q_offset"_a = 0,
-      "stream"_a = nb::none());
+      "stream"_a = nb::none(),
+      "use_nax"_a = false);
+  m.def(
+      "dsa_indexer_nax_kernels_built",
+      &omlx::glm_kernels::dsa_indexer_nax_kernels_built);
+  m.def(
+      "dsa_indexer_nax_runtime_active",
+      &omlx::glm_kernels::dsa_indexer_nax_runtime_active);
   m.def(
       "dsa_indexer_scores_mma",
       &omlx::glm_kernels::dsa_indexer_scores_mma,
@@ -50,7 +63,8 @@ NB_MODULE(_ext, m) {
       "weights"_a,
       "mask_ratio"_a = 0,
       "mask_q_offset"_a = 0,
-      "stream"_a = nb::none());
+      "stream"_a = nb::none(),
+      "use_wm4_wn1"_a = false);
   m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
@@ -64,6 +78,11 @@ NB_MODULE(_ext, m) {
       &omlx::glm_kernels::dspark_fp32_topk_indices,
       "scores"_a,
       "topk"_a = 512,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_router_topk_indices",
+      &omlx::glm_kernels::ds4_router_topk_indices,
+      "scores"_a,
       "stream"_a = nb::none());
   m.def(
       "dsa_decode_scores",
@@ -187,6 +206,151 @@ NB_MODULE(_ext, m) {
       "variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
+      "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_swiglu_blocks,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "activation_limit"_a = 10.0f,
+      "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "activation_limit"_a = 10.0f,
+      "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_blocks_tail8",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_blocks_tail8,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_q_head_rms_rope",
+      &omlx::glm_kernels::ds4_q_head_rms_rope,
+      "q"_a,
+      "freqs"_a,
+      "offset"_a,
+      "eps"_a,
+      "return_normalized"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_kv_rms_rope",
+      &omlx::glm_kernels::ds4_kv_rms_rope,
+      "kv"_a,
+      "weight"_a,
+      "freqs"_a,
+      "offset"_a,
+      "eps"_a,
+      "return_normalized"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_projection_mxfp8_qmm",
+      &omlx::glm_kernels::ds4_projection_mxfp8_qmm,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "variant"_a = 0,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_output_oa_interleaved",
+      &omlx::glm_kernels::ds4_output_oa_interleaved,
+      "x"_a,
+      "o_a_weight"_a,
+      "o_a_scales"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_output_projection_chain",
+      &omlx::glm_kernels::ds4_output_projection_chain,
+      "x"_a,
+      "o_a_weight"_a,
+      "o_a_scales"_a,
+      "o_b_weight"_a,
+      "o_b_scales"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_projection_nax_kernels_built",
+      &omlx::glm_kernels::ds4_projection_nax_kernels_built);
+  m.def(
+      "ds4_projection_nax_device_available",
+      &omlx::glm_kernels::ds4_projection_nax_device_available);
+  m.def(
+      "deepseek_mxfp4_gather_qmm_blocks_nax",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_blocks_nax,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_pair_blocks_nax",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_blocks_nax,
+      "x"_a,
+      "weight0"_a,
+      "scales0"_a,
+      "weight1"_a,
+      "scales1"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_pair_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_pair_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor128_bundle_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor128_bundle_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "compressor_wkv"_a,
+      "compressor_wgate"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor_bundle_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "compressor_wkv"_a,
+      "compressor_wgate"_a,
+      "index_compressor_wkv"_a,
+      "index_compressor_wgate"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor_bundle_b1_dispatches",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1_dispatches);
+  m.def(
       "deepseek_affine_gather_qmm_blocks",
       &omlx::glm_kernels::deepseek_affine_gather_qmm_blocks,
       "x"_a,
@@ -223,5 +387,19 @@ NB_MODULE(_ext, m) {
       "scales"_a,
       "indices"_a,
       "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_full_decode",
+      &omlx::glm_kernels::deepseek_mxfp4_full_decode,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "down_weight"_a,
+      "down_scales"_a,
+      "indices"_a,
+      "scores"_a,
+      "activation_limit"_a,
       "stream"_a = nb::none());
 }

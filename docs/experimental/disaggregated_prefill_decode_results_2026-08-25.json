@@ -1,0 +1,155 @@
+{
+  "backend": "jaccl",
+  "hardware": {
+    "rank_0": "Apple M3 Ultra 256 GB",
+    "rank_1": "Apple M5 Max 128 GB"
+  },
+  "mlx_version": "0.32.2.dev20260825+ceab91938",
+  "model": "Qwen3.8-27B-4bit",
+  "model_identity": "f4ad23f9019f77fcc8e494ff76423e577cdd48fac923f93fb83c6b5f3872b022",
+  "runs": [
+    {
+      "prompt_tokens": 512,
+      "completion_tokens": 32,
+      "prefill_rank": 0,
+      "decode_rank": 1,
+      "prefill_tokens_per_second": 302.3330574370868,
+      "cache_tensor_bytes": 187498496,
+      "cache_send_seconds": 0.042581042000165326,
+      "cache_send_bytes_per_second": 4403332731.953155,
+      "decode_tokens_per_second": 30.148118615184657,
+      "parity": true,
+      "token_sha256": "387a9e99c50425a745a01cdd3610b0804dec61011bb7480b67ff5866ead84f4e"
+    },
+    {
+      "prompt_tokens": 512,
+      "completion_tokens": 32,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "prefill_tokens_per_second": 874.7718033027323,
+      "cache_tensor_bytes": 187498496,
+      "cache_send_seconds": 0.03927937499975087,
+      "cache_send_bytes_per_second": 4773459251.864094,
+      "decode_tokens_per_second": 29.368231263422956,
+      "parity": true,
+      "token_sha256": "387a9e99c50425a745a01cdd3610b0804dec61011bb7480b67ff5866ead84f4e"
+    },
+    {
+      "prompt_tokens": 4096,
+      "completion_tokens": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "prefill_tokens_per_second": 1005.7425767365867,
+      "cache_tensor_bytes": 422379520,
+      "cache_send_seconds": 0.06478825000067445,
+      "cache_send_bytes_per_second": 6519384610.567549,
+      "decode_tokens_per_second": 31.2143911607807,
+      "parity": true,
+      "token_sha256": "9b3eebb13ad62954e76a71fddae1f9dcd860b5bb9d153283efbbd0c01df4fcce"
+    },
+    {
+      "prompt_tokens": 30000,
+      "completion_tokens": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "prefill_tokens_per_second": 871.8155903224881,
+      "cache_tensor_bytes": 2120024064,
+      "cache_send_seconds": 0.3239790000006906,
+      "cache_send_bytes_per_second": 6543708277.374401,
+      "decode_tokens_per_second": 27.374466335427122,
+      "parity": true,
+      "token_sha256": "2587d4d2049d46f42eb3f08673ac0754c7a8d689ff1a56185cce044286e94d44"
+    }
+  ],
+  "pipeline_runs": [
+    {
+      "requests": 2,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "prefill_tokens_per_second": [
+        1024.1740455768747,
+        1033.2636062951308
+      ],
+      "remote_decode_tokens_per_second": [
+        31.198193856306165,
+        32.55066457317105
+      ],
+      "cache_tensor_bytes": [
+        422379520,
+        422379520
+      ],
+      "cache_send_seconds": [
+        0.06449808299930737,
+        0.07172066700059077
+      ],
+      "overlap_window_seconds": 3.964937667000413,
+      "serial_source_seconds": 12.072617709000951,
+      "pipeline_seconds": 10.039742707999721,
+      "measured_pipeline_speedup": 1.2024827787052177,
+      "parity_by_request": [true, true],
+      "token_sha256": [
+        "362f2bd93bbf9e8f8eefdf873284d4d6979d1689a8adea6df5984111d6b807f4",
+        "0ea614fa16658a5f9e8d056667f2949eeed0c4c554f329af2d260b6a68cc82c8"
+      ]
+    },
+    {
+      "requests": 4,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "serial_source_seconds": 24.729965539996556,
+      "pipeline_seconds": 18.822177749998446,
+      "pipeline_seconds_per_request": 4.705544437499611,
+      "measured_pipeline_speedup": 1.313873764686905,
+      "parity_by_request": [true, true, true, true],
+      "cache_tensor_bytes_per_request": 422379520,
+      "prefill_tokens_per_second_range": [955.6426522112222, 1025.1743587567464],
+      "decode_tokens_per_second_range": [31.328686928973326, 32.70666688781281]
+    },
+    {
+      "requests": 8,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "serial_source_seconds": 50.54528474900326,
+      "pipeline_seconds": 36.69946083399918,
+      "pipeline_seconds_per_request": 4.587432604249898,
+      "measured_pipeline_speedup": 1.3772759490291204,
+      "parity_by_request": [true, true, true, true, true, true, true, true],
+      "cache_tensor_bytes_per_request": 422379520,
+      "prefill_tokens_per_second_range": [927.9495382128434, 1020.1364774141709],
+      "decode_tokens_per_second_range": [31.281211466886383, 32.641643163073105]
+    }
+  ],
+  "integrated_serving": {
+    "commit": "cc29d5fbf47c407eaaff2a69f47a049b17d33173",
+    "public_model": "Qwen3.8-27B-4bit",
+    "serving_mode": "disaggregated",
+    "prefill_rank": 1,
+    "decode_rank": 0,
+    "cold_prompt_tokens": 9410,
+    "cold_completion_tokens": 32,
+    "prefill_compute_average_tokens_per_second": 991.3617555418816,
+    "prefill_headline_tokens_per_second": 966.2581945351149,
+    "decode_tokens_per_second": 29.589626490854403,
+    "cache_tensor_bytes": 770637824,
+    "cache_array_count": 128,
+    "cache_transfer_window": 8,
+    "cache_handoff_seconds": 0.10497087499970803,
+    "cache_handoff_bytes_per_second": 7341444224.430285,
+    "exact_prefix_first_wall_seconds": 12.312,
+    "exact_prefix_repeat_wall_seconds": 1.395,
+    "b4_prompt_tokens_per_request": 2219,
+    "b4_completion_tokens_per_request": 32,
+    "b4_wall_seconds": 10.863,
+    "b4_estimated_speedup_vs_sequential": 1.29,
+    "tool_call_structured_without_marker_leak": true,
+    "unload_reload_canary": true,
+    "runtime_marker_visible": true
+  },
+  "scope": "standalone parity/overlap evidence plus persistent public HTTP serving integration"
+}

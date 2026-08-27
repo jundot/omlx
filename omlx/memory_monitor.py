@@ -24,7 +24,9 @@ if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
-from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    native_indexer_memory_safe_eligible,
+)
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -805,7 +807,13 @@ class MemoryMonitor:
         # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        if self._prefill_memory_profile is not None:
+            attn = self._prefill_memory_profile.estimate_prefill_transient_bytes(
+                eff_chunk,
+                full_kv_len,
+            )
+        else:
+            attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
@@ -942,12 +950,23 @@ class _DeepSeekV4PrefillMemoryProfile:
     dtype_size: float
     wsdpa_dtype_supported: bool = False
 
-    def _wsdpa_route_active(self, *, topk: bool = False) -> bool:
+    def _wsdpa_route_active(
+        self,
+        *,
+        query_tokens: int,
+        topk: bool = False,
+    ) -> bool:
         """Match the live WSDPA route without a process-wide head-dim flag."""
         if (
             not self.wsdpa_dtype_supported
-            or self.num_attention_heads != 64
             or self.head_dim != 512
+            or (
+                self.num_attention_heads != 64
+                and not (
+                    self.num_attention_heads in (24, 32, 40)
+                    and query_tokens >= 1024
+                )
+            )
         ):
             return False
         try:
@@ -1104,7 +1123,9 @@ class _DeepSeekV4PrefillMemoryProfile:
         candidates: list[int] = []
 
         if self.local_layers:
-            if query_tokens > 1 and self._wsdpa_route_active():
+            if query_tokens > 1 and self._wsdpa_route_active(
+                query_tokens=query_tokens
+            ):
                 local_attention = self._wsdpa_attention_bytes(
                     query_tokens, local_tokens
                 )
@@ -1122,7 +1143,9 @@ class _DeepSeekV4PrefillMemoryProfile:
             pooled_tokens = kv_len // 128
             attended = local_tokens + pooled_tokens
             projection = 2 * query_tokens * self.head_dim * self.dtype_size
-            if query_tokens > 1 and self._wsdpa_route_active():
+            if query_tokens > 1 and self._wsdpa_route_active(
+                query_tokens=query_tokens
+            ):
                 attention = self._wsdpa_attention_bytes(
                     query_tokens,
                     local_tokens,
@@ -1152,7 +1175,7 @@ class _DeepSeekV4PrefillMemoryProfile:
                 * (self.head_dim + self.index_head_dim)
                 * self.dtype_size
             )
-            if native_indexer_eligible(
+            if native_indexer_memory_safe_eligible(
                 query_tokens=query_tokens,
                 pooled_tokens=pooled_tokens,
                 n_heads=self.index_n_heads,
@@ -1165,7 +1188,9 @@ class _DeepSeekV4PrefillMemoryProfile:
                 indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
             if pooled_tokens <= self.index_topk:
                 attended = local_tokens + pooled_tokens
-                if query_tokens > 1 and self._wsdpa_route_active():
+                if query_tokens > 1 and self._wsdpa_route_active(
+                    query_tokens=query_tokens
+                ):
                     attention = self._wsdpa_attention_bytes(
                         query_tokens,
                         local_tokens,
@@ -1180,7 +1205,10 @@ class _DeepSeekV4PrefillMemoryProfile:
                         self.dtype_size,
                     )
             else:
-                if query_tokens > 4 and self._wsdpa_route_active(topk=True):
+                if query_tokens > 4 and self._wsdpa_route_active(
+                    query_tokens=query_tokens,
+                    topk=True,
+                ):
                     attention = self._wsdpa_attention_bytes(
                         query_tokens,
                         local_tokens,
@@ -1331,6 +1359,52 @@ def collect_kv_layer_specs(
 
     specs = [(count, window) for window, count in sorted(windows.items())]
     return full, specs, arrays
+
+
+def estimate_deepseek_v4_kv_bytes_per_token(
+    config: Any,
+    dtype_size: float,
+) -> float | None:
+    """Exact per-token KV growth for DeepSeek V4's pooled caches.
+
+    Every DS4F layer keeps a sliding-window local cache — a fixed footprint
+    priced separately through ``rotating_layer_specs`` — while ratio-4/128
+    layers add pooled caches that grow with context: ``head_dim / ratio``
+    latent elements per token, plus ``index_head_dim / ratio`` for the
+    indexer pool ratio-4 layers carry. The uniform
+    ``num_kv_heads * head_dim * 2`` formula over-counts this by more than an
+    order of magnitude. Returns None when the config is not a valid DS4F
+    description (same validation ``make_prefill_memory_profile`` applies), so
+    callers keep their generic fallback.
+    """
+
+    model_type = str(_cfg_get(config, "model_type", "") or "")
+    if not model_type.startswith("deepseek_v4"):
+        return None
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    ratios = _cfg_get(config, "compress_ratios")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return None
+    ratios = tuple(ratios[:num_layers])
+    if len(ratios) != num_layers or any(
+        ratio not in (0, 4, 128) for ratio in ratios
+    ):
+        return None
+    head_dim = _cfg_get(config, "head_dim")
+    if not _pos_int(head_dim):
+        return None
+    counts = Counter(ratios)
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    if counts[4] and not _pos_int(index_head_dim):
+        return None
+    elements = counts[4] * (
+        head_dim // 4 + (index_head_dim or 0) // 4
+    ) + counts[128] * (head_dim // 128)
+    return float(elements) * float(dtype_size)
 
 
 def estimate_mla_kv_bytes_per_token(
@@ -1500,12 +1574,33 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         kv_bytes_per_token = estimate_mla_kv_bytes_per_token(
             config, cache_list, dtype_size
         )
+        if kv_bytes_per_token is None:
+            # DeepSeek V4 has no kv_lora_rank: its pooled caches grow
+            # head_dim/ratio elements per token instead.
+            kv_bytes_per_token = estimate_deepseek_v4_kv_bytes_per_token(
+                config, dtype_size
+            )
 
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
         # inside MemoryMonitor. Insist on real positive integers before calling.
         if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            declared_dtype = str(
+                _cfg_get(config, "torch_dtype", _cfg_get(config, "dtype", ""))
+                or ""
+            ).lower()
+            model_dtype = str(getattr(model, "dtype", "") or "").lower()
+            wsdpa_dtype_supported = declared_dtype in {
+                "bfloat16",
+                "bf16",
+                "mlx.core.bfloat16",
+            } or model_dtype in {"bfloat16", "bf16", "mlx.core.bfloat16"}
+            prefill_memory_profile = make_prefill_memory_profile(
+                config,
+                compute_dtype_size=dtype_size,
+                wsdpa_dtype_supported=wsdpa_dtype_supported,
+            )
             monitor.set_model_info(
                 num_layers=num_layers,
                 num_kv_heads=num_kv_heads,
@@ -1518,6 +1613,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                prefill_memory_profile=prefill_memory_profile,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(

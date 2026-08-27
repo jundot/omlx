@@ -228,6 +228,32 @@ def test_a_marker_response_without_the_peer_clock_is_rejected(tmp_path):
     assert "peer clock" in error
 
 
+def test_a_missing_remote_marker_is_reported_without_a_traceback():
+    from omlx.cluster.liveness import (
+        _REMOTE_MARKER_MISSING,
+        read_remote_marker,
+    )
+
+    fake = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=(
+            b'{"marker":null,"process_live":false,"peer_now":1.0,'
+            b'"missing":true}'
+        ),
+        stderr=b"",
+    )
+
+    marker, live, peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/missing.json", runner=lambda *a, **k: fake
+    )
+
+    assert marker is None
+    assert live is False
+    assert peer_now == 1.0
+    assert error == _REMOTE_MARKER_MISSING
+
+
 def test_the_watchdog_reports_once_and_stops(tmp_path):
     """It ends the wait; it does not thrash trying to repair a collective."""
 
@@ -563,3 +589,114 @@ def test_status_names_each_way_a_rank_can_be_wrong(tmp_path):
     assert PeerHealth("a", 0, True, 1.0).status == "healthy"
     assert PeerHealth("a", 0, True, None, heartbeat_required=True).status == "missing"
     assert PeerHealth("a", 0, True, 1.0, process_live=False).status == "dead"
+
+
+# ---------------------------------------------------------------------------
+# Graduated response: warn/abort first, exit last.
+# ---------------------------------------------------------------------------
+
+
+def test_the_watchdog_aborts_and_recovers_without_exiting(tmp_path):
+    losses = []
+    aborts = []
+    unhealthy = (
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+    healthy = (
+        PeerHealth("test-mbp", 0, True, 1.0),
+        PeerHealth("mac-studio", 1, True, 2.0),
+    )
+    state = {"aborted": False}
+
+    def on_abort(reason):
+        aborts.append(reason)
+        state["aborted"] = True
+
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+        on_abort=on_abort,
+        abort_grace=5.0,
+    )
+    watchdog.run_once = lambda: healthy if state["aborted"] else unhealthy  # type: ignore[method-assign]
+
+    ticks = [0]
+
+    def fake_sleep(_seconds):
+        ticks[0] += 1
+        if ticks[0] > 10:
+            watchdog.stop()
+
+    watchdog.run(sleep=fake_sleep)
+
+    # The abort stage fired once at tolerance; the peer recovered during the
+    # grace window, so the exit stage never ran and the watchdog kept polling.
+    assert aborts and "mac-studio" in aborts[0]
+    assert losses == []
+    assert watchdog._consecutive_failures == {0: 0, 1: 0}
+
+
+def test_the_watchdog_exits_only_after_the_abort_grace_expires(tmp_path):
+    losses = []
+    aborts = []
+    unhealthy = (
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+        on_abort=aborts.append,
+        abort_grace=0.2,
+    )
+    watchdog.run_once = lambda: unhealthy  # type: ignore[method-assign]
+
+    import time as _time
+
+    def fast_sleep(seconds):
+        _time.sleep(min(seconds, 0.01))
+
+    started = _time.monotonic()
+    watchdog.run(sleep=fast_sleep)
+    elapsed = _time.monotonic() - started
+
+    assert len(aborts) == 1
+    assert len(losses) == 1
+    assert "mac-studio" in losses[0]
+    # The exit was delayed by the abort grace, not instant.
+    assert elapsed >= 0.2
+
+
+def test_without_an_abort_stage_the_timing_is_unchanged(tmp_path):
+    losses = []
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+    )
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+
+    ticks = [0]
+
+    def fake_sleep(_seconds):
+        ticks[0] += 1
+        if ticks[0] > 5:
+            raise AssertionError("watchdog should have reported immediately")
+
+    watchdog.run(sleep=fake_sleep)
+
+    # Two strikes (the failure tolerance) then the exit stage, no grace.
+    assert ticks[0] == 2
+    assert len(losses) == 1

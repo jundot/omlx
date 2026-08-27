@@ -51,13 +51,20 @@ from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .continuous_batching import (
+    DEFAULT_MIXED_PREFILL_QUANTUM,
+    MIN_MIXED_PREFILL_QUANTUM,
+    MIXED_PREFILL_GRID,
+    ContinuousBatchBudget,
+    continuous_batch_budget,
+)
+from .decode_activity import get_decode_activity
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
 from .patches.sdpa256_attention import set_unfused_headroom_provider
-from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -532,6 +539,11 @@ class _RegisteredRow(NamedTuple):
 
     sampler: Any
     logits_processors: list
+    # Whether the request asked for API logprobs; drives the full-vocab
+    # logprobs skip in _patched_generation_batch_step.  Defaults to True so
+    # registrations that predate the gate keep mlx-lm's always-compute
+    # behaviour — the skip is opt-out only once the row's intent is known.
+    wants_logprobs: bool = True
 
 
 _UID_ROW_REGISTRY_MAX = 4096
@@ -556,16 +568,24 @@ _uid_row_drift_last_warning = float("-inf")
 _SDPA256_UNBOUNDED_HEADROOM = 1 << 62
 
 
-def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
+def _register_uid_rows(model, uids, samplers, lps_rows, wants_logprobs_rows=None) -> None:
     """Record the sampler and logits processors each freshly-inserted uid must run.
 
     Each (model, uid) key is inserted exactly once per request, so plain
     insertion order is enough for the oldest-first backstop eviction.
+
+    ``wants_logprobs_rows`` carries each uid's ``sampling_params.logprobs``
+    flag; callers that omit it keep the always-compute default (see
+    ``_RegisteredRow.wants_logprobs``).
     """
+    if wants_logprobs_rows is None:
+        wants_logprobs_rows = [True] * len(list(uids))
     with _uid_row_registry_lock:
-        for uid, sampler, lps in zip(uids, samplers, lps_rows):
+        for uid, sampler, lps, wants_logprobs in zip(
+            uids, samplers, lps_rows, wants_logprobs_rows
+        ):
             _uid_row_registry[(id(model), uid)] = _RegisteredRow(
-                sampler, list(lps or ())
+                sampler, list(lps or ()), bool(wants_logprobs)
             )
         while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
             _uid_row_registry.popitem(last=False)
@@ -724,6 +744,172 @@ def _omlx_advance_grammar_rows(self) -> None:
         proc.accept_token(sampled[e])
 
 
+# ---------------------------------------------------------------------------
+# Full-vocab logprobs skip.
+#
+# mlx-lm's GenerationBatch._step ends every decode step with
+#
+#     self._next_logprobs = list(logprobs)                    # B x vocab fp32
+#     mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+#     ...
+#     mx.eval(inputs, self._current_logprobs)
+#
+# i.e. it materialises and retains one [vocab] fp32 array per row per step
+# (~800KB at 200k vocab).  omlx discards those arrays host-side whenever the
+# request did not ask for logprobs (see _process_batch_responses), so nearly
+# every step pays a full B x vocab materialisation whose only consumer is
+# the sampler that already ran.  When NO row in the batch wants logprobs —
+# and no speculative-decode path reads them internally — the patched step
+# below runs a variant with the materialisation elided.  Consumer audit:
+#
+#   * API responses: per-row via the ``wants_logprobs`` registry flag
+#     recorded at insert (``sampling_params.logprobs``).  Any row wanting
+#     them runs the original step for the whole batch, so requested values
+#     are bit-identical to before.
+#   * Samplers (omlx.utils.sampling): consume the NORMALISED logprobs —
+#     top-p's cumulative mass and min_p's ``max + log(min_p)`` threshold
+#     assume true log-probabilities — so the variant keeps the
+#     ``logits - logsumexp`` normalisation for sampler input and sampling
+#     stays bit-identical; only the per-row materialisation/retention is
+#     skipped.
+#   * Grammar constraints: ``_omlx_advance_grammar_rows`` reads
+#     ``_next_tokens`` only; processors see raw logits rows in both
+#     variants.  Unaffected.
+#   * Native MTP / dspark (omlx.patches.mlx_lm_mtp): reads
+#     ``gen_batch._next_logprobs`` for acceptance math — including the
+#     PREVIOUS standard step's arrays when it lazily activates inside
+#     ``GenerationBatch.next`` (``_post_init_mtp``,
+#     ``_prepare_mtp_batch_state_for_next``).  Gated below on the same
+#     per-load model markers that patch's own eligibility checks consult,
+#     plus any live MTP state on the batch.
+#   * VLM MTP (omlx.speculative.processing_sampler): its sampler receives
+#     logprobs from mlx-vlm's verify walk, never from GenerationBatch, and
+#     vlm_mtp requests are routed away before BatchGenerator.insert.
+#     Unaffected.
+#   * dflash / specprefill / gemma4_verify patches and the glm_moe_dsa
+#     ``GenerationBatch.next`` call site: none read ``_next_logprobs`` or
+#     ``Response.logprobs`` (grep-verified).
+# ---------------------------------------------------------------------------
+
+
+def _omlx_batch_wants_logprobs(self) -> bool:
+    """True when any row in the generation batch asked for API logprobs.
+
+    Reads the same per-uid registry the row realignment uses.  Uids without
+    a registered row — a fresh singleton mid-insert (``GenerationBatch``
+    steps once in ``__init__``, before ``_register_uid_rows`` runs) or a
+    batch omlx did not insert — keep mlx-lm's always-compute behaviour.
+    """
+    uids = getattr(self, "uids", None) or []
+    if not uids:
+        return True
+    model_id = id(getattr(self, "model", None))
+    with _uid_row_registry_lock:
+        rows = [_uid_row_registry.get((model_id, uid)) for uid in uids]
+    return any(row is None or row.wants_logprobs for row in rows)
+
+
+def _omlx_spec_decode_reads_logprobs(self) -> bool:
+    """True while speculative decoding may consume ``_next_logprobs``.
+
+    Native MTP activation is lazy (see the header above), so a live
+    ``_omlx_mtp_state`` is not the only hazard: any MTP/dspark-enabled load
+    must keep materialising logprobs because the next ``next()`` call may
+    bridge a row into speculative decode using THIS step's arrays.  The
+    model markers mirror ``_model_mtp_decode_enabled`` in
+    omlx.patches.mlx_lm_mtp.batch_generator.
+    """
+    if (
+        getattr(self, "_omlx_mtp_state", None) is not None
+        or getattr(self, "_omlx_mtp_batch_state", None) is not None
+    ):
+        return True
+    model = getattr(self, "model", None)
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    return any(
+        bool(
+            getattr(candidate, "_omlx_mtp_decode_enabled", False)
+            or getattr(candidate, "_omlx_dspark_decode_enabled", False)
+        )
+        for candidate in candidates
+    )
+
+
+def _omlx_generation_batch_step_no_logprobs(self):
+    """``GenerationBatch._step`` with the per-row logprobs materialisation elided.
+
+    Mirrors mlx-lm 0.31.x ``GenerationBatch._step`` line for line — keep in
+    sync with upstream on mlx-lm upgrades — except:
+
+    * ``_next_logprobs``/``_current_logprobs`` hold per-row ``None`` slots
+      (length-preserving, so ``extend()``/``filter()`` reindexing is
+      unaffected) and are dropped from the ``async_eval``/``eval`` calls;
+      ``next()`` therefore builds Responses with ``logprobs=None``, exactly
+      the state omlx's host-side discard produces today.
+    * the ``logits - logsumexp`` normalisation stays: omlx's samplers take
+      true log-probabilities (see the audit header above), so the sampled
+      tokens are bit-identical to the original step.
+    """
+    self._current_tokens = self._next_tokens
+    # Drop any arrays a previous logprobs-computing step left behind: nothing
+    # reads them in this mode, and releasing the batch's reference here lets
+    # the allocator reclaim the full-vocab buffers.
+    self._current_logprobs = [None] * len(self.uids)
+    inputs = self._current_tokens
+
+    # Forward pass
+    logits = self.model(inputs[:, None], cache=self.prompt_cache)
+    logits = logits[:, -1, :]
+
+    # Logits processors
+    token_context = []
+    if any(self.logits_processors):
+        # Update the token context that will be used by the logits processors
+        token_context = [
+            tc.update_and_fetch(inputs[i : i + 1])
+            for i, tc in enumerate(self._token_context)
+        ]
+        processed_logits = []
+        for e in range(len(self.uids)):
+            sample_logits = logits[e : e + 1]
+            for processor in self.logits_processors[e]:
+                sample_logits = processor(token_context[e], sample_logits)
+            processed_logits.append(sample_logits)
+        logits = mx.concatenate(processed_logits, axis=0)
+
+    # Normalize the logits — required for sampler correctness, see header.
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    # Sample
+    if any(self.samplers):
+        all_samples = []
+        for e in range(len(self.uids)):
+            sample_sampler = self.samplers[e] or self.fallback_sampler
+            sampled = sample_sampler(logprobs[e : e + 1])
+            all_samples.append(sampled)
+        sampled = mx.concatenate(all_samples, axis=0)
+    else:
+        sampled = self.fallback_sampler(logprobs)
+
+    # Assign the next step to member variables and start computing it
+    # asynchronously — without the per-row full-vocab logprobs arrays.
+    self._next_tokens = sampled
+    self._next_logprobs = [None] * len(self.uids)
+    mx.async_eval(self._next_tokens, token_context)
+
+    # Eval the current tokens. After that also add them to self.tokens so
+    # that it always represents the tokens contained in the KV Cache.
+    mx.eval(inputs)
+    inputs = inputs.tolist()
+    for sti, ti in zip(self.tokens, inputs):
+        sti.append(ti)
+    return inputs, self._current_logprobs
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -762,7 +948,13 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
-    return _original_generation_batch_step(self)
+    # Skip the full-vocab logprobs materialisation when no row asked for
+    # logprobs and no speculative-decode path reads them (see the audit
+    # header above _omlx_batch_wants_logprobs).  Any consumer at all runs
+    # the upstream step unchanged, keeping requested logprobs bit-identical.
+    if _omlx_batch_wants_logprobs(self) or _omlx_spec_decode_reads_logprobs(self):
+        return _original_generation_batch_step(self)
+    return _omlx_generation_batch_step_no_logprobs(self)
 
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
@@ -1165,6 +1357,62 @@ PromptProcessingBatch._omlx_prompt_wrapper = _patched_ppb_prompt
 PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch BatchGenerator._next to reroute mlx-lm's decode-time cache
+# clear through omlx's synced, pressure-gated policy. Upstream runs
+#
+#     self._steps_counter += 1
+#     if self._steps_counter % 512 == 0:
+#         mx.clear_cache()
+#
+# — an UNSYNCED mx.clear_cache() every 512 decode steps, the exact
+# in-flight-buffer race class documented in #300/#888/#1106: the generation
+# stream may still hold command buffers referencing the pool entries being
+# released. omlx's own decode-time clear in Scheduler.step already drains
+# the stream first via _sync_and_clear_cache, so the upstream clear is both
+# unsafe and redundant.
+#
+# _steps_counter exists solely to drive that cadence, so the patch bumps it
+# past the boundary before delegating (the original body then skips the
+# clear) and restores it afterwards — the 512-step cadence is preserved
+# exactly, but the clear is re-fired through _sync_and_clear_cache and only
+# when the MLX buffer pool exceeds the pressure threshold. The threshold
+# provider is attached per instance as _omlx_decode_clear_threshold_bytes
+# by Scheduler._create_batch_generator; generators without it (not created
+# by omlx) keep stock upstream behaviour. The 512 modulus mirrors the
+# installed mlx-lm; re-validate when bumping the dependency.
+# ---------------------------------------------------------------------------
+_original_batch_generator_next = BatchGenerator._next
+
+
+def _patched_batch_generator_next(self):
+    threshold = getattr(self, "_omlx_decode_clear_threshold_bytes", None)
+    steps = getattr(self, "_steps_counter", None)
+    if (
+        threshold is None
+        or steps is None
+        or len(self._generation_batch) == 0
+        or (steps + 1) % 512 != 0
+    ):
+        return _original_batch_generator_next(self)
+
+    # This call would cross the upstream unsynced-clear boundary. Pre-set
+    # the counter past it so the original body skips the clear, restore the
+    # logical count afterwards (exactly one decode step elapsed either
+    # way), and re-fire the clear through the synced policy instead.
+    self._steps_counter = steps + 1
+    try:
+        result = _original_batch_generator_next(self)
+    finally:
+        self._steps_counter = steps + 1
+    if mx.get_cache_memory() > threshold():
+        _sync_and_clear_cache(self._stream)
+    return result
+
+
+BatchGenerator._next = _patched_batch_generator_next
+
+
 # Cache class names known to be sliceable (no boundary snapshots needed).
 # ChunkedKVCache is included once the batch=1 patch above installs its
 # extract/filter/size pass-throughs; without it Llama-4 requests fall
@@ -1405,15 +1653,14 @@ _DECODE_FAIR_SHARE = float(os.environ.get("OMLX_DECODE_FAIR_SHARE", "0.5"))
 _DECODE_STALL_TARGET_MS = float(
     os.environ.get("OMLX_DECODE_STALL_TARGET_MS", "500")
 )
-_CONTENDED_PREFILL_CHUNK = int(
-    os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
-)
+_CONTENDED_PREFILL_CHUNK = DEFAULT_MIXED_PREFILL_QUANTUM
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
 # L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
 # route every contended chunk onto the ~4x-slower MLX fallback.
-_CONTENDED_CHUNK_GRID = 64
+_CONTENDED_CHUNK_GRID = MIXED_PREFILL_GRID
+_MIXED_PREFILL_MIN_QUANTUM = MIN_MIXED_PREFILL_QUANTUM
 _DECODE_ACTIVITY_TTL_S = 2.5
 
 
@@ -1496,6 +1743,11 @@ class SchedulerConfig:
     initial_cache_blocks: int = (
         256  # Starting blocks (grows dynamically to max_cache_blocks)
     )
+    # Fixed ANE prefill shape, when the engine enabled the hybrid ANE path.
+    # Pooling-cache models clamp prefill chunks to block boundaries, so the
+    # block size must match this shape or the fixed-shape ANE ops never see
+    # an eligible chunk.
+    ane_prefill_block_size: int = 0
 
     # paged SSD cache settings (oMLX only supports paged SSD-based caching)
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
@@ -1752,6 +2004,31 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+        # DeepSeek V4 (native sparse indexer + ratio-128 attention over a
+        # PoolingCache): the prefill indexer kernel handles partial 64x64
+        # tiles (patches/deepseek_v4/indexer_dispatch.py), so chunk sizes
+        # need no scheduler-visible alignment; 4096 is 64-aligned and a
+        # multiple of the 2048 pooling block size, so when the paged-cache
+        # boundary clamp shrinks a chunk it still lands on an exact block
+        # boundary. Same machine-headroom gate as the qwen3_5 path: floor
+        # at 4096 only when the probe passes, and the prefill memory
+        # guard / adaptive throttle / decode-fairness contention cap still
+        # shrink chunks on top of the floor.
+        self._ds4_prefill_floor = 0
+        try:
+            _mt = str(getattr(model, "model_type", "") or "")
+            if not _mt:
+                _mt = str(
+                    getattr(getattr(model, "config", None), "model_type", "") or ""
+                )
+            if _mt.startswith("deepseek_v4"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._ds4_prefill_floor = 4096
+        except Exception:
+            logger.debug("prefill floor probe failed", exc_info=True)
+
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -2615,6 +2892,9 @@ class Scheduler:
         hi = self._ROTATING_BLOCK_SIZE_MAX
         if self._detect_pooling_cache():
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            ane_block = int(getattr(self.config, "ane_prefill_block_size", 0) or 0)
+            if ane_block:
+                lo = hi = ane_block
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -2985,6 +3265,12 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+
+        # Reroute mlx-lm's every-512-steps unsynced decode-time clear
+        # through omlx's synced, pressure-gated policy (see
+        # _patched_batch_generator_next). Bound method, so the patch reads
+        # the live threshold as _memory_limit_bytes changes.
+        bg._omlx_decode_clear_threshold_bytes = self._periodic_clear_threshold_bytes
 
         return bg
 
@@ -4733,32 +5019,72 @@ class Scheduler:
             logger.debug("decode-activity check failed: %s", exc)
             return False
 
+    def _active_decode_rows(self) -> int:
+        """Return local plus process-peer decode rows for budget pressure."""
+
+        rows = len(self.running)
+        try:
+            registry = get_decode_activity()
+            counter = getattr(registry, "other_decode_rows", None)
+            if callable(counter):
+                rows += max(
+                    0,
+                    int(counter(self._decode_activity_key, _DECODE_ACTIVITY_TTL_S)),
+                )
+            elif registry.others_decoding(
+                self._decode_activity_key, _DECODE_ACTIVITY_TTL_S
+            ):
+                rows += 1
+        except Exception as exc:
+            logger.debug("decode-row activity check failed: %s", exc)
+        return rows
+
     def _decode_contention(self) -> bool:
         """Any decode (own engine or another engine) this prefill contends
         with."""
         return bool(self.running) or self._others_decoding()
 
-    def _contended_prefill_cap(self) -> int:
-        """Chunk cap while decodes contend with this prefill (0 = no cap).
+    def _base_contended_prefill_quantum(self) -> int:
+        """B1 stall-time quantum before decode-row pressure scaling."""
 
-        Derived from the stall-time target and this engine's measured
-        prefill throughput, so the victim's stall stays ~constant in wall
-        time across machines and model sizes. Falls back to a fixed token
-        count until the first chunk has been timed.
-        """
-        if not self._decode_fairness:
-            return 0
-        if not self._decode_contention():
-            return 0
         tps = self._prefill_tps_best
+        ceiling = max(
+            1,
+            min(
+                self.config.prefill_step_size,
+                self.config.max_num_batched_tokens,
+                _CONTENDED_PREFILL_CHUNK,
+            ),
+        )
+        floor = min(_CONTENDED_CHUNK_FLOOR, ceiling)
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
             cap = (cap // _CONTENDED_CHUNK_GRID) * _CONTENDED_CHUNK_GRID
             return max(
-                _CONTENDED_CHUNK_FLOOR,
-                min(cap, self.config.prefill_step_size),
+                floor,
+                min(cap, ceiling),
             )
-        return _CONTENDED_PREFILL_CHUNK
+        return ceiling
+
+    def _mixed_batch_budget(self) -> ContinuousBatchBudget:
+        """Deterministic prompt/decode budgets for the next scheduler turn."""
+
+        decode_rows = self._active_decode_rows() if self._decode_fairness else 0
+        return continuous_batch_budget(
+            configured_prefill_tokens=self.config.prefill_step_size,
+            active_decode_rows=decode_rows,
+            decode_row_budget=self.config.completion_batch_size,
+            max_prompt_tokens=self.config.max_num_batched_tokens,
+            mixed_prefill_quantum=self._base_contended_prefill_quantum(),
+            min_mixed_quantum=_MIXED_PREFILL_MIN_QUANTUM,
+            grid=_CONTENDED_CHUNK_GRID,
+        )
+
+    def _contended_prefill_cap(self) -> int:
+        """Prompt-token quantum while decodes run (0 means idle/unbounded)."""
+
+        budget = self._mixed_batch_budget()
+        return budget.prefill_quantum if budget.mixed else 0
 
     def _prefill_hold_deadline(self) -> float:
         """Effective hold deadline: own deadline or the shared one.
@@ -4920,7 +5246,12 @@ class Scheduler:
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
             size = self.config.prefill_step_size
-            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            # Model-family chunk floors (qwen3_5 / deepseek_v4). A model is
+            # exactly one family, so the max is that family's floor (or 0).
+            floor = max(
+                getattr(self, "_qwen35_prefill_floor", 0),
+                getattr(self, "_ds4_prefill_floor", 0),
+            )
             if floor and size < floor:
                 size = floor
             return size
@@ -5319,7 +5650,12 @@ class Scheduler:
                 state_machines=[state.sm],
             )
         if uids:
-            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
+            _register_uid_rows(
+                self.model, uids, [state.sampler], [per_row_lps],
+                wants_logprobs_rows=[
+                    bool(getattr(request.sampling_params, "logprobs", False))
+                ],
+            )
             uid = uids[0]
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
@@ -5353,12 +5689,14 @@ class Scheduler:
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
     ) -> None:
-        """Process one prefill chunk per in-flight chunked-prefill request.
+        """Advance chunked prefills within this turn's prompt budgets.
 
         Called at the start of each step() before _schedule_waiting(). Each
-        call advances every request in self.prefilling by one prefill_step_size
-        chunk. When a request's prefill completes it is inserted into
-        BatchGenerator and moved to self.running.
+        Idle calls retain the existing all-row behavior. Mixed decode/prompt
+        calls consume one dynamically-sized prompt row and rotate it behind
+        untouched rows before returning to generation. When a request's
+        prefill completes it is inserted into BatchGenerator and moved to
+        self.running.
 
         Args:
             scheduled: The step's running list of newly-scheduled requests;
@@ -5372,6 +5710,10 @@ class Scheduler:
 
         pending_prefills = list(self.prefilling)
         still_prefilling: deque[Request] = deque()
+        cycled_prefills: deque[Request] = deque()
+        budget = self._mixed_batch_budget()
+        prompt_rows = 0
+        prompt_tokens = 0
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -5381,6 +5723,22 @@ class Scheduler:
             # _do_abort_request() between steps — just skip it.
             if state is None:
                 continue
+
+            # Mixed turns reserve decode rows independently and allow only the
+            # planned prompt rows/tokens before returning to generation. Idle
+            # turns have zero (unbounded) budgets and retain today's loop.
+            if (
+                budget.prompt_row_budget > 0
+                and prompt_rows >= budget.prompt_row_budget
+            ) or (
+                budget.prompt_token_budget > 0
+                and prompt_tokens >= budget.prompt_token_budget
+            ):
+                still_prefilling.extend(pending_prefills[index:])
+                break
+
+            processed_before = int(getattr(state, "tokens_processed", 0) or 0)
+            prompt_rows += 1
 
             try:
                 done = self._step_prefill_chunk(state)
@@ -5439,8 +5797,19 @@ class Scheduler:
                 )
                 continue
 
+            prompt_tokens += max(
+                0,
+                int(getattr(state, "tokens_processed", processed_before) or 0)
+                - processed_before,
+            )
+
             if not done:
-                still_prefilling.append(request)
+                if budget.mixed:
+                    # Round-robin in-flight prompts so B2/B4 admission cannot
+                    # pin every mixed quantum to the oldest long request.
+                    cycled_prefills.append(request)
+                else:
+                    still_prefilling.append(request)
                 continue
 
             # Prefill complete — emit final boundary snapshot and insert.
@@ -5467,6 +5836,7 @@ class Scheduler:
 
             self._insert_prefilled_request(request, state, scheduled)
 
+        still_prefilling.extend(cycled_prefills)
         self.prefilling = still_prefilling
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
@@ -10359,7 +10729,12 @@ class Scheduler:
                     state_machines=[sm],
                 )
             if uids:
-                _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
+                _register_uid_rows(
+                    self.model, uids, [sampler], [per_row_lps],
+                    wants_logprobs_rows=[
+                        bool(getattr(request.sampling_params, "logprobs", False))
+                    ],
+                )
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
@@ -10520,7 +10895,10 @@ class Scheduler:
             ):
                 response.logprobs = None
 
-            # Create output
+            # Create output. output_token_ids stays empty here on purpose:
+            # copying the growing cumulative list for every emitted token is
+            # O(n^2) over a response. The full list is attached once below
+            # when the request finishes.
             output_generated_at = (
                 generated_at
                 if request.num_output_tokens > completion_tokens_before
@@ -10530,7 +10908,6 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
@@ -10564,6 +10941,8 @@ class Scheduler:
                 elif is_length:
                     request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED)
 
+                # Attach the complete cumulative ids only on the final output.
+                output.output_token_ids = list(request.output_token_ids)
                 output.finished = True
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
@@ -11659,12 +12038,27 @@ class Scheduler:
                     # there is no race window. Decode-only path —
                     # next_generated() returns nothing during prefill, so
                     # we never disrupt prefill activation buffers.
+                    #
+                    # The clear is pressure-gated on the MLX buffer pool
+                    # (same threshold as _should_periodic_clear_cache):
+                    # _sync_and_clear_cache drains the GPU pipeline, a
+                    # full stall for every in-flight request, so a decode
+                    # whose pool holds little to release should not pay it
+                    # every 1024 tokens. The 1024-token counter still
+                    # drives the *check* cadence; when the pool does exceed
+                    # the threshold the synced clear fires at the same
+                    # cadence as before, preserving the IOGPU residency
+                    # invariant above.
                     self._tokens_since_clear_cache = getattr(
                         self, "_tokens_since_clear_cache", 0
                     ) + len(responses)
                     if self._tokens_since_clear_cache >= 1024:
-                        _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
+                        if (
+                            mx.get_cache_memory()
+                            > self._periodic_clear_threshold_bytes()
+                        ):
+                            _sync_and_clear_cache(self._stream)
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.

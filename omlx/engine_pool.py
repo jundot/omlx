@@ -17,6 +17,7 @@ import asyncio
 import gc
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -58,6 +59,109 @@ logger = logging.getLogger(__name__)
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+_CLUSTER_RANK_STATE_DIR = "~/.omlx/cluster/runtime"
+
+# mlx-lm ships explicit outer wrappers for these multimodal families that
+# discard vision weights in ``sanitize()`` and serve the language model with a
+# native, layer-local ``Model.shard()`` implementation.  A distributed
+# deployment may therefore expose their exact language backbone without
+# pretending images are supported.  Keep this allow-list narrow: adding a
+# model type is a load/parity commitment, not a filename heuristic.
+_CLUSTER_TEXT_BACKBONE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def _config_supports_cluster_text_backbone(config: object) -> bool:
+    if not isinstance(config, dict):
+        return False
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES:
+        return False
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict) or not text_config:
+        return False
+    architectures = config.get("architectures")
+    return isinstance(architectures, list) and any(
+        isinstance(name, str) and "ForConditionalGeneration" in name
+        for name in architectures
+    )
+
+
+def _entry_supports_cluster_text_backbone(entry: "EngineEntry") -> bool:
+    if (
+        entry.config_model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES
+    ):
+        return False
+    config_path = Path(entry.model_path).expanduser() / "config.json"
+    try:
+        if config_path.stat().st_size > 4 * 1024**2:
+            return False
+        return _config_supports_cluster_text_backbone(
+            json.loads(config_path.read_text())
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _cluster_rank_resident_bytes(
+    *,
+    state_dir: str | Path | None = None,
+    exclude_deployment_id: str | None = None,
+) -> int:
+    """Resident memory of live cluster rank workers in sibling processes.
+
+    Rank workers are separate processes — launched over SSH, possibly by a
+    peer coordinator — so this process's ``mx.get_active_memory()`` and
+    ``phys_footprint`` see none of the tens of GB they hold. Admission that
+    ignores them overcommits the host (observed live: a 59 GB local model
+    admitted on top of a 75 GB rank on a 128 GB node → ~77 GB of compressor
+    spill and red memory pressure). Ranks publish runtime markers carrying
+    their memory; fresh markers from live processes are charged here.
+
+    Markers belonging to the deployment currently being admitted are
+    excluded: its new ranks are not alive yet, and a stale marker from its
+    previous incarnation must not block re-activation.
+    """
+
+    try:
+        from .cluster.runtime import _marker_is_fresh, _process_is_live
+    except Exception:  # pragma: no cover - cluster module unavailable
+        return 0
+    if state_dir is None:
+        state_dir = os.environ.get(
+            "OMLX_CLUSTER_STATE_DIR", _CLUSTER_RANK_STATE_DIR
+        )
+    root = Path(state_dir).expanduser()
+    try:
+        markers = sorted(root.glob("*-rank-*.json"))
+    except OSError:
+        return 0
+    total = 0
+    for path in markers:
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            exclude_deployment_id
+            and payload.get("deployment_id") == exclude_deployment_id
+        ):
+            continue
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if not _process_is_live(pid):
+            continue
+        if not _marker_is_fresh(payload.get("updated_at", "")):
+            continue
+        resident = payload.get("load_memory_bytes")
+        if not isinstance(resident, (int, float)) or resident <= 0:
+            resident = payload.get("measured_weight_bytes")
+        if isinstance(resident, (int, float)) and resident > 0:
+            total += int(resident)
+    return total
 
 
 def _positive_int(value: object) -> int:
@@ -174,6 +278,80 @@ def _qwen35_cpu_share_estimated_bytes(
         )
         extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
 
+    return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
+
+def _deepseek_v4_cpu_share_estimated_bytes(
+    model_path: str,
+    settings: object | None,
+) -> int | None:
+    """Estimate eager FP16 query rows retained by DeepSeek ANE sharing.
+
+    Every layer keeps a CPU middle from attention ``wq_b``. Sparse ratio-4
+    layers stack the indexer ``wq_b`` into that projection, so their aligned
+    CPU slice can be wider. ``None`` means the feature is enabled for a
+    DeepSeek-V4 checkpoint but the required geometry is unreadable; callers
+    must fail closed instead of admitting the packed model estimate alone.
+    """
+
+    if (
+        settings is None
+        or not bool(getattr(settings, "deepseek_ane_prefill_enabled", False))
+        or not bool(getattr(settings, "deepseek_ane_prefill_cpu_enabled", True))
+        or int(getattr(settings, "deepseek_ane_prefill_sequence_length", 4096) or 0)
+        < 4096
+    ):
+        return 0
+
+    fraction = float(
+        getattr(settings, "deepseek_ane_prefill_cpu_fraction", 0.125) or 0.0
+    )
+    if fraction <= 0:
+        return 0
+
+    config_path = Path(model_path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    model_type = str(text.get("model_type") or config.get("model_type") or "")
+    if not model_type.lower().replace("-", "_").startswith("deepseek_v4"):
+        return 0
+
+    # These are the defaults of the registered DeepSeek-V4 model class, so a
+    # standard checkpoint may omit them without making its geometry unknown.
+    layer_count = _positive_int(text.get("num_hidden_layers", 43))
+    q_lora_rank = _positive_int(text.get("q_lora_rank", 1024))
+    query_outputs = _positive_int(text.get("num_attention_heads", 64)) * _positive_int(
+        text.get("head_dim", 512)
+    )
+    index_outputs = _positive_int(text.get("index_n_heads", 64)) * _positive_int(
+        text.get("index_head_dim", 128)
+    )
+    if not layer_count or not q_lora_rank or not query_outputs or not index_outputs:
+        return None
+
+    ratios = text.get("compress_ratios")
+    if isinstance(ratios, list) and len(ratios) >= layer_count:
+        sparse_layers = sum(
+            int(_positive_int(ratio) == 4) for ratio in ratios[:layer_count]
+        )
+    else:
+        # The model default alternates sparse and compressed attention, but a
+        # conservative all-sparse charge is safer when the explicit map is
+        # absent or truncated.
+        sparse_layers = layer_count
+
+    plain_rows = _aligned_share_rows(query_outputs, fraction)
+    stacked_rows = _aligned_share_rows(query_outputs + index_outputs, fraction)
+    total_rows = layer_count * plain_rows
+    total_rows += sparse_layers * max(0, stacked_rows - plain_rows)
+    extra = total_rows * q_lora_rank * _FP16_BYTES
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
 
 
@@ -313,7 +491,10 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or (
+            entry.engine_type != "batched"
+            and not _entry_supports_cluster_text_backbone(entry)
+        ):
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -348,24 +529,41 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
-        if extra is None:
-            # An enabled CPU path with unreadable geometry must not silently
-            # retain the quantized estimate. One additional model-sized charge
-            # is conservative and lets normal admission produce useful errors.
-            extra = entry.estimated_size
-            logger.warning(
-                "Could not determine Qwen CPU-share geometry for %s; "
-                "reserving one additional model-sized memory allowance",
-                entry.model_id,
-            )
-        if extra > 0:
-            logger.info(
-                "Qwen CPU sharing adds %s to the projected memory for %s",
-                format_size(extra),
-                entry.model_id,
-            )
-        return base + extra
+        estimates = (
+            (
+                "Qwen",
+                _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings),
+            ),
+            (
+                "DeepSeek-V4",
+                _deepseek_v4_cpu_share_estimated_bytes(
+                    entry.model_path, runtime_settings
+                ),
+            ),
+        )
+        extra_total = 0
+        for family, extra in estimates:
+            if extra is None:
+                # An enabled CPU path with unreadable geometry must not
+                # silently retain the packed estimate. One additional
+                # model-sized charge is conservative and lets normal
+                # admission produce a useful error.
+                extra = entry.estimated_size
+                logger.warning(
+                    "Could not determine %s CPU-share geometry for %s; "
+                    "reserving one additional model-sized memory allowance",
+                    family,
+                    entry.model_id,
+                )
+            if extra > 0:
+                logger.info(
+                    "%s CPU sharing adds %s to the projected memory for %s",
+                    family,
+                    format_size(extra),
+                    entry.model_id,
+                )
+            extra_total += extra
+        return base + extra_total
 
     @property
     def current_model_memory(self) -> int:
@@ -534,6 +732,8 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        if mtp_active:
+            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -591,6 +791,51 @@ class EnginePool:
                 add(
                     "qwen35_ane_prefill_cpu_shared_resource",
                     data.get("qwen35_ane_prefill_cpu_shared_resource", True),
+                )
+
+        dsv4_ane_active = bool(data.get("deepseek_ane_prefill_enabled", False))
+        add("deepseek_ane_prefill_enabled", dsv4_ane_active)
+        if dsv4_ane_active:
+            add(
+                "deepseek_ane_prefill_sequence_length",
+                data.get("deepseek_ane_prefill_sequence_length", 4096),
+            )
+            add(
+                "deepseek_ane_prefill_tail_padding_min_tokens",
+                data.get("deepseek_ane_prefill_tail_padding_min_tokens", 0),
+            )
+            add(
+                "deepseek_ane_prefill_down_enabled",
+                data.get("deepseek_ane_prefill_down_enabled", True),
+            )
+            add(
+                "deepseek_ane_prefill_down_fraction",
+                data.get("deepseek_ane_prefill_down_fraction", 0.65),
+            )
+            add(
+                "deepseek_ane_prefill_wo_a_enabled",
+                data.get("deepseek_ane_prefill_wo_a_enabled", True),
+            )
+            add(
+                "deepseek_ane_prefill_wo_a_fraction",
+                data.get("deepseek_ane_prefill_wo_a_fraction", 0.5),
+            )
+            cpu_active = bool(
+                data.get("deepseek_ane_prefill_cpu_enabled", True)
+            )
+            add("deepseek_ane_prefill_cpu_enabled", cpu_active)
+            if cpu_active:
+                add(
+                    "deepseek_ane_prefill_cpu_fraction",
+                    data.get("deepseek_ane_prefill_cpu_fraction", 0.125),
+                )
+                add(
+                    "deepseek_ane_prefill_cpu_threads",
+                    data.get("deepseek_ane_prefill_cpu_threads", 12),
+                )
+                add(
+                    "deepseek_ane_prefill_cpu_shared_resource",
+                    data.get("deepseek_ane_prefill_cpu_shared_resource", True),
                 )
 
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
@@ -665,7 +910,7 @@ class EnginePool:
     @property
     def loaded_model_count(self) -> int:
         """Number of currently loaded models."""
-        return sum(1 for e in self._entries.values() if e.engine is not None)
+        return sum(1 for e in self._entries.values() if self._entry_is_loaded(e))
 
     async def apply_embedding_batch_size(self, batch_size: int) -> None:
         """Apply embedding batch size to future and currently loaded embedding engines."""
@@ -798,7 +1043,21 @@ class EnginePool:
 
     def get_loaded_model_ids(self) -> list[str]:
         """Get list of currently loaded model IDs."""
-        return [mid for mid, e in self._entries.items() if e.engine is not None]
+        return [mid for mid, e in self._entries.items() if self._entry_is_loaded(e)]
+
+    @staticmethod
+    def _entry_runtime_failure(entry: EngineEntry) -> str | None:
+        engine = entry.engine
+        if engine is None:
+            return None
+        reason = getattr(engine, "runtime_failed_reason", None)
+        return reason if isinstance(reason, str) and bool(reason.strip()) else None
+
+    @classmethod
+    def _entry_is_loaded(cls, entry: EngineEntry) -> bool:
+        """Treat a terminal distributed worker as unloaded during teardown."""
+
+        return entry.engine is not None and cls._entry_runtime_failure(entry) is None
 
     def get_entry(self, model_id: str) -> EngineEntry | None:
         """Get entry for a specific model, or None if not found."""
@@ -861,7 +1120,9 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if entry.engine_type != "batched" and not (
+            _entry_supports_cluster_text_backbone(entry)
+        ):
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
                 "Distributed cluster inference currently supports text LLM "
@@ -899,7 +1160,9 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if entry.engine_type != "batched" and not (
+                _entry_supports_cluster_text_backbone(entry)
+            ):
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
@@ -913,6 +1176,40 @@ class EnginePool:
             raise ValueError(f"cluster model config is unreadable: {exc}") from exc
         if not isinstance(config, dict):
             raise ValueError("cluster model config.json must contain an object")
+
+        # A remote-only stage bypasses normal local model discovery, but it
+        # must not bypass the same engine classification.  In particular, a
+        # staged VLM still carries its vision configuration even when rank
+        # zero owns only part of the weights. Registering it as a synthetic
+        # BatchedEngine entry would evade resolve_cluster_model_id's text-only
+        # guard and fail much later inside the distributed worker, unless it
+        # is one of the explicitly proven text-backbone wrappers above.
+        from .model_discovery import _has_vision_subconfig, detect_model_type
+
+        detected_model_type = detect_model_type(path)
+        config_candidates = [config]
+        config_candidates.extend(
+            value
+            for key in ("model", "text_config", "language_config", "llm_config")
+            if isinstance((value := config.get(key)), dict)
+        )
+        carries_vision = any(
+            _has_vision_subconfig(candidate) for candidate in config_candidates
+        )
+        # Some text-only families are intentionally served through mlx-vlm
+        # locally (for example MiniMax-M3), so ``detect_model_type == vlm`` is
+        # not alone proof that a remote stage contains vision weights.  A
+        # non-empty vision sub-config is the fail-closed distributed boundary;
+        # other unambiguously non-generative/audio engines remain ineligible.
+        text_backbone = _config_supports_cluster_text_backbone(config)
+        if (
+            (carries_vision and not text_backbone)
+            or detected_model_type not in {"llm", "vlm"}
+        ):
+            raise ValueError(
+                "Distributed cluster inference currently supports text LLM "
+                f"models only; staged model is {detected_model_type}."
+            )
 
         base_id = path.name or "cluster-model"
         model_id = base_id
@@ -1119,9 +1416,41 @@ class EnginePool:
         if not callable(has_active_requests):
             return False
         try:
-            return has_active_requests() is True
+            if has_active_requests() is True:
+                return True
         except Exception:
             return True
+        # A terminal distributed-runtime failure makes the rank marker a
+        # historical snapshot.  The worker may have died while its last
+        # telemetry sample still said ``active_requests > 0``; treating that
+        # frozen value as live work makes quiescence-gated unload impossible
+        # and leaves the cluster tab showing a model that no process owns.
+        # Keep respecting coordinator-side generators above, but once they
+        # drain, do not let dead-rank telemetry veto teardown.
+        runtime_failed_reason = getattr(engine, "runtime_failed_reason", None)
+        if (
+            isinstance(runtime_failed_reason, str)
+            and runtime_failed_reason.strip()
+        ):
+            return False
+        # Distributed engines: the coordinator counter draining only proves
+        # the httpx side closed. Rank-side telemetry reporting active
+        # requests means the ranks are still generating and the entry is NOT
+        # quiescent (G5); no marker evidence (None) falls through, since a
+        # dead rank's marker is handled by the supervisor failure paths.
+        rank_side = getattr(engine, "rank_side_active_requests", None)
+        if callable(rank_side):
+            try:
+                remaining = rank_side()
+            except Exception:
+                remaining = None
+            if (
+                isinstance(remaining, int)
+                and not isinstance(remaining, bool)
+                and remaining > 0
+            ):
+                return True
+        return False
 
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
@@ -1535,6 +1864,12 @@ class EnginePool:
                         mx.get_active_memory(),
                         get_phys_footprint(),
                         self._current_model_memory,
+                    ) + _cluster_rank_resident_bytes(
+                        exclude_deployment_id=(
+                            deployment.deployment_id
+                            if deployment is not None
+                            else None
+                        )
                     )
                     projected = current + admission_size
                     if projected <= evict_target:
@@ -1668,6 +2003,14 @@ class EnginePool:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+            if e is not None:
+                failure = self._entry_runtime_failure(e)
+                if failure and not e.pending_unload_reason:
+                    self._mark_pending_unload_locked(
+                        model_id,
+                        f"distributed runtime failed: {failure}",
+                        allow_pinned=True,
+                    )
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
@@ -2187,10 +2530,13 @@ class EnginePool:
             await entry.engine.stop()
         except Exception as e:
             if distributed:
-                # Keep the supervisor reachable and the planned memory
-                # accounted so a later unload can retry process teardown.
+                # The supervisor raises (DistributedTeardownError) when the
+                # final SIGKILL cannot be verified, so this path is now
+                # reachable: keep the supervisor reachable and the planned
+                # memory accounted so a later unload can retry process
+                # teardown instead of releasing the budget over a live rank.
                 logger.error(
-                    f"Distributed teardown failed for {model_id}; "
+                    f"Distributed teardown failed for {model_id} ({e}); "
                     "keeping the engine registered for retry",
                     exc_info=True,
                 )
@@ -2234,7 +2580,10 @@ class EnginePool:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        # Clear engine reference before settle barrier
+        # Clear engine reference before settle barrier. Capture the observed
+        # load-time footprint first: the barrier target must not exceed what
+        # the load actually allocated.
+        observed_actual_size = entry.actual_size
         entry.engine = None
         entry.last_access = 0.0
         entry.actual_size = None
@@ -2278,8 +2627,17 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
-        min_expected_freed = max(0, resident_size - settle_tolerance)
+        # Base the target on the observed load-time footprint when it is
+        # smaller than the estimate: a model whose actual size undershoots
+        # the estimate by more than the tolerance (e.g. DeepSeek-V4-Flash
+        # MXFP4: actual 148.9 GB vs estimated 163.4 GB) can never free the
+        # estimated amount, making the barrier unsatisfiable and burning
+        # all 10 rounds on every unload.
+        settle_basis = entry.estimated_size
+        if observed_actual_size and 0 < observed_actual_size < settle_basis:
+            settle_basis = observed_actual_size
+        settle_tolerance = max(2 * 1024**3, int(settle_basis * 0.05))
+        min_expected_freed = max(0, settle_basis - settle_tolerance)
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
@@ -2497,7 +2855,18 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = deployment if effective_type == "batched" else None
+            cluster_text_backbone = _entry_supports_cluster_text_backbone(entry)
+            deployment = (
+                deployment
+                if effective_type == "batched" or cluster_text_backbone
+                else None
+            )
+            if deployment is not None and cluster_text_backbone:
+                logger.info(
+                    "Distributed inference will serve the exact text backbone "
+                    "of multimodal model %s; image/video inputs remain disabled",
+                    model_id,
+                )
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
@@ -2586,6 +2955,7 @@ class EnginePool:
                             model_settings, "enable_thinking", None
                         ),
                         model_settings=model_settings,
+                        text_backbone_only=cluster_text_backbone,
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "
@@ -2989,26 +3359,23 @@ class EnginePool:
         Returns:
             Dictionary with pool status information
         """
-        return {
-            "final_ceiling": self._current_ceiling(),
-            "current_model_memory": self._current_model_memory,
-            "model_count": len(self._entries),
-            "loaded_count": sum(
-                1 for e in self._entries.values() if e.engine is not None
-            ),
-            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
-            "load_time_observations": self._load_time_observations,
-            "models": [
+        models = []
+        for mid, e in sorted(self._entries.items()):
+            deployment = self._distributed_deployment_for_entry(e)
+            models.append(
                 {
                     "id": mid,
                     "model_path": e.model_path,
-                    "loaded": e.engine is not None,
+                    "loaded": self._entry_is_loaded(e),
                     "is_loading": e.is_loading,
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "resident_estimated_size": self._entry_resident_size(e),
-                    "distributed": (
-                        self._distributed_deployment_for_entry(e) is not None
+                    "distributed": deployment is not None,
+                    "cluster": (
+                        self._cluster_status_payload(deployment)
+                        if deployment is not None
+                        else None
                     ),
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
@@ -3026,8 +3393,40 @@ class EnginePool:
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
-                for mid, e in sorted(self._entries.items())
-            ],
+            )
+        return {
+            "final_ceiling": self._current_ceiling(),
+            "current_model_memory": self._current_model_memory,
+            "model_count": len(self._entries),
+            "loaded_count": sum(
+                1 for e in self._entries.values() if self._entry_is_loaded(e)
+            ),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
+            "models": models,
+        }
+
+    @staticmethod
+    def _cluster_status_payload(deployment: ClusterDeployment) -> dict:
+        """Badge/cluster topology summary for dashboard model rows."""
+
+        world_size = deployment.world_size
+        tensor_parallel_size = deployment.tensor_parallel_size
+        return {
+            "deployment_id": deployment.deployment_id,
+            "world_size": world_size,
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_stages": world_size // tensor_parallel_size,
+            "strategy": (
+                "tensor"
+                if tensor_parallel_size == world_size
+                else "pipeline"
+                if tensor_parallel_size == 1
+                else "hybrid"
+            ),
+            "backend": str(deployment.backend),
+            "target_context_tokens": deployment.target_context_tokens,
+            "profile": deployment.execution.profile,
         }
 
     async def check_ttl_expirations(

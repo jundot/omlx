@@ -11,6 +11,7 @@ import mlx.core as mx
 import pytest
 
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.patches.deepseek_v4.cache_extras import BatchPoolingCache
 
 pytestmark = pytest.mark.skipif(
     not (
@@ -134,3 +135,41 @@ def test_mask_ratio_zero_matches_unmasked():
         q, pooled[:, None], weights, causal=False, mask_ratio=0, mask_q_offset=0
     )
     assert _bit_equal(plain, zero_ratio)
+
+
+def test_singleton_batch_pool_mask_folds_bit_identically():
+    """The production B1 cache's 3-D mask is uniform and foldable."""
+
+    mx.random.seed(20260828)
+    B, H, D, L, P, ratio, q_offset = 1, 64, 128, 65, 577, 4, 2304
+    q = mx.random.normal((B, H, L, D)).astype(mx.bfloat16)
+    pooled = mx.random.normal((B, P, D)).astype(mx.bfloat16)
+    weights = mx.random.normal((B, L, H)).astype(mx.bfloat16)
+    cache = BatchPoolingCache(ratio, [0])
+    cache._pool_buf = pooled
+    cache._pool_extent = P
+    cache._pool_lengths = [P]
+    mask = cache.make_mask(L, q_offset)
+
+    reference = glm_fast.dsa_indexer_scores(
+        q, pooled[:, None], weights, causal=False
+    )
+    reference = mx.where(
+        mask[:, None],
+        reference,
+        mx.finfo(reference.dtype).min,
+    )
+    fused = glm_fast.dsa_indexer_scores(
+        q,
+        pooled[:, None],
+        weights,
+        causal=False,
+        mask_ratio=ratio,
+        mask_q_offset=q_offset,
+    )
+
+    assert _bit_equal(fused, reference)
+    expected_indices = glm_fast.dsa_topk_indices(reference, 512, bucketed=False)
+    fused_indices = glm_fast.dsa_topk_indices(fused, 512, bucketed=False)
+    mx.eval(expected_indices, fused_indices)
+    assert bool(mx.array_equal(expected_indices, fused_indices))

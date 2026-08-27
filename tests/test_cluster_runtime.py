@@ -4,6 +4,8 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
 from omlx.cluster.runtime import read_runtime_markers
 
@@ -98,6 +100,22 @@ def test_runtime_markers_report_this_macs_live_rank(tmp_path):
     assert result["jobs"][0]["end_layer"] == 26
 
 
+def test_runtime_reader_ignores_launch_and_control_json_files(tmp_path):
+    (tmp_path / "job.json").write_text(json.dumps(_marker()))
+    for name in (
+        "launch-deployment.json",
+        "deployment-cancel.json",
+        "deployment-cancel-ack.json",
+        "deployment-serve.json",
+    ):
+        (tmp_path / name).write_text("not a rank marker", encoding="utf-8")
+
+    result = read_runtime_markers(tmp_path)
+
+    assert len(result["jobs"]) == 1
+    assert result["warnings"] == []
+
+
 def test_runtime_marker_with_reused_live_pid_is_not_reported_as_running(tmp_path):
     payload = _marker(
         updated_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
@@ -123,6 +141,31 @@ def test_failed_runtime_phase_never_looks_live_while_process_exits(tmp_path):
     assert result["jobs"][0]["phase"] == "launcher_lost"
     assert result["jobs"][0]["live"] is False
     assert result["jobs"][0]["error"] == "rank launcher parent changed"
+
+
+@pytest.mark.parametrize(
+    "load_stage",
+    (
+        "initializing",
+        "initializing_full_replica",
+        "loading_weights",
+        "materializing_fixed",
+        "materializing_layers",
+        "tensor_ready",
+        "weights_resident",
+        "validating",
+        "warming_prefill_shape",
+    ),
+)
+def test_runtime_preserves_real_intermediate_load_stages(tmp_path, load_stage):
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(phase="loading", load_stage=load_stage))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["load_stage"] == load_stage
 
 
 def test_runtime_marker_rejects_non_string_failure_evidence(tmp_path):
@@ -168,6 +211,41 @@ def test_runtime_markers_expose_full_unequal_shard_map_and_pipeline_rates(
         "eta": None,
         "elapsed": 2.0,
     }
+
+
+def test_runtime_markers_admit_full_replica_phase_ownership_and_handoff(tmp_path):
+    assignments = _assignments()
+    for assignment in assignments:
+        assignment["start_layer"] = 0
+        assignment["end_layer"] = 80
+        assignment["layer_count"] = 80
+    phase = {
+        "handoffs_completed": 3,
+        "last_handoff_bytes": 2_000_000_000,
+        "last_handoff_arrays": 128,
+        "last_handoff_seconds": 0.25,
+        "last_handoff_bytes_per_second": 8_000_000_000.0,
+        "queue_depth": 1,
+    }
+    payload = _marker(
+        start_layer=0,
+        end_layer=80,
+        assignments=assignments,
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        metrics=_metrics() | {"phase_split": phase},
+    )
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    job = result["jobs"][0]
+    assert job["serving_mode"] == "disaggregated"
+    assert job["prefill_rank"] == 1
+    assert job["decode_rank"] == 0
+    assert job["metrics"]["phase_split"] == phase
     assert job["metrics"]["requests_cancelled"] == 1
 
 
@@ -237,6 +315,142 @@ def test_runtime_markers_reject_nonfinite_rates(tmp_path):
     assert "out of range" in result["warnings"][0]
 
 
+def _tiered_cache_metrics():
+    return {
+        "affinity": "deployment",
+        "lookups": 5,
+        "hits": 3,
+        "misses": 2,
+        "hit_rate": 0.6,
+        "tokens_reused": 6_144,
+        "entries": 9,
+        "bytes": 69_632,
+        "ssd_enabled": True,
+        "memory": {"entries": 2, "bytes": 4_096, "hits": 1},
+        "ssd": {
+            "entries": 7,
+            "bytes": 65_536,
+            "hits": 2,
+            "max_bytes": 20 * 1024**3,
+            "capacity_bytes": 70_000,
+            "evictions": 3,
+            "capacity_drops": 1,
+            "pending_bytes": 0,
+            "pending_max_bytes": 512 * 1024**2,
+            "write_failures": 0,
+        },
+    }
+
+
+def test_runtime_markers_preserve_validated_cache_tier_metrics(tmp_path):
+    metrics = _metrics() | {"cache": _tiered_cache_metrics()}
+    payload = _marker(assignments=_assignments(), metrics=metrics)
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["metrics"]["cache"] == metrics["cache"]
+
+
+def test_runtime_markers_reject_inconsistent_cache_tier_totals(tmp_path):
+    cache = _tiered_cache_metrics()
+    cache["ssd"]["bytes"] += 1
+    metrics = _metrics() | {"cache": cache}
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(assignments=_assignments(), metrics=metrics))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "cache tier totals are inconsistent" in result["warnings"][0]
+
+
+def test_runtime_markers_reject_partial_or_disabled_ssd_tier_metrics(tmp_path):
+    partial = _tiered_cache_metrics()
+    partial.pop("memory")
+    (tmp_path / "partial.json").write_text(
+        json.dumps(
+            _marker(assignments=_assignments(), metrics=_metrics() | {"cache": partial})
+        )
+    )
+    disabled = _tiered_cache_metrics()
+    disabled["ssd_enabled"] = False
+    (tmp_path / "disabled.json").write_text(
+        json.dumps(
+            _marker(
+                assignments=_assignments(), metrics=_metrics() | {"cache": disabled}
+            )
+        )
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert any(
+        "cache tier metrics are incomplete" in item for item in result["warnings"]
+    )
+    assert any(
+        "SSD tier is populated while disabled" in item for item in result["warnings"]
+    )
+
+
+def test_runtime_markers_preserve_distinct_active_request_rates(tmp_path):
+    metrics = _metrics()
+    first = metrics["last_request"] | {
+        "request_id": 7,
+        "status": "running",
+        "prefill_tps": 410.0,
+        "decode_tps": 0.0,
+    }
+    second = metrics["last_request"] | {
+        "request_id": 8,
+        "status": "running",
+        "prefill_tps": 205.0,
+        "decode_tps": 37.5,
+    }
+    metrics |= {
+        "active_requests": 2,
+        "active_request_metrics": [first, second],
+        "active_request_metrics_truncated": 0,
+        "last_request": second,
+    }
+    payload = _marker(assignments=_assignments(), metrics=metrics)
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    requests = result["jobs"][0]["metrics"]["active_request_metrics"]
+    assert [
+        (item["request_id"], item["prefill_tps"], item["decode_tps"])
+        for item in requests
+    ] == [
+        (7, 410.0, 0.0),
+        (8, 205.0, 37.5),
+    ]
+
+
+def test_runtime_markers_reject_duplicate_active_request_ids(tmp_path):
+    metrics = _metrics()
+    request = metrics["last_request"] | {
+        "request_id": 7,
+        "status": "running",
+    }
+    metrics |= {
+        "active_requests": 2,
+        "active_request_metrics": [request, dict(request)],
+        "active_request_metrics_truncated": 0,
+    }
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "IDs are not unique" in result["warnings"][0]
+
+
 def test_runtime_markers_reject_impossible_prefill_progress(tmp_path):
     metrics = _metrics()
     metrics["last_request"]["prefill_progress"]["processed"] = 385
@@ -249,11 +463,72 @@ def test_runtime_markers_reject_impossible_prefill_progress(tmp_path):
     assert "prefill progress exceeds" in result["warnings"][0]
 
 
+def test_runtime_markers_validate_mtp_cycle_economics(tmp_path):
+    metrics = _metrics()
+    metrics["mtp"] = {
+        "sequences": 3,
+        "tokens": 360,
+        "cycles": 120,
+        "accepted_draft_tokens": 240,
+        "drafted_tokens": 300,
+        "zero_depth_cycles": 2,
+        "acceptance_ratio": 0.8,
+        "tokens_per_cycle": 3.0,
+        "depth_drafted": [120, 100, 80],
+        "depth_accepted": [115, 85, 40],
+        "timing_ms": {
+            "backbone": 2_400.0,
+            "mtp_head": 600.0,
+            "sampling": 60.0,
+            "cache_ops": 30.0,
+        },
+        "last_finish_reason": "length",
+    }
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(assignments=_assignments(), metrics=metrics))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["metrics"]["mtp"] == metrics["mtp"]
+
+
+def test_runtime_markers_reject_impossible_mtp_acceptance(tmp_path):
+    metrics = _metrics()
+    metrics["mtp"] = {
+        "sequences": 1,
+        "tokens": 20,
+        "cycles": 10,
+        "accepted_draft_tokens": 11,
+        "drafted_tokens": 10,
+        "zero_depth_cycles": 0,
+        "acceptance_ratio": 1.1,
+        "tokens_per_cycle": 2.0,
+        "depth_drafted": [10],
+        "depth_accepted": [11],
+        "timing_ms": {
+            "backbone": 1.0,
+            "mtp_head": 1.0,
+            "sampling": 1.0,
+            "cache_ops": 1.0,
+        },
+        "last_finish_reason": "length",
+    }
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "accepted count exceeds drafted" in result["warnings"][0]
+
+
 def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics(
     tmp_path,
 ):
     metrics = _metrics() | {
         "aggregate_decode_tps": 31.5,
+        "average_request_decode_tps": 9.25,
         "cache": {
             "affinity": "deployment",
             "lookups": 4,
@@ -313,6 +588,13 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
             "async_overlap",
             "cache_affinity",
             "pipeline_prefill_overlap",
+            "prefill_logits_skip",
+            "prefill_allocator_reuse",
+            "sparse_indexer_row_parallel",
+            "deepseek_v4_fused_decode_attention",
+            "deepseek_v4_adaptive_prefill",
+            "deepseek_v4_prefill_yield",
+            "deepseek_v4_prefill_async",
         )
     }
     payload = _marker(
@@ -329,11 +611,19 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
     assert result["warnings"] == []
     job = result["jobs"][0]
     assert job["metrics"]["aggregate_decode_tps"] == 31.5
+    assert job["metrics"]["average_request_decode_tps"] == 9.25
     assert job["metrics"]["cache"]["hit_rate"] == 0.75
     assert job["metrics"]["pipeline"]["utilization"] == 0.8
     assert job["performance_profiles"][1]["node_id"] == "mobile"
     assert job["optimizations"]["sampling_rank_only"]["active"] is False
     assert job["optimizations"]["pipeline_prefill_overlap"]["active"] is True
+    assert job["optimizations"]["prefill_logits_skip"]["active"] is True
+    assert job["optimizations"]["prefill_allocator_reuse"]["active"] is True
+    assert job["optimizations"]["sparse_indexer_row_parallel"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_fused_decode_attention"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_adaptive_prefill"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_prefill_yield"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_prefill_async"]["active"] is True
 
 
 def test_runtime_markers_ignore_symlinks_and_invalid_json(tmp_path):

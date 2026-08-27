@@ -18,11 +18,16 @@ from omlx.server import (
     EngineType,
     SamplingDefaults,
     ServerState,
+    _contains_multimodal_content,
     _format_generation_speed_for_log,
+    _reject_cluster_text_backbone_multimodal,
     _reject_diffusion_structured_outputs,
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
     app,
+    create_anthropic_message,
+    create_chat_completion,
+    create_response,
     get_engine,
     get_max_context_window,
     get_sampling_params,
@@ -100,6 +105,156 @@ class TestDiffusionStructuredOutputGuard:
                 guided_grammar='root ::= "ok"',
             )
 
+
+class TestClusterTextBackboneMediaGuard:
+    class _TextBackboneEngine:
+        text_backbone_only = True
+
+    class _NormalEngine:
+        text_backbone_only = False
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "image",
+            "image_url",
+            "input_image",
+            "video",
+            "video_url",
+            "input_video",
+            "audio",
+            "input_audio",
+        ],
+    )
+    def test_detects_supported_api_media_spellings(self, content_type):
+        content = [{"role": "user", "content": [{"type": content_type}]}]
+
+        assert _contains_multimodal_content(content) is True
+
+    def test_detects_media_inside_pydantic_message(self):
+        from omlx.api.openai_models import Message
+
+        message = Message(
+            role="user",
+            content=[
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                }
+            ],
+        )
+
+        assert _contains_multimodal_content([message]) is True
+
+    def test_allows_text_only_content(self):
+        content = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+
+        _reject_cluster_text_backbone_multimodal(self._TextBackboneEngine(), content)
+
+    def test_normal_vlm_engine_keeps_media(self):
+        content = [{"role": "user", "content": [{"type": "image"}]}]
+
+        _reject_cluster_text_backbone_multimodal(self._NormalEngine(), content)
+
+    def test_text_backbone_rejects_media_with_actionable_400(self):
+        content = [{"role": "user", "content": [{"type": "input_video"}]}]
+
+        with pytest.raises(HTTPException) as exc_info:
+            _reject_cluster_text_backbone_multimodal(
+                self._TextBackboneEngine(), content
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "single-node VLM engine" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_chat_endpoint_rejects_before_text_extraction(self):
+        from omlx.api.openai_models import ChatCompletionRequest
+
+        request = ChatCompletionRequest(
+            model="qwen38",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        }
+                    ],
+                }
+            ],
+        )
+        engine = self._TextBackboneEngine()
+
+        with (
+            patch("omlx.server.get_engine_for_model", AsyncMock(return_value=engine)),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await create_chat_completion(request, MagicMock(), True)
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_anthropic_endpoint_rejects_before_conversion(self):
+        from omlx.api.anthropic_models import MessagesRequest
+
+        request = MessagesRequest(
+            model="qwen38",
+            max_tokens=8,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "abc",
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+        engine = self._TextBackboneEngine()
+
+        with (
+            patch("omlx.server.get_engine_for_model", AsyncMock(return_value=engine)),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await create_anthropic_message(request, MagicMock(), True)
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_responses_endpoint_rejects_before_conversion(self):
+        from omlx.api.responses_models import ResponsesRequest
+
+        request = ResponsesRequest(
+            model="qwen38",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        }
+                    ],
+                }
+            ],
+        )
+        engine = self._TextBackboneEngine()
+
+        with (
+            patch("omlx.server.get_engine_for_model", AsyncMock(return_value=engine)),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await create_response(request, MagicMock(), True)
+
+        assert exc_info.value.status_code == 400
 
 class TestGenerationSpeedLog:
     def test_formats_plain_generation_speed(self):

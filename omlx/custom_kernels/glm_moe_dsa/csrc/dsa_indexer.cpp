@@ -2,6 +2,7 @@
 
 #include "kernels/mma_dsa_indexer_score.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/steel/gemm/params.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
@@ -39,6 +41,48 @@ struct DSATopKParams {
   bool causal_valid_prefix;
 };
 
+struct NAXDSAScoreParams {
+  int M;
+  int N;
+  int mask_ratio;
+  int mask_q_offset;
+};
+
+constexpr const char* kNAXDSAMetallibName = "omlx_glm_kernels_nax";
+constexpr const char* kNAXDSAKernelName =
+    "nax_dsa_indexer_score_bfloat16_h64_d128_ratio4";
+
+// A missing/stale optional metallib must cost at most one failed pipeline
+// lookup. The same primitive immediately falls through to Steel, and later
+// calls skip the NAX lookup for the rest of the process.
+std::atomic<bool> nax_dsa_runtime_ok{true};
+
+bool dsa_nax_available() {
+  // Exact local mirror of mlx::core::metal::is_nax_available() (the upstream
+  // declaration is intentionally not exported from libmlx): macOS >= 26.2
+  // and applegpu gen >= 17, or >= 18 for p-suffix parts. This second gate
+  // keeps the native ABI safe even when OMLX_NAX=1 overrides Python detection.
+  static bool available = []() {
+    if (!metal::is_available()) {
+      return false;
+    }
+    bool os_ok = false;
+    if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+      os_ok = true;
+    }
+    if (!os_ok) {
+      return false;
+    }
+    auto& d = metal::device(Device::gpu);
+    const auto& arch = d.get_architecture();
+    if (arch.empty()) {
+      return false;
+    }
+    return d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
+  }();
+  return available;
+}
+
 bool row_contiguous(const array& arr) {
   return arr.flags().row_contiguous && arr.strides(-1) == 1 &&
       arr.offset() == 0;
@@ -58,7 +102,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
       bool skip_causal_future_store,
       int causal_q_offset,
       int mask_ratio,
-      int mask_q_offset)
+      int mask_q_offset,
+      bool prefer_nax)
       : Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
@@ -66,7 +111,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_(skip_causal_future_store),
         causal_q_offset_(causal_q_offset),
         mask_ratio_(mask_ratio),
-        mask_q_offset_(mask_q_offset) {}
+        mask_q_offset_(mask_q_offset),
+        prefer_nax_(prefer_nax) {}
 
   static bool unsupported(
       const array& q,
@@ -104,7 +150,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
         return true;
       }
     }
-    if (q.shape(3) != 128 || k.shape(3) != 128) {
+    if (q.shape(3) != k.shape(3) || q.shape(3) < 16 || q.shape(3) > 128) {
       return true;
     }
     if (q.shape(3) % 16 != 0) {
@@ -140,6 +186,51 @@ class DSAIndexerScoresPrimitive : public Primitive {
     const int M = q.shape(2);
     const int N = k.shape(2);
     const int D = q.shape(3);
+
+    // M5/NAX port of ds4-metal's retained prefill score tile. Keep this
+    // dispatch deliberately narrower than the generic Steel primitive: the
+    // exact DS4-Flash call site is bf16/B1/H64/D128/weights-LH, non-causal,
+    // ratio-4 masked, and prefill-sized. Any optional-library or pipeline
+    // failure falls through to the already validated Steel encoding below.
+    const bool nax_shape = prefer_nax_ && q.dtype() == bfloat16 && B == 1 &&
+        H == 64 && D == 128 && M >= 16 && N > 512 && weights_lh_ &&
+        !causal_ && unused_causal_prefix_topk_ == 0 &&
+        !skip_causal_future_store_ && causal_q_offset_ == -1 &&
+        mask_ratio_ == 4 && mask_q_offset_ >= 0;
+    if (nax_shape && dsa_nax_available() &&
+        nax_dsa_runtime_ok.load(std::memory_order_relaxed)) {
+      try {
+        auto lib = d.get_library(kNAXDSAMetallibName, current_binary_dir());
+        auto kernel = d.get_kernel(kNAXDSAKernelName, lib);
+        auto& encoder = metal::get_command_encoder(s);
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_input_array(q, 0);
+        encoder.set_input_array(k, 1);
+        encoder.set_input_array(weights, 2);
+        encoder.set_output_array(out, 3);
+        NAXDSAScoreParams nax_params{
+            /* int M = */ M,
+            /* int N = */ N,
+            /* int mask_ratio = */ mask_ratio_,
+            /* int mask_q_offset = */ mask_q_offset_};
+        encoder.set_bytes(nax_params, 4);
+
+        constexpr int tm = 16;
+        constexpr int tn = 32;
+        constexpr int threads = 128;
+        constexpr size_t q_shared = 2 * 32 * 32 * sizeof(uint16_t);
+        constexpr size_t k_shared = 32 * 128 * sizeof(uint16_t);
+        constexpr size_t dot_shared = 32 * 32 * sizeof(float);
+        encoder.set_threadgroup_memory_length(
+            q_shared + k_shared + dot_shared, 0);
+        encoder.dispatch_threadgroups(
+            MTL::Size((N + tn - 1) / tn, (M + tm - 1) / tm, B),
+            MTL::Size(threads, 1, 1));
+        return;
+      } catch (const std::exception&) {
+        nax_dsa_runtime_ok.store(false, std::memory_order_relaxed);
+      }
+    }
 
     // bm/bn/wm/wn do not enter the per-element K-reduction order (bk=16 and
     // the MMA fragment K-layout are unchanged), so the tile config only
@@ -235,7 +326,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_ == rhs.skip_causal_future_store_ &&
         causal_q_offset_ == rhs.causal_q_offset_ &&
         mask_ratio_ == rhs.mask_ratio_ &&
-        mask_q_offset_ == rhs.mask_q_offset_;
+        mask_q_offset_ == rhs.mask_q_offset_ &&
+        prefer_nax_ == rhs.prefer_nax_;
   }
   auto state() const {
     return std::make_tuple(
@@ -245,7 +337,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_,
         causal_q_offset_,
         mask_ratio_,
-        mask_q_offset_);
+        mask_q_offset_,
+        prefer_nax_);
   }
 
  private:
@@ -256,6 +349,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int causal_q_offset_;
   int mask_ratio_;
   int mask_q_offset_;
+  bool prefer_nax_;
 };
 
 // ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
@@ -275,10 +369,15 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
   static constexpr int kThreads = 128; // WM=2, WN=2
   static constexpr int kSwizzleLog = 2;
 
-  MMADSAIndexerScoresPrimitive(Stream stream, int mask_ratio, int mask_q_offset)
+  MMADSAIndexerScoresPrimitive(
+      Stream stream,
+      int mask_ratio,
+      int mask_q_offset,
+      bool use_wm4_wn1)
       : Primitive(stream),
         mask_ratio_(mask_ratio),
-        mask_q_offset_(mask_q_offset) {}
+        mask_q_offset_(mask_q_offset),
+        use_wm4_wn1_(use_wm4_wn1) {}
 
   static bool unsupported(
       const array& q,
@@ -306,7 +405,8 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     if (weights.shape(1) != q.shape(2) || weights.shape(2) != q.shape(1)) {
       return true;
     }
-    if (q.shape(3) != 128 || k.shape(3) != 128) {
+    if ((q.shape(3) != 48 && q.shape(3) != 128) ||
+        k.shape(3) != q.shape(3)) {
       return true;
     }
     return k.shape(2) < 64;
@@ -334,10 +434,39 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const int B = q.shape(0);
     const int M = q.shape(2);
     const int N = k.shape(2);
+    const int D = q.shape(3);
+    // Physical qualification is deliberately exact: WM4xWN1 wins on the
+    // M3 Ultra's g15d GPU but regresses on the M5 Max's g17s GPU.  A caller
+    // hint can therefore never move an unknown/non-g15d device off WM2xWN2.
+    const bool wm4_wn1_active = use_wm4_wn1_ &&
+        d.get_architecture() == "applegpu_g15d";
 
-    const int tiles_m_full = M / kBM;
+    int tile_bm = kBM;
+    int tile_threads = kThreads;
+    const char* interior_name = D == 48
+        ? "mma_dsa_indexer_score_bfloat16_d48_interior"
+        : "mma_dsa_indexer_score_bfloat16_interior";
+    const char* boundary_name = D == 48
+        ? "mma_dsa_indexer_score_bfloat16_d48_boundary"
+        : "mma_dsa_indexer_score_bfloat16_boundary";
+    if (wm4_wn1_active && D == 128 && M >= kBM) {
+      interior_name = "mma_dsa_indexer_score_bfloat16_wm4_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_wm4_boundary";
+    } else if (D == 128 && M <= 16) {
+      tile_bm = 16;
+      tile_threads = 64;
+      interior_name = "mma_dsa_indexer_score_bfloat16_bm16_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_bm16_boundary";
+    } else if (D == 128 && M <= 32) {
+      tile_bm = 32;
+      tile_threads = 64;
+      interior_name = "mma_dsa_indexer_score_bfloat16_bm32_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_bm32_boundary";
+    }
+
+    const int tiles_m_full = M / tile_bm;
     const int tiles_n_full = N / kBN;
-    const int tiles_m = (M + kBM - 1) / kBM;
+    const int tiles_m = (M + tile_bm - 1) / tile_bm;
     const int tiles_n = (N + kBN - 1) / kBN;
 
     OMLXMMADSAScoreParamsHost params{
@@ -350,10 +479,16 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const int tg_x = tiles_n << kSwizzleLog;
     const int tg_y =
         (tiles_m + (1 << kSwizzleLog) - 1) >> kSwizzleLog;
-    MTL::Size group_dims = MTL::Size(kThreads, 1, 1);
+    MTL::Size group_dims = MTL::Size(tile_threads, 1, 1);
     MTL::Size grid_dims = MTL::Size(tg_x, tg_y, B);
 
-    auto lib = d.get_library("omlx_glm_mma_dsa_v25", []() {
+    // Give the candidate a fresh runtime-library identity.  The production
+    // v25 library name intentionally remains unchanged so a candidate build
+    // cannot perturb its compiler or OS shader-cache entry during A/B.
+    const char* library_name = wm4_wn1_active
+        ? "omlx_glm_mma_dsa_wm4_v1"
+        : "omlx_glm_mma_dsa_v25";
+    auto lib = d.get_library(library_name, []() {
       return std::string(kMMADSAScoreKernelSource);
     });
     auto& compute_encoder = metal::get_command_encoder(s);
@@ -370,10 +505,10 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     };
 
     if (tiles_m_full > 0 && tiles_n_full > 0) {
-      dispatch("mma_dsa_indexer_score_bfloat16_interior");
+      dispatch(interior_name);
     }
     if (tiles_m > tiles_m_full || tiles_n > tiles_n_full) {
-      dispatch("mma_dsa_indexer_score_bfloat16_boundary");
+      dispatch(boundary_name);
     }
   }
 
@@ -382,15 +517,17 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const MMADSAIndexerScoresPrimitive&>(other);
     return mask_ratio_ == rhs.mask_ratio_ &&
-        mask_q_offset_ == rhs.mask_q_offset_;
+        mask_q_offset_ == rhs.mask_q_offset_ &&
+        use_wm4_wn1_ == rhs.use_wm4_wn1_;
   }
   auto state() const {
-    return std::make_tuple(mask_ratio_, mask_q_offset_);
+    return std::make_tuple(mask_ratio_, mask_q_offset_, use_wm4_wn1_);
   }
 
  private:
   int mask_ratio_;
   int mask_q_offset_;
+  bool use_wm4_wn1_;
 };
 
 class DSATopKIndicesPrimitive : public Primitive {
@@ -558,6 +695,32 @@ class DSparkFP32TopKIndicesPrimitive : public Primitive {
   }
 };
 
+class DS4RouterTopKIndicesPrimitive : public Primitive {
+ public:
+  explicit DS4RouterTopKIndicesPrimitive(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("DS4 router top-k has no CPU path.");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& y = out[0];
+    y.set_data(allocator::malloc(y.nbytes()));
+    auto lib = d.get_library("omlx_glm_kernels_decode", current_binary_dir());
+    auto kernel = d.get_kernel("ds4_router_topk6_f32", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(in[0], 0);
+    encoder.set_output_array(y, 1);
+    encoder.dispatch_threadgroups(
+        MTL::Size(in[0].shape(0), 1, 1), MTL::Size(256, 1, 1));
+  }
+  DEFINE_NAME(DS4RouterTopKIndicesPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive&) const override { return true; }
+  auto state() const { return std::make_tuple(nullptr); }
+};
+
 // ── DC-1: fused decode indexer scan ─────────────────────────────────────────
 // One kernel computes the head-summed indexer scores for a single query position
 // (s == 1) directly into [B,1,1,S] with fp32 accumulation, replacing the decode
@@ -581,11 +744,12 @@ class DSADecodeScoresPrimitive : public Primitive {
       const array& q,
       const array& k,
       const array& w,
+      bool fp32_scores,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
-    if (q.dtype() != k.dtype() || q.dtype() != w.dtype()) {
+    if (q.dtype() != k.dtype()) {
       return true;
     }
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
@@ -597,10 +761,21 @@ class DSADecodeScoresPrimitive : public Primitive {
     if (q.ndim() != 4 || k.ndim() != 4 || w.ndim() != 2) {
       return true;
     }
-    // q [B,32,1,128] contiguous; k [B,1,S,128] with contiguous rows only
-    // (capacity-backed slices allowed); rows must stay 16B-aligned for the
-    // vec4 loads: row stride % 8 elements == 0.
-    if (q.shape(1) != 32 || q.shape(2) != 1 || q.shape(3) != 128) {
+    // q [B,H,1,128] contiguous, H in {32, 64}; k [B,1,S,128] with contiguous
+    // rows only (capacity-backed slices allowed); rows must stay 16B-aligned
+    // for the vec4 loads: row stride % 8 elements == 0.
+    const int heads = q.shape(1);
+    if ((heads != 32 && heads != 64) || q.shape(2) != 1 || q.shape(3) != 128) {
+      return true;
+    }
+    // Weights are either the query dtype (all configs) or fp32. fp32 weights
+    // are instantiated only for the 64-head fp32-score configuration (the
+    // DeepSeek V4 reference decode path keeps its head weights in fp32).
+    if (w.dtype() == float32) {
+      if (!fp32_scores || heads != 64) {
+        return true;
+      }
+    } else if (w.dtype() != q.dtype()) {
       return true;
     }
     if (k.shape(0) != q.shape(0) || k.shape(1) != 1 || k.shape(3) != 128) {
@@ -609,7 +784,7 @@ class DSADecodeScoresPrimitive : public Primitive {
     if (k.strides(3) != 1 || (k.strides(2) % 8) != 0) {
       return true;
     }
-    if (w.shape(0) != q.shape(0) || w.shape(1) != 32) {
+    if (w.shape(0) != q.shape(0) || w.shape(1) != heads) {
       return true;
     }
     return k.shape(2) < 1024;
@@ -645,7 +820,9 @@ class DSADecodeScoresPrimitive : public Primitive {
         "dsa_decode_scores_",
         type_to_name(q),
         fp32_scores_ ? "_of32" : "_osame",
-        "_h32_d128_t",
+        w.dtype() == float32 ? "_wf32" : "_wsame",
+        q.shape(1) == 64 ? "_h64" : "_h32",
+        "_d128_t",
         threads);
 
     OMLXDSADecodeParamsHost params{
@@ -722,6 +899,21 @@ array dsa_topk_indices_impl(
 
 } // namespace
 
+bool dsa_indexer_nax_kernels_built() {
+  static bool built = []() {
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(current_binary_dir()) /
+            (std::string(kNAXDSAMetallibName) + ".metallib"),
+        ec);
+  }();
+  return built;
+}
+
+bool dsa_indexer_nax_runtime_active() {
+  return nax_dsa_runtime_ok.load(std::memory_order_relaxed);
+}
+
 array dsa_indexer_scores(
     const array& queries,
     const array& keys,
@@ -732,7 +924,8 @@ array dsa_indexer_scores(
     int causal_q_offset,
     int mask_ratio,
     int mask_q_offset,
-    StreamOrDevice s) {
+    StreamOrDevice s,
+    bool use_nax) {
   if (queries.ndim() != 4 || keys.ndim() != 4 ||
       (weights.ndim() != 3 && weights.ndim() != 4)) {
     std::ostringstream msg;
@@ -822,7 +1015,8 @@ array dsa_indexer_scores(
           skip_causal_future_store,
           causal_q_offset,
           mask_ratio,
-          mask_q_offset),
+          mask_q_offset,
+          use_nax && dsa_indexer_nax_kernels_built()),
       std::move(inputs));
 }
 
@@ -832,7 +1026,8 @@ array dsa_indexer_scores_mma(
     const array& weights,
     int mask_ratio,
     int mask_q_offset,
-    StreamOrDevice s) {
+    StreamOrDevice s,
+    bool use_wm4_wn1) {
   if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] expected q/k rank 4 "
@@ -872,7 +1067,7 @@ array dsa_indexer_scores_mma(
     // causal, weights rank 4, GLM shapes) to dsa_indexer_scores.
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_indexer_scores_mma] unsupported shape/dtype "
-        "(kernel serves bf16, H=64, D=128, weights [B, L, H] only).");
+        "(kernel serves bf16, H=64, D in {48,128}, weights [B, L, H] only).");
   }
 
   Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};
@@ -880,7 +1075,7 @@ array dsa_indexer_scores_mma(
       std::move(out_shape),
       bfloat16,
       std::make_shared<MMADSAIndexerScoresPrimitive>(
-          stream, mask_ratio, mask_q_offset),
+          stream, mask_ratio, mask_q_offset, use_wm4_wn1),
       std::move(inputs));
 }
 
@@ -918,6 +1113,19 @@ array dspark_fp32_topk_indices(
       std::vector<array>{contiguous_scores});
 }
 
+array ds4_router_topk_indices(const array& scores, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu || scores.dtype() != float32 ||
+      scores.ndim() != 2 || scores.shape(1) != 256 ||
+      !scores.flags().row_contiguous) {
+    throw std::invalid_argument("DS4 router top-k requires FP32 [rows,256]");
+  }
+  return array(
+      Shape{scores.shape(0), 6}, uint32,
+      std::make_shared<DS4RouterTopKIndicesPrimitive>(stream),
+      std::vector<array>{scores});
+}
+
 array dsa_decode_scores(
     const array& queries,
     const array& keys,
@@ -938,11 +1146,18 @@ array dsa_decode_scores(
         "query position (q shape [B,H,1,D]).");
   }
 
-  auto final_type = result_type(queries, keys, weights);
+  auto final_type = result_type(queries, keys);
   if (final_type != float16 && final_type != bfloat16) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.dsa_decode_scores] expected float16 or bfloat16 "
-        << "inputs, got " << final_type << ".";
+        << "queries/keys, got " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weights.dtype() != float16 && weights.dtype() != bfloat16 &&
+      weights.dtype() != float32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_decode_scores] expected float16, bfloat16 "
+        << "or float32 weights, got " << weights.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -952,7 +1167,11 @@ array dsa_decode_scores(
   // (astype is a no-op on the cache's native dtype; a dtype-mismatched call
   // would still copy, which the row-stride guard then re-checks.)
   auto k = astype(keys, final_type, stream);
-  auto w = astype(weights, final_type, stream);
+  // fp32 weights stay fp32 (the 64-head fp32-score instantiation reads them
+  // directly); 16-bit weights are normalized to the query dtype.
+  auto w = weights.dtype() == float32
+      ? weights
+      : astype(weights, final_type, stream);
   if (w.ndim() == 3) {
     // accept [B, 1, H]
     w = reshape(w, {w.shape(0), w.shape(2)}, stream);
@@ -960,7 +1179,8 @@ array dsa_decode_scores(
   w = ensure_row_contiguous(w, stream);
 
   std::vector<array> inputs = {q, k, w};
-  if (DSADecodeScoresPrimitive::unsupported(q, k, w, stream)) {
+  if (DSADecodeScoresPrimitive::unsupported(
+          q, k, w, fp32_scores, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_decode_scores] unsupported shape/dtype/layout.");
   }

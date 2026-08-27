@@ -1424,6 +1424,7 @@ def _synthesize_mtp_quant_entries(
         candidates = (
             base,
             bare_module,
+            bare_module[len("mtp.") :] if bare_module.startswith("mtp.") else bare_module,
             "language_model." + bare_module,
             "model." + bare_module,
             "model.language_model." + bare_module,
@@ -1689,6 +1690,40 @@ def _strip_mtp_key_prefix(key: str) -> Optional[str]:
     return None
 
 
+def _normalize_mtp_donor_key(key: str, config: dict) -> Optional[str]:
+    """Return the merged ``mtp.*`` name for one donor tensor.
+
+    Full Qwen checkpoints store the head below ``mtp.*`` (optionally under a
+    VLM prefix). Official mlx-community standalone adapters instead declare
+    ``model_type=qwen3_5_mtp`` and store the same module at their root as
+    ``fc.*``, ``norm.*``, ``pre_fc_norm_*`` and ``layers.*``. Recognize bare
+    names only for that explicit adapter architecture so an arbitrary
+    headless Qwen checkpoint can never be mistaken for an MTP donor.
+    """
+
+    normalized = _strip_mtp_key_prefix(key)
+    if normalized is not None:
+        return normalized
+    model_type = str(config.get("model_type") or "").lower()
+    if model_type not in {"qwen3_5_mtp", "qwen3_6_mtp"}:
+        return None
+    if key == "norm.weight" or key.startswith(
+        ("fc.", "pre_fc_norm_embedding.", "pre_fc_norm_hidden.", "layers.")
+    ):
+        return "mtp." + key
+    return None
+
+
+def _mtp_donor_key_shards(model_dir: Path, config: dict) -> dict[str, str]:
+    """Original donor key -> shard for either merged or standalone heads."""
+
+    return {
+        key: shard
+        for key, shard in _shard_key_map(model_dir).items()
+        if _normalize_mtp_donor_key(key, config) is not None
+    }
+
+
 def validate_mtp_donor_pair(
     recipient_path: Union[str, Path],
     donor_path: Union[str, Path],
@@ -1703,8 +1738,6 @@ def validate_mtp_donor_pair(
     message so the combine fails at task submission, not after a full
     quantization run.
     """
-    from omlx.utils.model_loading import _checkpoint_has_mtp_weights
-
     recipient = Path(recipient_path)
     donor = Path(donor_path)
     with open(recipient / "config.json") as f:
@@ -1725,13 +1758,31 @@ def validate_mtp_donor_pair(
             f"({donor_family or donor_config.get('model_type')!r}) does not "
             f"match the recipient ({recipient_family})"
         )
-    if _mtp_declared_layers(donor_config) <= 0 or not _checkpoint_has_mtp_weights(
-        donor
-    ):
+    donor_head_keys = _mtp_donor_key_shards(donor, donor_config)
+    if _mtp_declared_layers(donor_config) <= 0 or not donor_head_keys:
         raise ValueError(
             "Donor model has no MTP head (mtp_num_hidden_layers missing or "
-            "mtp.* weights stripped)"
+            "MTP adapter weights stripped)"
         )
+    if str(donor_config.get("model_type") or "").lower() in {
+        "qwen3_5_mtp",
+        "qwen3_6_mtp",
+    }:
+        normalized_keys = {
+            _normalize_mtp_donor_key(key, donor_config) for key in donor_head_keys
+        }
+        required = {
+            "mtp.fc.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.layers.0.input_layernorm.weight",
+        }
+        missing = sorted(required - normalized_keys)
+        if missing:
+            raise ValueError(
+                "Donor MTP adapter is incomplete; missing " + ", ".join(missing)
+            )
     donor_geometry = _mtp_geometry(donor_config)
     recipient_geometry = _mtp_geometry(recipient_config)
     for field in _MTP_GEOMETRY_FIELDS:
@@ -1781,12 +1832,7 @@ def combine_mtp_donor(
     with open(donor / "config.json") as f:
         donor_config = json.load(f)
 
-    donor_key_map = _shard_key_map(donor)
-    mtp_key_shards = {
-        key: shard
-        for key, shard in donor_key_map.items()
-        if _strip_mtp_key_prefix(key) is not None
-    }
+    mtp_key_shards = _mtp_donor_key_shards(donor, donor_config)
     if not mtp_key_shards:
         raise ValueError(f"No mtp.* tensors found in donor model: {donor}")
 
@@ -1803,7 +1849,7 @@ def combine_mtp_donor(
     for shard in sorted(set(mtp_key_shards.values())):
         shard_weights = mx.load(str(donor / shard))
         for key, value in shard_weights.items():
-            bare = _strip_mtp_key_prefix(key)
+            bare = _normalize_mtp_donor_key(key, donor_config)
             if bare is not None:
                 mtp_weights[recipient_prefix + bare] = value
         del shard_weights
@@ -1815,9 +1861,13 @@ def combine_mtp_donor(
     # mlx-lm's class_predicate applies the recipient's *global* bits to the
     # donor-packed arrays and the strict load fails on shape mismatch.
     donor_quant = donor_config.get("quantization") or {}
+    normalized_key_shards = {
+        _normalize_mtp_donor_key(key, donor_config): shard
+        for key, shard in mtp_key_shards.items()
+    }
     quant_entries = _synthesize_mtp_quant_entries(
         donor_quant,
-        mtp_key_shards,
+        normalized_key_shards,
         recipient_prefix=recipient_prefix,
     )
 

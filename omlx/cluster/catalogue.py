@@ -175,12 +175,17 @@ def _splits(
     *,
     tensor_parallel_ok: bool,
     pipeline_ok: bool = True,
+    prefer_tensor: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Every (tensor_parallel_size, pipeline_stages) this cluster can form.
 
-    Ordered fewest-nodes-first, then pipeline before tensor parallelism at
-    equal width: pipeline loads faster, uses less memory, and survives a
-    slow link, so it is the better answer when both fit.
+    Ordered fewest-nodes-first. At equal width the default is pipeline before
+    tensor parallelism: pipeline loads faster, uses less memory, and survives
+    a slow link, so it is the better answer when both fit and nothing is
+    known about the link. ``prefer_tensor`` flips the tie-break for callers
+    that know every link is fast (JACCL/Thunderbolt): there, splitting each
+    layer's compute across the group cuts per-token latency, which is what a
+    user who just cabled two Macs together is after.
     """
 
     options: list[tuple[int, int]] = []
@@ -196,7 +201,15 @@ def _splits(
                 # weights and then fail at load.
                 continue
             options.append((tp, used // tp))
-    return tuple(sorted(options, key=lambda item: (item[0] * item[1], item[0])))
+    return tuple(
+        sorted(
+            options,
+            key=lambda item: (
+                item[0] * item[1],
+                -item[0] if prefer_tensor else item[0],
+            ),
+        )
+    )
 
 
 _SHORTFALL_RE = re.compile(r"\bat least (\d+) additional bytes required\b")
@@ -340,11 +353,14 @@ def assess_model(
     tensor_parallel_ok: bool | None = None,
     pipeline_ok: bool | None = None,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> ModelFit:
     """Whether this model runs here, using the fewest nodes that work.
 
     ``tensor_parallel_ok`` defaults to what the layout already determined, so
     a model mlx-lm cannot shard is never offered a tensor-parallel plan.
+    ``prefer_tensor`` requests the tensor-parallel split when both strategies
+    fit at equal width — callers set it when every link is known-fast.
     """
 
     if tensor_parallel_ok is None:
@@ -361,6 +377,7 @@ def assess_model(
         len(nodes),
         tensor_parallel_ok=tensor_parallel_ok,
         pipeline_ok=pipeline_ok,
+        prefer_tensor=prefer_tensor,
     )
     for tp_size, stages in splits:
         used = tp_size * stages
@@ -508,12 +525,21 @@ def assess_model_path(
     nodes: Sequence[NodeBudget],
     *,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> ModelFit:
     """Assess a model directory, reading its real layout and config."""
 
     from omlx.model_discovery import _read_model_context_length
 
     root = Path(model_path)
+    # Some architectures are registered into mlx-lm by oMLX immediately before
+    # loading (MiniMax-M3 and DeepSeek-V4 are examples). Capability detection
+    # must inspect that registered module, not conclude from stock mlx-lm that
+    # the architecture can be neither pipelined nor sharded. The dispatchers
+    # are idempotent compatibility registrations and load no weights.
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(root))
     try:
         layout = inspect_safetensors_layout(root)
     except (PlanningError, OSError, ValueError) as exc:
@@ -536,6 +562,7 @@ def assess_model_path(
         model_id=root.name,
         declared_context_tokens=declared,
         workload_profile=workload_profile,
+        prefer_tensor=prefer_tensor,
     )
 
 
@@ -544,6 +571,7 @@ def catalogue_for_cluster(
     nodes: Sequence[NodeBudget],
     *,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> tuple[ModelFit, ...]:
     """Assess every model, largest first among those that fit.
 
@@ -553,7 +581,12 @@ def catalogue_for_cluster(
     """
 
     fits = [
-        assess_model_path(path, nodes, workload_profile=workload_profile)
+        assess_model_path(
+            path,
+            nodes,
+            workload_profile=workload_profile,
+            prefer_tensor=prefer_tensor,
+        )
         for path in model_paths
     ]
     runnable = sorted(

@@ -23,7 +23,10 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _CLUSTER = _REPO / "omlx" / "cluster"
-_DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+_DASHBOARD_JS = (
+    _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js",
+    _REPO / "omlx" / "admin" / "static" / "js" / "cluster_v2.js",
+)
 
 _PREFIX = "/admin/api/cluster"
 # Template literals interpolate with ${...}, which may contain calls and nested
@@ -47,12 +50,17 @@ def _js_called_paths() -> set[str]:
     """Cluster URLs the dashboard builds, normalised to their route shape."""
 
     called = set()
-    for match in _CLUSTER_URL.finditer(_DASHBOARD_JS.read_text()):
-        path = match.group("path").split("?")[0]
-        # Any interpolated segment stands for a path parameter.
-        path = re.sub(r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path)
-        path = path.rstrip("/") if path not in ("", "/") else path
-        called.add(_PREFIX + path)
+    for source in _DASHBOARD_JS:
+        for match in _CLUSTER_URL.finditer(source.read_text()):
+            path = match.group("path").split("?")[0]
+            # Any interpolated segment stands for a path parameter.
+            path = re.sub(
+                r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}",
+                "{parameter}",
+                path,
+            )
+            path = path.rstrip("/") if path not in ("", "/") else path
+            called.add(_PREFIX + path)
     return called
 
 
@@ -61,7 +69,7 @@ def test_every_cluster_url_the_dashboard_calls_is_a_real_route():
 
     missing = _js_called_paths() - _registered_routes()
     assert not missing, (
-        f"dashboard.js calls cluster endpoints that are not registered: "
+        f"dashboard scripts call cluster endpoints that are not registered: "
         f"{sorted(missing)}"
     )
 
@@ -73,7 +81,14 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    allowed_without_caller: set[str] = set()
+    allowed_without_caller: set[str] = {
+        # Cluster v2 runtime endpoints (Module E). Their callers ship with
+        # the wizard UI (Module C): /replan is the one-action
+        # deactivate→re-plan→reload the wizard's plan view drives, and
+        # /backend-selection renders the jaccl-vs-ring decision beside it.
+        "/admin/api/cluster/replan",
+        "/admin/api/cluster/backend-selection",
+    }
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
@@ -88,7 +103,7 @@ def test_fetch_calls_never_use_a_params_option():
     the suite stayed green.
     """
 
-    source = _DASHBOARD_JS.read_text()
+    source = "\n".join(path.read_text() for path in _DASHBOARD_JS)
     offenders = []
     for index, line in enumerate(source.splitlines(), start=1):
         if re.search(r"^\s*params:\s*\{", line):
@@ -137,6 +152,7 @@ def test_worker_contract_round_trips_with_tensor_parallelism():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 8,
         tensor_parallel_heads=16,
+        supports_tensor_parallel=True,
     )
     nodes = [
         planner.NodeBudget(
@@ -230,6 +246,21 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test hooks that drop process-wide v2 singletons between cases; only
+        # the test suite calls them (production swaps via configure_*).
+        ("identity.py", "reset_configured_identity"),
+        ("registry.py", "reset_configured_device_registry"),
+        ("pairing.py", "reset_pairing_manager"),
+        # Test hook injecting a PairingManager double into the route module.
+        ("pairing_routes.py", "set_pairing_manager_getter"),
+        # Settings write path for cluster.json; the admin settings endpoint
+        # that calls it lands with the cluster settings UI.
+        ("discovery.py", "save_cluster_name"),
+        # Synthetic rank probes may nominate an asymmetric vector for operator
+        # diagnostics, but production deliberately consumes only persisted
+        # full-model parity qualifications. Keep the candidate generator
+        # testable without pretending it is a launch path.
+        ("planner.py", "_tensor_shard_weights"),
     }
 
     sources = {

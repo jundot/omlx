@@ -222,6 +222,43 @@ def test_single_undo_trim_restores_pre_update_rows():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("offset,L,P", ((8, 5, 4), (64, 16, 20), (257, 7, 66)))
+def test_singleton_batch_prompt_mask_matches_pooling_cache(offset, L, P):
+    """Scalar and one-element vector offsets must share absolute semantics."""
+
+    pooled = mx.zeros((1, P, 8), dtype=mx.bfloat16)
+    single = PoolingCache(4)
+    single.pooled = pooled
+    batch = BatchPoolingCache(4, [0])
+    batch._pool_buf = pooled
+    batch._pool_extent = P
+    batch._pool_lengths = [P]
+
+    expected = single.make_mask(L, offset)
+    scalar = batch.make_mask(L, offset)[0]
+    vector = batch.make_mask(L, mx.array([offset], dtype=mx.int32))[0]
+    mx.eval(expected, scalar, vector)
+
+    assert bool(mx.array_equal(scalar, expected))
+    assert bool(mx.array_equal(vector, expected))
+
+
+def test_batch_prompt_mask_keeps_per_row_logical_lengths():
+    pooled = mx.zeros((2, 6, 8), dtype=mx.bfloat16)
+    batch = BatchPoolingCache(4, [0, 0])
+    batch._pool_buf = pooled
+    batch._pool_extent = 6
+    batch._pool_lengths = [6, 3]
+
+    mask = batch.make_mask(4, mx.array([24, 24], dtype=mx.int32))
+    mx.eval(mask)
+
+    assert mask.shape == (2, 4, 6)
+    assert bool(mx.all(mask[0]))
+    assert bool(mx.all(mask[1, :, :3]))
+    assert not bool(mx.any(mask[1, :, 3:]))
+
+
 def _old_batch_update(state, px, ratio):
     """Verbatim old (pre-rework) BatchPoolingCache.update_and_fetch semantics.
 

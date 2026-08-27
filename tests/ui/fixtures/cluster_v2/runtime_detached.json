@@ -1,0 +1,15 @@
+{
+  "_comment": "GET /admin/api/cluster/runtime after unload/reboot — a retained ready marker is detached and cannot prove residency.",
+  "jobs": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "rank": 0,
+      "world_size": 2,
+      "phase": "ready",
+      "live": false,
+      "ownership": "detached"
+    }
+  ],
+  "launchers": [],
+  "warnings": []
+}

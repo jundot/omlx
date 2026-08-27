@@ -7,7 +7,11 @@ import pytest
 
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.planner import PipelineAssignment
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import (
+    EngineEntry,
+    EnginePool,
+    _entry_supports_cluster_text_backbone,
+)
 
 
 def _deployment(model_path: str) -> ClusterDeployment:
@@ -175,6 +179,47 @@ def test_cluster_model_path_rejects_non_text_model(tmp_path):
         pool.resolve_cluster_model_id(str(model_path))
 
 
+def _qwen35_vlm_config() -> str:
+    return (
+        '{"model_type":"qwen3_5","architectures":'
+        '["Qwen3_5ForConditionalGeneration"],'
+        '"text_config":{"model_type":"qwen3_5",'
+        '"num_hidden_layers":64},'
+        '"vision_config":{"hidden_size":1024}}'
+    )
+
+
+def test_cluster_model_path_accepts_proven_qwen35_text_backbone(tmp_path):
+    model_path = tmp_path / "qwen35-vlm"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(_qwen35_vlm_config())
+    pool = EnginePool()
+    entry = _entry(str(model_path))
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    entry.config_model_type = "qwen3_5"
+    pool._entries["qwen35-vlm"] = entry
+
+    assert pool.resolve_cluster_model_id(str(model_path)) == "qwen35-vlm"
+
+
+def test_qwen35_vlm_entry_uses_registered_distributed_deployment(tmp_path):
+    model_path = tmp_path / "qwen35-vlm"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(_qwen35_vlm_config())
+    deployment = _deployment(str(model_path))
+    pool = EnginePool()
+    pool._cluster_registry = SimpleNamespace(
+        get_for_model=lambda model: deployment if model == str(model_path) else None
+    )
+    entry = _entry(str(model_path))
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    entry.config_model_type = "qwen3_5"
+
+    assert pool._distributed_deployment_for_entry(entry) is deployment
+
+
 def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
     model_path = tmp_path / "minimax"
     model_path.mkdir()
@@ -197,6 +242,45 @@ def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
     assert entry.source_type == "cluster"
     assert entry.model_context_length == 262144
     assert pool.resolve_cluster_model_id(str(model_path)) == model_id
+
+
+def test_remote_only_cluster_model_rejects_vlm_before_registration(tmp_path):
+    model_path = tmp_path / "qwen-vlm"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"model_type":"qwen2_vl","architectures":'
+        '["Qwen2VLForConditionalGeneration"],'
+        '"vision_config":{"hidden_size":1024}}'
+    )
+    pool = EnginePool()
+
+    with pytest.raises(ValueError, match="text LLM models only.*vlm"):
+        pool.register_cluster_model(
+            str(model_path),
+            estimated_size=16 * 1024**3,
+        )
+
+    assert pool.get_entry("qwen-vlm") is None
+
+
+def test_remote_only_qwen35_registers_exact_text_backbone(tmp_path):
+    model_path = tmp_path / "qwen35-vlm"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(_qwen35_vlm_config())
+    pool = EnginePool()
+
+    model_id, created = pool.register_cluster_model(
+        str(model_path),
+        estimated_size=16 * 1024**3,
+    )
+
+    entry = pool.get_entry(model_id)
+    assert created is True
+    assert entry is not None
+    assert entry.model_type == "llm"
+    assert entry.engine_type == "batched"
+    assert entry.config_model_type == "qwen3_5"
+    assert _entry_supports_cluster_text_backbone(entry) is True
 
 
 def test_cluster_only_pool_entry_is_removed_after_registry_deactivation(tmp_path):

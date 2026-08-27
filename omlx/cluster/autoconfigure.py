@@ -68,19 +68,26 @@ def _divides_heads(model: ModelLayout, tensor_parallel_size: int) -> bool:
 def candidate_tensor_parallel_sizes(
     model: ModelLayout,
     node_count: int,
+    *,
+    hybrid_runtime_supported: bool = True,
 ) -> tuple[int, ...]:
-    """Runtime-supported TP degrees, largest first.
+    """Executable TP degrees whose product with PP consumes every node.
 
-    The pinned MLX model ``shard()`` implementations operate on a complete
-    model. They cannot safely shard a partial pipeline stage, so the product
-    offers either all nodes tensor-parallel (one stage) or pipeline-only. The
-    pure planner can model hybrid layouts, but exposing one here would produce
-    a plan the worker deliberately refuses before launch.
+    Every divisor of ``node_count`` is a real topology candidate: TP=N is pure
+    tensor parallelism, TP=1 is pure pipeline, and the intermediate divisors
+    are TP x pipeline. Architecture dimensions still fail closed before any
+    model is loaded.
     """
 
-    candidates = []
-    if node_count > 1 and _divides_heads(model, node_count):
-        candidates.append(node_count)
+    candidates = [
+        size
+        for size in range(node_count, 1, -1)
+        if node_count % size == 0
+        and _divides_heads(model, size)
+        and (
+            size == node_count or (model.supports_pipeline and hybrid_runtime_supported)
+        )
+    ]
     candidates.append(1)
     return tuple(candidates)
 
@@ -110,18 +117,18 @@ def transports_are_fast_enough(
 STRATEGIES = {
     "auto": {
         "label": "Automatic",
-        "summary": "Pick the best split for this model and link",
+        "summary": "Pick the best TP, pipeline, or hybrid topology",
         "detail": (
-            "Uses tensor parallelism when the model can be split evenly and the "
-            "link is fast enough, otherwise falls back to pipeline stages."
+            "Evaluates every architecture-valid TP x pipeline factorization, "
+            "then selects the best one for the model, memory and verified link."
         ),
     },
     "tensor": {
         "label": "Tensor — faster responses",
         "summary": "Both Macs work on every token",
         "detail": (
-            "Splits every layer's weights across your Macs, so both compute each "
-            "token together. Measured 1.78x on a 27B across two Macs over "
+            "Splits every layer's weights across every selected Mac, so all "
+            "compute each token together. Measured 1.78x on a 27B across two Macs over "
             "Thunderbolt RDMA. Needs a fast link and a model whose attention "
             "heads divide evenly by the number of Macs."
         ),
@@ -149,6 +156,8 @@ def choose_parallelism(
     measurements: Mapping[int, Any] | None = None,
     workload_profile: str = "balanced",
     context_tokens: int = 8192,
+    qualified_tensor_shard_weights: Sequence[Sequence[int]] | None = None,
+    hybrid_runtime_supported: bool = True,
 ) -> ParallelismChoice:
     """Pick the tensor-parallel degree and produce the plan it implies.
 
@@ -169,7 +178,11 @@ def choose_parallelism(
     if strategy not in STRATEGIES:
         raise ValueError(f"strategy must be one of {sorted(STRATEGIES)}")
 
-    candidates = candidate_tensor_parallel_sizes(model, len(nodes))
+    candidates = candidate_tensor_parallel_sizes(
+        model,
+        len(nodes),
+        hybrid_runtime_supported=hybrid_runtime_supported,
+    )
     if strategy == "pipeline":
         # Explicit request for layer-wise splitting only.
         if (
@@ -186,7 +199,9 @@ def choose_parallelism(
     elif strategy == "tensor":
         # Explicit request for tensor parallelism: refuse rather than silently
         # falling back, so the user learns *why* it is not possible.
-        candidates = tuple(size for size in candidates if size > 1)
+        # "Tensor" means every selected Mac collaborates on every layer.
+        # Intermediate TP degrees are hybrid and belong to Automatic.
+        candidates = tuple(size for size in candidates if size == len(nodes))
         if not candidates:
             raise PlanningError(
                 f"tensor parallelism is not possible for this model on "
@@ -211,7 +226,7 @@ def choose_parallelism(
         # A one-Mac fallback is not a cluster strategy. Keep only genuine
         # tensor-parallel choices so Automatic cannot return a signed plan
         # that the worker will reject after staging.
-        candidates = tuple(size for size in candidates if size > 1)
+        candidates = tuple(size for size in candidates if size == len(nodes))
         if not candidates:
             raise PlanningError(
                 "this model cannot use more than one Mac: its architecture "
@@ -222,9 +237,7 @@ def choose_parallelism(
     measured_choice = False
     if strategy == "auto" and len(candidates) > 1 and measurements:
         available = {
-            size: measurements[size]
-            for size in candidates
-            if size in measurements
+            size: measurements[size] for size in candidates if size in measurements
         }
         # A single measurement is not a comparison. Require every candidate
         # so an old pipeline run cannot beat an unmeasured tensor path (or vice
@@ -254,14 +267,10 @@ def choose_parallelism(
             transports,
             tensor_parallel_size,
         )
-        measured_on_this_path = (
-            measured_choice and tensor_parallel_size in (measurements or {})
+        measured_on_this_path = measured_choice and tensor_parallel_size in (
+            measurements or {}
         )
-        if (
-            strategy == "auto"
-            and not fast_enough
-            and not measured_on_this_path
-        ):
+        if strategy == "auto" and not fast_enough and not measured_on_this_path:
             continue
         try:
             plan = plan_hybrid(
@@ -270,8 +279,18 @@ def choose_parallelism(
                 tensor_parallel_size=tensor_parallel_size,
                 workload_profile=workload_profile,
                 context_tokens=context_tokens,
+                qualified_tensor_shard_weights=(
+                    qualified_tensor_shard_weights
+                    if tensor_parallel_size == len(nodes)
+                    else None
+                ),
             )
         except PlanningError as exc:
+            # A coordinator operator explicitly qualified this exact pure-TP
+            # graph.  Invalid units or insufficient memory must fail closed,
+            # not silently turn an experimental TP request into pipeline mode.
+            if qualified_tensor_shard_weights is not None and tensor_parallel_size > 1:
+                raise
             last_error = exc
             continue
 
@@ -287,8 +306,7 @@ def choose_parallelism(
                     "tensor-parallel sharding in MLX-LM"
                 )
             elif any(
-                value % max(len(nodes), 1)
-                for value in model.tensor_parallel_divisors
+                value % max(len(nodes), 1) for value in model.tensor_parallel_divisors
             ):
                 reason += (
                     " because an architecture-specific head group does not "
@@ -298,12 +316,17 @@ def choose_parallelism(
                 reason += " because the link between nodes is too slow for it"
             else:
                 reason += " because no larger split fit in memory"
+        elif stages == 1:
+            reason = (
+                f"{len(nodes)} nodes as one {tensor_parallel_size}-way tensor "
+                f"parallelism group — each layer's weights are split across "
+                f"{tensor_parallel_size} Macs"
+            )
         else:
             reason = (
-                f"{len(nodes)} nodes as {stages} pipeline "
-                f"stage{'s' if stages != 1 else ''} of {tensor_parallel_size}-way "
-                f"tensor parallelism — each layer's weights are split across "
-                f"{tensor_parallel_size} Macs"
+                f"{len(nodes)} nodes as {stages} pipeline stages with "
+                f"{tensor_parallel_size}-way tensor parallelism inside each "
+                "stage — every node holds only its signed layer-and-tensor shard"
             )
         if measured_choice:
             outcome = measurements[tensor_parallel_size]
@@ -333,9 +356,7 @@ def choose_parallelism(
         )
 
     if last_error is not None:
-        raise PlanningError(
-            f"no workable split for {len(nodes)} nodes: {last_error}"
-        )
+        raise PlanningError(f"no workable split for {len(nodes)} nodes: {last_error}")
     raise PlanningError(
         f"no tensor-parallel degree divides {len(nodes)} nodes across "
         f"architecture dimensions {model.tensor_parallel_divisors}"
@@ -446,17 +467,17 @@ def describe_transports(transports: Sequence[Any]) -> str:
 
     if not transports:
         return "Link speed unknown"
-    speeds = [
-        getattr(transport, "link_speed_gbps", None) for transport in transports
-    ]
+    speeds = [getattr(transport, "link_speed_gbps", None) for transport in transports]
     known = [speed for speed in speeds if speed]
     versions = {
         getattr(transport, "tb_version", None)
         for transport in transports
         if getattr(transport, "tb_version", None)
     }
-    label = "/".join(sorted(versions)) if versions else next(
-        iter({getattr(t, "kind", "unknown") for t in transports})
+    label = (
+        "/".join(sorted(versions))
+        if versions
+        else next(iter({getattr(t, "kind", "unknown") for t in transports}))
     )
     if known:
         return f"{label} at {min(known)} Gb/s"
@@ -531,9 +552,7 @@ def order_hosts_for_topology(
             candidates = [
                 host
                 for host in remaining
-                if all(
-                    bandwidth_between(fast, host, member) > 0 for member in block
-                )
+                if all(bandwidth_between(fast, host, member) > 0 for member in block)
             ]
             if not candidates:
                 break
@@ -575,7 +594,8 @@ def order_hosts_for_topology(
     basis = (
         "measured bandwidth"
         if evidence == {"measured"}
-        else "link speed" if "measured" not in evidence
+        else "link speed"
+        if "measured" not in evidence
         else "measured bandwidth where available"
     )
     warnings: tuple[str, ...] = ()
@@ -635,6 +655,7 @@ class PreflightIssue:
     kind: str  # "model_missing", "runtime_mismatch", "unreachable", "import_missing"
     detail: str
     remediation: str = ""
+    blocking: bool = True
 
 
 def preflight_issues(
@@ -659,7 +680,9 @@ def preflight_issues(
             )
             continue
 
-        payload = status.get("status") if isinstance(status.get("status"), dict) else status
+        payload = (
+            status.get("status") if isinstance(status.get("status"), dict) else status
+        )
         runtime = payload.get("runtime") or {}
         reported_runtime_mismatch = status.get("runtime_compatible") is False
         if reported_runtime_mismatch:
@@ -684,6 +707,24 @@ def preflight_issues(
                     )
 
         node = payload.get("node") or {}
+        power = node.get("power") if isinstance(node.get("power"), dict) else {}
+        if power.get("low_power_mode_enabled") is True:
+            modes = []
+            if power.get("ac_low_power_mode") is True:
+                modes.append("AC Power")
+            if power.get("battery_low_power_mode") is True:
+                modes.append("Battery Power")
+            issues.append(
+                PreflightIssue(
+                    node_id,
+                    "low_power_mode",
+                    "Low Power Mode is enabled"
+                    + (f" for {' and '.join(modes)}" if modes else "")
+                    + "; synthetic calibration will be ignored until it is "
+                    "disabled in System Settings",
+                    blocking=False,
+                )
+            )
         if node.get("accelerator") == "cuda" and node.get("memory_kind") == "vram":
             issues.append(
                 PreflightIssue(
@@ -694,7 +735,11 @@ def preflight_issues(
             )
 
         models = payload.get("models")
-        if model_path and isinstance(models, (list, tuple)) and model_path not in models:
+        if (
+            model_path
+            and isinstance(models, (list, tuple))
+            and model_path not in models
+        ):
             issues.append(
                 PreflightIssue(
                     node_id,
@@ -715,8 +760,14 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
 
     if not issues:
         return "All peers are reachable and ready."
+    blockers = [issue for issue in issues if issue.blocking]
+    guidance = [issue for issue in issues if not issue.blocking]
+    if not blockers:
+        return "Peers are reachable. " + " ".join(
+            issue.detail + "." for issue in guidance
+        )
     by_kind: dict[str, list[str]] = {}
-    for issue in issues:
+    for issue in blockers:
         by_kind.setdefault(issue.kind, []).append(issue.node_id)
     parts = []
     labels = {
@@ -725,12 +776,15 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
         "runtime_mismatch": "running a different MLX version",
         "import_missing": "missing a Python package this model needs",
         "cuda_memory_guard_unavailable": "using unsupported discrete CUDA memory",
+        "low_power_mode": "using Low Power Mode",
     }
     for kind, nodes in by_kind.items():
         parts.append(f"{', '.join(sorted(set(nodes)))} {labels.get(kind, kind)}")
     sentence = "Cannot activate yet: " + "; ".join(parts) + "."
+    if guidance:
+        sentence += " " + " ".join(issue.detail + "." for issue in guidance)
     commands = list(
-        dict.fromkeys(issue.remediation for issue in issues if issue.remediation)
+        dict.fromkeys(issue.remediation for issue in blockers if issue.remediation)
     )
     if commands:
         sentence += " Run: " + "  ".join(commands)
@@ -793,9 +847,7 @@ class _Guard:
             return False
         return all(
             any(
-                declared == literal
-                if kind == "eq"
-                else declared.startswith(literal)
+                declared == literal if kind == "eq" else declared.startswith(literal)
                 for kind, literal in alternatives
                 for declared in model_types
             )

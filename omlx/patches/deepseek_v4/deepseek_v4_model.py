@@ -3,24 +3,32 @@
 import logging
 import math
 import os
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map_with_path
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+from omlx.patches.deepseek_v4.hierarchical_indexer import hierarchical_topk
 from omlx.patches.deepseek_v4.indexer_dispatch import (
     disable_native_indexer,
     native_indexer_available,
     native_indexer_disabled,
     native_indexer_shape_eligible,
+)
+from omlx.patches.deepseek_v4.qkv_prefill_bundle import (
+    prefill_qkv_projection_bundle,
 )
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.verify_attention import (
@@ -33,12 +41,962 @@ from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_p
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .hyper_connection import (
+    HyperConnection,
+    HyperHead,
+    hc_expand,
+    hc_merge_branch,
+    hc_residual_branch,
+)
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+_DEEPSEEK_V4_B1_SCALAR_OFFSET = os.getenv(
+    "OMLX_DSV4_B1_SCALAR_OFFSET", "1"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
+# Fused sparse decode attention (decode_fast.sparse_attn_decode) replaces the
+# composed rowwise-GEMM + logsumexp glue of _dspark_sparse_exact_attention
+# with one Metal dispatch. The kernel is batch-row invariant by construction
+# (independent per-row reduction), preserving the DSpark decode==verify
+# contract. OMLX_DSV4_FUSED_SPARSE=0 forces the composed path.
+_DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED = os.environ.get(
+    "OMLX_DSV4_FUSED_SPARSE", "1"
+).strip().lower() in ("0", "false", "off")
+_DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = False
+# OMLX_DSV4_RING=0 disables the dspark_ring_gemm verify fast path, forcing
+# the per-row _sparse_pooled_attention route (fused or composed). Diagnostic
+# escape hatch for A/B benchmarking.
+_DEEPSEEK_V4_RING_VERIFY_DISABLED = os.environ.get(
+    "OMLX_DSV4_RING", "1"
+).strip().lower() in ("0", "false", "off")
+# The exact row-wise decode path exists to make one-token target decoding
+# bit-identical to DSpark's multi-row verification.  It is unnecessary when
+# speculative decoding is disabled and is materially slower on TP-local head
+# counts (24/32/40 on the supported 64-head checkpoint).  The MTP patch marks
+# attention modules that need the consistency contract at model construction;
+# this switch is a startup-time rollback to the legacy always-exact behavior.
+_DEEPSEEK_V4_EXACT_DECODE = os.environ.get(
+    "OMLX_DSV4_EXACT_DECODE", "0"
+).strip().lower() in ("1", "true", "on")
+
+# ``DeepseekV4Model.__call__`` normally materializes every cache update before
+# returning.  That barrier is the conservative default for decode and for all
+# non-cluster callers.  The distributed TP prefill A/B may temporarily capture
+# those exact arrays instead, queue them with ``mx.async_eval``, and complete
+# them at its own bounded depth-two boundary.  Thread-local state is required:
+# model loading and unrelated engines can execute on other threads while one
+# generation thread owns the experiment.
+_CACHE_MATERIALIZATION_CAPTURE = threading.local()
+
+
+def _exact_decode_required(attention: Any, batch: int, length: int) -> bool:
+    return bool(
+        attention.dspark
+        and batch == 1
+        and length == 1
+        and (
+            _DEEPSEEK_V4_EXACT_DECODE
+            or getattr(attention, "_omlx_decode_consistent", False)
+        )
+    )
+
+
+def _tp_partition_weights(
+    group: mx.distributed.Group,
+) -> Optional[Tuple[int, ...]]:
+    """Validated unequal TP weights, or None for MLX's equal split."""
+
+    raw = os.environ.get("OMLX_TP_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return None
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError("OMLX_TP_SHARD_WEIGHTS must contain integers") from exc
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
+        raise ValueError(
+            "OMLX_TP_SHARD_WEIGHTS must contain one positive weight per TP rank"
+        )
+    if len(set(weights)) == 1:
+        return None
+    return weights
+
+
+_PROJECTION_OWNER_LOGGED = False
+
+
+def _projection_owner_rank(group: Any) -> Optional[int]:
+    """Return the operator-qualified owner of replicated DS4 projections."""
+
+    if group is None or int(group.size()) != 2:
+        return None
+    raw = os.environ.get("OMLX_DSV4_PROJECTION_OWNER_RANK", "off").strip().lower()
+    if raw in {"", "off", "none", "false", "disabled"}:
+        return None
+    try:
+        owner = int(raw)
+    except ValueError:
+        return None
+    # The physical gate is specific to the signed M3:M5 3:5 placement. A
+    # differently ordered or equal cluster must qualify its own owner first.
+    if owner not in (0, 1) or _tp_partition_weights(group) != (3, 5):
+        return None
+    return owner
+
+
+def _owned_projection_bank(
+    x: mx.array,
+    modules: Tuple[Any, ...],
+    group: Any,
+) -> Optional[Tuple[mx.array, ...]]:
+    """Compute replicated input projections once and send exact BF16 views.
+
+    Rank zero's physical M3 gate executes the full DS4 projection shapes much
+    faster than the M5. Both ranks enter one symmetric all-sum: the owner
+    contributes its original packed arrays and the peer contributes exact
+    zeros. Unlike selecting the owner's own all-gather slice, this collective
+    cannot be optimized away on only one rank.
+    """
+
+    owner = _projection_owner_rank(group)
+    if owner is None or not modules:
+        return None
+    rank = int(group.rank())
+    widths = tuple(int(module.weight.shape[0]) for module in modules)
+    total = sum(widths)
+    if any(width < 1 for width in widths) or x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    if rank == owner:
+        values = tuple(module(x) for module in modules)
+        packed = mx.concatenate(values, axis=-1)
+    else:
+        shape = (*x.shape[:-1], total)
+        # A free constant has no edge to this layer, so MLX may enqueue later
+        # placeholder reductions ahead of the owner's real projection graphs.
+        # Tie the placeholder to the replicated layer input to preserve the
+        # same per-layer collective order without adding arithmetic.
+        packed = mx.depends(mx.zeros(shape, dtype=x.dtype), x)
+    packed = mx.distributed.all_sum(packed, group=group)
+    boundaries = []
+    cursor = 0
+    for width in widths[:-1]:
+        cursor += width
+        boundaries.append(cursor)
+    outputs = tuple(mx.split(packed, boundaries, axis=-1))
+    global _PROJECTION_OWNER_LOGGED
+    if not _PROJECTION_OWNER_LOGGED:
+        _PROJECTION_OWNER_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 replicated projections owned by rank %d "
+            "(rank=%d packed_width=%d)",
+            owner,
+            rank,
+            total,
+        )
+    return outputs
+
+
+def _validated_ds4_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+) -> Optional[Tuple[int, ...]]:
+    weights = _tp_partition_weights(group)
+    if weights is not None:
+        heads_per_group = args.num_attention_heads // args.o_groups
+        if sum(weights) != heads_per_group:
+            raise ValueError(
+                "unequal DS4 TP weights must sum to the heads in each output group"
+            )
+    return weights
+
+
+def _validated_ds4_moe_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+    outer_weights: Optional[Tuple[int, ...]],
+) -> Optional[Tuple[int, ...]]:
+    """Optional routed-MoE-only split over a signed unequal outer TP plan."""
+
+    raw = os.environ.get("OMLX_TP_MOE_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return outer_weights
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError("OMLX_TP_MOE_SHARD_WEIGHTS must contain integers") from exc
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS must contain one positive weight per TP rank"
+        )
+    if outer_weights is None:
+        # A conservative signed-equal plan may still qualify a mixed layout by
+        # declaring the non-routed split explicitly. In that form the plan's
+        # 4:4 weight budget safely covers the routed 4:4 banks, while the small
+        # attention/shared shift remains inside the existing tolerance.
+        if not os.environ.get("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "").strip():
+            raise ValueError(
+                "OMLX_TP_MOE_SHARD_WEIGHTS requires either a signed unequal "
+                "outer plan or OMLX_TP_NON_MOE_SHARD_WEIGHTS"
+            )
+        expected_total = int(args.num_attention_heads) // int(args.o_groups)
+    else:
+        expected_total = sum(outer_weights)
+    if sum(weights) != expected_total:
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS must sum to the signed outer TP weights"
+        )
+
+    intermediate = int(getattr(args, "moe_intermediate_size", 0) or 0)
+    total = expected_total
+    if intermediate <= 0 or intermediate % total:
+        raise ValueError(
+            "routed MoE intermediate size is not divisible by the override sum"
+        )
+    boundaries = [sum(weights[:rank]) for rank in range(1, len(weights))]
+    if any(intermediate * boundary % total for boundary in boundaries):
+        raise ValueError("routed MoE override does not preserve model boundaries")
+    local_widths = [intermediate * weight // total for weight in weights]
+    if any(width % 32 for width in local_widths):
+        raise ValueError(
+            "routed MoE override must preserve 32-value MXFP4 quant groups"
+        )
+    return weights
+
+
+def _validated_ds4_non_moe_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+    outer_weights: Optional[Tuple[int, ...]],
+) -> Optional[Tuple[int, ...]]:
+    """Optional attention/shared/vocab split over a conservative outer plan."""
+
+    raw = os.environ.get("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return outer_weights
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError("OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain integers") from exc
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
+        raise ValueError(
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain one positive weight per TP rank"
+        )
+    units = int(args.num_attention_heads) // int(args.o_groups)
+    if sum(weights) != units:
+        raise ValueError(
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must sum to the heads in each "
+            "DS4 output group"
+        )
+    intermediate = int(getattr(args, "moe_intermediate_size", 0) or 0)
+    if intermediate <= 0 or intermediate % units:
+        raise ValueError(
+            "DS4 shared-expert intermediate size is not divisible by the "
+            "non-MoE override sum"
+        )
+    boundaries = [sum(weights[:rank]) for rank in range(1, len(weights))]
+    if any(intermediate * boundary % units for boundary in boundaries):
+        raise ValueError("non-MoE override does not preserve shared-expert boundaries")
+    local_widths = [intermediate * weight // units for weight in weights]
+    if any(width % 32 for width in local_widths):
+        raise ValueError("non-MoE override must preserve 32-value MXFP4 quant groups")
+    return None if len(set(weights)) == 1 else weights
+
+
+def _weighted_segment_slice(
+    value: mx.array,
+    *,
+    axis: int,
+    segments: int,
+    rank: int,
+    weights: Tuple[int, ...],
+) -> mx.array:
+    """Slice every fused segment by the same exact integer partition."""
+
+    axis %= value.ndim
+    if segments < 1 or value.shape[axis] % segments:
+        raise ValueError("asymmetric TP segment dimension is not divisible")
+    total = sum(weights)
+    before = sum(weights[:rank])
+    after = before + weights[rank]
+    pieces = []
+    for segment in mx.split(value, segments, axis=axis):
+        length = int(segment.shape[axis])
+        if length * before % total or length * after % total:
+            raise ValueError(
+                "asymmetric TP boundary does not preserve a tensor/quant group"
+            )
+        start = length * before // total
+        stop = length * after // total
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(start, stop)
+        pieces.append(segment[tuple(index)])
+    return mx.contiguous(mx.concatenate(pieces, axis=axis))
+
+
+def _asymmetric_shard_parameters(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Tuple[int, ...],
+    segments: int = 1,
+) -> Dict[str, Any]:
+    """MLX distributed-linear parameter slicing with unequal rank widths."""
+
+    rank = int(group.rank())
+
+    def shard(path: str, value: Any) -> Any:
+        if not isinstance(value, mx.array):
+            return value
+        if sharding == "all-to-sharded":
+            axis = -1 if path.endswith("bias") else max(value.ndim - 2, 0)
+        elif sharding == "sharded-to-all":
+            if path.endswith("bias"):
+                return value
+            axis = -1
+        else:
+            raise ValueError(f"unsupported asymmetric TP sharding {sharding!r}")
+        return _weighted_segment_slice(
+            value,
+            axis=axis,
+            segments=segments,
+            rank=rank,
+            weights=weights,
+        )
+
+    return tree_map_with_path(shard, module.parameters())
+
+
+def _shard_linear_weighted(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Optional[Tuple[int, ...]],
+    segments: int = 1,
+) -> nn.Module:
+    replacement = shard_linear(
+        module,
+        sharding,
+        segments=segments,
+        group=group,
+    )
+    if weights is not None:
+        replacement.update(
+            _asymmetric_shard_parameters(
+                module,
+                sharding,
+                group=group,
+                weights=weights,
+                segments=segments,
+            )
+        )
+    return replacement
+
+
+def _shard_inplace_weighted(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Optional[Tuple[int, ...]],
+    segments: int = 1,
+) -> None:
+    if weights is None:
+        shard_inplace(module, sharding, segments=segments, group=group)
+        return
+    module.update(
+        _asymmetric_shard_parameters(
+            module,
+            sharding,
+            group=group,
+            weights=weights,
+            segments=segments,
+        )
+    )
+
+
+# Fused decode indexer (glm_moe_dsa.dsa_decode_scores, 64-head instantiation)
+# replaces the DSpark verify indexer score pipeline's fp32 cast of the pooled
+# context, the full-width rowwise GEMM, and the (rows, 64, P) fp32 score
+# sheet with one Metal scan per row that streams K exactly once in its cache
+# dtype and accumulates in fp32. Scores stay fp32 with fp32 head weights, so
+# the downstream dspark_fp32_topk_indices/_stable_topk_indices selection
+# semantics are unchanged. OMLX_DSV4_FUSED_DECODE_INDEXER=0 forces the fp32
+# reference path.
+_DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED = os.environ.get(
+    "OMLX_DSV4_FUSED_DECODE_INDEXER", "1"
+).strip().lower() in ("0", "false", "off")
+_DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = False
+_DEEPSEEK_V4_NAX_OA_PREFILL = os.getenv(
+    "OMLX_DSV4_NAX_OA_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = False
+_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL = os.getenv(
+    "OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ATTN_FINALIZER_VERIFY = os.getenv(
+    "OMLX_DSV4_ATTN_FINALIZER_VERIFY", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = False
+_DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
+    "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_OUTPUT_CHAIN_EQUAL_TP = os.getenv(
+    "OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
+_DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE = os.getenv(
+    "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED = False
+_DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
+    "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL = os.getenv(
+    "OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE = threading.local()
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED = False
+_DEEPSEEK_V4_QKV_BUNDLE_DECODE = os.getenv(
+    "OMLX_DSV4_QKV_BUNDLE_DECODE", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = False
+_DEEPSEEK_V4_QKV_BUNDLE_ALL_SCHEDULES = os.getenv(
+    "OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _decode_qkv_projection_bundle(
+    attn: nn.Module,
+    x: mx.array,
+) -> Optional[Tuple[mx.array, ...]]:
+    """Exact DS4 attention-input bundle for qualified decode/prefill tiles."""
+
+    prefill = prefill_qkv_projection_bundle(attn, x)
+    if prefill is not None:
+        return prefill
+
+    if (
+        not _DEEPSEEK_V4_QKV_BUNDLE_DECODE
+        or getattr(attn, "training", False)
+        or is_dspark_verify_armed()
+        or tuple(x.shape) != (1, 1, 4096)
+        or x.dtype != mx.bfloat16
+    ):
+        return None
+    config = getattr(attn, "config", None)
+    try:
+        if config is None or not _dsv4f_exact_config(config, 4):
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    ratio = int(getattr(attn, "compress_ratio", -1))
+    if ratio not in (0, 4, 128):
+        return None
+    if ratio in (0, 128):
+        if not _DEEPSEEK_V4_QKV_BUNDLE_ALL_SCHEDULES:
+            return None
+        try:
+            if mx.device_info().get("device_name") != "Apple M5 Max":
+                return None
+        except Exception:
+            return None
+    indexer = getattr(attn, "indexer", None)
+    compressor = getattr(attn, "compressor", None)
+    index_compressor = getattr(indexer, "compressor", None)
+    common = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+    compressor_pair = (
+        getattr(compressor, "wkv", None),
+        getattr(compressor, "wgate", None),
+    )
+    index_pair = (
+        getattr(index_compressor, "wkv", None),
+        getattr(index_compressor, "wgate", None),
+    )
+    modules = (
+        common
+        if ratio == 0
+        else common + compressor_pair
+        if ratio == 128
+        else common + compressor_pair + index_pair
+    )
+    if any(
+        module is None or not callable(getattr(module, "get", None))
+        for module in modules
+    ):
+        return None
+    q_a, wkv = common
+    if not (
+        getattr(q_a, "group_size", None) == 32
+        and getattr(q_a, "bits", None) == 8
+        and getattr(q_a, "mode", None) == "mxfp8"
+        and getattr(wkv, "group_size", None) == 32
+        and getattr(wkv, "bits", None) == 8
+        and getattr(wkv, "mode", None) == "mxfp8"
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        flat = mx.contiguous(x.reshape(1, 4096))
+        args = (
+            flat,
+            q_a["weight"],
+            q_a["scales"],
+            wkv["weight"],
+            wkv["scales"],
+        )
+        if ratio == 0:
+            if not glm_fast.has_symbol("deepseek_v4_qkv_pair_b1"):
+                return None
+            packed = glm_fast.deepseek_v4_qkv_pair_b1(*args)
+            boundaries = (1024,)
+        elif ratio == 128:
+            if not glm_fast.has_symbol("deepseek_v4_qkv_compressor128_bundle_b1"):
+                return None
+            compressor_kv, compressor_gate = compressor_pair
+            packed = glm_fast.deepseek_v4_qkv_compressor128_bundle_b1(
+                *args,
+                compressor_kv["weight"],
+                compressor_gate["weight"],
+            )
+            boundaries = (1024, 1536, 2048)
+        else:
+            if not glm_fast.has_symbol("deepseek_v4_qkv_compressor_bundle_b1"):
+                return None
+            compressor_kv, compressor_gate = compressor_pair
+            index_kv, index_gate = index_pair
+            packed = glm_fast.deepseek_v4_qkv_compressor_bundle_b1(
+                *args,
+                compressor_kv["weight"],
+                compressor_gate["weight"],
+                index_kv["weight"],
+                index_gate["weight"],
+            )
+            boundaries = (1024, 1536, 2560, 3584, 3840)
+        packed = packed.reshape(1, 1, packed.shape[-1])
+    except (KeyError, TypeError, ValueError):
+        return None
+    global _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED
+    if not _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED:
+        _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 exact B1 Q/KV/compressor bundles active "
+            "(ratio=%d, one dispatch)",
+            ratio,
+        )
+    return tuple(mx.split(packed, boundaries, axis=-1))
+
+
+def _verify_q_a_kv_bank(
+    attn: nn.Module,
+    x: mx.array,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    """One target-row-exact MXFP8 dispatch for DS4 verify Q-A + raw KV."""
+
+    if (
+        not is_dspark_verify_armed()
+        or x.dtype != mx.bfloat16
+        or x.ndim != 3
+        or x.shape[0] != 1
+        or not 2 <= int(x.shape[1]) <= 6
+        or int(x.shape[2]) != 4096
+    ):
+        return None
+    modules = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+    if any(
+        module is None
+        or not callable(getattr(module, "get", None))
+        or getattr(module, "bits", None) != 8
+        or getattr(module, "group_size", None) != 32
+        or getattr(module, "mode", None) != "mxfp8"
+        or module.get("biases") is not None
+        or module.get("weight") is None
+        or module.get("scales") is None
+        for module in modules
+    ):
+        return None
+    q_a, wkv = modules
+    assert q_a is not None and wkv is not None
+    if (
+        tuple(q_a.weight.shape) != (1024, 1024)
+        or tuple(q_a.scales.shape) != (1024, 128)
+        or tuple(wkv.weight.shape) != (512, 1024)
+        or tuple(wkv.scales.shape) != (512, 128)
+    ):
+        return None
+    weight = getattr(attn, "_omlx_verify_q_a_kv_weight", None)
+    scales = getattr(attn, "_omlx_verify_q_a_kv_scales", None)
+    if weight is None or scales is None:
+        weight = mx.concatenate([q_a.weight, wkv.weight], axis=0)
+        scales = mx.concatenate([q_a.scales, wkv.scales], axis=0)
+        mx.eval(weight, scales)
+        object.__setattr__(attn, "_omlx_verify_q_a_kv_weight", weight)
+        object.__setattr__(attn, "_omlx_verify_q_a_kv_scales", scales)
+    from omlx.patches.deepseek_v4.verify_qmv import exact_verify_mxfp8_bank
+
+    packed = exact_verify_mxfp8_bank(weight, scales, x)
+    q_a_out, kv_out = mx.split(packed, (1024,), axis=-1)
+    return q_a_out, kv_out
+
+
+def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
+    """Exact M=1024 TP-only gate for scheduling HC beside collectives."""
+
+    if (
+        not _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP
+        or getattr(block, "training", False)
+        or is_dspark_verify_armed()
+        or h.ndim != 4
+        or h.shape[0] != 1
+        or h.shape[1] != 1024
+        or h.shape[-1] != 4096
+        or h.dtype != mx.bfloat16
+    ):
+        return False
+    attn_group = getattr(getattr(block, "attn", None), "sharding_group", None)
+    ffn_group = getattr(getattr(block, "ffn", None), "sharding_group", None)
+    return bool(
+        attn_group is not None
+        and ffn_group is not None
+        and int(attn_group.size()) == 2
+        and int(ffn_group.size()) == 2
+    )
+
+
+def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
+    """Return true only for the confirmed M5 rank-1 O-A prefill contract."""
+
+    if not _DEEPSEEK_V4_NAX_OA_PREFILL or getattr(attn, "training", False):
+        return False
+    if tuple(prepared.shape) != (1, 8, 1024, 2560):
+        return False
+    if prepared.dtype != mx.bfloat16:
+        return False
+
+    projection = getattr(attn, "wo_a", None)
+    if (
+        projection is None
+        or not callable(getattr(projection, "get", None))
+        or getattr(projection, "group_size", None) != 32
+        or getattr(projection, "bits", None) != 8
+        or getattr(projection, "mode", None) != "mxfp8"
+        or projection.get("biases") is not None
+    ):
+        return False
+    weight = projection.get("weight")
+    scales = projection.get("scales")
+    if (
+        weight is None
+        or scales is None
+        or tuple(weight.shape) != (8, 1024, 640)
+        or tuple(scales.shape) != (8, 1024, 80)
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.uint8
+    ):
+        return False
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return bool(
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_projection_mxfp8_qmm")
+            and glm_fast.ds4_projection_nax_kernels_built()
+            and glm_fast.ds4_projection_nax_device_available()
+        )
+    except Exception:
+        # Capability probing happens before graph construction. An old or
+        # classic-only extension keeps the unchanged stock O-A path.
+        return False
+
+
+def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
+    """Project one prepared O-A tensor, selecting native only before enqueue."""
+
+    if not _can_use_nax_oa_prefill(attn, prepared):
+        return attn.wo_a(prepared)
+
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    global _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED:
+        _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact M5 NAX O-A prefill tile "
+            "(M=1024, heads=40, BM64/BN64/BK64; "
+            "OMLX_DSV4_NAX_OA_PREFILL=0 disables)"
+        )
+    projection = attn.wo_a
+    return glm_fast.ds4_projection_mxfp8_qmm(
+        mx.contiguous(prepared),
+        projection["weight"],
+        projection["scales"],
+        variant=0,
+        use_nax=True,
+        nax_variant=0,
+    )
+
+
+def _attention_output_chain_native_inputs(
+    attn: nn.Module,
+    prepared: mx.array,
+) -> Optional[Tuple[mx.array, mx.array, mx.array, mx.array]]:
+    """Preflight the exact DS4 3:5 M=1024 O-A→BF16→O-B chain."""
+
+    prepared_shape = tuple(prepared.shape)
+    legacy_shapes = {
+        (1, 8, 1024, 1536),
+        (1, 8, 1024, 2560),
+        (1, 8, 1024, 4096),
+        (1, 8, 2048, 4096),
+    }
+    equal_shapes = {
+        (1, 8, 1024, 2048),
+        (1, 8, 2048, 2048),
+    }
+    if (
+        getattr(attn, "training", False)
+        or is_dspark_verify_armed()
+        or prepared.dtype != mx.bfloat16
+        or prepared_shape not in legacy_shapes | equal_shapes
+    ):
+        return None
+    config = getattr(attn, "config", None)
+    try:
+        if config is None or not _dsv4f_exact_config(config, 4):
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    o_a = getattr(attn, "wo_a", None)
+    o_b = getattr(attn, "wo_b", None)
+    if not all(
+        projection is not None
+        and callable(getattr(projection, "get", None))
+        and getattr(projection, "group_size", None) == 32
+        and getattr(projection, "bits", None) == 8
+        and getattr(projection, "mode", None) == "mxfp8"
+        and projection.get("biases") is None
+        for projection in (o_a, o_b)
+    ):
+        return None
+    assert o_a is not None and o_b is not None
+    o_a_weight = o_a.get("weight")
+    o_a_scales = o_a.get("scales")
+    o_b_weight = o_b.get("weight")
+    o_b_scales = o_b.get("scales")
+    k = int(prepared.shape[-1])
+    if k == 2048:
+        if not _DEEPSEEK_V4_OUTPUT_CHAIN_EQUAL_TP:
+            return None
+        try:
+            # Equal TP2's K2048 classic chain is bit-exact and faster on M3
+            # Ultra. M5 stock dispatches O-A/O-B through NAX TensorOps; the
+            # classic chain changes that arithmetic frontier and is ~3x
+            # slower, so that peer must retain its canonical stock graph.
+            if str(mx.device_info().get("device_name") or "") != "Apple M3 Ultra":
+                return None
+        except Exception:
+            return None
+    elif not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL:
+        return None
+    if (
+        o_a_weight is None
+        or o_a_scales is None
+        or o_b_weight is None
+        or o_b_scales is None
+        or tuple(o_a_weight.shape) != (8, 1024, k // 4)
+        or tuple(o_a_scales.shape) != (8, 1024, k // 32)
+        or tuple(o_b_weight.shape) != (4096, 2048)
+        or tuple(o_b_scales.shape) != (4096, 256)
+        or o_a_weight.dtype != mx.uint32
+        or o_a_scales.dtype != mx.uint8
+        or o_b_weight.dtype != mx.uint32
+        or o_b_scales.dtype != mx.uint8
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not (
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_output_projection_chain")
+        ):
+            return None
+    except Exception:
+        return None
+    return o_a_weight, o_a_scales, o_b_weight, o_b_scales
+
+
+def _project_attention_output_chain(
+    attn: nn.Module,
+    prepared: mx.array,
+) -> Optional[mx.array]:
+    native_inputs = _attention_output_chain_native_inputs(attn, prepared)
+    if native_inputs is None:
+        return None
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    global _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED:
+        _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact BF16 O-A/O-B prefill chain "
+            "(M=%d, H=%d, BM64/BK32/BN64; "
+            "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0 disables)",
+            prepared.shape[2],
+            prepared.shape[-1] // 64,
+        )
+    o_a_weight, o_a_scales, o_b_weight, o_b_scales = native_inputs
+    return glm_fast.ds4_output_projection_chain(
+        mx.contiguous(prepared),
+        o_a_weight,
+        o_a_scales,
+        o_b_weight,
+        o_b_scales,
+        variant=1,
+    )
+
+
+def _stock_attention_qkv_finalizer(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Tuple[mx.array, mx.array]:
+    """Preserve the established four-operation BF16 finalizer graph."""
+
+    q = mx.fast.rms_norm(q_raw, None, attn.config.rms_norm_eps)
+    q = q.transpose(0, 2, 1, 3)
+    q = attn.rope(q, offset)
+    kv = attn.kv_norm(kv_raw).reshape(q_raw.shape[0], 1, q_raw.shape[1], attn.head_dim)
+    kv = attn.rope(kv, offset)
+    return q, kv
+
+
+def _attention_finalizer_native_inputs(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Optional[Tuple[mx.array, mx.array, float]]:
+    """Preflight both native finalizers before either graph node is created."""
+
+    verify_armed = is_dspark_verify_armed()
+    tokens = int(q_raw.shape[1]) if q_raw.ndim == 4 else -1
+    verify_route = bool(
+        _DEEPSEEK_V4_ATTN_FINALIZER_VERIFY and verify_armed and tokens == 6
+    )
+    prefill_route = bool(
+        _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
+        and not verify_armed
+        and tokens in (1024, 2048)
+    )
+    if (
+        not (verify_route or prefill_route)
+        or getattr(attn, "training", False)
+        or type(offset) is not int
+        or not 0 <= offset <= 0x7FFFFFFF
+    ):
+        return None
+    supported_heads = (24, 32, 40, 64)
+    if (
+        q_raw.ndim != 4
+        or q_raw.shape[0] != 1
+        or q_raw.shape[1] not in (6, 1024, 2048)
+        or q_raw.shape[2] not in supported_heads
+        or q_raw.shape[3] != 512
+        or q_raw.dtype != mx.bfloat16
+        or kv_raw.shape != (1, q_raw.shape[1], 512)
+        or kv_raw.dtype != mx.bfloat16
+        or getattr(attn, "head_dim", None) != 512
+    ):
+        return None
+
+    kv_norm = getattr(attn, "kv_norm", None)
+    rope = getattr(attn, "rope", None)
+    config = getattr(attn, "config", None)
+    if (
+        kv_norm is None
+        or not callable(getattr(kv_norm, "get", None))
+        or rope is None
+        or not callable(getattr(rope, "_get_freqs", None))
+        or config is None
+    ):
+        return None
+    weight = kv_norm.get("weight")
+    if weight is None or weight.shape != (512,) or weight.dtype != mx.bfloat16:
+        return None
+
+    try:
+        eps = float(config.rms_norm_eps)
+        if not math.isfinite(eps) or eps <= 0:
+            return None
+        freqs = rope._get_freqs(512, False)
+        if freqs.shape != (256,) or freqs.dtype != mx.float32:
+            return None
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not (
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_q_head_rms_rope")
+            and glm_fast.has_symbol("ds4_kv_rms_rope")
+        ):
+            return None
+    except Exception:
+        # All capability and frequency checks precede graph construction. Old
+        # extensions and custom RoPE modules retain the stock four-op path.
+        return None
+    return weight, freqs, eps
+
+
+def _finalize_attention_qkv(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Tuple[mx.array, mx.array]:
+    """Select the exact native pair or the unchanged stock graph, once."""
+
+    native_inputs = _attention_finalizer_native_inputs(attn, q_raw, kv_raw, offset)
+    if native_inputs is None:
+        return _stock_attention_qkv_finalizer(attn, q_raw, kv_raw, offset)
+
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    weight, freqs, eps = native_inputs
+    global _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED:
+        _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE finalizers (M=%d, H=%d)",
+            q_raw.shape[1],
+            q_raw.shape[2],
+        )
+
+    q_raw = mx.contiguous(q_raw)
+    kv_raw = mx.contiguous(kv_raw)
+    weight = mx.contiguous(weight)
+    freqs = mx.contiguous(freqs)
+    q = glm_fast.ds4_q_head_rms_rope(q_raw, freqs, offset, eps)
+    kv = glm_fast.ds4_kv_rms_rope(
+        kv_raw,
+        weight,
+        freqs,
+        offset,
+        eps,
+    )
+    return q, kv
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -47,27 +1005,140 @@ def set_dspark_verify_armed(flag: bool) -> None:
     set_armed(flag)
 
 
+# Optional ANE prefill backends. They see every eligible call and return None
+# to fall through to the normal GPU path (decode, verify, non-fixed shapes).
+_ANE_LINEAR_BACKEND = None
+_ANE_GROUPED_LINEAR_BACKEND = None
+_ANE_MLP_BACKEND = None
+_ANE_ATTENTION_INPUT_BACKEND = None
+
+
+def register_ane_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for eligible plain linears."""
+    global _ANE_LINEAR_BACKEND
+    _ANE_LINEAR_BACKEND = backend
+
+
+def register_ane_grouped_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for grouped linears."""
+    global _ANE_GROUPED_LINEAR_BACKEND
+    _ANE_GROUPED_LINEAR_BACKEND = backend
+
+
+def register_ane_mlp_backend(backend) -> None:
+    """Install the optional ANE prefill backend for the shared-expert MLP."""
+    global _ANE_MLP_BACKEND
+    _ANE_MLP_BACKEND = backend
+
+
+def register_ane_attention_input_backend(backend) -> None:
+    """Install the optional stacked backend for projections that consume x."""
+    global _ANE_ATTENTION_INPUT_BACKEND
+    _ANE_ATTENTION_INPUT_BACKEND = backend
+
+
+def _ane_attention_input(attn: nn.Module, x: mx.array) -> dict[str, mx.array]:
+    backend = _ANE_ATTENTION_INPUT_BACKEND
+    if backend is not None:
+        projected = backend(attn, x)
+        if projected is not None:
+            return projected
+    return {}
+
+
+def _projection_or(
+    projected: dict[str, mx.array], name: str, linear: nn.Module, x: mx.array
+) -> mx.array:
+    value = projected.get(name)
+    return linear(x) if value is None else value
+
+
+def _ane_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+def _ane_grouped_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_GROUPED_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+_ANE_STACKED_Q_BACKEND = None
+
+
+def register_ane_stacked_q_backend(backend) -> None:
+    """Install the optional ANE backend for the stacked attn+indexer wq_b."""
+    global _ANE_STACKED_Q_BACKEND
+    _ANE_STACKED_Q_BACKEND = backend
+
+
+def _ane_stacked_q(
+    attn_linear: nn.Module, indexer_linear: nn.Module | None, value: mx.array
+):
+    """Project the attention q, folding the indexer q into the same hybrid op.
+
+    Returns ``(attn_q_raw, indexer_q_raw)``; the second element is ``None``
+    whenever the stacked backend did not run, and the caller must then leave
+    the indexer to do its own projection.
+    """
+    backend = _ANE_STACKED_Q_BACKEND
+    if backend is not None and indexer_linear is not None:
+        split = backend(attn_linear, value)
+        if split is not None:
+            return split
+    return _ane_linear(attn_linear, value), None
+
+
+def _prepare_attention_output(attn: nn.Module, row: mx.array) -> mx.array:
+    """Map (B,H,M,D) attention rows to grouped O-A input (B,G,M,K)."""
+
+    batch, _, length, _ = row.shape
+    row = row.reshape(batch, attn.o_groups, -1, length, attn.head_dim)
+    return row.transpose(0, 1, 3, 2, 4).flatten(-2)
+
+
 def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx.array:
     out = attn.rope(out, offset, inverse=True)
-
-    def prepare(row: mx.array) -> mx.array:
-        batch, _, length, _ = row.shape
-        row = row.reshape(batch, attn.o_groups, -1, length, attn.head_dim)
-        return row.transpose(0, 1, 3, 2, 4).flatten(-2)
 
     def finish(row: mx.array) -> mx.array:
         return row.transpose(0, 2, 1, 3).flatten(-2)
 
-    def project_a(row: mx.array) -> mx.array:
-        return finish(attn.wo_a(prepare(row)))
-
     if is_dspark_verify_armed():
-        prepared = mx.concatenate(
-            [prepare(out[:, :, idx : idx + 1]) for idx in range(out.shape[2])],
-            axis=2,
+        if _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE:
+            # This view is element-for-element identical to concatenating M
+            # independently prepared one-row views, but avoids six slice
+            # graphs plus a materializing concatenate in depth-5 verify.
+            prepared = _prepare_attention_output(attn, out)
+            global _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED
+            if not _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED:
+                _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "deepseek_v4: using exact batched O-A verify preparation "
+                    "(M=%d; OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=0 disables)",
+                    out.shape[2],
+                )
+        else:
+            prepared = mx.concatenate(
+                [
+                    _prepare_attention_output(attn, out[:, :, idx : idx + 1])
+                    for idx in range(out.shape[2])
+                ],
+                axis=2,
+            )
+        from omlx.patches.deepseek_v4.verify_qmv import (
+            eligible as qmv_eligible,
         )
         from omlx.patches.deepseek_v4.verify_qmv import (
             exact_verify_multi_qmv,
+            exact_verify_qmv,
             multi_eligible,
         )
 
@@ -81,8 +1152,35 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
                 ],
                 axis=1,
             )
-        return attn.wo_b(projected)
-    return attn.wo_b(project_a(out))
+        return (
+            exact_verify_qmv(attn.wo_b, projected)
+            if qmv_eligible(attn.wo_b, projected)
+            else attn.wo_b(projected)
+        )
+    prepared = _prepare_attention_output(attn, out)
+    native_chain = _project_attention_output_chain(attn, prepared)
+    if native_chain is not None:
+        return native_chain
+    if _ANE_GROUPED_LINEAR_BACKEND is not None:
+        projected = finish(_ane_grouped_linear(attn.wo_a, prepared))
+        return _ane_linear(attn.wo_b, projected)
+    return attn.wo_b(finish(_project_attention_oa(attn, prepared)))
+
+
+def _project_verify_q_b(module: nn.Module, inputs: mx.array) -> mx.array:
+    """Use the one-token reduction order for DSpark's six target rows."""
+
+    if is_dspark_verify_armed():
+        from omlx.patches.deepseek_v4.verify_qmv import (
+            eligible as qmv_eligible,
+        )
+        from omlx.patches.deepseek_v4.verify_qmv import (
+            exact_verify_qmv,
+        )
+
+        if qmv_eligible(module, inputs):
+            return exact_verify_qmv(module, inputs)
+    return _ane_linear(module, inputs)
 
 
 def _batched_m1_attention(
@@ -102,6 +1200,30 @@ def _is_dspark_model(config: Any) -> bool:
     )
 
 
+@contextmanager
+def _defer_cache_materialization():
+    """Capture one forward's cache arrays instead of evaluating them.
+
+    The yielded list belongs to the caller and remains valid after the context
+    exits.  Nested use restores the prior capture target, and exceptions cannot
+    leave later decode calls in deferred mode.
+    """
+
+    previous = getattr(_CACHE_MATERIALIZATION_CAPTURE, "arrays", None)
+    captured = []
+    _CACHE_MATERIALIZATION_CAPTURE.arrays = captured
+    try:
+        yield captured
+    finally:
+        if previous is None:
+            try:
+                del _CACHE_MATERIALIZATION_CAPTURE.arrays
+            except AttributeError:
+                pass
+        else:
+            _CACHE_MATERIALIZATION_CAPTURE.arrays = previous
+
+
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
     """Detach DeepSeek-V4 cache update graphs from prior decode steps."""
     if cache is None:
@@ -119,8 +1241,14 @@ def _materialize_cache_arrays(cache: Optional[Any]) -> None:
                 if isinstance(value, mx.array):
                     cache_arrays.append(value)
 
-    if cache_arrays:
-        mx.eval(*cache_arrays)
+    if not cache_arrays:
+        return
+
+    captured = getattr(_CACHE_MATERIALIZATION_CAPTURE, "arrays", None)
+    if captured is not None:
+        captured.extend(cache_arrays)
+        return
+    mx.eval(*cache_arrays)
 
 
 @dataclass
@@ -238,6 +1366,67 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sqrtsoftplus":
         return mx.sqrt(nn.softplus(scores))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
+
+
+_DEEPSEEK_V4_ROUTER_TOPK_DECODE = os.getenv(
+    "OMLX_DSV4_ROUTER_TOPK_DECODE", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED = False
+
+
+@mx.compile
+def _router_native_pre(logits: mx.array, bias: mx.array):
+    scores = mx.sqrt(nn.softplus(logits.astype(mx.float32)))
+    return scores, mx.contiguous(scores + bias)
+
+
+@mx.compile
+def _router_native_post(
+    scores: mx.array,
+    indices: mx.array,
+    routed_scaling_factor: float,
+):
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    return weights * routed_scaling_factor
+
+
+def _native_router_select(
+    logits: mx.array,
+    bias: mx.array,
+    routed_scaling_factor: float,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    if (
+        not _DEEPSEEK_V4_ROUTER_TOPK_DECODE
+        or tuple(logits.shape) != (1, 1, 256)
+        or logits.dtype not in (mx.bfloat16, mx.float16)
+        or bias.shape != (256,)
+        or bias.dtype != mx.float32
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not glm_fast.has_symbol("ds4_router_topk_indices"):
+            return None
+        scores, biased = _router_native_pre(logits, bias)
+        indices = glm_fast.ds4_router_topk_indices(biased.reshape(1, 256)).reshape(
+            1, 1, 6
+        )
+        weights = _router_native_post(
+            scores,
+            indices,
+            routed_scaling_factor,
+        )
+    except (TypeError, ValueError):
+        return None
+    global _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED
+    if not _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED:
+        _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 exact B1 native router top-6 active"
+        )
+    return indices, weights
 
 
 @mx.compile
@@ -422,20 +1611,51 @@ def _dspark_ring_mm(
     )[:, None]
 
 
-def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int):
+def _extend_mask(
+    mask: Optional[mx.array],
+    pool_mask: Optional[mx.array],
+    N: int,
+    *,
+    local_width: Optional[int] = None,
+    pooled_width: Optional[int] = None,
+):
     if mask is None:
         return None
 
     if mask.ndim == 2:
         mask = mask[None, None]
     B, H, L, S = mask.shape
+    local_width = S if local_width is None else int(local_width)
+    pooled_width = N - local_width if pooled_width is None else int(pooled_width)
+    if local_width < 0 or pooled_width < 0 or local_width + pooled_width != N:
+        raise ValueError("logical local/pooled widths do not match the KV sequence")
+    if S > local_width:
+        # RotatingKVCache retains the newest local window. A causal mask built
+        # from the absolute prompt can therefore be wider than the physical
+        # local KV view after restoring a prefix; keep the matching suffix.
+        mask = mask[..., S - local_width :]
+        S = local_width
+    elif S < local_width:
+        raise ValueError("local attention mask is shorter than local KV")
+
+    if pool_mask is not None:
+        mask_width = int(pool_mask.shape[-1])
+        if mask_width > pooled_width:
+            # BatchPoolingCache may retain a capacity/physical tail beyond the
+            # restored row's logical pooled extent. make_mask marks that tail
+            # invalid, but broadcasting it to the shorter logical KV view
+            # fails before the values can be ignored. Logical pooled rows are
+            # prefix-contiguous, so trim only the physical tail.
+            pool_mask = pool_mask[..., :pooled_width]
+        elif mask_width < pooled_width:
+            raise ValueError("pooled attention validity mask is shorter than pooled KV")
 
     if pool_mask is None:
-        pool_mask = mx.ones((B, H, L, N - S), dtype=mx.bool_)
+        pool_mask = mx.ones((B, H, L, pooled_width), dtype=mx.bool_)
     elif pool_mask.ndim == 2:
-        pool_mask = mx.broadcast_to(pool_mask, (B, H, L, N - S))
+        pool_mask = mx.broadcast_to(pool_mask, (B, H, L, pooled_width))
     elif pool_mask.ndim == 3:
-        pool_mask = mx.broadcast_to(pool_mask[:, None], (B, H, L, N - S))
+        pool_mask = mx.broadcast_to(pool_mask[:, None], (B, H, L, pooled_width))
 
     full_mask = mx.concatenate([mask, pool_mask], axis=-1)
 
@@ -485,25 +1705,330 @@ _INDEXER_POOL_TILE = 16384
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
-_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
-    "OMLX_DSV4F_M2_MMA_SCORE", "1"
+# Shape/argument rejections from the native kernels surface as ValueError
+# (std::invalid_argument) and are raised before any GPU work. They are
+# per-call conditions -- e.g. a stale extension binary rejecting unaligned
+# prefill tails -- so they must NOT latch the process-wide native-disable
+# flags: warn once and fall back for that call only, keeping the native
+# path armed for later calls with different shapes. Genuine runtime
+# failures (RuntimeError etc.) still latch exactly as before.
+_DEEPSEEK_V4_INDEXER_SHAPE_WARNED = False
+_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED = False
+_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = False
+# The original v25 gate was qualified on M2 Ultra first.  Keep its environment
+# name as a compatibility alias, while the preferred name reflects the now
+# qualified M2 Ultra / M3 Ultra / M5 Max family.
+_DEEPSEEK_V4_MMA_SCORE = os.getenv(
+    "OMLX_DSV4F_MMA_SCORE", os.getenv("OMLX_DSV4F_M2_MMA_SCORE", "1")
 ).strip().lower() in ("1", "true", "on", "yes")
-_DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+_DEEPSEEK_V4_MMA_SCORE_LOGGED = False
+_DEEPSEEK_V4_NAX_INDEXER_SCORE = os.getenv(
+    # Experimental/default-off: the first M5 strict gate retained exact top-k
+    # membership but found a one-BF16-ULP score drift in 1/8,208 outputs. Keep
+    # Steel until the score sheet itself is bit-exact across the full matrix.
+    "OMLX_DSV4F_NAX_INDEXER_SCORE",
+    "0",
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED = False
+_DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
+    "OMLX_DSV4_INDEXER_ROW_TP", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS = os.getenv(
+    # Default-off: the first live 3:5/30K gate lost 3.1% because padding the
+    # all-gather to the larger 640-row shard outweighed the score imbalance.
+    "OMLX_DSV4_WEIGHTED_INDEXER_ROWS",
+    "0",
+).strip().lower() in ("1", "true", "on", "yes")
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS = tuple(
+        int(value)
+        for value in os.getenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS", "").split(",")
+        if value.strip()
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS = ()
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL = max(
+        0,
+        int(os.getenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "16000")),
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL = 16000
+_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED = False
+# JACCL's two-rank all-gather lost a completion during the 100K lifetime
+# gate.  DS4 row parallelism does not need a general collective here: each
+# rank already knows the peer's exact row shape and both need only exchange
+# their compact uint32 top-k rows. The physical gate rejected P2P for equal
+# rows but found it useful for unpadded 3:5 rows, so the path below requires
+# both explicit P2P and weighted-row opt-ins in addition to pure TP2.
+_DEEPSEEK_V4_INDEXER_GATHER_P2P = os.getenv(
+    # Default-off until a physical two-Mac lifetime gate proves that the
+    # stricter ordering does not cost more than 2% at 100K-equivalent rows.
+    "OMLX_DSV4_INDEXER_GATHER_P2P",
+    "0",
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = (
+    os.getenv("OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl").strip().lower()
+)
+_DEEPSEEK_V4_INDEXER_CONTROL_LOGGED = False
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = max(
+        0, int(os.getenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"))
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = 2048
 
 
-def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
-    """True only for the exact DeepSeek-V4-Flash / Apple M2 Ultra pairing.
+def _indexer_decode_owner_rank(group: Any) -> Optional[int]:
+    """Process-local owner selected from the signed performance profiles."""
 
-    The v25 MMA indexer score kernel is benchmark-proven (and bit-exact
-    validated) on precisely this checkpoint/hardware combination; every
-    other pairing keeps the Steel kernel.
-    """
-    if compress_ratio != 4:
-        return False
+    if group is None or int(group.size()) < 2:
+        return None
+    raw = os.getenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "").strip().lower()
+    if not raw or raw in {"auto", "false", "no", "off", "disabled"}:
+        return None
     try:
-        if mx.device_info().get("device_name") != "Apple M2 Ultra":
-            return False
-    except Exception:
+        owner = int(raw)
+    except ValueError:
+        return None
+    return owner if 0 <= owner < int(group.size()) else None
+
+
+def _broadcast_indexer_indices(
+    indices: Optional[mx.array],
+    *,
+    shape: Tuple[int, ...],
+    group: Any,
+    owner: int,
+) -> mx.array:
+    """Broadcast one exact owner-computed top-k decision.
+
+    The shipped path remains JACCL until live A/B promotes the separate control
+    channel.  ``control`` is deliberately explicit: once any rank starts a TCP
+    packet, falling back locally would split the distributed operation order.
+    Prefill row parallelism and DSpark verification never enter this helper's
+    owner-decode call sites, so their collective schedules remain unchanged.
+    """
+
+    # Startup-fixed on purpose. Changing transport between layers would split
+    # the global control/JACCL operation order across ranks.
+    transport = _DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT
+    if transport in {"control", "tcp"}:
+        global _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED
+        from omlx.cluster.control_plane import active_rank_control_plane
+
+        control = active_rank_control_plane()
+        if control is None:
+            raise RuntimeError(
+                "DS4 indexer control transport requires an active rank-control plane"
+            )
+        rank = int(group.rank())
+        size = int(group.size())
+        if int(control.rank) != rank or int(control.world_size) != size:
+            raise RuntimeError(
+                "DS4 indexer control transport does not match its tensor group"
+            )
+        expected_shape = tuple(int(value) for value in shape)
+        count = math.prod(expected_shape)
+        if count < 1:
+            raise RuntimeError("DS4 indexer decision shape is empty")
+        expected_size = count * np.dtype(">u4").itemsize
+        if not _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED:
+            _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED = True
+            logging.getLogger(__name__).info(
+                "deepseek_v4: sparse decode index decisions use the rank-control "
+                "plane (owner=%d, payload=%d bytes)",
+                owner,
+                expected_size,
+            )
+        if rank == owner:
+            if indices is None or tuple(indices.shape) != expected_shape:
+                raise RuntimeError("DS4 indexer owner produced an invalid decision")
+            local = indices.astype(mx.uint32).reshape(-1)
+            # The control plane is host TCP, so this is the intentional graph
+            # boundary: materialize the owner's deterministic top-k before the
+            # peer can consume it.  Only 512 uint32 values cross for DS4 decode.
+            payload = np.asarray(local, dtype=">u4").tobytes()
+        else:
+            local = None
+            payload = None
+        received = control.broadcast_owned_bytes(
+            payload,
+            source_rank=owner,
+            expected_size=expected_size,
+        )
+        if rank == owner:
+            return local.reshape(expected_shape)
+        values = np.frombuffer(received, dtype=">u4").astype(np.uint32)
+        return mx.array(values, dtype=mx.uint32).reshape(expected_shape)
+    if transport not in {"jaccl", "collective", "all_sum"}:
+        raise RuntimeError(
+            "OMLX_DSV4_INDEXER_DECISION_TRANSPORT must be jaccl or control"
+        )
+
+    local = (
+        indices.astype(mx.int32)
+        if int(group.rank()) == owner and indices is not None
+        else mx.zeros(shape, dtype=mx.int32)
+    )
+    return mx.distributed.all_sum(local, group=group).astype(mx.uint32)
+
+
+def _balanced_row_ranges(length: int, size: int) -> Tuple[Tuple[int, int], ...]:
+    """Contiguous query-row ranges with at most one row of skew."""
+
+    base, remainder = divmod(length, size)
+    ranges = []
+    start = 0
+    for rank in range(size):
+        stop = start + base + (1 if rank < remainder else 0)
+        ranges.append((start, stop))
+        start = stop
+    return tuple(ranges)
+
+
+def _weighted_row_ranges(
+    length: int,
+    weights: Tuple[int, ...],
+) -> Tuple[Tuple[int, int], ...]:
+    """Contiguous row ranges proportional to a qualified TP partition.
+
+    Cumulative integer boundaries keep every row exactly once and preserve
+    sequence order without a floating-point or host-specific tie break.  The
+    signed 3:5 DS4 placement therefore gives 384/640 rows of an M=1024 indexer
+    score build to the M3/M5 ranks instead of repeating the old 512/512 split.
+    """
+
+    if length < 0 or not weights or any(weight < 1 for weight in weights):
+        raise ValueError("row length and TP weights must be valid")
+    total = sum(weights)
+    ranges = []
+    prefix = 0
+    for weight in weights:
+        start = length * prefix // total
+        prefix += weight
+        stop = length * prefix // total
+        ranges.append((start, stop))
+    return tuple(ranges)
+
+
+def _indexer_row_ranges(
+    length: int,
+    group: mx.distributed.Group,
+    pooled_tokens: Optional[int] = None,
+) -> Tuple[Tuple[int, int], ...]:
+    """Use explicit long-context compute weights or preserve equal splitting."""
+
+    size = int(group.size())
+    explicit = _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS
+    explicit_active = (
+        len(explicit) == size
+        and all(weight > 0 for weight in explicit)
+        and pooled_tokens is not None
+        and pooled_tokens >= _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL
+    )
+    weights = explicit if explicit_active else None
+    if weights is None and _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS:
+        weights = _tp_partition_weights(group)
+    if weights is None:
+        return _balanced_row_ranges(length, size)
+    ranges = _weighted_row_ranges(length, weights)
+    if explicit_active:
+        global _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED
+        if not _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED:
+            _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED = True
+            logging.getLogger(__name__).info(
+                "deepseek_v4: long-context indexer rows use explicit "
+                "weights=%s ranges=%s pool=%d (min_pool=%d)",
+                weights,
+                ranges,
+                pooled_tokens,
+                _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL,
+            )
+    return ranges
+
+
+def _gather_indexer_rows(
+    local_indices: mx.array,
+    total_rows: int,
+    group: Any,
+    pooled_tokens: Optional[int] = None,
+) -> mx.array:
+    """Reassemble uneven row shards after exact per-row top-k selection."""
+
+    size = int(group.size())
+    ranges = _indexer_row_ranges(total_rows, group, pooled_tokens)
+    rank = int(group.rank()) if hasattr(group, "rank") else -1
+    row_counts = tuple(stop - start for start, stop in ranges)
+    # For unequal TP2 rows, rank zero's reconstruction depends on send before
+    # recv while rank one's depends on recv before send. This rank-asymmetric
+    # graph order gives JACCL one producer and one consumer per direction with
+    # one final transport evaluation instead of two Python/Metal barriers.
+    # The payload stays on-device throughout; recv_like's zero is shape
+    # metadata and no control-plane/CPU copy participates.
+    #
+    # Do not extend this ordering to a ring without a separate qualification:
+    # the two-phase proof relies on exactly one peer and non-empty row shards.
+    if (
+        _DEEPSEEK_V4_INDEXER_GATHER_P2P
+        and _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS
+        and size == 2
+        and rank in (0, 1)
+        and all(rows > 0 for rows in row_counts)
+        and row_counts[0] != row_counts[1]
+    ):
+        peer = 1 - rank
+        peer_rows = row_counts[peer]
+        rows_first = local_indices.swapaxes(0, 1)
+        peer_template = mx.zeros(
+            (peer_rows, *rows_first.shape[1:]),
+            dtype=rows_first.dtype,
+        )
+        # Both ranks finish their independent score/top-k work before either
+        # begins transport. Without this common boundary rank 1's first recv
+        # would defer its own score graph until after rank 0 sent, serializing
+        # the heterogeneous GPUs and surrendering row parallelism's benefit.
+        mx.eval(rows_first)
+        sent = mx.distributed.send(rows_first, peer, group=group)
+        peer_rows_first = mx.distributed.recv_like(
+            peer_template,
+            peer,
+            group=group,
+        )
+        parts = (sent, peer_rows_first) if rank == 0 else (peer_rows_first, sent)
+        return mx.concatenate(parts, axis=0).swapaxes(0, 1)
+
+    max_rows = max(stop - start for start, stop in ranges)
+    rows_first = local_indices.swapaxes(0, 1)
+    if rows_first.shape[0] < max_rows:
+        rows_first = mx.concatenate(
+            [
+                rows_first,
+                mx.zeros(
+                    (max_rows - rows_first.shape[0], *rows_first.shape[1:]),
+                    dtype=rows_first.dtype,
+                ),
+            ],
+            axis=0,
+        )
+    gathered = mx.distributed.all_gather(rows_first, group=group)
+    # The normal prompt chunk divides evenly across TP ranks (512 rows over
+    # two Macs). ``all_gather`` already concatenates those equal row blocks in
+    # rank order, which is the final sequence order. Slicing every block and
+    # concatenating them again only schedules another full top-k-index copy
+    # (1 MiB per ratio-4 layer at L=K=512).
+    if total_rows == max_rows * size and rows_first.shape[0] == max_rows:
+        return gathered.swapaxes(0, 1)
+    parts = [
+        gathered[rank * max_rows : rank * max_rows + (stop - start)]
+        for rank, (start, stop) in enumerate(ranges)
+    ]
+    return mx.concatenate(parts, axis=0).swapaxes(0, 1)
+
+
+def _dsv4f_exact_config(config, compress_ratio: int) -> bool:
+    """Exact DeepSeek-V4-Flash ratio-4 fingerprint shared by tuned kernels."""
+    if compress_ratio != 4:
         return False
     return (
         config.model_type == "deepseek_v4"
@@ -521,17 +2046,64 @@ def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
     )
 
 
-def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
-    """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
+def _dsv4f_mma_exact_pairing(config, compress_ratio: int) -> bool:
+    """True only for a benchmark-qualified DS4-Flash / Apple GPU pairing.
 
-    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
-    and an extension build exposing the symbol. The kernel serves bf16 /
+    The v25 MMA indexer score kernel is benchmark-proven and bit-exact on M2
+    Ultra, M3 Ultra, and M5 Max for this precise checkpoint fingerprint.
+    Unknown Apple generations and every other model keep the Steel kernel.
+    """
+    try:
+        if mx.device_info().get("device_name") not in {
+            "Apple M2 Ultra",
+            "Apple M3 Ultra",
+            "Apple M5 Max",
+        }:
+            return False
+    except Exception:
+        return False
+    return _dsv4f_exact_config(config, compress_ratio)
+
+
+def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
+    """Compatibility alias for callers written before M3/M5 qualification."""
+    return _dsv4f_mma_exact_pairing(config, compress_ratio)
+
+
+def _dsv4f_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Gate for the exact v25 from-scratch MMA score kernel.
+
+    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_MMA_SCORE=0, with
+    OMLX_DSV4F_M2_MMA_SCORE retained as an alias), and an extension build
+    exposing the symbol. The kernel serves bf16 /
     H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
     the fingerprint and this call site; N >= 64 is re-checked per call.
     """
-    if not _DEEPSEEK_V4_M2_MMA_SCORE:
+    if not _DEEPSEEK_V4_MMA_SCORE:
         return False
-    return _dsv4f_m2_exact_pairing(config, compress_ratio)
+    return _dsv4f_mma_exact_pairing(config, compress_ratio)
+
+
+def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Compatibility alias for the original M2-named startup gate."""
+    return _dsv4f_mma_score_enabled(config, compress_ratio)
+
+
+def _dsv4f_nax_indexer_score_enabled(config, compress_ratio: int) -> bool:
+    """Startup gate for the lossless M5 TensorOps indexer-score port.
+
+    Hardware detection mirrors ``metal::is_nax_available`` and the exact
+    checkpoint fingerprint prevents the H64/D128/ratio-4 tuning from leaking
+    into GLM or future DeepSeek variants. The candidate remains default-off;
+    ``OMLX_DSV4F_NAX_INDEXER_SCORE=1`` arms it for isolated A/B only until the
+    strict score-bit gate passes. Per-call dtype/shape and artifact gates remain
+    below.
+    """
+    return bool(
+        _DEEPSEEK_V4_NAX_INDEXER_SCORE
+        and _dsv4f_exact_config(config, compress_ratio)
+        and is_nax_available()
+    )
 
 
 @partial(mx.compile, shapeless=True)
@@ -544,6 +2116,46 @@ def _indexer_head_reduce(scores, weights, scale):
     return (mx.maximum(scores, 0) * scale * weights).sum(axis=1)
 
 
+def _foldable_pool_mask_ratio(
+    pool_cache: Any,
+    pmask: Optional[mx.array],
+    *,
+    batch_size: int,
+    pooled_tokens: int,
+    query_offset: Any,
+) -> int:
+    """Return an exact uniform pooled-mask ratio, or zero for mx.where.
+
+    A singleton ``BatchPoolingCache`` has the same causal mask as
+    ``PoolingCache`` only when its one logical pool length fills the physical
+    view. Multi-row batches and restored/trimmed physical tails retain their
+    explicit 3-D validity mask.
+    """
+
+    if pmask is None or not isinstance(query_offset, int):
+        return 0
+    name = type(pool_cache).__name__
+    if name == "PoolingCache":
+        if pmask.ndim != 2:
+            return 0
+    elif name == "BatchPoolingCache":
+        lengths = getattr(pool_cache, "_pool_lengths", None)
+        if (
+            batch_size != 1
+            or pmask.ndim != 3
+            or not isinstance(lengths, list)
+            or lengths != [pooled_tokens]
+        ):
+            return 0
+    else:
+        return 0
+    try:
+        ratio = int(pool_cache.ratio)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return ratio if ratio > 0 else 0
+
+
 @partial(mx.compile, shapeless=True)
 def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     if sinks is not None:
@@ -551,6 +2163,37 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     weights_a = mx.exp(logits_a - log_normalizer)
     weights_b = mx.exp(logits_b - log_normalizer)
     return weights_a, weights_b
+
+
+def _fused_sparse_decode_attention(
+    q_scaled: mx.array,
+    local_kv: mx.array,
+    pooled_sq: mx.array,
+    sinks: mx.array,
+) -> Optional[mx.array]:
+    """Single-dispatch fused sparse decode attention; None when unavailable.
+
+    decode_fast.sparse_attn_decode computes the same composition as
+    _dspark_sparse_exact_attention in one Metal kernel with an independent
+    per-(batch, head) reduction order, so decode (B=1) and verify (B=block)
+    stay bitwise row-consistent. Any failure latches the composed path for
+    the rest of the process.
+    """
+    global _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED
+    if _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED:
+        return None
+    try:
+        from omlx.custom_kernels.decode_fast import fast as decode_fast
+
+        return decode_fast.sparse_attn_decode(q_scaled, local_kv, pooled_sq, sinks)
+    except Exception as exc:
+        _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 fused sparse decode attention failed; composed path for "
+            "the rest of this process: %s",
+            exc,
+        )
+        return None
 
 
 @mx.compile
@@ -712,7 +2355,7 @@ def _sparse_pooled_attention(
         and q.dtype in (mx.float16, mx.bfloat16)
         and topk.dtype == mx.uint32
         and B >= 1
-        and H == 64
+        and H in (24, 32, 40, 64)
         and L > 4
         and D == 512
         and local_kv.ndim == 4
@@ -736,7 +2379,10 @@ def _sparse_pooled_attention(
             )
             if out is not None:
                 return out
-        if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+        # The separate native sparse kernel is still specialized to the full
+        # 64-head model. TP=2/H in {24, 32, 40} either returned through WSDPA
+        # above or keeps the exact composed fallback below.
+        if H == 64 and not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
             try:
                 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
@@ -751,6 +2397,19 @@ def _sparse_pooled_attention(
                         int(q_offset),
                         int(compress_ratio),
                         int(local_window),
+                    )
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): per-call
+                # condition, raised before GPU work. Do NOT latch -- keep
+                # the native path armed for later calls.
+                global _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED
+                if not _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED:
+                    _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native sparse attention rejected this shape; "
+                        "MLX fallback for this call only (native path "
+                        "stays armed for later calls): %s",
+                        exc,
                     )
             except Exception as exc:
                 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
@@ -775,6 +2434,10 @@ def _sparse_pooled_attention(
     exact_local = decode_consistent and L == 1 and 1 <= B <= 6
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
+        if not _DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED:
+            fused = _fused_sparse_decode_attention(q_scaled, local_kv, pooled_sq, sinks)
+            if fused is not None:
+                return fused
         return _dspark_sparse_exact_attention(
             q_scaled,
             local_kv,
@@ -864,14 +2527,28 @@ class MoEGate(nn.Module):
                 self.scoring_func,
             )
         else:
-            inds, weights = _expert_select(
-                logits,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
+            native = (
+                _native_router_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.routed_scaling_factor,
+                )
+                if self.top_k == 6
+                and self.norm_topk_prob
+                and self.scoring_func == "sqrtsoftplus"
+                else None
             )
+            if native is None:
+                inds, weights = _expert_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = native
 
         return inds, weights
 
@@ -893,6 +2570,11 @@ class DeepseekV4MLP(nn.Module):
         self.fp32_swiglu = False
 
     def __call__(self, x: mx.array) -> mx.array:
+        backend = _ANE_MLP_BACKEND
+        if backend is not None and not is_dspark_verify_armed():
+            hybrid = backend(self, x)
+            if hybrid is not None:
+                return hybrid
         paired = False
         if is_dspark_verify_armed():
             from omlx.patches.deepseek_v4.verify_qmv import (
@@ -928,6 +2610,12 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             activation=LimitedSwiGLU(config.swiglu_limit),
         )
+        try:
+            self.switch_mlp._omlx_dsv4f_exact_config = _dsv4f_exact_config(config, 4)
+        except (AttributeError, TypeError, ValueError):
+            # Future/partial configs fail closed before the tuned path can
+            # create a graph.
+            self.switch_mlp._omlx_dsv4f_exact_config = False
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -951,7 +2639,6 @@ class DeepseekV4MoE(nn.Module):
 
 
 class Compressor(nn.Module):
-
     def __init__(self, config: ModelArgs, compress_ratio: int, head_dim: int):
         super().__init__()
         self.compress_ratio = compress_ratio
@@ -1241,6 +2928,41 @@ def _stable_topk_indices(scores: mx.array, k: int) -> mx.array:
     return mx.sort(indices, axis=-1)
 
 
+def _fp32_topk_indices(scores: mx.array, k: int) -> mx.array:
+    """Deterministic native FP32 top-k with a per-call safe fallback."""
+
+    global _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED
+    global _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED
+
+    if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast
+
+            if fast.has_symbol("dspark_fp32_topk_indices"):
+                flat = scores.reshape(-1, scores.shape[-1])
+                indices = fast.dspark_fp32_topk_indices(flat, k)
+                return indices.reshape(*scores.shape[:-1], k)
+        except ValueError as exc:
+            # Shape rejection happens before GPU work and may be unique to one
+            # tail. Keep the native path armed for later compatible calls.
+            if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
+                _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native FP32 top-k rejected this shape; stable "
+                    "fallback for this call only (native path stays armed): %s",
+                    exc,
+                )
+        except Exception as exc:
+            _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+            logging.getLogger(__name__).warning(
+                "DSV4 native FP32 top-k failed; stable fallback for the rest "
+                "of this process: %s",
+                exc,
+                exc_info=True,
+            )
+    return _stable_topk_indices(scores, k)
+
+
 class Indexer(nn.Module):
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
@@ -1253,9 +2975,11 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
-        self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
+        self._m2_mma_score = _dsv4f_mma_score_enabled(config, compress_ratio)
+        self._nax_indexer_score = _dsv4f_nax_indexer_score_enabled(
             config, compress_ratio
         )
+        self.row_sharding_group = None
 
     def __call__(
         self,
@@ -1269,6 +2993,7 @@ class Indexer(nn.Module):
         projected_weights: Optional[mx.array] = None,
     ):
         B, L, _ = x.shape
+        total_rows = L
         if compressor_projection is None:
             pooled = self.compressor(x, pool_cache, offset)
         else:
@@ -1280,16 +3005,61 @@ class Indexer(nn.Module):
         if pooled.shape[1] == 0:
             return None
 
+        # Sparse score/top-k selection is independent for every prompt row,
+        # but TP used to repeat all of it on every rank. Keep pooled-cache
+        # updates replicated, split only the expensive query rows, and gather
+        # the compact uint32 top-k result before sharded attention consumes it.
+        # Decode and DSpark's pre-projected verify rows retain the original path.
+        row_group = self.row_sharding_group
+        k = min(self.index_topk, pooled.shape[1])
+        decode_owner = _indexer_decode_owner_rank(row_group)
+        owner_decode = bool(
+            decode_owner is not None
+            and B == 1
+            and L == 1
+            and pooled.shape[1] > self.index_topk
+            and projected_q is None
+            and projected_weights is None
+            and not is_dspark_verify_armed()
+        )
+        if owner_decode and int(row_group.rank()) != decode_owner:
+            return _broadcast_indexer_indices(
+                None,
+                shape=(B, L, k),
+                group=row_group,
+                owner=decode_owner,
+            )
+        row_sharded = bool(
+            _DEEPSEEK_V4_INDEXER_ROW_TP
+            and row_group is not None
+            and int(row_group.size()) > 1
+            and B == 1
+            and L >= int(row_group.size())
+            and pooled.shape[1] >= _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL
+            and projected_q is None
+            and projected_weights is None
+        )
+        query_offset = offset
+        if row_sharded:
+            ranges = _indexer_row_ranges(L, row_group, int(pooled.shape[1]))
+            start, stop = ranges[int(row_group.rank())]
+            x = x[:, start:stop]
+            q_residual = q_residual[:, start:stop]
+            L = stop - start
+            query_offset = offset + start
+
         if projected_q is None:
             q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
             q = q.transpose(0, 2, 1, 3)
-            q = position_rope(q, offset)
+            q = position_rope(q, query_offset)
         else:
             q = projected_q
 
-        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
-        k = min(self.index_topk, pooled.shape[1])
-
+        pmask = (
+            pool_cache.make_mask(total_rows, offset) if pool_cache is not None else None
+        )
+        if row_sharded and pmask is not None:
+            pmask = pmask[..., start:stop, :]
         if native_indexer_shape_eligible(
             query_tokens=L,
             pooled_tokens=pooled.shape[1],
@@ -1326,25 +3096,59 @@ class Indexer(nn.Module):
                     ).astype(q.dtype) * ((self.n_heads**-0.5) * self.scale)
                     # Fused pooled-ratio causal mask (lossless): the kernel
                     # epilogue writes the finfo(bf16).min sentinel itself
-                    # when the mask is the plain 2-D PoolingCache ratio mask,
-                    # bit-identical to the mx.where pass it replaces.
-                    # Batched 3-D masks keep the where pass; pmask is None
-                    # stays unmasked as before.
-                    _mask_ratio = 0
+                    # for a uniform PoolingCache ratio mask, bit-identical to
+                    # the mx.where pass it replaces. Singleton
+                    # BatchPoolingCache is also uniform when its logical pool
+                    # fills the physical view; true multi-row/tailed batches
+                    # keep the explicit 3-D mask.
+                    _mask_ratio = _foldable_pool_mask_ratio(
+                        pool_cache,
+                        pmask,
+                        batch_size=B,
+                        pooled_tokens=int(pooled.shape[1]),
+                        query_offset=query_offset,
+                    )
                     _mask_q_offset = 0
-                    if (
-                        pmask is not None
-                        and pmask.ndim == 2
-                        and isinstance(offset, int)
-                        and type(pool_cache).__name__ == "PoolingCache"
-                    ):
-                        _mask_ratio = int(pool_cache.ratio)
-                        _mask_q_offset = int(offset)
-                    # v25 from-scratch MMA score kernel: 1.37x over Steel
-                    # on the exact M2/DSV4F pairing, bit-exact incl. the
+                    if _mask_ratio:
+                        _mask_q_offset = int(query_offset)
+                    hierarchical_indices = hierarchical_topk(
+                        q,
+                        pooled,
+                        weights,
+                        pool_cache,
+                        query_offset=(
+                            int(query_offset) if isinstance(query_offset, int) else -1
+                        ),
+                        topk=self.index_topk,
+                        ratio=_mask_ratio,
+                        kernels=glm_fast,
+                    )
+                    if hierarchical_indices is not None:
+                        indices = (
+                            _gather_indexer_rows(
+                                hierarchical_indices,
+                                total_rows,
+                                row_group,
+                                int(pooled.shape[1]),
+                            )
+                            if row_sharded
+                            else hierarchical_indices
+                        )
+                        return (
+                            _broadcast_indexer_indices(
+                                indices,
+                                shape=tuple(indices.shape),
+                                group=row_group,
+                                owner=decode_owner,
+                            )
+                            if owner_decode
+                            else indices
+                        )
+                    # v25 from-scratch MMA score kernel: bit-exact and faster
+                    # on the qualified M2/M3/M5 DS4F pairings, including the
                     # fused pooled-ratio mask (validated across aligned and
                     # unaligned M/N and chunked-prefill offsets). Gated by
-                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
+                    # fingerprint + OMLX_DSV4F_MMA_SCORE + extension
                     # symbol; every other configuration keeps the Steel
                     # path below unchanged.
                     _use_mma = (
@@ -1353,13 +3157,47 @@ class Indexer(nn.Module):
                         and q.dtype == mx.bfloat16
                         and pooled.shape[1] >= 64
                     )
-                    global _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED
-                    if _use_mma and not _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED:
-                        _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = True
+                    _use_mma_wm4_wn1 = (
+                        _use_mma and glm_fast.dsa_indexer_mma_wm4_wn1_eligible()
+                    )
+                    # M5 TensorOps score tile: exact DS4F fingerprint at
+                    # construction, then the narrow runtime domain here.
+                    # In heterogeneous TP, only row-sharded prefill may use a
+                    # rank-local kernel: replicated rows stay on Steel on both
+                    # ranks so a numerical drift can never split top-k control
+                    # flow. The native primitive itself demotes to Steel if the
+                    # optional NAX library/pipeline cannot load.
+                    _nax_rank_safe = (
+                        row_group is None or int(row_group.size()) <= 1 or row_sharded
+                    )
+                    _use_nax = (
+                        self._nax_indexer_score
+                        and _nax_rank_safe
+                        and getattr(glm_fast, "_EXT_NAX_SCORE", False)
+                        and glm_fast.dsa_indexer_nax_kernels_built()
+                        and q.dtype == mx.bfloat16
+                        and B == 1
+                        and q.shape[1] == 64
+                        and q.shape[3] == 128
+                        and L >= 16
+                        and pooled.shape[1] > 512
+                        and _mask_ratio == 4
+                    )
+                    global _DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED
+                    if _use_nax and not _DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED:
+                        _DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED = True
                         logging.getLogger(__name__).info(
-                            "deepseek_v4: DSV4F/M2 v25 MMA indexer score "
+                            "deepseek_v4: DS4F M5/NAX ratio-4 indexer score "
+                            "kernel active (TensorOps 16x32 tile)"
+                        )
+                    global _DEEPSEEK_V4_MMA_SCORE_LOGGED
+                    if _use_mma and not _DEEPSEEK_V4_MMA_SCORE_LOGGED:
+                        _DEEPSEEK_V4_MMA_SCORE_LOGGED = True
+                        logging.getLogger(__name__).info(
+                            "deepseek_v4: DSV4F v25 MMA indexer score "
                             "kernel active (zero-per-head-barrier, "
-                            "1.37x over Steel)"
+                            "lossless qualified Apple GPU path, partition=%s)",
+                            "WM4xWN1" if _use_mma_wm4_wn1 else "WM2xWN2",
                         )
                     if _use_mma:
                         scores4 = glm_fast.dsa_indexer_scores_mma(
@@ -1368,6 +3206,7 @@ class Indexer(nn.Module):
                             weights,
                             mask_ratio=_mask_ratio,
                             mask_q_offset=_mask_q_offset,
+                            use_wm4_wn1=_use_mma_wm4_wn1,
                         )
                     else:
                         scores4 = glm_fast.dsa_indexer_scores(
@@ -1377,6 +3216,7 @@ class Indexer(nn.Module):
                             causal=False,
                             mask_ratio=_mask_ratio,
                             mask_q_offset=_mask_q_offset,
+                            use_nax=_use_nax,
                         )
                     if _mask_ratio == 0 and pmask is not None:
                         scores4 = mx.where(
@@ -1394,7 +3234,41 @@ class Indexer(nn.Module):
                         # resolves cutoff ties by temporal index.
                         bucketed=False,
                     )[:, 0]
-                    return mx.sort(indices, axis=-1)
+                    indices = mx.sort(indices, axis=-1)
+                    indices = (
+                        _gather_indexer_rows(
+                            indices,
+                            total_rows,
+                            row_group,
+                            int(pooled.shape[1]),
+                        )
+                        if row_sharded
+                        else indices
+                    )
+                    return (
+                        _broadcast_indexer_indices(
+                            indices,
+                            shape=tuple(indices.shape),
+                            group=row_group,
+                            owner=decode_owner,
+                        )
+                        if owner_decode
+                        else indices
+                    )
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): raised
+                # before any GPU work and per-call -- e.g. a stale extension
+                # binary rejecting an unaligned prefill tail. Do NOT latch:
+                # later calls with different shapes may succeed natively.
+                global _DEEPSEEK_V4_INDEXER_SHAPE_WARNED
+                if not _DEEPSEEK_V4_INDEXER_SHAPE_WARNED:
+                    _DEEPSEEK_V4_INDEXER_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native indexer top-k rejected this shape; MLX "
+                        "fallback for this call only (native path stays "
+                        "armed for later calls): %s",
+                        exc,
+                    )
             except Exception as exc:
                 disable_native_indexer()
                 logging.getLogger(__name__).warning(
@@ -1403,6 +3277,11 @@ class Indexer(nn.Module):
                     exc,
                     exc_info=True,
                 )
+
+        # NOTE: M=1 decode deliberately keeps the fp32 GEMV path below. The
+        # fused dsa_decode_scores scan was measured slower than mlx's GEMV
+        # for a single row (see _dspark_fused_indexer_scores); the fused
+        # route only pays off for multi-row DSpark verify batches.
 
         weights = (
             self.weights_proj(x) if projected_weights is None else projected_weights
@@ -1440,7 +3319,113 @@ class Indexer(nn.Module):
                 scores,
                 mx.finfo(scores.dtype).min,
             )
-        return _stable_topk_indices(scores, k)
+        indices = _fp32_topk_indices(scores, k)
+        indices = (
+            _gather_indexer_rows(
+                indices,
+                total_rows,
+                row_group,
+                int(pooled.shape[1]),
+            )
+            if row_sharded
+            else indices
+        )
+        return (
+            _broadcast_indexer_indices(
+                indices,
+                shape=tuple(indices.shape),
+                group=row_group,
+                owner=decode_owner,
+            )
+            if owner_decode
+            else indices
+        )
+
+
+def _dspark_fused_indexer_scores(
+    indexer: "Indexer",
+    pooled_rows: List[mx.array],
+    projected_q: mx.array,
+    projected_weights: mx.array,
+    row_start: int = 0,
+) -> Optional[List[mx.array]]:
+    """Score DSpark verify rows with the fused dsa_decode_scores scan.
+
+    One dispatch per row: K is streamed exactly once in its cache dtype with
+    fp32 accumulation, so neither the fp32 cast of the pooled context nor the
+    (rows, n_heads, P) fp32 score sheet of the reference path exists. Head
+    weights stay fp32 (folded with n_heads**-0.5 * scale), so scores match
+    the reference reduction semantics: relu(q . k) * scale, weighted by
+    projected_weights * n_heads**-0.5, summed over heads.
+
+    Returns one fp32 (1, P_row) score row per pooled row, or None when the
+    fused kernel is opted out, ineligible for these shapes (including the
+    single-row case, where the fused scan measures slower than the reference
+    GEMV), or failed at runtime; the caller then uses the fp32 rowwise-GEMM
+    reference path.
+    """
+    global _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED
+    if (
+        _DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED
+        or _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED
+    ):
+        return None
+    # Single-row calls (M=1 decode, depth-1 verify) stay on the fp32 GEMV
+    # reference: measured at 100K pooled tokens the one-dispatch fused scan
+    # is slightly SLOWER than mlx's GEMV (0.95 ms vs 0.89 ms — the h64 scan
+    # is issue-bound at B=1), while at 2+ rows the fused route wins
+    # (1.2-1.4x at 100K) because the reference pays the fp32 cast and the
+    # (rows, 64, P) score sheet per row.
+    if len(pooled_rows) < 2:
+        return None
+    # The fp32-weight instantiation exists for the 64-head DS4 indexer only;
+    # 32-head DSA models are GLM and route through their own patch.
+    if indexer.n_heads != 64 or getattr(indexer, "head_dim", 128) != 128:
+        return None
+    if projected_q.dtype not in (mx.float16, mx.bfloat16):
+        return None
+    if projected_q.ndim != 4 or projected_q.shape[0] != 1:
+        return None
+    if projected_q.shape[1] != indexer.n_heads:
+        return None
+    if projected_weights.shape[0] != 1:
+        return None
+    for row in pooled_rows:
+        # The native scan requires S >= 1024. It reads K by strides and
+        # re-validates the row layout (contiguous, 16B-aligned rows) itself,
+        # so capacity-backed cache slices are consumed in place.
+        if row.ndim != 3 or row.shape[2] != 128 or row.shape[1] < 1024:
+            return None
+        if row.dtype != projected_q.dtype:
+            return None
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if not fast.has_symbol("dsa_decode_scores"):
+        return None
+    weight_scale = (indexer.n_heads**-0.5) * indexer.scale
+    score_rows: List[mx.array] = []
+    try:
+        for idx, row in enumerate(pooled_rows):
+            q_row = projected_q[0:1, :, row_start + idx : row_start + idx + 1, :]
+            w_row = (
+                projected_weights[0:1, row_start + idx].astype(mx.float32)
+                * weight_scale
+            )
+            scores = fast.dsa_decode_scores(
+                q_row, row[:, None], w_row, fp32_scores=True
+            )
+            score_rows.append(scores.reshape(1, row.shape[1]))
+    except Exception as exc:
+        _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 fused decode indexer failed; fp32 rowwise-GEMM fallback "
+            "for the rest of this process: %s",
+            exc,
+            exc_info=True,
+        )
+        return None
+    return score_rows
 
 
 def _batch_indexer_rows(
@@ -1450,62 +3435,71 @@ def _batch_indexer_rows(
     projected_weights: mx.array,
 ) -> List[Optional[mx.array]]:
     """Select each decode row's pooled indices with grouped FP32 GEMMs."""
-    global _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED
-
     lengths = [int(row.shape[1]) for row in pooled_rows]
     if len(lengths) > 1 and min(lengths) > indexer.index_topk:
         # A ratio-4 boundary makes adjacent verify rows differ by one pooled
         # token. The score reduction is over the fixed 128-wide head, so
-        # padding N does not alter any valid dot product. Mask the padded tail
-        # before top-k and keep all rows in one native GEMM/top-k dispatch.
+        # padding N does not alter any valid dot product. The fused path
+        # scores each row at its own length and pads the score tail with the
+        # sentinel; the reference path pads the pooled rows instead. Either
+        # way the padded tail is masked before top-k and all rows share one
+        # native top-k dispatch.
         max_length = max(lengths)
-        padded_rows = []
-        for row, length in zip(pooled_rows, lengths):
-            if length < max_length:
-                row = mx.concatenate(
-                    [
-                        row,
-                        mx.zeros(
-                            (row.shape[0], max_length - length, row.shape[2]),
-                            dtype=row.dtype,
-                        ),
-                    ],
-                    axis=1,
-                )
-            padded_rows.append(row)
-        query_batch = projected_q[0].transpose(1, 0, 2)
-        pooled_batch = mx.concatenate(padded_rows, axis=0)
-        scores = rowwise_gemm(
-            query_batch.astype(mx.float32),
-            pooled_batch.astype(mx.float32),
-            True,
+        score_rows = _dspark_fused_indexer_scores(
+            indexer, pooled_rows, projected_q, projected_weights
         )
-        scores = mx.maximum(scores, 0) * indexer.scale
-        weights = projected_weights[0].astype(mx.float32)
-        weights = weights * (indexer.n_heads**-0.5)
-        scores = (scores * weights[..., None]).sum(axis=1)
+        if score_rows is not None:
+            # Per-row fused scores; pad the ±1-token tails with the same
+            # finfo.min sentinel the `valid` mask below writes, so the padded
+            # positions stay excluded from top-k.
+            scores = mx.concatenate(
+                [
+                    row_scores
+                    if row_scores.shape[1] == max_length
+                    else mx.concatenate(
+                        [
+                            row_scores,
+                            mx.full(
+                                (1, max_length - row_scores.shape[1]),
+                                mx.finfo(mx.float32).min,
+                                dtype=mx.float32,
+                            ),
+                        ],
+                        axis=1,
+                    )
+                    for row_scores in score_rows
+                ],
+                axis=0,
+            )
+        else:
+            padded_rows = []
+            for row, length in zip(pooled_rows, lengths):
+                if length < max_length:
+                    row = mx.concatenate(
+                        [
+                            row,
+                            mx.zeros(
+                                (row.shape[0], max_length - length, row.shape[2]),
+                                dtype=row.dtype,
+                            ),
+                        ],
+                        axis=1,
+                    )
+                padded_rows.append(row)
+            query_batch = projected_q[0].transpose(1, 0, 2)
+            pooled_batch = mx.concatenate(padded_rows, axis=0)
+            scores = rowwise_gemm(
+                query_batch.astype(mx.float32),
+                pooled_batch.astype(mx.float32),
+                True,
+            )
+            scores = mx.maximum(scores, 0) * indexer.scale
+            weights = projected_weights[0].astype(mx.float32)
+            weights = weights * (indexer.n_heads**-0.5)
+            scores = (scores * weights[..., None]).sum(axis=1)
         valid = mx.arange(max_length)[None] < mx.array(lengths)[:, None]
         scores = mx.where(valid, scores, mx.finfo(scores.dtype).min)
-        indices = None
-        if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
-            try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
-
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(
-                        scores,
-                        indexer.index_topk,
-                    )
-            except Exception as exc:
-                _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
-                logging.getLogger(__name__).warning(
-                    "DSV4 native DSpark top-k failed; stable-sort fallback "
-                    "for the rest of this process: %s",
-                    exc,
-                    exc_info=True,
-                )
-        if indices is None:
-            indices = _stable_topk_indices(scores, indexer.index_topk)
+        indices = _fp32_topk_indices(scores, indexer.index_topk)
         indices = indices[:, None]
         return [indices[idx : idx + 1] for idx in range(len(lengths))]
 
@@ -1534,40 +3528,181 @@ def _batch_indexer_rows(
             start = stop
             continue
 
-        query_batch = projected_q[0, :, start:stop].transpose(1, 0, 2)
-        pooled_batch = mx.concatenate(pooled_rows[start:stop], axis=0)
-        scores = rowwise_gemm(
-            query_batch.astype(mx.float32),
-            pooled_batch.astype(mx.float32),
-            True,
+        score_rows = _dspark_fused_indexer_scores(
+            indexer, pooled_rows[start:stop], projected_q, projected_weights, start
         )
-        scores = mx.maximum(scores, 0) * indexer.scale
-        weights = projected_weights[0, start:stop].astype(mx.float32)
-        weights = weights * (indexer.n_heads**-0.5)
-        scores = (scores * weights[..., None]).sum(axis=1)
+        if score_rows is not None:
+            # Equal-length group: rows stack without any score padding.
+            scores = mx.concatenate(score_rows, axis=0)
+        else:
+            query_batch = projected_q[0, :, start:stop].transpose(1, 0, 2)
+            pooled_batch = mx.concatenate(pooled_rows[start:stop], axis=0)
+            scores = rowwise_gemm(
+                query_batch.astype(mx.float32),
+                pooled_batch.astype(mx.float32),
+                True,
+            )
+            scores = mx.maximum(scores, 0) * indexer.scale
+            weights = projected_weights[0, start:stop].astype(mx.float32)
+            weights = weights * (indexer.n_heads**-0.5)
+            scores = (scores * weights[..., None]).sum(axis=1)
         k = min(indexer.index_topk, pooled_length)
-        indices = None
-        if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED and k == 512:
-            try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
-
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(scores, k)
-            except Exception as exc:
-                _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
-                logging.getLogger(__name__).warning(
-                    "DSV4 native DSpark top-k failed; stable-sort fallback "
-                    "for the rest of this process: %s",
-                    exc,
-                    exc_info=True,
-                )
-        if indices is None:
-            indices = _stable_topk_indices(scores, k)
+        indices = _fp32_topk_indices(scores, k)
         indices = indices[:, None]
         results.extend(indices[idx : idx + 1] for idx in range(stop - start))
         start = stop
 
     return results
+
+
+def _ragged_verify_sparse_attention(
+    query_rows: mx.array,
+    local_rows: List[mx.array],
+    pooled_rows: List[mx.array],
+    topk_rows: List[mx.array],
+    scale: float,
+    sinks: mx.array,
+    *,
+    decode_consistent: bool,
+) -> mx.array:
+    """Evaluate equal-geometry verify subgroups when sparse widths differ.
+
+    At a ratio-4/128 pooling boundary, the first speculative row can select
+    511 pooled entries while the following rows select 512. Padding that first
+    row would either duplicate a KV entry or change the softmax reduction tree.
+    Split the at-most-six verification rows into adjacent equal-geometry
+    groups. The boundary row runs through the established B=1 exact path while
+    the usual 512-wide tail remains batched. Each group's final pooled view is
+    safe for its earlier rows because their top-k indices can only name the
+    prefix they observed; no padded/duplicated entry enters the softmax.
+    """
+
+    outputs: List[mx.array] = []
+    start = 0
+    count = min(
+        int(query_rows.shape[0]),
+        len(local_rows),
+        len(pooled_rows),
+        len(topk_rows),
+    )
+    while start < count:
+        signature = (
+            int(local_rows[start].shape[2]),
+            int(topk_rows[start].shape[-1]),
+        )
+        stop = start + 1
+        while stop < count and (
+            int(local_rows[stop].shape[2]),
+            int(topk_rows[stop].shape[-1]),
+        ) == signature:
+            stop += 1
+        group_size = stop - start
+        pooled = pooled_rows[stop - 1]
+        pooled_batch = mx.broadcast_to(
+            pooled,
+            (group_size, pooled.shape[1], pooled.shape[2]),
+        )
+        output = _sparse_pooled_attention(
+            query_rows[start:stop],
+            mx.concatenate(local_rows[start:stop], axis=0),
+            pooled_batch,
+            mx.concatenate(topk_rows[start:stop], axis=0),
+            None,
+            None,
+            scale,
+            sinks,
+            decode_consistent=decode_consistent,
+        )
+        if output is None:
+            raise RuntimeError("DS4 rowwise verify attention did not produce output")
+        outputs.append(output)
+        start = stop
+    if sum(int(output.shape[0]) for output in outputs) != int(query_rows.shape[0]):
+        raise RuntimeError("DS4 rowwise verify cache count is inconsistent")
+    return mx.concatenate(outputs, axis=0)
+
+
+def _b1_cache_offset(cache: Any, batch_size: int) -> Any:
+    """Use BatchRotatingKVCache's host absolute offset for a B=1 request.
+
+    The public ``offset`` is an MLX vector because batched rows may differ.
+    Its private ``_offset`` is the same absolute position as a Python integer
+    while B=1, which lets the exact DS4 WSDPA/native-mask routes dispatch
+    without a device synchronization. Multi-row batches retain the vector.
+    """
+
+    if cache is None:
+        return 0
+    if _DEEPSEEK_V4_B1_SCALAR_OFFSET and batch_size == 1:
+        host_offset = getattr(cache, "_offset", None)
+        if isinstance(host_offset, int) and not isinstance(host_offset, bool):
+            return host_offset
+    return cache.offset
+
+
+def _canonical_wide_attention_prefill(
+    module: nn.Module,
+    x: mx.array,
+    cache: Any,
+    *,
+    standard_mask: bool,
+    call: Any,
+) -> Optional[mx.array]:
+    """Run a 2K outer tile as two exact 1K attention/cache transactions.
+
+    HyperConnection and attention are the chunk-sensitive arithmetic frontier.
+    Keeping only those boundaries at 1K lets the surrounding block retain 2K
+    routed-MoE/GEMM scheduling without changing the established 1K result.
+    """
+
+    if (
+        not _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL
+        or getattr(_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE, "active", False)
+        or getattr(module, "training", False)
+        or is_dspark_verify_armed()
+        or not standard_mask
+        or cache is None
+        or x.ndim != 3
+        or tuple(x.shape) != (1, 2048, 4096)
+        or x.dtype != mx.bfloat16
+        or int(getattr(module, "compress_ratio", 0)) not in (4, 128)
+    ):
+        return None
+
+    global _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED:
+        _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: preserving the 1K HC/attention arithmetic frontier "
+            "inside a 2K outer prefill tile"
+        )
+
+    outputs = []
+    _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE.active = True
+    try:
+        for start in (0, 1024):
+            part = x[:, start : start + 1024]
+            first = cache[0] if hasattr(cache, "caches") else cache
+            mask = create_attention_mask(
+                part,
+                first,
+                window_size=module.config.sliding_window,
+                return_array=True,
+            )
+            output = call(
+                part,
+                mask,
+                cache,
+                _standard_mask=True,
+            )
+            # A true outer 1K step queues its cache before the next model call.
+            # async_eval preserves that dependency/alias boundary without the
+            # host synchronization that erased the wider block's gain.
+            mx.async_eval(output, cache.state)
+            outputs.append(output)
+    finally:
+        _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE.active = False
+    return mx.concatenate(outputs, axis=1)
 
 
 class LocalAttention(nn.Module):
@@ -1577,6 +3712,9 @@ class LocalAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        # Set True per model instance by the MTP patch when draft/verify
+        # equality is required.  Ordinary decode can use fused SDPA.
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = 0
         self.hidden_size = config.hidden_size
@@ -1623,17 +3761,33 @@ class LocalAttention(nn.Module):
         _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        offset = _b1_cache_offset(cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+        else:
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (self.wq_a, self.wkv),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+            else:
+                q_a, kv_raw = projection_bank
+        q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
             key_rows = _consume_rotating_verify_rows(cache, kv)
@@ -1645,7 +3799,7 @@ class LocalAttention(nn.Module):
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        if self.dspark and B == 1 and L == 1:
+        if _exact_decode_required(self, B, L):
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
             out = None
@@ -1685,6 +3839,7 @@ class CompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1732,23 +3887,63 @@ class CompressedAttention(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        canonical = _canonical_wide_attention_prefill(
+            self,
+            x,
+            cache,
+            standard_mask=_standard_mask,
+            call=self.__call__,
+        )
+        if canonical is not None:
+            return canonical
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            compressor_projection = (
+                (compressed_kv, compressed_gate)
+                if compressed_kv is not None and compressed_gate is not None
+                else None
+            )
+        else:
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (
+                        self.wq_a,
+                        self.wkv,
+                        self.compressor.wkv,
+                        self.compressor.wgate,
+                    ),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+                compressor_projection = None
+            else:
+                q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
+                compressor_projection = (compressed_kv, compressed_gate)
+        q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
+            if compressor_projection is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -1773,7 +3968,15 @@ class CompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, pool_cache, offset)
+        pooled = (
+            self.compressor(x, pool_cache, offset)
+            if compressor_projection is None
+            else self.compressor.consume(
+                *compressor_projection,
+                pool_cache,
+                offset,
+            )
+        )
         pooled_mask = None
         if pooled.shape[1] > 0:
             pooled_mask = (
@@ -1800,7 +4003,7 @@ class CompressedAttention(nn.Module):
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
-            and not (self.dspark and B == 1 and L == 1)
+            and not _exact_decode_required(self, B, L)
             and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
@@ -1819,15 +4022,23 @@ class CompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self._omlx_decode_consistent,
                 native_only=True,
                 _standard_mask=_standard_mask,
             )
         if out is None:
+            local_width = int(kv.shape[2])
+            pooled_width = int(pooled.shape[1])
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-            if self.dspark and B == 1 and L == 1:
+            mask = _extend_mask(
+                mask,
+                pooled_mask,
+                kv.shape[2],
+                local_width=local_width,
+                pooled_width=pooled_width,
+            )
+            if _exact_decode_required(self, B, L):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = scaled_dot_product_attention(
@@ -1854,6 +4065,7 @@ class SparseCompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1901,25 +4113,93 @@ class SparseCompressedAttention(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        canonical = _canonical_wide_attention_prefill(
+            self,
+            x,
+            cache,
+            standard_mask=_standard_mask,
+            call=self.__call__,
+        )
+        if canonical is not None:
+            return canonical
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            compressor_projection = (
+                (compressed_kv, compressed_gate)
+                if compressed_kv is not None and compressed_gate is not None
+                else None
+            )
+            index_kv = projected.get("indexer_compressor_wkv")
+            index_gate = projected.get("indexer_compressor_wgate")
+            index_compressor_projection = (
+                (index_kv, index_gate)
+                if index_kv is not None and index_gate is not None
+                else None
+            )
+        else:
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (
+                        self.wq_a,
+                        self.wkv,
+                        self.compressor.wkv,
+                        self.compressor.wgate,
+                        self.indexer.compressor.wkv,
+                        self.indexer.compressor.wgate,
+                    ),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+                compressor_projection = None
+                index_compressor_projection = None
+            else:
+                (
+                    q_a,
+                    kv_raw,
+                    compressed_kv,
+                    compressed_gate,
+                    index_kv,
+                    index_gate,
+                ) = projection_bank
+                compressor_projection = (compressed_kv, compressed_gate)
+                index_compressor_projection = (index_kv, index_gate)
+        q_residual = self.q_norm(q_a)
+        if is_dspark_verify_armed():
+            q_raw = _project_verify_q_b(self.wq_b, q_residual)
+            indexer_q_raw = None
+        else:
+            q_raw, indexer_q_raw = _ane_stacked_q(
+                self.wq_b,
+                getattr(self.indexer, "wq_b", None),
+                q_residual,
+            )
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
-            index_kv, index_gate = self.indexer.compressor.project(x)
+            if compressor_projection is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
+            if index_compressor_projection is None:
+                index_kv, index_gate = self.indexer.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -1955,7 +4235,7 @@ class SparseCompressedAttention(nn.Module):
                 ]
                 out = _batched_m1_attention(q, key_rows, self.scale, sinks)
             else:
-                index_q = self.indexer.wq_b(q_residual).reshape(
+                index_q = _project_verify_q_b(self.indexer.wq_b, q_residual).reshape(
                     B,
                     L,
                     self.indexer.n_heads,
@@ -1963,7 +4243,12 @@ class SparseCompressedAttention(nn.Module):
                 )
                 index_q = index_q.transpose(0, 2, 1, 3)
                 index_q = self.rope(index_q, offset)
-                index_weights = self.indexer.weights_proj(x)
+                index_weights = _projection_or(
+                    projected,
+                    "indexer_weights",
+                    self.indexer.weights_proj,
+                    x,
+                )
                 topk_rows = _batch_indexer_rows(
                     self.indexer,
                     index_pooled_rows,
@@ -1975,9 +4260,20 @@ class SparseCompressedAttention(nn.Module):
                     pooled,
                     (L, pooled.shape[1], pooled.shape[2]),
                 )
-                topk_batch = mx.concatenate(topk_rows, axis=0)
+                topk_widths = tuple(int(row.shape[-1]) for row in topk_rows)
+                ragged_topk = len(set(topk_widths)) > 1
+                topk_batch = (
+                    None if ragged_topk else mx.concatenate(topk_rows, axis=0)
+                )
                 use_ring_kernel = bool(
-                    ring_view is not None
+                    not _DEEPSEEK_V4_RING_VERIFY_DISABLED
+                    and not ragged_topk
+                    and ring_view is not None
+                    # The physical-ring kernel has an aligned 64-row MMA
+                    # store. TP ranks own fewer query heads, so they must use
+                    # the materialized rowwise path until a tail-safe ring
+                    # kernel is available.
+                    and q.shape[1] == 64
                     and ring_view.source.ndim == 2
                     and ring_view.source.shape[1] == 512
                     and ring_view.indices.ndim == 2
@@ -1996,7 +4292,19 @@ class SparseCompressedAttention(nn.Module):
                         use_ring_kernel = False
                 set_dspark_verify_armed(False)
                 try:
-                    if use_ring_kernel:
+                    if ragged_topk:
+                        if local_rows is None:
+                            local_rows = _materialize_rotating_verify_rows(ring_view)
+                        batch_out = _ragged_verify_sparse_attention(
+                            query_batch,
+                            local_rows,
+                            pooled_rows,
+                            topk_rows,
+                            self.scale,
+                            sinks,
+                            decode_consistent=self._omlx_decode_consistent,
+                        )
+                    elif use_ring_kernel:
                         batch_out = _sparse_pooled_ring_attention(
                             query_batch,
                             ring_view.source,
@@ -2019,7 +4327,7 @@ class SparseCompressedAttention(nn.Module):
                             None,
                             self.scale,
                             sinks,
-                            decode_consistent=self.dspark,
+                            decode_consistent=self._omlx_decode_consistent,
                         )
                 finally:
                     set_dspark_verify_armed(True)
@@ -2032,10 +4340,26 @@ class SparseCompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, comp_cache, offset)
+        pooled = (
+            self.compressor(x, comp_cache, offset)
+            if compressor_projection is None
+            else self.compressor.consume(
+                *compressor_projection,
+                comp_cache,
+                offset,
+            )
+        )
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
         if 0 < pooled.shape[1] <= self.indexer.index_topk:
-            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            index_pooled = (
+                self.indexer.compressor(x, idx_cache, offset)
+                if index_compressor_projection is None
+                else self.indexer.compressor.consume(
+                    *index_compressor_projection,
+                    idx_cache,
+                    offset,
+                )
+            )
             if index_pooled.shape[1] != pooled.shape[1]:
                 raise RuntimeError(
                     "DeepSeek V4 attention/indexer pooling caches diverged"
@@ -2045,7 +4369,24 @@ class SparseCompressedAttention(nn.Module):
                 (B, L, pooled.shape[1]),
             )
         else:
-            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+            projected_q = None
+            if indexer_q_raw is not None:
+                projected_q = self.rope(
+                    indexer_q_raw.reshape(
+                        B, L, self.indexer.n_heads, self.indexer.head_dim
+                    ).transpose(0, 2, 1, 3),
+                    offset,
+                )
+            topk = self.indexer(
+                x,
+                q_residual,
+                self.rope,
+                idx_cache,
+                offset,
+                compressor_projection=index_compressor_projection,
+                projected_q=projected_q,
+                projected_weights=projected.get("indexer_weights"),
+            )
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(
@@ -2055,7 +4396,7 @@ class SparseCompressedAttention(nn.Module):
             )[:, None]
 
         if pooled.shape[1] == 0:
-            if self.dspark and B == 1 and L == 1:
+            if _exact_decode_required(self, B, L):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = None
@@ -2081,7 +4422,7 @@ class SparseCompressedAttention(nn.Module):
                         sinks=sinks,
                     )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            if self.dspark and B == 1 and L == 1:
+            if _exact_decode_required(self, B, L):
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
@@ -2098,8 +4439,16 @@ class SparseCompressedAttention(nn.Module):
                         self.compress_ratio,
                     )
                 if out is None:
+                    local_width = int(kv.shape[2])
+                    pooled_width = int(pooled.shape[1])
                     full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-                    mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                    mask = _extend_mask(
+                        mask,
+                        pmask,
+                        full_kv.shape[2],
+                        local_width=local_width,
+                        pooled_width=pooled_width,
+                    )
                     out = scaled_dot_product_attention(
                         q,
                         full_kv,
@@ -2122,7 +4471,7 @@ class SparseCompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self._omlx_decode_consistent,
                 _standard_mask=_standard_mask,
             )
 
@@ -2163,22 +4512,41 @@ class DeepseekV4Block(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        overlap_hc = _can_overlap_hc_residual(self, h)
         residual = h
-        x, post, comb = self.attn_hc(h)
-        attn_input = self.attn_norm(x)
+        fused_hc = self.attn_hc.call_with_norm(h, self.attn_norm)
+        if fused_hc is None:
+            x, post, comb = self.attn_hc(h)
+            attn_input = self.attn_norm(x)
+        else:
+            x, attn_input, post, comb = fused_hc
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         x = self.attn(
             attn_input,
             mask=mask,
             cache=cache,
             _standard_mask=_standard_mask,
         )
-        h = hc_expand(x, residual, post, comb)
+        h = (
+            hc_merge_branch(x, post, residual_branch)
+            if residual_branch is not None
+            else hc_expand(x, residual, post, comb)
+        )
 
         residual = h
-        x, post, comb = self.ffn_hc(h)
-        x = self.ffn_norm(x)
+        fused_hc = self.ffn_hc.call_with_norm(h, self.ffn_norm)
+        if fused_hc is None:
+            x, post, comb = self.ffn_hc(h)
+            x = self.ffn_norm(x)
+        else:
+            _collapsed, x, post, comb = fused_hc
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         x = self.ffn(x, input_ids)
-        return hc_expand(x, residual, post, comb)
+        return (
+            hc_merge_branch(x, post, residual_branch)
+            if residual_branch is not None
+            else hc_expand(x, residual, post, comb)
+        )
 
 
 class DeepseekV4Model(PipelineMixin, nn.Module):
@@ -2428,28 +4796,88 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+        outer_shard_weights = _validated_ds4_tp_weights(self.args, group)
+        shard_weights = _validated_ds4_non_moe_tp_weights(
+            self.args, group, outer_shard_weights
+        )
+        moe_shard_weights = _validated_ds4_moe_tp_weights(
+            self.args, group, outer_shard_weights
+        )
         for layer in self.model.layers:
             layer.attn.sharding_group = group
-            layer.attn.wq_b = shard_linear(
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is not None:
+                indexer.row_sharding_group = group
+            layer.attn.wq_b = _shard_linear_weighted(
                 layer.attn.wq_b,
                 "all-to-sharded",
                 segments=self.args.o_groups,
                 group=group,
+                weights=shard_weights,
             )
-            shard_inplace(layer.attn.wo_a, "sharded-to-all", group=group)
-            layer.attn.attn_sink = mx.split(layer.attn.attn_sink, N)[rank]
-            layer.attn.n_heads //= N
+            _shard_inplace_weighted(
+                layer.attn.wo_a,
+                "sharded-to-all",
+                group=group,
+                weights=shard_weights,
+            )
+            # wq_b shards segment-interleaved (segments=o_groups): rank r
+            # keeps slice r of *every* head group, not the contiguous r-th
+            # block of all heads. Slice the sinks the same way or each one
+            # gates the wrong head under TP.
+            sinks = layer.attn.attn_sink.reshape(self.args.o_groups, -1)
+            if shard_weights is None:
+                layer.attn.attn_sink = mx.split(sinks, N, axis=1)[rank].reshape(-1)
+                layer.attn.n_heads //= N
+            else:
+                layer.attn.attn_sink = _weighted_segment_slice(
+                    sinks,
+                    axis=1,
+                    segments=1,
+                    rank=rank,
+                    weights=shard_weights,
+                ).reshape(-1)
+                layer.attn.n_heads = self.args.o_groups * shard_weights[rank]
 
             layer.ffn.sharding_group = group
-            shard_inplace(
-                layer.ffn.shared_experts.gate_proj, "all-to-sharded", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.gate_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(
-                layer.ffn.shared_experts.down_proj, "sharded-to-all", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.down_proj,
+                "sharded-to-all",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(
-                layer.ffn.shared_experts.up_proj, "all-to-sharded", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.up_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
-            shard_inplace(layer.ffn.switch_mlp.up_proj, "all-to-sharded", group=group)
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.gate_proj,
+                "all-to-sharded",
+                group=group,
+                weights=moe_shard_weights,
+            )
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.down_proj,
+                "sharded-to-all",
+                group=group,
+                weights=moe_shard_weights,
+            )
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.up_proj,
+                "all-to-sharded",
+                group=group,
+                weights=moe_shard_weights,
+            )
+            layer.ffn.switch_mlp._omlx_dsv4f_moe_tp = (
+                int(N),
+                int(rank),
+                tuple(moe_shard_weights or ()),
+            )

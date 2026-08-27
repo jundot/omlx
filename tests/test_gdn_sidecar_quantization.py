@@ -846,6 +846,9 @@ def test_rejected_sidecar_degrades_to_a_cache_miss(tmp_path):
         assert store.gdn_decode_failures == 0
 
         arrays, metadata = mx.load(str(staged), return_metadata=True)
+        # MLX loads lazily. Evaluate before replacing the same safetensors
+        # path so save_safetensors cannot truncate its own mapped inputs.
+        mx.eval(*arrays.values())
         info = json.loads(metadata["layer_info"])
         info[0]["state_1_original_dtype"] = "bfloat16"
         metadata["layer_info"] = json.dumps(info)

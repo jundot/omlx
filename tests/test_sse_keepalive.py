@@ -3,10 +3,15 @@
 
 import asyncio
 import json
+import socket
 
 import pytest
 
-from omlx.server import _with_sse_keepalive
+from omlx.server import (
+    ClientDisconnectTrackingMiddleware,
+    _with_request_disconnect_abort,
+    _with_sse_keepalive,
+)
 
 
 async def _collect(gen):
@@ -128,6 +133,81 @@ class TestSSEKeepaliveExceptionHandling:
         assert items[0] == ": keep-alive\n\n"
         assert request.checks == 2
         assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_real_uvicorn_socket_disconnect_aborts_only_its_request():
+    """Exercise the real Uvicorn/Starlette receive race, not a mocked Request."""
+
+    import uvicorn
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse
+
+    aborted: list[str] = []
+    abort_seen = asyncio.Event()
+
+    class Engine:
+        supports_request_scoped_abort = True
+
+        async def abort_request(self, request_id, **_kwargs):
+            aborted.append(request_id)
+            abort_seen.set()
+            return True
+
+    engine = Engine()
+    socket_app = FastAPI()
+    socket_app.add_middleware(ClientDisconnectTrackingMiddleware)
+
+    @socket_app.get("/stream")
+    async def stream(http_request: Request):
+        async def prefill():
+            while True:
+                await asyncio.sleep(60)
+                yield "data: token\n\n"
+
+        body = _with_request_disconnect_abort(
+            _with_sse_keepalive(
+                prefill(),
+                http_request=http_request,
+                interval=60,
+                disconnect_poll=60,
+            ),
+            http_request,
+            engine,
+            "transport-socket-owner",
+        )
+        return StreamingResponse(body, media_type="text/event-stream")
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.setblocking(False)
+    port = listener.getsockname()[1]
+    config = uvicorn.Config(socket_app, lifespan="off", log_level="warning")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        while not server.started:
+            await asyncio.sleep(0.01)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /stream HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+        await asyncio.wait_for(reader.read(1024), timeout=2.0)  # initial keepalive
+        writer.close()
+        await writer.wait_closed()
+
+        await asyncio.wait_for(abort_seen.wait(), timeout=2.0)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=5.0)
+
+    assert aborted == ["transport-socket-owner"]
 
 
 class TestKeepaliveChunkFormats:

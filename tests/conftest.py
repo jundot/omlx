@@ -28,6 +28,19 @@ apply_m5_gather_qmm_workaround()
 from omlx.request import Request, SamplingParams
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cluster_rank_state(tmp_path_factory, monkeypatch):
+    """Keep load-admission tests hermetic from live cluster rank markers.
+
+    ``_cluster_rank_resident_bytes`` reads ``~/.omlx/cluster/runtime`` so
+    admission can charge sibling rank-worker memory. On a machine actually
+    serving a cluster deployment those live markers would skew every
+    admission test, so the suite reads an empty directory instead.
+    """
+
+    state_dir = tmp_path_factory.mktemp("cluster-runtime-empty")
+    monkeypatch.setenv("OMLX_CLUSTER_STATE_DIR", str(state_dir))
+
 class MockTokenizer:
     """Mock tokenizer for testing without loading real models."""
 

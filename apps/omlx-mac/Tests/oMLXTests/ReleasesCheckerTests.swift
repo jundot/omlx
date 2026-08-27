@@ -3,6 +3,30 @@ import XCTest
 
 final class ReleasesCheckerTests: XCTestCase {
 
+    func testReleaseRepositoryDefaultsToForkAndBuildsAPIURL() throws {
+        XCTAssertEqual(
+            ReleasesChecker.configuredRepository(nil),
+            "jonathan308/omlx"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(ReleasesChecker.releasesAPIURL(repository: "owner/project")).absoluteString,
+            "https://api.github.com/repos/owner/project/releases?per_page=20"
+        )
+    }
+
+    func testReleaseRepositoryRejectsPathAndQueryInjection() {
+        for invalid in [
+            "owner", "owner/repo/extra", "owner/repo?x=1", "owner//repo",
+            " owner/repo", "../repo", "owner/..",
+        ] {
+            XCTAssertNil(ReleasesChecker.releasesAPIURL(repository: invalid))
+            XCTAssertEqual(
+                ReleasesChecker.configuredRepository(invalid),
+                ReleasesChecker.defaultRepository
+            )
+        }
+    }
+
     func testCompareVersionsOrdersPrereleaseSuffixes() {
         XCTAssertEqual(
             ReleasesChecker.compareVersions("0.4.0rc2", "0.4.0rc1"),
@@ -119,7 +143,7 @@ final class ReleasesCheckerTests: XCTestCase {
             tagName: tag,
             name: tag,
             body: nil,
-            htmlURL: URL(string: "https://github.com/jundot/omlx/releases/tag/\(tag)")!,
+            htmlURL: ReleasesChecker.releasesPageURL.appendingPathComponent("tag/\(tag)"),
             prerelease: prerelease,
             draft: draft,
             assets: []

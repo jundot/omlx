@@ -9,7 +9,8 @@
 // Update mechanism: GitHub Releases is the single source of truth. The
 // PyObjC menubar app shipped this pattern; the Swift app uses the same
 // flow via `ReleasesChecker` + `AppUpdater`. No appcast XML, no EdDSA
-// keys. Apple's notarization stapled to each .dmg is the trust boundary.
+// keys. Apple's notarization plus a same-team Developer ID requirement is
+// enforced before the downloaded app is staged.
 
 import AppKit
 import Foundation

@@ -841,7 +841,7 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
 
     monkeypatch.setattr(
         memory_monitor,
-        "native_indexer_eligible",
+        "native_indexer_memory_safe_eligible",
         lambda **kwargs: True,
     )
     monkeypatch.setattr(wsdpa, "_ENABLED", True)

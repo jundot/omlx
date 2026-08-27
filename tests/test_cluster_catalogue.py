@@ -394,3 +394,108 @@ def test_the_interface_can_grey_out_an_unsplittable_model():
     payload = assess_model(layout, _nodes(128, 128), model_id="m").to_dict()
     assert payload["splittable"] is False
     assert payload["fits"] is False
+
+
+# --- Fast-link recommendation -----------------------------------------------
+
+
+def test_prefer_tensor_flips_the_equal_width_tiebreak():
+    # 90 GiB across 2x64 GiB fits both ways; pipeline is the safe default...
+    def shardable():
+        layout = _model(90)
+        # The synthetic helper declares a single attention head group, which
+        # no TP degree above 1 divides; give it 8 heads so TP=2 is legal.
+        object.__setattr__(layout, "tensor_parallel_heads", 8)
+        object.__setattr__(layout, "tensor_parallel_kv_heads", 8)
+        object.__setattr__(layout, "tensor_parallel_divisors", (8,))
+        return layout
+
+    fit = assess_model(shardable(), _nodes(64, 64), model_id="medium")
+    assert fit.strategy == "pipeline"
+    # ...but a caller that knows the link is fast gets the tensor split.
+    fast = assess_model(
+        shardable(), _nodes(64, 64), model_id="medium", prefer_tensor=True
+    )
+    assert fast.fits
+    assert fast.strategy == "tensor"
+    assert fast.tensor_parallel_size == 2
+    assert fast.pipeline_stages == 1
+
+
+def test_prefer_tensor_still_prefers_fewer_nodes_first():
+    # A model that fits one Mac stays single-node even on fast links.
+    fit = assess_model(
+        _model(20), _nodes(128, 128), model_id="small", prefer_tensor=True
+    )
+    assert fit.strategy == "single node"
+
+
+def test_prefer_tensor_never_offers_tp_to_an_unshardable_model():
+    layout = _model(90)
+    object.__setattr__(layout, "supports_tensor_parallel", False)
+    fit = assess_model(
+        layout, _nodes(64, 64), model_id="m", prefer_tensor=True
+    )
+    assert fit.fits
+    assert fit.strategy == "pipeline"
+
+
+def test_requested_links_fast(tmp_path):
+    from omlx.cluster import routes as cluster_routes
+    from omlx.cluster.identity import (
+        configure_node_identity,
+        reset_configured_identity,
+    )
+    from omlx.cluster.registry import (
+        configure_device_registry,
+        reset_configured_device_registry,
+    )
+
+    configure_node_identity(tmp_path / "identity.json")
+    registry = configure_device_registry(tmp_path / "devices.json")
+    try:
+        self_id = cluster_routes.get_node_identity().node_id
+
+        def node(node_id):
+            return cluster_routes.ClusterPlanNodeRequest(
+                node_id=node_id,
+                capacity_bytes=64 * GiB,
+                role="headless",
+                memory_guard_tier="balanced",
+                accelerator="metal",
+            )
+
+        # A single-node request has no link to judge.
+        assert cluster_routes._requested_links_fast([node(self_id)]) is False
+
+        # Unpaired peer: fail closed.
+        assert (
+            cluster_routes._requested_links_fast([node(self_id), node("peer1")])
+            is False
+        )
+
+        # Paired peer without fast-link caps: fail closed.
+        registry.mark_paired("peer1", caps={"chip": "M", "ram_gb": 64.0})
+        assert (
+            cluster_routes._requested_links_fast([node(self_id), node("peer1")])
+            is False
+        )
+
+        # Paired over JACCL/Thunderbolt: tensor becomes the recommendation.
+        registry.mark_paired(
+            "peer2", caps={"jaccl": True, "thunderbolt": True}
+        )
+        assert (
+            cluster_routes._requested_links_fast([node(self_id), node("peer2")])
+            is True
+        )
+        # One slow peer in a larger pool fails the whole request closed.
+        assert (
+            cluster_routes._requested_links_fast(
+                [node(self_id), node("peer2"), node("peer1")]
+            )
+            is False
+        )
+    finally:
+        reset_configured_device_registry()
+        reset_configured_identity()

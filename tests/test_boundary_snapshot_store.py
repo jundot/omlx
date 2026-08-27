@@ -350,6 +350,64 @@ class TestBoundarySnapshotSSDStore:
         assert detached_path.parent == self.store._snapshot_root / "_promote"
         assert detached_path.read_bytes() == b"checkpoint"
 
+    def test_take_staged_file_serializes_request_dir_removal_with_writer(self):
+        """Detaching one boundary cannot remove another writer's directory."""
+        import threading
+        from unittest.mock import patch
+
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "req-promote-writer-race"
+        token_count = 1024
+        staged_path = self.store._file_path(request_id, token_count)
+        staged_path.parent.mkdir(parents=True)
+        staged_path.write_bytes(b"checkpoint")
+        with self.store._registry_lock:
+            self.store._file_registry.setdefault(request_id, {})[
+                token_count
+            ] = staged_path
+
+        moved = threading.Event()
+        rmdir_attempted = threading.Event()
+        original_replace = mod.os.replace
+        original_rmdir = Path.rmdir
+        result: list[Path | None] = []
+
+        def observe_move(source, destination):
+            replaced = original_replace(source, destination)
+            moved.set()
+            return replaced
+
+        def observe_rmdir(path):
+            rmdir_attempted.set()
+            return original_rmdir(path)
+
+        self.store._writer_busy.acquire()
+        try:
+            with (
+                patch.object(mod.os, "replace", side_effect=observe_move),
+                patch.object(Path, "rmdir", new=observe_rmdir),
+            ):
+                thread = threading.Thread(
+                    target=lambda: result.append(
+                        self.store.take_staged_file(request_id, token_count)
+                    )
+                )
+                thread.start()
+                assert moved.wait(timeout=5.0)
+                assert not rmdir_attempted.wait(timeout=0.1)
+                self.store._writer_busy.release()
+                assert rmdir_attempted.wait(timeout=5.0)
+                thread.join(timeout=5.0)
+        finally:
+            if self.store._writer_busy.locked():
+                self.store._writer_busy.release()
+
+        assert not thread.is_alive()
+        assert len(result) == 1
+        assert result[0] is not None
+        assert result[0].read_bytes() == b"checkpoint"
+
     def test_load_from_disk_after_pending_writes_cleared(self):
         """After background writer completes, load should read from disk."""
         import time

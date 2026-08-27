@@ -311,6 +311,14 @@ def _patch_model(dsv4: Any) -> None:
         mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
         self._omlx_dspark_decode_enabled = bool(mtp_decode_enabled and is_dspark)
+        # Backbone decode and batched target verification must use the same
+        # reduction order only while MTP is active.  Without MTP, allowing the
+        # base model's fused SDPA route avoids the row-wise exact-attention
+        # overhead on every token, especially after tensor sharding.
+        for layer in getattr(self.model, "layers", ()):
+            attention = getattr(layer, "attn", None)
+            if attention is not None:
+                attention._omlx_decode_consistent = mtp_decode_enabled
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             if is_dspark:
@@ -319,6 +327,12 @@ def _patch_model(dsv4: Any) -> None:
                 ]
             else:
                 self.mtp = [dsv4.MTPBlock(config, n_main + i) for i in range(n_mtp)]
+            for stage in self.mtp:
+                attention = getattr(stage, "attn", None)
+                if attention is None:
+                    attention = getattr(getattr(stage, "block", None), "attn", None)
+                if attention is not None:
+                    attention._omlx_decode_consistent = True
             # Depth-k chained drafting is available: mtp_forward supports
             # return_hidden below, backbone rollback goes through
             # mtp_partial_rollback, and the head cache is a RotatingKVCache
@@ -686,6 +700,36 @@ def _patch_model(dsv4: Any) -> None:
                 return False
         return True
 
+    def _omlx_tensor_auxiliary_modules(self):
+        """Full transformer-like DSpark/Lightning stages owned outside layers.
+
+        The cluster tensor loader consumes this explicit contract only after
+        validating that ``Model.shard`` is layer-local. DSpark stages already
+        expose the same ``attn``/``ffn`` surface as a backbone block; legacy
+        Lightning stages own that block under ``.block``.
+        """
+
+        return tuple(getattr(self, "mtp", ()) or ())
+
+    def _omlx_tensor_vocab_modules(self):
+        """Vocabulary projections that must follow the shared head's TP slice.
+
+        DSpark adds a low-rank Markov correction to every draft row. Its final
+        projection has the same vocabulary axis as ``lm_head``; sharding both
+        on identical contiguous rows lets distributed MTP add the correction
+        locally and send only rank-local logits to the coordinator.
+        """
+
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            return ()
+        stages = tuple(getattr(self, "mtp", ()) or ())
+        if not stages:
+            return ()
+        markov = getattr(stages[-1], "markov_head", None)
+        if markov is None or not hasattr(markov, "markov_w2"):
+            return ()
+        return ((markov, "markov_w2"),)
+
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
         """Combined oMLX-base + PR 15 sanitize.
 
@@ -931,4 +975,6 @@ def _patch_model(dsv4: Any) -> None:
     cls.mtp_take_primed = mtp_take_primed
     cls.mtp_clamp_accept = mtp_clamp_accept
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls._omlx_tensor_auxiliary_modules = _omlx_tensor_auxiliary_modules
+    cls._omlx_tensor_vocab_modules = _omlx_tensor_vocab_modules
     cls.sanitize = sanitize

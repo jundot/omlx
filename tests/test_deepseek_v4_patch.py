@@ -89,6 +89,39 @@ class TestCacheInjection:
         assert cache.offset == 0
 
 
+def test_b1_cache_offset_uses_host_scalar_without_sync(applied_patch):
+    import mlx.core as mx
+
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+    cache = SimpleNamespace(offset=mx.array([15360]), _offset=15360)
+
+    old = dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = True
+    assert dsv4._b1_cache_offset(cache, 1) == 15360
+    assert dsv4._b1_cache_offset(cache, 2) is cache.offset
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = False
+    assert dsv4._b1_cache_offset(cache, 1) is cache.offset
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = old
+
+
+def test_restored_singleton_merge_preserves_absolute_rotating_offset(applied_patch):
+    import mlx.core as mx
+    from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+
+    cache = RotatingKVCache(max_size=128)
+    cache.keys = mx.zeros((1, 1, 1151, 8), dtype=mx.bfloat16)
+    cache.values = mx.zeros((1, 1, 1151, 0), dtype=mx.bfloat16)
+    cache.offset = 4096
+    cache._idx = 1151
+
+    merged = BatchRotatingKVCache.merge([cache])
+    mx.eval(merged.offset)
+
+    assert merged.offset.tolist() == [4096]
+    assert merged._offset == 4096
+    assert merged.keys.shape[2] == 128
+
+
 class TestUtilsPatch:
     """mlx_lm.utils.load_model + _load_safetensors + SAFETENSORS_DTYPE_FALLBACKS."""
 
@@ -1168,6 +1201,35 @@ class TestCacheMaterialization:
         assert len(calls) == 1
         assert calls[0] == (leaf_a.arr, leaf_b.arr, leaf_c.arr)
 
+    def test_helper_can_defer_exact_arrays_and_restores_after_exception(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Leaf:
+            def __init__(self, arr):
+                self.arr = arr
+
+        leaf = Leaf(mx.array([7], dtype=mx.int32))
+        calls = []
+        monkeypatch.setattr(dsv4.mx, "eval", lambda *arrays: calls.append(arrays))
+
+        captured = None
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            with dsv4._defer_cache_materialization() as captured:
+                dsv4._materialize_cache_arrays([leaf])
+                raise RuntimeError("synthetic failure")
+
+        assert captured == [leaf.arr]
+        assert calls == []
+
+        # The thread-local capture is strictly scoped: a later decode-style
+        # call immediately restores the stock materialization barrier.
+        dsv4._materialize_cache_arrays([leaf])
+        assert calls == [(leaf.arr,)]
+
     def test_model_call_materializes_cache_after_layer_loop(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         source = inspect.getsource(dsv4.DeepseekV4Model.__call__)
@@ -1322,6 +1384,66 @@ class TestDeepseekV4SwitchGLU:
         assert y.shape == (1, 8, 8, 16)
 
 
+def test_pooled_mask_trims_batch_cache_physical_tail(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    local = mx.ones((1, 1, 8, 128), dtype=mx.bool_)
+    # Restored BatchPoolingCache capacity can exceed this row's logical pooled
+    # KV width. The invalid physical tail must not change the logical mask.
+    pooled = mx.concatenate(
+        [
+            mx.ones((1, 8, 25), dtype=mx.bool_),
+            mx.zeros((1, 8, 5), dtype=mx.bool_),
+        ],
+        axis=-1,
+    )
+
+    extended = dsv4._extend_mask(
+        local,
+        pooled,
+        128 + 25,
+        local_width=128,
+        pooled_width=25,
+    )
+    mx.eval(extended)
+
+    assert extended.shape == (1, 1, 8, 153)
+    assert bool(mx.all(extended).item()) is True
+
+
+def test_pooled_mask_rejects_missing_validity_columns(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    with pytest.raises(ValueError, match="shorter than pooled KV"):
+        dsv4._extend_mask(
+            mx.ones((1, 1, 2, 4), dtype=mx.bool_),
+            mx.ones((1, 2, 2), dtype=mx.bool_),
+            7,
+            local_width=4,
+            pooled_width=3,
+        )
+
+
+def test_pooled_mask_keeps_rotating_local_suffix(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    local = mx.array([[[[False, False, True, False, True, True]]]])
+    pooled = mx.ones((1, 1, 2), dtype=mx.bool_)
+    extended = dsv4._extend_mask(
+        local,
+        pooled,
+        6,
+        local_width=4,
+        pooled_width=2,
+    )
+    mx.eval(extended)
+
+    assert extended.tolist() == [[[[True, False, True, True, True, True]]]]
+
+
 class TestDeepseekV4CompressedNativeAttention:
     @staticmethod
     def _attention_config(dsv4):
@@ -1440,13 +1562,14 @@ class TestDeepseekV4CompressedNativeAttention:
 
         assert result is None
 
+    @pytest.mark.parametrize("heads", (64, 40, 32, 24))
     def test_topk_wsdpa_dispatch_ignores_native_sparse_disable(
-        self, applied_patch, monkeypatch
+        self, applied_patch, monkeypatch, heads
     ):
         import mlx.core as mx
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
-        expected = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+        expected = mx.zeros((1, heads, 5, 512), dtype=mx.bfloat16)
         calls = []
 
         def wsdpa_spy(*args):
@@ -1460,14 +1583,14 @@ class TestDeepseekV4CompressedNativeAttention:
             True,
         )
         actual = dsv4._sparse_pooled_attention(
-            mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16),
+            mx.zeros((1, heads, 5, 512), dtype=mx.bfloat16),
             mx.zeros((1, 1, 133, 512), dtype=mx.bfloat16),
             mx.zeros((1, 513, 512), dtype=mx.bfloat16),
             mx.zeros((1, 5, 512), dtype=mx.uint32),
             None,
             None,
             512**-0.5,
-            mx.zeros((64,), dtype=mx.bfloat16),
+            mx.zeros((heads,), dtype=mx.bfloat16),
             q_offset=128,
             compress_ratio=4,
             local_window=128,
@@ -1562,6 +1685,91 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         assert mx.allclose(actual, expected, atol=0.02, rtol=0.02).item()
         assert float(max_abs.item()) <= max_tolerance
+
+
+class TestDeepseekV4AttentionInputBackend:
+    @staticmethod
+    def _config(dsv4, ratio):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=8,
+            sliding_window=128,
+            compress_ratios=[ratio],
+        )
+
+    @pytest.mark.parametrize("ratio,length", [(0, 16), (128, 129), (4, 40)])
+    def test_attention_variants_preserve_stacked_input_projection_results(
+        self, applied_patch, monkeypatch, ratio, length
+    ):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        layer = dsv4.v4_attention_factory(self._config(dsv4, ratio), 0)
+        x = mx.random.normal((1, length, 16), dtype=mx.bfloat16)
+        expected = layer(x)
+        mx.eval(expected)
+        projected = {
+            "wq_a": layer.wq_a(x),
+            "wkv": layer.wkv(x),
+        }
+        if ratio:
+            projected.update(
+                compressor_wkv=layer.compressor.wkv(x),
+                compressor_wgate=layer.compressor.wgate(x),
+            )
+        if ratio == 4:
+            projected.update(
+                indexer_compressor_wkv=layer.indexer.compressor.wkv(x),
+                indexer_compressor_wgate=layer.indexer.compressor.wgate(x),
+                indexer_weights=layer.indexer.weights_proj(x),
+            )
+        mx.eval(*projected.values())
+
+        calls = []
+
+        def backend(owner, value):
+            calls.append((owner, value.shape))
+            return projected
+
+        class FailLinear(nn.Module):
+            def __call__(self, value):
+                raise AssertionError("stacked projection fell back to its GPU linear")
+
+        monkeypatch.setattr(dsv4, "_ANE_ATTENTION_INPUT_BACKEND", backend)
+        layer.wq_a = FailLinear()
+        layer.wkv = FailLinear()
+        if ratio:
+            layer.compressor.wkv = FailLinear()
+            layer.compressor.wgate = FailLinear()
+        if ratio == 4:
+            layer.indexer.compressor.wkv = FailLinear()
+            layer.indexer.compressor.wgate = FailLinear()
+            layer.indexer.weights_proj = FailLinear()
+
+        output = layer(x)
+        mx.eval(output)
+
+        assert output.shape == (1, length, 16)
+        assert mx.array_equal(output, expected).item()
+        assert calls == [(layer, x.shape)]
 
 
 class TestPreLoadDispatch:
@@ -2211,6 +2419,409 @@ class TestIndexerFallbackTiling:
         ref = (mx.maximum(scores, 0) * 0.125 * weights).sum(axis=1)
         assert float(mx.abs(got - ref).max()) < 1e-5
 
+    def test_tensor_prefill_row_split_matches_full_indexer(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+
+        class Group:
+            def __init__(self, rank):
+                self._rank = rank
+
+            def rank(self):
+                return self._rank
+
+            @staticmethod
+            def size():
+                return 2
+
+        config = dm.ModelArgs(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=3,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+        indexer = dm.Indexer(config, compress_ratio=4)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL", 0)
+        mx.random.seed(29)
+        indexer.wq_b.weight = mx.random.normal(indexer.wq_b.weight.shape)
+        indexer.weights_proj.weight = mx.random.normal(
+            indexer.weights_proj.weight.shape
+        )
+        pooled = mx.random.normal((1, 7, 8), dtype=mx.bfloat16)
+        monkeypatch.setattr(
+            dm.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: pooled,
+        )
+        x = mx.random.normal((1, 5, 16), dtype=mx.bfloat16)
+        q_residual = mx.random.normal((1, 5, 8), dtype=mx.bfloat16)
+        rope = lambda value, offset: value
+
+        full = indexer(x, q_residual, rope, None, 0)
+        monkeypatch.setattr(
+            dm,
+            "_gather_indexer_rows",
+            lambda local, total_rows, group, pooled_tokens=None: local,
+        )
+        indexer.row_sharding_group = Group(0)
+        first = indexer(x, q_residual, rope, None, 0)
+        indexer.row_sharding_group = Group(1)
+        second = indexer(x, q_residual, rope, None, 0)
+        reconstructed = mx.concatenate([first, second], axis=1)
+        mx.eval(full, reconstructed)
+
+        assert dm._balanced_row_ranges(5, 2) == ((0, 3), (3, 5))
+        assert mx.array_equal(reconstructed, full).item()
+
+    def test_tensor_prefill_uses_qualified_weighted_row_ranges(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+
+        group = SimpleNamespace(size=lambda: 2)
+
+        assert dm._weighted_row_ranges(1024, (3, 5)) == (
+            (0, 384),
+            (384, 1024),
+        )
+        assert dm._indexer_row_ranges(1024, group) == (
+            (0, 384),
+            (384, 1024),
+        )
+        assert dm._weighted_row_ranges(5, (3, 5)) == ((0, 1), (1, 5))
+
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", False)
+        assert dm._indexer_row_ranges(5, group) == ((0, 3), (3, 5))
+
+    def test_tensor_prefill_row_gather_removes_uneven_padding(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        first = mx.array([[[1, 2], [3, 4], [5, 6]]], dtype=mx.uint32)
+        second = mx.array([[[7, 8], [9, 10]]], dtype=mx.uint32)
+        second_padded = mx.concatenate(
+            [second.swapaxes(0, 1), mx.zeros((1, 1, 2), dtype=mx.uint32)],
+            axis=0,
+        )
+        wire = mx.concatenate([first.swapaxes(0, 1), second_padded], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        gathered = dm._gather_indexer_rows(first, 5, group)
+
+        assert gathered.tolist() == [
+            [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+        ]
+
+    def test_tensor_prefill_explicit_rows_activate_only_after_pool_threshold(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS", (9, 7))
+        monkeypatch.setattr(
+            dm,
+            "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL",
+            16000,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        assert dm._indexer_row_ranges(1024, group, 15999) == (
+            (0, 512),
+            (512, 1024),
+        )
+        assert dm._indexer_row_ranges(1024, group, 16000) == (
+            (0, 576),
+            (576, 1024),
+        )
+
+    def test_tensor_prefill_invalid_explicit_rows_fail_closed_to_balanced(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        group = SimpleNamespace(size=lambda: 2)
+
+        for weights in ((9,), (9, 0), (9, -1)):
+            monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS", weights)
+            assert dm._indexer_row_ranges(8, group, 20000) == ((0, 4), (4, 8))
+
+    def test_tensor_prefill_weighted_row_gather_preserves_sequence_order(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+        first = mx.array([[[1], [2], [3]]], dtype=mx.uint32)
+        second = mx.array([[[4], [5], [6], [7], [8]]], dtype=mx.uint32)
+        first_padded = mx.concatenate(
+            [first.swapaxes(0, 1), mx.zeros((2, 1, 1), dtype=mx.uint32)],
+            axis=0,
+        )
+        wire = mx.concatenate([first_padded, second.swapaxes(0, 1)], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        gathered = dm._gather_indexer_rows(first, 8, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
+
+    def test_tensor_prefill_equal_row_gather_reuses_collective_output(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        first = mx.array([[[1, 2], [3, 4]]], dtype=mx.uint32)
+        second = mx.array([[[5, 6], [7, 8]]], dtype=mx.uint32)
+        wire = mx.concatenate([first.swapaxes(0, 1), second.swapaxes(0, 1)], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        monkeypatch.setattr(
+            dm.mx,
+            "concatenate",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("equal row shards must not be copied again")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(
+            first,
+            4,
+            SimpleNamespace(size=lambda: 2),
+        )
+
+        assert gathered.tolist() == [[[1, 2], [3, 4], [5, 6], [7, 8]]]
+
+    @pytest.mark.parametrize(
+        "rank,local_values,peer_values,expected_ops",
+        (
+            (0, (1, 2, 3), (4, 5, 6, 7, 8), ("eval", "send", "recv")),
+            (1, (4, 5, 6, 7, 8), (1, 2, 3), ("eval", "send", "recv")),
+        ),
+    )
+    def test_tensor_prefill_tp2_p2p_gather_is_exact_and_ordered(
+        self,
+        applied_patch,
+        monkeypatch,
+        rank,
+        local_values,
+        peer_values,
+        expected_ops,
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+        local = mx.array([[list(local_values)]], dtype=mx.uint32).swapaxes(1, 2)
+        peer = mx.array([[list(peer_values)]], dtype=mx.uint32).swapaxes(1, 2)
+        peer_rows_first = peer.swapaxes(0, 1)
+        operations = []
+        original_eval = mx.eval
+
+        def traced_eval(*values):
+            operations.append(("eval", tuple(values[0].shape)))
+            return original_eval(*values)
+
+        def send(value, destination, *, group=None):
+            assert destination == 1 - rank
+            assert group is not None
+            operations.append(("send", tuple(value.shape)))
+            return value
+
+        def recv_like(template, source, *, group=None):
+            assert source == 1 - rank
+            assert group is not None
+            assert tuple(template.shape) == tuple(peer_rows_first.shape)
+            assert template.dtype == peer_rows_first.dtype
+            operations.append(("recv", tuple(template.shape)))
+            return peer_rows_first
+
+        monkeypatch.setattr(dm.mx, "eval", traced_eval)
+        monkeypatch.setattr(dm.mx.distributed, "send", send)
+        monkeypatch.setattr(dm.mx.distributed, "recv_like", recv_like)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "all_gather",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("qualified TP2 must not enter all_gather")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(local, 8, group)
+        original_eval(gathered)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
+        assert tuple(op for op, _shape in operations) == expected_ops
+
+    @pytest.mark.parametrize(
+        "weighted,weights,total_rows",
+        ((False, "3,5", 5), (True, "4,4", 4)),
+    )
+    def test_tensor_prefill_p2p_requires_weighted_uneven_rows(
+        self, applied_patch, monkeypatch, weighted, weights, total_rows
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", weights)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", weighted)
+        ranges = dm._indexer_row_ranges(total_rows, SimpleNamespace(size=lambda: 2))
+        local_rows = ranges[0][1] - ranges[0][0]
+        max_rows = max(stop - start for start, stop in ranges)
+        local = mx.arange(local_rows, dtype=mx.uint32).reshape(1, local_rows, 1)
+        wire = mx.arange(2 * max_rows, dtype=mx.uint32).reshape(
+            2 * max_rows, 1, 1
+        )
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append(group)
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("equal or unweighted rows must use all_gather")
+            ),
+        )
+
+        dm._gather_indexer_rows(local, total_rows, group)
+
+        assert calls == [group]
+
+    @pytest.mark.parametrize("rank", (0, 1))
+    def test_tensor_prefill_tp2_p2p_preserves_weighted_row_order(
+        self, applied_patch, monkeypatch, rank
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+        shards = (
+            mx.array([[[1], [2], [3]]], dtype=mx.uint32),
+            mx.array([[[4], [5], [6], [7], [8]]], dtype=mx.uint32),
+        )
+        local = shards[rank]
+        peer_rows_first = shards[1 - rank].swapaxes(0, 1)
+
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda value, destination, *, group=None: value,
+        )
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "recv_like",
+            lambda template, source, *, group=None: peer_rows_first,
+        )
+        gathered = dm._gather_indexer_rows(local, 8, group)
+        mx.eval(gathered)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
+
+    def test_tensor_prefill_tp2_p2p_has_collective_rollback(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", False)
+        first = mx.array([[[1], [2]]], dtype=mx.uint32)
+        second = mx.array([[[3], [4]]], dtype=mx.uint32)
+        wire = mx.concatenate([first.swapaxes(0, 1), second.swapaxes(0, 1)], axis=0)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append((tuple(value.shape), group))
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("rollback must not enter send")
+            ),
+        )
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "recv_like",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("rollback must not enter recv")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(first, 4, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4]]]
+        assert calls == [((2, 1, 1), group)]
+
+    def test_tensor_prefill_p2p_hard_gates_tp2(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        local = mx.array([[[1], [2]]], dtype=mx.uint32)
+        wire = mx.concatenate(
+            [
+                local.swapaxes(0, 1),
+                mx.array([[[3], [4]]], dtype=mx.uint32).swapaxes(0, 1),
+                mx.array([[[5], [6]]], dtype=mx.uint32).swapaxes(0, 1),
+            ],
+            axis=0,
+        )
+        group = SimpleNamespace(size=lambda: 3, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append(group)
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("non-TP2 world must not enter send")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(local, 6, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6]]]
+        assert calls == [group]
+
     def test_missing_native_warning_fires_once(
         self, applied_patch, caplog, monkeypatch
     ):
@@ -2314,3 +2925,604 @@ class TestIndexerFallbackTiling:
         _, dm = self._reduce_and_ref()
         assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
         assert dm._INDEXER_MAX_ELEMS < 2**31
+
+
+class TestDS4NAXIndexerScoreDispatch:
+    @staticmethod
+    def _exact_config(dm):
+        return SimpleNamespace(
+            model_type="deepseek_v4",
+            vocab_size=129280,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            num_hidden_layers=43,
+            num_attention_heads=64,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            max_position_embeddings=1048576,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=512,
+        )
+
+    def test_startup_gate_requires_exact_ds4f_ratio4_and_nax(
+        self, applied_patch, monkeypatch
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", True)
+        monkeypatch.setattr(dm, "is_nax_available", lambda: True)
+        assert dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 128)
+
+        monkeypatch.setattr(dm, "is_nax_available", lambda: False)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+        monkeypatch.setattr(dm, "is_nax_available", lambda: True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", False)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", True)
+        bad = SimpleNamespace(**vars(cfg))
+        bad.index_n_heads = 32
+        assert not dm._dsv4f_nax_indexer_score_enabled(bad, 4)
+
+    @pytest.mark.parametrize(
+        "device_name", ("Apple M2 Ultra", "Apple M3 Ultra", "Apple M5 Max")
+    )
+    def test_lossless_mma_gate_accepts_qualified_apple_chips(
+        self, applied_patch, monkeypatch, device_name
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": device_name})
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_MMA_SCORE", True)
+
+        assert dm._dsv4f_mma_score_enabled(cfg, 4)
+        assert not dm._dsv4f_mma_score_enabled(cfg, 128)
+
+    def test_lossless_mma_gate_rejects_unknown_chip_and_config(
+        self, applied_patch, monkeypatch
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_MMA_SCORE", True)
+        monkeypatch.setattr(
+            dm.mx, "device_info", lambda: {"device_name": "Apple M6 Ultra"}
+        )
+        assert not dm._dsv4f_mma_score_enabled(cfg, 4)
+
+        monkeypatch.setattr(
+            dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"}
+        )
+        bad = SimpleNamespace(**vars(cfg))
+        bad.index_topk = 256
+        assert not dm._dsv4f_mma_score_enabled(bad, 4)
+
+    @pytest.mark.parametrize(
+        "architecture,expected",
+        (("applegpu_g15d", True), ("applegpu_g17s", False)),
+    )
+    def test_mma_partition_is_forwarded_only_on_g15d(
+        self, applied_patch, monkeypatch, architecture, expected
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        B, L, H, D, N = 1, 64, 64, 128, 513
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = dm.PoolingCache(4)
+        cache.pooled = pooled
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=True,
+            _nax_indexer_score=False,
+            row_sharding_group=None,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_MMA_SCORE", True)
+        monkeypatch.setattr(fast, "_EXT_MMA_WM4", True)
+        monkeypatch.setattr(
+            fast.mx,
+            "device_info",
+            lambda: {"architecture": architecture},
+        )
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        seen = []
+
+        def scores(q, k, weights, **kwargs):
+            seen.append(kwargs.get("use_wm4_wn1"))
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda scores, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, scores.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=2048,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        assert out.shape == (B, L, 512)
+        assert seen == [expected]
+
+    @pytest.mark.parametrize("physical_tail,expected_ratio", ((False, 4), (True, 0)))
+    def test_singleton_batch_mask_reaches_hierarchy_only_when_uniform(
+        self, applied_patch, monkeypatch, physical_tail, expected_ratio
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        B, L, H, D, N, offset = 1, 64, 64, 128, 577, 2304
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = BatchPoolingCache(4, [0])
+        cache._pool_buf = pooled
+        cache._pool_extent = N
+        cache._pool_lengths = [N - 1 if physical_tail else N]
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=True,
+            _nax_indexer_score=False,
+            row_sharding_group=None,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_MMA_SCORE", True)
+        seen = {"hierarchy": [], "score": []}
+
+        def hierarchy(*args, **kwargs):
+            seen["hierarchy"].append((kwargs["ratio"], kwargs["query_offset"]))
+            return None
+
+        def scores(q, k, weights, **kwargs):
+            seen["score"].append(
+                (kwargs["mask_ratio"], kwargs["mask_q_offset"])
+            )
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(dm, "hierarchical_topk", hierarchy)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda score_sheet, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, score_sheet.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=offset,
+            projected_q=q,
+            projected_weights=weights,
+        )
+
+        assert out.shape == (B, L, 512)
+        assert seen["hierarchy"] == [(expected_ratio, offset)]
+        assert seen["score"] == [
+            (expected_ratio, offset if expected_ratio else 0)
+        ]
+
+    def test_foldable_batch_mask_rejects_true_batches(self, applied_patch):
+        import mlx.core as mx
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cache = BatchPoolingCache(4, [0, 0])
+        cache._pool_lengths = [8, 8]
+        pmask = mx.ones((2, 16, 8), dtype=mx.bool_)
+
+        assert (
+            dm._foldable_pool_mask_ratio(
+                cache,
+                pmask,
+                batch_size=2,
+                pooled_tokens=8,
+                query_offset=32,
+            )
+            == 0
+        )
+
+    @staticmethod
+    def _run_projected_indexer(dm, monkeypatch, *, group=None):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        B, L, H, D, N = 1, 16, 64, 128, 513
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = dm.PoolingCache(4)
+        cache.pooled = pooled
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=False,
+            _nax_indexer_score=True,
+            row_sharding_group=group,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_NAX_SCORE", True)
+        monkeypatch.setattr(fast, "dsa_indexer_nax_kernels_built", lambda: True)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        seen = []
+
+        def scores(q, k, weights, **kwargs):
+            seen.append(kwargs.get("use_nax"))
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda scores, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, scores.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=2048,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        return out, seen
+
+    def test_single_m5_path_forwards_nax_hint(self, applied_patch, monkeypatch):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        out, seen = self._run_projected_indexer(dm, monkeypatch)
+        assert out.shape == (1, 16, 512)
+        assert seen == [True]
+
+    def test_replicated_tp_rows_stay_on_steel(self, applied_patch, monkeypatch):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Group:
+            @staticmethod
+            def size():
+                return 2
+
+            @staticmethod
+            def rank():
+                return 0
+
+        out, seen = self._run_projected_indexer(dm, monkeypatch, group=Group())
+        assert out.shape == (1, 16, 512)
+        assert seen == [False]
+
+
+class TestNativeKernelLatchSemantics:
+    """ValueError shape rejections (std::invalid_argument, raised before any
+    GPU work) must fall back per-call WITHOUT latching the process-wide
+    native-disable flags; genuine runtime failures still latch.
+
+    Regression test for the stale-binary incident: an extension built before
+    the unaligned-tail fix raised ValueError on the first 327-token prefill
+    chunk and latched the fp32 fallback for the whole process, multiplying
+    resident memory at long context.
+    """
+
+    @staticmethod
+    def _sparse_args():
+        import mlx.core as mx
+
+        q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+        local_kv = mx.zeros((1, 1, 5, 512), dtype=mx.bfloat16)
+        pooled = mx.zeros((1, 64, 512), dtype=mx.bfloat16)
+        topk = mx.broadcast_to(
+            mx.arange(64, dtype=mx.uint32)[None, None], (1, 5, 64)
+        )
+        sinks = mx.zeros((64,), dtype=mx.bfloat16)
+        return q, local_kv, pooled, topk, sinks
+
+    def test_sparse_attention_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def reject(*args):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "deepseek_v4_sparse_attention", reject)
+        q, local_kv, pooled, topk, sinks = self._sparse_args()
+
+        out = dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        mx.eval(out)
+        assert out.shape == q.shape  # composed MLX fallback produced output
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED is True
+
+        # Native path stays armed: a second call attempts the kernel again.
+        dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert len(calls) == 2
+
+    def test_sparse_attention_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def boom(*args):
+            calls.append(1)
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "deepseek_v4_sparse_attention", boom)
+        q, local_kv, pooled, topk, sinks = self._sparse_args()
+
+        out = dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert out is not None
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is True
+
+        # Latched: the kernel is not attempted again.
+        dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert len(calls) == 1
+
+    @staticmethod
+    def _indexer_config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=512,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+
+    def _run_indexer(self, dsv4, indexer):
+        import mlx.core as mx
+
+        x = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        q_residual = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        return indexer(x, q_residual, lambda q, offset: q, None, 0)
+
+    def test_indexer_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.patches.deepseek_v4 import indexer_dispatch
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 600, self.head_dim), dtype=x.dtype
+            ),
+        )
+        calls = []
+
+        def reject(*args, **kwargs):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", reject)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", reject)
+
+        indexer = dsv4.Indexer(self._indexer_config(dsv4), 4)
+        indexer.set_dtype(mx.bfloat16)
+        out = self._run_indexer(dsv4, indexer)
+        mx.eval(out)
+        assert out.shape == (1, 2, 512)  # fp32 MLX fallback produced top-k
+        assert indexer_dispatch.native_indexer_disabled() is False
+        assert dsv4._DEEPSEEK_V4_INDEXER_SHAPE_WARNED is True
+
+        # Native path stays armed: a second call attempts the kernel again.
+        self._run_indexer(dsv4, indexer)
+        assert len(calls) == 2
+
+    def test_indexer_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.patches.deepseek_v4 import indexer_dispatch
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 600, self.head_dim), dtype=x.dtype
+            ),
+        )
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(1)
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", boom)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", boom)
+
+        indexer = dsv4.Indexer(self._indexer_config(dsv4), 4)
+        indexer.set_dtype(mx.bfloat16)
+        out = self._run_indexer(dsv4, indexer)
+        mx.eval(out)
+        assert out.shape == (1, 2, 512)
+        assert indexer_dispatch.native_indexer_disabled() is True
+
+        # Latched: the kernel is not attempted again.
+        self._run_indexer(dsv4, indexer)
+        assert len(calls) == 1
+
+    def test_dspark_topk_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def reject(*args):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "dspark_fp32_topk_indices", reject)
+
+        # Batched path: >1 rows, every row longer than top-k.
+        indexer = SimpleNamespace(index_topk=8, n_heads=2, scale=0.5)
+        pooled_rows = [
+            mx.zeros((1, 10, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 11, 4), dtype=mx.bfloat16),
+        ]
+        projected_q = mx.zeros((1, 2, 2, 4), dtype=mx.bfloat16)
+        projected_weights = mx.zeros((1, 2, 2), dtype=mx.bfloat16)
+        result = dsv4._batch_indexer_rows(
+            indexer, pooled_rows, projected_q, projected_weights
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 8), (1, 1, 8)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is False
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED is True
+
+        # Grouped path: same-length rows, k == 512 gate.
+        indexer512 = SimpleNamespace(index_topk=512, n_heads=2, scale=0.5)
+        result = dsv4._batch_indexer_rows(
+            indexer512,
+            [mx.zeros((1, 600, 4), dtype=mx.bfloat16)],
+            mx.zeros((1, 2, 1, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 512)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is False
+        # Both paths kept the native kernel armed.
+        assert len(calls) == 2
+
+    def test_dspark_topk_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+
+        def boom(*args):
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "dspark_fp32_topk_indices", boom)
+
+        indexer = SimpleNamespace(index_topk=8, n_heads=2, scale=0.5)
+        result = dsv4._batch_indexer_rows(
+            indexer,
+            [
+                mx.zeros((1, 10, 4), dtype=mx.bfloat16),
+                mx.zeros((1, 11, 4), dtype=mx.bfloat16),
+            ],
+            mx.zeros((1, 2, 2, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 2, 2), dtype=mx.bfloat16),
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 8), (1, 1, 8)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is True

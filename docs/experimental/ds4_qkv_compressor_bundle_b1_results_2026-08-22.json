@@ -1,0 +1,55 @@
+{
+  "contract_version": 1,
+  "date": "2026-08-22",
+  "base_commit": "e915cb07",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 2,
+  "shape": {
+    "batch": 1,
+    "rows": 1,
+    "hidden": 4096,
+    "ratio": 4,
+    "packed_output_rows": 4096
+  },
+  "dispatches": {
+    "separate": 6,
+    "grouped_stock": 2,
+    "native": 2
+  },
+  "hosts": {
+    "m3_ultra": {
+      "all_six_slices_exact_vs_separate": true,
+      "all_six_slices_exact_vs_grouped": true,
+      "grouped_exact_vs_separate": true,
+      "median_ms": {
+        "native": 0.247375,
+        "grouped_stock": 0.2372295,
+        "separate": 0.243521
+      },
+      "speedup_vs_faster_baseline": 0.958987367357251,
+      "passed": false
+    },
+    "m5_max": {
+      "all_six_slices_exact_vs_separate": true,
+      "all_six_slices_exact_vs_grouped": true,
+      "grouped_exact_vs_separate": true,
+      "median_ms": {
+        "native": 0.3891455,
+        "grouped_stock": 0.370708,
+        "separate": 0.38375
+      },
+      "speedup_vs_faster_baseline": 0.9526205493831998,
+      "passed": false
+    }
+  },
+  "gate": {
+    "minimum_speedup_each_host": 1.05,
+    "all_six_slices_array_equal": true,
+    "passed": false
+  },
+  "outcome": {
+    "promoted": false,
+    "production_dispatch": false,
+    "reason": "The two-dispatch native bundle is lossless but slower than the exact grouped-stock baseline on both Macs."
+  }
+}

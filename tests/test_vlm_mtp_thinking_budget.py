@@ -31,6 +31,8 @@ from omlx.speculative.processing_sampler import (
     supports_vlm_mtp_processing,
 )
 from omlx.speculative.vlm_mtp import (
+    _restore_vlm_rng_state,
+    _rng_key_as_uint64,
     _VLMAdapterMTPProxy,
     vlm_mtp_positioned_sampling_available,
 )
@@ -336,6 +338,75 @@ class TestEndToEndMtpRounds:
         # Control: a bare sampler (pre-fix behaviour) never closes thinking.
         tokens, _, _ = _run_rounds(_argmax_sampler, max_tokens=12)
         assert all(t == THINK for t in tokens)
+
+
+class TestImmutableMlxRngCompatibility:
+    def test_uint32_key_round_trips_through_a_uint64_seed(self):
+        key = mx.array([0xFEDCBA98, 0x76543210], dtype=mx.uint32)
+        encoded = _rng_key_as_uint64([key])
+
+        assert encoded == 0xFEDCBA9876543210
+        assert mx.array_equal(mx.random.key(encoded), key).item()
+
+    def test_restore_replays_the_exact_next_random_draw(self):
+        starting_state = [mx.array(key) for key in mx.random.state]
+        try:
+            mx.random.seed(0x123456789ABCDEF0)
+            snapshot = [mx.array(key) for key in mx.random.state]
+            expected = mx.random.uniform(shape=(16,))
+            mx.eval(expected)
+
+            _restore_vlm_rng_state(snapshot)
+            replayed = mx.random.uniform(shape=(16,))
+            mx.eval(replayed)
+
+            assert mx.array_equal(expected, replayed).item()
+        finally:
+            _restore_vlm_rng_state(starting_state)
+
+    def test_immutable_state_falls_back_to_exact_reseed(self):
+        class ImmutableState:
+            pass
+
+        class FakeRandom:
+            state = ImmutableState()
+
+            def __init__(self):
+                self.seeds = []
+
+            def seed(self, value):
+                self.seeds.append(value)
+
+        random_api = FakeRandom()
+
+        def legacy_restore(_state):
+            raise TypeError("immutable random state")
+
+        _restore_vlm_rng_state(
+            [mx.array([0x12345678, 0x9ABCDEF0], dtype=mx.uint32)],
+            legacy_restore=legacy_restore,
+            random_module=random_api,
+        )
+
+        assert random_api.seeds == [0x123456789ABCDEF0]
+
+    def test_mutable_state_does_not_mask_an_unrelated_type_error(self):
+        class FakeRandom:
+            state = [object()]
+
+            @staticmethod
+            def seed(_value):
+                raise AssertionError("fallback must not run")
+
+        def legacy_restore(_state):
+            raise TypeError("unrelated legacy error")
+
+        with pytest.raises(TypeError, match="unrelated legacy error"):
+            _restore_vlm_rng_state(
+                [mx.array([0, 1], dtype=mx.uint32)],
+                legacy_restore=legacy_restore,
+                random_module=FakeRandom(),
+            )
 
 
 # ---------------------------------------------------------------------------

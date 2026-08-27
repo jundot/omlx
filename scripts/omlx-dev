@@ -1,0 +1,220 @@
+#!/bin/zsh
+# SPDX-License-Identifier: Apache-2.0
+# Start/stop the editable oMLX dev server from this tracked worktree.
+
+set -eu
+
+script_path=${0:A}
+repo_root=${OMLX_DEV_REPO:-${script_path:h:h}}
+venv_root=${OMLX_DEV_VENV:-${HOME}/omlx-v2-build}
+state_root=${OMLX_DEV_STATE_DIR:-${HOME}/.omlx/run}
+env_file=${OMLX_DEV_ENV_FILE:-${HOME}/.omlx/dev-server.env}
+if [[ -f "${env_file}" ]]; then
+  set -a
+  source "${env_file}"
+  set +a
+fi
+log_file=${OMLX_DEV_LOG:-${venv_root}/serve.log}
+host=${OMLX_DEV_HOST:-0.0.0.0}
+port=${OMLX_DEV_PORT:-8000}
+label=${OMLX_DEV_LAUNCH_LABEL:-com.omlx.fusion.dev}
+launch_agents=${HOME}/Library/LaunchAgents
+plist_file=${launch_agents}/${label}.plist
+launch_target=gui/${UID}/${label}
+
+die() {
+  print -u2 -- "omlx-dev: $*"
+  exit 1
+}
+
+tracked_head() {
+  git -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null
+}
+
+server_pid() {
+  local pid
+  pid=$(launchctl print "${launch_target}" 2>/dev/null |
+    awk '/^[[:space:]]*pid = / { print $3; exit }')
+  if [[ "${pid}" == <-> ]] && kill -0 "${pid}" 2>/dev/null; then
+    print -- "${pid}"
+    return 0
+  fi
+  return 1
+}
+
+verify_worktree() {
+  [[ -d "${repo_root}" ]] || die "repo is missing: ${repo_root}"
+  [[ -x "${venv_root}/bin/omlx" ]] || die "venv CLI is missing: ${venv_root}/bin/omlx"
+  [[ -z "$(git -C "${repo_root}" status --porcelain)" ]] || {
+    [[ "${OMLX_DEV_ALLOW_DIRTY:-0}" == "1" ]] ||
+      die "worktree is dirty; commit/stash it or set OMLX_DEV_ALLOW_DIRTY=1"
+  }
+  local upstream
+  upstream=$(git -C "${repo_root}" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)
+  if [[ -n "${upstream}" ]]; then
+    local local_head upstream_head
+    local_head=$(tracked_head)
+    upstream_head=$(git -C "${repo_root}" rev-parse '@{upstream}')
+    [[ "${local_head}" == "${upstream_head}" ]] || {
+      [[ "${OMLX_DEV_ALLOW_UNPUSHED:-0}" == "1" ]] ||
+        die "HEAD ${local_head[1,12]} is not the tracked fork ${upstream} ${upstream_head[1,12]}"
+    }
+  fi
+}
+
+write_launch_agent() {
+  mkdir -p "${launch_agents}" "${state_root}" "${log_file:h}"
+  local run_at_load='<false/>'
+  [[ "${OMLX_DEV_RUN_AT_LOAD:-0}" == "1" ]] && run_at_load='<true/>'
+  local temporary=${plist_file}.tmp.$$
+  command cat >"${temporary}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${script_path}</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${repo_root}</string>
+  <key>RunAtLoad</key>
+  ${run_at_load}
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>${log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>${log_file}</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "${temporary}" >/dev/null
+  mv -f "${temporary}" "${plist_file}"
+}
+
+run_server() {
+  cd "${repo_root}"
+  exec "${venv_root}/bin/omlx" serve --host "${host}" --port "${port}"
+}
+
+unload_loaded_models() {
+  "${venv_root}/bin/python" - "${port}" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+port = sys.argv[1]
+base = f"http://127.0.0.1:{port}"
+try:
+    with urllib.request.urlopen(f"{base}/v1/models/status", timeout=5) as response:
+        models = json.load(response).get("models", [])
+except Exception:
+    raise SystemExit(0)
+
+for model in models:
+    if not model.get("loaded"):
+        continue
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        continue
+    request = urllib.request.Request(
+        f"{base}/v1/models/{urllib.parse.quote(model_id, safe='')}/unload",
+        data=b"",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            response.read()
+        print(f"omlx-dev: unloaded {model_id}")
+    except urllib.error.HTTPError as exc:
+        # Helper-backed entries such as MarkItDown can report loaded in the
+        # aggregate status without owning an EnginePool unload endpoint.
+        if exc.code in (400, 404):
+            continue
+        print(f"omlx-dev: could not unload {model_id}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"omlx-dev: could not unload {model_id}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+
+start_server() {
+  if pid=$(server_pid); then
+    print -- "oMLX dev server already running (pid ${pid})"
+    return 0
+  fi
+  verify_worktree
+  write_launch_agent
+  launchctl bootout "${launch_target}" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/${UID}" "${plist_file}"
+  launchctl kickstart -k "${launch_target}"
+
+  local attempts=0
+  while (( attempts < 60 )); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      local pid
+      pid=$(server_pid)
+      print -- "oMLX dev server ready (pid ${pid}, HEAD $(tracked_head))"
+      return 0
+    fi
+    sleep 0.5
+    attempts=$((attempts + 1))
+  done
+  die "server did not become healthy; inspect ${log_file}"
+}
+
+stop_server() {
+  local pid
+  if ! pid=$(server_pid); then
+    launchctl bootout "${launch_target}" >/dev/null 2>&1 || true
+    print -- "oMLX dev server is not running"
+    return 0
+  fi
+  # Give EnginePool and the distributed supervisor their normal verified
+  # teardown path before launchd terminates the coordinator. This prevents a
+  # child launcher from being reparented and later marked launcher_lost.
+  unload_loaded_models
+  launchctl bootout "${launch_target}"
+  local attempts=0
+  while kill -0 "${pid}" 2>/dev/null && (( attempts < 60 )); do
+    sleep 0.5
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    die "server pid ${pid} did not stop within 30 seconds"
+  fi
+  print -- "oMLX dev server stopped"
+}
+
+status_server() {
+  local pid
+  if pid=$(server_pid); then
+    print -- "running pid=${pid} repo=${repo_root} HEAD=$(tracked_head)"
+    curl -fsS --max-time 3 "http://127.0.0.1:${port}/health" || true
+    print
+    return 0
+  fi
+  print -- "stopped repo=${repo_root} HEAD=$(tracked_head)"
+  return 1
+}
+
+case "${1:-status}" in
+  run) run_server ;;
+  start) start_server ;;
+  stop) stop_server ;;
+  restart)
+    stop_server
+    start_server
+    ;;
+  status) status_server ;;
+  *) die "usage: omlx-dev {start|stop|restart|status}" ;;
+esac

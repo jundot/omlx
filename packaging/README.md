@@ -66,7 +66,9 @@ The Swift build (`build.sh release`) produces
 3. Walk through the first-run wizard (Storage + API key), then Start
    Server.
 
-> The DMGs on the [Releases](https://github.com/jundot/omlx/releases)
-> page are produced by an off-tree maintainer pipeline, not by anything
-> in this repo. End users follow the Releases install path; this
-> section is for developers building from source.
+Maintainers can turn this staged app into an arm64 Developer ID-signed,
+notarized, and stapled DMG with the manually triggered
+[`Signed macOS DMG`](../.github/workflows/release-macos-dmg.yml) workflow. The
+workflow uploads only to a draft GitHub Release; see the
+[public release checklist](../docs/release-public-checklist.md) for required
+Apple/GitHub configuration and verification steps.

@@ -52,8 +52,34 @@ def test_eligibility_checks_runtime_availability(monkeypatch):
     )
 
 
+def test_low_memory_eligibility_requires_an_evaluated_runtime_probe(monkeypatch):
+    monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+    monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_PROVEN", False)
+    monkeypatch.setattr(indexer_dispatch, "native_indexer_available", lambda: True)
+    shape = {
+        "query_tokens": 1817,
+        "pooled_tokens": 86_982,
+        "n_heads": 64,
+        "head_dim": 128,
+        "index_topk": 512,
+        "dtype_supported": True,
+    }
+
+    assert not indexer_dispatch.native_indexer_memory_safe_eligible(**shape)
+    indexer_dispatch.mark_native_indexer_proven()
+    assert indexer_dispatch.native_indexer_memory_safe_eligible(**shape)
+
+
 def test_runtime_failure_disables_native_state(monkeypatch):
     monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
     indexer_dispatch.disable_native_indexer()
+    assert indexer_dispatch.native_indexer_disabled()
+    assert not indexer_dispatch.native_indexer_available()
+
+
+def test_operator_can_disable_native_indexer_without_runtime_failure(monkeypatch):
+    monkeypatch.setenv("OMLX_DSV4_NATIVE_INDEXER", "0")
+    monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+
     assert indexer_dispatch.native_indexer_disabled()
     assert not indexer_dispatch.native_indexer_available()

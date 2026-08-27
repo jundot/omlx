@@ -47,21 +47,23 @@ def _link(kind, speed=120, tb_version="TB5"):
 
 
 def test_candidates_must_divide_both_nodes_and_heads():
-    # Hybrid TP+pipeline is not a runtime-supported choice: use every node or
-    # pipeline only.
-    assert candidate_tensor_parallel_sizes(_model(heads=48), 4) == (4, 1)
-    # 6 heads with 4 nodes: four-way TP does not divide, so only pipeline.
-    assert candidate_tensor_parallel_sizes(_model(heads=6), 4) == (1,)
+    # Four nodes can run pure TP4, hybrid TP2 x PP2, or pure pipeline.
+    assert candidate_tensor_parallel_sizes(_model(heads=48), 4) == (4, 2, 1)
+    # 6 heads reject TP4 but retain the valid TP2 x PP2 hybrid.
+    assert candidate_tensor_parallel_sizes(_model(heads=6), 4) == (2, 1)
     # A head count that divides nothing leaves only the no-TP option.
     assert candidate_tensor_parallel_sizes(_model(heads=7), 4) == (1,)
+    assert candidate_tensor_parallel_sizes(
+        _model(heads=48),
+        4,
+        hybrid_runtime_supported=False,
+    ) == (4, 1)
 
 
 def test_two_fast_linked_macs_get_tensor_parallelism():
     """The headline case: plug two Macs together, get one model split across both."""
 
-    choice = choose_parallelism(
-        _model(), _nodes(2), transports=[_link("thunderbolt")]
-    )
+    choice = choose_parallelism(_model(), _nodes(2), transports=[_link("thunderbolt")])
 
     assert choice.tensor_parallel_size == 2
     assert choice.pipeline_stages == 1
@@ -69,6 +71,21 @@ def test_two_fast_linked_macs_get_tensor_parallelism():
     # Both ranks hold the same layers, split between them.
     ranges = {(a.start_layer, a.end_layer) for a in choice.plan.assignments}
     assert len(ranges) == 1
+
+
+def test_automatic_uses_hybrid_when_all_node_tp_does_not_divide():
+    choice = choose_parallelism(
+        _model(heads=6),
+        _nodes(4),
+        transports=[_link("rdma")],
+    )
+
+    assert choice.tensor_parallel_size == 2
+    assert choice.pipeline_stages == 2
+    assert "pipeline stages" in choice.reason
+    ranges = [(row.start_layer, row.end_layer) for row in choice.plan.assignments]
+    assert len(set(ranges)) == 2
+    assert all(ranges.count(layer_range) == 2 for layer_range in set(ranges))
 
 
 def test_a_slow_link_falls_back_to_pipeline_stages():
@@ -151,7 +168,10 @@ def test_transport_summary_reports_the_slowest_link():
 def test_mixed_fabric_is_not_treated_as_fast():
     """One Ethernet hop in the set means TP should not span the whole cluster."""
 
-    assert transports_are_fast_enough([_link("thunderbolt"), _link("ethernet")], 2) is False
+    assert (
+        transports_are_fast_enough([_link("thunderbolt"), _link("ethernet")], 2)
+        is False
+    )
     assert transports_are_fast_enough([_link("thunderbolt"), _link("rdma")], 2) is True
     assert transports_are_fast_enough([_link("ethernet")], 1) is True
 
@@ -194,6 +214,7 @@ def test_autoconfigure_returns_an_activatable_proposal():
     payload = _autoconfigure_payload()
     payload.update(
         {
+            "deployment_id": "existing-pool",
             "auto_tune": False,
             "sampling_rank_only": True,
             "async_overlap": False,
@@ -204,9 +225,7 @@ def test_autoconfigure_returns_an_activatable_proposal():
         }
     )
     with TestClient(_app()) as client:
-        response = client.post(
-            "/admin/api/cluster/autoconfigure", json=payload
-        )
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -216,10 +235,10 @@ def test_autoconfigure_returns_an_activatable_proposal():
     assert body["summary"]
     assert body["tensor_parallel_size"] >= 1
     assert body["pipeline_stages"] >= 1
-    assert (
-        body["tensor_parallel_size"] * body["pipeline_stages"]
-        == len(body["activation"]["nodes"])
+    assert body["tensor_parallel_size"] * body["pipeline_stages"] == len(
+        body["activation"]["nodes"]
     )
+    assert body["activation"]["deployment_id"] == "existing-pool"
 
     # The activation block must be shaped for POST /deployments as-is.
     activation = body["activation"]
@@ -230,11 +249,47 @@ def test_autoconfigure_returns_an_activatable_proposal():
     assert activation["sampling_rank_only"] is True
     assert activation["async_overlap"] is False
     assert activation["cache_affinity"] is False
+    assert activation["prompt_cache_ssd"] is False
+    assert "prompt_cache_ssd" not in body["plan"]
     assert activation["max_kv_size"] == 4096
     assert activation["target_context_tokens"] == 4096
     assert body["plan"]["cluster"]["target_context_tokens"] == 4096
     assert activation["ring_connections_per_ip"] == (
         7 if activation["backend"] == "ring" else None
+    )
+
+
+def test_autoconfigure_signs_and_activates_explicit_ssd_prompt_snapshots():
+    """One-click used to ignore this field, leaving every rank memory-only."""
+
+    from fastapi.testclient import TestClient
+
+    baseline = _autoconfigure_payload()
+    enabled = baseline | {
+        "prompt_cache_ssd": True,
+        "prompt_cache_ssd_max_bytes": 7 * 1024**3,
+    }
+    with TestClient(_app()) as client:
+        cold = client.post("/admin/api/cluster/autoconfigure", json=baseline)
+        durable = client.post("/admin/api/cluster/autoconfigure", json=enabled)
+
+    assert cold.status_code == 200, cold.text
+    assert durable.status_code == 200, durable.text
+    cold_body = cold.json()
+    durable_body = durable.json()
+    assert cold_body["activation"]["prompt_cache_ssd"] is False
+    assert "prompt_cache_ssd" not in cold_body["plan"]
+    assert durable_body["activation"]["prompt_cache_ssd"] is True
+    assert durable_body["activation"]["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
+    assert durable_body["plan"]["prompt_cache_ssd"] is True
+    assert durable_body["plan"]["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
+    assert (
+        durable_body["activation"]["approved_placement"]
+        == (durable_body["plan"]["placement_signature"])
+    )
+    assert (
+        durable_body["plan"]["placement_signature"]
+        != (cold_body["plan"]["placement_signature"])
     )
 
 
@@ -412,7 +467,9 @@ def test_performance_is_measured_and_applied_before_staging(tmp_path, monkeypatc
         }
 
     def staging(_request, choice):
-        events.append(("staging", [item.layer_count for item in choice.plan.assignments]))
+        events.append(
+            ("staging", [item.layer_count for item in choice.plan.assignments])
+        )
         return {"ready": True, "nodes": []}
 
     monkeypatch.setattr(routes, "run_cluster_performance_probe", probe)
@@ -447,9 +504,9 @@ def test_performance_is_measured_and_applied_before_staging(tmp_path, monkeypatc
     assert events[1][1][1] > events[1][1][0]
     assert body["performance_probe"]["status"] == "applied_before_staging"
     assert all(node["performance"] for node in body["activation"]["nodes"])
-    assert body["activation"]["approved_placement"] == body["plan"][
-        "placement_signature"
-    ]
+    assert (
+        body["activation"]["approved_placement"] == body["plan"]["placement_signature"]
+    )
 
 
 def test_rejected_performance_split_is_not_replayed_during_activation(
@@ -617,19 +674,29 @@ def test_head_count_is_read_from_the_model_config(tmp_path):
     from omlx.cluster.planner import inspect_safetensors_layout
 
     (tmp_path / "config.json").write_text(
-        json.dumps({
-            "model_type": "llama",  # a real mlx-lm module that implements shard()
-            "hidden_size": 4096,
-            "num_attention_heads": 32,
-        })
+        json.dumps(
+            {
+                "model_type": "llama",  # a real mlx-lm module that implements shard()
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+            }
+        )
     )
     header = {
-        "model.embed_tokens.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]},
+        "model.embed_tokens.weight": {
+            "dtype": "F16",
+            "shape": [1],
+            "data_offsets": [0, 2],
+        },
         "model.layers.0.self_attn.q_proj.weight": {
-            "dtype": "F16", "shape": [1], "data_offsets": [2, 6],
+            "dtype": "F16",
+            "shape": [1],
+            "data_offsets": [2, 6],
         },
         "model.layers.1.self_attn.q_proj.weight": {
-            "dtype": "F16", "shape": [1], "data_offsets": [6, 10],
+            "dtype": "F16",
+            "shape": [1],
+            "data_offsets": [6, 10],
         },
     }
     blob = json.dumps(header).encode()
@@ -652,7 +719,9 @@ def test_a_model_without_a_config_gets_no_tensor_parallelism(tmp_path):
 
     header = {
         "model.layers.0.self_attn.q_proj.weight": {
-            "dtype": "F16", "shape": [1], "data_offsets": [0, 4],
+            "dtype": "F16",
+            "shape": [1],
+            "data_offsets": [0, 4],
         },
     }
     blob = json.dumps(header).encode()
@@ -763,8 +832,11 @@ def test_kv_heads_default_to_attention_heads():
 
 def _pair(source, peer, kind="thunderbolt"):
     return SimpleNamespace(
-        kind=kind, source_node_id=source, peer_node_id=peer,
-        link_speed_gbps=120, tb_version="TB5",
+        kind=kind,
+        source_node_id=source,
+        peer_node_id=peer,
+        link_speed_gbps=120,
+        tb_version="TB5",
     )
 
 
@@ -775,14 +847,16 @@ def test_fast_linked_pairs_are_grouped_not_split():
 
     hosts = ["A", "C", "B", "D"]  # deliberately interleaved input order
     fabric = [
-        _pair("A", "B"), _pair("B", "A"),
-        _pair("C", "D"), _pair("D", "C"),
+        _pair("A", "B"),
+        _pair("B", "A"),
+        _pair("C", "D"),
+        _pair("D", "C"),
         _pair("A", "C", kind="ethernet"),
     ]
 
     placement = order_hosts_for_topology(hosts, fabric, 2)
 
-    groups = [set(placement.hosts[i:i + 2]) for i in (0, 2)]
+    groups = [set(placement.hosts[i : i + 2]) for i in (0, 2)]
     assert {"A", "B"} in groups
     assert {"C", "D"} in groups
     # The placement must explain itself: which groups, and on what evidence.
@@ -824,6 +898,7 @@ def test_autoconfigure_reorders_nodes_and_hosts_as_one_rank_map(monkeypatch):
             tensor_parallel_heads=2,
             tensor_parallel_kv_heads=2,
             supports_tensor_parallel=True,
+            supports_pipeline=True,
         ),
     )
     monkeypatch.setattr(
@@ -862,9 +937,69 @@ def test_autoconfigure_reorders_nodes_and_hosts_as_one_rank_map(monkeypatch):
     activation = response.json()["activation"]
     assert [item["node_id"] for item in activation["nodes"]] == ["A", "B", "C", "D"]
     assert [item["node_id"] for item in activation["hosts"]] == ["A", "B", "C", "D"]
-    assert activation["approved_placement"] == response.json()["plan"][
-        "placement_signature"
+    assert (
+        activation["approved_placement"]
+        == response.json()["plan"]["placement_signature"]
+    )
+
+
+def test_autoconfigure_builds_signed_full_replica_phase_split():
+    from fastapi.testclient import TestClient
+
+    payload = _autoconfigure_payload()
+    payload.update(
+        strategy="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        auto_tune=False,
+        preflight=False,
+    )
+    payload["hosts"] = [
+        {
+            "node_id": f"node-{rank}",
+            "ssh": "127.0.0.1" if rank == 0 else "worker.local",
+            "ips": [f"10.0.0.{rank + 1}"],
+        }
+        for rank in range(2)
     ]
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 200, response.text
+    proposal = response.json()
+    plan = proposal["plan"]
+    activation = proposal["activation"]
+    assert proposal["serving_mode"] == "disaggregated"
+    assert proposal["tensor_parallel_size"] == 1
+    assert proposal["pipeline_stages"] == 1
+    assert plan["serving_mode"] == "disaggregated"
+    assert plan["prefill_rank"] == 1
+    assert plan["decode_rank"] == 0
+    assert [row["layer_count"] for row in plan["assignments"]] == [32, 32]
+    assert activation["serving_mode"] == "disaggregated"
+    assert activation["prefill_rank"] == 1
+    assert activation["decode_rank"] == 0
+    assert proposal["performance_probe"]["status"] == "phase_probe_required"
+    assert activation["approved_placement"] == plan["placement_signature"]
+
+
+def test_autoconfigure_phase_split_refuses_a_partial_replica_fit():
+    from fastapi.testclient import TestClient
+
+    payload = _autoconfigure_payload(capacity_gib=32)
+    payload.update(
+        strategy="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        preflight=False,
+    )
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 400
+    assert "full replica does not fit" in response.json()["detail"]
 
 
 def test_placement_falls_back_loudly_when_the_fabric_will_not_split():
@@ -959,6 +1094,36 @@ def test_preflight_is_quiet_when_everything_matches():
     )
     assert issues == ()
     assert describe_preflight(issues) == "All peers are reachable and ready."
+
+
+def test_preflight_surfaces_low_power_mode_as_nonblocking_guidance():
+    from omlx.cluster.autoconfigure import describe_preflight, preflight_issues
+
+    issues = preflight_issues(
+        {
+            "m5-max": {
+                "runtime_compatible": True,
+                "status": {
+                    "runtime": {"mlx_version": "0.32.0"},
+                    "node": {
+                        "power": {
+                            "low_power_mode_enabled": True,
+                            "ac_low_power_mode": True,
+                            "battery_low_power_mode": False,
+                        }
+                    },
+                },
+            }
+        },
+        model_path=None,
+    )
+
+    assert [(issue.kind, issue.blocking) for issue in issues] == [
+        ("low_power_mode", False)
+    ]
+    guidance = describe_preflight(issues)
+    assert "Low Power Mode" in guidance
+    assert "System Settings" in guidance
 
 
 def test_preflight_does_not_invent_problems_from_missing_data():
@@ -1091,14 +1256,18 @@ def test_asking_for_tensor_when_impossible_explains_why():
 
     with pytest.raises(PlanningError, match="does not implement sharding"):
         choose_parallelism(
-            _model(shardable=False), _nodes(2),
-            transports=[_link("thunderbolt")], strategy="tensor",
+            _model(shardable=False),
+            _nodes(2),
+            transports=[_link("thunderbolt")],
+            strategy="tensor",
         )
 
     with pytest.raises(PlanningError, match="head group"):
         choose_parallelism(
-            _model(heads=7), _nodes(2),
-            transports=[_link("thunderbolt")], strategy="tensor",
+            _model(heads=7),
+            _nodes(2),
+            transports=[_link("thunderbolt")],
+            strategy="tensor",
         )
 
 
@@ -1214,13 +1383,19 @@ def test_the_faster_of_two_thunderbolt_links_wins_the_group():
 
     hosts = ["A", "B", "C", "D"]
     fabric = [
-        _pair("A", "B"), _pair("A", "C"), _pair("A", "D"),
-        _pair("B", "C"), _pair("B", "D"), _pair("C", "D"),
+        _pair("A", "B"),
+        _pair("A", "C"),
+        _pair("A", "D"),
+        _pair("B", "C"),
+        _pair("B", "D"),
+        _pair("C", "D"),
     ]
     # A and C were measured fast; B and D slow but still above the floor.
     profiles = [
-        _profile("A", 6.6), _profile("C", 6.6),
-        _profile("B", 1.6), _profile("D", 1.6),
+        _profile("A", 6.6),
+        _profile("C", 6.6),
+        _profile("B", 1.6),
+        _profile("D", 1.6),
     ]
 
     placement = order_hosts_for_topology(hosts, fabric, 2, profiles)
@@ -1266,7 +1441,9 @@ def test_a_slow_group_is_reported_by_measured_bandwidth():
 
     hosts = ["A", "B"]
     fabric = [_pair("A", "B")]
-    assert not tp_groups_spanning_slow_links(hosts, fabric, 2, [_profile("A", 6.6), _profile("B", 6.6)])
+    assert not tp_groups_spanning_slow_links(
+        hosts, fabric, 2, [_profile("A", 6.6), _profile("B", 6.6)]
+    )
     slow = tp_groups_spanning_slow_links(
         hosts, fabric, 2, [_profile("A", 0.4), _profile("B", 0.4)]
     )
@@ -1293,9 +1470,7 @@ def _interfaces(name, addresses, *, rdma=(), thunderbolt=None):
         host=name,
         addresses=interfaces,
         rdma_interfaces=frozenset(rdma),
-        thunderbolt_interfaces=frozenset(
-            rdma if thunderbolt is None else thunderbolt
-        ),
+        thunderbolt_interfaces=frozenset(rdma if thunderbolt is None else thunderbolt),
     )
 
 
@@ -1652,9 +1827,7 @@ def test_a_vlm_load_and_a_rank_of_the_same_model_need_different_things(tmp_path)
     model = _model_dir(tmp_path, model_type="qwen3_5_moe", vision_config={})
 
     rank = {requirement.module for requirement in required_imports(model)}
-    vlm = {
-        requirement.module for requirement in required_imports(model, for_vlm=True)
-    }
+    vlm = {requirement.module for requirement in required_imports(model, for_vlm=True)}
 
     assert "mlx_vlm" not in rank
     assert "mlx_vlm" in vlm

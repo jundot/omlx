@@ -96,7 +96,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Source, issues, and roadmap",
                                  comment: "Sublabel under the GitHub Repository link on the About screen"),
                 icon: "chevron.left.forwardslash.chevron.right",
-                url: URL(string: "https://github.com/jundot/omlx")!
+                url: ReleasesChecker.repositoryURL
             )
             LinkRow(
                 label: String(localized: "about.project.releases.label",
@@ -106,7 +106,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Download the latest CLI and macOS app",
                                  comment: "Sublabel under the Releases link on the About screen"),
                 icon: "shippingbox",
-                url: URL(string: "https://github.com/jundot/omlx/releases")!
+                url: ReleasesChecker.releasesPageURL
             )
             LinkRow(
                 label: String(localized: "about.project.docs.label",
@@ -116,7 +116,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Setup, model management, integrations",
                                  comment: "Sublabel under the Documentation link on the About screen"),
                 icon: "book.closed",
-                url: URL(string: "https://github.com/jundot/omlx")!
+                url: ReleasesChecker.repositoryURL
             )
             LinkRow(
                 label: String(localized: "about.project.issue.label",
@@ -126,7 +126,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Bugs and feature requests on GitHub",
                                  comment: "Sublabel under the Report an Issue link on the About screen"),
                 icon: "exclamationmark.bubble",
-                url: URL(string: "https://github.com/jundot/omlx/issues/new")!,
+                url: ReleasesChecker.newIssueURL,
                 isLast: true
             )
         }

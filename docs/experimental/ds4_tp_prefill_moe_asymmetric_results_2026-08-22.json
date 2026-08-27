@@ -1,0 +1,112 @@
+{
+  "date": "2026-08-22",
+  "device": "Apple M3 Ultra",
+  "model": "DeepSeek-V4-Flash-0731-MXFP4-MLX",
+  "layer": 20,
+  "tokens": 1024,
+  "routes": 6144,
+  "tp": {
+    "weights": [3, 5],
+    "rank": 0,
+    "intermediate_start": 0,
+    "intermediate_stop": 768,
+    "local_intermediate": 768,
+    "down_packed_width": 96,
+    "down_scale_width": 24
+  },
+  "existing_variants": [
+    {
+      "variant": 0,
+      "bm": 8,
+      "bn": 32,
+      "pair_ms": 6.614458,
+      "down_ms": 3.551708,
+      "full_ms": 9.956646,
+      "all_exact": true
+    },
+    {
+      "variant": 1,
+      "bm": 16,
+      "bn": 32,
+      "pair_ms": 6.6734375,
+      "down_ms": 3.4847915,
+      "full_ms": 9.898667,
+      "all_exact": true
+    },
+    {
+      "variant": 2,
+      "bm": 32,
+      "bn": 32,
+      "pair_ms": 6.1209585,
+      "down_ms": 3.2139165,
+      "full_ms": 9.0706875,
+      "pair_speedup_vs_stock": 1.1227714580976165,
+      "down_speedup_vs_stock": 1.084346777522067,
+      "full_speedup_vs_stock": 1.1210698748027645,
+      "all_exact": true
+    },
+    {
+      "variant": 3,
+      "bm": 16,
+      "bn": 64,
+      "pair_ms": 6.681792,
+      "down_ms": 3.5589585,
+      "full_ms": 10.054521,
+      "all_exact": true
+    },
+    {
+      "variant": 4,
+      "bm": 32,
+      "bn": 64,
+      "pair_ms": 6.250813,
+      "down_ms": 3.2695,
+      "full_ms": 9.37575,
+      "all_exact": true
+    }
+  ],
+  "dominant": {
+    "primitive": "pair",
+    "best_pair_ms": 6.1209585,
+    "best_down_ms": 3.2139165,
+    "pair_to_down_ratio": 1.904516965515439
+  },
+  "tail8_vs_variant2": [
+    {
+      "kind": "integrated_after_variant_sweep",
+      "pair_exact": true,
+      "down_exact": true,
+      "full_exact": true,
+      "pair_speedup": 1.4602716057290717,
+      "down_speedup": 0.9471075161049751,
+      "full_speedup": 1.211035613561564
+    },
+    {
+      "kind": "tail_only_confirmation",
+      "pair_exact": true,
+      "down_exact": true,
+      "full_exact": true,
+      "pair_candidate_ms": 8.827458,
+      "pair_baseline_ms": 13.3115,
+      "pair_speedup": 1.5079652602142088,
+      "down_candidate_ms": 5.089583,
+      "down_baseline_ms": 6.007271,
+      "down_speedup": 1.180307109639434,
+      "full_candidate_ms": 14.4598955,
+      "full_baseline_ms": 17.8262705,
+      "full_speedup": 1.2328076990597892
+    }
+  ],
+  "gate": {
+    "minimum_full_speedup_vs_best_existing": 1.10,
+    "all_boundaries_exact": true,
+    "both_tail8_runs_pass": true,
+    "thermal_noise_observed": true
+  },
+  "decision": {
+    "isolated_asymmetric_candidate": "pass",
+    "production_dispatch": "off",
+    "rank1_width_1280_native_semantics": "wired_unmeasured",
+    "remote_touched": false,
+    "server_replanned": false
+  }
+}

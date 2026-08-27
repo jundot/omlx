@@ -750,7 +750,11 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
 @pytest.mark.parametrize(
     ("mxfp4_threshold", "native_kind", "num_routes", "expected"),
     [
+        (16384, "mxfp4", 6143, (16, 1)),
+        (16384, "mxfp4", 6144, (32, 2)),
+        (16384, "mxfp4", 8191, (32, 2)),
         (16384, "mxfp4", 8192, (16, 1)),
+        (16384, "mxfp4", 12288, (16, 1)),
         (16384, "mxfp4", 16383, (16, 1)),
         (16384, "mxfp4", 16384, (32, 2)),
         (8192, "mxfp4", 8192, (32, 2)),

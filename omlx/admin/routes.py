@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -58,6 +60,80 @@ from .auth import (
 logger = logging.getLogger(__name__)
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
+
+
+def _clear_cold_remote_cluster_cache_roots(
+    roots: tuple[Path, ...],
+    *,
+    runner: Any = subprocess.run,
+) -> tuple[int, int]:
+    """Remove unloaded cluster snapshots from every configured peer Mac.
+
+    Loaded ranks clear through their live cache managers. With no resident
+    engine, the normal SSD-clear action still has to reach peer-local snapshot
+    trees; deleting only the coordinator root makes the next load silently
+    restore data the user explicitly cleared.
+    """
+
+    from ..cluster.launch import _run_cluster_ssh
+    from ..cluster.registry import get_cluster_registry
+
+    try:
+        deployments = get_cluster_registry().list()
+    except RuntimeError:
+        return 0, 0
+    if not deployments:
+        return 0, 0
+
+    normalized = tuple(str(path.expanduser()) for path in roots)
+    allowed = {"cluster-prompt-snapshots", "prompt-cache-ssd"}
+    if any(Path(path).name not in allowed for path in normalized):
+        raise RuntimeError("refusing to clear an unexpected cluster cache root")
+
+    node_ids: set[str] = set()
+    remote_targets: set[str] = set()
+    for deployment in deployments:
+        for rank, host in enumerate(deployment.hosts):
+            node_ids.add(host.node_id)
+            if rank > 0:
+                remote_targets.add(host.ssh)
+
+    script = r"""
+import json, shutil, sys
+from pathlib import Path
+roots = [Path(value).expanduser() for value in json.loads(sys.argv[1])]
+allowed = {'cluster-prompt-snapshots', 'prompt-cache-ssd'}
+if any(root.name not in allowed for root in roots):
+    raise SystemExit(3)
+deleted = 0
+for root in roots:
+    if not root.exists():
+        continue
+    deleted += sum(1 for item in root.rglob('*') if item.is_file())
+    shutil.rmtree(root)
+print(deleted)
+""".strip()
+    command = shlex.join(["python3", "-c", script, json.dumps(normalized)])
+    deleted = 0
+    for target in sorted(remote_targets):
+        completed = _run_cluster_ssh(
+            target,
+            command,
+            timeout=45.0,
+            runner=runner,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"cold cluster SSD clear failed on {target}: {detail[:300]}"
+            )
+        try:
+            deleted += max(0, int(completed.stdout.strip() or "0"))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"cold cluster SSD clear returned invalid output on {target}"
+            ) from exc
+    return deleted, len(node_ids)
 
 
 # =============================================================================
@@ -151,6 +227,18 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # DeepSeek-V4 hybrid ANE prefill
+    deepseek_ane_prefill_enabled: bool | None = None
+    deepseek_ane_prefill_sequence_length: int | None = None
+    deepseek_ane_prefill_tail_padding_min_tokens: int | None = None
+    deepseek_ane_prefill_down_enabled: bool | None = None
+    deepseek_ane_prefill_down_fraction: float | None = None
+    deepseek_ane_prefill_wo_a_enabled: bool | None = None
+    deepseek_ane_prefill_wo_a_fraction: float | None = None
+    deepseek_ane_prefill_cpu_enabled: bool | None = None
+    deepseek_ane_prefill_cpu_fraction: float | None = None
+    deepseek_ane_prefill_cpu_threads: int | None = None
+    deepseek_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -175,6 +263,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -188,6 +277,19 @@ class ModelSettingsRequest(BaseModel):
     is_favorite: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+
+    @field_validator("guided_grammar", mode="before")
+    @classmethod
+    def _coerce_guided_grammar(cls, value: Any) -> Any:
+        # Dashboard builds before the null-fix sent 0 for "no grammar", and a
+        # browser tab older than the frontend patch still does. A falsy
+        # non-string means unset — coerce it instead of 422ing the whole save
+        # over a field the user never touched. Truthy non-strings still 422.
+        if value is None or isinstance(value, str):
+            return value
+        if not value:
+            return None
+        return value
 
 
 class CreateProfileRequest(BaseModel):
@@ -1490,7 +1592,14 @@ async def admin_static(path: str):
         ".ttf": "font/ttf",
     }
     media_type = media_types.get(file_path.suffix, "application/octet-stream")
-    return FileResponse(file_path, media_type=media_type)
+    # no-cache: browsers must revalidate every load (cheap 304s via ETag).
+    # Without this, heuristic caching serves stale JS after an update and the
+    # dashboard runs an old frontend against a new backend.
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 # =============================================================================
@@ -1957,6 +2066,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "distributed": model_info.get("distributed", False),
+            "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
@@ -2478,6 +2589,94 @@ async def update_model_settings(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
         )
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + attention-input stack +
+    # wq_b + stacked indexer).
+    if "deepseek_ane_prefill_enabled" in sent:
+        enabled = bool(request.deepseek_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith("deepseek_v4"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE prefill is available only for DeepSeek-V4 "
+                    "models."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_enabled = enabled
+    if "deepseek_ane_prefill_sequence_length" in sent:
+        value = request.deepseek_ane_prefill_sequence_length
+        if value is None or value < 1024 or value % 64:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+            )
+        current_settings.deepseek_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens = 0
+    if "deepseek_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.deepseek_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.deepseek_ane_prefill_sequence_length)
+        if value is None or not (value == 0 or 2 <= value < sequence_length):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE tail padding threshold must be zero or "
+                    "between 2 and one less than the ANE prompt block."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_tail_padding_min_tokens = int(value)
+    if "deepseek_ane_prefill_down_enabled" in sent:
+        current_settings.deepseek_ane_prefill_down_enabled = bool(
+            request.deepseek_ane_prefill_down_enabled
+        )
+    if "deepseek_ane_prefill_down_fraction" in sent:
+        value = request.deepseek_ane_prefill_down_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek shared-down ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_down_fraction = float(value)
+    if "deepseek_ane_prefill_wo_a_enabled" in sent:
+        current_settings.deepseek_ane_prefill_wo_a_enabled = bool(
+            request.deepseek_ane_prefill_wo_a_enabled
+        )
+    if "deepseek_ane_prefill_wo_a_fraction" in sent:
+        value = request.deepseek_ane_prefill_wo_a_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek wo_a ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_wo_a_fraction = float(value)
+    if "deepseek_ane_prefill_cpu_enabled" in sent:
+        current_settings.deepseek_ane_prefill_cpu_enabled = bool(
+            request.deepseek_ane_prefill_cpu_enabled
+        )
+    if "deepseek_ane_prefill_cpu_fraction" in sent:
+        value = request.deepseek_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value < 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU fraction must be between 0.0 and 0.5.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_fraction = float(value)
+    if "deepseek_ane_prefill_cpu_threads" in sent:
+        value = request.deepseek_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU worker count must be between 0 and 64.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_threads = int(value)
+    if "deepseek_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.deepseek_ane_prefill_cpu_shared_resource = bool(
+            request.deepseek_ane_prefill_cpu_shared_resource
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -2672,6 +2871,8 @@ async def update_model_settings(
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+    if "mtp_num_draft_tokens" in sent:
+        current_settings.mtp_num_draft_tokens = request.mtp_num_draft_tokens
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -4818,6 +5019,77 @@ def _parse_commits_from_pyproject(pyproject_path, packages: dict[str, str]) -> d
     return commits
 
 
+def _distributed_runtime_cache_stats(engine) -> dict | None:
+    """Rank zero's telemetry cache counters as a runtime-cache row source.
+
+    Distributed engines own no local scheduler, so the paged hot/SSD stats do
+    not exist for them. What rank zero reports is its per-rank prompt cache
+    (in-memory LRU) and prompt-snapshot store — returned here under a
+    separate ``rank_prompt_cache`` key so callers never confuse it with the
+    tiered hot/SSD cache columns or aggregates.
+    """
+
+    get_live = getattr(engine, "get_live_metrics", None)
+    if not callable(get_live):
+        return None
+    try:
+        live = get_live()
+    except Exception:  # noqa: BLE001
+        logger.debug("cluster live metrics failed", exc_info=True)
+        return None
+    if live is None or live.get("stale"):
+        return None
+    metrics = live.get("metrics")
+    cache = metrics.get("cache") if isinstance(metrics, dict) else None
+    if not isinstance(cache, dict):
+        return None
+    memory = cache.get("memory")
+    if not isinstance(memory, dict):
+        memory = {}
+    ssd = cache.get("ssd")
+    if not isinstance(ssd, dict):
+        ssd = {}
+    total_entries = int(cache.get("entries", 0) or 0)
+    total_bytes = int(cache.get("bytes", 0) or 0)
+    has_tier_split = bool(memory or ssd or "ssd_enabled" in cache)
+    return {
+        "rank_prompt_cache": {
+            "entries": total_entries,
+            "bytes": total_bytes,
+            "lookups": int(cache.get("lookups", 0) or 0),
+            "hits": int(cache.get("hits", 0) or 0),
+            "misses": int(cache.get("misses", 0) or 0),
+            "hit_rate": float(cache.get("hit_rate", 0.0) or 0.0),
+            "tokens_reused": int(cache.get("tokens_reused", 0) or 0),
+            "affinity": str(cache.get("affinity", "none")),
+            "ssd_enabled": bool(cache.get("ssd_enabled", False)),
+            "memory_entries": int(
+                (memory.get("entries", 0) or 0) if has_tier_split else total_entries
+            ),
+            "memory_bytes": int(
+                (memory.get("bytes", 0) or 0) if has_tier_split else total_bytes
+            ),
+            "memory_hits": int(
+                (memory.get("hits", 0) or 0)
+                if has_tier_split
+                else int(cache.get("hits", 0) or 0)
+            ),
+            "ssd_entries": int(ssd.get("entries", 0) or 0),
+            "ssd_bytes": int(ssd.get("bytes", 0) or 0),
+            "ssd_hits": int(ssd.get("hits", 0) or 0),
+            "ssd_max_bytes": int(ssd.get("max_bytes", 0) or 0),
+            "ssd_capacity_bytes": int(ssd.get("capacity_bytes", 0) or 0),
+            "ssd_evictions": int(ssd.get("evictions", 0) or 0),
+            "ssd_capacity_drops": int(ssd.get("capacity_drops", 0) or 0),
+            "ssd_pending_bytes": int(ssd.get("pending_bytes", 0) or 0),
+            "ssd_pending_max_bytes": int(
+                ssd.get("pending_max_bytes", 0) or 0
+            ),
+            "ssd_write_failures": int(ssd.get("write_failures", 0) or 0),
+        },
+    }
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -4911,6 +5183,12 @@ def _build_runtime_cache_observability(
                     exc,
                 )
                 continue
+
+        if not runtime_stats and model_info.get("cluster"):
+            # Distributed engines own no local scheduler; fall back to rank
+            # zero's telemetry cache counters (kept out of the tiered hot/SSD
+            # columns and aggregates — see _distributed_runtime_cache_stats).
+            runtime_stats = _distributed_runtime_cache_stats(entry.engine)
 
         if not runtime_stats:
             continue
@@ -5062,6 +5340,15 @@ def _build_runtime_cache_observability(
         cache_rates = runtime_stats.get("cache_rates")
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
+
+        rank_prompt_cache = runtime_stats.get("rank_prompt_cache")
+        if isinstance(rank_prompt_cache, dict):
+            # Label the row so the UI presents these as rank-local prompt
+            # cache/snapshot stats, never as the tiered hot/SSD cache. Every
+            # tiered numeric field above stays 0, so the hot-cache and SSD
+            # aggregates are unaffected.
+            model_payload["cache_tier"] = "rank-prompt-snapshot"
+            model_payload["rank_prompt_cache"] = rank_prompt_cache
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -5271,6 +5558,28 @@ def _build_active_models_data() -> dict:
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
 
+        # Cluster (distributed) engines own no local scheduler or collectors;
+        # their live stats come from rank zero's telemetry marker instead.
+        cluster_live = None
+        if (
+            model_info.get("cluster")
+            and entry is not None
+            and entry.engine is not None
+        ):
+            get_live = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live):
+                try:
+                    cluster_live = get_live()
+                except Exception:  # noqa: BLE001
+                    logger.debug("cluster live metrics failed", exc_info=True)
+        # A stale marker proves nothing about the ranks' current state; show
+        # the model as idle rather than repeating outdated rates.
+        cluster_metrics = (
+            cluster_live["metrics"]
+            if cluster_live is not None and not cluster_live.get("stale")
+            else None
+        )
+
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
@@ -5280,6 +5589,10 @@ def _build_active_models_data() -> dict:
         if has_scheduler_snapshot or collector_request_ids:
             active_requests = len(active_request_ids)
         active_requests += activity_requests
+        if cluster_metrics is not None:
+            # Rank zero's count is the only live source for distributed rows.
+            rank_active = cluster_metrics.get("active_requests", 0)
+            active_requests = int(rank_active) if isinstance(rank_active, int) else 0
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -5306,6 +5619,67 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        if cluster_metrics is not None:
+            # Synthesize scheduler-shaped rows from every active rank-zero
+            # request sample.  Older markers expose only ``last_request``;
+            # retain that as a compatibility fallback, but never collapse a
+            # current concurrent batch to whichever request happened to
+            # publish last.
+            active_samples = cluster_metrics.get("active_request_metrics")
+            if isinstance(active_samples, list):
+                samples = [
+                    sample
+                    for sample in active_samples
+                    if isinstance(sample, dict)
+                    and sample.get("status") == "running"
+                ]
+            else:
+                samples = []
+            using_legacy_sample = not samples
+            if using_legacy_sample:
+                last = cluster_metrics.get("last_request")
+                samples = (
+                    [last]
+                    if isinstance(last, dict) and last.get("status") == "running"
+                    else []
+                )
+
+            for index, sample in enumerate(samples):
+                request_id = sample.get("request_id")
+                if request_id is None:
+                    request_id = (
+                        "rank0"
+                        if using_legacy_sample
+                        else f"rank0-{index + 1}"
+                    )
+                progress = sample.get("prefill_progress")
+                if isinstance(progress, dict) and progress.get("active"):
+                    prefilling.append(
+                        {
+                            "request_id": request_id,
+                            "processed": progress.get("processed", 0),
+                            "total": progress.get("total", 0),
+                            "speed": progress.get("speed", 0.0),
+                            "eta": progress.get("eta"),
+                            "elapsed": progress.get("elapsed"),
+                            "detail": "cluster prefill",
+                        }
+                    )
+                elif sample.get("decode_tps"):
+                    generating.append(
+                        {
+                            "request_id": request_id,
+                            "elapsed_seconds": sample.get("elapsed_seconds"),
+                            "generated_tokens": sample.get("completion_tokens", 0),
+                            "tokens_per_second": sample.get("decode_tps", 0.0),
+                            "last_activity_age_seconds": cluster_live.get(
+                                "age_seconds"
+                            ),
+                            "prompt_tokens": sample.get("prompt_tokens", 0),
+                            "max_tokens": None,
+                        }
+                    )
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (
@@ -5408,6 +5782,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                "cluster": (
+                    {**model_info["cluster"], "live": cluster_live}
+                    if model_info.get("cluster")
+                    else None
+                ),
             }
         )
 
@@ -5489,8 +5868,8 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     return {"status": "ok"}
 
 
-def _iter_loaded_scheduler_records():
-    """Yield (model_id, scheduler, core) for each loaded model.
+def _iter_loaded_engine_records():
+    """Yield (model_id, scheduler-or-None, core) for each loaded model.
 
     Traverses the internal engine hierarchy: pool entry → async engine →
     core engine → scheduler.
@@ -5505,9 +5884,26 @@ def _iter_loaded_scheduler_records():
         entry = engine_pool._entries.get(model_id)
         if entry is None or entry.engine is None:
             continue
-        async_core = getattr(entry.engine, "_engine", None)
-        core = getattr(async_core, "engine", None) if async_core is not None else None
+        # DistributedBatchedEngine is stored directly in the pool; local
+        # batched engines retain the historical async-wrapper chain.
+        direct = entry.engine
+        async_core = getattr(direct, "_engine", None)
+        core = (
+            direct
+            if callable(getattr(direct, "clear_prompt_caches", None))
+            else getattr(async_core, "engine", None)
+            if async_core is not None
+            else None
+        )
         scheduler = getattr(core, "scheduler", None) if core is not None else None
+        if core is not None:
+            yield model_id, scheduler, core
+
+
+def _iter_loaded_scheduler_records():
+    """Yield local scheduler records, excluding distributed proxy engines."""
+
+    for model_id, scheduler, core in _iter_loaded_engine_records():
         if scheduler is not None:
             yield model_id, scheduler, core
 
@@ -5530,8 +5926,24 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     is loaded.
     """
     total_deleted = 0
+    distributed_ranks = 0
+    distributed_failures = []
 
-    for model_id, scheduler in _iter_loaded_schedulers():
+    for model_id, scheduler, core in _iter_loaded_engine_records():
+        distributed_clear = getattr(core, "clear_prompt_caches", None)
+        if callable(distributed_clear):
+            try:
+                report = await distributed_clear(ssd=True)
+                total_deleted += int(report.get("ssd_deleted", 0))
+                distributed_ranks += len(report.get("ranks", ()))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear distributed SSD cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
+                distributed_failures.append(f"{model_id}: {exc}")
+            continue
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None:
             try:
@@ -5564,7 +5976,55 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
-    return {"status": "ok", "total_deleted": total_deleted}
+        # A cold configured cluster has no rank process to answer the normal
+        # distributed clear RPC. Its persistent snapshots still belong to the
+        # same global SSD-cache action, so remove the shared local root when no
+        # loaded distributed rank handled the request. Keep the live root in
+        # place when ranks are active: their store objects continue writing
+        # after clear and own their directory lifetime.
+        if distributed_ranks == 0:
+            cluster_roots = (
+                cache_dir / "cluster-prompt-snapshots",
+                # Pre-unification location; clearing SSD cache also cleans the
+                # one-time legacy residue left by an older build.
+                Path(global_settings.base_path)
+                / "cluster/runtime/prompt-cache-ssd",
+            )
+            for cluster_root in cluster_roots:
+                if not cluster_root.exists():
+                    continue
+                try:
+                    total_deleted += sum(
+                        1 for item in cluster_root.rglob("*") if item.is_file()
+                    )
+                    shutil.rmtree(cluster_root)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clean distributed SSD cache directory %s: %s",
+                        cluster_root,
+                        exc,
+                    )
+            try:
+                remote_deleted, configured_ranks = await asyncio.to_thread(
+                    _clear_cold_remote_cluster_cache_roots,
+                    cluster_roots,
+                )
+                total_deleted += remote_deleted
+                distributed_ranks = configured_ranks
+            except Exception as exc:
+                logger.warning("Failed to clean cold peer SSD cache: %s", exc)
+                distributed_failures.append(f"cold cluster peers: {exc}")
+
+    if distributed_failures:
+        raise HTTPException(
+            status_code=503,
+            detail="; ".join(distributed_failures)[:1000],
+        )
+    return {
+        "status": "ok",
+        "total_deleted": total_deleted,
+        "distributed_ranks": distributed_ranks,
+    }
 
 
 @router.post("/api/hot-cache/clear")
@@ -5584,7 +6044,24 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
 
     footprint_before = get_phys_footprint()
     total_cleared = 0
+    distributed_ranks = 0
+    distributed_failures = []
     reclaim_targets = []
+    for model_id, scheduler, core in _iter_loaded_engine_records():
+        distributed_clear = getattr(core, "clear_prompt_caches", None)
+        if not callable(distributed_clear):
+            continue
+        try:
+            report = await distributed_clear(hot=True)
+            total_cleared += int(report.get("hot_cleared", 0))
+            distributed_ranks += len(report.get("ranks", ()))
+        except Exception as exc:
+            logger.warning(
+                "Failed to clear distributed hot cache for model '%s': %s",
+                model_id,
+                exc,
+            )
+            distributed_failures.append(f"{model_id}: {exc}")
     for model_id, scheduler, core in _iter_loaded_scheduler_records():
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
@@ -5641,10 +6118,16 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
         await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
     bytes_reclaimed = max(0, footprint_before - get_phys_footprint())
 
+    if distributed_failures:
+        raise HTTPException(
+            status_code=503,
+            detail="; ".join(distributed_failures)[:1000],
+        )
     return {
         "status": "ok",
         "total_cleared": total_cleared,
         "bytes_reclaimed": bytes_reclaimed,
+        "distributed_ranks": distributed_ranks,
     }
 
 
@@ -6692,7 +7175,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune a Qwen or DeepSeek ANE split without persisting settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -6750,6 +7233,16 @@ async def start_ane_tuning(
         raise HTTPException(
             status_code=400,
             detail=f"Model {tuning_request.model_id} is not a supported language model",
+        )
+    config_type = str(getattr(entry, "config_model_type", "") or "")
+    config_type = config_type.lower().replace("-", "_")
+    if (
+        tuning_request.model_family == "deepseek_v4"
+        and not config_type.startswith("deepseek_v4")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="DeepSeek ANE tuning is available only for DeepSeek-V4 models.",
         )
 
     cleanup_old_runs()

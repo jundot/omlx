@@ -32,10 +32,6 @@ _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
-# command line so the peer's shell expands ``~`` to its own home.
-DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
-
 
 def is_local_host(host: str) -> bool:
     """Whether this address names this machine, so ssh would be a detour."""
@@ -171,8 +167,11 @@ def shards_for_stage(
 # Files a model needs besides its weights. Tiny, so always staged.
 _SIDECAR_GLOBS = (
     "*.json",
+    "*.jsonl",
     "*.txt",
     "*.model",
+    "*.tiktoken",
+    "*.py",
     "tokenizer*",
     "*.jinja",
 )
@@ -210,6 +209,11 @@ def _model_identity_digest(model_path: str | Path) -> str:
         hasher.update(struct.pack("<Q", len(payload)))
         hasher.update(payload)
     return hasher.hexdigest()
+
+
+# Public name for the digest; the manifest endpoint and peer comparison in
+# ``modelsync.py`` share this exact identity definition with staging.
+model_identity_digest = _model_identity_digest
 
 
 def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
@@ -365,7 +369,7 @@ def remote_model_staging_inventory(
     ssh_target: str,
     model_path: str,
     *,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> tuple[tuple[ShardInfo, ...], dict[str, int]]:
     """Read a complete source model's shard map on the Mac that owns it."""
@@ -484,7 +488,7 @@ def stage_manifest(
     hosts_by_node: dict[str, str],
     *,
     source_host: str = "127.0.0.1",
-    source_python_executable: str = DEFAULT_REMOTE_PYTHON,
+    source_python_executable: str | None = None,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -933,7 +937,8 @@ def stage_files_from_source(
     to the coordinator's own absolute source path, correct only when every Mac
     shares the same $HOME. On a cross-user cluster the caller passes the path
     resolved in the destination's own home so the present-file probe and the
-    scp destination address the peer's real directory.
+    scp destination address the peer's real directory. Cluster v2 callers pass
+    the node's path_map entry here when one exists.
     """
 
     import time
@@ -1060,7 +1065,7 @@ def run_remote_python(
     argument: str,
     *,
     description: str,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> Any:
     """Run one line of oMLX on a peer and return the JSON it printed.
@@ -1071,19 +1076,22 @@ def run_remote_python(
     reaches here from an API request, and an unquoted one is a command the
     peer's shell would happily run. Paths keep their ``~`` because the oMLX
     side expands it in Python.
+
+    With no ``python_executable``, the peer's own interpreter is discovered
+    over SSH (see ``launch.resolve_remote_python``) rather than assumed —
+    there is no install layout every peer shares.
     """
 
-    executable = str(python_executable).strip()
-    if executable == DEFAULT_REMOTE_PYTHON:
-        # This one fixed internal default intentionally keeps ``~`` for the
-        # peer shell. All discovered/user-carried paths must be absolute and
-        # are quoted as a single word below.
-        executable_word = executable
-    else:
-        path = Path(executable)
-        if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
-            raise ValueError("remote Python executable must be an absolute path")
-        executable_word = shlex.quote(executable)
+    executable = str(python_executable or "").strip()
+    if not executable:
+        # Late import: launch.py already imports this module.
+        from .launch import resolve_remote_python
+
+        executable = resolve_remote_python(ssh_target)
+    path = Path(executable)
+    if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
+        raise ValueError("remote Python executable must be an absolute path")
+    executable_word = shlex.quote(executable)
     result = subprocess.run(
         [
             "ssh",
@@ -1217,7 +1225,8 @@ def stage_remote_files(
     coordinator's own absolute source path, which is only correct when every
     Mac shares the same $HOME. On a cross-user cluster the caller must pass the
     directory resolved in the peer's own home, or the present-file probe reads
-    an empty directory and re-copies everything.
+    an empty directory and re-copies everything. Cluster v2 callers pass the
+    node's path_map entry here when one exists.
     """
 
     import time

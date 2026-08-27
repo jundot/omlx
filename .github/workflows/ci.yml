@@ -37,4 +37,45 @@ jobs:
           python -m pip install pytest pytest-asyncio
 
       - name: Run unit tests
-        run: python -m pytest tests/ -m "not slow and not integration"
+        run: |
+          # These safetensors/GDN/embedding suites delete backing files or
+          # mutate process-global MLX/model state. The snapshot-cache file
+          # itself needs one fresh interpreter per test: file-level isolation
+          # only moves a stale lazy mapping to its next array-evaluating node.
+          # The main suite still covers every other test in one process.
+          python -m pytest tests/ -m "not slow and not integration" \
+            --ignore=tests/test_cluster_prompt_snapshot_cache.py \
+            --ignore=tests/test_gdn_sidecar_quantization.py \
+            --ignore=tests/test_prefix_cache_gdn_split.py \
+            --ignore=tests/test_cluster_ds4_shard_native_adapter.py \
+            --ignore=tests/test_cluster_ds4f_tp.py \
+            --ignore=tests/test_embedding.py
+          while IFS= read -r test_node; do
+            python -m pytest -q "$test_node" -m "not slow and not integration"
+          done < <(
+            python -m pytest --collect-only -qq tests/test_cluster_prompt_snapshot_cache.py \
+              -m "not slow and not integration" | \
+              sed -n '/^tests\/test_cluster_prompt_snapshot_cache.py::/p'
+          )
+          # Two GDN tests rewrite/evaluate safetensors after prior lazy MLX
+          # mappings in this same module. Isolate only those functions; the
+          # remaining GDN suite still runs together for normal coverage.
+          python -m pytest -q tests/test_gdn_sidecar_quantization.py -m "not slow and not integration" \
+            --deselect=tests/test_gdn_sidecar_quantization.py::test_rejected_sidecar_degrades_to_a_cache_miss \
+            --deselect=tests/test_gdn_sidecar_quantization.py::test_pending_raw_and_durable_file_restore_identically
+          python -m pytest -q tests/test_gdn_sidecar_quantization.py::test_rejected_sidecar_degrades_to_a_cache_miss -m "not slow and not integration"
+          python -m pytest -q tests/test_gdn_sidecar_quantization.py::test_pending_raw_and_durable_file_restore_identically -m "not slow and not integration"
+          python -m pytest -q tests/test_prefix_cache_gdn_split.py -m "not slow and not integration"
+          # The shard-native adapter suite also rewrites model.safetensors
+          # fixtures while MLX may still retain a lazy mapping from an earlier
+          # test. Run each collected node in a fresh interpreter so a deleted
+          # fixture can never poison a later mx.save_safetensors call.
+          while IFS= read -r test_node; do
+            python -m pytest -q "$test_node" -m "not slow and not integration"
+          done < <(
+            python -m pytest --collect-only -qq tests/test_cluster_ds4_shard_native_adapter.py \
+              -m "not slow and not integration" | \
+              sed -n '/^tests\/test_cluster_ds4_shard_native_adapter.py::/p'
+          )
+          python -m pytest -q tests/test_cluster_ds4f_tp.py -m "not slow and not integration"
+          python -m pytest -q tests/test_embedding.py -m "not slow and not integration"

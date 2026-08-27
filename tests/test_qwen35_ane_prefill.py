@@ -104,6 +104,18 @@ class _Model(nn.Module):
         self.layers = [_MLP() for _ in range(count)]
 
 
+class _FakeGroup:
+    def __init__(self, rank=0, size=2):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
 class _GDN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -711,6 +723,55 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
 
     assert result.shape == (1, 1, 128)
     assert captured[0][-2:] == (8, True)
+
+
+def test_tp_quantized_linears_remain_ane_eligible_and_reduce_down(monkeypatch):
+    from mlx.nn.layers.distributed import shard_linear
+    from omlx.patches import qwen35_q4_mlp as q4_patch
+
+    group = _FakeGroup()
+    gate_source = nn.QuantizedLinear(
+        128, 256, bias=False, group_size=64, bits=4
+    )
+    gate_source.scales = gate_source.scales.astype(mx.bfloat16)
+    gate_source.biases = gate_source.biases.astype(mx.bfloat16)
+    down_source = nn.QuantizedLinear(
+        256, 128, bias=False, group_size=64, bits=4
+    )
+    down_source.scales = down_source.scales.astype(mx.bfloat16)
+    down_source.biases = down_source.biases.astype(mx.bfloat16)
+    gate = shard_linear(
+        gate_source,
+        "all-to-sharded",
+        group=group,
+    )
+    down = shard_linear(
+        down_source,
+        "sharded-to-all",
+        group=group,
+    )
+
+    assert ane_patch._affine_spec(gate, gate.scales.dtype) == (4, 64)
+    assert ane_patch._affine_spec(down, down.scales.dtype) == (4, 64)
+
+    marker = mx.zeros((1, 4, 128), dtype=mx.bfloat16)
+    reductions = []
+    monkeypatch.setattr(q4_patch, "_linear_qmm", lambda *args: marker)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, *, group: reductions.append((value, group)) or value,
+    )
+
+    result = ane_patch._post_ane_linear(
+        down,
+        mx.zeros((1, 4, 128), dtype=mx.bfloat16),
+        8,
+        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
+    )
+
+    assert result is marker
+    assert reductions == [(marker, group)]
 
 
 def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):

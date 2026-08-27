@@ -46,7 +46,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -195,6 +195,59 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
+
+
+_MULTIMODAL_INPUT_TYPES = frozenset(
+    {
+        "image",
+        "image_url",
+        "input_image",
+        "video",
+        "video_url",
+        "input_video",
+        "audio",
+        "input_audio",
+    }
+)
+
+
+def _contains_multimodal_content(value: object) -> bool:
+    """Return whether an API content tree carries image/video/audio input."""
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        value = model_dump(exclude_none=True)
+
+    if isinstance(value, dict):
+        content_type = value.get("type")
+        if (
+            isinstance(content_type, str)
+            and content_type.lower() in _MULTIMODAL_INPUT_TYPES
+        ):
+            return True
+        return any(_contains_multimodal_content(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_multimodal_content(item) for item in value)
+    return False
+
+
+def _reject_cluster_text_backbone_multimodal(
+    engine: object,
+    content: object,
+) -> None:
+    """Fail closed when a distributed text-only wrapper receives media."""
+
+    if getattr(engine, "text_backbone_only", False) and _contains_multimodal_content(
+        content
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This clustered deployment serves only the model's text backbone; "
+                "image, video, and audio inputs are not supported. Use the model's "
+                "single-node VLM engine or send a text-only request."
+            ),
+        )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -422,6 +475,32 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
+    # Reap distributed ranks orphaned by a crashed previous coordinator
+    # (G8): all teardown used to live in-process, so a SIGKILL/panic of
+    # omlx-server stranded loaded ranks with no owner. The launch manifest
+    # written at spawn lets this new coordinator finish the teardown.
+    # The HTTP control plane may still start so the operator can read the
+    # failure, but DistributedJobSupervisor.start treats any retained
+    # manifest/failure as an admission barrier for new ranks.
+    try:
+        from .cluster.launch import reap_orphaned_launches
+
+        orphan_report = await asyncio.to_thread(reap_orphaned_launches)
+        if orphan_report["failures"]:
+            logger.warning(
+                "Orphaned distributed launch recovery report from a previous "
+                "coordinator (failures remain blocked): %s",
+                orphan_report,
+            )
+        elif orphan_report["reaped"]:
+            logger.warning(
+                "Reaped orphaned distributed launches from a previous "
+                "coordinator: %s",
+                orphan_report,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Orphaned-launch reaper failed at startup: %s", exc)
+
     # Publish the interpreter another Mac's coordinator discovers over SSH.
     # Without it a packaged-app peer fails every discovery candidate and gets
     # reported as "worker runtime is not installed" (#2680). Best effort: a
@@ -464,6 +543,48 @@ async def lifespan(app: FastAPI):
                     break
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
+
+    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # manual + Tailscale). Best-effort: discovery failures must never block
+    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    discovery_service = None
+    if (
+        distributed_inference_enabled()
+        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        try:
+            from .cluster.discovery import (
+                DiscoveryConfig,
+                DiscoveryService,
+                configure_discovery_service,
+                load_cluster_name,
+            )
+            from .cluster.identity import get_node_identity
+            from .cluster.registry import get_device_registry
+
+            cluster_base = (
+                Path(_server_state.global_settings.base_path)
+                if _server_state.global_settings is not None
+                else Path.home() / ".omlx"
+            )
+            discovery_service = DiscoveryService(
+                get_node_identity(),
+                get_device_registry(),
+                DiscoveryConfig(
+                    cluster_name=load_cluster_name(cluster_base),
+                    http_port=(
+                        _server_state.global_settings.server.port
+                        if _server_state.global_settings is not None
+                        else 8000
+                    )
+                ),
+            )
+            configure_discovery_service(discovery_service)
+            await asyncio.to_thread(discovery_service.start)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to start: %s", exc)
+            discovery_service = None
 
     # Start process memory enforcer if configured
     if (
@@ -566,6 +687,14 @@ async def lifespan(app: FastAPI):
             await bonjour_task
     if bonjour_publisher is not None:
         bonjour_publisher.stop()
+    if discovery_service is not None:
+        try:
+            from .cluster.discovery import configure_discovery_service
+
+            await asyncio.to_thread(discovery_service.stop)
+            configure_discovery_service(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to stop: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -672,6 +801,19 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster v2 model-sync manifest: admin-gated like the rest of the
+    # cluster surface; peers use it to compare model contents before sync.
+    from .cluster.modelsync import manifest_router as cluster_manifest_router
+    from .cluster.modelsync import set_modelsync_getters
+
+    set_modelsync_getters(get_engine_pool)
+    app.include_router(
+        cluster_manifest_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
     # command. Claim/source/complete authenticate with one-time enrollment
     # credentials, not the browser's admin cookie.
@@ -679,6 +821,33 @@ def _register_cluster_routes() -> None:
         cluster_join_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
+    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # rate-limited probe peers use to verify announced addresses before any
+    # pairing trust exists; /api/cluster/devices requires admin per-route.
+    from .cluster.discovery_routes import discovery_router
+
+    app.include_router(
+        discovery_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2 pairing (Module B): the joiner's pair/request + pair/status
+    # are public but carry only blake2s(code + node_id) and a code-encrypted
+    # cluster key — the admin's approve step is the trust decision. Approve,
+    # deny, and unpair are admin-only like every other cluster mutation.
+    from .cluster.pairing_routes import pair_admin_router, pair_router
+
+    app.include_router(
+        pair_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    app.include_router(
+        pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+
     _cluster_routes_registered = True
 
 
@@ -1057,6 +1226,93 @@ class DebugRequestLoggingMiddleware:
         await self.app(scope, cached_receive, send)
 
 
+_DISCONNECT_SIGNAL_SCOPE_KEY = "omlx.client_disconnect_signal"
+_disconnect_callback_tasks: set[asyncio.Task] = set()
+
+
+class _ClientDisconnectSignal:
+    """Fan one ASGI disconnect message out to request-owned cleanup hooks.
+
+    Starlette's ``StreamingResponse`` and ``Request.is_disconnected()`` both
+    consume the same one-shot ``http.disconnect`` receive message.  Whichever
+    one wins used to hide it from the other.  In particular, a real Uvicorn
+    socket could close while a long distributed prefill kept running because
+    the response generator never reached its nested ``aclose()`` chain.
+
+    The outer ASGI middleware records the message before either consumer sees
+    it, then schedules request-scoped callbacks outside Starlette's response
+    cancellation scope.  A callback is keyed by the inference request id, so
+    cancelling one client can never fall back to aborting every active request.
+    """
+
+    def __init__(self) -> None:
+        self._disconnected = False
+        self._next_token = 0
+        self._callbacks: dict[int, Callable[[], Awaitable[None]]] = {}
+
+    def register(self, callback: Callable[[], Awaitable[None]]) -> int:
+        self._next_token += 1
+        token = self._next_token
+        if self._disconnected:
+            self._spawn(callback)
+        else:
+            self._callbacks[token] = callback
+        return token
+
+    def unregister(self, token: int) -> None:
+        self._callbacks.pop(token, None)
+
+    def disconnect(self) -> None:
+        if self._disconnected:
+            return
+        self._disconnected = True
+        callbacks = tuple(self._callbacks.values())
+        self._callbacks.clear()
+        for callback in callbacks:
+            self._spawn(callback)
+
+    @staticmethod
+    def _spawn(callback: Callable[[], Awaitable[None]]) -> None:
+        async def run_callback() -> None:
+            try:
+                await callback()
+            except Exception:
+                logger.exception("Request-scoped disconnect callback failed")
+
+        task = asyncio.create_task(run_callback())
+        # asyncio only holds weak task references.  Retain the detached abort
+        # until it completes; Starlette may already be cancelling the response
+        # task that observed the disconnect.
+        _disconnect_callback_tasks.add(task)
+        task.add_done_callback(_disconnect_callback_tasks.discard)
+
+
+class ClientDisconnectTrackingMiddleware:
+    """Record ``http.disconnect`` before competing ASGI consumers receive it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        signal = _ClientDisconnectSignal()
+        scope[_DISCONNECT_SIGNAL_SCOPE_KEY] = signal
+
+        async def tracked_receive():
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                signal.disconnect()
+            return message
+
+        await self.app(scope, tracked_receive, send)
+
+
+# Keep this outside response middleware so every consumer of ASGI ``receive``
+# passes through the same one-shot disconnect fan-out.
+app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
 
 
@@ -1328,7 +1584,14 @@ async def _release_after_stream(
         async for chunk in generator:
             yield chunk
     finally:
-        await lease.release()
+        try:
+            # StreamingResponse closes this outer iterator on disconnect.
+            # Await the nested body close before releasing the pool lease so
+            # its engine request (and, for clusters, private rank-zero HTTP
+            # response) cannot outlive the lease that was protecting it.
+            await _aclose_async_iterator(generator)
+        finally:
+            await lease.release()
 
 
 async def get_engine_for_model(
@@ -1886,9 +2149,17 @@ def init_server(
         _register_cluster_routes()
     response_state_dir = None
     if global_settings:
-        response_state_dir = (
-            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
-            / "response-state"
+        ssd_cache_root = global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        )
+        response_state_dir = ssd_cache_root / "response-state"
+        # The hostfile copies this value to every rank. Preserve an explicit
+        # operator override, otherwise colocate cluster snapshots with the
+        # configured ordinary SSD cache instead of hiding them under runtime
+        # marker state.
+        os.environ.setdefault(
+            "OMLX_CLUSTER_PROMPT_CACHE_ROOT",
+            str(ssd_cache_root / "cluster-prompt-snapshots"),
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
 
@@ -1974,15 +2245,52 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
-    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
-    from .cluster.registry import configure_cluster_registry
+    from .cluster.pairing import configure_pairing_manager
+    from .cluster.registry import (
+        configure_cluster_registry,
+        configure_device_registry,
+        get_device_registry,
+    )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
+    from .cluster.tp_qualifications import (
+        configure_tp_layout_qualification_store,
+    )
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+    configure_tp_layout_qualification_store(base_path)
+    # Cluster v2: stable node identity + trusted device inventory. Best
+    # effort — a failure here must never block local inference. Configured
+    # before the pairing manager so pairing approvals persist into the real
+    # device registry instead of the schema-compatible fallback store.
+    try:
+        from .cluster.identity import configure_node_identity
+
+        configure_node_identity(base_path)
+        configure_device_registry(base_path / "cluster" / "devices.json")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+    try:
+        device_registry = get_device_registry()
+    except RuntimeError:
+        device_registry = None
+    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # available (DeviceRegistryBridge adapts the API and fails loudly on
+    # drift); otherwise the schema-compatible fallback store is used. The
+    # caps provider resolves at call time — discovery is configured later in
+    # startup — so join requests carry the same caps discovery announces.
+    from .cluster.discovery import announced_caps
+
+    configure_pairing_manager(
+        base_path,
+        registry=device_registry,
+        enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
+    )
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
@@ -2186,6 +2494,70 @@ async def _safe_anext(ait):
         return await ait.__anext__()
     except StopAsyncIteration:
         return _KEEPALIVE_SENTINEL
+
+
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Deterministically unwind a nested async stream, when it supports it.
+
+    ``async for`` does not await ``aclose()`` on the iterator when the *outer*
+    async generator is closed at one of its own yield points. The runtime may
+    eventually finalize that iterator, but a client disconnect must release an
+    inference request now: local engines abort their scheduler request in that
+    close path and the distributed engine closes its private rank-zero HTTP
+    response there. The compatibility check keeps this safe for custom async
+    iterators used by integrations and tests.
+    """
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
+
+
+def _request_abort_id(engine: BaseEngine) -> str | None:
+    """Mint an opaque id only for engines with targeted abort semantics."""
+
+    if not getattr(engine, "supports_request_scoped_abort", False):
+        return None
+    abort = getattr(engine, "abort_request", None)
+    if not callable(abort):
+        return None
+    return f"transport-{uuid.uuid4().hex}"
+
+
+async def _with_request_disconnect_abort(
+    generator: AsyncIterator[str],
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    request_id: str | None,
+) -> AsyncIterator[str]:
+    """Bind one public response transport to one inference request.
+
+    The ASGI middleware invokes ``abort_request`` as soon as either Starlette
+    or our keepalive poll consumes ``http.disconnect``.  The ordinary nested
+    iterator close remains in ``finally`` as a second, local-engine-safe path.
+    """
+
+    signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    token: int | None = None
+    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
+        abort = getattr(engine, "abort_request")
+
+        async def abort_disconnected_request() -> None:
+            await abort(
+                request_id,
+                reason="public client transport disconnected",
+                error_code="client_disconnected",
+            )
+
+        token = signal.register(abort_disconnected_request)
+
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        await _aclose_async_iterator(generator)
 
 
 async def _with_sse_keepalive(
@@ -2411,6 +2783,8 @@ async def _json_response_or_keepalive(
     media_type: str = "application/json",
     headers: dict | None = None,
     lease: "_LLMEngineLease | None" = None,
+    engine: BaseEngine | None = None,
+    request_id: str | None = None,
 ) -> Response:
     """Resolve a non-streaming JSON-body coroutine, preferring a real HTTP
     status code over the keepalive-streaming fallback.
@@ -2459,6 +2833,13 @@ async def _json_response_or_keepalive(
         return Response(content=result, media_type=media_type, headers=headers)
 
     generator = _with_json_keepalive(http_request, task)
+    if engine is not None:
+        generator = _with_request_disconnect_abort(
+            generator,
+            http_request,
+            engine,
+            request_id,
+        )
     if lease is not None:
         generator = _release_after_stream(generator, lease)
     return StreamingResponse(generator, media_type=media_type, headers=headers)
@@ -3363,6 +3744,7 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3371,18 +3753,24 @@ async def create_completion(
                 keepalive = _completion_keepalive_chunk(response_id)
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            model_load_duration=model_load_duration,
-                            prompt_token_ids=prompt_token_ids_by_prompt[0],
-                            resolved_model=resolved_model,
-                            response_id=response_id,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_completion(
+                                engine,
+                                prompts[0],
+                                request,
+                                model_load_duration=model_load_duration,
+                                prompt_token_ids=prompt_token_ids_by_prompt[0],
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                inference_request_id=inference_request_id,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -3428,6 +3816,8 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
+            if inference_request_id is not None:
+                gen_kwargs["_request_id"] = inference_request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -3514,7 +3904,11 @@ async def create_completion(
             ).model_dump_json(exclude_none=True)
 
         return await _json_response_or_keepalive(
-            http_request, _build_completion(), lease=lease
+            http_request,
+            _build_completion(),
+            lease=lease,
+            engine=engine,
+            request_id=inference_request_id,
         )
     except BaseException:
         await lease.release()
@@ -3579,6 +3973,7 @@ async def create_chat_completion(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -3898,6 +4293,9 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -3911,18 +4309,23 @@ async def create_chat_completion(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_chat_completion(
-                            engine,
-                            messages,
-                            request,
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_id=response_id,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_chat_completion(
+                                engine,
+                                messages,
+                                request,
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -4054,7 +4457,12 @@ async def create_chat_completion(
             {"Warning": response_format_warning} if response_format_warning else None
         )
         return await _json_response_or_keepalive(
-            http_request, _build_chat_completion(), lease=lease, headers=json_headers
+            http_request,
+            _build_chat_completion(),
+            lease=lease,
+            headers=json_headers,
+            engine=engine,
+            request_id=inference_request_id,
         )
 
     except BaseException:
@@ -4477,6 +4885,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    inference_request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4518,6 +4927,8 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    if inference_request_id is not None:
+        gen_kwargs["_request_id"] = inference_request_id
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -4525,23 +4936,24 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    engine_stream = engine.stream_generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        stop=request.stop,
+        seed=request.seed,
+        **gen_kwargs,
+    )
     try:
-        async for output in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            stop=request.stop,
-            seed=request.seed,
-            **gen_kwargs,
-        ):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -4572,6 +4984,8 @@ async def stream_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Record metrics
     if last_output and last_output.finished:
@@ -4794,8 +5208,9 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -4848,6 +5263,8 @@ async def stream_chat_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -5257,8 +5674,9 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -5345,6 +5763,8 @@ async def stream_anthropic_messages(
             yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
@@ -5608,6 +6028,7 @@ async def create_anthropic_message(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5846,20 +6267,28 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_anthropic_messages(
-                            engine,
-                            messages,
-                            request,
-                            resolved_model=resolved_model,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_anthropic_messages(
+                                engine,
+                                messages,
+                                request,
+                                resolved_model=resolved_model,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("anthropic"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("anthropic"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -5946,7 +6375,11 @@ async def create_anthropic_message(
             return response.model_dump_json()
 
         return await _json_response_or_keepalive(
-            http_request, _build_anthropic_message(), lease=lease
+            http_request,
+            _build_anthropic_message(),
+            lease=lease,
+            engine=engine,
+            request_id=inference_request_id,
         )
 
     except BaseException:
@@ -6104,6 +6537,7 @@ async def create_response(
         model_load_duration = time.perf_counter() - load_start
 
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.input)
 
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
@@ -6358,6 +6792,9 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
@@ -6365,21 +6802,26 @@ async def create_response(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_responses_api(
-                            engine,
-                            messages,
-                            request,
-                            input_messages=current_input_messages,
-                            store_response=_should_store_response(request.store),
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_format=response_format,
-                            native_reasoning=native_reasoning,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_responses_api(
+                                engine,
+                                messages,
+                                request,
+                                input_messages=current_input_messages,
+                                store_response=_should_store_response(request.store),
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_format=response_format,
+                                native_reasoning=native_reasoning,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("openai_responses"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("openai_responses"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -6533,7 +6975,12 @@ async def create_response(
             {"Warning": response_format_warning} if response_format_warning else None
         )
         return await _json_response_or_keepalive(
-            http_request, _build_responses_api(), lease=lease, headers=json_headers
+            http_request,
+            _build_responses_api(),
+            lease=lease,
+            headers=json_headers,
+            engine=engine,
+            request_id=inference_request_id,
         )
 
     except BaseException:
@@ -6813,8 +7260,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -6879,6 +7327,8 @@ async def stream_responses_api(
             },
         )
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining content from parsers
     if stream_content:

@@ -41,7 +41,7 @@ from typing import Any, Callable, Generator, List, Optional, Set, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-
+from mlx_vlm.speculative import common as _vlm_speculative_common
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
 
 # The round loops dispatch their target-verify and cache-rollback forwards
@@ -66,6 +66,87 @@ from ..utils.metal_sync import _sync_and_clear_cache
 from ..utils.model_loading import materialize_lazy_state
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# mlx-vlm compat patch: MLX 0.32.1 immutable global RNG state
+# ---------------------------------------------------------------------------
+# mlx-vlm 0.6.3 snapshots the target and drafter RNG streams and restores a
+# snapshot with ``mx.random.state[i] = value``.  MLX 0.32.1 changed
+# ``mx.random.state`` from a mutable list into a thread-local ``_RandomState``
+# sentinel.  The sentinel is still iterable, so mlx-vlm can take a snapshot,
+# but item assignment raises TypeError when a non-positioned sampler enters an
+# MTP round.  That is the normal production path for requests without logits
+# processors, not merely a test-only incompatibility.
+#
+# An MLX PRNG key is the uint32 pair returned by ``mx.random.key(seed)``.  The
+# pair is the high and low words of the uint64 seed, so reseeding with those
+# words restores the exact stream on immutable-state releases.  Keep the
+# legacy mlx-vlm implementation as the first choice and use this path only
+# when MLX specifically rejects item assignment.
+
+_installed_rng_restore = getattr(
+    _vlm_speculative_common, "_restore_rng_state", None
+)
+_original_rng_restore = getattr(
+    _installed_rng_restore,
+    "_omlx_original_rng_restore",
+    _installed_rng_restore,
+)
+
+
+def _rng_key_as_uint64(state: list[mx.array]) -> int:
+    """Encode MLX's single uint32[2] global PRNG key as its uint64 seed."""
+
+    if len(state) != 1:
+        raise RuntimeError(
+            "cannot restore MLX RNG state: expected one global PRNG key"
+        )
+    key = state[0]
+    if tuple(key.shape) != (2,) or key.dtype != mx.uint32:
+        raise RuntimeError(
+            "cannot restore MLX RNG state: expected a uint32[2] PRNG key"
+        )
+    words = key.tolist()
+    if (
+        not isinstance(words, list)
+        or len(words) != 2
+        or any(isinstance(word, bool) or not isinstance(word, int) for word in words)
+        or any(word < 0 or word > 0xFFFFFFFF for word in words)
+    ):
+        raise RuntimeError(
+            "cannot restore MLX RNG state: PRNG key words are invalid"
+        )
+    return (words[0] << 32) | words[1]
+
+
+def _restore_vlm_rng_state(
+    state: list[mx.array],
+    *,
+    legacy_restore: Callable[[list[mx.array]], None] | None = None,
+    random_module: Any = None,
+) -> None:
+    """Restore mlx-vlm RNG snapshots on mutable and immutable MLX releases."""
+
+    restore = _original_rng_restore if legacy_restore is None else legacy_restore
+    random_api = mx.random if random_module is None else random_module
+    if not callable(restore):
+        raise RuntimeError("mlx-vlm does not expose its RNG restore helper")
+    try:
+        restore(state)
+        return
+    except TypeError:
+        # Do not reinterpret unrelated errors from mutable-state releases.
+        if hasattr(random_api.state, "__setitem__"):
+            raise
+    random_api.seed(_rng_key_as_uint64(state))
+
+
+if callable(_original_rng_restore):
+    _restore_vlm_rng_state._omlx_original_rng_restore = (  # type: ignore[attr-defined]
+        _original_rng_restore
+    )
+    _vlm_speculative_common._restore_rng_state = _restore_vlm_rng_state
 
 # ---------------------------------------------------------------------------
 # mlx-vlm compat patch: Qwen3.5 MoE MTP drafter support

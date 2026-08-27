@@ -138,6 +138,29 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
+        deepseek_ane_prefill_enabled: Enable private fixed-shape DeepSeek-V4
+            hybrid ANE prefill (shared expert, attention-input projections,
+            wq_b, and stacked indexer wq_b).
+        deepseek_ane_prefill_sequence_length: Exact flattened token count routed
+            through the DeepSeek ANE procedures; also realigns the paged cache
+            block size, rebuilding this model's SSD cache once.
+        deepseek_ane_prefill_tail_padding_min_tokens: Smallest short token block
+            zero-padded to the compiled DeepSeek ANE shape (zero disables).
+        deepseek_ane_prefill_down_enabled: Accelerate the shared-expert down
+            projection independently of the other DeepSeek projections.
+        deepseek_ane_prefill_down_fraction: Fraction of shared-expert down
+            projection rows assigned across both ANE instances.
+        deepseek_ane_prefill_wo_a_enabled: Accelerate grouped attention-output
+            wo_a independently of the other DeepSeek projections.
+        deepseek_ane_prefill_wo_a_fraction: Fraction of each wo_a group's rows
+            assigned across both ANE instances.
+        deepseek_ane_prefill_cpu_enabled: Share benchmark-selected query
+            projection rows with the CPU while both ANEs and the GPU run.
+        deepseek_ane_prefill_cpu_fraction: Fraction of query projection rows
+            assigned to the CPU after the dual-ANE prefix.
+        deepseek_ane_prefill_cpu_threads: Requested Accelerate worker count.
+        deepseek_ane_prefill_cpu_shared_resource: Use Qwen's shared-resource
+            CPU scheduling policy; unavailable runtimes disable CPU offload.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -249,6 +272,25 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
+
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + attention-input stack +
+    # wq_b + stacked indexer wq_b). Off by default for the same reasons as
+    # the Qwen variant; also
+    # realigns the paged cache block size to the fixed ANE shape, so enabling
+    # it rebuilds this model's SSD cache once.
+    deepseek_ane_prefill_enabled: bool = False
+    deepseek_ane_prefill_sequence_length: int = 4096
+    deepseek_ane_prefill_tail_padding_min_tokens: int = 0
+    deepseek_ane_prefill_down_enabled: bool = True
+    deepseek_ane_prefill_down_fraction: float = 0.65
+    # The latest exact-head M3 Ultra matrix found grouped wo_a flat/slower;
+    # keep it opt-in until the bounded tuner proves a >=1% local win.
+    deepseek_ane_prefill_wo_a_enabled: bool = False
+    deepseek_ane_prefill_wo_a_fraction: float = 0.5
+    deepseek_ane_prefill_cpu_enabled: bool = True
+    deepseek_ane_prefill_cpu_fraction: float = 0.125
+    deepseek_ane_prefill_cpu_threads: int = 12
+    deepseek_ane_prefill_cpu_shared_resource: bool = True
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

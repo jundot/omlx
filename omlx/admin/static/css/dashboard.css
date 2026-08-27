@@ -49,6 +49,40 @@
     [data-theme="dark"] .text-neutral-400 { color: var(--text-muted) !important; }
     [data-theme="dark"] .text-neutral-300 { color: var(--text-muted) !important; }
 
+    /* Cluster status is operational data, not decorative helper copy. Keep
+       its cache/fabric labels and request metrics readable in dark mode even
+       when the global muted palette is intentionally subtle. */
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-600,
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-500 {
+        color: #d4d4d8 !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-400 {
+        color: #a1a1aa !important;
+    }
+
+    /* Cluster setup is an operational surface, often viewed while two Macs
+       are being wired side by side. Keep its dense labels legible without
+       changing the page title or the typography used by the rest of oMLX. */
+    [data-cluster-v2-wizard] .text-\[9px\] {
+        font-size: 0.6875rem !important;
+        line-height: 1rem !important;
+    }
+    [data-cluster-v2-wizard] .text-\[10px\],
+    [data-cluster-v2-wizard] .text-\[11px\] {
+        font-size: 0.75rem !important;
+        line-height: 1rem !important;
+    }
+    [data-cluster-v2-wizard] .text-xs {
+        font-size: 0.8125rem !important;
+        line-height: 1.125rem !important;
+    }
+    [data-cluster-v2-wizard] .text-neutral-400 {
+        color: #737373 !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-wizard] .text-neutral-400 {
+        color: #b3b3b3 !important;
+    }
+
     /* === Borders === */
     [data-theme="dark"] .border-neutral-100 { border-color: var(--border-faint) !important; }
     [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
@@ -103,6 +137,50 @@
     /* Spinner inside inverted button */
     [data-theme="dark"] button.bg-neutral-900 svg.animate-spin circle { stroke: #18181b; }
     [data-theme="dark"] button.bg-neutral-900 svg.animate-spin path { fill: #18181b; }
+
+    /* The cluster-v2 strategy control contains a nested recommendation pill.
+       The generic inverted-button rule above recolored every nested span and
+       made the selected Tensor label/pill look washed out in dark mode. Keep
+       this segmented control genuinely dark with explicit foregrounds. */
+    [data-theme="dark"] [data-cluster-v2-strategy-picker]
+        button[data-selected="true"] {
+        border-color: #71717a !important;
+        color: #f8fafc !important;
+        background: #27272a !important;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+        text-shadow: none;
+        -webkit-font-smoothing: antialiased;
+    }
+    [data-theme="dark"] [data-cluster-v2-strategy-picker]
+        button[data-selected="true"] > span:first-child {
+        color: #f8fafc !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-strategy-picker]
+        button[data-selected="true"] [data-cluster-v2-strategy-recommended] {
+        border-color: rgba(74, 222, 128, 0.45) !important;
+        color: #86efac !important;
+        background: rgba(20, 83, 45, 0.52) !important;
+    }
+
+    /* Tensor segments use a semantic palette instead of theme-remapped
+       Tailwind utilities. This prevents white-on-light text when dark-mode
+       utility overrides alter a segment background independently. */
+    .cluster-v2-tensor-segment {
+        color: #f8fafc;
+        text-shadow: none;
+        -webkit-font-smoothing: antialiased;
+    }
+    .cluster-v2-tensor-segment--0 { background: #18181b; }
+    .cluster-v2-tensor-segment--1 { background: #3f3f46; }
+    .cluster-v2-tensor-segment--2 { background: #52525b; }
+    .cluster-v2-tensor-segment--3 {
+        color: #18181b;
+        background: #d4d4d8;
+    }
+    .cluster-v2-tensor-segment--4 {
+        color: #27272a;
+        background: #e4e4e7;
+    }
 
     /* === Log viewer: keep dark === */
     [data-theme="dark"] div.bg-neutral-900 { background-color: #0f0f11 !important; }

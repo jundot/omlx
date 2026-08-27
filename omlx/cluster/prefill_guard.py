@@ -25,6 +25,8 @@ otherwise every rank enters the model collectives together.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -34,11 +36,54 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PREFILL_STEP = 2048
 
 
+def _kv_cache_replicated_layout(model: Any) -> bool:
+    """Whether every tensor-parallel member holds this model's full KV cache.
+
+    Mirrors the planner's ``_kv_cache_replicated_across_tp``: a GLM/DeepSeek
+    MLA latent cache (``kv_lora_rank`` + ``qk_rope_head_dim``) or a
+    DeepSeek-V4 pooled cache (valid ``compress_ratios``) is not per-head, so
+    ``shard()`` leaves it unsplit and each rank stores it whole.
+    """
+
+    config = getattr(model, "args", None) or getattr(model, "config", None)
+    if config is None:
+        return False
+
+    def _get(key: str) -> Any:
+        if isinstance(config, dict):
+            return config.get(key)
+        return getattr(config, key, None)
+
+    def _pos_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    if _pos_int(_get("kv_lora_rank")) and _pos_int(_get("qk_rope_head_dim")):
+        return True
+    model_type = _get("model_type")
+    if not isinstance(model_type, str) or not model_type.startswith("deepseek_v4"):
+        return False
+    num_layers = _get("num_hidden_layers")
+    ratios = _get("compress_ratios")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return False
+    ratios = tuple(ratios[:num_layers])
+    return len(ratios) == num_layers and all(
+        ratio in (0, 4, 128) for ratio in ratios
+    )
+
+
 def rank_monitor(
     model: Any,
     *,
+    start_layer: int = 0,
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    tensor_parallel_shard_weight: int = 0,
+    tensor_parallel_shard_weight_total: int = 0,
 ) -> Any | None:
     """A ``MemoryMonitor`` calibrated to the slice this rank actually holds.
 
@@ -65,19 +110,81 @@ def rank_monitor(
     heads = int(getattr(monitor, "_num_attention_heads", 0) or kv_heads)
     dtype_size = float(getattr(monitor, "_dtype_size", 2) or 2)
     kv_override = getattr(monitor, "_kv_bytes_per_token_override", None)
+    prefill_profile = getattr(monitor, "_prefill_memory_profile", None)
+    ane_prefill_transient_bytes = int(
+        getattr(monitor, "_ane_prefill_transient_bytes", 0) or 0
+    )
+    # Preserve the sliding-window layer groups ``set_model_info_from_model``
+    # classified: re-setting model info below would otherwise drop them and
+    # charge a hybrid model's windowed layers as full linear caches.
+    rotating_specs = getattr(monitor, "_rotating_layer_specs", ())
 
     # Pipeline: this rank stores KV for its own layers only.
     stage_layers = int(layer_count) if layer_count else num_layers
     stage_layers = max(1, min(stage_layers, num_layers or stage_layers))
 
-    # Tensor parallel: heads are split across ranks, so both the KV this rank
-    # stores and the attention transient it computes shrink with the shard.
+    # Tensor parallel: attention heads — and the transient they compute —
+    # split across ranks. The KV cache splits too, except replicated
+    # MLA-style layouts (GLM/DeepSeek latent, DeepSeek-V4 pooled), where
+    # shard() divides heads but every member holds the whole cache: dividing
+    # that by the TP degree under-counts each rank by exactly that factor.
+    kv_replicated = _kv_cache_replicated_layout(model)
     tp = max(1, int(tensor_parallel_size))
     if tp > 1:
-        kv_heads = max(1, kv_heads // tp)
-        heads = max(1, heads // tp)
-        if kv_override:
-            kv_override = float(kv_override) / tp
+        shard_weight = max(0, int(tensor_parallel_shard_weight))
+        shard_total = max(0, int(tensor_parallel_shard_weight_total))
+        if shard_weight and shard_total >= shard_weight:
+            heads = max(1, heads * shard_weight // shard_total)
+        else:
+            heads = max(1, heads // tp)
+        if not kv_replicated:
+            kv_heads = max(1, kv_heads // tp)
+            if kv_override:
+                kv_override = float(kv_override) / tp
+
+    # ``set_model_info`` below used to silently discard DS4's exact hybrid
+    # cache/attention profile. The fallback then priced a 250K prompt as a
+    # dense [heads, 1024, 250K] score matrix on every TP rank even though the
+    # live model uses local + pooled sparse attention. On the 3:5 M3/M5 split
+    # that fabricated roughly 30 GiB of transient memory and rejected a prompt
+    # whose exact-shape estimate is about 1--2 GiB.
+    #
+    # Keep the architecture profile and specialize its query-head count to the
+    # signed rank share. Pipeline stages also need the ratio counts for only
+    # their contiguous layer range; derive them from the same config that made
+    # the profile, failing closed to the generic estimator if it is malformed.
+    if prefill_profile is not None:
+        updates: dict[str, Any] = {"num_attention_heads": heads}
+        if stage_layers != num_layers:
+            config = getattr(model, "args", None) or getattr(model, "config", None)
+
+            def _get(key: str) -> Any:
+                if isinstance(config, dict):
+                    return config.get(key)
+                return getattr(config, key, None)
+
+            ratios = _get("compress_ratios")
+            start = max(0, int(start_layer))
+            if (
+                isinstance(ratios, Sequence)
+                and not isinstance(ratios, (str, bytes))
+                and start + stage_layers <= len(ratios)
+            ):
+                stage_ratios = tuple(ratios[start : start + stage_layers])
+                updates.update(
+                    local_layers=stage_layers,
+                    ratio4_layers=stage_ratios.count(4),
+                    ratio128_layers=stage_ratios.count(128),
+                )
+            else:
+                prefill_profile = None
+        if prefill_profile is not None:
+            try:
+                prefill_profile = replace(prefill_profile, **updates)
+            except (TypeError, ValueError):
+                # Future non-dataclass profiles must explicitly grow a rank
+                # specialization contract before the cluster can trust them.
+                prefill_profile = None
 
     monitor.set_model_info(
         num_layers=num_layers or stage_layers,
@@ -87,6 +194,9 @@ def rank_monitor(
         num_attention_heads=heads,
         num_kv_cache_layers=stage_layers,
         kv_bytes_per_token=kv_override,
+        rotating_layer_specs=rotating_specs,
+        prefill_memory_profile=prefill_profile,
+        ane_prefill_transient_bytes=ane_prefill_transient_bytes,
     )
     return monitor
 
@@ -217,15 +327,43 @@ class RankPrefillGuard:
         ]
         if not rejecting_ranks:
             return
-        if local_error is not None:
-            raise local_error
 
         rejecting = rejecting_ranks[0]
+        # Preserve the rejecting host's actionable estimate. Previously peers
+        # received only "would exceed the host memory limit", hiding whether
+        # the cause was resident usage, KV growth, or a generic-SDPA fallback
+        # estimate. This second collective runs only on rejection, after every
+        # rank agreed to leave, so accepted prefills pay nothing and ordering
+        # remains symmetric. Only the first rejecting rank contributes bytes;
+        # simultaneous rejectors therefore cannot corrupt the payload.
+        max_detail_bytes = 1023
+        detail_payload = [0] * (max_detail_bytes + 1)
+        if rank == rejecting and local_error is not None:
+            encoded = str(local_error).encode("utf-8", errors="replace")[
+                :max_detail_bytes
+            ]
+            detail_payload[0] = len(encoded)
+            detail_payload[1 : 1 + len(encoded)] = encoded
+        agreed_detail = collective_mx.distributed.all_sum(
+            collective_mx.array(detail_payload)
+        ).tolist()
+        detail_len = min(max_detail_bytes, max(0, int(agreed_detail[0])))
+        detail = bytes(
+            max(0, min(255, int(value)))
+            for value in agreed_detail[1 : 1 + detail_len]
+        ).decode("utf-8", errors="replace")
+
+        if local_error is not None:
+            raise local_error
         raise PrefillMemoryExceededError(
             message=(
                 f"Cluster prefill rejected by rank {rejecting}: its local model "
-                "slice would exceed the host memory limit. Reduce context length "
-                "or free memory on that node."
+                "slice would exceed the host memory limit. "
+                + (
+                    f"Rank detail: {detail}"
+                    if detail
+                    else "Reduce context length or free memory on that node."
+                )
             ),
             request_id=request_id,
         )
@@ -236,8 +374,11 @@ def build_guard(
     *,
     rank: int,
     node_id: str = "",
+    start_layer: int = 0,
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    tensor_parallel_shard_weight: int = 0,
+    tensor_parallel_shard_weight_total: int = 0,
     memory_guard_tier: str = "balanced",
     prefill_step_size: int = _DEFAULT_PREFILL_STEP,
 ) -> RankPrefillGuard:
@@ -254,8 +395,11 @@ def build_guard(
     return RankPrefillGuard(
         rank_monitor(
             model,
+            start_layer=start_layer,
             layer_count=layer_count,
             tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_shard_weight=tensor_parallel_shard_weight,
+            tensor_parallel_shard_weight_total=tensor_parallel_shard_weight_total,
         ),
         rank=rank,
         node_id=node_id,

@@ -69,7 +69,58 @@ enum ReleasesError: Error, CustomStringConvertible {
 }
 
 enum ReleasesChecker {
-    static let releasesURL = URL(string: "https://api.github.com/repos/jundot/omlx/releases?per_page=20")!
+    static let defaultRepository = "jonathan308/omlx"
+
+    static var repository: String {
+        configuredRepository(
+            Bundle.main.object(forInfoDictionaryKey: "OMLXReleaseRepository") as? String
+        )
+    }
+
+    static var repositoryURL: URL {
+        URL(string: "https://github.com/\(repository)")!
+    }
+
+    static var releasesPageURL: URL {
+        repositoryURL.appendingPathComponent("releases")
+    }
+
+    static var newIssueURL: URL {
+        repositoryURL.appendingPathComponent("issues/new")
+    }
+
+    static var releasesURL: URL {
+        releasesAPIURL(repository: repository)!
+    }
+
+    static func configuredRepository(_ candidate: String?) -> String {
+        guard let candidate, isValidRepository(candidate) else {
+            return defaultRepository
+        }
+        return candidate
+    }
+
+    static func releasesAPIURL(repository: String) -> URL? {
+        guard isValidRepository(repository) else { return nil }
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "api.github.com"
+        components.path = "/repos/\(repository)/releases"
+        components.queryItems = [URLQueryItem(name: "per_page", value: "20")]
+        return components.url
+    }
+
+    private static func isValidRepository(_ repository: String) -> Bool {
+        let components = repository.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 2 else { return false }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+        return components.allSatisfy { component in
+            !component.isEmpty
+                && component != "."
+                && component != ".."
+                && component.unicodeScalars.allSatisfy { allowed.contains($0) }
+        }
+    }
 
     /// Fetches recent releases and picks the newest one that beats `currentVersion`
     /// under the given channel. Returns `nil` if we're already up to date.

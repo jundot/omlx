@@ -28,6 +28,7 @@ enum UpdateInstaller {
         case atomicSwapFailed(Int32, String)
         case launchAgentFailed(String)
         case relaunchFailed(String)
+        case rollbackFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -45,6 +46,8 @@ enum UpdateInstaller {
                 return "Could not start the updater launch agent: \(message)"
             case .relaunchFailed(let message):
                 return "Could not relaunch oMLX: \(message)"
+            case .rollbackFailed(let message):
+                return "Could not roll back the failed oMLX update: \(message)"
             }
         }
     }
@@ -195,12 +198,11 @@ enum UpdateInstaller {
                 throw InstallerError.parentExitTimedOut(request.parentPID)
             }
 
-            try atomicSwap(
+            try replaceAndRelaunch(
                 liveApp: request.liveApp,
-                stagedApp: request.stagedApp
+                stagedApp: request.stagedApp,
+                relaunchAction: relaunch
             )
-            clearQuarantine(at: request.liveApp)
-            try relaunch(request.liveApp)
             return EXIT_SUCCESS
         } catch {
             NSLog("oMLX updater: %@", error.localizedDescription)
@@ -248,6 +250,33 @@ enum UpdateInstaller {
         }
     }
 
+    /// Swap in the staged bundle and relaunch it. If the relaunch request is
+    /// rejected, exchange the bundles again and relaunch the previous app.
+    /// Quarantine metadata is intentionally preserved so Gatekeeper remains
+    /// part of the update trust boundary.
+    static func replaceAndRelaunch(
+        liveApp: URL,
+        stagedApp: URL,
+        relaunchAction: (URL) throws -> Void
+    ) throws {
+        try atomicSwap(liveApp: liveApp, stagedApp: stagedApp)
+        do {
+            try relaunchAction(liveApp)
+        } catch {
+            let updateError = error
+            do {
+                try atomicSwap(liveApp: liveApp, stagedApp: stagedApp)
+                try relaunchAction(liveApp)
+            } catch {
+                throw InstallerError.rollbackFailed(error.localizedDescription)
+            }
+            NSLog(
+                "oMLX updater: updated app relaunch failed; restored previous bundle: %@",
+                updateError.localizedDescription
+            )
+        }
+    }
+
     private static var launchDomain: String {
         "gui/\(getuid())"
     }
@@ -271,19 +300,6 @@ enum UpdateInstaller {
         guard liveApp.pathExtension == "app" else {
             throw InstallerError.invalidBundlePaths("live bundle must be an app")
         }
-    }
-
-    private static func clearQuarantine(at app: URL) {
-        guard let result = try? runProcess(
-            "/usr/bin/xattr",
-            arguments: ["-rd", "com.apple.quarantine", app.path]
-        ), result.status != 0 else {
-            return
-        }
-        NSLog(
-            "oMLX updater: could not clear quarantine: %@",
-            result.stderr.isEmpty ? result.stdout : result.stderr
-        )
     }
 
     private static func relaunch(_ app: URL) throws {

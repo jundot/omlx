@@ -3,7 +3,11 @@
 
 import contextlib
 import json
+import os
+import signal
+import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,18 +16,394 @@ import pytest
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
+    _configure_distributed_mtp,
+    _configure_indexer_decode_owner,
+    _configure_tensor_shard_weights,
     _cross_thread_generation_stream,
     _execution_settings,
     _install_distributed_model_protocol,
+    _planned_prefill_shape_warmup_tokens,
+    _run_prefill_shape_warmup,
     _server_arguments,
+    _trace_collectives,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
+    _wait_for_serve_release,
     _watch_launcher_parent,
+    _write_cancel_request,
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_ds4_mtp_caps_decode_concurrency_until_batched_verification(
+    tmp_path,
+    monkeypatch,
+):
+    model = tmp_path / "ds4"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = SimpleNamespace(
+        model=str(model),
+        decode_concurrency=16,
+        prompt_concurrency=8,
+        pipeline_microbatch_size=8,
+    )
+
+    monkeypatch.delenv("OMLX_DSV4_MTP_DECODE_CONCURRENCY", raising=False)
+    assert inference_worker._apply_distributed_mtp_decode_concurrency(
+        args,
+        mtp_enabled=True,
+    ) == 1
+    assert args.decode_concurrency == 1
+    assert args.prompt_concurrency == 1
+    assert args.pipeline_microbatch_size == 1
+
+
+def test_non_mtp_decode_concurrency_is_unchanged(tmp_path):
+    model = tmp_path / "ds4"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = SimpleNamespace(
+        model=str(model),
+        decode_concurrency=16,
+        prompt_concurrency=8,
+        pipeline_microbatch_size=8,
+    )
+
+    assert inference_worker._apply_distributed_mtp_decode_concurrency(
+        args,
+        mtp_enabled=False,
+    ) == 16
+    assert args.decode_concurrency == 16
+    assert args.prompt_concurrency == 8
+    assert args.pipeline_microbatch_size == 8
+
+
+def test_collective_trace_records_order_and_restores_mlx_functions(
+    tmp_path, monkeypatch
+):
+    class Distributed:
+        def all_sum(self, value, **_kwargs):
+            return ("sum", value)
+
+        def all_gather(self, value, **_kwargs):
+            return ("gather", value)
+
+    distributed = Distributed()
+    mx = SimpleNamespace(distributed=distributed)
+    group = SimpleNamespace(rank=lambda: 1)
+    value = SimpleNamespace(shape=(2, 4096), dtype="bfloat16")
+    original_sum = distributed.all_sum.__func__
+    monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
+
+    with _trace_collectives(
+        mx,
+        group,
+        state_dir=tmp_path,
+        deployment_id="trace-test",
+    ) as path:
+        assert distributed.all_sum(value) == ("sum", value)
+        assert distributed.all_gather(value) == ("gather", value)
+
+    assert distributed.all_sum.__func__ is original_sum
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(item["seq"], item["op"]) for item in records] == [
+        (1, "all_sum"),
+        (2, "all_gather"),
+    ]
+    assert records[0]["rank"] == 1
+    assert records[0]["shape"] == [2, 4096]
+    assert records[0]["dtype"] == "bfloat16"
+    assert "test_collective_trace_records_order" in records[0]["caller"]
+
+
+def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    plan_hash = "a" * 64
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": plan_hash,
+                "world_size": 2,
+            }
+        )
+    )
+
+    _wait_for_serve_release(tmp_path, deployment_id, plan_hash, 2, timeout=0)
+
+
+def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": "old",
+                "world_size": 2,
+            }
+        )
+    )
+
+    with pytest.raises(TimeoutError, match="did not release"):
+        _wait_for_serve_release(
+            tmp_path,
+            deployment_id,
+            "new",
+            2,
+            timeout=0,
+        )
+
+
+def test_prefill_shape_warmup_requires_qualified_tp_metadata():
+    qualified = {
+        "deepseek_v4_adaptive_prefill": {
+            "active": True,
+            "shape_warmup_tokens": 1024,
+        }
+    }
+
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=2,
+        )
+        == 1024
+    )
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=1,
+        )
+        == 0
+    )
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            {"deepseek_v4_adaptive_prefill": {"active": False}},
+            tensor_parallel_size=2,
+        )
+        == 0
+    )
+    qualified["deepseek_v4_adaptive_prefill"]["shape_warmup_tokens"] = 8192
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=2,
+        )
+        == 0
+    )
+
+
+def test_prefill_shape_warmup_evaluates_cache_then_releases_scratch():
+    calls = []
+
+    class FakeMX:
+        int32 = "int32"
+
+        @staticmethod
+        def zeros(shape, *, dtype):
+            calls.append(("zeros", shape, dtype))
+            return "token-batch"
+
+        @staticmethod
+        def eval(*values):
+            calls.append(("eval", values))
+
+        @staticmethod
+        def synchronize():
+            calls.append(("synchronize",))
+
+        @staticmethod
+        def clear_cache():
+            calls.append(("clear_cache",))
+
+    class Model:
+        def __call__(self, tokens, **kwargs):
+            calls.append(("model", tokens, kwargs))
+            return "hidden-output"
+
+    caches = [SimpleNamespace(state="cache-0"), SimpleNamespace(state="cache-1")]
+
+    def cache_factory(model, *, max_kv_size):
+        calls.append(("cache_factory", model, max_kv_size))
+        return caches
+
+    ticks = iter((10.0, 10.25))
+    model = Model()
+    report = _run_prefill_shape_warmup(
+        FakeMX,
+        model,
+        tokens=1024,
+        max_kv_size=32768,
+        cache_factory=cache_factory,
+        clock=lambda: next(ticks),
+    )
+
+    assert report == {
+        "active": True,
+        "tokens": 1024,
+        "elapsed_seconds": 0.25,
+    }
+    assert ("cache_factory", model, 32768) in calls
+    assert ("zeros", (1, 1024), "int32") in calls
+    assert (
+        "model",
+        "token-batch",
+        {"cache": caches, "skip_lm_head": True},
+    ) in calls
+    assert ("eval", ("hidden-output", ["cache-0", "cache-1"])) in calls
+    assert calls[-1] == ("clear_cache",)
+
+
+def test_distributed_mtp_pins_one_signed_depth_on_every_rank(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"})
+    )
+    monkeypatch.delenv("OMLX_MTP_FIXED_DEPTH", raising=False)
+
+    fixed = _configure_distributed_mtp(
+        tmp_path,
+        enabled=True,
+        depth=5,
+        tensor_parallel_size=2,
+    )
+
+    assert fixed == 5
+    assert os.environ["OMLX_MTP_FIXED_DEPTH"] == "5"
+
+
+def test_distributed_mtp_can_qualify_coordinated_adaptive_depth(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"})
+    )
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "5")
+    monkeypatch.setenv("OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", "1")
+
+    fixed = _configure_distributed_mtp(
+        tmp_path,
+        enabled=True,
+        depth=5,
+        tensor_parallel_size=2,
+    )
+
+    assert fixed is None
+    assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
+
+
+def test_distributed_mtp_can_qualify_lockstep_acceptance_depth(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"})
+    )
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "5")
+    monkeypatch.setenv("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "1")
+
+    fixed = _configure_distributed_mtp(
+        tmp_path,
+        enabled=True,
+        depth=5,
+        tensor_parallel_size=2,
+    )
+
+    assert fixed is None
+    assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
+
+
+def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+
+    with pytest.raises(RuntimeError, match="not validated"):
+        _configure_distributed_mtp(
+            tmp_path,
+            enabled=True,
+            depth=3,
+            tensor_parallel_size=2,
+        )
+
+
+def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch, caplog):
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=f"node-{rank}",
+            rank=rank,
+            start_layer=0,
+            end_layer=4,
+            layer_weight_bytes=50 if rank == 0 else 30,
+            fixed_weight_bytes=10,
+            reserve_bytes=10,
+            capacity_bytes=100,
+            tensor_parallel_rank=rank,
+            tensor_parallel_size=2,
+            tensor_parallel_shard_weight=5 if rank == 0 else 3,
+        )
+        for rank in range(2)
+    )
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "1,1")
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
+
+    assert _configure_tensor_shard_weights(
+        assignments,
+        rank=1,
+        tensor_parallel_size=2,
+    ) == (5, 3)
+    assert os.environ["OMLX_TP_SHARD_WEIGHTS"] == "5,3"
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "unsigned tensor-component shard overrides" in caplog.text
+    assert "3,5" not in caplog.text
+    assert "4,4" not in caplog.text
+
+
+def test_non_tp_worker_clears_unsigned_component_shard_overrides(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
+
+    assert _configure_tensor_shard_weights(
+        (),
+        rank=0,
+        tensor_parallel_size=1,
+    ) == (1,)
+    assert "OMLX_TP_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_MOE_SHARD_WEIGHTS" not in os.environ
+
+
+def test_decode_indexer_owner_uses_the_fastest_measured_tp_rank(monkeypatch):
+    profiles = [
+        SimpleNamespace(decode_weight_bytes_per_second=15e9),
+        SimpleNamespace(decode_weight_bytes_per_second=25e9),
+    ]
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto")
+
+    assert _configure_indexer_decode_owner(
+        profiles,
+        rank=0,
+        tensor_parallel_size=2,
+    ) == 1
+    assert os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] == "1"
+
+
+def test_decode_indexer_owner_has_an_operator_rollback(monkeypatch):
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "off")
+
+    assert _configure_indexer_decode_owner(
+        (),
+        rank=0,
+        tensor_parallel_size=2,
+    ) is None
+    assert os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] == "off"
 
 
 def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers(
@@ -129,6 +509,33 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
     assert FakeResponseGenerator._generate is original
 
 
+def test_generation_thread_failure_forces_rank_exit(monkeypatch):
+    import mlx.core as mx
+
+    exits = []
+
+    class FakeResponseGenerator:
+        def _generate(self):
+            raise RuntimeError("token collective corrupted")
+
+    monkeypatch.setattr(
+        inference_worker,
+        "_fatal_generation_thread_exit",
+        lambda: exits.append(inference_worker._FATAL_GENERATION_EXIT_CODE),
+    )
+    original = FakeResponseGenerator._generate
+    with _bind_generation_thread_stream(
+        FakeResponseGenerator,
+        mx,
+        mx.new_thread_unsafe_stream(mx.default_device()),
+    ):
+        with pytest.raises(RuntimeError, match="token collective corrupted"):
+            FakeResponseGenerator()._generate()
+
+    assert exits == [70]
+    assert FakeResponseGenerator._generate is original
+
+
 def _assignment() -> PipelineAssignment:
     return PipelineAssignment(
         node_id="studio",
@@ -199,6 +606,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
     updates: list[tuple[str, dict]] = []
     events: list[dict] = []
     exit_codes: list[int] = []
+    releases: list[str] = []
     marker = SimpleNamespace(
         update=lambda phase, **extra: updates.append((phase, extra))
     )
@@ -210,6 +618,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         wait=lambda _seconds: None,
         exit_process=exit_codes.append,
         emit_event=events.append,
+        release_memory=releases.append,
     )
 
     assert updates == [
@@ -224,6 +633,9 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         )
     ]
     assert events[0]["type"] == "launcher_lost"
+    # The Metal release runs before the exit: os._exit skips every
+    # finally/atexit handler, so a skipped release orphans wired memory.
+    assert len(releases) == 1
     assert exit_codes == [1]
 
 
@@ -282,6 +694,73 @@ def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
     assert server.pipeline is True
 
     assert _server_arguments(args, tensor_parallel_size=2).pipeline is False
+
+
+def test_worker_execution_contract_parses_deepseek_ane_settings():
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "org/model",
+            "--backend",
+            "ring",
+            "--port",
+            "32000",
+            "--deployment-id",
+            "test",
+            "--plan-hash",
+            "a" * 64,
+            "--plan",
+            "encoded",
+            "--prefill-step-size",
+            "4096",
+            "--deepseek-ane-prefill",
+            "--deepseek-ane-sequence-length",
+            "4096",
+            "--deepseek-ane-down-fraction",
+            "0.5",
+            "--no-deepseek-ane-wo-a",
+            "--no-deepseek-ane-cpu",
+        ]
+    )
+
+    execution = _execution_settings(args)
+    ane = execution.deepseek_ane_prefill
+    assert ane.enabled is True
+    assert ane.sequence_length == execution.prefill_step_size == 4096
+    assert ane.down_fraction == 0.5
+    assert ane.wo_a_enabled is False
+    assert ane.cpu_enabled is False
+
+
+def test_worker_enables_deepseek_ane_after_tensor_sharding(monkeypatch):
+    from omlx.cluster.performance import DeepseekAnePrefillSettings
+    from omlx.patches.deepseek_v4 import ane_prefill
+
+    calls = []
+    monkeypatch.setattr(
+        ane_prefill,
+        "enable_deepseek_v4_ane_prefill",
+        lambda model, **kwargs: calls.append((model, kwargs)) or 17,
+    )
+    model = SimpleNamespace(args=SimpleNamespace(model_type="deepseek_v4"))
+    settings = DeepseekAnePrefillSettings(
+        enabled=True,
+        sequence_length=4096,
+        down_fraction=0.5,
+        wo_a_enabled=False,
+        cpu_enabled=False,
+    )
+
+    count = inference_worker._enable_distributed_deepseek_ane_prefill(
+        model,
+        settings,
+    )
+
+    assert count == 17
+    assert calls[0][0] is model
+    assert calls[0][1]["sequence_length"] == 4096
+    assert calls[0][1]["wo_a_enabled"] is False
+    assert calls[0][1]["cpu_fraction"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +962,27 @@ def _even_plan():
     )
 
 
+def _tensor_plan():
+    """Two ranks holding the same full layer span as one TP stage."""
+
+    return tuple(
+        PipelineAssignment(
+            node_id=node_id,
+            rank=rank,
+            start_layer=0,
+            end_layer=60,
+            layer_weight_bytes=30 * GiB,
+            fixed_weight_bytes=GiB,
+            reserve_bytes=8 * GiB,
+            capacity_bytes=400 * GiB,
+            role="headless",
+            tensor_parallel_rank=rank,
+            tensor_parallel_size=2,
+        )
+        for rank, node_id in enumerate(("mbp", "studio"))
+    )
+
+
 class _Group:
     def __init__(self, rank: int, size: int) -> None:
         self._rank, self._size = rank, size
@@ -541,6 +1041,8 @@ def _run_rank(
     ceiling: int = 107 * GiB,
     wired_result=(0, None),
     assignment_honored: bool = False,
+    optimizations: dict[str, Any] | None = None,
+    tensor_parallel_size: int = 1,
 ):
     """Drive ``run_worker`` through its real argv, recording what it did.
 
@@ -570,6 +1072,7 @@ def _run_rank(
         "build_guard_kwargs": None,
         "marker_while_serving": None,
         "pin_at_load": None,
+        "events": [],
     }
 
     # --- process boundaries: never reached in a test -----------------------
@@ -586,7 +1089,9 @@ def _run_rank(
         pipeline_index, "apply_mlx_lm_pipeline_index_patch", lambda: None
     )
     monkeypatch.setattr(
-        model_loading, "maybe_apply_pre_load_patches", lambda _model: None
+        model_loading,
+        "maybe_apply_pre_load_patches",
+        lambda _model, **_kwargs: None,
     )
     monkeypatch.setattr(
         inference_worker,
@@ -595,7 +1100,24 @@ def _run_rank(
     )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(
-        inference_worker, "_start_launcher_watchdog", lambda _m, _pid: None
+        inference_worker,
+        "_wait_for_serve_release",
+        lambda *_args, **_kwargs: record["order"].append("serve-release"),
+    )
+    monkeypatch.setattr(
+        inference_worker,
+        "_run_prefill_shape_warmup",
+        lambda *_args, tokens, **_kwargs: record["order"].append("shape-warmup")
+        or {"active": True, "tokens": tokens, "elapsed_seconds": 0.01},
+    )
+
+    def fake_emit_event(event):
+        record["events"].append(dict(event))
+        record["order"].append(f"event:{event.get('type')}")
+
+    monkeypatch.setattr(inference_worker, "_emit_event", fake_emit_event)
+    monkeypatch.setattr(
+        inference_worker, "_start_launcher_watchdog", lambda _m, _pid, **_kw: None
     )
 
     def fake_wired(desired):
@@ -635,7 +1157,19 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_contract",
-        lambda _plan: ("a" * 64, assignments, (), 1),
+        lambda _plan: ("a" * 64, assignments, (), tensor_parallel_size),
+    )
+    # The fake plan above is not a real encoded contract, so the path_map
+    # decoder it feeds must be faked alongside it (empty = legacy behavior).
+    monkeypatch.setattr(
+        inference_worker,
+        "decode_worker_path_map",
+        lambda _plan: {},
+    )
+    monkeypatch.setattr(
+        inference_worker,
+        "decode_worker_speculation",
+        lambda _plan: (False, None),
     )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
@@ -669,7 +1203,7 @@ def _run_rank(
 
     @contextlib.contextmanager
     def fake_optimizations(*_args, **_kwargs):
-        yield {"coalesced_batching": {"active": True}}
+        yield optimizations or {"coalesced_batching": {"active": True}}
 
     monkeypatch.setattr(
         inference_worker, "install_runtime_optimizations", fake_optimizations
@@ -706,6 +1240,31 @@ def _run_rank(
     finally:
         pipeline_patch.clear_assigned_stage()
     return record
+
+
+def test_rank_zero_ready_event_follows_collective_shape_warmup(
+    monkeypatch,
+    tmp_path,
+):
+    record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        rank=0,
+        assignments=_tensor_plan(),
+        tensor_parallel_size=2,
+        optimizations={
+            "deepseek_v4_adaptive_prefill": {
+                "active": True,
+                "shape_warmup_tokens": 1024,
+            }
+        },
+    )
+
+    order = record["order"]
+    assert order.index("event:rank_ready") < order.index("serve-release")
+    assert order.index("serve-release") < order.index("shape-warmup")
+    assert order.index("shape-warmup") < order.index("event:ready")
+    assert order.index("event:ready") < order.index("serve")
 
 
 def test_worker_refuses_excess_resident_weights_before_ready(monkeypatch, tmp_path):
@@ -1112,6 +1671,330 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     assert list(tmp_path.glob("*.json")) == []
 
 
+def test_launcher_watchdog_fires_on_a_stale_launcher_lease(tmp_path):
+    updates: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    exit_codes: list[int] = []
+    aborts: list[str] = []
+    releases: list[str] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    stale = time.time() - 120.0
+    os.utime(lease, (stale, stale))
+
+    _watch_launcher_parent(
+        42,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=lambda _seconds: None,
+        exit_process=exit_codes.append,
+        emit_event=events.append,
+        on_abort=aborts.append,
+        release_memory=releases.append,
+    )
+
+    assert updates[0][0] == "launcher_lost"
+    assert "stale" in updates[0][1]["error"]
+    # The abort stage ran before the exit stage.
+    assert len(aborts) == 1
+    assert events[0]["type"] == "launcher_lost"
+    assert len(releases) == 1
+    assert exit_codes == [1]
+
+
+def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+
+    polls = [0]
+
+    class StopLoop(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=lease,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    missing = tmp_path / "not-yet-created-lease.json"
+
+    polls = [0]
+
+    class StopLoop(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=missing,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_launcher_watchdog_fires_if_a_seen_lease_disappears(tmp_path):
+    exit_codes: list[int] = []
+    updates: list[tuple[str, dict]] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    polls = 0
+
+    def wait(_seconds):
+        nonlocal polls
+        polls += 1
+        if polls == 2:
+            lease.unlink()
+
+    _watch_launcher_parent(
+        42,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=wait,
+        exit_process=exit_codes.append,
+        emit_event=lambda _event: None,
+        release_memory=lambda _reason: None,
+    )
+
+    assert exit_codes == [1]
+    assert "disappeared" in updates[0][1]["error"]
+
+
+def test_launcher_watchdog_exits_when_dead_server_breaks_diagnostics(tmp_path):
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    stale = time.time() - 120.0
+    os.utime(lease, (stale, stale))
+    exit_codes: list[int] = []
+    releases: list[str] = []
+
+    def broken(*_args, **_kwargs):
+        raise BrokenPipeError("coordinator pipe is gone")
+
+    _watch_launcher_parent(
+        42,
+        SimpleNamespace(update=broken),
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=lambda _seconds: None,
+        exit_process=exit_codes.append,
+        emit_event=broken,
+        release_memory=releases.append,
+    )
+
+    assert len(releases) == 1
+    assert exit_codes == [1]
+
+
+def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
+    _write_cancel_request(str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64)
+
+    payload = json.loads((tmp_path / "dep-9-cancel.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["deployment_id"] == "dep-9"
+    assert payload["plan_hash"] == "e" * 64
+    assert payload["scope"] == "all"
+    assert isinstance(payload["epoch"], int) and payload["epoch"] > 0
+    assert payload["reason"] == "peer watchdog test"
+
+
+def test_cancel_request_epoch_advances_past_an_existing_clock_jump(tmp_path):
+    path = tmp_path / "dep-9-cancel.json"
+    path.write_text(json.dumps({"epoch": 9999999999999}), encoding="utf-8")
+
+    _write_cancel_request(str(tmp_path), "dep-9", "new event", plan_hash="f" * 64)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["epoch"] == 10000000000000
+
+
+def _fake_mlx_core(calls: list[str], *, with_metal: bool = True) -> SimpleNamespace:
+    metal = (
+        SimpleNamespace(clear_cache=lambda: calls.append("metal.clear_cache"))
+        if with_metal
+        else None
+    )
+    fake = SimpleNamespace(
+        set_wired_limit=lambda limit: calls.append(f"set_wired_limit({limit})"),
+        clear_cache=lambda: calls.append("clear_cache"),
+    )
+    if with_metal:
+        fake.metal = metal
+    return fake
+
+
+def _install_fake_mlx_core(monkeypatch, fake_core: SimpleNamespace) -> None:
+    """Make ``import mlx.core as mx`` bind to the fake without real Metal.
+
+    ``import a.b as x`` resolves ``b`` as an attribute of package ``a``, so
+    the fake package must expose ``core`` — a bare sys.modules entry is not
+    enough.
+    """
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=fake_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+
+
+def test_release_metal_memory_unwires_before_clearing(monkeypatch):
+    calls: list[str] = []
+    _install_fake_mlx_core(monkeypatch, _fake_mlx_core(calls))
+
+    inference_worker._release_metal_memory("test")
+
+    # Unwiring is the load-bearing call — the cache flush alone leaves the
+    # wired model weights stranded when os._exit skips every cleanup handler.
+    assert calls == [
+        "set_wired_limit(0)",
+        "clear_cache",
+        "metal.clear_cache",
+    ]
+
+
+def test_release_metal_memory_tolerates_a_missing_metal_module(monkeypatch):
+    calls: list[str] = []
+    _install_fake_mlx_core(monkeypatch, _fake_mlx_core(calls, with_metal=False))
+
+    inference_worker._release_metal_memory("test")
+
+    assert calls == ["set_wired_limit(0)", "clear_cache"]
+
+
+def test_release_metal_memory_survives_failures(monkeypatch):
+    def fail(*_args):
+        raise RuntimeError("wedged")
+
+    fake = SimpleNamespace(
+        set_wired_limit=fail,
+        clear_cache=fail,
+        metal=SimpleNamespace(clear_cache=fail),
+    )
+    _install_fake_mlx_core(monkeypatch, fake)
+
+    # Must not raise: the force-exit behind this hook has to happen regardless.
+    inference_worker._release_metal_memory("test")
+
+
+def test_release_metal_memory_without_mlx_is_a_noop(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+
+    inference_worker._release_metal_memory("test")
+
+
+def test_sigterm_handler_releases_metal_before_interrupt(monkeypatch):
+    releases: list[str] = []
+    monkeypatch.setattr(
+        inference_worker, "_release_metal_memory", releases.append
+    )
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_alrm = signal.getsignal(signal.SIGALRM)
+    try:
+        inference_worker._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+        with pytest.raises(KeyboardInterrupt):
+            handler(signal.SIGTERM, None)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGALRM, previous_alrm)
+
+    # The rank releases its own wired memory on SIGTERM, while it still can —
+    # the coordinator's SIGKILL escalation behind it cannot unwire anything.
+    assert len(releases) == 1
+    assert "SIGTERM" in releases[0]
+
+
+def test_peer_watchdog_on_lost_releases_metal_before_exit(monkeypatch, tmp_path):
+    captured: dict[str, Any] = {}
+
+    class FakePeerWatchdog:
+        def __init__(self, _hosts, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(inference_worker, "PeerWatchdog", FakePeerWatchdog)
+    monkeypatch.setattr(inference_worker, "_emit_event", lambda _event: None)
+    order: list[str] = []
+    monkeypatch.setattr(
+        inference_worker,
+        "_release_metal_memory",
+        lambda _reason: order.append("release"),
+    )
+    monkeypatch.setattr(os, "_exit", lambda code: order.append(f"exit:{code}"))
+    assignments = [
+        PipelineAssignment(
+            node_id=node,
+            rank=rank,
+            start_layer=0,
+            end_layer=1,
+            layer_weight_bytes=10,
+            fixed_weight_bytes=10,
+            reserve_bytes=10,
+            capacity_bytes=100,
+        )
+        for rank, node in enumerate(("local", "studio"))
+    ]
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: None,
+        payload={"deployment_id": "dep-9", "plan_hash": "e" * 64},
+    )
+
+    watchdog = inference_worker._start_peer_watchdog(
+        marker,
+        assignments,
+        ["127.0.0.1", "user@studio.local"],
+        "dep-9",
+        str(tmp_path),
+        rank=0,
+    )
+
+    assert isinstance(watchdog, FakePeerWatchdog)
+    captured["on_lost"]("peer vanished")
+    assert order == ["release", "exit:1"]
 class _ThinkTokenizer:
     think_end_id = 55
     think_start_id = 54

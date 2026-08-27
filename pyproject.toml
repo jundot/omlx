@@ -9,7 +9,12 @@ requires = [
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
     "nanobind==2.13.0",
-    "mlx==0.32.0",
+    # mlx floor admits the custom 0.32.0.dev build (JACCL guards/backports);
+    # an exact ==0.32.0 pin would make a fresh resolve replace it with the
+    # stock PyPI wheel and silently drop those fixes. When building with
+    # isolation, pre-install the dev wheel with --no-build-isolation or
+    # PIP_NO_BUILD_ISOLATION so this floor resolves to it.
+    "mlx>=0.32.0.dev0,<0.33",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -39,11 +44,16 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.32.0; optional custom kernels live under
+    # MLX 0.32.0 line; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
-    # binaries are ABI-coupled to this exact mlx version — bumping the pin
+    # binaries are ABI-coupled to this mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    "mlx==0.32.0",
+    # The floor admits the custom 0.32.0.dev wheel (JACCL guards/backports):
+    # an exact ==0.32.0 pin made a fresh resolve reinstall the stock PyPI
+    # wheel over the dev build, silently dropping those fixes. Install the
+    # dev wheel first with --no-deps (ops/install_mlx_variant.sh) so the
+    # resolver keeps it.
+    "mlx>=0.32.0.dev0,<0.33",
     # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
@@ -147,6 +157,13 @@ grammar = [
 ]
 mcp = [
     "mcp>=2.0.0,<3",
+]
+cluster = [
+    # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
+    # Pure-Python; works in launchd agents. Absence disables mDNS only — the
+    # IPv6 multicast fallback, manual peer add, and Tailscale paths keep
+    # working (see omlx/cluster/discovery.py).
+    "zeroconf>=0.131.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",
@@ -264,6 +281,7 @@ include = ["omlx*"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins

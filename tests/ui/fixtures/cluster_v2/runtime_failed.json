@@ -1,0 +1,16 @@
+{
+  "_comment": "GET /admin/api/cluster/runtime — terminal evidence remains useful after pool ownership is detached.",
+  "jobs": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "rank": 0,
+      "world_size": 2,
+      "phase": "failed",
+      "live": false,
+      "ownership": "detached",
+      "error": "rank 1 stopped heartbeating"
+    }
+  ],
+  "launchers": [],
+  "warnings": []
+}

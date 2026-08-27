@@ -1,0 +1,7 @@
+{
+  "_comment": "STUB endpoint contract (GET /api/cluster/discovery/health) — Module C-defined, implemented by Module A's probe path. multicast_rx_within_5s=false must surface the macOS Local Network permission guidance in the checks row.",
+  "multicast_rx_within_5s": true,
+  "last_multicast_rx_at": 1782000002.5,
+  "mdns_active": true,
+  "transport": "mdns+multicast"
+}

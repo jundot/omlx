@@ -18,6 +18,16 @@ class TestDecodeActivityRegistry:
         reg.publish("engine-a", 0)
         assert not reg.others_decoding("engine-b")
 
+    def test_other_decode_rows_sums_live_b1_b2_b4_pressure(self):
+        reg = DecodeActivityRegistry()
+        reg.publish("engine-a", 1)
+        reg.publish("engine-b", 2)
+        reg.publish("engine-c", 4)
+
+        assert reg.other_decode_rows("engine-a") == 6
+        assert reg.other_decode_rows("engine-b") == 5
+        assert reg.other_decode_rows("new-engine") == 7
+
     def test_ttl_expires_stale_entries(self):
         reg = DecodeActivityRegistry()
         reg.publish("engine-a", 1)

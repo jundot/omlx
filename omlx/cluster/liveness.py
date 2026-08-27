@@ -26,6 +26,7 @@ absent.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -37,6 +38,8 @@ from typing import Any
 
 from .ssh_policy import cluster_ssh_options
 
+logger = logging.getLogger(__name__)
+
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
 # intervals distinguishes "busy with a long prefill" from "gone".
@@ -47,6 +50,7 @@ from .ssh_policy import cluster_ssh_options
 _DEFAULT_STALE_AFTER = 45.0
 _DEFAULT_PROBE_TIMEOUT = 5.0
 _MAX_REMOTE_MARKER_BYTES = 256 * 1024
+_REMOTE_MARKER_MISSING = "runtime marker is missing"
 
 _LOOPBACK_TARGETS = {"127.0.0.1", "localhost", "::1"}
 
@@ -170,7 +174,9 @@ _REMOTE_MARKER_SCRIPT = (
     "import json,os,sys,time;"
     "from pathlib import Path;"
     "p=Path(sys.argv[1]).expanduser();"
-    "d=json.loads(p.read_text());"
+    "\nif not p.is_file():"
+    "\n print(json.dumps({'marker':None,'process_live':False,'peer_now':time.time(),'missing':True},separators=(',',':'))); raise SystemExit(0)"
+    "\nd=json.loads(p.read_text());"
     "pid=d.get('pid');"
     "live=None;"
     "\nif isinstance(pid,int) and not isinstance(pid,bool) and pid>0:"
@@ -236,15 +242,17 @@ def read_remote_marker(
     marker = payload.get("marker")
     process_live = payload.get("process_live")
     peer_now = payload.get("peer_now")
-    if not isinstance(marker, dict):
-        return None, None, None, "runtime marker response did not contain a marker"
-    if process_live not in (True, False, None):
-        process_live = None
     if isinstance(peer_now, bool) or not isinstance(peer_now, (int, float)):
         # The script above always emits it; a payload without it is malformed,
         # and quietly substituting the local clock would revive the cross-Mac
         # comparison this field exists to remove.
         return None, None, None, "runtime marker response did not carry the peer clock"
+    if not isinstance(marker, dict):
+        if payload.get("missing") is True:
+            return None, False, float(peer_now), _REMOTE_MARKER_MISSING
+        return None, None, None, "runtime marker response did not contain a marker"
+    if process_live not in (True, False, None):
+        process_live = None
     return marker, process_live, float(peer_now), ""
 
 
@@ -456,6 +464,8 @@ class PeerWatchdog:
         interval: float = 15.0,
         serving_interval: float | None = None,
         on_lost: Callable[[str], None] | None = None,
+        on_abort: Callable[[str], None] | None = None,
+        abort_grace: float = 5.0,
         failure_tolerance: int = _DEFAULT_FAILURE_TOLERANCE,
     ) -> None:
         self._hosts = hosts_by_rank
@@ -473,6 +483,14 @@ class PeerWatchdog:
             else max(0.0, float(serving_interval))
         )
         self._on_lost = on_lost
+        # Graduated response: once a peer is confirmed lost, fire on_abort
+        # (request cancellation at a step boundary) and re-probe for up to
+        # abort_grace seconds before the final on_lost exit, so a recoverable
+        # flap no longer suicides the healthy rank and in-flight work gets a
+        # chance to unwind. With on_abort unset or abort_grace=0 the timing
+        # is exactly the old fire-on-tolerance behavior.
+        self._on_abort = on_abort
+        self._abort_grace = max(0.0, float(abort_grace))
         self._failure_tolerance = max(1, int(failure_tolerance))
         self._consecutive_failures: dict[int, int] = {
             rank: 0 for rank in hosts_by_rank
@@ -527,6 +545,45 @@ class PeerWatchdog:
             if not failed_ranks:
                 continue
             failed = tuple(item for item in health if item.rank in failed_ranks)
+            reason = describe_failure(failed)
+            # Graduated response: request cancellation first, exit last.
+            if self._on_abort is not None and self._abort_grace > 0:
+                logger.warning(
+                    "Peer watchdog: %s — aborting in-flight requests and "
+                    "allowing %.1fs of recovery before teardown",
+                    reason,
+                    self._abort_grace,
+                )
+                try:
+                    self._on_abort(reason)
+                except Exception:
+                    logger.warning(
+                        "Peer watchdog abort stage failed", exc_info=True
+                    )
+                if self._wait_for_recovery(sleep):
+                    for rank in failed_ranks:
+                        self._consecutive_failures[rank] = 0
+                    continue
             if self._on_lost is not None:
-                self._on_lost(describe_failure(failed))
+                self._on_lost(reason)
             return
+
+    def _wait_for_recovery(self, sleep: Callable[[float], None]) -> bool:
+        """Re-probe during the abort grace; True if every peer recovered."""
+
+        deadline = time.monotonic() + self._abort_grace
+        while not self._stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sleep(min(0.5, remaining))
+            if self._stop:
+                return False
+            try:
+                health = self.run_once()
+            except Exception:
+                continue
+            if health and all(item.healthy for item in health):
+                logger.warning("Peer watchdog: peer contact recovered")
+                return True
+        return False

@@ -801,6 +801,18 @@ class TestDeepSeekV4PrefillMemoryProfile:
         )
         return monitor
 
+    def test_model_introspection_attaches_ds4_profile_to_rank_guard(self):
+        from omlx.memory_monitor import set_model_info_from_model
+
+        config = self._config()
+        config.torch_dtype = "bfloat16"
+        monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
+
+        set_model_info_from_model(monitor, SimpleNamespace(args=config))
+
+        assert monitor._prefill_memory_profile is not None
+        assert monitor._prefill_memory_profile.wsdpa_dtype_supported is True
+
     @staticmethod
     def _set_wsdpa_route(
         monkeypatch,
@@ -888,7 +900,11 @@ class TestDeepSeekV4PrefillMemoryProfile:
     def test_active_wsdpa_route_prices_ratio4_dense_without_scores(self, monkeypatch):
         import omlx.memory_monitor as memory_monitor
 
-        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_memory_safe_eligible",
+            lambda **_: True,
+        )
         self._set_wsdpa_route(monkeypatch)
         monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
         query_tokens = kv_len = 2048
@@ -906,7 +922,11 @@ class TestDeepSeekV4PrefillMemoryProfile:
     ):
         import omlx.memory_monitor as memory_monitor
 
-        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", lambda **_: True)
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_memory_safe_eligible",
+            lambda **_: True,
+        )
         monitor = self._monitor(ratios=[4], wsdpa_dtype_supported=True)
         query_tokens, kv_len = 2048, 66_000
         local_tokens = 128 + query_tokens - 1
@@ -955,7 +975,7 @@ class TestDeepSeekV4PrefillMemoryProfile:
 
         monkeypatch.setattr(
             memory_monitor,
-            "native_indexer_eligible",
+            "native_indexer_memory_safe_eligible",
             lambda **kwargs: True,
         )
         monitor = self._monitor()
@@ -979,14 +999,14 @@ class TestDeepSeekV4PrefillMemoryProfile:
 
         monkeypatch.setattr(
             memory_monitor,
-            "native_indexer_eligible",
+            "native_indexer_memory_safe_eligible",
             lambda **kwargs: True,
         )
         native = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
 
         monkeypatch.setattr(
             memory_monitor,
-            "native_indexer_eligible",
+            "native_indexer_memory_safe_eligible",
             lambda **kwargs: False,
         )
         fallback = monitor.estimate_chunk_transient_bytes(query_tokens, kv_len)
@@ -1013,7 +1033,11 @@ class TestDeepSeekV4PrefillMemoryProfile:
             calls.append(kwargs)
             return False
 
-        monkeypatch.setattr(memory_monitor, "native_indexer_eligible", unavailable)
+        monkeypatch.setattr(
+            memory_monitor,
+            "native_indexer_memory_safe_eligible",
+            unavailable,
+        )
         estimate = monitor.estimate_chunk_transient_bytes(1817, 347_929)
 
         assert estimate > 0

@@ -272,6 +272,29 @@ def _write_qwen_donor(
     return donor
 
 
+def _write_qwen_standalone_mtp_donor(tmp_path, *, quantized=True):
+    """Official mlx-community adapter layout: bare head keys at repo root."""
+
+    donor = _write_qwen_donor(tmp_path, quantized=quantized)
+    config = json.loads((donor / "config.json").read_text())
+    config["model_type"] = "qwen3_5_mtp"
+    (donor / "config.json").write_text(json.dumps(config))
+
+    source = mx.load(str(donor / "model.safetensors"))
+    standalone = {
+        key[len("mtp.") :]: value
+        for key, value in source.items()
+        if key.startswith("mtp.")
+    }
+    mx.save_safetensors(str(donor / "model.safetensors"), standalone)
+    index = {
+        "metadata": {"total_size": sum(value.nbytes for value in standalone.values())},
+        "weight_map": {key: "model.safetensors" for key in standalone},
+    }
+    (donor / "model.safetensors.index.json").write_text(json.dumps(index))
+    return donor
+
+
 def test_graft_bf16_donor_writes_shard_index_config(tmp_path):
     out = _write_qwen_output(tmp_path)
     donor = _write_qwen_donor(tmp_path)
@@ -336,6 +359,36 @@ def test_graft_quantized_donor_synthesizes_per_layer_entries(tmp_path):
     assert mx.array_equal(
         merged["mtp.layers.0.self_attn.q_proj.scales"],
         donor_weights["mtp.layers.0.self_attn.q_proj.scales"],
+    )
+
+
+def test_graft_official_standalone_mtp_adapter_into_vlm(tmp_path):
+    out = _write_qwen_output(tmp_path, vlm=True, rope_nested=True)
+    donor = _write_qwen_standalone_mtp_donor(tmp_path)
+
+    validate_mtp_donor_pair(out, donor)
+    combine_mtp_donor(out, donor)
+
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    assert "language_model.mtp.fc.weight" in merged
+    assert "language_model.mtp.norm.weight" in merged
+    assert all(key.startswith("language_model.mtp.") for key in merged)
+    donor_weights = mx.load(str(donor / "model.safetensors"))
+    assert mx.array_equal(
+        merged["language_model.mtp.fc.weight"], donor_weights["fc.weight"]
+    )
+
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["mtp_num_hidden_layers"] == 1
+    assert config["quantization"]["language_model.mtp.layers.0.self_attn.q_proj"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "affine",
+    }
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert (
+        index["weight_map"]["language_model.mtp.fc.weight"]
+        == GEMMA4_ASSISTANT_MTP_SHARD
     )
 
 
@@ -595,4 +648,3 @@ def test_import_mtplx_sidecar_rejects_failed_audit(tmp_path):
 
     with pytest.raises(ValueError, match="payload_audit"):
         import_mtplx_sidecar(out)
-

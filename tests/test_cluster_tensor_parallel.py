@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
 from omlx.cluster.planner import (
     ModelLayout,
     NodeBudget,
@@ -15,6 +17,7 @@ def test_plan_hybrid_4_nodes_tp2():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 32,
         tensor_parallel_heads=32,
+        supports_tensor_parallel=True,
     )
     nodes = [
         NodeBudget(
@@ -50,6 +53,7 @@ def test_plan_hybrid_rank_mapping():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 32,
         tensor_parallel_heads=32,
+        supports_tensor_parallel=True,
     )
     nodes = [
         NodeBudget(
@@ -81,6 +85,7 @@ def test_plan_hybrid_not_divisible():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 32,
         tensor_parallel_heads=32,
+        supports_tensor_parallel=True,
     )
     nodes = [
         NodeBudget(
@@ -106,6 +111,7 @@ def test_plan_hybrid_heads_not_divisible():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 32,
         tensor_parallel_heads=33,  # Not divisible by 2
+        supports_tensor_parallel=True,
     )
     nodes = [
         NodeBudget(
@@ -122,6 +128,28 @@ def test_plan_hybrid_heads_not_divisible():
         raise AssertionError("should have raised PlanningError")
     except PlanningError as e:
         assert "not divisible" in str(e)
+
+
+def test_plan_hybrid_rejects_architecture_without_tp_support():
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=1 * 1024**3,
+        layer_weight_bytes=(2 * 1024**3,) * 8,
+        tensor_parallel_heads=32,
+        supports_tensor_parallel=False,
+    )
+    nodes = [
+        NodeBudget(
+            node_id=f"node-{index}",
+            capacity_bytes=32 * 1024**3,
+            reserve_bytes=2 * 1024**3,
+            rank=index,
+        )
+        for index in range(2)
+    ]
+
+    with pytest.raises(PlanningError, match="does not support tensor parallelism"):
+        plan_hybrid(model, nodes, tensor_parallel_size=2)
 
 
 def test_plan_hybrid_single_node():
@@ -156,6 +184,7 @@ def test_plan_hybrid_assignment_to_dict():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 32,
         tensor_parallel_heads=32,
+        supports_tensor_parallel=True,
     )
     nodes = [
         NodeBudget(
@@ -196,6 +225,7 @@ def _grid_model(layers=32, layer_gib=2, fixed_gib=1, heads=48):
         fixed_weight_bytes=fixed_gib * 1024**3,
         layer_weight_bytes=(layer_gib * 1024**3,) * layers,
         tensor_parallel_heads=heads,
+        supports_tensor_parallel=True,
     )
 
 

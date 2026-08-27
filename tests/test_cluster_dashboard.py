@@ -332,6 +332,16 @@ def test_cluster_model_setup_shows_context_and_per_node_kv_cost():
     assert "font-size: 0.55rem" not in context_css
 
 
+def test_cluster_v2_dense_operational_copy_has_a_readable_floor():
+    css = _read("omlx/admin/static/css/dashboard.css")
+
+    assert "[data-cluster-v2-wizard] .text-\\[9px\\]" in css
+    assert "[data-cluster-v2-wizard] .text-\\[10px\\]" in css
+    assert "[data-cluster-v2-wizard] .text-xs" in css
+    assert "font-size: 0.8125rem !important" in css
+    assert '[data-theme="dark"] [data-cluster-v2-wizard] .text-neutral-400' in css
+
+
 def test_cluster_quick_start_has_per_mac_memory_allowances():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")

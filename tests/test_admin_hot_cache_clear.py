@@ -121,7 +121,12 @@ class TestHotCacheClear:
         ):
             result = _run_clear()
 
-        assert set(result.keys()) == {"status", "total_cleared", "bytes_reclaimed"}
+        assert set(result.keys()) == {
+            "status",
+            "total_cleared",
+            "bytes_reclaimed",
+            "distributed_ranks",
+        }
         assert result["status"] == "ok"
 
 
