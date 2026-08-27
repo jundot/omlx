@@ -923,9 +923,52 @@ if _TQ_SINGLETON_CACHE_TYPE is not None:
         _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
+_original_make_cache = _mlx_lm_generate_module._make_cache
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
 _REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
+
+
+def _patched_make_cache(model, left_padding, max_kv_size):
+    """Honor model-owned batch conversion before MLX-LM's fallbacks."""
+    if not hasattr(model, "make_cache"):
+        return _original_make_cache(model, left_padding, max_kv_size)
+
+    model_cache = model.make_cache()
+
+    def has_model_owned_conversion(cache_obj):
+        if callable(getattr(cache_obj, "to_batch", None)):
+            return True
+        sub_caches = getattr(cache_obj, "caches", None)
+        return isinstance(sub_caches, (list, tuple)) and any(
+            has_model_owned_conversion(child) for child in sub_caches
+        )
+
+    class _SingleCacheModel:
+        layers = (None,)
+
+        def __init__(self, cache_obj):
+            self.cache_obj = cache_obj
+
+        def make_cache(self):
+            return [self.cache_obj]
+
+    def convert(cache_obj):
+        to_batch = getattr(cache_obj, "to_batch", None)
+        if callable(to_batch):
+            return to_batch(left_padding)
+
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)) and any(
+            has_model_owned_conversion(child) for child in sub_caches
+        ):
+            return type(cache_obj)(*(convert(child) for child in sub_caches))
+
+        return _original_make_cache(
+            _SingleCacheModel(cache_obj), left_padding, max_kv_size
+        )[0]
+
+    return [convert(cache_obj) for cache_obj in model_cache]
 
 
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
@@ -1025,6 +1068,7 @@ def _patched_ppb_split(self, indices):
     return _original_ppb_split(self, indices)
 
 
+_mlx_lm_generate_module._make_cache = _patched_make_cache
 _mlx_lm_generate_module._merge_caches = _patched_merge_caches
 _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
