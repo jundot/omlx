@@ -12,7 +12,11 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from omlx.api.anthropic_models import ContentBlockText, ContentBlockToolUse, SystemContent
-from omlx.api.anthropic_utils import _extract_system_text, _text_from_content_blocks
+from omlx.api.anthropic_utils import (
+    _BILLING_HEADER_PREFIX,
+    _extract_system_text,
+    _text_from_content_blocks,
+)
 
 # ---------------------------------------------------------------------------
 # _extract_system_text: pin existing behavior before refactoring (#8)
@@ -71,6 +75,24 @@ def test_extract_system_text_strips_budget_markers_after_joining_blocks():
 
 def test_extract_system_text_returns_empty_for_neither_str_nor_list():
     assert _extract_system_text(None) == ""  # type: ignore[arg-type]
+
+
+# No "<total_tokens>" substring: keeps _strip_client_budget_markers a no-op so the
+# property below isolates the billing-header filter without reimplementing the
+# marker-stripping regex.
+_system_text = st.text().filter(lambda t: "<total_tokens>" not in t)
+_system_block = st.builds(
+    lambda text: SystemContent(type="text", text=text), text=_system_text
+)
+
+
+@given(st.lists(_system_block, max_size=10))
+def test_extract_system_text_always_drops_billing_header_blocks(blocks):
+    """Every non-billing-header block's text survives, joined in order; every
+    billing-header block's text never appears as a joined line (#8)."""
+    result = _extract_system_text(blocks)
+    expected = "\n".join(b.text for b in blocks if not b.text.startswith(_BILLING_HEADER_PREFIX))
+    assert result == expected
 
 
 # ---------------------------------------------------------------------------
