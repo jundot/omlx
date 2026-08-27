@@ -825,7 +825,7 @@ def test_read_retries_a_transient_ssh_failure_before_giving_up(monkeypatch):
     that used to surface as the confusing "has no routable IPv4 address"
     report even though the peer answers fine a moment later."""
 
-    monkeypatch.setattr("omlx.cluster.transport.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
     calls = []
 
     def fake_run(argv, **_kwargs):
@@ -843,7 +843,7 @@ def test_read_retries_a_transient_ssh_failure_before_giving_up(monkeypatch):
 
 
 def test_read_gives_up_after_exhausting_retries(monkeypatch):
-    monkeypatch.setattr("omlx.cluster.transport.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
     calls = []
 
     def fake_run(argv, **_kwargs):
