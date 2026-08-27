@@ -2,6 +2,7 @@
 """Staging must send each Mac its layers' shards and nothing else."""
 
 import json
+import shlex
 import struct
 import subprocess
 import sys
@@ -282,6 +283,11 @@ def test_cluster_plan_covers_every_layer_across_nodes(tmp_path):
 def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monkeypatch):
     """Configured model directories must not be rewritten to ~/.omlx/models."""
 
+    # A model path under $HOME is the default case (model_dir defaults to
+    # ~/.omlx/models) and the one that exposes the abbreviation bug (#7) — a
+    # path outside $HOME never gets tildified, so it can't catch a regression.
+    # Fix $HOME so this doesn't depend on where the OS happens to put tmp_path.
+    monkeypatch.setenv("HOME", str(tmp_path))
     root = _model(tmp_path / "models with spaces" / "qwen", layers=4, per_file=2)
 
     class A:
@@ -415,6 +421,43 @@ def test_remote_staging_pushes_weights_and_sidecars_to_the_named_node(
     assert any(status == "copied" for _name, status, _size in progress)
 
 
+def test_remote_staging_sends_the_tilde_form_when_destination_dir_is_omitted(
+    tmp_path,
+    monkeypatch,
+):
+    """stage_remote_files's destination_dir default must own the
+    ~-abbreviation for transit itself (#16 variant), matching
+    remote_model_dir's contract — a caller that omits destination_dir still
+    reaches the peer's own home instead of sending the coordinator's raw
+    absolute path, which names nothing on a cross-user peer."""
+    from omlx.cluster.staging import stage_remote_files
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = _model(tmp_path / "source", layers=2, per_file=2)
+    plan = plan_staging(root, node_id="studio", start_layer=0, end_layer=2)
+    seen_paths = []
+    monkeypatch.setattr(
+        "omlx.cluster.staging.check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+
+    def present_reader(_host, path):
+        seen_paths.append(path)
+        return {}
+
+    stage_remote_files(
+        plan,
+        model_path=root,
+        destination_host="studio.local",
+        sidecars=sidecar_files(root),
+        transfer=lambda **_kwargs: None,
+        present_reader=present_reader,
+    )
+
+    assert seen_paths
+    assert all(path == "~/source" for path in seen_paths)
+
+
 def test_remote_staging_resumes_without_recopying_verified_files(
     tmp_path,
     monkeypatch,
@@ -546,6 +589,49 @@ def test_peer_owned_model_stages_from_the_holder_not_the_coordinator(monkeypatch
     assert copies[0]["source_dir"] == "/Users/peeruser/models/m"
 
 
+def test_source_peer_resolution_sends_the_exact_path_when_under_home(monkeypatch):
+    """A model path under $HOME (the default: model_dir defaults to
+    ~/.omlx/models) must reach remote_model_dir unabbreviated (#7) — it, not
+    the caller, is responsible for re-expressing it in ~-form for the peer."""
+    from omlx.cluster import staging
+    from omlx.cluster.staging import StagingPlan, stage_files_from_source
+
+    monkeypatch.setenv("HOME", "/models")
+
+    plan = StagingPlan(
+        node_id="MacBook",
+        start_layer=6,
+        end_layer=8,
+        required=("tail.safetensors",),
+        missing=("tail.safetensors",),
+        required_bytes=100,
+        missing_bytes=100,
+        total_model_bytes=1000,
+    )
+    monkeypatch.setattr(staging, "remote_file_sizes", lambda _host, _path: {})
+    monkeypatch.setattr(
+        staging, "check_disk_for_staging", lambda *args, **kwargs: 100 * 1024**3
+    )
+    resolved = []
+
+    def fake_remote_model_dir(host, path, **_kwargs):
+        resolved.append((host, path))
+        return path
+
+    monkeypatch.setattr(staging, "remote_model_dir", fake_remote_model_dir)
+
+    stage_files_from_source(
+        plan,
+        model_path="/models/m",
+        source_host="studio",
+        destination_host="macbook",
+        expected_sizes={"tail.safetensors": 100},
+        transfer=lambda **_kwargs: None,
+    )
+
+    assert resolved == [("studio", "/models/m")]
+
+
 def test_manifest_can_be_built_from_a_peer_shard_index(tmp_path, monkeypatch):
     from omlx.cluster import staging
 
@@ -613,11 +699,21 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     from omlx.cluster.planner import ModelLayout
     from omlx.cluster.staging import StagingResult
 
+    # A model under $HOME is the default case and the one that exposes the
+    # tilde-abbreviation bug (#7): the coordinator must send remote_model_dir
+    # the exact absolute path, not a pre-abbreviated ~-form.
+    monkeypatch.setenv("HOME", str(tmp_path))
     root = _model(tmp_path / "source", layers=4, per_file=2)
     app = FastAPI()
     app.include_router(routes.router)
     monkeypatch.setattr(routes, "remote_file_sizes", lambda _host, _path: {})
-    monkeypatch.setattr(routes, "remote_model_dir", lambda _host, path: path)
+    resolved_dirs = []
+
+    def fake_remote_model_dir(_host, path, **_kwargs):
+        resolved_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(routes, "remote_model_dir", fake_remote_model_dir)
     monkeypatch.setattr(
         routes,
         "complete_model_layout",
@@ -702,6 +798,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     assert job["nodes"]["local"]["status"] == "ready"
     assert job["nodes"]["studio"]["status"] == "ready"
     assert job["nodes"]["studio"]["files_completed"] == 1
+    assert resolved_dirs == [str(root)]
 
 
 # ---------------------------------------------------------------------------
@@ -782,3 +879,94 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_free_disk_bytes_quotes_the_remote_path(monkeypatch):
+    """The peer-resolved model directory is interpolated into a remote shell
+    command; an unquoted path with shell metacharacters would let a
+    maliciously-named directory inject commands into the df probe."""
+    from omlx.cluster import staging
+    from omlx.cluster.staging import free_disk_bytes
+
+    captured = {}
+
+    class FakeResult:
+        stdout = "/dev/disk1  1000  100  900  10% /\n"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeResult()
+
+    monkeypatch.setattr(staging.subprocess, "run", fake_run)
+
+    dangerous_path = "/models/a; rm -rf /"
+    free_disk_bytes(dangerous_path, ssh_target="studio.local")
+
+    remote_command = captured["cmd"][-1]
+    # Tokenized as shell input, the dangerous path must parse back as a
+    # single argument to df — not as a separate `rm -rf /` command.
+    tokens = shlex.split(remote_command)
+    assert tokens == ["df", "-k", dangerous_path, "|", "tail", "-1"]
+
+
+def test_remote_model_dir_sends_the_tilde_form_not_the_absolute_path(monkeypatch):
+    """remote_model_dir owns the ~-abbreviation for transit (#7): every
+    caller was fixed to pass it the exact absolute path, so this must be the
+    one place that actually re-expresses it in ~-form before dispatch — every
+    prior test mocked this function away entirely, so nothing checked its own
+    body."""
+    from omlx.cluster import staging
+
+    monkeypatch.setenv("HOME", "/Users/ranger")
+    captured = {}
+
+    def fake_run_remote_python(ssh_target, snippet, argument, **kwargs):
+        captured["argument"] = argument
+        return "/Users/peeruser/models/m"
+
+    monkeypatch.setattr(staging, "run_remote_python", fake_run_remote_python)
+
+    result = staging.remote_model_dir("studio.local", "/Users/ranger/models/m")
+
+    assert captured["argument"] == "~/models/m"
+    assert result == "/Users/peeruser/models/m"
+
+
+def test_remote_model_dir_rejects_an_empty_result(monkeypatch):
+    """The error must name the model directory that failed to resolve, not
+    just the peer — this is the sole chokepoint for all three staging call
+    sites, so an ambiguous message leaves no way to tell which caller or
+    which model path was involved."""
+    from omlx.cluster import staging
+
+    monkeypatch.setattr(
+        staging, "run_remote_python", lambda *args, **kwargs: ""
+    )
+
+    with pytest.raises(RuntimeError, match="studio.local") as exc_info:
+        staging.remote_model_dir("studio.local", "/models/m")
+
+    assert "/models/m" in str(exc_info.value)
+
+
+def test_remote_model_staging_inventory_sends_the_tilde_form_not_the_absolute_path(
+    monkeypatch,
+):
+    """remote_model_staging_inventory must own the ~-abbreviation for transit
+    itself (#12), matching remote_model_dir's contract (#7) — callers pass
+    the coordinator's exact absolute path and this function converts it
+    internally, instead of requiring every caller to pre-convert."""
+    from omlx.cluster import staging
+
+    monkeypatch.setenv("HOME", "/Users/ranger")
+    captured = {}
+
+    def fake_run_remote_python(ssh_target, snippet, argument, **kwargs):
+        captured["argument"] = argument
+        return {"shards": [], "sidecars": {}}
+
+    monkeypatch.setattr(staging, "run_remote_python", fake_run_remote_python)
+
+    staging.remote_model_staging_inventory("studio.local", "/Users/ranger/models/m")
+
+    assert captured["argument"] == "~/models/m"
