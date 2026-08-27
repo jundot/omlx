@@ -14,6 +14,7 @@ import secrets
 import shlex
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -1221,23 +1222,36 @@ def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
     return tuple(addresses)
 
 
-def _read(ssh_hostname: str, command: list[str]) -> str:
-    """Run one read-only command on a host, returning "" when it cannot run."""
+def _read(ssh_hostname: str, command: list[str], *, attempts: int = 3) -> str:
+    """Run one read-only command on a host, returning "" when it cannot run.
 
+    mDNS resolution for a ``.local`` hostname is intermittently flaky — one
+    dropped multicast round trip used to be indistinguishable from "this host
+    genuinely has no addresses", surfacing as the confusing "has no routable
+    IPv4 address" report even though the peer answers fine a moment later.
+    Retry a bounded few times before treating the command as having failed.
+    """
+
+    argv = list(command)
     if ssh_hostname not in _LOCAL_HOSTS:
-        command = [
+        argv = [
             "ssh",
             *cluster_ssh_options(connect_timeout=10),
             ssh_hostname,
-            *command,
+            *argv,
         ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            return result.stdout
+        if attempt < attempts - 1:
+            time.sleep(0.5)
+    return ""
 
 
 def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
