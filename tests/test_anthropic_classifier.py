@@ -357,6 +357,43 @@ class TestUserMessageContentShapes:
         req = _request(_classifier_payload(messages=[]))
         assert any("transcript" in r for r in classifier_envelope_drift(req))
 
+    _ascii_text = st.text(alphabet=st.characters(min_codepoint=32, max_codepoint=126), max_size=20)
+    _text_block = st.builds(lambda t: {"type": "text", "text": t}, _ascii_text)
+    _non_text_block = st.sampled_from(
+        [
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}},
+            {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {}},
+        ]
+    )
+    _block = st.one_of(_text_block, _non_text_block)
+    _content = st.one_of(_ascii_text, st.lists(_block, max_size=5))
+    _message = st.fixed_dictionaries(
+        {"role": st.sampled_from(["user", "assistant"]), "content": _content}
+    )
+
+    @given(messages=st.lists(_message, max_size=5))
+    def test_user_message_text_property(self, messages):
+        """_user_message_text must equal the concatenation of str content and
+        text-block text from user messages only, in message order, regardless
+        of how many non-text blocks or assistant messages are interleaved."""
+        from omlx.api.anthropic_utils import _user_message_text
+
+        req = _request(_classifier_payload(messages=messages))
+        result = _user_message_text(req.messages)
+
+        expected_parts = []
+        for m in messages:
+            if m["role"] != "user":
+                continue
+            content = m["content"]
+            if isinstance(content, str):
+                expected_parts.append(content)
+            else:
+                for block in content:
+                    if block.get("type") == "text":
+                        expected_parts.append(block["text"])
+        assert result == "".join(expected_parts)
+
 
 class TestNoContentLeakage:
     """Drift reasons are logged, so they must never carry prompt content."""
