@@ -706,7 +706,7 @@ private struct UpdatesSection: View {
                         comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
-        case .downloading(let pct):
+        case .downloading(_, let pct):
             Text(String(localized: "status.updates.downloading_secondary",
                         defaultValue: "Downloading · \(pct)%",
                         comment: "Secondary update status line during download; placeholder is the percent complete"))
@@ -735,7 +735,7 @@ private struct UpdatesSection: View {
                 updates.requestUpdateConfirmation()
             }
                 .buttonStyle(.omlx(.primary, size: .small))
-        case .downloading(let pct):
+        case .downloading(_, let pct):
             Button(String(localized: "status.updates.downloading_button",
                           defaultValue: "Downloading… \(pct)%",
                           comment: "Updates action button label while the download is in progress; placeholder is the percent complete")) { }

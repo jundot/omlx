@@ -143,13 +143,18 @@ final class AppUpdater {
 
         let mountPoint: URL
         do {
-            mountPoint = try mountDMG(at: dmgPath)
+            mountPoint = try await Task.detached(priority: .utility) { [dmgPath] in
+                try self.mountDMG(at: dmgPath)
+            }.value
         } catch let err as UpdateError {
             onError(err); return
         } catch {
             onError(.mountFailed(error.localizedDescription)); return
         }
 
+        // ponytail: the detach stays on the main actor — `defer` can't await
+        // and `hdiutil detach` is a sub-second call. Wrap it in a detached task
+        // too if it ever shows up in a trace.
         defer { _ = try? unmountDMG(at: mountPoint) }
 
         if cancelled { return }
@@ -157,7 +162,9 @@ final class AppUpdater {
 
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
         do {
-            try stageApp(fromMount: mountPoint, to: stagedApp)
+            try await Task.detached(priority: .utility) { [mountPoint, stagedApp] in
+                try self.stageApp(fromMount: mountPoint, to: stagedApp)
+            }.value
         } catch let err as UpdateError {
             onError(err); return
         } catch {
@@ -290,7 +297,7 @@ final class AppUpdater {
 
     // MARK: - Mount / unmount
 
-    private func mountDMG(at dmg: URL) throws -> URL {
+    private nonisolated func mountDMG(at dmg: URL) throws -> URL {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
@@ -314,7 +321,7 @@ final class AppUpdater {
     }
 
     @discardableResult
-    private func unmountDMG(at mountPoint: URL) throws -> Bool {
+    private nonisolated func unmountDMG(at mountPoint: URL) throws -> Bool {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["detach", mountPoint.path, "-force"]
@@ -324,7 +331,7 @@ final class AppUpdater {
 
     // MARK: - Stage
 
-    private func stageApp(fromMount mountPoint: URL, to stagedApp: URL) throws {
+    private nonisolated func stageApp(fromMount mountPoint: URL, to stagedApp: URL) throws {
         let appInVolume = try findAppInVolume(mountPoint)
         if FileManager.default.fileExists(atPath: stagedApp.path) {
             try FileManager.default.removeItem(at: stagedApp)
@@ -341,7 +348,7 @@ final class AppUpdater {
         }
     }
 
-    private func findAppInVolume(_ mountPoint: URL) throws -> URL {
+    private nonisolated func findAppInVolume(_ mountPoint: URL) throws -> URL {
         let preferred = mountPoint.appendingPathComponent("oMLX.app")
         if FileManager.default.fileExists(atPath: preferred.path) { return preferred }
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: mountPoint.path)) ?? []

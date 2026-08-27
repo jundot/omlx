@@ -26765,6 +26765,54 @@
         }
       }
     },
+    "update.confirm.auto_prefetch" : {
+      "comment" : "Checkbox in the update confirmation sheet that enables downloading the update while the release notes are open",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download in the background while reading"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загружать в фоне во время чтения"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "阅读时在后台下载"
+          }
+        }
+      }
+    },
+    "update.confirm.downloading" : {
+      "comment" : "Update confirmation footer while the release DMG downloads in the background; placeholder is the percent complete",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading… %lld%%"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачивание… %lld%%"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在下载… %lld%%"
+          }
+        }
+      }
+    },
     "update.confirm.empty_notes" : {
       "comment" : "Empty state when a GitHub release has no release notes",
       "extractionState" : "manual",
@@ -26916,19 +26964,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Review the release notes before downloading and relaunching."
+            "value" : "The update downloads in the background while you read."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Просмотрите примечания к выпуску перед скачиванием и перезапуском."
+            "value" : "Обновление загружается в фоне, пока вы читаете."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在下载并重启前查看更新说明。"
+            "value" : "更新会在您阅读时于后台下载。"
           }
         }
       }

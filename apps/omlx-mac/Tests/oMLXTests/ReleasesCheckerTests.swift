@@ -160,4 +160,61 @@ final class UpdateControllerPrefsTests: XCTestCase {
         XCTAssertEqual(saved?["autoNotify"] as? Bool, false)
         XCTAssertNil(saved?["autoDownload"])
     }
+
+    /// The single branch behind the background prefetch: warm the DMG only for
+    /// a sheet the user asked for, and only once per release.
+    func testPrefetchOnlyWarmsUserInitiatedAvailableReleaseWithDMG() {
+        func update(dmgURL: URL?) -> AvailableUpdate {
+            AvailableUpdate(
+                version: "9.9.9",
+                sizeText: nil,
+                notes: "",
+                htmlURL: URL(string: "https://example.com/releases/9.9.9")!,
+                dmgURL: dmgURL
+            )
+        }
+
+        let info = update(dmgURL: URL(string: "https://example.com/oMLX-9.9.9.dmg")!)
+        XCTAssertNotNil(
+            UpdateController.prefetchURL(state: .available(info), info: info, automatic: false, enabled: true)
+        )
+        // Checkbox in the sheet footer, off.
+        XCTAssertNil(
+            UpdateController.prefetchURL(state: .available(info), info: info, automatic: false, enabled: false)
+        )
+        // Unattended prompt: never pull ~1 GB behind the user's back.
+        XCTAssertNil(
+            UpdateController.prefetchURL(state: .available(info), info: info, automatic: true, enabled: true)
+        )
+        // Reopening the sheet must not race a second AppUpdater onto the
+        // same staged bundle path.
+        XCTAssertNil(
+            UpdateController.prefetchURL(state: .downloading(info, percent: 12), info: info, automatic: false, enabled: true)
+        )
+        XCTAssertNil(
+            UpdateController.prefetchURL(state: .ready(info), info: info, automatic: false, enabled: true)
+        )
+
+        let noDMG = update(dmgURL: nil)
+        XCTAssertNil(
+            UpdateController.prefetchURL(state: .available(noDMG), info: noDMG, automatic: false, enabled: true)
+        )
+    }
+
+    /// The checkbox defaults to on and round-trips through update-prefs.json.
+    func testAutoPrefetchDefaultsOnAndPersists() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-update-prefs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("update-prefs.json")
+
+        // Prefs written before this key existed must still opt in.
+        try Data(#"{"channel":"stable","autoCheck":true,"autoNotify":false}"#.utf8).write(to: url)
+        let controller = UpdateController(storeURL: url, currentVersion: "0.0.0")
+        XCTAssertTrue(controller.autoPrefetch)
+
+        controller.autoPrefetch = false
+        XCTAssertFalse(UpdateController(storeURL: url, currentVersion: "0.0.0").autoPrefetch)
+    }
 }
