@@ -697,7 +697,10 @@ def test_qwen4_exp_preload_dispatch_arms_embedded_mtp(
         json.dumps(
             {
                 "model_type": "qwen4_exp",
-                "text_config": {"model_type": "qwen4_exp_text"},
+                "text_config": {
+                    "model_type": "qwen4_exp_text",
+                    "mtp_num_hidden_layers": 1,
+                },
                 "vision_config": {"model_type": "qwen4_exp"},
             }
         )

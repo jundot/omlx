@@ -680,7 +680,11 @@ def maybe_apply_pre_load_patches(
     # correctly, but Model.__init__ skips ``self.mtp = MTPModule(args)``;
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
-    if _is_mtp_compatible(config, model_type):
+    # Qwen4 is handled by the dedicated branch above. It uses checkpoint
+    # tensor discovery and a depth-1 default; sending it through this generic
+    # config-driven path as well would arm the same backend twice and overwrite
+    # the Qwen4-specific depth with the generic depth-3 default.
+    if model_type != "qwen4_exp" and _is_mtp_compatible(config, model_type):
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
@@ -1039,11 +1043,11 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
-    Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    Supports Qwen3.5/3.6 (mlx-lm PR 990), Qwen4-Exp, DeepSeek-V4-Flash
+    (Blaizzy/mlx-lm fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids
+    (nemotron_h) and Gemma 4 merged-assistant checkpoints (gemma4 and
+    gemma4_unified, VLM path only). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -1052,6 +1056,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
+        or model_type == "qwen4_exp"
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
