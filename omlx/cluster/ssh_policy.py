@@ -98,9 +98,9 @@ def run_ssh_retrying(
     mDNS resolution for a ``.local`` peer is intermittently flaky — one
     dropped multicast round trip should not be mistaken for a permanently
     unreachable host. Every caller across this module's users is a read-only
-    remote query (interface/inventory/shard/layout probes), so retrying is
-    always safe. An exception raised by ``subprocess.run`` itself (the
-    ``ssh``/``scp`` binary missing, say) is folded into a failed
+    remote query (interface/inventory/shard/layout/RDMA-device probes), so
+    retrying is always safe. An exception raised by ``subprocess.run`` itself
+    (the ``ssh``/``scp`` binary missing, say) is folded into a failed
     ``CompletedProcess`` the same as a nonzero exit, so callers only ever
     need to check ``returncode``.
     """
