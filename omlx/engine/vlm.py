@@ -959,10 +959,20 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
         try:
-            path = Path(filename).resolve()
+            path = Path(filename)
+            resolved = path.resolve()
         except TypeError:
             return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        # Judge the path as handed to us, not only the fully resolved one. A
+        # model served from the HuggingFace cache is a symlinked snapshot whose
+        # shards point into a sibling blobs/ directory, where files are named by
+        # hash with no extension. Resolving first therefore loses both the
+        # directory match and the .safetensors suffix, so this wrapper never
+        # gets applied and sanitize stays skipped for format=mlx checkpoints.
+        if path.suffix == ".safetensors" and (
+            resolved.parent == target_dir
+            or path.parent.resolve() == target_dir
+        ):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
@@ -1080,10 +1090,20 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
         try:
-            path = Path(filename).resolve()
+            path = Path(filename)
+            resolved = path.resolve()
         except TypeError:
             return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        # Judge the path as handed to us, not only the fully resolved one. A
+        # model served from the HuggingFace cache is a symlinked snapshot whose
+        # shards point into a sibling blobs/ directory, where files are named by
+        # hash with no extension. Resolving first therefore loses both the
+        # directory match and the .safetensors suffix, so this wrapper never
+        # gets applied and sanitize stays skipped for format=mlx checkpoints.
+        if path.suffix == ".safetensors" and (
+            resolved.parent == target_dir
+            or path.parent.resolve() == target_dir
+        ):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
