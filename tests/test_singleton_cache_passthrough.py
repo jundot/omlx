@@ -113,6 +113,105 @@ def test_make_cache_finds_nested_model_owned_batch_conversion():
     assert nested == ("custom-batch", (2, 0))
 
 
+def _qsa_cache(offset_base: int = 0):
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+    cache = QSAKVCache()
+    cache.state = (
+        mx.full((1, 2, 3, 4), float(offset_base), dtype=mx.float32),
+        mx.full((1, 2, 3, 4), float(offset_base + 1), dtype=mx.float32),
+        mx.full((1, 3, 4), float(offset_base + 2), dtype=mx.float32),
+        mx.full((1, 3), offset_base + 3, dtype=mx.int32),
+    )
+    mx.eval(
+        cache.keys,
+        cache.values,
+        cache.index_keys,
+        cache.index_position_ids,
+    )
+    return cache
+
+
+def _batched_qsa(*caches):
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    return BatchQSAKVCache.merge(list(caches))
+
+
+def test_singleton_merge_preserves_qsa_cache_object():
+    gen = importlib.import_module("mlx_lm.generate")
+    qsa = _qsa_cache()
+
+    merged = gen._merge_caches([[qsa]])
+
+    assert merged[0] is qsa
+
+
+def test_extend_converts_singleton_qsa_to_batched_cache():
+    gen = importlib.import_module("mlx_lm.generate")
+    qsa_a = _qsa_cache(0)
+    qsa_b = _qsa_cache(100)
+
+    extended = gen._extend_cache([qsa_a], [qsa_b])
+    batch_qsa = extended[0]
+    mx.eval(
+        batch_qsa.offset,
+        batch_qsa.left_padding,
+        batch_qsa.index_keys,
+        batch_qsa.index_position_ids,
+    )
+
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    assert isinstance(batch_qsa, BatchQSAKVCache)
+    assert batch_qsa.offset.tolist() == [3, 3]
+    assert batch_qsa.left_padding.tolist() == [0, 0]
+    assert batch_qsa.index_offset == 3
+    assert batch_qsa.index_keys.shape == (2, 3, 4)
+    assert mx.array_equal(batch_qsa.index_keys[0], qsa_a.index_keys[0]).item()
+    assert mx.array_equal(batch_qsa.index_keys[1], qsa_b.index_keys[0]).item()
+    assert mx.array_equal(
+        batch_qsa.index_position_ids,
+        mx.stack([qsa_a.index_position_ids[0], qsa_b.index_position_ids[0]]),
+    ).item()
+    assert batch_qsa.kv_cache.keys.shape == (2, 2, 3, 4)
+    assert mx.array_equal(batch_qsa.kv_cache.keys[0], qsa_a.keys[0]).item()
+    assert mx.array_equal(batch_qsa.kv_cache.keys[1], qsa_b.keys[0]).item()
+
+
+def test_extend_singleton_qsa_with_batched_qsa():
+    gen = importlib.import_module("mlx_lm.generate")
+    qsa_a = _qsa_cache(0)
+    batched = _batched_qsa(_qsa_cache(100), _qsa_cache(200))
+
+    extended = gen._extend_cache([qsa_a], [batched])
+    batch_qsa = extended[0]
+    mx.eval(batch_qsa.offset, batch_qsa.index_keys)
+
+    assert isinstance(batch_qsa, type(batched))
+    assert batch_qsa.offset.tolist() == [3, 3, 3]
+    assert batch_qsa.left_padding.tolist() == [0, 0, 0]
+    assert batch_qsa.index_keys.shape == (3, 3, 4)
+    assert mx.array_equal(batch_qsa.index_keys[0], qsa_a.index_keys[0]).item()
+    assert mx.array_equal(batch_qsa.index_keys[1], batched.index_keys[0]).item()
+    assert mx.array_equal(batch_qsa.index_keys[2], batched.index_keys[1]).item()
+
+
+def test_extend_keeps_batched_qsa_cache_in_place():
+    gen = importlib.import_module("mlx_lm.generate")
+    batched_a = _batched_qsa(_qsa_cache(0))
+    batched_b = _batched_qsa(_qsa_cache(100))
+
+    extended = gen._extend_cache([batched_a], [batched_b])
+
+    assert extended[0] is batched_a
+    assert batched_a.offset.tolist() == [3, 3]
+    assert batched_a.index_keys.shape == (2, 3, 4)
+
+
 def test_prompt_batch_full_split_moves_cache_without_copy():
     arrays = _arrays_cache()
     kv = _kv_cache(3)
