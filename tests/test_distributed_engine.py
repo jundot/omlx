@@ -1194,8 +1194,8 @@ async def test_peer_health_refresh_logs_its_elapsed_time(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_peer_health_refresh_logs_even_when_the_probe_breaks(monkeypatch, caplog):
-    """The timing line must survive a broken probe (fail-open path) -- a
-    finally, not something only the success branch reaches."""
+    """The timing line must survive a broken probe: placed after the
+    try/except/else, not something only the success branch reaches."""
 
     engine = _ready_engine(lambda request: httpx.Response(200))
     monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
