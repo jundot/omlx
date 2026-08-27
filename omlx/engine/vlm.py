@@ -32,6 +32,7 @@ import json
 import logging
 import threading
 from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -695,9 +696,7 @@ def _load_optiq_vision_sidecar_on_load(model_dir: Path):
         duplicates = model_keys.intersection(sidecar_weights)
         if duplicates:
             sample = ", ".join(sorted(duplicates)[:3])
-            raise ValueError(
-                f"OptiQ vision sidecar duplicates model weights: {sample}"
-            )
+            raise ValueError(f"OptiQ vision sidecar duplicates model weights: {sample}")
 
         injected = True
         result = original_load_weights(
@@ -886,8 +885,7 @@ def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
         _vu._load_safetensors = original_load_safetensors
         if transposed:
             logger.info(
-                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d "
-                "layout for %s",
+                "Transposed Qwen3.5 vision patch embedding to MLX Conv3d layout for %s",
                 model_dir.name,
             )
 
@@ -1263,8 +1261,12 @@ def _count_image_tokens(
 
 
 def _smart_resize_tokens(
-    h: int, w: int, patch_size: int, merge_size: int,
-    min_pixels: int, max_pixels: int,
+    h: int,
+    w: int,
+    patch_size: int,
+    merge_size: int,
+    min_pixels: int,
+    max_pixels: int,
 ) -> int:
     """Real merged-token count for one image of pixel size (h, w), mirroring
     the Qwen image processor's ``smart_resize`` -> grid_thw ->
@@ -1286,7 +1288,7 @@ def _smart_resize_tokens(
         beta = math.sqrt(min_pixels / (h * w))
         h_bar = math.ceil(h * beta / factor) * factor
         w_bar = math.ceil(w * beta / factor) * factor
-    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
+    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size**2)
 
 
 def _read_image_dims(part: dict) -> Optional[tuple]:
@@ -1353,9 +1355,7 @@ def _count_image_tokens_real(
     ms = getattr(ip, "merge_size", None)
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
-    qwen_ok = all(
-        isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp)
-    )
+    qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
 
     total = 0
     for msg in messages:
@@ -1599,7 +1599,7 @@ class VLMBatchedEngine(BaseEngine):
 
         from mlx_vlm.utils import load as vlm_load
 
-        from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..engine_core import AsyncEngineCore, EngineConfig, get_mlx_executor
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import maybe_load_custom_quantization
 
@@ -1617,10 +1617,41 @@ class VLMBatchedEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
+        # Populate the OS file cache before mlx-vlm creates file-backed/lazy
+        # arrays. Doing this after model construction is too late: MLX may
+        # already have established cold private storage, and the first forward
+        # still demand-faults it. A sequential NVMe pass here turns a minutes-
+        # long random first touch into a bounded part of model startup.
+        if _read_config_model_type(self._model_name) == "qwen4_exp":
+            try:
+                from mlx_vlm.models.qwen4_exp.language import get_ple_runtime_mode
+
+                from ..patches.mlx_vlm_qwen4_exp_compat.residency import (
+                    prefault_qwen4_exp_checkpoint,
+                )
+
+                ple_mode = get_ple_runtime_mode()
+                loop = asyncio.get_running_loop()
+                prefaulted, elapsed = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    partial(
+                        prefault_qwen4_exp_checkpoint,
+                        self._model_name,
+                        include_ple=ple_mode == "resident",
+                    ),
+                )
+                if prefaulted:
+                    logger.info(
+                        "Qwen4 checkpoint pre-load prefault (%s): %.1f GB in %.1fs",
+                        ple_mode,
+                        prefaulted / 1e9,
+                        elapsed,
+                    )
+            except Exception:
+                logger.warning("Qwen4 checkpoint prefault failed", exc_info=True)
+
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
-        from ..engine_core import get_mlx_executor
-
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
@@ -1648,9 +1679,7 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
-                with _load_optiq_vision_sidecar_on_load(
-                    Path(self._model_name)
-                ):
+                with _load_optiq_vision_sidecar_on_load(Path(self._model_name)):
                     loaded = vlm_load(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
@@ -1704,9 +1733,7 @@ class VLMBatchedEngine(BaseEngine):
                 get_mlx_executor(), free_t5_biases, self._vlm_model
             )
             if freed > 0:
-                logger.info(
-                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
-                )
+                logger.info("t5 bias tensors freed: %.0f MB recovered", freed / 1e6)
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
@@ -1880,9 +1907,7 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_verify_sdpa_split_patch()
         except Exception:
-            logger.debug(
-                "Qwen verify-split attention patch not applied", exc_info=True
-            )
+            logger.debug("Qwen verify-split attention patch not applied", exc_info=True)
 
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
         # Decode and masked paths keep the original mlx-vlm kernel.
@@ -2081,9 +2106,7 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
-                )
+                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
@@ -2509,8 +2532,7 @@ class VLMBatchedEngine(BaseEngine):
                         )
                     except TypeError:
                         logger.debug(
-                            "encode_image rejected image metadata; "
-                            "retrying without it",
+                            "encode_image rejected image metadata; retrying without it",
                             exc_info=True,
                         )
                 else:
@@ -2542,7 +2564,10 @@ class VLMBatchedEngine(BaseEngine):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
                         )
                     ]
-                    if image_position_ids is not None and len(positional_parameters) >= 2:
+                    if (
+                        image_position_ids is not None
+                        and len(positional_parameters) >= 2
+                    ):
                         return model.encode_image(pixel_values, image_position_ids)
 
             return model.encode_image(pixel_values)
@@ -2816,9 +2841,7 @@ class VLMBatchedEngine(BaseEngine):
         num_audios = len(audio) if audio else 0
 
         model_type = self.model_type or ""
-        if model_type == COHERE2_MOE_MODEL_TYPE and (
-            num_images > 0 or num_audios > 0
-        ):
+        if model_type == COHERE2_MOE_MODEL_TYPE and (num_images > 0 or num_audios > 0):
             raise InvalidRequestError(
                 "Cohere2 MoE is a text-only model and does not support "
                 "image or audio input.",
@@ -3048,7 +3071,8 @@ class VLMBatchedEngine(BaseEngine):
         extra_model_inputs = {
             k: v
             for k, v in inputs.items()
-            if k not in (
+            if k
+            not in (
                 "input_ids",
                 "attention_mask",
                 "pixel_values",

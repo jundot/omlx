@@ -114,26 +114,101 @@ def _make_patched_call(orig_call):
         if gate_up is None:
             return orig_call(self, x, indices)
 
+        use_native_q2 = _can_use_native_q2(self, x)
         x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= 64 or use_native_q2
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
+        native_plan = (
+            _native_q2_plan(idx, gate_up.num_experts) if use_native_q2 else None
+        )
+        x_gate_up = _call_projection(gate_up, x, idx, do_sort, native_plan)
         x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
-        x = self.down_proj(
+        x = _call_projection(
+            self.down_proj,
             self.activation(x_up, x_gate),
             idx,
-            sorted_indices=do_sort,
+            do_sort,
+            native_plan,
         )
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
         return x.squeeze(-2)
 
     return patched
+
+
+def _is_native_q2_projection(module: Any, dtype: Any) -> bool:
+    if not isinstance(module, QuantizedSwitchLinear):
+        return False
+    biases = module.get("biases")
+    return (
+        module.group_size == 32
+        and module.bits == 2
+        and module.mode == "affine"
+        and "bias" not in module
+        and module["weight"].dtype == mx.uint32
+        and biases is not None
+        and module["scales"].dtype == dtype
+        and biases.dtype == dtype
+    )
+
+
+def _can_use_native_q2(switch_mlp: Any, x: mx.array) -> bool:
+    # Stock gather_qmm wins at Qwen4's full 512-expert shape on M3 Ultra.
+    # Keep the bit-exact native path opt-in while it remains useful for
+    # smaller banks and continued kernel tuning.
+    if os.environ.get("OMLX_QWEN35_MOE_Q2_NATIVE", "0") != "1":
+        return False
+    # Keep prompt processing on stock gather_qmm; the block-list kernel is
+    # intended for the one-to-five-token decode regime.
+    if x.ndim != 3 or x.shape[-2] > 5 or x.dtype not in (mx.float16, mx.bfloat16):
+        return False
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    down = getattr(switch_mlp, "down_proj", None)
+    if not (
+        _is_native_q2_projection(gate_up, x.dtype)
+        and _is_native_q2_projection(down, x.dtype)
+    ):
+        return False
+    try:
+        from ..custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return glm_fast.has_symbol("deepseek_affine_gather_qmm_blocks")
+    except Exception:
+        return False
+
+
+def _native_q2_plan(indices: mx.array, num_experts: int):
+    from .deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
+
+    block_bm, variant = _block_config(indices.size, "affine")
+    block_meta, block_count = _build_mxfp4_blocks(indices, num_experts, block_bm)
+    return block_meta, block_count, variant
+
+
+def _call_projection(module, x, indices, sorted_indices, native_plan):
+    if native_plan is None:
+        return module(x, indices, sorted_indices=sorted_indices)
+
+    from ..custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    block_meta, block_count, variant = native_plan
+    return glm_fast.deepseek_affine_gather_qmm_blocks(
+        x,
+        module["weight"],
+        module["scales"],
+        module["biases"],
+        block_meta,
+        block_count,
+        module.group_size,
+        module.bits,
+        variant,
+    )
 
 
 def _make_patched_target_verify(orig_fn):

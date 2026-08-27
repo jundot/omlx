@@ -92,7 +92,8 @@ int affine_bytes_per_pack(int bits) {
 }
 
 bool supported_deepseek_affine(int group_size, int bits) {
-  return group_size == 64 && (bits == 2 || bits == 3);
+  return (group_size == 64 && (bits == 2 || bits == 3)) ||
+      (group_size == 32 && bits == 2);
 }
 
 int affine_packed_row_bytes(int K, int bits) {

@@ -30,6 +30,7 @@ from .config import ModelConfig, TextConfig
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+_Q2_UNPACK_SHIFTS = np.arange(0, 32, 2, dtype=np.uint32)
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,16 @@ def resolve_ple_runtime_mode(
         raise ValueError("OMLX_QWEN4_PLE_MODE must be auto, resident, or mmap")
     if requested != "auto":
         return requested
-    return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
+    # Decide from estimated live storage rather than raw file size, and leave
+    # 35% of unified memory for macOS, KV state, Metal temporaries, and the
+    # serving process. The previous raw-checkpoint 70% test undercounted this
+    # model by roughly 5% and could select resident mode with no runtime
+    # headroom.
+    estimated_resident = checkpoint_bytes * 1.05
+    resident_ceiling = physical_memory * 0.65
+    if estimated_resident <= resident_ceiling:
+        return "resident"
+    return "mmap"
 
 
 def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:
@@ -986,6 +996,16 @@ class _SafeTensorMMap:
         return str(self._header[key]["dtype"])
 
     def rows(self, key: str, rows: list[int]) -> mx.array:
+        dtype, copied = self.numpy_rows(key, rows)
+        if dtype == "BF16":
+            return mx.array(copied).astype(mx.bfloat16)
+        if dtype == "F8_E4M3":
+            return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
+        return mx.array(copied)
+
+    def numpy_rows(self, key: str, rows: list[int]) -> tuple[str, np.ndarray]:
+        """Copy selected rows, converting BF16 storage to float32 values."""
+
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
@@ -1010,11 +1030,8 @@ class _SafeTensorMMap:
         )
         copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
         if dtype == "BF16":
-            values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
-            return mx.array(values).astype(mx.bfloat16)
-        if dtype == "F8_E4M3":
-            return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
-        return mx.array(copied)
+            copied = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
+        return dtype, copied
 
     def close(self):
         if self._mapping is not None:
@@ -1204,21 +1221,43 @@ class DiskBackedShardedEmbedding(nn.Module):
             weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
                 shard_index
             ]
-            values = self._tensor_readers[weight_key].rows(weight_key, local)
-            if bits is not None:
+            if bits is None:
+                values = self._tensor_readers[weight_key].rows(weight_key, local)
+            else:
                 assert scales_key is not None
                 assert biases_key is not None
                 assert group_size is not None
-                scales = self._tensor_readers[scales_key].rows(scales_key, local)
-                biases = self._tensor_readers[biases_key].rows(biases_key, local)
-                values = mx.dequantize(
-                    values,
-                    scales,
-                    biases,
-                    group_size=group_size,
-                    bits=bits,
-                    mode="affine",
-                )
+                if bits == 2:
+                    _, packed = self._tensor_readers[weight_key].numpy_rows(
+                        weight_key, local
+                    )
+                    _, scales = self._tensor_readers[scales_key].numpy_rows(
+                        scales_key, local
+                    )
+                    _, biases = self._tensor_readers[biases_key].numpy_rows(
+                        biases_key, local
+                    )
+                    quantized = ((packed[..., None] >> _Q2_UNPACK_SHIFTS) & 3).reshape(
+                        len(local), -1
+                    )[:, : self.dims]
+                    dequantized = (
+                        quantized.reshape(len(local), -1, group_size)
+                        * scales[..., None]
+                        + biases[..., None]
+                    ).reshape(len(local), self.dims)
+                    values = mx.array(dequantized).astype(mx.bfloat16)
+                else:
+                    values = self._tensor_readers[weight_key].rows(weight_key, local)
+                    scales = self._tensor_readers[scales_key].rows(scales_key, local)
+                    biases = self._tensor_readers[biases_key].rows(biases_key, local)
+                    values = mx.dequantize(
+                        values,
+                        scales,
+                        biases,
+                        group_size=group_size,
+                        bits=bits,
+                        mode="affine",
+                    )
             values = values.astype(mx.bfloat16) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
@@ -1477,8 +1516,10 @@ class Qwen4ExpPLELayer(nn.Module):
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
         target_verify: bool = False,
+        embeddings: Optional[mx.array] = None,
     ):
-        embeddings = self.ple_embedding(input_ids, cache)
+        if embeddings is None:
+            embeddings = self.ple_embedding(input_ids, cache)
         keys = self.norm_key(
             _target_verify_linear(self.key_proj, embeddings, target_verify)
         ).reshape(*hidden_states.shape[:-1], self.hc_count, self.hidden_size)
@@ -1527,6 +1568,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        ple_embeddings: Optional[mx.array] = None,
     ):
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
@@ -1535,6 +1577,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cache,
                 mask,
                 target_verify=target_verify,
+                embeddings=ple_embeddings,
             )
 
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
@@ -1599,12 +1642,24 @@ class Qwen4ExpModel(nn.Module):
         **kwargs,
     ):
         del kwargs
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        # PLE shard selection needs the generated token IDs on the host. Do
+        # that before queueing layer 0 so ShardedEmbedding's tiny mx.eval()
+        # cannot flush an already-built Metal graph halfway through the
+        # forward pass. The selected row gathers remain lazy and execute with
+        # the rest of the model graph.
+        prefetched_ple = {
+            index: layer.ple.ple_embedding(inputs, cache[index])
+            for index, layer in enumerate(self.layers)
+            if "ple" in layer
+        }
+
         hidden_states = (
             self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         )
         hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
-        if cache is None:
-            cache = [None] * len(self.layers)
 
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
@@ -1622,6 +1677,7 @@ class Qwen4ExpModel(nn.Module):
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
+                ple_embeddings=prefetched_ple.get(index),
             )
             if hidden_sink is not None and index in capture:
                 hidden_sink.append(

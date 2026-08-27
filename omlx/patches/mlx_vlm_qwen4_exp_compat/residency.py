@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 _MODEL_OVERHEAD_FACTOR = 1.05
 _NGRAM_EMBEDDING_MARKER = ".ngram_embedding."
+_PREFAULT_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -134,8 +137,88 @@ def qwen4_exp_residency_estimate(
     index_path = ple_path / "model.safetensors.index.json"
     index_stat = index_path.stat() if index_path.is_file() else None
     index_signature = (
-        (index_stat.st_size, index_stat.st_mtime_ns)
-        if index_stat is not None
-        else None
+        (index_stat.st_size, index_stat.st_mtime_ns) if index_stat is not None else None
     )
     return _cached_residency_estimate(str(ple_path), signature, index_signature)
+
+
+def prefault_qwen4_exp_checkpoint(
+    model_path: str | Path,
+    *,
+    chunk_bytes: int = _PREFAULT_CHUNK_BYTES,
+    include_ple: bool = True,
+) -> tuple[int, float]:
+    """Sequentially fault resident Qwen4 checkpoint pages into the file cache.
+
+    MLX keeps safetensor storage file-backed. Evaluating the arrays makes the
+    graph concrete but does not touch every weight page, so a 60+ GB MoE can
+    otherwise spend minutes demand-faulting random expert and PLE pages during
+    its first decode. A sequential pass is dramatically cheaper on NVMe and
+    makes that cost part of model loading instead of the first request.
+
+    Set ``OMLX_QWEN4_PREFAULT=0`` to disable the pass. The returned tuple is
+    ``(bytes_read, elapsed_seconds)``.
+    """
+
+    requested = os.environ.get("OMLX_QWEN4_PREFAULT", "auto").strip().lower()
+    if requested in {"0", "false", "off", "no"}:
+        return 0, 0.0
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+
+    compute_path = Path(model_path).expanduser().resolve()
+    ple_path = _resolve_ple_path(compute_path)
+    checkpoint_files = sorted(
+        {
+            path.resolve()
+            for root in {compute_path, ple_path}
+            for path in root.glob("*.safetensors")
+        }
+    )
+    if not checkpoint_files:
+        return 0, 0.0
+
+    buffer = bytearray(chunk_bytes)
+    view = memoryview(buffer)
+    total = 0
+    started = time.perf_counter()
+    for path in checkpoint_files:
+        with path.open("rb", buffering=0) as file:
+            if include_ple:
+                ranges = [(0, path.stat().st_size)]
+            else:
+                raw_size = file.read(8)
+                if len(raw_size) != 8:
+                    continue
+                header_size = struct.unpack("<Q", raw_size)[0]
+                header = json.loads(file.read(header_size))
+                data_start = 8 + header_size
+                ranges = [(0, data_start)]
+                ranges.extend(
+                    (data_start + int(start), data_start + int(end))
+                    for key, entry in header.items()
+                    if key != "__metadata__" and _NGRAM_EMBEDDING_MARKER not in key
+                    for start, end in (entry["data_offsets"],)
+                )
+                ranges.sort()
+                merged: list[tuple[int, int]] = []
+                for start, end in ranges:
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((start, end))
+                ranges = merged
+
+            for start, end in ranges:
+                file.seek(start)
+                remaining = end - start
+                while remaining > 0:
+                    count = file.readinto(view[: min(remaining, chunk_bytes)])
+                    if not count:
+                        break
+                    # Keep the read observable without retaining a second copy
+                    # of the checkpoint in Python-managed memory.
+                    total += count
+                    remaining -= count
+                    _ = view[count - 1]
+    return total, time.perf_counter() - started

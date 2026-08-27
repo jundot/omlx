@@ -97,6 +97,31 @@ def test_qwen4_exp_compat_registers_model_and_media_formatter():
     assert message["content"][0]["type"] == "image"
 
 
+def test_qwen4_auto_residency_preserves_system_headroom():
+    from mlx_vlm.models.qwen4_exp.language import resolve_ple_runtime_mode
+
+    gib = 1024**3
+    checkpoint = 63 * gib
+    assert (
+        resolve_ple_runtime_mode(
+            "auto", checkpoint_bytes=checkpoint, physical_memory=96 * gib
+        )
+        == "mmap"
+    )
+    assert (
+        resolve_ple_runtime_mode(
+            "auto", checkpoint_bytes=checkpoint, physical_memory=128 * gib
+        )
+        == "resident"
+    )
+    assert (
+        resolve_ple_runtime_mode(
+            "resident", checkpoint_bytes=checkpoint, physical_memory=64 * gib
+        )
+        == "resident"
+    )
+
+
 def test_qwen4_exp_config_normalizes_reference_layer_type():
     config = _tiny_config()
     assert config.text_config.layer_types == [

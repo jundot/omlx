@@ -152,6 +152,24 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
     assert hasattr(model.blocks[0], "gate_up_proj")
 
 
+def test_qwen4_q2_group32_native_decode_is_bit_exact():
+    model = _make_model(quantize=False, model_cls=_FakeQwen4Model, n_blocks=1)
+    glu = model.blocks[0]
+    glu.gate_proj = glu.gate_proj.to_quantized(32, 2)
+    glu.up_proj = glu.up_proj.to_quantized(32, 2)
+    glu.down_proj = glu.down_proj.to_quantized(32, 2)
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    indices = mx.array([[[1, 7]]], dtype=mx.int32)
+
+    reference = glu(x, indices)
+    mx.eval(reference)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    actual = glu(x, indices)
+    mx.eval(actual)
+
+    assert mx.array_equal(reference, actual).item()
+
+
 def test_env_kill_switch(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
     model = _make_model()

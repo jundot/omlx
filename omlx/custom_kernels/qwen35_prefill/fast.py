@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import platform
@@ -23,7 +24,7 @@ def _detach_import_error(exc: Exception) -> Exception:
 
 
 try:
-    from . import _ext
+    _ext = importlib.import_module(f"{__package__}._ext")
 except Exception as exc:  # pragma: no cover - depends on local native build
     _ext = None
     _IMPORT_ERROR = _detach_import_error(exc)
@@ -128,9 +129,7 @@ def qwen35_cpu_fp16_affine_qmm_t(
         cpu_threads,
     )
     if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
-        return _ext.qwen35_cpu_fp16_affine_qmm_t(
-            *args, cpu_shared_resource
-        )
+        return _ext.qwen35_cpu_fp16_affine_qmm_t(*args, cpu_shared_resource)
     return _ext.qwen35_cpu_fp16_affine_qmm_t(*args)
 
 
@@ -147,9 +146,7 @@ def qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
 ) -> mx.array:
-    if _ext is None or not hasattr(
-        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
-    ):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"):
         raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
     args = (
         x,
@@ -164,9 +161,7 @@ def qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
         cpu_threads,
     )
     if hasattr(_ext, "qwen35_cpu_shared_resource_available"):
-        return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
-            *args, cpu_shared_resource
-        )
+        return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(*args, cpu_shared_resource)
     return _ext.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(*args)
 
 
@@ -274,9 +269,7 @@ def qwen35_ane_dual_cpu_fp16_swiglu_t(
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
 ) -> mx.array:
-    if _ext is None or not hasattr(
-        _ext, "qwen35_ane_dual_cpu_fp16_swiglu_t"
-    ):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_cpu_fp16_swiglu_t"):
         raise RuntimeError("ANE/CPU/GPU fp16 hybrid SwiGLU is unavailable")
     return _ext.qwen35_ane_dual_cpu_fp16_swiglu_t(
         x,
@@ -309,9 +302,7 @@ def qwen35_ane_dual_cpu_fp16_affine_qmm_t(
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
 ) -> mx.array:
-    if _ext is None or not hasattr(
-        _ext, "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
-    ):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_cpu_fp16_affine_qmm_t"):
         raise RuntimeError("ANE/CPU/GPU fp16 hybrid affine qmm is unavailable")
     return _ext.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
         x,
@@ -434,16 +425,16 @@ def qwen35_ane_compile_linear_bank(
 ):
     if not qwen35_ane_bank_compiler_available():
         raise RuntimeError("Private ANE procedure-bank compiler is unavailable")
-    return _ext.qwen35_ane_compile_linear_bank(
-        weights, sequence_length, ane_instance
-    )
+    return _ext.qwen35_ane_compile_linear_bank(weights, sequence_length, ane_instance)
 
 
 def qwen35_ane_linear_bank_builder(sequence_length: int):
     """Incremental bank builder: add() converts one fp32 slice at a time so
     the caller can release each staging array immediately (issue #2781)."""
-    if not qwen35_ane_available() or _ext is None or not hasattr(
-        _ext, "AneLinearBankBuilder"
+    if (
+        not qwen35_ane_available()
+        or _ext is None
+        or not hasattr(_ext, "AneLinearBankBuilder")
     ):
         raise RuntimeError("Private ANE procedure-bank builder is unavailable")
     return _ext.AneLinearBankBuilder(sequence_length)
@@ -453,8 +444,10 @@ def qwen35_ane_fused_bank_builder(sequence_length: int):
     """Incremental fused SwiGLU/down bank builder: add() converts one fp32
     gate/up/down triple at a time so the caller can release each staging
     array immediately (the issue #2781 recipe applied to fused banks)."""
-    if not qwen35_ane_available() or _ext is None or not hasattr(
-        _ext, "AneFusedBankBuilder"
+    if (
+        not qwen35_ane_available()
+        or _ext is None
+        or not hasattr(_ext, "AneFusedBankBuilder")
     ):
         raise RuntimeError("Private ANE procedure-bank builder is unavailable")
     return _ext.AneFusedBankBuilder(sequence_length)
@@ -666,9 +659,7 @@ def qwen35_ane_dual_affine_swiglu_t(
     group_size: int = 128,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_ane_dual_affine_swiglu_t"):
-        raise RuntimeError(
-            "Dual ANE hybrid affine SwiGLU native kernel is unavailable"
-        )
+        raise RuntimeError("Dual ANE hybrid affine SwiGLU native kernel is unavailable")
     return _ext.qwen35_ane_dual_affine_swiglu_t(
         x,
         gpu_weight,
@@ -757,9 +748,7 @@ def qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
 ) -> mx.array:
-    if _ext is None or not hasattr(
-        _ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t"
-    ):
+    if _ext is None or not hasattr(_ext, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t"):
         raise RuntimeError(
             "Dual-ANE/CPU fused SwiGLU/down native kernel is unavailable"
         )
