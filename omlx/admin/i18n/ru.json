@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
-  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы.",
+  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
 }

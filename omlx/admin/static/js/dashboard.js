@@ -207,6 +207,11 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            // settings_revision the form was built from — sent back on save
+            // as expected_settings_revision so a write against stale state
+            // 409s instead of silently clobbering a newer one. See
+            // docs/dashboard-model-config-sync.md.
+            modelSettingsRevision: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -7596,6 +7601,11 @@
                             this.selectedModel,
                             settings,
                         );
+                        // Applying a profile persists server-side and bumps
+                        // settings_revision — keep the form's tracked
+                        // revision in sync or the next Save would 409
+                        // against a change this same page just made.
+                        this.modelSettingsRevision = settings.settings_revision ?? null;
                         if (this.selectedModel) {
                             this.selectedModel.settings = { ...settings };
                         }
@@ -8080,6 +8090,13 @@
                     if (model && data.settings) {
                         model.settings = { ...data.settings };
                     }
+                    // This PUT persists and bumps settings_revision same as
+                    // any other save — keep the form's tracked revision in
+                    // sync or the next manual Save would 409 against a
+                    // change this same page just made.
+                    if (data.settings) {
+                        this.modelSettingsRevision = data.settings.settings_revision ?? null;
+                    }
                     this.aneTuning.applied = true;
                 } catch (error) {
                     this.aneTuning.error = error.message || String(error);
@@ -8100,6 +8117,16 @@
                 this.activeProfileName = isDiffusion
                     ? null
                     : ((model.settings && model.settings.active_profile_name) || null);
+                // Fresh read of this model's settings — the `model` argument
+                // carries a snapshot from the last /admin/api/models list
+                // fetch, which can be arbitrarily stale (another tab, a raw
+                // API call, an ANE-tuner apply elsewhere). Fall back to that
+                // snapshot only if the fresh read fails. See
+                // docs/dashboard-model-config-sync.md.
+                let freshSettings = model.settings || {};
+                const fetches = [
+                    fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`),
+                ];
                 if (isDiffusion) {
                     this.profiles = [];
                     this.templates = [];
@@ -8111,22 +8138,31 @@
                             this.profileScope = saved;
                         }
                     } catch (e) {}
-                    await Promise.all([
-                        this.loadProfilesForModel(model.id),
-                        this.loadTemplates(),
-                    ]);
-                    if (this.reasoningParsers.length === 0) {
-                        try {
-                            const resp = await fetch('/admin/api/grammar/parsers');
-                            if (resp.ok) this.reasoningParsers = await resp.json();
-                            else if (resp.status === 401) window.location.href = '/admin';
-                        } catch (_) { /* network error */ }
+                    fetches.push(this.loadProfilesForModel(model.id), this.loadTemplates());
+                }
+                const [settingsResp] = await Promise.all(fetches);
+                try {
+                    if (settingsResp.ok) {
+                        const data = await settingsResp.json();
+                        freshSettings = data.settings;
+                        model.settings = freshSettings; // keep list badges honest too
+                    } else if (settingsResp.status === 401) {
+                        window.location.href = '/admin';
+                        return;
                     }
+                } catch (_) { /* network error — use the cached snapshot */ }
+                if (!isDiffusion && this.reasoningParsers.length === 0) {
+                    try {
+                        const resp = await fetch('/admin/api/grammar/parsers');
+                        if (resp.ok) this.reasoningParsers = await resp.json();
+                        else if (resp.status === 401) window.location.href = '/admin';
+                    } catch (_) { /* network error */ }
                 }
                 this.selectedModel = model;
+                this.modelSettingsRevision = freshSettings.settings_revision ?? null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
-                    model.settings || {},
+                    freshSettings,
                 );
                 if (isDiffusion) {
                     this.profilesDrift = false;
@@ -8281,6 +8317,7 @@
                                 }
                             }
                             const payload = {
+                                expected_settings_revision: this.modelSettingsRevision,
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
@@ -8494,6 +8531,8 @@
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else if (response.status === 409) {
+                        await this.handleModelSettingsConflict(await response.json());
                     } else {
                         const data = await response.json();
                         alert(data.detail || window.t('js.error.save_model_settings_failed'));
@@ -8504,6 +8543,37 @@
                 } finally {
                     this.savingModelSettings = false;
                 }
+            },
+
+            // Someone else (another tab, a raw API call, an ANE-tuner apply)
+            // changed this model's settings since the form was opened, and
+            // save() was correctly rejected before touching anything (409,
+            // see the backend's expected_settings_revision check). Offer the
+            // two honest exits from docs/dashboard-model-config-sync.md — no
+            // silent merge, no silent overwrite.
+            async handleModelSettingsConflict(errorBody) {
+                const payload = errorBody && errorBody.detail;
+                const current = payload && payload.current_settings;
+                if (!current) {
+                    // Shape we didn't expect — fail safe rather than guess.
+                    alert(window.t('js.error.save_model_settings_failed'));
+                    return;
+                }
+                const wantsLoadLatest = confirm(
+                    (payload.message || window.t('js.error.model_settings_conflict')) +
+                    '\n\n' + window.t('js.confirm.model_settings_conflict_choice')
+                );
+                if (wantsLoadLatest) {
+                    if (this.selectedModel) this.selectedModel.settings = current;
+                    this.modelSettingsRevision = current.settings_revision ?? null;
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, current);
+                    this.computeDrift();
+                    return;
+                }
+                // Deliberate, informed overwrite — resend against the
+                // revision the 409 just told us is current, never blind.
+                this.modelSettingsRevision = current.settings_revision ?? null;
+                await this.saveModelSettings();
             },
 
             async loadGenerationDefaults() {

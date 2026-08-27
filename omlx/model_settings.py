@@ -334,6 +334,14 @@ class ModelSettings:
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
+    # Bumped by ModelSettingsManager on every persisted write (see _touch()).
+    # Lets a client detect "someone else changed this since I read it" by
+    # comparing the value it read against the value at write time — see
+    # docs/dashboard-model-config-sync.md. Not meant to be set by callers;
+    # inbound profile/template merges must strip it so a stale profile dict
+    # can't rewind a model's revision.
+    settings_revision: int = 0
+
     def __post_init__(self) -> None:
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
@@ -576,6 +584,25 @@ class ModelSettingsManager:
 
         return self.get_settings(resolved_model_id or model_id)
 
+    def _touch(self, model_id: str, settings: ModelSettings) -> ModelSettings:
+        """Bump ``settings.settings_revision`` past whatever this model's
+        current stored revision is (0 if none stored yet), in place.
+
+        Call with ``self._lock`` held, immediately before the write it
+        accompanies takes effect — either right before assigning
+        ``self._settings[model_id] = settings`` (reads the about-to-be-
+        replaced entry) or on an existing entry mutated in place (reads and
+        writes the same object). Every site that changes what
+        ``GET .../settings`` returns for a model must call this so a client
+        comparing revisions can detect the write — see
+        docs/dashboard-model-config-sync.md.
+        """
+        previous = self._settings.get(model_id)
+        settings.settings_revision = (
+            previous.settings_revision if previous is not None else 0
+        ) + 1
+        return settings
+
     def set_settings(self, model_id: str, settings: ModelSettings) -> None:
         """Set settings for a specific model.
 
@@ -597,7 +624,11 @@ class ModelSettingsManager:
                             f"(new default: '{model_id}')"
                         )
 
-            # Store a copy of the settings
+            # Touch the caller's object (not yet stored) before copying it,
+            # so both the copy this manager keeps AND the object the caller
+            # still holds (often returned straight back in an API response)
+            # agree on the new revision.
+            self._touch(model_id, settings)
             self._settings[model_id] = ModelSettings.from_dict(settings.to_dict())
             logger.info(f"Updated settings for model '{model_id}'")
 
@@ -1125,6 +1156,7 @@ class ModelSettingsManager:
                 old_active = self._settings.get(model_id)
                 if old_active is not None and old_active.active_profile_name == name:
                     old_active.active_profile_name = target_name
+                    self._touch(model_id, old_active)
                 del per_model[name]
 
             per_model[target_name] = profile
@@ -1204,6 +1236,7 @@ class ModelSettingsManager:
             # VLM MTP toggle when the merged settings need logits processors.
             merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
+            self._touch(model_id, new_settings)
             self._settings[model_id] = new_settings
             try:
                 self._save()

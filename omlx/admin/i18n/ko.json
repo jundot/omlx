@@ -1130,5 +1130,7 @@
   "js.success.download_started": "다운로드 시작: {repo_id}",
   "js.success.settings_saved": "설정이 저장되었습니다",
   "settings.mcp.expose_tools": "백엔드 MCP 도구를 클라이언트에 노출",
-  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요."
+  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요.",
+  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
 }

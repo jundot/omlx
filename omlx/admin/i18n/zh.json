@@ -1130,5 +1130,7 @@
   "js.success.download_started": "已开始下载：{repo_id}",
   "js.success.settings_saved": "设置已成功保存",
   "settings.mcp.expose_tools": "向客户端公开后端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。"
+  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。",
+  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
 }

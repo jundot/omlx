@@ -112,6 +112,13 @@ class CacheProbeRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
+    # Optional optimistic-concurrency check: when sent, the write is rejected
+    # with 409 if it no longer matches the model's current settings_revision
+    # (someone else wrote in between). Omitted by scripts/raw curl/older
+    # clients — behavior for them is unchanged. See
+    # docs/dashboard-model-config-sync.md.
+    expected_settings_revision: int | None = None
+
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
@@ -2228,6 +2235,27 @@ async def update_model_settings(
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
 
+    # Optimistic-concurrency check: reject before touching anything if the
+    # caller's view is stale. Opt-in — omitted entirely by scripts/raw curl,
+    # so this can never break a client that doesn't know about it. See
+    # docs/dashboard-model-config-sync.md.
+    if (
+        request.expected_settings_revision is not None
+        and request.expected_settings_revision != current_settings.settings_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Settings for '{model_id}' changed since this form was "
+                    "loaded (expected revision "
+                    f"{request.expected_settings_revision}, current "
+                    f"{current_settings.settings_revision})."
+                ),
+                "current_settings": current_settings.to_dict(),
+            },
+        )
+
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
@@ -3016,6 +3044,24 @@ def _raise_if_alias_conflicts_exposed_profiles(
                     f"model ID '{candidate_id}'"
                 ),
             )
+
+
+@router.get("/api/models/{model_id}/settings")
+async def get_model_settings(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Fresh read of one model's persisted settings.
+
+    Exists so the dashboard's Model Settings modal can build its form from
+    truth at open time instead of the possibly-stale snapshot embedded in
+    the last `GET /api/models` list response — see
+    docs/dashboard-model-config-sync.md. Includes `settings_revision` for
+    the optimistic-concurrency check on save.
+    """
+    _require_model(model_id)
+    settings_manager = _require_settings_manager()
+    return {"model_id": model_id, "settings": settings_manager.get_settings(model_id).to_dict()}
 
 
 @router.get("/api/models/{model_id}/profiles")

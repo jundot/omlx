@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Download iniciado: {repo_id}",
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
-  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP."
+  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP.",
+  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
 }
