@@ -928,12 +928,8 @@ def convert_anthropic_tools_to_internal(
     dropped: list[str] = []
 
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        tool_dict = _content_block_to_dict(tool)
+        if tool_dict is None:
             continue
 
         if _is_server_side_tool(tool_dict):
