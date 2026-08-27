@@ -221,6 +221,7 @@ final class ModelSettingsScreenVM {
     var allModels: [ModelDTO] = []
     var modelID: String = ""
     var lastError: String?
+    var isImportingMtplxSidecar: Bool = false
 
     // Basic
     var alias: String = ""
@@ -1011,6 +1012,30 @@ final class ModelSettingsScreenVM {
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
+    }
+
+    /// MTPLX checkpoints keep MTP weights in a sidecar until the server
+    /// imports them into the model index. Match the server-provided
+    /// compatibility marker rather than guessing from model names.
+    var canImportMtplxSidecar: Bool {
+        guard model?.mtpCompatible == false,
+              let reason = model?.mtpCompatibilityReason else {
+            return false
+        }
+        return reason.localizedCaseInsensitiveContains("MTPLX side-car")
+    }
+
+    func importMtplxSidecar(client: OMLXClient) async {
+        guard !isImportingMtplxSidecar, canImportMtplxSidecar else { return }
+        isImportingMtplxSidecar = true
+        defer { isImportingMtplxSidecar = false }
+
+        do {
+            _ = try await client.importMtplxSidecar(id: modelID)
+            await load(modelID: modelID, client: client)
+        } catch {
+            lastError = error.omlxDescription
+        }
     }
 
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
