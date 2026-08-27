@@ -104,6 +104,17 @@ class RuntimeTelemetry:
         self._completion_tokens_total = 0
         self._cached_tokens_total = 0
         self._batch_steps = 0
+        # §A1 part 2 / 2.2: a monotonic "generation made forward progress"
+        # counter, distinct from ``_batch_steps``. ``_batch_steps`` only
+        # increments on the batched continuous-batching path
+        # (``observe_batch_step``); a sequential/seeded request never
+        # touches it, so a liveness reader using ``_batch_steps`` alone
+        # would see a static value for the entire duration of a healthy
+        # sequential generation and misreport it as stalled. This counter
+        # increments on both paths -- once per coalesced batch step and
+        # once per generated token -- so "unchanged for N heartbeats"
+        # means the same thing regardless of which path a request took.
+        self._progress_ticks = 0
         self._busy_seconds = 0.0
         self._idle_seconds = 0.0
         self._last_batch: dict[str, Any] | None = None
@@ -260,6 +271,7 @@ class RuntimeTelemetry:
                 return
             sample.completion_tokens += 1
             sample.updated_at = now
+            self._progress_ticks += 1
             first = sample.first_token_at is None
             if first:
                 sample.first_token_at = now
@@ -379,6 +391,7 @@ class RuntimeTelemetry:
             self._busy_seconds += elapsed
             self._last_step_finished_at = now
             self._batch_steps += 1
+            self._progress_ticks += 1
             coalesced = max(prompt_responses, generation_responses)
             self._last_batch = {
                 "step_seconds": elapsed,
@@ -550,6 +563,7 @@ class RuntimeTelemetry:
         result = {
             "scope": "end_to_end_pipeline",
             "active_requests": len(self._requests),
+            "progress_ticks": self._progress_ticks,
             "requests_completed": self._requests_completed,
             "requests_failed": self._requests_failed,
             "requests_cancelled": self._requests_cancelled,

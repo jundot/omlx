@@ -90,6 +90,34 @@ def test_telemetry_calculates_ttft_prefill_and_decode_rates():
     assert marker.updates[-1][0] == "ready"
 
 
+def test_progress_ticks_advance_on_both_the_sequential_and_batched_paths():
+    """§A1 part 2 / 2.2: _batch_steps alone only advances on the batched
+    path -- a healthy sequential request would look permanently stalled to
+    a reader using it. progress_ticks must advance on both, so "unchanged
+    for N heartbeats" means the same thing regardless of which path a
+    request took."""
+
+    marker = _Marker()
+    telemetry = RuntimeTelemetry(marker, publish_interval=0)
+    request_id = telemetry.begin_request()
+
+    assert telemetry.snapshot()["progress_ticks"] == 0
+
+    telemetry.observe_token(request_id)  # sequential-path progress
+    assert telemetry.snapshot()["progress_ticks"] == 1
+
+    telemetry.observe_batch_step(
+        prompt_responses=1, generation_responses=1, elapsed_seconds=0.1
+    )  # batched-path progress
+    assert telemetry.snapshot()["progress_ticks"] == 2
+
+    telemetry.observe_token(request_id)
+    assert telemetry.snapshot()["progress_ticks"] == 3
+    # _batch_steps only reflects the one batched call, not the two tokens --
+    # confirms this is a genuinely separate counter, not a rename.
+    assert telemetry.snapshot()["pipeline"]["batch_steps"] == 1
+
+
 def test_telemetry_publishes_live_mlx_lm_prefill_progress():
     clock = _Clock()
     marker = _Marker()
