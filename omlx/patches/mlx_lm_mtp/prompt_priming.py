@@ -28,7 +28,9 @@ Fail-safe invariant: every capture verifies the anchor offset advanced
 contiguously since the previous capture (``expected_offset``). Any rewind,
 trim, request switch, or unknown cache path breaks the equality and
 invalidates the context, degrading to the current unprimed behaviour —
-never to a wrong history.
+never to a wrong history. A batched (B>1) forward advances the anchor
+without capture seeing its tokens, so it drops the context outright rather
+than let a later singleton chunk read as contiguous across it.
 
 Capture sites (each calls :func:`maybe_capture` after the backbone forward):
 
@@ -83,12 +85,14 @@ def priming_enabled() -> bool:
 
 
 def prime_window() -> int:
-    """Max prompt length (tokens) to prime; 0 = unlimited.
+    """Max tokens to fold into one prime context; 0 = unlimited.
 
-    Escape hatch for the head-cache memory cost on very long prompts (one
-    full-attention layer of KV over the prompt). Prompts longer than the
-    window run unprimed — a coarse cap, not a suffix window, because the
-    prompt length is unknown while chunks stream through the model.
+    Escape hatch for the head-cache memory cost of priming (one
+    full-attention layer of KV over the folded span). The cap is measured
+    against the span actually folded this request — with a warm prefix cache
+    that is only the boundary remainder, not the full prompt — so a
+    long-context request with a small remainder still primes. A remainder
+    larger than the window runs unprimed.
     """
     try:
         return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
@@ -124,10 +128,66 @@ class _PrimeCtx:
     # capture requires offset_now - S == expected_offset (contiguity).
     expected_offset: int = 0
     valid: bool = True
+    # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
+    # lightweight marker so later small chunks cannot restart priming.
+    window_exceeded: bool = False
+
+
+def _read_offset(entry: Any) -> Optional[int]:
+    """``entry.offset`` as a plain int, unwrapping size-1 array offsets.
+
+    Batch caches (``BatchKVCache`` / ``BatchRotatingKVCache``) hold their
+    offset as a 1-element ``mx.array``. Reading it costs one sync, so
+    callers do it once per forward at most.
+    """
+    offset = getattr(entry, "offset", None)
+    if type(offset) is int:
+        return offset
+    if offset is not None and getattr(offset, "size", 0) == 1:
+        try:
+            return int(offset.reshape(()).item())
+        except Exception:
+            return None
+    return None
+
+
+def _offset_readable(entry: Any) -> bool:
+    """Whether :func:`_read_offset` can serve this entry — no sync."""
+    offset = getattr(entry, "offset", None)
+    return type(offset) is int or (
+        offset is not None and getattr(offset, "size", 0) == 1
+    )
+
+
+class _IntOffsetAnchor:
+    """Anchor view exposing a scalar-or-size-1-array offset as an int.
+
+    Under ``BatchGenerator`` every request's caches are merged into
+    ``Batch*`` entries at ``PromptProcessingBatch.__init__``, whose
+    ``offset`` is a 1-element ``mx.array`` **even for a single request**
+    (B==1). The plain-int probe this replaces therefore found no anchor on
+    any batch-engine prefill, so ``maybe_capture`` bailed silently and
+    priming never activated there (#3079).
+
+    The unwrap is unambiguous because :func:`maybe_capture` only captures
+    ``(1, S)`` forwards — a singleton timeline. It does cost one ``int()``
+    sync per captured forward, which is what the contiguity invariant is
+    built on; ``BatchRotatingKVCache._offset`` would be sync-free but
+    counts buffer slots rather than tokens.
+    """
+
+    __slots__ = ("_cache",)
+
+    def __init__(self, cache: Any) -> None:
+        self._cache = cache
+
+    @property
+    def offset(self) -> Optional[int]:
+        return _read_offset(self._cache)
 
 
 def _anchor(cache: Optional[List[Any]]) -> Optional[Any]:
-    """First cache entry with a plain-int offset.
+    """First cache entry whose offset can be read as an int, as a view.
 
     Container layers (``CacheList``-style, exposing ``.caches`` — DeepSeek-V4
     and GLM-5.2 backbones) are searched one level deep: the container itself
@@ -136,11 +196,11 @@ def _anchor(cache: Optional[List[Any]]) -> Optional[Any]:
     if not cache:
         return None
     for c in cache:
-        if type(getattr(c, "offset", None)) is int:
-            return c
+        if _offset_readable(c):
+            return _IntOffsetAnchor(c)
         for sub in getattr(c, "caches", ()) or ():
-            if type(getattr(sub, "offset", None)) is int:
-                return sub
+            if _offset_readable(sub):
+                return _IntOffsetAnchor(sub)
     return None
 
 
@@ -149,29 +209,16 @@ def _activation_offset(cache: Optional[List[Any]]) -> Optional[int]:
 
     Between the last capture and activation, ``insert()`` runs mlx-lm's
     cache merge: scalar ``KVCache`` entries without singleton passthrough
-    become batch caches whose ``offset`` is a 1-element ``mx.array``. The
-    one-off ``int()`` sync here is activation-time only, never per-chunk.
+    become batch caches whose ``offset`` is a 1-element ``mx.array``.
     """
     if not cache:
         return None
-
-    def _read(entry: Any) -> Optional[int]:
-        offset = getattr(entry, "offset", None)
-        if type(offset) is int:
-            return offset
-        if offset is not None and getattr(offset, "size", 0) == 1:
-            try:
-                return int(offset.reshape(()).item())
-            except Exception:
-                return None
-        return None
-
     for c in cache:
-        got = _read(c)
+        got = _read_offset(c)
         if got is not None:
             return got
         for sub in getattr(c, "caches", ()) or ():
-            got = _read(sub)
+            got = _read_offset(sub)
             if got is not None:
                 return got
     return None
@@ -212,10 +259,12 @@ def drop_ctx(model: Any) -> None:
 
 
 def _host_eligible(host: Any) -> bool:
+    get_mtp = getattr(host, "get_mtp_module", None)
+    mtp = get_mtp() if callable(get_mtp) else getattr(host, "mtp", None)
     return bool(
         getattr(host, "_omlx_mtp_decode_enabled", False)
         and getattr(host, "_omlx_mtp_chain", False)
-        and getattr(host, "mtp", None) is not None
+        and mtp is not None
     )
 
 
@@ -248,14 +297,21 @@ def maybe_capture(
     forward is dispatched lazily and no GPU sync happens here.
 
     Call sites guard the cheap negatives (return_hidden / n_confirmed /
-    inputs_embeds / batch>1) before calling; everything here re-checks what
-    is load-bearing and bails silently, so a miss degrades to unprimed.
+    inputs_embeds) before calling; everything here re-checks what is
+    load-bearing and bails silently, so a miss degrades to unprimed.
     """
     if _suppressed() or not priming_enabled():
         return
     if cache is None or not _host_eligible(host):
         return
-    if inputs is None or getattr(inputs, "ndim", 0) != 2 or inputs.shape[0] != 1:
+    if inputs is None or getattr(inputs, "ndim", 0) != 2:
+        return
+    if inputs.shape[0] != 1:
+        # A B>1 forward advances the anchor invisibly to capture, so a later
+        # singleton chunk could look contiguous with a timeline it never
+        # belonged to (chunk boundaries are aligned across requests). Drop
+        # the slot rather than risk a wrong history.
+        drop_ctx(host)
         return
     anchor = _anchor(cache)
     if anchor is None:
@@ -265,6 +321,8 @@ def maybe_capture(
 
     seq_len = int(inputs.shape[1])
     offset_after = anchor.offset  # forward already ran; offset includes S
+    if offset_after is None:
+        return
 
     ctx = getattr(host, _CTX_ATTR, None)
     if ctx is not None and (
@@ -273,11 +331,26 @@ def maybe_capture(
         # Rewind / trim / request switch / unknown path: never guess.
         drop_ctx(host)
         ctx = None
-    window = prime_window()
-    if window and offset_after > window:
-        if ctx is not None:
-            drop_ctx(host)
+    if ctx is not None and ctx.window_exceeded:
+        ctx.expected_offset = offset_after
         return
+    window = prime_window()
+    if window:
+        # Cap by the primed span (the head-KV the window exists to bound),
+        # not the absolute prompt offset: on a warm prefix cache only the
+        # boundary remainder is ever folded, so a long-context request with a
+        # small remainder is exactly the cheap case priming is for (#2909).
+        folded = ctx.folded if ctx is not None else 0
+        if folded + seq_len > window:
+            setattr(
+                host,
+                _CTX_ATTR,
+                _PrimeCtx(
+                    expected_offset=offset_after,
+                    window_exceeded=True,
+                ),
+            )
+            return
     if ctx is None:
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
@@ -289,9 +362,7 @@ def maybe_capture(
 
     if ctx.pending_hidden is not None:
         if seq_len > 1:
-            pairs_hidden = mx.concatenate(
-                [ctx.pending_hidden, normed[:, :-1]], axis=1
-            )
+            pairs_hidden = mx.concatenate([ctx.pending_hidden, normed[:, :-1]], axis=1)
         else:
             pairs_hidden = ctx.pending_hidden
         pairs_tokens = inputs
@@ -349,9 +420,21 @@ def take_primed(
     for host in _host_candidates(model):
         hook = getattr(host, "mtp_take_primed", None)
         if callable(hook):
-            return hook(cache, main_tok)
+            primed = hook(cache, main_tok)
+            if primed is not None:
+                return primed
+            # None means the hook declined ownership, not "no priming": the
+            # DeepSeek-V4 patch registers ``mtp_take_primed`` on the class
+            # but only DSpark builds answer it, so legacy single-head MTP
+            # models could never reach the generic seam below and priming
+            # was structurally dead for them (#3079). Every hook pops its
+            # own context before declining, so the fallthrough cannot adopt
+            # a foreign timeline.
+            break
     ctx = _find_ctx(model)
-    if ctx is None:
+    if not isinstance(ctx, _PrimeCtx):
+        # No context, or a host-owned one sharing the slot (inkling's) whose
+        # hook declined without popping it — not ours to consume.
         return None
     drop_ctx(model)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
@@ -380,7 +463,7 @@ def take_primed(
 def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
     ctx = _find_ctx(model)
-    return ctx.folded if ctx is not None else None
+    return ctx.folded if ctx is not None and not ctx.window_exceeded else None
 
 
 __all__ = [

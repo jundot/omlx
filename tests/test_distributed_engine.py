@@ -251,6 +251,75 @@ def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
     assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
 
 
+def test_payloads_forward_repetition_context_size_when_requested():
+    engine = DistributedBatchedEngine(_deployment())
+    kwargs = {"repetition_context_size": 128}
+    chat = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs=dict(kwargs),
+    )
+    completion = engine._completion_payload(
+        prompt="hi",
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs=dict(kwargs),
+    )
+    assert chat["repetition_context_size"] == 128
+    assert completion["repetition_context_size"] == 128
+
+
+def test_payloads_omit_repetition_context_size_by_default():
+    # The key must stay off the wire unless the client asked for it: ranks
+    # running mlx-lm default the window to 20 tokens when it is absent.
+    engine = DistributedBatchedEngine(_deployment())
+    chat = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={},
+    )
+    completion = engine._completion_payload(
+        prompt="hi",
+        max_tokens=64,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.1,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={},
+    )
+    assert "repetition_context_size" not in chat
+    assert "repetition_context_size" not in completion
+
+
 def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine = DistributedBatchedEngine(
         _deployment(),
@@ -750,5 +819,353 @@ async def test_distributed_preflight_rejects_features_before_stream_starts():
                 [{"role": "user", "content": "hello"}],
                 specprefill=True,
             )
+    finally:
+        await engine._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort fallback: the distributed engine cannot render the chat
+# template itself (only rank-zero can), so an unsupported value must be
+# retried against rank-zero's HTTP endpoint rather than caught locally the
+# way the batched/vlm/dflash engines do.
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_retry_payloads_maps_alias_first():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+    variants = _reasoning_effort_retry_payloads(
+        payload, "Unexpected reasoning effort high. Supported types are xhigh."
+    )
+    assert len(variants) == 2
+    assert variants[0]["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+    # Second tier drops the field entirely (template's own default).
+    assert "reasoning_effort" not in variants[1].get("chat_template_kwargs", {})
+
+
+def test_reasoning_effort_retry_payloads_drops_when_no_alias_helps():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    # "xhigh" has no further fallback in _ALIAS_FALLBACKS beyond "max", but if
+    # the alias candidate equals the normalized value there is nothing to
+    # retry with as an alias -- only the drop tier applies. Use a value with a
+    # real alias to prove the two-tier ordering, and a bogus value to prove
+    # single-tier (drop only) when there's no useful candidate.
+    payload = {"chat_template_kwargs": {"reasoning_effort": "not-a-real-level"}}
+    variants = _reasoning_effort_retry_payloads(
+        payload, "Unexpected reasoning effort not-a-real-level."
+    )
+    assert len(variants) == 1
+    assert "reasoning_effort" not in variants[0].get("chat_template_kwargs", {})
+
+
+def test_reasoning_effort_retry_payloads_ignores_unrelated_failures():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+    assert _reasoning_effort_retry_payloads(payload, "model not found") == []
+
+
+def test_reasoning_effort_retry_payloads_ignores_when_not_requested():
+    from omlx.engine.distributed import _reasoning_effort_retry_payloads
+
+    payload = {"chat_template_kwargs": {}}
+    assert (
+        _reasoning_effort_retry_payloads(
+            payload, "Unexpected reasoning effort high."
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                404,
+                json={
+                    "error": "Unexpected reasoning effort high. Supported "
+                    "types are xhigh (default), medium, and low."
+                },
+            )
+        assert effort == "xhigh"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "high"},
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["high", "xhigh"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_tries_the_normalized_value_first():
+    # Local engines normalize before the first render, so "High" succeeds
+    # locally; the cluster path must land on the same value, not jump
+    # straight to the alias tier.
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+        return httpx.Response(
+            404,
+            json={"error": "Unexpected reasoning effort High."},
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "High"},
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["High", "high"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_generate_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "minimal":
+            return httpx.Response(
+                404,
+                json={"error": "Unexpected reasoning effort minimal."},
+            )
+        assert effort == "low"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"text": "ok", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.generate(
+            "hi", chat_template_kwargs={"reasoning_effort": "minimal"}
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["minimal", "low"]
+    assert output.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_retries_unsupported_reasoning_effort():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
+        calls.append(effort)
+        if effort == "high":
+            return httpx.Response(
+                404,
+                json={"error": "Unexpected reasoning effort high."},
+            )
+        assert effort == "xhigh"
+        lines = [
+            'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": null}]}',
+            'data: {"choices": [{"delta": {}, "finish_reason": "stop"}], '
+            '"usage": {"prompt_tokens": 1, "completion_tokens": 1}}',
+            "data: [DONE]",
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content="\n".join(lines) + "\n",
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                chat_template_kwargs={"reasoning_effort": "high"},
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert calls == ["high", "xhigh"]
+    assert "".join(o.new_text for o in outputs) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_generate_bounds_retries_and_gives_up():
+    # Every attempt is rejected. "High" walks the full ladder — original,
+    # normalized ("high"), alias ("xhigh"), dropped — exactly 4 requests,
+    # then raise; never an unbounded loop.
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(
+            404,
+            json={"error": "Unexpected reasoning effort High."},
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        with pytest.raises(DistributedInferenceError, match="HTTP 404"):
+            async for _ in engine.stream_generate(
+                "hi", chat_template_kwargs={"reasoning_effort": "High"}
+            ):
+                pass
+    finally:
+        await engine._client.aclose()
+
+    assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_does_not_retry_unrelated_404():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(404, json={"error": "model not found"})
+
+    engine = _ready_engine(handler)
+    try:
+        with pytest.raises(DistributedInferenceError, match="model not found"):
+            await engine.chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+    assert len(calls) == 1
+
+
+def _healthy_supervisor_status():
+    return SimpleNamespace(returncode=None, failure_reason=None)
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch):
+    # The 200 commits before a streaming body runs, so preflight is the last
+    # point a half-dead cluster can still become a clean HTTP error (#2708).
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed,
+        "check_peers",
+        lambda hosts, **kwargs: (
+            SimpleNamespace(healthy=True),
+            SimpleNamespace(healthy=False),
+        ),
+    )
+    monkeypatch.setattr(
+        distributed,
+        "describe_failure",
+        lambda health: "rank 1 (peer) stopped heartbeating",
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="not serving"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_caches_the_peer_health_read(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    calls = []
+
+    def fake_check_peers(hosts, **kwargs):
+        calls.append(hosts)
+        return (SimpleNamespace(healthy=True),)
+
+    monkeypatch.setattr(distributed, "check_peers", fake_check_peers)
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        await engine.preflight_completion("hi")
+        assert len(calls) == 1  # second preflight served from the TTL cache
+        assert calls[0] == {0: ("local", "127.0.0.1"), 1: ("peer", "peer.local")}
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_a_reported_failure_without_probing(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=None, failure_reason="rank 1 connection closed"
+        ),
+    )
+    probed = []
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda *a, **k: probed.append(1) or ()
+    )
+    try:
+        with pytest.raises(DistributedInferenceError, match="rank 1 connection"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert probed == []
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
+    # A broken probe must not take down a serving cluster; the supervisor
+    # checks still catch hard failures.
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+
+    def broken_check_peers(hosts, **kwargs):
+        raise OSError("ssh binary missing")
+
+    monkeypatch.setattr(distributed, "check_peers", broken_check_peers)
+    try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
     finally:
         await engine._client.aclose()

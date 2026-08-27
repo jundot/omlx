@@ -2102,6 +2102,61 @@ class TestAsyncBackgroundWrite:
         assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
 
+    def test_write_safetensors_no_mx_fsyncs_before_close(self, mx, tmp_path):
+        """The file must be durable on disk before any caller renames it
+        into place -- otherwise a crash between close() and the rename can
+        leave the renamed file pointing at data that was only ever in the
+        OS page cache, reading back as truncated/zero-filled garbage."""
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        t1 = mx.ones((4,), dtype=mx.float32)
+        mx.eval(t1)
+        tensors_raw = {"tensor_a": _extract_tensor_bytes(t1)}
+        out_path = str(tmp_path / "test.safetensors")
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _write_safetensors_no_mx(out_path, tensors_raw)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_fsyncs_the_directory(self, tmp_path):
+        """F1: renaming a file into place doesn't guarantee the directory
+        entry itself survives a crash until the containing directory is
+        fsynced too."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        target = tmp_path / "sub" / "file.txt"
+        target.parent.mkdir()
+        target.write_text("data")
+
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _fsync_parent_dir(target)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_tolerates_missing_directory(self, tmp_path):
+        """Must not raise if the directory vanished (e.g. concurrent
+        eviction) -- this is best-effort durability, not correctness."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        _fsync_parent_dir(str(tmp_path / "does-not-exist" / "file.txt"))
+
     def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
         """Verify bfloat16 safetensors file is loadable by mx.load."""
         original = mx.random.normal((8, 16, 32)).astype(mx.bfloat16)
@@ -2508,6 +2563,50 @@ class TestPreloadMatchedBlocks:
         # Verify blocks ARE in hot cache after preload
         for h in hashes:
             assert manager2._hot_cache_get(h) is not None
+
+        manager2.close()
+
+    def test_preload_mx_load_runs_serially_on_caller_thread(self, tmp_path, mx):
+        """Preload must not run mx.load() in worker threads -- a prior
+        ThreadPoolExecutor-based version caused deadlocks contesting Metal
+        GPU resources with the calling (inference) thread, the same failure
+        mode load_block's own discipline comment already documents. Every
+        mx.load() call during preload must happen on the calling thread,
+        one at a time."""
+        import threading
+
+        from omlx.cache import paged_ssd_cache as ssd_mod
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        caller_thread = threading.current_thread()
+        seen_threads = []
+        concurrent_calls = {"active": 0, "max_active": 0}
+        original_load = ssd_mod.mx.load
+
+        def spy_load(*args, **kwargs):
+            seen_threads.append(threading.current_thread())
+            concurrent_calls["active"] += 1
+            concurrent_calls["max_active"] = max(
+                concurrent_calls["max_active"], concurrent_calls["active"]
+            )
+            try:
+                return original_load(*args, **kwargs)
+            finally:
+                concurrent_calls["active"] -= 1
+
+        with patch.object(ssd_mod.mx, "load", spy_load):
+            loaded = manager2.preload_matched_blocks(hashes)
+
+        assert loaded == 4
+        assert len(seen_threads) == 4
+        assert all(t is caller_thread for t in seen_threads)
+        assert concurrent_calls["max_active"] == 1
 
         manager2.close()
 
@@ -3069,6 +3168,14 @@ class TestComputeMaxPendingWrites:
         cap = _compute_max_pending_writes()
         assert 1 <= cap <= 256
 
+    def test_non_positive_kv_estimate_uses_conservative_default(self):
+        """A zero per-token estimate must not make blocks look one byte wide."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        assert _compute_max_pending_writes(kv_bytes_per_token=0) == (
+            _compute_max_pending_writes(kv_bytes_per_token=200_000)
+        )
+
     def test_manager_picks_up_per_instance_cap(self, tmp_path):
         """The PagedSSDCacheManager must recompute the cap from its
         constructor args, not just inherit the module-level constant.
@@ -3111,6 +3218,27 @@ class TestComputeMaxPendingWrites:
         mgr_small.close()
         mgr_large.close()
 
+    def test_manager_normalizes_non_positive_kv_estimate(self, tmp_path):
+        """The manager must enforce the same safe fallback as the formula."""
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDCacheManager,
+            _compute_max_pending_writes,
+        )
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "zero-kv",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=1024,
+            expected_kv_bytes_per_token=0,
+        )
+
+        assert mgr._expected_kv_bytes_per_token == 200_000
+        assert mgr._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=1024,
+            kv_bytes_per_token=200_000,
+        )
+        mgr.close()
+
 
 class TestSchedulerPlumbsBlockSizeToSSDCache:
     """The Scheduler construction path must plumb its final
@@ -3126,11 +3254,20 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
       > construction path still does not pass them.
     """
 
-    def _make_scheduler(self, tmp_path, block_size_tokens, model_layers):
+    def _make_scheduler(
+        self,
+        tmp_path,
+        block_size_tokens,
+        model_layers,
+        kv_cache_layers=None,
+        rotating_cache_layers=0,
+    ):
         """Build a Scheduler with paged SSD cache enabled at the given
         block size and a model whose config exposes ``model_layers``
         layers (so the memory monitor produces a real per-token KV
-        estimate rather than its default)."""
+        estimate rather than its default). When ``kv_cache_layers`` is
+        provided, the remaining layers use fixed recurrent or rotating
+        state, as selected by ``rotating_cache_layers``."""
         from unittest.mock import MagicMock
 
         from omlx.scheduler import Scheduler, SchedulerConfig
@@ -3146,6 +3283,18 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         model = MagicMock()
         model.layers = []
         model.config = _Config()
+        if kv_cache_layers is not None:
+            from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+            fixed_cache_layers = model_layers - kv_cache_layers - rotating_cache_layers
+            if fixed_cache_layers < 0:
+                raise ValueError("cache layer counts exceed model_layers")
+
+            model.make_cache = lambda: [
+                *[KVCache() for _ in range(kv_cache_layers)],
+                *[RotatingKVCache(max_size=512) for _ in range(rotating_cache_layers)],
+                *[ArraysCache(size=2) for _ in range(fixed_cache_layers)],
+            ]
 
         tokenizer = MagicMock()
         tokenizer.eos_token_id = 2
@@ -3248,6 +3397,53 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         )
         assert mgr._max_pending_writes == expected_cap
         assert mgr._write_queue.maxsize == mgr._max_pending_writes
+
+        mgr.close()
+
+    def test_hybrid_model_uses_kv_layers_for_ssd_estimate(self, tmp_path):
+        """The SSD queue estimate must ignore fixed-state hybrid layers."""
+        sched = self._make_scheduler(
+            tmp_path / "hybrid",
+            block_size_tokens=1024,
+            model_layers=64,
+            kv_cache_layers=16,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+        expected = 16 * 8 * 192 * 2 * 2
+        assert mgr._expected_kv_bytes_per_token == expected
+
+        mgr.close()
+
+    @pytest.mark.parametrize(
+        ("kv_cache_layers", "rotating_cache_layers"),
+        [(0, 0), (0, 40)],
+        ids=("arrays_only", "rotating_only"),
+    )
+    def test_zero_token_kv_layout_uses_safe_ssd_default(
+        self, tmp_path, kv_cache_layers, rotating_cache_layers
+    ):
+        """Zero per-token KV must not expand the SSD writer queue to 256."""
+        sched = self._make_scheduler(
+            tmp_path,
+            block_size_tokens=1024,
+            model_layers=40,
+            kv_cache_layers=kv_cache_layers,
+            rotating_cache_layers=rotating_cache_layers,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+        assert sched.memory_monitor.estimate_block_memory(1) == 0
+        assert mgr._expected_kv_bytes_per_token == 200_000
+
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        expected_cap = _compute_max_pending_writes(
+            block_size_tokens=mgr._expected_block_size_tokens,
+            kv_bytes_per_token=200_000,
+        )
+        assert mgr._max_pending_writes == expected_cap
+        assert mgr._write_queue.maxsize == expected_cap
 
         mgr.close()
 

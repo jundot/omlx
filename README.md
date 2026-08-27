@@ -91,7 +91,7 @@ pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4).
+Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4/M5).
 
 > **Note on native custom kernels:** a plain `pip install -e .` does NOT build
 > them, and the affected model families then silently fall back to much slower

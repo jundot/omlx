@@ -31,11 +31,11 @@ from typing import Any
 from omlx.utils import hardware
 
 from .deployment import ClusterDeployment, validate_ssh_target
-from .liveness import read_marker, read_remote_marker
+from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
 from .ssh_policy import cluster_ssh_options
-from .staging import validate_staged_model
+from .staging import home_relative_model_path, validate_staged_model
 
 logger = logging.getLogger(__name__)
 
@@ -361,8 +361,11 @@ def build_mlx_launch_argv(
                 fallback=python_executable,
                 module="omlx.cluster.inference_worker",
             ),
+            # One shared argv launches every rank; send the ~-form so each rank
+            # resolves the model in its own home (worker expands it). A coord
+            # absolute path outside ~ is returned unchanged.
             "--model",
-            deployment.model,
+            home_relative_model_path(deployment.model),
             "--backend",
             deployment.backend,
             "--port",
@@ -805,6 +808,18 @@ def _run_cluster_ssh(
     return completed
 
 
+def _raise_for_ssh_transport_failure(
+    ssh_target: str,
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    """Keep OpenSSH failures out of remote interpreter fallback."""
+
+    if completed.returncode != 255:
+        return
+    detail = completed.stderr.strip() or "OpenSSH exited with status 255"
+    raise DistributedLaunchError(f"SSH to {ssh_target} failed: {detail}")
+
+
 def discover_remote_python_executable(
     ssh_target: str,
     *,
@@ -831,15 +846,17 @@ def discover_remote_python_executable(
         if candidate in seen:
             continue
         seen.add(candidate)
-        # The packaged macOS app exposes a launcher which assembles PYTHONPATH
-        # for its bundled interpreter.  Returning ``sys.executable`` from that
-        # launcher loses the environment and makes the very next probe fail.
-        # Preserve the launcher itself while still resolving ``~`` to an
-        # absolute path accepted by the launcher's path validation.
+        # The packaged macOS app and the worker shim are launchers which
+        # assemble PYTHONPATH for an underlying interpreter.  Returning
+        # ``sys.executable`` from a launcher loses that environment and makes
+        # the very next probe fail with ModuleNotFoundError.  Preserve every
+        # path-shaped candidate (absolute or ``~``) exactly as given; only a
+        # bare command name (``python3``) needs ``sys.executable`` to become an
+        # absolute path.
         script = (
             "import os,omlx; print(os.path.expanduser("
             f"{candidate!r}))"
-            if candidate.startswith("~")
+            if candidate.startswith(("~", "/"))
             else "import sys,omlx; print(sys.executable)"
         )
         command = (
@@ -853,6 +870,7 @@ def discover_remote_python_executable(
             timeout=timeout,
             runner=runner,
         )
+        _raise_for_ssh_transport_failure(ssh_target, completed)
         if completed.returncode != 0:
             continue
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
@@ -891,6 +909,7 @@ def discover_remote_system_python(
             timeout=timeout,
             runner=runner,
         )
+        _raise_for_ssh_transport_failure(ssh_target, completed)
         if completed.returncode != 0:
             continue
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
@@ -1142,16 +1161,31 @@ def probe_remote_admission_ceiling(
     own instead.
     """
 
+    # Ask the peer's live server first: one HTTP round trip instead of a cold
+    # `import omlx` (which imports MLX and can blow the SSH timeout). Peers
+    # conventionally run the coordinator's port; 9000 is kept as a legacy
+    # candidate for mixed setups. Hardcoding 9000 alone left the fast path dead
+    # on every cluster serving on the (default) port 8000.
+    try:
+        from omlx.settings import get_settings
+
+        local_port = int(get_settings().server.port)
+    except Exception:
+        local_port = 8000
+    ports = tuple(dict.fromkeys((local_port, 9000)))
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
-        "try:\n"
-        "    with urllib.request.urlopen("
-        "'http://127.0.0.1:9000/health',timeout=2) as response:\n"
-        "        health=json.load(response)\n"
-        "    ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
-        "except Exception:\n"
-        "    pass\n"
+        f"for port in {ports!r}:\n"
+        "    try:\n"
+        "        with urllib.request.urlopen("
+        "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
+        "            health=json.load(response)\n"
+        "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
+        "        if ceiling>0:\n"
+        "            break\n"
+        "    except Exception:\n"
+        "        pass\n"
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
@@ -1479,12 +1513,15 @@ def preflight_remote_hosts(
             )
             continue
         remote_python = host.python_executable or python_executable
+        # Send the ~-form: deployment.model is the coordinator's absolute path,
+        # which names nothing on a peer with a different macOS account. The
+        # preflight script expanduser()s it in the peer's own home.
         remote_command = shlex.join(
             [
                 remote_python,
                 "-c",
                 script,
-                deployment.model,
+                home_relative_model_path(deployment.model),
                 str(assignment.start_layer),
                 str(assignment.end_layer),
                 assignment.memory_guard_tier,
@@ -1919,6 +1956,7 @@ class DistributedJobSupervisor:
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
+        self._reap_remote_ranks()
         for reader in self._readers:
             reader.join(timeout=0.5)
         self._readers.clear()
@@ -1936,6 +1974,154 @@ class DistributedJobSupervisor:
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None
+
+    def _reap_remote_ranks(self, *, runner: SSHRunner = subprocess.run) -> None:
+        """Kill rank workers on peer hosts that the local group kill cannot reach.
+
+        ``mlx.launch`` runs each rank through SSH in its own process group on
+        its host. When local supervision stops, an uncooperative remote rank
+        (for example, blocked in a Metal/JACCL collective) remains resident,
+        pinning unified memory and breaking future admission.
+
+        Each rank writes a marker at
+        ``{state_dir}/{deployment_id}-rank-{rank}.json``. Read that marker
+        over SSH, validate that the PID matches the expected deployment,
+        plan, and rank, verify the process command line before signaling,
+        and escalate SIGTERM -> wait -> SIGKILL -> confirmed dead.
+
+        The marker file is deliberately left in place: it holds the rank's
+        failure phase and error, which ``_runtime_failure_reason`` and the
+        liveness views read after exactly this teardown. The script reports
+        what it did as one JSON line so a failed reap is visible in the logs
+        instead of passing as a clean stop.
+        """
+        if not self.deployment or not self.deployment.hosts:
+            return
+        for rank, host in enumerate(self.deployment.hosts):
+            if host.ssh in _LOOPBACK_TARGETS:
+                continue
+            filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
+            script = (
+                "import json,os,pathlib,signal,subprocess,sys,time\n"
+                f"root=pathlib.Path({self.state_dir!r}).expanduser()\n"
+                f"p=root / {filename!r}\n"
+                f"dep_id={self.deployment.deployment_id!r}\n"
+                f"p_hash={self.deployment.plan_hash!r}\n"
+                f"rank_idx={rank!r}\n"
+                "def out(action):\n"
+                "  print(json.dumps({'rank':rank_idx,'action':action}))\n"
+                "  sys.stdout.flush()\n"
+                "if not p.is_file():\n"
+                "  out('no-marker'); raise SystemExit(0)\n"
+                "try:\n"
+                "  d=json.loads(p.read_text())\n"
+                "except Exception:\n"
+                "  out('marker-unreadable'); raise SystemExit(0)\n"
+                "if d.get('deployment_id') != dep_id or d.get('plan_hash') != p_hash or d.get('rank') != rank_idx:\n"
+                "  out('identity-mismatch'); raise SystemExit(0)\n"
+                "pid=d.get('pid')\n"
+                "if not isinstance(pid,int) or isinstance(pid,bool) or pid<=0 or pid==os.getpid():\n"
+                "  out('identity-mismatch'); raise SystemExit(0)\n"
+                "def is_dead(target_pid):\n"
+                "  try:\n"
+                "    os.kill(target_pid,0)\n"
+                "  except ProcessLookupError:\n"
+                "    return True\n"
+                "  except PermissionError:\n"
+                "    pass\n"
+                "  try:\n"
+                "    res=subprocess.run(['ps','-p',str(target_pid),'-o','stat='],capture_output=True,text=True,check=False)\n"
+                "    st=res.stdout.strip()\n"
+                "    if not st or 'Z' in st:\n"
+                "      return True\n"
+                "  except Exception:\n"
+                "    pass\n"
+                "  return False\n"
+                "if is_dead(pid):\n"
+                "  out('already-dead'); raise SystemExit(0)\n"
+                "try:\n"
+                "  res=subprocess.run(['ps','-p',str(pid),'-o','args='],capture_output=True,text=True,check=False)\n"
+                "  cmd=res.stdout.strip()\n"
+                "  if not cmd:\n"
+                "    res=subprocess.run(['ps','-p',str(pid),'-o','command='],capture_output=True,text=True,check=False)\n"
+                "    cmd=res.stdout.strip()\n"
+                "except Exception:\n"
+                "  cmd=''\n"
+                "if not ('omlx.cluster.inference_worker' in cmd and dep_id in cmd):\n"
+                "  out('pid-reused'); raise SystemExit(0)\n"
+                "try:\n"
+                "  os.kill(pid,signal.SIGTERM)\n"
+                "except ProcessLookupError:\n"
+                "  out('already-dead'); raise SystemExit(0)\n"
+                "deadline=time.monotonic()+3.0\n"
+                "while time.monotonic()<deadline:\n"
+                "  if is_dead(pid):\n"
+                "    out('terminated'); raise SystemExit(0)\n"
+                "  time.sleep(0.05)\n"
+                "try:\n"
+                "  os.kill(pid,signal.SIGKILL)\n"
+                "except ProcessLookupError:\n"
+                "  out('terminated'); raise SystemExit(0)\n"
+                "kill_deadline=time.monotonic()+2.0\n"
+                "while time.monotonic()<kill_deadline:\n"
+                "  if is_dead(pid):\n"
+                "    out('killed'); raise SystemExit(0)\n"
+                "  time.sleep(0.05)\n"
+                "out('kill-failed')\n"
+            )
+            try:
+                completed = _run_cluster_ssh(
+                    host.ssh,
+                    f"python3 -c {shlex.quote(script)}",
+                    timeout=8.0,
+                    runner=runner,
+                )
+            except (DistributedLaunchError, OSError) as exc:
+                # Best effort: an unreachable peer or disconnected link
+                # cannot leave a resident rank behind. Still say so — a
+                # reap that never ran must not read as a clean stop.
+                logger.warning(
+                    "remote rank reap unreachable for rank %d on %s: %s",
+                    rank,
+                    host.ssh,
+                    exc,
+                )
+                continue
+            action = ""
+            for line in reversed(completed.stdout.strip().splitlines()):
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("action"):
+                    action = str(payload["action"])
+                    break
+            if action == "kill-failed":
+                logger.warning(
+                    "remote rank %d on %s survived SIGKILL; its memory stays "
+                    "resident until cleaned up manually",
+                    rank,
+                    host.ssh,
+                )
+            elif action in ("terminated", "killed"):
+                logger.info(
+                    "reaped remote rank %d on %s (%s)", rank, host.ssh, action
+                )
+            elif action:
+                logger.debug(
+                    "remote rank reap for rank %d on %s: %s",
+                    rank,
+                    host.ssh,
+                    action,
+                )
+            else:
+                logger.warning(
+                    "remote rank reap for rank %d on %s returned no report "
+                    "(exit %s)",
+                    rank,
+                    host.ssh,
+                    completed.returncode,
+                )
 
     def _exit_detail(self, returncode: int | None) -> str:
         failure_reason = self._failure_reason() or self._runtime_failure_reason()
@@ -1961,7 +2147,7 @@ class DistributedJobSupervisor:
         failures: list[str] = []
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
-            if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+            if host.ssh in _LOOPBACK_TARGETS:
                 marker = read_marker(
                     Path(self.state_dir).expanduser() / filename
                 )

@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -175,6 +176,15 @@ class ServerSettings:
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
     distributed_inference_enabled: bool = False
+    # Human-readable size, same grammar as cache limits ("100MB", "1GB").
+    max_audio_upload_size: str = "100MB"
+
+    def max_audio_upload_bytes(self) -> int:
+        """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_audio_upload_size)
+        if size <= 0:
+            raise ValueError("max_audio_upload_size must be positive")
+        return size
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -198,6 +208,7 @@ class ServerSettings:
                 "distributed_inference_enabled",
                 False,
             ),
+            max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
         )
 
 
@@ -322,6 +333,14 @@ class CacheSettings:
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    # When True (and the hot cache is enabled), every saved block is kept in
+    # RAM AND persisted to SSD immediately — RAM-speed resume for recent
+    # sessions without losing SSD durability for old ones.
+    hot_cache_write_through: bool = False
+    # Reuse Apple's AOT-compiled ANE programs across server restarts
+    # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
+    # once, at the first ANE compile, so a change applies on restart.
+    ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
@@ -417,6 +436,8 @@ class CacheSettings:
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
+            "hot_cache_write_through": self.hot_cache_write_through,
+            "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
 
@@ -463,6 +484,10 @@ class CacheSettings:
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
+            hot_cache_write_through=bool(
+                data.get("hot_cache_write_through", False)
+            ),
+            ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -1035,7 +1060,24 @@ class GlobalSettings:
                 )
 
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse settings file {path}: {e}")
+            # A corrupt settings file silently reverting the server to
+            # defaults is security-relevant (auth.api_key lives here), so
+            # preserve the evidence and be loud instead of a debug-level shrug.
+            backup = path.with_name(
+                f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
+            try:
+                os.replace(path, backup)
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}); moved it to "
+                    f"{backup} and continuing with defaults. Restore it or "
+                    "reconfigure, otherwise API-key auth may be disabled."
+                )
+            except OSError:
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}) and could not be "
+                    "moved aside; continuing with defaults."
+                )
         except OSError as e:
             logger.warning(f"Failed to read settings file {path}: {e}")
 
@@ -1055,6 +1097,8 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
+            self.server.max_audio_upload_size = max_audio_upload_size
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
@@ -1089,6 +1133,12 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if hot_cache_wt := os.getenv("OMLX_HOT_CACHE_WRITE_THROUGH"):
+            self.cache.hot_cache_write_through = hot_cache_wt.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
         if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
             try:
                 self.cache.set_gdn_snapshot_storage(gdn_storage)
@@ -1186,6 +1236,11 @@ class GlobalSettings:
             self.server.log_level = args.log_level
         if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
             self.server.sse_keepalive_mode = args.sse_keepalive_mode
+        if (
+            hasattr(args, "max_audio_upload_size")
+            and args.max_audio_upload_size is not None
+        ):
+            self.server.max_audio_upload_size = args.max_audio_upload_size
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
@@ -1242,6 +1297,8 @@ class GlobalSettings:
 
         if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -1342,18 +1399,29 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        # Write to a temp file and rename so a crash or a concurrent
+        # writer can never leave a torn settings.json (same pattern as
+        # ModelSettingsManager._save). The rename also carries the temp
+        # file's 0o600 mode onto the destination. The temp name embeds the
+        # pid: with a shared name, two processes saving at once interleave
+        # inside the same temp file and the rename publishes the mix.
+        temp_file = settings_file.with_name(
+            f"{settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            if os.name == "posix" and settings_file.exists():
-                settings_file.chmod(0o600)
             with os.fdopen(
-                os.open(settings_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
                 "w",
                 encoding="utf-8",
             ) as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, settings_file)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def save_cli_overrides(self, args: Any) -> None:
@@ -1435,6 +1503,13 @@ class GlobalSettings:
                 f"Invalid sse_keepalive_mode: {self.server.sse_keepalive_mode} "
                 f"(must be one of {valid_keepalive_modes})"
             )
+
+        try:
+            audio_upload_size = parse_size(self.server.max_audio_upload_size)
+            if audio_upload_size <= 0:
+                errors.append("max_audio_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_audio_upload_size: {e}")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
@@ -1646,6 +1721,7 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

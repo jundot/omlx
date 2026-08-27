@@ -176,6 +176,7 @@ from .api.utils import (
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
+from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -824,6 +825,31 @@ async def scheduler_queue_full_handler(
     )
 
 
+@app.exception_handler(DistributedInferenceError)
+async def distributed_unavailable_handler(
+    request: FastAPIRequest, exc: DistributedInferenceError
+):
+    """Map a failed distributed cluster check to a clean HTTP 503.
+
+    The distributed engine's preflight health gate raises this before the
+    StreamingResponse is built, which is what turns a dead or half-dead
+    cluster into an honest error instead of an empty 200 whose failure only
+    surfaces mid-stream (#2708). Errors raised after streaming has started
+    still land in-band; this handler covers every pre-commit path.
+    """
+    logger.warning(
+        "%s %s -> 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(str(exc), 503)
+    else:
+        content = {"detail": str(exc)}
+    return JSONResponse(status_code=503, content=content)
+
+
 def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
     if isinstance(exc, PrefillMemoryAbortedError):
         # This request was admitted and then killed mid-prefill, so "rejected
@@ -837,6 +863,23 @@ def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
         "To continue, set Memory Guard to aggressive, raise the custom "
         "memory guard ceiling, free system memory, or compact/reduce context."
     )
+
+
+def _streaming_error_payload(e: Exception, context: str) -> dict:
+    """Error body for a failure inside an OpenAI SSE generator.
+
+    A prefill-guard rejection raised during streaming must keep its
+    structured body (root ``type``, ``omlx_code``, byte fields) — the
+    blanket ``except`` in the generators would otherwise flatten it to a
+    generic ``server_error`` that clients cannot classify, and the correct
+    handler in ``_with_sse_keepalive`` never sees the exception because the
+    generator's own handler is the innermost one (#3036).
+    """
+    if isinstance(e, PrefillMemoryExceededError):
+        logger.warning(f"{context} prefill rejected: {e}")
+        return _prefill_memory_openai_error_body(e)
+    logger.error(f"Error during {context}: {e}")
+    return {"error": {"message": str(e), "type": "server_error"}}
 
 
 def _prefill_memory_openai_error_body(
@@ -1932,11 +1975,13 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.incidents import configure_cluster_incidents
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)
@@ -2283,21 +2328,37 @@ async def _run_with_disconnect_guard(
     return task.result()
 
 
+# Below this, prefer racing the coroutine to a real HTTP status code over
+# committing early to the keepalive-streaming fallback (see
+# _json_response_or_keepalive). Matches the keepalive loop's own
+# disconnect_poll cadence -- short enough that ordinary requests never
+# notice it, long enough that it isn't just a formality.
+_JSON_KEEPALIVE_GRACE_S = 2.0
+
+
 async def _with_json_keepalive(
     http_request: FastAPIRequest,
-    coro,
+    coro_or_task,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
 ) -> AsyncIterator[str]:
-    """Wrap a coroutine to send keepalive spaces while waiting for completion.
+    """Send keepalive spaces while waiting for a coroutine or task.
 
     For non-streaming requests, the HTTP response body is buffered until
     generation finishes, causing client read timeouts on long prefills.
     This wrapper uses StreamingResponse to send space characters as
     keepalive. JSON parsers ignore leading whitespace, so the final
     response parses normally.
+
+    Callers reaching this generator via ``_json_response_or_keepalive``
+    have already confirmed the task is still running past the grace period
+    -- from this point on, HTTP has committed the response status to 200
+    (the status line ships with the first byte), so a failure discovered
+    here can only be reported through the JSON body, never the status code.
+    ``asyncio.ensure_future`` is a no-op when given an already-scheduled
+    task, so passing either shape is safe.
     """
-    task = asyncio.ensure_future(coro)
+    task = asyncio.ensure_future(coro_or_task)
     keepalive_elapsed = 0.0
 
     yield " "
@@ -2341,6 +2402,66 @@ async def _with_json_keepalive(
                 await task
             except (asyncio.CancelledError, StopAsyncIteration):
                 pass
+
+
+async def _json_response_or_keepalive(
+    http_request: FastAPIRequest,
+    coro,
+    *,
+    media_type: str = "application/json",
+    headers: dict | None = None,
+    lease: "_LLMEngineLease | None" = None,
+) -> Response:
+    """Resolve a non-streaming JSON-body coroutine, preferring a real HTTP
+    status code over the keepalive-streaming fallback.
+
+    Most rejections (validation, guard checks) resolve in well under a
+    second. Racing the coroutine against ``_JSON_KEEPALIVE_GRACE_S`` lets
+    those return a plain ``Response``/``JSONResponse`` with the correct
+    status code (e.g. 400 for a memory-guard rejection) instead of the
+    keepalive wrapper's forced 200 -- a request that fails fast must not
+    look like a success to the client. Only requests still running past
+    the grace period fall back to keepalive streaming, where any later
+    failure can only be signaled via the JSON body: the status line ships
+    with the first keepalive byte and cannot be revised afterward, an
+    HTTP/ASGI constraint, not a choice.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=_JSON_KEEPALIVE_GRACE_S
+        )
+    except BaseException:
+        # The handler can unwind during the grace period (server shutdown,
+        # middleware cancellation, or another request-level abort). The task
+        # was scheduled independently by ensure_future(), so cancellation does
+        # not propagate into it automatically. Drain it before releasing the
+        # lease; otherwise inference can continue after ModelRegistry considers
+        # the engine idle and eligible for unload.
+        task.cancel()
+        with suppress(BaseException):
+            await task
+        if lease is not None:
+            await lease.release()
+        raise
+    if done:
+        if lease is not None:
+            await lease.release()
+        try:
+            result = task.result()
+        except PrefillMemoryExceededError as e:
+            logger.warning(f"JSON keepalive prefill rejected (fast path): {e}")
+            return JSONResponse(
+                status_code=400,
+                content=_prefill_memory_openai_error_body(e),
+                headers=headers,
+            )
+        return Response(content=result, media_type=media_type, headers=headers)
+
+    generator = _with_json_keepalive(http_request, task)
+    if lease is not None:
+        generator = _release_after_stream(generator, lease)
+    return StreamingResponse(generator, media_type=media_type, headers=headers)
 
 
 @app.get("/health")
@@ -2473,7 +2594,47 @@ async def server_status(_: bool = Depends(verify_api_key)):
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
         "custom_kernels": native_kernel_status(),
+        "ane_prefill": _ane_prefill_status(pool),
     }
+
+
+def _ane_prefill_status(pool) -> dict:
+    """Aggregate the Qwen ANE prefill state across loaded models.
+
+    Best-effort and defensive: any model that never attempted ANE prefill is
+    omitted, so an empty ``models`` list means no loaded model uses it. Lets a
+    statusline distinguish "ANE active on N layers" from a silent no-op.
+    """
+    result = {"patch_available": False, "configured_models": 0, "models": []}
+    if pool is None:
+        return result
+    try:
+        from .patches.qwen35_ane_prefill import qwen35_ane_prefill_status
+    except Exception:  # noqa: BLE001 - patch optional at runtime
+        return result
+    # "patch importable", not "ANE hardware present": eligibility is decided
+    # per model at enable time and reported through the per-model entries.
+    result["patch_available"] = True
+    try:
+        for model_id, entry in pool._entries.items():
+            engine = getattr(entry, "engine", None)
+            mdl = (
+                getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
+                if engine is not None
+                else None
+            )
+            if mdl is None:
+                continue
+            st = qwen35_ane_prefill_status(mdl)
+            if not st["attempted"]:
+                continue
+            st["model_id"] = model_id
+            result["models"].append(st)
+            if st["configured"]:
+                result["configured_models"] += 1
+    except Exception as exc:  # noqa: BLE001 - status must never fail the endpoint
+        logger.warning("ANE prefill status unavailable: %s", exc)
+    return result
 
 
 def _markitdown_virtual_model_status() -> dict:
@@ -2723,9 +2884,8 @@ async def _create_markitdown_chat_completion(
             markdown,
         ).model_dump_json(exclude_none=True)
 
-    return StreamingResponse(
-        _with_json_keepalive(http_request, _build_markitdown_completion()),
-        media_type="application/json",
+    return await _json_response_or_keepalive(
+        http_request, _build_markitdown_completion()
     )
 
 
@@ -3037,10 +3197,7 @@ async def create_embeddings(
             ),
         ).model_dump_json()
 
-    return StreamingResponse(
-        _with_json_keepalive(http_request, _build_embeddings()),
-        media_type="application/json",
-    )
+    return await _json_response_or_keepalive(http_request, _build_embeddings())
 
 
 # =============================================================================
@@ -3271,6 +3428,13 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
+            # Widen the repetition-penalty look-back window when the client
+            # asks for it (mlx-lm default window is 20 tokens).
+            repetition_context_size = getattr(
+                request, "repetition_context_size", None
+            )
+            if repetition_context_size is not None:
+                gen_kwargs["repetition_context_size"] = repetition_context_size
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -3349,12 +3513,8 @@ async def create_completion(
                 ),
             ).model_dump_json(exclude_none=True)
 
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_completion()),
-                lease,
-            ),
-            media_type="application/json",
+        return await _json_response_or_keepalive(
+            http_request, _build_completion(), lease=lease
         )
     except BaseException:
         await lease.release()
@@ -3647,6 +3807,14 @@ async def create_chat_completion(
             "xtc_threshold": xtc_threshold,
         }
 
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
+
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
             chat_kwargs["seed"] = request.seed
@@ -3885,13 +4053,8 @@ async def create_chat_completion(
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
         )
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_chat_completion()),
-                lease,
-            ),
-            media_type="application/json",
-            headers=json_headers,
+        return await _json_response_or_keepalive(
+            http_request, _build_chat_completion(), lease=lease, headers=json_headers
         )
 
     except BaseException:
@@ -4355,6 +4518,13 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
+    if repetition_context_size is not None:
+        gen_kwargs["repetition_context_size"] = repetition_context_size
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
@@ -4398,8 +4568,7 @@ async def stream_completion(
             }
             yield f"data: {json.dumps(data)}\n\n"
     except Exception as e:
-        logger.error(f"Error during completion streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "completion streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -4675,8 +4844,7 @@ async def stream_chat_completion(
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
-        logger.error(f"Error during chat streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -5163,8 +5331,18 @@ async def stream_anthropic_messages(
             if output.finished:
                 break
     except Exception as e:
-        logger.error(f"Error during Anthropic streaming: {e}")
-        yield create_error_event("api_error", str(e))
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the OpenAI generators (#3036): keep the
+            # rejection classifiable. invalid_request_error is the Anthropic
+            # terminal request-error type — a retry without shrinking the
+            # prompt cannot succeed.
+            logger.warning(f"Anthropic streaming prefill rejected: {e}")
+            yield create_error_event(
+                "invalid_request_error", _prefill_memory_error_detail(e)
+            )
+        else:
+            logger.error(f"Error during Anthropic streaming: {e}")
+            yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
 
@@ -5554,6 +5732,14 @@ async def create_anthropic_message(
             "xtc_threshold": xtc_threshold,
         }
 
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
+
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:
@@ -5759,12 +5945,8 @@ async def create_anthropic_message(
 
             return response.model_dump_json()
 
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_anthropic_message()),
-                lease,
-            ),
-            media_type="application/json",
+        return await _json_response_or_keepalive(
+            http_request, _build_anthropic_message(), lease=lease
         )
 
     except BaseException:
@@ -5923,9 +6105,17 @@ async def create_response(
 
         resolved_model = _serving_model_id(lease, request.model)
 
+        # Images in function_call_output lists survive only for engines that
+        # can extract them; text engines get a placeholder instead so base64
+        # payloads never reach the prompt (#2989).
+        preserve_tool_images = isinstance(engine, VLMBatchedEngine) or getattr(
+            engine, "supports_multimodal_fallback", False
+        )
+
         current_input_messages = convert_responses_input_to_messages(
             request.input,
             consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
         )
 
         # Build previous context from previous_response_id
@@ -5941,6 +6131,7 @@ async def create_response(
             request.instructions,
             previous_messages,
             consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
         )
 
         # Convert tools: flat → nested
@@ -6109,6 +6300,14 @@ async def create_response(
             "xtc_probability": xtc_probability,
             "xtc_threshold": xtc_threshold,
         }
+
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -6303,9 +6502,13 @@ async def create_response(
                 cached_tokens=output.cached_tokens,
             )
 
+            # Surface max_output_tokens truncation so clients can tell an
+            # incomplete turn from a natural stop. The Responses API has no
+            # finish_reason field; status + incomplete_details is the signal.
+            truncated = getattr(output, "finish_reason", None) == "length"
             response_obj = ResponseObject(
                 model=request.model,
-                status="completed",
+                status="incomplete" if truncated else "completed",
                 output=output_items,
                 usage=usage,
                 tools=request.tools or [],
@@ -6314,6 +6517,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response
@@ -6328,13 +6532,8 @@ async def create_response(
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
         )
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_responses_api()),
-                lease,
-            ),
-            media_type="application/json",
-            headers=json_headers,
+        return await _json_response_or_keepalive(
+            http_request, _build_responses_api(), lease=lease, headers=json_headers
         )
 
     except BaseException:
@@ -6653,13 +6852,29 @@ async def stream_responses_api(
                             },
                         )
     except Exception as e:
-        logger.error(f"Error during Responses API streaming: {e}")
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the chat generator (#3036): surface the
+            # guard's code and message in the response.failed error object
+            # instead of failing with no error at all.
+            logger.warning(f"Responses API streaming prefill rejected: {e}")
+            guard_body = _prefill_memory_openai_error_body(e)["error"]
+            failure_error = {
+                "code": guard_body.get("omlx_code", "prefill_memory_exceeded"),
+                "message": guard_body["message"],
+            }
+        else:
+            logger.error(f"Error during Responses API streaming: {e}")
+            failure_error = {"code": "server_error", "message": str(e)}
         seq += 1
         yield format_sse_event(
             "response.failed",
             {
                 "type": "response.failed",
-                "response": {**initial_data, "status": "failed"},
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "error": failure_error,
+                },
                 "sequence_number": seq,
             },
         )
@@ -7015,13 +7230,15 @@ async def stream_responses_api(
             "output_tokens_details": {"reasoning_tokens": reasoning_token_count},
         }
 
-    # 13. response.completed — MUST always be sent
+    # 13. Emit the terminal event matching the final response status.
+    truncated = getattr(last_output, "finish_reason", None) == "length"
+    terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
         "object": "response",
         "created_at": initial_response.created_at,
         "model": request.model,
-        "status": "completed",
+        "status": "incomplete" if truncated else "completed",
         "output": output_items,
         "usage": usage_data,
         "tool_choice": request.tool_choice or "auto",
@@ -7034,14 +7251,16 @@ async def stream_responses_api(
         "top_p": request.top_p,
         "max_output_tokens": request.max_output_tokens,
     }
+    if truncated:
+        final_response["incomplete_details"] = {"reason": "max_output_tokens"}
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
     seq += 1
     yield format_sse_event(
-        "response.completed",
+        terminal_event,
         {
-            "type": "response.completed",
+            "type": terminal_event,
             "response": final_response,
             "sequence_number": seq,
         },

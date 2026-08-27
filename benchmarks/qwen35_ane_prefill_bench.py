@@ -10,6 +10,7 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +45,12 @@ def cosine(a: mx.array, b: mx.array) -> float:
 
 def accuracy(model: Any, reference: mx.array, candidate: mx.array) -> dict[str, Any]:
     lm = model.language_model
-    reference_logits = lm.lm_head(reference[:, -1:, :])
-    candidate_logits = lm.lm_head(candidate[:, -1:, :])
+    if hasattr(lm, "lm_head"):
+        reference_logits = lm.lm_head(reference[:, -1:, :])
+        candidate_logits = lm.lm_head(candidate[:, -1:, :])
+    else:
+        reference_logits = lm.model.embed_tokens.as_linear(reference[:, -1:, :])
+        candidate_logits = lm.model.embed_tokens.as_linear(candidate[:, -1:, :])
     difference = candidate.astype(mx.float32) - reference.astype(mx.float32)
     mx.eval(reference_logits, candidate_logits, difference)
     return {
@@ -63,6 +68,8 @@ def accuracy(model: Any, reference: mx.array, candidate: mx.array) -> dict[str, 
 
 
 def run_body(model: Any, tokens: mx.array) -> mx.array:
+    if getattr(model, "_omlx_benchmark_force_lm", False):
+        return hidden_tensor(model.language_model.model(tokens))
     return hidden_tensor(
         model.language_model(tokens, skip_logits=True, return_hidden=True)
     )
@@ -86,12 +93,18 @@ def benchmark_mode(
         fast.qwen35_ane_profile_reset()
 
     samples = []
+    graph_build_samples = []
+    execution_samples = []
     for _ in range(repeats):
         started = time.perf_counter()
         output = run_body(model, tokens)
+        graph_built = time.perf_counter()
         mx.eval(output)
         mx.synchronize()
-        samples.append(time.perf_counter() - started)
+        finished = time.perf_counter()
+        samples.append(finished - started)
+        graph_build_samples.append(graph_built - started)
+        execution_samples.append(finished - graph_built)
     median = statistics.median(samples)
     profile_result: dict[str, Any] = {}
     if profile:
@@ -104,7 +117,7 @@ def benchmark_mode(
                 "input_ready_ms_per_op": metrics["pack_ns"] / operations / 1e6
                 if operations
                 else 0.0,
-                "ane_region_ms_per_op": metrics["ane_region_ns"]
+                "parallel_region_ms_per_op": metrics["ane_region_ns"]
                 / operations
                 / 1e6
                 if operations
@@ -134,6 +147,21 @@ def benchmark_mode(
                 / 1e6
                 if operations
                 else 0.0,
+                "gpu_completion_ms_per_op": metrics["gpu_completion_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
+                "cpu_matmul_ms_per_op": metrics["cpu_matmul_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
+                "cpu_completion_ms_per_op": metrics["cpu_completion_ns"]
+                / operations
+                / 1e6
+                if operations
+                else 0.0,
                 "gap_before_ms_per_op": metrics["gap_before_ns"]
                 / operations
                 / 1e6
@@ -158,6 +186,9 @@ def benchmark_mode(
         {
             "median_seconds": median,
             "samples_seconds": samples,
+            "median_graph_build_ms": statistics.median(graph_build_samples) * 1e3,
+            "graph_build_samples_ms": [value * 1e3 for value in graph_build_samples],
+            "median_execution_ms": statistics.median(execution_samples) * 1e3,
             "prompt_tokens_per_second": int(tokens.size) / median,
             **({"ane_profile": profile_result} if profile_result else {}),
         },
@@ -169,7 +200,46 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
     parser.add_argument("--extension", type=Path)
+    parser.add_argument(
+        "--force-lm",
+        action="store_true",
+        help="load through oMLX's text-model path, matching the app benchmark",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=8,
+        help="worker count for the optional fp16 CPU share (default: 8; 0=auto)",
+    )
+    parser.add_argument(
+        "--disable-cpu-shared-resource",
+        action="store_true",
+        help="disable performance-aware shared-resource CPU scheduling",
+    )
+    parser.add_argument(
+        "--cpu-threads-grid",
+        nargs="+",
+        type=int,
+        help="Benchmark several CPU worker counts after one ANE compilation",
+    )
+    parser.add_argument(
+        "--cpu-gdn-fraction-grid",
+        nargs="+",
+        type=float,
+        help="Benchmark several CPU GDN shares after one ANE compilation",
+    )
+    parser.add_argument(
+        "--cpu-down-fraction-grid",
+        nargs="+",
+        type=float,
+        help="Benchmark several CPU down shares after one ANE compilation",
+    )
     parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument(
+        "--ane-sequence-length",
+        type=int,
+        help="Fixed ANE program rows (defaults to --tokens; use 2048 to test wide tiling)",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--modes",
@@ -181,27 +251,90 @@ def main() -> None:
     parser.add_argument("--single-gdn-fraction", type=float, default=0.40)
     parser.add_argument("--dual-mlp-fraction", type=float, default=0.53)
     parser.add_argument("--dual-gdn-fraction", type=float, default=0.50)
+    parser.add_argument(
+        "--cpu-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of each MLP gate/up projection",
+    )
+    parser.add_argument(
+        "--cpu-down-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of each MLP down projection",
+    )
+    parser.add_argument(
+        "--ane-down-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Experimental output-row share, or per-ANE hidden share with "
+            "--ane-fused-down"
+        ),
+    )
+    parser.add_argument(
+        "--ane-fused-down",
+        action="store_true",
+        help="Fuse each ANE gate/up slice through its partial down projection",
+    )
+    parser.add_argument(
+        "--cpu-gdn-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fp16 CPU share of the residual GDN qkv projection",
+    )
+    parser.add_argument(
+        "--disable-gdn",
+        action="store_true",
+        help="benchmark MLP offload without compiling or dispatching GDN",
+    )
     args = parser.parse_args()
+    ane_sequence_length = args.ane_sequence_length or args.tokens
     if "single" in args.modes and "dual" in args.modes:
         parser.error(
             "benchmark single and dual ANE in separate processes so resident "
             "programs from the first mode do not consume the second mode's budget"
         )
+    if args.cpu_threads_grid and any(
+        value < 0 or value > 64 for value in args.cpu_threads_grid
+    ):
+        parser.error("CPU worker counts must be between 0 and 64")
+    if args.cpu_gdn_fraction_grid and any(
+        value < 0 or value > 0.50 for value in args.cpu_gdn_fraction_grid
+    ):
+        parser.error("CPU GDN fractions must be between 0 and 0.50")
+    if args.cpu_down_fraction_grid and any(
+        value < 0 or value > 0.50 for value in args.cpu_down_fraction_grid
+    ):
+        parser.error("CPU down fractions must be between 0 and 0.50")
 
     native_ext = inject_extension(args.extension) if args.extension else None
-    from mlx_vlm.utils import load_model
-
     from omlx.custom_kernels.qwen35_prefill import fast
     from omlx.patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
-    from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_mlp_patch
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_q4_lm_prefill_linear_patch,
+        apply_qwen35_q4_mlp_patch,
+    )
 
     native_ext = native_ext or fast._ext
     if native_ext is None:
         raise RuntimeError("The Qwen3.5 native extension is unavailable")
 
     print(f"Loading {args.model}", flush=True)
-    model = load_model(args.model, lazy=False, strict=False)
+    if args.force_lm:
+        from omlx.utils.model_loading import load_text_model
+
+        model, _ = load_text_model(str(args.model))
+        model._omlx_benchmark_force_lm = True
+    else:
+        from mlx_vlm.utils import load_model
+
+        model = load_model(args.model, lazy=False, strict=False)
     apply_qwen35_q4_mlp_patch()
+    if args.force_lm:
+        # The app installs this after loading so it wraps the final class
+        # implementation (including the optional MTP compatibility patch).
+        apply_qwen35_q4_lm_prefill_linear_patch()
     mx.random.seed(0)
     tokens = mx.random.randint(0, 1000, shape=(1, args.tokens), dtype=mx.int32)
     mx.eval(tokens)
@@ -217,62 +350,170 @@ def main() -> None:
             started = time.perf_counter()
             mlp_layers = enable_qwen35_ane_prefill(
                 model,
-                sequence_length=args.tokens,
+                sequence_length=ane_sequence_length,
                 fraction=args.single_mlp_fraction,
-                gdn=True,
+                gdn=not args.disable_gdn,
                 gdn_fraction=args.single_gdn_fraction,
                 dual_ane=False,
+                cpu_fraction=args.cpu_fraction,
+                cpu_down_fraction=args.cpu_down_fraction,
+                ane_down_fraction=args.ane_down_fraction,
+                fused_down=args.ane_fused_down,
+                cpu_gdn_fraction=args.cpu_gdn_fraction,
+                cpu_threads=args.cpu_threads,
+                cpu_shared_resource=not args.disable_cpu_shared_resource,
             )
             compile_seconds = time.perf_counter() - started
         elif mode == "dual":
             started = time.perf_counter()
             mlp_layers = enable_qwen35_ane_prefill(
                 model,
-                sequence_length=args.tokens,
+                sequence_length=ane_sequence_length,
                 fraction=args.dual_mlp_fraction,
-                gdn=True,
+                gdn=not args.disable_gdn,
                 gdn_fraction=args.dual_gdn_fraction,
                 dual_ane=True,
+                cpu_fraction=args.cpu_fraction,
+                cpu_down_fraction=args.cpu_down_fraction,
+                ane_down_fraction=args.ane_down_fraction,
+                fused_down=args.ane_fused_down,
+                cpu_gdn_fraction=args.cpu_gdn_fraction,
+                cpu_threads=args.cpu_threads,
+                cpu_shared_resource=not args.disable_cpu_shared_resource,
             )
             compile_seconds = time.perf_counter() - started
         else:
             mlp_layers = 0
             compile_seconds = 0.0
 
-        measured, output = benchmark_mode(model, tokens, args.repeats)
-        measured.update(
-            {
-                "compile_seconds": compile_seconds,
-                "mlp_layers": mlp_layers,
-                "dual_mlp_layers": int(
-                    getattr(model, "_omlx_ane_dual_prefill_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "resident_programs": int(
-                    getattr(model, "_omlx_ane_resident_program_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "procedures": int(
-                    getattr(model, "_omlx_ane_procedure_count", 0)
-                )
-                if mode != "gpu"
-                else 0,
-                "gdn_layers": int(getattr(model, "_omlx_ane_gdn_prefill_count", 0))
-                if mode != "gpu"
-                else 0,
-            }
-        )
-        if mode == "gpu":
-            reference = output
-        elif reference is not None:
-            measured["accuracy_vs_gpu"] = accuracy(model, reference, output)
-            measured["speedup_vs_gpu"] = (
-                results["gpu"]["median_seconds"] / measured["median_seconds"]
+        variants: list[tuple[str, int | None, float | None, float | None]] = [
+            (mode, None, None, None)
+        ]
+        if mode in ("single", "dual") and args.cpu_threads_grid:
+            variants = [
+                (f"{mode}_cpu_threads_{threads}", threads, None, None)
+                for threads in args.cpu_threads_grid
+            ]
+        if mode in ("single", "dual") and args.cpu_gdn_fraction_grid:
+            variants = [
+                (f"{mode}_cpu_gdn_{fraction:.3f}", None, fraction, None)
+                for fraction in args.cpu_gdn_fraction_grid
+            ]
+        if mode in ("single", "dual") and args.cpu_down_fraction_grid:
+            variants = [
+                (f"{mode}_cpu_down_{fraction:.3f}", None, None, fraction)
+                for fraction in args.cpu_down_fraction_grid
+            ]
+        for result_key, cpu_threads, cpu_gdn_fraction, cpu_down_fraction in variants:
+            if cpu_threads is not None:
+                for module in model.modules():
+                    config = getattr(module, "_omlx_ane_prefill_config", None)
+                    if config is not None:
+                        module._omlx_ane_prefill_config = replace(
+                            config, cpu_threads=cpu_threads
+                        )
+                    gdn_config = getattr(module, "_omlx_ane_gdn_config", None)
+                    if gdn_config is not None:
+                        module._omlx_ane_gdn_config = replace(
+                            gdn_config, cpu_threads=cpu_threads
+                        )
+            if cpu_gdn_fraction is not None:
+                from omlx.patches import qwen35_ane_prefill as ane_patch
+
+                for module in model.modules():
+                    gdn_config = getattr(module, "_omlx_ane_gdn_config", None)
+                    gdn_state = getattr(module, "_omlx_ane_gdn_state", None)
+                    if gdn_config is None or gdn_state is None:
+                        continue
+                    updated_config = replace(
+                        gdn_config, cpu_fraction=cpu_gdn_fraction
+                    )
+                    updated_state = ane_patch._prepare_gdn_runtime_state(
+                        module,
+                        updated_config,
+                        gdn_state.model,
+                        gdn_state.model1,
+                    )
+                    if updated_state is None:
+                        raise RuntimeError(
+                            f"CPU GDN fraction {cpu_gdn_fraction:.3f} is ineligible"
+                        )
+                    module._omlx_ane_gdn_config = updated_config
+                    module._omlx_ane_gdn_state = updated_state
+                mx.clear_cache()
+            if cpu_down_fraction is not None:
+                from omlx.patches import qwen35_ane_prefill as ane_patch
+
+                for module in model.modules():
+                    state = getattr(module, "_omlx_ane_prefill_state", None)
+                    if state is None or not hasattr(module, "down_proj"):
+                        continue
+                    module._omlx_ane_prefill_state = replace(
+                        state,
+                        down_cpu=ane_patch._prepare_cpu_linear(
+                            module.down_proj, cpu_down_fraction
+                        ),
+                    )
+                mx.clear_cache()
+            measured, output = benchmark_mode(model, tokens, args.repeats)
+            measured.update(
+                {
+                    "compile_seconds": compile_seconds,
+                    "mlp_layers": mlp_layers,
+                    "cpu_threads": cpu_threads
+                    if cpu_threads is not None
+                    else args.cpu_threads,
+                    "cpu_shared_resource": not args.disable_cpu_shared_resource,
+                    "cpu_down_fraction": (
+                        cpu_down_fraction
+                        if cpu_down_fraction is not None
+                        else args.cpu_down_fraction
+                    ),
+                    "ane_down_fraction": args.ane_down_fraction,
+                    "cpu_gdn_fraction": (
+                        cpu_gdn_fraction
+                        if cpu_gdn_fraction is not None
+                        else args.cpu_gdn_fraction
+                    ),
+                    "dual_mlp_layers": int(
+                        getattr(model, "_omlx_ane_dual_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "resident_programs": int(
+                        getattr(model, "_omlx_ane_resident_program_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "procedures": int(
+                        getattr(model, "_omlx_ane_procedure_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "gdn_layers": int(
+                        getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                    "down_layers": int(
+                        getattr(model, "_omlx_ane_down_prefill_count", 0)
+                    )
+                    if mode != "gpu"
+                    else 0,
+                }
             )
-        results[mode] = measured
-        print(f"{mode.upper()} {json.dumps(measured, sort_keys=True)}", flush=True)
+            if mode == "gpu":
+                reference = output
+            elif reference is not None:
+                measured["accuracy_vs_gpu"] = accuracy(model, reference, output)
+                measured["speedup_vs_gpu"] = (
+                    results["gpu"]["median_seconds"] / measured["median_seconds"]
+                )
+            results[result_key] = measured
+            print(
+                f"{result_key.upper()} {json.dumps(measured, sort_keys=True)}",
+                flush=True,
+            )
 
     print("RESULT " + json.dumps(results, sort_keys=True), flush=True)
 

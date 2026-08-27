@@ -1203,11 +1203,18 @@ class PagedCacheManager(CacheManager):
         extra_keys: Optional[Tuple[Any, ...]] = None,
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
-    ) -> Tuple[List[int], List[int]]:
+    ) -> Tuple[List[int], List[Optional[BlockHash]], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
 
-        Uses get_computed_blocks for consistent chain-hash lookup.
+        Uses get_computed_blocks for consistent chain-hash lookup. Returns
+        each block's hash as observed at lookup time alongside its id, so
+        the caller can acquire it with acquire_cached_block(id, hash)
+        instead of a membership-only increment_ref -- closing the TOCTOU
+        window between this lookup (outside any lock the caller holds) and
+        the caller taking a reference, where a concurrent eviction +
+        reallocation could otherwise splice a foreign block's content into
+        the returned chain (docs/qwen35-hardening-and-optimization.md A2).
         """
         cached_blocks, num_cached_tokens = self.get_computed_blocks(
             tokens,
@@ -1217,9 +1224,10 @@ class PagedCacheManager(CacheManager):
         )
 
         shared_block_ids = [b.block_id for b in cached_blocks]
+        shared_block_hashes = [b.block_hash for b in cached_blocks]
         remaining_tokens = tokens[num_cached_tokens:]
 
-        return shared_block_ids, remaining_tokens
+        return shared_block_ids, shared_block_hashes, remaining_tokens
 
     def fork_block_table(
         self,
@@ -1314,43 +1322,6 @@ class PagedCacheManager(CacheManager):
     # Eviction
     # =========================================================================
 
-    def evict_lru_blocks(self, num_blocks: int) -> int:
-        """
-        Evict least recently used blocks.
-
-        With the doubly linked list, LRU blocks are already at the front
-        of the free queue. We just need to pop from front.
-        """
-        with self._lock:
-            evicted = 0
-
-            # Get evictable blocks from free queue (they're already LRU ordered)
-            for _ in range(min(num_blocks, self.free_block_queue.num_free_blocks)):
-                try:
-                    block = self.free_block_queue.popleft()
-                    self._maybe_evict_cached_block(block)
-                    # Put back at end (now available for allocation)
-                    self.free_block_queue.append(block)
-                    evicted += 1
-                except ValueError:
-                    break
-
-            if evicted > 0:
-                logger.info(f"Evicted {evicted} LRU blocks from cache")
-
-            return evicted
-
-    def handle_memory_pressure(self, requested_blocks: int) -> bool:
-        """Handle memory pressure by evicting blocks."""
-        with self._lock:
-            if self.free_block_queue.num_free_blocks >= requested_blocks:
-                return True
-
-            needed = requested_blocks - self.free_block_queue.num_free_blocks
-            self.evict_lru_blocks(needed)
-
-            return self.free_block_queue.num_free_blocks >= requested_blocks
-
     # =========================================================================
     # Statistics and Properties
     # =========================================================================
@@ -1402,28 +1373,6 @@ class PagedCacheManager(CacheManager):
             self.stats.misses = 0
             self.stats.cow_copies = 0
             self.stats.evictions = 0
-
-    def reset_prefix_cache(self) -> bool:
-        """Reset the prefix cache."""
-        with self._lock:
-            num_used = self.max_blocks - self.free_block_queue.num_free_blocks
-            if num_used > 1:  # null_block is always "used"
-                logger.warning(f"Cannot reset cache: {num_used - 1} blocks in use")
-                return False
-
-            self.cached_block_hash_to_block.clear()
-            if self.on_hash_map_cleared is not None:
-                self.on_hash_map_cleared()
-
-            for block in self.blocks:
-                block.reset_hash()
-
-            self.stats.evictions = 0
-            self.stats.hits = 0
-            self.stats.misses = 0
-
-            logger.info("Prefix cache reset successfully")
-            return True
 
     def clear(self) -> int:
         """

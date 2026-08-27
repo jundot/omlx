@@ -509,25 +509,37 @@ def stage_manifest(
             for name in sidecar_files(source_root)
         }
     else:
+        # Send the ~-form: the peer's inventory snippet expanduser()s it in
+        # its own home, so a cross-user source reports its real shard map
+        # instead of an empty directory at the coordinator's absolute path.
         shards, sidecar_sizes = remote_model_staging_inventory(
             source_host,
-            remote_dir,
+            home_relative_model_path(str(model_path)),
             python_executable=source_python_executable,
         )
+    # A peer with a different macOS account has a different $HOME, so the
+    # coordinator-absolute path names nothing there. The worker now receives the
+    # ~-form and resolves it per-node (see home_relative_model_path / launch),
+    # so readiness must probe each peer in its OWN home too — otherwise an
+    # already-present model reads as entirely missing and a full re-copy is
+    # (needlessly, and here fatally) proposed.
+    portable = home_relative_model_path(str(model_path))
     present_by_node = {}
     for assignment in assignments:
         ssh_target = hosts_by_node.get(assignment.node_id)
         if not ssh_target:
             continue
-        present_by_node[assignment.node_id] = (
-            {
+        if is_local_host(ssh_target):
+            present_by_node[assignment.node_id] = {
                 path.name: path.stat().st_size
                 for path in Path(remote_dir).iterdir()
                 if path.is_file()
             }
-            if is_local_host(ssh_target)
-            else remote_file_sizes(ssh_target, remote_dir)
-        )
+        else:
+            peer_dir = remote_model_dir(ssh_target, portable)
+            present_by_node[assignment.node_id] = remote_file_sizes(
+                ssh_target, peer_dir
+            )
 
     plans = (
         plan_cluster_staging(
@@ -909,17 +921,36 @@ def stage_files_from_source(
     source_host: str,
     destination_host: str,
     expected_sizes: dict[str, int],
+    destination_dir: str | None = None,
     parallel: int = _DEFAULT_PARALLEL,
     transfer: Any = scp_copy,
     progress: Callable[[str, str, int], None] | None = None,
     clock: Any = None,
 ) -> StagingResult:
-    """Stage one rank from a local or peer model holder and verify every file."""
+    """Stage one rank from a local or peer model holder and verify every file.
+
+    ``destination_dir`` is where files land on the destination Mac; it defaults
+    to the coordinator's own absolute source path, correct only when every Mac
+    shares the same $HOME. On a cross-user cluster the caller passes the path
+    resolved in the destination's own home so the present-file probe and the
+    scp destination address the peer's real directory.
+    """
 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    destination_dir = str(Path(model_path).expanduser())
+    # model_path is the coordinator's own absolute form. On a remote source
+    # whose macOS account differs it names nothing, so resolve the ~-form in
+    # the source peer's OWN home before using it as the scp source path —
+    # the same treatment the destination side already gets from the caller.
+    source_dir = (
+        str(Path(model_path).expanduser())
+        if is_local_host(source_host)
+        else remote_model_dir(
+            source_host, home_relative_model_path(str(model_path))
+        )
+    )
+    destination_dir = destination_dir or source_dir
     expected = dict(expected_sizes)
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
@@ -939,6 +970,7 @@ def stage_files_from_source(
             plan,
             model_path=model_path,
             destination_host=destination_host,
+            destination_dir=destination_dir,
             sidecars=common,
             parallel=parallel,
             progress=progress,
@@ -980,7 +1012,7 @@ def stage_files_from_source(
             transfer(
                 source_host=source_host,
                 destination_host=destination_host,
-                source_dir=destination_dir,
+                source_dir=source_dir,
                 destination_dir=destination_dir,
                 filename=name,
             )
@@ -1113,11 +1145,61 @@ def remote_file_sizes(
     }
 
 
+_REMOTE_EXPAND_SNIPPET = (
+    "import json,sys;from pathlib import Path;"
+    "print(json.dumps(str(Path(sys.argv[1]).expanduser())))"
+)
+
+
+def home_relative_model_path(model: str) -> str:
+    """Re-express a coordinator-absolute model path in portable ~-form.
+
+    A locally-sourced deployment resolves the model to the coordinator's own
+    absolute path. Sent verbatim to a peer with a different macOS account that
+    path names nothing, so callers send this ~-form for the peer to expand in
+    its own home. A path outside the local home is returned unchanged.
+    """
+
+    expanded = Path(model).expanduser()
+    try:
+        return "~/" + str(expanded.relative_to(Path.home()))
+    except ValueError:
+        return str(expanded)
+
+
+def remote_model_dir(
+    ssh_target: str,
+    model_dir: str,
+    *,
+    timeout: float = 60.0,
+) -> str:
+    """Expand a ``~``-form model path in the peer's OWN home.
+
+    A cross-user cluster has a different ``$HOME`` per Mac, so the coordinator's
+    absolute path names nothing on the peer. Resolving the ``~``-form on the
+    peer yields the concrete directory its copy actually lives in, which the
+    present-file probe and the scp destination both need.
+    """
+
+    path = run_remote_python(
+        ssh_target,
+        _REMOTE_EXPAND_SNIPPET,
+        model_dir,
+        description="resolve the model directory",
+        python_executable="/usr/bin/python3",
+        timeout=timeout,
+    )
+    if not isinstance(path, str) or not path:
+        raise RuntimeError(f"invalid model directory from {ssh_target}")
+    return path
+
+
 def stage_remote_files(
     plan: StagingPlan,
     *,
     model_path: str | Path,
     destination_host: str,
+    destination_dir: str | None = None,
     sidecars: Sequence[str] = (),
     parallel: int = _DEFAULT_PARALLEL,
     transfer: Any = scp_push,
@@ -1130,13 +1212,19 @@ def stage_remote_files(
     The coordinator owns the source model and the job state. That makes the
     direction unambiguous (local source → explicit destination), supports any
     number of nodes, and lets the GUI show file-level progress.
+
+    ``destination_dir`` is where the files land on the peer. It defaults to the
+    coordinator's own absolute source path, which is only correct when every
+    Mac shares the same $HOME. On a cross-user cluster the caller must pass the
+    directory resolved in the peer's own home, or the present-file probe reads
+    an empty directory and re-copies everything.
     """
 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()
-    destination_dir = str(source)
+    destination_dir = destination_dir or str(source)
     expected = {
         path.name: path.stat().st_size
         for path in source.iterdir()

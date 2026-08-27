@@ -419,6 +419,27 @@ class TestExtractImagesFromMessages:
         assert "Describe this image and audio" in text_msgs[0]["content"]
 
 
+def test_video_input_is_rejected():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe"},
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "data:video/mp4;base64,AAAA",
+                        "fps": 3,
+                    },
+                },
+            ],
+        }
+    ]
+
+    with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+        extract_images_from_messages(messages)
+
+
 # =============================================================================
 # Tests: compute_image_hash
 # =============================================================================

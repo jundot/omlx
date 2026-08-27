@@ -24,6 +24,7 @@ from omlx.cluster.launch import (
     _local_runtime_versions,
     build_mlx_launch_argv,
     discover_remote_python_executable,
+    discover_remote_system_python,
     preflight_remote_hosts,
     probe_remote_host,
     probe_remote_system_host,
@@ -451,7 +452,11 @@ def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
     assert "StrictHostKeyChecking=accept-new" in argv
     assert "CheckHostIP=no" in argv
     assert "system_profiler" not in argv[-1]
-    assert "127.0.0.1:9000/health" in argv[-1]
+    # The fast path probes the configured server port first and keeps 9000 as
+    # a legacy candidate; both must stay in the port loop.
+    assert "for port in" in argv[-1]
+    assert "9000" in argv[-1]
+    assert "/health" in argv[-1]
     assert kwargs["timeout"] == 8.0
 
 
@@ -709,7 +714,10 @@ def test_peer_probe_discovers_a_different_linux_python_path():
         commands.append(command)
         if "omlx.cli" in command and command.startswith("/opt/omlx/bin/python"):
             return subprocess.CompletedProcess(argv, 0, json.dumps(status), "")
-        if "import sys,omlx" in command and command.startswith("/opt/omlx/bin/python"):
+        # Path-shaped candidates echo themselves (import os,omlx) so a
+        # launcher path survives discovery instead of being unwrapped to the
+        # bare interpreter it fronts.
+        if "import os,omlx" in command and command.startswith("/opt/omlx/bin/python"):
             return subprocess.CompletedProcess(argv, 0, "/opt/omlx/bin/python\n", "")
         return subprocess.CompletedProcess(argv, 127, "", "not found")
 
@@ -847,6 +855,42 @@ def test_remote_python_discovery_finds_gui_bootstrapped_cuda_worker():
         command.startswith("/opt/omlx-cluster-worker/venv/bin/python")
         for command in commands
     )
+
+
+@pytest.mark.parametrize(
+    "discover",
+    [discover_remote_python_executable, discover_remote_system_python],
+)
+def test_remote_python_discovery_preserves_ssh_transport_failure(discover):
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            255,
+            "",
+            "Permission denied (publickey,password,keyboard-interactive).\n",
+        )
+
+    with pytest.raises(DistributedLaunchError, match="Permission denied"):
+        discover(
+            "user@studio.local",
+            preferred="/usr/bin/python3",
+            runner=runner,
+        )
+
+
+def test_system_python_discovery_keeps_genuine_interpreter_failure():
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 127, "", "command not found")
+
+    with pytest.raises(
+        DistributedLaunchError,
+        match="no Python interpreter for hardware discovery",
+    ):
+        discover_remote_system_python(
+            "user@studio.local",
+            preferred="/missing/python3",
+            runner=runner,
+        )
 
 
 def test_preinstall_cuda_host_remains_visible_but_not_runnable():
@@ -1515,3 +1559,253 @@ def test_a_planned_workstation_reaches_the_rank_as_a_workstation(tmp_path):
     assert [item.planned_weight_bytes for item in assignments] == [
         item.planned_weight_bytes for item in plan.assignments
     ]
+
+
+def test_supervisor_reaps_remote_ranks_via_ssh_sigterm(monkeypatch, tmp_path):
+    deployment = _deployment()
+    supervisor = launch.DistributedJobSupervisor(
+        deployment,
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    calls = []
+
+    def fake_ssh(ssh_target, command, **kwargs):
+        calls.append((ssh_target, command))
+        return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launch, "_run_cluster_ssh", fake_ssh)
+
+    marker_dir = tmp_path / ".omlx" / "cluster" / "runtime"
+    marker_dir.mkdir(parents=True)
+    marker_file = marker_dir / "cluster-test-rank-1.json"
+
+    victim_code = (
+        "import sys, time\n"
+        "sys.argv = ['omlx.cluster.inference_worker', '--deployment-id', 'cluster-test']\n"
+        "time.sleep(30)\n"
+    )
+    victim = subprocess.Popen(
+        [sys.executable, "-c", victim_code],
+    )
+    try:
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "deployment_id": "cluster-test",
+                    "plan_hash": deployment.plan_hash,
+                    "rank": 1,
+                    "pid": victim.pid,
+                }
+            )
+        )
+        supervisor.state_dir = str(marker_dir)
+
+        supervisor._reap_remote_ranks()
+
+        assert len(calls) == 1
+        ssh_target, command = calls[0]
+        assert "user@studio.local" in ssh_target
+        assert "cluster-test-rank-1.json" in command
+
+        # Run the script to verify actual SIGTERM termination
+        script = command.split("python3 -c ", 1)[1]
+        import shlex as _shlex
+
+        script = _shlex.split(script)[0]
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        victim.wait(timeout=2.0)
+        assert victim.poll() is not None
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait()
+
+
+def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_path):
+    deployment = _deployment()
+    supervisor = launch.DistributedJobSupervisor(
+        deployment,
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    calls = []
+
+    def fake_ssh(ssh_target, command, **kwargs):
+        calls.append((ssh_target, command))
+        return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launch, "_run_cluster_ssh", fake_ssh)
+
+    marker_dir = tmp_path / ".omlx" / "cluster" / "runtime"
+    marker_dir.mkdir(parents=True)
+    marker_file = marker_dir / "cluster-test-rank-1.json"
+
+    # Process that ignores SIGTERM
+    victim_code = (
+        "import sys, signal, time\n"
+        "sys.argv = ['omlx.cluster.inference_worker', '--deployment-id', 'cluster-test']\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n"
+    )
+    victim = subprocess.Popen(
+        [sys.executable, "-c", victim_code],
+    )
+    try:
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "deployment_id": "cluster-test",
+                    "plan_hash": deployment.plan_hash,
+                    "rank": 1,
+                    "pid": victim.pid,
+                }
+            )
+        )
+        supervisor.state_dir = str(marker_dir)
+
+        supervisor._reap_remote_ranks()
+
+        assert len(calls) == 1
+        ssh_target, command = calls[0]
+
+        script = command.split("python3 -c ", 1)[1]
+        import shlex as _shlex
+
+        script = _shlex.split(script)[0]
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        victim.wait(timeout=5.0)
+        assert victim.poll() is not None
+        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait()
+
+
+def test_supervisor_reap_rejects_pid_reuse_command_mismatch(monkeypatch, tmp_path):
+    deployment = _deployment()
+    supervisor = launch.DistributedJobSupervisor(
+        deployment,
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    calls = []
+
+    def fake_ssh(ssh_target, command, **kwargs):
+        calls.append((ssh_target, command))
+        return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launch, "_run_cluster_ssh", fake_ssh)
+
+    marker_dir = tmp_path / ".omlx" / "cluster" / "runtime"
+    marker_dir.mkdir(parents=True)
+    marker_file = marker_dir / "cluster-test-rank-1.json"
+
+    # Innocent unrelated process
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "deployment_id": "cluster-test",
+                    "plan_hash": deployment.plan_hash,
+                    "rank": 1,
+                    "pid": victim.pid,
+                }
+            )
+        )
+        supervisor.state_dir = str(marker_dir)
+
+        supervisor._reap_remote_ranks()
+
+        assert len(calls) == 1
+        ssh_target, command = calls[0]
+
+        script = command.split("python3 -c ", 1)[1]
+        import shlex as _shlex
+
+        script = _shlex.split(script)[0]
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        # Innocent process must NOT be killed
+        assert victim.poll() is None
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_supervisor_reap_rejects_mismatched_deployment_or_plan(monkeypatch, tmp_path):
+    deployment = _deployment()
+    supervisor = launch.DistributedJobSupervisor(
+        deployment,
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    calls = []
+
+    def fake_ssh(ssh_target, command, **kwargs):
+        calls.append((ssh_target, command))
+        return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launch, "_run_cluster_ssh", fake_ssh)
+
+    marker_dir = tmp_path / ".omlx" / "cluster" / "runtime"
+    marker_dir.mkdir(parents=True)
+    marker_file = marker_dir / "cluster-test-rank-1.json"
+
+    victim_code = (
+        "import sys, time\n"
+        "sys.argv = ['omlx.cluster.inference_worker', '--deployment-id', 'cluster-test']\n"
+        "time.sleep(30)\n"
+    )
+    victim = subprocess.Popen(
+        [sys.executable, "-c", victim_code],
+    )
+    try:
+        # Marker with different deployment_id
+        marker_file.write_text(
+            json.dumps(
+                {
+                    "deployment_id": "wrong-deployment",
+                    "plan_hash": deployment.plan_hash,
+                    "rank": 1,
+                    "pid": victim.pid,
+                }
+            )
+        )
+        supervisor.state_dir = str(marker_dir)
+
+        supervisor._reap_remote_ranks()
+
+        ssh_target, command = calls[0]
+        script = command.split("python3 -c ", 1)[1]
+        import shlex as _shlex
+
+        script = _shlex.split(script)[0]
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        # Victim must NOT be killed due to mismatched deployment_id
+        assert victim.poll() is None
+    finally:
+        victim.kill()
+        victim.wait()

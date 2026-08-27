@@ -58,6 +58,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let serverAliases: [String]
         let sseKeepaliveMode: String?
         let autoStartOnLaunch: Bool?
+        let maxAudioUploadSize: String?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
@@ -212,6 +213,8 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// `"off"`. Server rejects anything else with a 400.
     var sseKeepaliveMode: String? = nil
     var autoStartOnLaunch: Bool? = nil
+    /// Human-readable cap such as `100MB` or `1GB`. Applied immediately.
+    var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
     var claudeCodeContextScalingEnabled: Bool? = nil

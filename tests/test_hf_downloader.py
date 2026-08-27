@@ -3,24 +3,26 @@
 
 import asyncio
 import json
+import os
 import shutil
 import threading
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from huggingface_hub.utils import HfHubHTTPError
 
+from omlx._hf_download_worker import _download_without_xet
 from omlx.admin.hf_downloader import (
     DownloadStatus,
     DownloadTask,
     HFDownloader,
+    _DownloadActivity,
     _DownloadCancelled,
+    _is_xet_transport_error,
     _make_cancellable_tqdm,
 )
-
 
 # =============================================================================
 # DownloadTask Tests
@@ -2540,91 +2542,255 @@ class TestStallDetection:
         return d
 
     @pytest.mark.asyncio
-    async def test_stall_detection_marks_task_failed(self, model_dir, monkeypatch):
-        """Download should be marked failed when stalled for _STALL_TIMEOUT seconds."""
+    async def test_zero_byte_startup_stall_aborts_xet(self, model_dir, monkeypatch):
+        """No first write must trigger the startup deadline, including at 0%."""
         import omlx.admin.hf_downloader as dl_module
 
-        # Use a very short stall timeout for testing
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 2)
-
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
         target = model_dir / "owner" / "model"
         target.mkdir(parents=True)
-        # Create a file so current_size > 0 (needed to trigger stall detection)
-        (target / "partial.bin").write_bytes(b"x" * 1000)
-
         downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        calls = 0
 
-        def _slow_download(**kwargs):
-            if kwargs.get("dry_run"):
-                return []
-            time.sleep(30)
+        def zero_byte_temp(_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _DownloadActivity()
+            return _DownloadActivity(file_count=1, latest_mtime_ns=1)
 
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=_slow_download,
-        ), patch(
-            "omlx.admin.hf_downloader.abort_xet_session"
-        ) as mock_abort:
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=zero_byte_temp,
+        ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
+            await downloader._poll_progress(task.task_id, target)
 
-            task = await downloader.start_download("owner/model")
-
-            # Wait for stall detection to kick in (2s timeout + polling intervals)
-            await asyncio.sleep(8)
-
-            assert task.status == DownloadStatus.FAILED
-            assert "stalled" in task.error.lower()
-            # The stall handler must reap the wedged xet transfer thread.
-            mock_abort.assert_called()
-
-            await downloader.shutdown()
+        stalled = downloader._stalled[task.task_id]
+        assert stalled.phase == "startup"
+        assert stalled.transport == "Xet"
+        mock_abort.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_no_stall_when_size_zero(self, model_dir, monkeypatch):
-        """Stall detection should not trigger when current_size is 0."""
+    async def test_active_stall_uses_longer_timeout(self, model_dir, monkeypatch):
+        """After the first write, the active-transfer timeout must apply."""
         import omlx.admin.hf_downloader as dl_module
 
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 1)
-
-        # Empty directory - no files yet
-        target = model_dir / "model"
-        target.mkdir()
-
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 1)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
         downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+        empty = _DownloadActivity()
+        writing = _DownloadActivity(
+            file_count=1,
+            logical_size=10,
+            allocated_size=4096,
+            latest_mtime_ns=1,
+        )
 
-        def _slow_download(**kwargs):
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=[empty, writing, writing, writing, writing, writing],
+        ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
+            await downloader._poll_progress(task.task_id, model_dir)
+
+        stalled = downloader._stalled[task.task_id]
+        assert stalled.phase == "active"
+        assert stalled.timeout == 0.03
+        mock_abort.assert_called_once()
+
+
+# =============================================================================
+# Xet HTTP Fallback Tests
+# =============================================================================
+
+
+class TestXetHTTPFallback:
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        path = tmp_path / "models"
+        path.mkdir()
+        return path
+
+    @staticmethod
+    def _api():
+        api = MagicMock()
+        info = MagicMock()
+        info.safetensors = {}
+        api.model_info.return_value = info
+        return api
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (
+                RuntimeError(
+                    "CAS service error: ReqwestMiddleware request failed "
+                    "for /xet-read-token"
+                ),
+                True,
+            ),
+            (RuntimeError("ordinary download failure"), False),
+            (OSError(28, "No space left on device"), False),
+        ],
+    )
+    def test_xet_error_classification(self, error, expected):
+        assert _is_xet_transport_error(error) is expected
+
+    @pytest.mark.asyncio
+    async def test_xet_error_retries_once_over_http(self, model_dir):
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        def fail_xet(**kwargs):
             if kwargs.get("dry_run"):
                 return []
-            time.sleep(10)
-
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=_slow_download,
-        ):
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
-
-            task = await downloader.start_download("owner/model")
-            await asyncio.sleep(5)
-
-            # Should still be downloading, not stalled
-            assert task.status in (
-                DownloadStatus.DOWNLOADING,
-                DownloadStatus.COMPLETED,
+            raise RuntimeError(
+                "CAS service error: ReqwestMiddleware request failed "
+                "for /xet-read-token"
             )
 
-            await downloader.shutdown()
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fail_xet,
+        ), patch.object(
+            downloader,
+            "_run_http_fallback",
+            new_callable=AsyncMock,
+        ) as fallback:
+            await downloader._run_download(task.task_id, "secret-token")
+
+        fallback.assert_awaited_once()
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_zero_byte_stall_waits_for_xet_exit_before_fallback(
+        self, model_dir, monkeypatch
+    ):
+        import omlx.admin.hf_downloader as dl_module
+
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+        aborted = threading.Event()
+        events = []
+
+        def stalled_xet(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            assert aborted.wait(1)
+            events.append("xet_stopped")
+            raise RuntimeError("xet session aborted")
+
+        async def finish_http(*_args, **_kwargs):
+            events.append("http_started")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=stalled_xet,
+        ), patch(
+            "omlx.admin.hf_downloader.abort_xet_session",
+            side_effect=aborted.set,
+        ) as abort, patch.object(
+            downloader,
+            "_run_http_fallback",
+            side_effect=finish_http,
+        ) as fallback:
+            await downloader._run_download(task.task_id, "")
+
+        assert events == ["xet_stopped", "http_started"]
+        abort.assert_called_once()
+        fallback.assert_awaited_once()
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_http_failure_preserves_both_errors(self, model_dir):
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        def fail_xet(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise RuntimeError("CAS service error from hf_xet")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fail_xet,
+        ), patch.object(
+            downloader,
+            "_run_http_fallback",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("HTTP offline"),
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        assert "CAS service error" in task.error
+        assert "HTTP offline" in task.error
+
+    @pytest.mark.asyncio
+    async def test_http_worker_disables_xet_without_token_in_argv(self, model_dir):
+        downloader = HFDownloader(model_dir=str(model_dir))
+        process = MagicMock()
+        process.returncode = 0
+        process.communicate = AsyncMock(return_value=(b'{"ok": true}\n', b""))
+        kwargs = {
+            "repo_id": "owner/model",
+            "local_dir": str(model_dir / "owner" / "model"),
+            "token": "secret-token",
+            "endpoint": None,
+            "etag_timeout": 30,
+        }
+
+        with patch(
+            "omlx.admin.hf_downloader.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as spawn:
+            await downloader._run_http_fallback("t1", kwargs)
+
+        argv = spawn.await_args.args
+        assert argv[1:] == ("-m", "omlx._hf_download_worker")
+        assert "secret-token" not in argv
+        assert spawn.await_args.kwargs["env"]["HF_HUB_DISABLE_XET"] == "1"
+        request = json.loads(process.communicate.await_args.kwargs["input"])
+        assert request["kwargs"]["token"] == "secret-token"
+
+    def test_worker_sets_disable_xet_before_download(self, monkeypatch):
+        monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+        download = MagicMock()
+
+        _download_without_xet({"repo_id": "owner/model"}, download)
+
+        assert os.environ["HF_HUB_DISABLE_XET"] == "1"
+        download.assert_called_once_with(repo_id="owner/model")
 
 
 # =============================================================================
@@ -2716,51 +2882,43 @@ class TestMtimeActivityDetection:
         """Download should not stall if file mtimes are updating."""
         import omlx.admin.hf_downloader as dl_module
 
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 3)
-
-        target = model_dir / "model"
-        target.mkdir()
-        # Create a file (size won't change, but mtime will)
-        test_file = target / "partial.bin"
-        test_file.write_bytes(b"x" * 1000)
-
+        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.03)
+        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
         downloader = HFDownloader(model_dir=str(model_dir))
-
-        # Simulate mtime advancing on each call
         call_count = 0
-        original_get_latest_mtime = HFDownloader._get_latest_mtime
 
-        @staticmethod
-        def mock_get_latest_mtime(path):
+        def active_download(_path):
             nonlocal call_count
             call_count += 1
-            # Return current time to simulate active writes
-            return time.time()
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=1000,
+                allocated_size=4096,
+                latest_mtime_ns=call_count,
+            )
 
-        monkeypatch.setattr(
-            HFDownloader, "_get_latest_mtime", mock_get_latest_mtime
+        task = DownloadTask(
+            task_id="t1",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
         )
+        downloader._tasks[task.task_id] = task
 
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
-        ):
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=active_download,
+        ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, model_dir)
+            )
+            await asyncio.sleep(0.08)
+            task.status = DownloadStatus.COMPLETED
+            await poll
 
-            task = await downloader.start_download("owner/model")
-            # Wait longer than stall timeout
-            await asyncio.sleep(8)
-
-            # Should still be downloading because mtime keeps updating
-            assert task.status == DownloadStatus.DOWNLOADING
-
-            await downloader.shutdown()
+        assert task.task_id not in downloader._stalled
+        mock_abort.assert_not_called()
 
 
 # =============================================================================

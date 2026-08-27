@@ -1,24 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """HuggingFace model downloader for oMLX admin panel.
 
-Downloads models from HuggingFace Hub using huggingface_hub's snapshot_download
-with directory-size-based progress polling.
+Downloads models with huggingface_hub's snapshot_download, filesystem-based
+progress polling, and an isolated HTTP retry for xet transport failures.
 """
 
 import asyncio
 import enum
+import errno
+import json
 import logging
+import os
 import shutil
+import signal
+import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
-    EntryNotFoundError,
     GatedRepoError,
     HfHubHTTPError,
     RepositoryNotFoundError,
@@ -37,6 +42,26 @@ _HF_API_TIMEOUT = 10
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+# A separate first-activity deadline catches xet token/CAS hangs that never
+# create a payload file. Once any write is observed, the more tolerant stall
+# timeout above applies so slow but active connections are left alone.
+_STARTUP_STALL_TIMEOUT = 120
+
+_PROGRESS_POLL_INTERVAL = 2
+_SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+_NON_XET_WORKER_MODULE = "omlx._hf_download_worker"
+
+_XET_ERROR_MARKERS = (
+    "cas service error",
+    "cas client",
+    "hf_xet",
+    "reqwestmiddleware",
+    "xet-read-token",
+    "xet storage",
+    "/xet-",
+)
 
 # Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
 # endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
@@ -110,6 +135,56 @@ def _resolve_endpoint(endpoint: str) -> str:
 
 class _DownloadCancelled(Exception):
     """Raised inside the download thread to interrupt a cancelled download."""
+
+
+class _DownloadStalledError(RuntimeError):
+    """Raised when a monitored transfer stops making observable progress."""
+
+    def __init__(self, *, transport: str, phase: str, timeout: float):
+        self.transport = transport
+        self.phase = phase
+        self.timeout = timeout
+        if phase == "startup":
+            detail = "no initial download activity"
+        else:
+            detail = "no download progress"
+        super().__init__(f"{transport} download stalled: {detail} for {timeout:g}s")
+
+
+class _NonXetDownloadError(RuntimeError):
+    """Raised when the isolated HTTP fallback process fails."""
+
+
+@dataclass(frozen=True)
+class _DownloadActivity:
+    """Filesystem signals used to distinguish slow transfers from stalls."""
+
+    file_count: int = 0
+    logical_size: int = 0
+    allocated_size: int = 0
+    latest_mtime_ns: int = 0
+
+
+def _is_xet_transport_error(error: BaseException) -> bool:
+    """Return whether an exception identifies the xet/CAS transport path."""
+    if isinstance(
+        error,
+        (
+            _DownloadCancelled,
+            _DownloadStalledError,
+            GatedRepoError,
+            RepositoryNotFoundError,
+        ),
+    ):
+        return False
+    if isinstance(error, OSError) and error.errno in {
+        errno.EACCES,
+        errno.ENOSPC,
+        errno.EROFS,
+    }:
+        return False
+    detail = f"{type(error).__name__}: {error}".lower()
+    return any(marker in detail for marker in _XET_ERROR_MARKERS)
 
 
 def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
@@ -607,6 +682,8 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._stalled: dict[str, _DownloadStalledError] = {}
+        self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
         self._download_sem = asyncio.Semaphore(1)
 
     @property
@@ -887,23 +964,59 @@ class HFDownloader:
                         f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
-                # Start progress polling
                 self._progress_tasks[task_id] = asyncio.create_task(
                     self._poll_progress(task_id, target_dir)
                 )
 
-                # Run snapshot_download in a thread (blocking call). Cancel
-                # reaches the thread two ways: the cancellable tqdm raises on
-                # the next chunk of the http_get path, and abort_xet_session()
-                # (called by cancel/stall/shutdown) unwinds the xet path with
-                # a RuntimeError (the thread itself can't be force-killed).
-                await asyncio.to_thread(
-                    snapshot_download,
-                    **dl_kwargs,
-                    tqdm_class=_make_cancellable_tqdm(
-                        lambda: task_id in self._cancelled
-                    ),
-                )
+                xet_error: Exception | None = None
+                try:
+                    # Awaiting the thread here is intentional: after a stall,
+                    # fallback cannot start until abort_xet_session() has made
+                    # the original writer return.
+                    await asyncio.to_thread(
+                        snapshot_download,
+                        **dl_kwargs,
+                        tqdm_class=_make_cancellable_tqdm(
+                            lambda: task_id in self._cancelled
+                        ),
+                    )
+                except Exception as error:
+                    stalled = self._stalled.pop(task_id, None)
+                    if stalled is not None:
+                        xet_error = stalled
+                    elif _is_xet_transport_error(error):
+                        xet_error = error
+                    else:
+                        raise
+                else:
+                    xet_error = self._stalled.pop(task_id, None)
+
+                if xet_error is not None:
+                    if task_id in self._cancelled:
+                        raise _DownloadCancelled()
+                    logger.warning(
+                        "Xet download failed for %s: %s. "
+                        "Retrying once over HTTP.",
+                        task.repo_id,
+                        xet_error,
+                    )
+                    progress_task = self._progress_tasks.pop(task_id, None)
+                    if progress_task and not progress_task.done():
+                        progress_task.cancel()
+                    self._progress_tasks[task_id] = asyncio.create_task(
+                        self._poll_progress(task_id, target_dir)
+                    )
+                    try:
+                        await self._run_http_fallback(task_id, dl_kwargs)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        fallback_error = self._stalled.pop(task_id, None) or error
+                        raise _NonXetDownloadError(
+                            "Xet download failed "
+                            f"({xet_error}); HTTP fallback also failed "
+                            f"({fallback_error})"
+                        ) from error
 
                 # Check if cancelled while downloading
                 if task_id in self._cancelled:
@@ -961,9 +1074,7 @@ class HFDownloader:
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
         except Exception as e:
-            # Skip when already cancelled (the xet abort surfaces here as a
-            # RuntimeError) or already FAILED by the stall detector, whose
-            # error message would otherwise be clobbered by the abort error.
+            # Do not clobber an earlier terminal error or a user cancellation.
             if (
                 task_id not in self._cancelled
                 and task.status != DownloadStatus.FAILED
@@ -976,9 +1087,78 @@ class HFDownloader:
             progress_task = self._progress_tasks.pop(task_id, None)
             if progress_task and not progress_task.done():
                 progress_task.cancel()
+            self._stalled.pop(task_id, None)
 
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
+
+    async def _run_http_fallback(
+        self,
+        task_id: str,
+        dl_kwargs: dict,
+    ) -> None:
+        env = os.environ.copy()
+        env["HF_HUB_DISABLE_XET"] = "1"
+        payload = json.dumps({"kwargs": dl_kwargs}).encode()
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            _NON_XET_WORKER_MODULE,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        self._fallback_processes[task_id] = process
+
+        try:
+            stdout, _ = await process.communicate(input=payload)
+            try:
+                response = json.loads(stdout.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise _NonXetDownloadError(
+                    f"HTTP fallback process exited with code {process.returncode}"
+                ) from error
+            if process.returncode != 0 or not response.get("ok"):
+                error_type = response.get("error_type", "DownloadError")
+                message = response.get("message", "unknown error")
+                raise _NonXetDownloadError(f"{error_type}: {message}")
+        except asyncio.CancelledError:
+            await self._stop_subprocess(process)
+            raise
+        finally:
+            self._fallback_processes.pop(task_id, None)
+
+    @staticmethod
+    async def _stop_subprocess(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            process.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=_SUBPROCESS_TERMINATE_TIMEOUT,
+            )
+            return
+        except TimeoutError:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=_SUBPROCESS_TERMINATE_TIMEOUT,
+            )
+        except TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            await process.wait()
 
     async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
         """Poll the target directory to estimate download progress.
@@ -993,58 +1173,95 @@ class HFDownloader:
         if task is None:
             return
 
-        last_size = 0
-        last_activity_at = time.time()
+        last_activity = self._get_download_activity(target_dir)
+        last_activity_at = time.monotonic()
+        observed_activity = False
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
-                await asyncio.sleep(2)
+                await asyncio.sleep(_PROGRESS_POLL_INTERVAL)
 
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
-                task.downloaded_size = current_size
+                activity = self._get_download_activity(target_dir)
+                task.downloaded_size = activity.logical_size
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
                     task.progress = min(
-                        (current_size / task.total_size) * 100, 99.0
+                        (activity.logical_size / task.total_size) * 100,
+                        99.0,
                     )
 
-                # Activity detection: size change OR file mtime change
-                if current_size != last_size:
-                    last_size = current_size
-                    last_activity_at = time.time()
-                else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
-                    if latest_mtime > last_activity_at:
-                        last_activity_at = latest_mtime
+                if activity != last_activity:
+                    # A zero-byte temp file or metadata touch is not payload
+                    # progress. APFS allocated blocks increase when bytes are
+                    # actually written, including into sparse/preallocated files.
+                    if activity.allocated_size > last_activity.allocated_size:
+                        observed_activity = True
+                    last_activity = activity
+                    last_activity_at = time.monotonic()
+                    continue
 
-                # Stall detection
-                if (
-                    current_size > 0
-                    and (time.time() - last_activity_at) > _STALL_TIMEOUT
-                ):
-                    task.status = DownloadStatus.FAILED
-                    task.error = (
-                        f"Download stalled: no progress for {_STALL_TIMEOUT}s. "
-                        "Try retrying the download."
+                timeout = (
+                    _STALL_TIMEOUT
+                    if observed_activity
+                    else _STARTUP_STALL_TIMEOUT
+                )
+                if time.monotonic() - last_activity_at > timeout:
+                    phase = "active" if observed_activity else "startup"
+                    process = self._fallback_processes.get(task_id)
+                    transport = "HTTP fallback" if process else "Xet"
+                    stalled = _DownloadStalledError(
+                        transport=transport,
+                        phase=phase,
+                        timeout=timeout,
                     )
+                    self._stalled[task_id] = stalled
                     logger.warning(
-                        f"Download stalled for {task.repo_id} "
-                        f"(task_id={task_id})"
+                        "%s for %s (task_id=%s)",
+                        stalled,
+                        task.repo_id,
+                        task_id,
                     )
-                    # Cancel the snapshot_download thread. The task cancel
-                    # only unblocks the awaiting coroutine; aborting the xet
-                    # session is what actually reaps a wedged transfer thread.
-                    active_task = self._active_tasks.get(task_id)
-                    if active_task and not active_task.done():
-                        active_task.cancel()
-                    abort_xet_session()
+                    if process is not None:
+                        await self._stop_subprocess(process)
+                    else:
+                        abort_xet_session()
                     break
         except asyncio.CancelledError:
             pass
+
+    @staticmethod
+    def _get_download_activity(path: Path) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files."""
+        if not path.exists():
+            return _DownloadActivity()
+        file_count = 0
+        logical_size = 0
+        allocated_size = 0
+        latest_mtime_ns = 0
+        try:
+            for file_path in path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                logical_size += stat.st_size
+                allocated_size += getattr(stat, "st_blocks", 0) * 512
+                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        except OSError:
+            pass
+        return _DownloadActivity(
+            file_count=file_count,
+            logical_size=logical_size,
+            allocated_size=allocated_size,
+            latest_mtime_ns=latest_mtime_ns,
+        )
 
     @staticmethod
     def _get_latest_mtime(path: Path) -> float:

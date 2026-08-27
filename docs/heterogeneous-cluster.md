@@ -250,7 +250,7 @@ The Cluster dashboard now has an **Add a CUDA worker** card. Enter the
 coordinator Studio's private LAN IPv4 address and select **Generate join
 command**. Paste that command into one Ubuntu/Debian CUDA box. Generate a fresh
 command for every additional box; each credential is single-use and expires
-after ten minutes.
+after thirty minutes.
 
 The generated command is intentionally not `curl | sudo`. It downloads a
 standalone standard-library bootstrap to a temporary file, verifies its

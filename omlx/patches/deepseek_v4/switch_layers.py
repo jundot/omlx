@@ -413,7 +413,7 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
-    def __call__(self, x, indices, scores=None) -> mx.array:
+    def __call__(self, x, indices, scores=None, weighted_sum=False) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
@@ -555,6 +555,18 @@ class SwitchGLU(nn.Module):
             sorted_indices=do_sort,
             block_plan=block_plan,
         )
+
+        if (
+            weighted_sum
+            and scores is not None
+            and do_sort
+            and scores.shape[-1] in (6, 8)
+            and scores.dtype == mx.float32
+            and x.dtype in (mx.float16, mx.bfloat16)
+            and glm_fast.has_symbol("glm_moe_weighted_sum")
+        ):
+            y = glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            return y.astype(original_dtype) if use_f16_moe else y
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

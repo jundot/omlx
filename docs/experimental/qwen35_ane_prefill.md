@@ -9,7 +9,13 @@ by default.
 At the default 53% MLP request, alignment gives the two ANEs 26.5% of gate and
 up channels each (52.9% total) and leaves 47.1% on GPU. A native merge applies
 SwiGLU without materializing the full gate/up result. The GDN z+qkv input
-projection is split 50/50 between the ANEs and GPU. The MLP down projection,
+projection uses a precision-aware split: ANE computes only the token-local z
+gate, while every recurrent qkv row stays off the approximate ANE path and
+normally uses checkpoint-precision GPU projection. The configured GDN fraction
+is a ceiling; a wider request is capped at the model's z boundary (37.5% on the
+validated Qwen3.6/3.8 27B layout). Optional FP16 CPU sharing can take
+independent gate/up, down-projection, and residual GDN qkv slices; all three
+branches run in parallel and are merged natively.
 GDN recurrence, b/a and output projections, normalization, embeddings, and
 logits remain on GPU.
 
@@ -19,23 +25,36 @@ logits remain on GPU.
 - The dual path is intended for M3 Ultra, where the two dies expose physical
   ANE instances 1 and 2.
 - The oMLX native custom kernels must be built (`OMLX_WITH_CUSTOM_KERNEL=1`).
-- Dense Qwen3.5/3.6/3.8 affine q4 gate/up linears with group size 64 or 128.
-  The down projection may use compatible affine q2/q4/q5/q6/q8 weights and
-  remains on the GPU.
-- Optional GDN acceleration accepts affine q4/q5 projections with group size
-  64 or 128. Mixed q4/q5 layouts are supported when the ANE prefix covers the
-  full z projection, leaving a homogeneous qkv suffix on the GPU.
-- An MLP prefill call whose flattened token count exactly matches the fixed
-  configured sequence length. Decode, target verification, short chunks, and
-  unsupported layers automatically use the existing path.
-- Fixed-shape ANE programs and their combined q4 suffixes are prepared eagerly
+- Dense Qwen3.5/3.6/3.8 affine q4/q5/q6/q8 gate/up linears with group size 64
+  or 128. The optimized fused q4 path remains unchanged; compatible quantized
+  weights are retained for every GPU suffix. The down projection may use
+  compatible affine q2/q4/q5/q6/q8 weights.
+- Optional GDN acceleration accepts affine q4/q5/q6/q8 projections with group
+  size 64 or 128. The z width must align exactly to the selected single- or
+  dual-ANE output granularity. Mixed q4/q5/q6/q8 layouts are supported because
+  ANE covers exactly z and leaves a homogeneous qkv suffix on the GPU.
+- CPU sharing requires a separately preprocessed FP16 clone of the model. It
+  does not modify or dequantize the source checkpoint in place. The CPU GDN
+  slice applies only to residual qkv outputs after the ANE prefix; z remains
+  wholly on ANE so mixed-quantization checkpoints keep a valid GPU suffix.
+  The clone utility rejects non-finite tensors and BF16 values outside the
+  FP16 range before writing any checkpoint files.
+- An MLP prefill call whose flattened token count matches the fixed configured
+  sequence length, or a single-prompt call that is wider: wide chunks are tiled
+  internally into fixed-shape blocks. A tuner-calibrated suffix may zero-pad a
+  sufficiently large residual intermediate activation to one fixed ANE tile;
+  smaller tails, decode, target verification, and unsupported layers use the
+  existing path.
+- Fixed-shape ANE programs and their combined affine suffixes are prepared eagerly
   on the MLX executor while the model starts. For the 64-layer 27B target this
   adds a substantial startup phase, but the first matching prompt no longer
   pays the compilation cost. Programs are cached for the model's lifetime.
 
 The implementation uses undocumented APIs and can stop working after a macOS
 update. It also requantizes the selected weights to per-output-channel INT8,
-so it is an approximate acceleration path rather than bit-exact inference.
+so ANE results are approximate rather than bit-exact. The approximation is
+kept out of recurrent GDN qkv state specifically to prevent long-context error
+accumulation; the MLP and token-local GDN z branches remain approximate.
 
 On NAX GPUs (the M5 family) the hybrid GPU suffix runs on dedicated NAX
 qmm kernels (group sizes 64 and 128), which resolves the prefill regression
@@ -48,18 +67,32 @@ classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
 `OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
 regardless of the per-model setting.
 
+The ANE GDN dispatch runs through the mlx-lm prefill linear patch, so
+`OMLX_QWEN35_Q4_LM_LINEAR=0` disables ANE GDN acceleration as well as the
+standalone GPU qmm routing. GDN b/a suffix projections follow the same q8
+token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
+(default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
+where the native q8 tile is not profitable.
+
 ## Per-model settings
 
 ```json
 {
   "qwen35_ane_prefill_enabled": true,
   "qwen35_ane_prefill_sequence_length": 2048,
+  "qwen35_ane_prefill_tail_padding_min_tokens": 0,
   "qwen35_ane_prefill_fraction": 0.53,
   "qwen35_ane_prefill_max_layers": 64,
   "qwen35_ane_prefill_dual_ane": true,
   "qwen35_ane_prefill_gdn": true,
   "qwen35_ane_prefill_gdn_fraction": 0.50,
-  "qwen35_ane_prefill_gdn_max_layers": 48
+  "qwen35_ane_prefill_gdn_max_layers": 48,
+  "qwen35_ane_prefill_cpu_enabled": false,
+  "qwen35_ane_prefill_cpu_fraction": 0.135,
+  "qwen35_ane_prefill_cpu_down_fraction": 0.0,
+  "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
+  "qwen35_ane_prefill_cpu_threads": 8,
+  "qwen35_ane_prefill_cpu_shared_resource": true
 }
 ```
 
@@ -94,15 +127,48 @@ The macOS app exposes the same controls under **Models → model settings →
 Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6/3.8
 models. Enabling or changing a control reloads a resident model when the
 working profile is applied. The editor starts from the measured 2,048-token,
-53% MLP / 50% GDN, dual-ANE, 64/48-layer configuration above; the feature
-itself stays off until explicitly enabled.
+53% MLP / 50% GDN ceiling, dual-ANE, 64/48-layer configuration above; the
+feature itself stays off until explicitly enabled. The runtime reports when it
+caps that requested GDN fraction at the model-specific z boundary.
 
-When the feature is active, oMLX aligns the scheduler's prompt chunk size with
-the configured fixed ANE shape. This also overrides the wider Qwen prefill
-floor used on high-memory systems. A 4,096-token ANE shape is supported, but a
-4K benchmark request prefills only 4,095 tokens because the final token is
-reserved for generation kickoff. The default remains 2,048 so 4K prompts still
-route one full chunk through ANE.
+The split tuner calibrates five workload controls: MLP gate/up work on ANE,
+MLP gate/up work on CPU, MLP down-projection work on CPU, GDN work on ANE, and
+GDN qkv work on CPU. It packages several widths from one real MLP and GDN layer
+into a small temporary procedure bank, measures the production native paths,
+and then eagerly compiles only the predicted full-model candidate. Timings
+from that application-level run rebalance the ANE, CPU, and GPU branch rates
+once before a final verification. This avoids a five-dimensional full-model
+grid while still making end-to-end prompt throughput the recommendation
+criterion. CPU dimensions are skipped automatically when the checkpoint or
+native extension does not support FP16 CPU sharing. Zero is always a valid CPU
+GDN candidate, so the tuner can retain GPU-only residual qkv when CPU sharing
+does not pay off.
+
+The tuner preserves the model's single- or dual-ANE execution setting. In
+single-ANE mode it compiles one unpinned calibration bank and tunes ANE/GPU
+MLP and GDN splits normally. CPU gate/up, down-projection, and GDN sharing are
+all calibrated in either mode when the checkpoint has the required eager FP16
+rows and the matching native symbols are available.
+
+After selecting the best full-model candidate, the tuner derives the first
+profitable padded tail from measurements made by the current run. If `S` is
+the fixed ANE sequence length, `G` is GPU-only prompt throughput, and `H` is
+the winning hybrid throughput, the crossover is
+`floor(S * G / H) + 1` tokens. This is the first integer tail for which the
+estimated GPU time (`tail / G`) exceeds one padded hybrid tile (`S / H`). The
+tuner writes zero when the hybrid candidate does not beat GPU-only, which
+keeps padding disabled. Saved thresholds are cleared during each search so an
+older calibration cannot influence a new result.
+
+The scheduler keeps its normal prompt chunk width; chunks wider than the
+compiled ANE shape are tiled internally. Chunks narrower than the compiled
+shape can use a padded intermediate tile only when they meet the calibrated
+threshold; otherwise they stay on the ordinary GPU path. With boundary caching
+on, delivered chunks are cut at the 2,048-token cache block edge, so 2,048
+remains the safe default everywhere.
+A 4K benchmark request prefills only 4,095 tokens because the final token is
+reserved for generation kickoff; the benchmark screen's ANE alignment option
+adds one token so an exact multiple of the fixed shape is prefilled.
 
 The throughput-benchmark screen also offers a **Full · 2,048** warm-up. The
 scheduler reserves the last prompt token for the first decode step, so this
@@ -114,8 +180,9 @@ Every native throughput-benchmark trial emits INFO-level comparison traces to
 cache offset, model/cache evaluation time, and non-model overhead), while
 `[benchmark-ane-profile]` records actual native MLP/GDN operation counts and
 the same input-ready, ANE-evaluation, GPU-QMM, gap, and duty-cycle counters used
-by the offline benchmark. `[benchmark-ane-summary]` explicitly reports the
-expected fixed-shape calls and residual GPU tail. Ordinary inference requests
+by the offline benchmark. `[benchmark-ane-summary]` reports the observed
+fixed-shape tiles and residual tail when the scheduler trace is available,
+falling back to a prompt-length estimate otherwise. Ordinary inference requests
 do not enable these counters or emit the per-chunk trace.
 
 Qwen's configured padding token (`<|endoftext|>` for the tested checkpoint) is
@@ -123,8 +190,11 @@ a normal learned token, not a state-neutral null token. Appending it changes
 the logits and advances both the KV cache and Gated DeltaNet recurrent state.
 Padding can only be made semantically inert by carrying a mask through cache
 positions, RoPE, and every recurrent update; the normal single-request path
-does not provide that guarantee, so synthetic padding is not used to force ANE
-shapes.
+does not provide that guarantee, so synthetic token padding is not used to
+force ANE shapes. Intermediate tail padding is different: it adds zero rows
+only around the tokenwise MLP and GDN input projections, slices those rows from
+the projection result before GDN recurrence or later model stages, and never
+alters the token sequence, positions, or cache state.
 
 For the combined-only path, the native bridge directly merges the planar ANE
 prefix and row-major GPU suffix while applying SwiGLU. This avoids materializing
@@ -136,6 +206,28 @@ The combined GPU suffix is retained alongside the original gate/up tensors so
 decode and every fallback remain unchanged. The dual path also owns two input
 and two output surfaces per accelerated layer. This deliberately spends memory
 to avoid per-request weight preparation and to keep both ANEs ready.
+When CPU sharing is enabled, model admission additionally reserves the eager
+FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
+materialization scratch. This projected size participates in the normal memory
+guard before the model begins loading.
+
+## Recurrent-safe GDN validation
+
+The current z-only policy was selected from a controlled 32K comparison on
+`Qwen3.6-27B-oQ4e-mtp`. A 50% ANE slice that included 2,048 of 10,240 recurrent
+qkv rows deterministically failed ordering and exact-format summarization tasks
+that distinguished the GPU baseline. Capping ANE at all 6,144 z rows (37.5% of
+z+qkv) restored all four baseline-discriminating retrieval, ordering, code, and
+summary checks. Six varied generations all ended normally without a suspected
+loop, and their output hashes repeated exactly in a second pass.
+
+The precision cap preserved nearly all of the useful acceleration. A direct
+2,048-token GDN projection measured 9.61 ms for z-only ANE/GPU versus 14.73 ms
+on GPU (1.53x). In an isolated real-server 32K cold/cache-hit pair, subtracting
+the hit time from the cold time gave about 507 prompt tok/s, approximately 22%
+above the matched 416 tok/s GPU baseline and slightly above the earlier 50%
+full-GDN result. These figures are specific to the tested M3 Ultra and model,
+but the recurrent-versus-token-local boundary is enforced for every model.
 
 ## Qwen3.8-27B-oQ4e validation
 
@@ -197,6 +289,8 @@ version lacked the anticipated backend-registration function. Those older
 4.80-4.96 second "GDN" figures therefore measured the MLP-only path and are
 superseded. The compatibility hook now intercepts mlx-vlm's projection helper,
 and the benchmark verifies 64 MLP plus 48 GDN procedure dispatches per prompt.
+The throughput-only GDN measurements below predate the recurrent-safe z-only
+policy and are retained as implementation history, not current tuning advice.
 
 With the corrected hook and the retuned 53% MLP / 50% GDN request, the final
 deterministic paired run measured:
@@ -210,13 +304,41 @@ Final hidden-state cosine similarity was 0.999200, last-token logit cosine
 similarity was 0.998522, and top-1 was unchanged. These are single-prompt
 numerical checks, not downstream quality validation.
 
+The optional CPU GDN branch was subsequently validated with the FP16 clone of
+`Qwen3.8-27B-AWQ-4.85bpw`, 2,048 tokens, 53% MLP on ANE, 13.5% MLP gate/up on
+CPU, and 20% MLP down projection on CPU. Moving 15% of qkv to CPU improved a
+deliberately reduced 45% ANE GDN split from 471.6 to 480.1 tok/s, with the ANE,
+CPU, and GPU GDN branches measuring 8.63, 8.86, and 9.18 ms per operation.
+However, it did not beat the already balanced 50% ANE / 0% CPU GDN result:
+
+| GDN on ANE | GDN on CPU | Prompt throughput | Versus 50% ANE / 0% CPU |
+|---:|---:|---:|---:|
+| 50% | 0% | 490.2 tok/s | reference |
+| 50% | 5% | 475.2 tok/s | -3.1% |
+| 45% | 12.5% | 478.7 tok/s | -2.3% |
+| 45% | 15% | 480.1 tok/s | -2.0% |
+
+That standalone sweep held the surrounding workload and most candidate widths
+fixed, so it was useful for validating branch timing but did not predict the
+best complete application split. The subsequent in-app five-way tuner jointly
+selected 45% MLP on ANE, 45% GDN on ANE, 14% gate/up on CPU, 20% down on CPU,
+and 13% GDN qkv on CPU. It measured 517.9 prompt tok/s, 45.8% above its GPU-only
+baseline. That application result was authoritative for the earlier
+throughput study; the current tuner fixes the ANE portion at z and only tunes
+the residual CPU/GPU qkv split. The standalone table illustrates why CPU GDN
+must be tuned jointly rather than accepted or rejected from an isolated
+fixed-split sweep. Hidden-state and last-token logit cosine similarity at the
+validated CPU GDN point were 0.999989 and 0.999999, and top-1 matched the GPU
+path.
+
 That layout issues two ANE evaluations for each accelerated operation: one
 request pinned to each physical ANE. Across 64 MLP and 48 GDN operations this
 is 224 evaluations per 2,048-token prompt, or 112 sequential evaluations on
 each ANE. The two evaluations belonging to an operation are launched in
-parallel. Gate and up are already combined in each MLP evaluation, and z and
-qkv are already combined in each GDN evaluation, so splitting either group
-would increase dispatch count.
+parallel. Gate and up are already combined in each MLP evaluation. In the
+historical GDN layout, z and qkv were also combined in each evaluation; the
+current layout compiles the same number of GDN procedures but ends each one at
+the z boundary.
 
 A single unpinned procedure containing the same 55% MLP slice took 57.90 ms
 for a representative layer, versus 41.51 ms for the two pinned evaluations.
@@ -226,7 +348,8 @@ procedure across both ANEs. Replacing the two short-lived dispatch threads
 with persistent high-priority workers also regressed throughput, so the
 existing paired launch was retained.
 
-Profiling identified 53% MLP / 50% GDN as the best measured split. At 50% GDN,
+Historical profiling identified 53% MLP / 50% GDN as the best measured split.
+At 50% GDN,
 the ANE and GPU GDN portions take about 10.1 ms and 9.95 ms respectively. The
 53% MLP point measured 4.4768 s in its seven-run tuning pass, versus 4.5172 s
 at 54% and 4.5370 s at 55%. Larger 60% banks were slower, and a monolithic

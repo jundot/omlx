@@ -4,7 +4,11 @@
 import importlib
 import inspect
 import json
+import os
+import subprocess
 import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -221,6 +225,58 @@ class TestGeneratePatch:
         result = gen_mod._make_cache(FakeModel(), [0], None)
         assert len(result) == 1
         assert isinstance(result[0], BatchPoolingCache)
+
+    @pytest.mark.parametrize("patch_order", ("scheduler-first", "deepseek-first"))
+    def test_deepseek_patch_preserves_mixed_model_owned_conversion(
+        self, patch_order
+    ):
+        if patch_order == "scheduler-first":
+            patch_setup = (
+                "import omlx.scheduler\n            apply_deepseek_v4_patch()"
+            )
+        else:
+            patch_setup = (
+                "apply_deepseek_v4_patch()\n            import omlx.scheduler"
+            )
+        script = textwrap.dedent(
+            f"""
+            import importlib
+
+            from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+            from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            {patch_setup}
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+
+            from mlx_lm.models.cache import BatchPoolingCache, CacheList, PoolingCache
+            from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+            class Model:
+                layers = (object(),)
+
+                def make_cache(self):
+                    return [CacheList(PoolingCache(4), QSAKVCache())]
+
+            generate = importlib.import_module("mlx_lm.generate")
+            caches = generate._make_cache(Model(), [0], None)
+            assert isinstance(caches[0].caches[0], BatchPoolingCache)
+            assert isinstance(caches[0].caches[1], BatchQSAKVCache)
+            """
+        )
+        env = dict(os.environ)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
 
 
 class TestTokenizerPatch:

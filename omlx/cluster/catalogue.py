@@ -90,6 +90,15 @@ class ModelFit:
     # cluster cannot combine memory for it.
     standalone_node_id: str = ""
     standalone_max_context_tokens: int = 0
+    # What the architecture can do, independent of the winning topology. The
+    # fit above is the FEWEST-node plan; a model that fits one Mac reports
+    # tensor_parallel_size=1 even on a 2-node cluster. The dashboard needs
+    # these to know a multi-node deploy of a pipeline-incapable model can
+    # only be tensor. Both default False (fail closed, like the planner's
+    # _supports_pipeline for an unknown model_type) — a constructor that
+    # skips them must not advertise capabilities nobody verified.
+    supports_pipeline: bool = False
+    supports_tensor_parallel: bool = False
 
     @property
     def strategy(self) -> str:
@@ -156,6 +165,8 @@ class ModelFit:
             "closest_nodes_required": self.closest_nodes_required,
             "standalone_node_id": self.standalone_node_id,
             "standalone_max_context_tokens": self.standalone_max_context_tokens,
+            "supports_pipeline": self.supports_pipeline,
+            "supports_tensor_parallel": self.supports_tensor_parallel,
         }
 
 
@@ -407,6 +418,8 @@ def assess_model(
             headroom_bytes=max(0, headroom),
             model_path=layout.source,
             warnings=tuple(warnings),
+            supports_pipeline=bool(pipeline_ok),
+            supports_tensor_parallel=bool(tensor_parallel_ok),
         )
 
     (
@@ -485,6 +498,8 @@ def assess_model(
         closest_nodes_required=closest_nodes_required,
         standalone_node_id=standalone_node_id,
         standalone_max_context_tokens=standalone_context,
+        supports_pipeline=bool(pipeline_ok),
+        supports_tensor_parallel=bool(tensor_parallel_ok),
     )
 
 

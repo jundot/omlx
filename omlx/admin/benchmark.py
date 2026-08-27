@@ -111,6 +111,7 @@ class BenchmarkRequest(BaseModel):
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
     warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
+    align_prompt_to_ane: bool = False
     force_lm_engine: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
@@ -138,6 +139,19 @@ class BenchmarkRequest(BaseModel):
                     f"Invalid batch size {bs}. Must be one of {VALID_BATCH_SIZES}"
                 )
         return sorted(v)
+
+
+def _single_prompt_lengths(request: BenchmarkRequest) -> list[int]:
+    """Return the actual prompt lengths used by single-request trials.
+
+    Generation reserves the last prompt token for first-token logits. Adding
+    one to the standard PP sizes therefore turns PP4096 into exactly 4096
+    prefill rows. Results intentionally report the actual length (PP4097), so
+    aligned local diagnostics cannot be mistaken for standard leaderboard
+    measurements.
+    """
+    adjustment = 1 if request.align_prompt_to_ane else 0
+    return [length + adjustment for length in request.prompt_lengths]
 
 
 @dataclass
@@ -355,12 +369,20 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_draft_block_size",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
     "qwen35_ane_prefill_gdn",
     "qwen35_ane_prefill_gdn_fraction",
     "qwen35_ane_prefill_gdn_max_layers",
+    "qwen35_ane_prefill_cpu_enabled",
+    "qwen35_ane_prefill_cpu_fraction",
+    "qwen35_ane_prefill_cpu_down_fraction",
+    "qwen35_ane_prefill_cpu_gdn_fraction",
+    "qwen35_ane_prefill_cpu_threads",
+    "qwen35_ane_prefill_cpu_shared_resource",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(
@@ -814,14 +836,35 @@ async def _run_single_test(
     if trace_prefill_duration_s is None and first_token_time is not None:
         trace_prefill_duration_s = max(0.0, first_token_time - start_time)
 
-    _log_ane_benchmark_trace(
+    ane_trace = _log_ane_benchmark_trace(
         pp_len=pp_len,
         prefill_duration_s=trace_prefill_duration_s,
         config=ane_trace_config,
         profile=ane_profile,
+        # An ABI-skewed extension can enable the profiler yet return an empty
+        # snapshot; that must read as unknown, not as an idle ANE.
+        profiling_available=ane_profile_enabled and bool(ane_profile),
+        scheduler_trace=(
+            {
+                "chunk_tokens": list(
+                    getattr(last_output, "benchmark_prefill_chunks", [])
+                ),
+                "requested_steps": list(
+                    getattr(last_output, "benchmark_requested_steps", [])
+                ),
+                "boundary_enabled": bool(
+                    getattr(last_output, "benchmark_boundary_enabled", False)
+                ),
+                "cache_block_size": int(
+                    getattr(last_output, "benchmark_cache_block_size", 0) or 0
+                ),
+            }
+            if last_output is not None
+            else None
+        ),
     )
 
-    return _compute_single_metrics(
+    metrics = _compute_single_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=metric_completion_tokens,
         start_time=start_time,
@@ -833,6 +876,9 @@ async def _run_single_test(
         generation_duration_s=generation_duration_s,
         generation_measured=generation_measured,
     )
+    if ane_trace_config is not None:
+        metrics["ane_trace"] = ane_trace
+    return metrics
 
 
 def _log_ane_benchmark_trace(
@@ -841,20 +887,58 @@ def _log_ane_benchmark_trace(
     prefill_duration_s: float | None,
     config: dict[str, Any] | None,
     profile: dict[str, dict[str, float]],
-) -> None:
-    """Log an offline-comparable ANE/scheduler summary for one PP trial."""
+    profiling_available: bool = True,
+    scheduler_trace: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Log an offline-comparable ANE/scheduler summary for one PP trial.
+
+    Returns the same per-category counters that are logged, so callers can
+    tell whether the ANE actually executed rather than only whether its
+    programs compiled.
+    """
     config = config or {}
+    scheduler_trace = scheduler_trace or {}
     sequence_length = int(config.get("sequence_length", 0) or 0)
     prefill_tokens = max(0, pp_len - 1)
+    chunk_tokens = [
+        int(value)
+        for value in scheduler_trace.get("chunk_tokens", [])
+        if int(value) > 0
+    ]
+    requested_steps = [
+        int(value)
+        for value in scheduler_trace.get("requested_steps", [])
+        if int(value) > 0
+    ]
+    accounting_widths = chunk_tokens or [prefill_tokens]
     full_shapes, tail = (0, prefill_tokens)
     if sequence_length > 0:
-        full_shapes, tail = divmod(prefill_tokens, sequence_length)
+        divisions = [divmod(width, sequence_length) for width in accounting_widths]
+        full_shapes = sum(full for full, _ in divisions)
+        tail = sum(remainder for _, remainder in divisions)
+
+    def width_histogram(values: list[int]) -> str:
+        counts: dict[int, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return ",".join(
+            f"{width}x{count}" for width, count in sorted(counts.items(), reverse=True)
+        ) or "none"
+
     logger.info(
         "[benchmark-ane-summary] pp=%d prefill_tokens=%d sequence_length=%d "
-        "expected_full_shapes=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
+        "model_calls=%d model_call_widths=%s requested_steps=%s "
+        "boundary_enabled=%s cache_block_size=%d accounting=%s "
+        "full_ane_tiles=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
         pp_len,
         prefill_tokens,
         sequence_length,
+        len(chunk_tokens),
+        width_histogram(chunk_tokens),
+        width_histogram(requested_steps),
+        bool(scheduler_trace.get("boundary_enabled", False)),
+        int(scheduler_trace.get("cache_block_size", 0) or 0),
+        "observed" if chunk_tokens else "prompt_estimate",
         full_shapes,
         tail,
         (
@@ -863,6 +947,17 @@ def _log_ane_benchmark_trace(
             else "unknown"
         ),
     )
+
+    summary: dict[str, Any] = {
+        # Without the profiler the operation counts below are all zero
+        # regardless of what the ANE did, so callers must not read them as
+        # evidence that it stayed idle.
+        "profiling_available": bool(profiling_available),
+        "sequence_length": sequence_length,
+        "expected_full_shapes": full_shapes,
+        "gpu_tail_tokens": tail,
+        "categories": {},
+    }
 
     for category, layer_key, compiled_key in (
         ("mlp", "mlp_layers", "compiled_mlp_layers"),
@@ -891,7 +986,7 @@ def _log_ane_benchmark_trace(
         logger.info(
             "[benchmark-ane-profile] pp=%d category=%s operations=%d "
             "configured_layers=%d compiled_layers=%s expected_operations=%d "
-            "observed_shapes=%.3f input_ready_ms_per_op=%.3f "
+            "observed_ane_tiles_per_layer=%.3f input_ready_ms_per_op=%.3f "
             "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
             "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
             "gap_before_ms_per_op=%.3f ane0_duty=%.4f ane1_duty=%.4f",
@@ -919,6 +1014,16 @@ def _log_ane_benchmark_trace(
                 else 0.0
             ),
         )
+
+        summary["categories"][category] = {
+            "operations": operations,
+            "expected_operations": expected_operations,
+            "observed_shapes": observed_shapes,
+            "configured_layers": configured_layers,
+            "compiled_layers": compiled_layers,
+        }
+
+    return summary
 
 
 async def _run_batch_test(
@@ -1662,7 +1767,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Generate prompts for all needed lengths
         tokenizer = engine.tokenizer
         prompts: dict[int, list[int]] = {}
-        for pp_len in request.prompt_lengths:
+        single_prompt_lengths = _single_prompt_lengths(request)
+        for pp_len in single_prompt_lengths:
             prompts[pp_len] = _generate_prompt(
                 tokenizer,
                 pp_len,
@@ -1798,19 +1904,32 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             ane_trace_config is not None,
             ane_trace_config,
         )
-        scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+        configured_scheduler = getattr(engine_pool, "_scheduler_config", None)
+        runtime_scheduler = getattr(
+            getattr(getattr(engine, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        effective_scheduler = getattr(runtime_scheduler, "config", None)
         logger.info(
-            "[benchmark-scheduler-config] prefill_step_size=%s "
-            "chunked_prefill=%s speed_priority=%s paged_cache_block_size=%s "
-            "max_num_batched_tokens=%s",
-            getattr(scheduler_config, "prefill_step_size", None),
-            getattr(scheduler_config, "chunked_prefill", None),
-            getattr(scheduler_config, "prefill_speed_priority", None),
-            getattr(scheduler_config, "paged_cache_block_size", None),
-            getattr(scheduler_config, "max_num_batched_tokens", None),
+            "[benchmark-scheduler-config] configured_step=%s effective_step=%s "
+            "effective_qwen_floor=%s configured_block_size=%s "
+            "effective_block_size=%s boundary_cache_available=%s "
+            "configured_chunked_prefill=%s effective_chunked_prefill=%s "
+            "speed_priority=%s max_num_batched_tokens=%s",
+            getattr(configured_scheduler, "prefill_step_size", None),
+            getattr(effective_scheduler, "prefill_step_size", None),
+            getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
+            getattr(configured_scheduler, "paged_cache_block_size", None),
+            getattr(effective_scheduler, "paged_cache_block_size", None),
+            bool(getattr(runtime_scheduler, "block_aware_cache", None)),
+            getattr(configured_scheduler, "chunked_prefill", None),
+            getattr(effective_scheduler, "chunked_prefill", None),
+            getattr(effective_scheduler, "prefill_speed_priority", None),
+            getattr(effective_scheduler, "max_num_batched_tokens", None),
         )
 
-        for pp_len in request.prompt_lengths:
+        for pp_len in single_prompt_lengths:
             current_test += 1
             await _send_event(
                 run,
@@ -1939,6 +2058,22 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         )
 
+        # Aligned prompts intentionally use non-standard PP4097/8193/etc.
+        # Keep them local rather than mixing them into PP4096 leaderboard
+        # buckets or depending on the remote service accepting arbitrary PP.
+        if request.align_prompt_to_ane:
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "ane_aligned_prompt"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "ane_aligned_prompt",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
         # Upload results to omlx.ai (failures don't affect benchmark status)
         try:
             await _upload_to_omlx_ai(run, engine_pool)
@@ -2044,7 +2179,7 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
         )
 
         # Single request tests
-        for pp_len in request.prompt_lengths:
+        for pp_len in _single_prompt_lengths(request):
             current_test += 1
             await _send_event(
                 run,

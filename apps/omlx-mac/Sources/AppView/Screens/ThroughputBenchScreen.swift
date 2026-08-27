@@ -64,6 +64,7 @@ struct ThroughputBenchScreen: View {
                 selectedModelId: $vm.selectedModelId,
                 contextProfile: $vm.contextProfile,
                 warmupMode: $vm.warmupMode,
+                alignPromptToAne: $vm.alignPromptToAne,
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
@@ -161,6 +162,7 @@ private struct ConfigurationSection: View {
     @Binding var selectedModelId: String
     @Binding var contextProfile: BenchmarkContextProfile
     @Binding var warmupMode: BenchmarkWarmupMode
+    @Binding var alignPromptToAne: Bool
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
@@ -232,6 +234,18 @@ private struct ConfigurationSection: View {
                 ])
                 .frame(width: 260)
                 .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.ane_alignment.label",
+                              defaultValue: "ANE-aligned prompts",
+                              comment: "Row label for aligned throughput benchmark prompts"),
+                sublabel: String(localized: "bench.throughput.row.ane_alignment.sub",
+                                 defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
+                                 comment: "Explanation of the ANE-aligned throughput benchmark option")) {
+                Toggle("", isOn: $alignPromptToAne)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(running)
             }
 
             FreeRow {

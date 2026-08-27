@@ -1245,6 +1245,42 @@ class TestBatchGeneratorDispatch:
 
         assert GenerationBatch.next(batch) is sentinel
 
+    def test_patched_next_counts_parked_standard_tokens(self, monkeypatch):
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        matcher_state = object()
+        batch = SimpleNamespace(
+            uids=[7],
+            _omlx_mtp_park_state=batch_generator._MtpParkState(
+                uid=7,
+                tokens_remaining=2,
+            ),
+            _step=lambda: ([42], [None]),
+            _num_tokens=[0],
+            max_tokens=[10],
+            state_machines=[
+                SimpleNamespace(
+                    match=lambda state, _token: (state, None, state)
+                )
+            ],
+            _matcher_states=[matcher_state],
+            Response=lambda **kwargs: kwargs,
+            extract_cache=lambda _idx: [],
+            tokens=[[]],
+        )
+        monkeypatch.setattr(
+            batch_generator, "_is_mtp_batch_eligible", lambda _: False
+        )
+        monkeypatch.setattr(batch_generator, "_is_mtp_eligible", lambda _: False)
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+
+        GenerationBatch.next(batch)
+        assert batch._omlx_mtp_park_state.tokens_remaining == 1
+        GenerationBatch.next(batch)
+        assert batch._omlx_mtp_park_state.tokens_remaining == 0
+
     def _make_handoff_batch(self, monkeypatch, *, queue_entries, next_main=None):
         """Fake singleton batch for _handoff_mtp_for_late_join tests.
 
@@ -1320,7 +1356,7 @@ class TestBatchGeneratorDispatch:
         assert old_cache.rollback_state is None
         assert old_cache._mtp_draft_stash is None
         assert not hasattr(batch, "_omlx_mtp_state")
-        assert not hasattr(batch, "_omlx_mtp_parked_uid")
+        assert not hasattr(batch, "_omlx_mtp_park_state")
         assert not hasattr(batch, "_omlx_mtp_tax_probe")
 
     def test_late_join_handoff_queue_empty_feeds_next_main_without_parking(
@@ -1341,7 +1377,7 @@ class TestBatchGeneratorDispatch:
         assert batch.prompt_cache[0].rollback_state is None
         assert batch.prompt_cache[0]._mtp_draft_stash is None
         assert not hasattr(batch, "_omlx_mtp_state")
-        assert not hasattr(batch, "_omlx_mtp_parked_uid")
+        assert not hasattr(batch, "_omlx_mtp_park_state")
         assert not hasattr(batch, "_omlx_mtp_tax_probe")
 
     def test_late_join_handoff_declines_deep_queue(self, monkeypatch):
@@ -1376,7 +1412,7 @@ class TestBatchGeneratorDispatch:
         assert batch._omlx_mtp_state is state
         assert batch._next_tokens.tolist() == [999]
 
-    def test_park_still_sets_parked_uid_after_refactor(self, monkeypatch):
+    def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
         import mlx.core as mx
 
         bg, batch, state, backbone_calls = self._make_handoff_batch(
@@ -1387,9 +1423,29 @@ class TestBatchGeneratorDispatch:
 
         assert bg._park_mtp_to_standard(batch, state) is True
         assert backbone_calls == [1]
-        assert batch._omlx_mtp_parked_uid == 7
+        assert batch._omlx_mtp_park_state.uid == 7
+        assert batch._omlx_mtp_park_state.tokens_remaining == 128
         assert batch._next_tokens.tolist() == [5]
         assert not hasattr(batch, "_omlx_mtp_state")
+
+    def test_failed_reentry_probe_doubles_cooldown(self, monkeypatch):
+        import mlx.core as mx
+
+        bg, batch, state, _ = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+        assert bg._park_mtp_to_standard(batch, state) is True
+
+        retry = bg._MtpState(
+            uid=7,
+            next_main=mx.array([7], dtype=mx.uint32),
+            reentry_probe=True,
+        )
+        batch._omlx_mtp_state = retry
+        assert bg._park_mtp_to_standard(batch, retry) is True
+        assert batch._omlx_mtp_park_state.tokens_remaining == 256
 
     def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
@@ -2454,13 +2510,11 @@ class TestRotatingCacheMtpUndo:
         assert cache.offset == 3
 
 
-class TestParkedScopePerSequence:
-    """The depth-0 hand-off must park exactly one sequence, not the batch.
+class TestReversiblePerformancePark:
+    """Performance parking must be scoped and reversible for one sequence.
 
-    GenerationBatch objects are reused across requests through extend()
-    merges, so the parked marker is keyed by uid: it blocks re-activation
-    only while that uid is still in the batch, and a later request that
-    inherits the same batch object gets MTP normally.
+    GenerationBatch objects are reused across requests through extend() merges,
+    so the cooldown is keyed by uid and must not leak to a later request.
     """
 
     def _fake_batch(self, uids):
@@ -2475,16 +2529,138 @@ class TestParkedScopePerSequence:
             logits_processors=None,
         )
 
-    def test_parked_uid_blocks_only_that_sequence(self):
-        from omlx.patches.mlx_lm_mtp.batch_generator import _mtp_common_eligible
+    def test_cooldown_blocks_then_releases_same_uid(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
 
         gb = self._fake_batch([7])
-        assert _mtp_common_eligible(gb)
-        gb._omlx_mtp_parked_uid = 7
-        assert not _mtp_common_eligible(gb)
+        assert batch_generator._mtp_common_eligible(gb)
+        park = batch_generator._MtpParkState(uid=7, tokens_remaining=2)
+        gb._omlx_mtp_park_state = park
+        assert not batch_generator._mtp_common_eligible(gb)
+        batch_generator._record_parked_standard_step(gb)
+        assert not batch_generator._mtp_common_eligible(gb)
+        batch_generator._record_parked_standard_step(gb)
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        assert batch_generator._mtp_common_eligible(gb)
+
+    def test_cooldown_does_not_leak_to_reused_batch(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(uid=7)
         # The parked request finished; a new request reuses the batch object.
         gb.uids = [8]
-        assert _mtp_common_eligible(gb)
+        assert batch_generator._mtp_common_eligible(gb)
+        assert not hasattr(gb, "_omlx_mtp_park_state")
+
+    def test_failed_probe_uses_bounded_exponential_backoff(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        park = batch_generator._MtpParkState(uid=7)
+        expected = [256, 512, 1024, 2048, 4096, 4096]
+        actual = []
+        for _ in expected:
+            park.restart_after_failed_probe()
+            actual.append(park.tokens_remaining)
+        assert actual == expected
+
+    def test_active_probe_stays_eligible_during_prefill_contention(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+        gb._omlx_mtp_state = batch_generator._MtpState(
+            uid=7,
+            reentry_probe=True,
+        )
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: True)
+        assert batch_generator._mtp_common_eligible(gb)
+
+    def test_due_probe_still_requires_singleton_batch(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7, 8])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=1,
+        )
+        batch_generator._record_parked_standard_step(gb)
+        assert gb._omlx_mtp_park_state.tokens_remaining == 0
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        assert not batch_generator._mtp_common_eligible(gb)
+
+    def test_due_cooldown_marks_new_state_as_reentry_probe(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        monkeypatch.setattr(
+            batch_generator, "_set_singleton_mrope_delta", lambda _: None
+        )
+
+        def fake_post_init(batch):
+            batch._omlx_mtp_state = batch_generator._MtpState(uid=7)
+
+        monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
+
+        state = batch_generator._prepare_mtp_state_for_next(gb)
+        assert state is not None
+        assert state.reentry_probe is True
+
+    def test_existing_controller_accepts_winning_reentry_probe(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        controller = batch_generator._DepthController(3)
+        controller._warmup = []
+        controller.exit_streak = 0
+        state = batch_generator._MtpState(
+            uid=7,
+            controller=controller,
+            reentry_probe=True,
+        )
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+
+        assert batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is False
+        assert not hasattr(gb, "_omlx_mtp_park_state")
+
+    def test_losing_reentry_probe_keeps_cooldown_state(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        controller = batch_generator._DepthController(3)
+        controller._warmup = []
+        controller.exit_streak = 1
+        state = batch_generator._MtpState(
+            uid=7,
+            controller=controller,
+            reentry_probe=True,
+        )
+        gb = self._fake_batch([7])
+        park = batch_generator._MtpParkState(uid=7, tokens_remaining=0)
+        gb._omlx_mtp_park_state = park
+
+        assert not batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is True
+        assert gb._omlx_mtp_park_state is park
 
     def test_tax_probe_discarded_when_batch_gains_rows(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (

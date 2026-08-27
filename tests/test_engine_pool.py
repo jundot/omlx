@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import (
+    EngineEntry,
+    EnginePool,
+    _qwen35_cpu_share_estimated_bytes,
+)
 from omlx.exceptions import (
     InsufficientMemoryError,
     ModelBusyError,
@@ -498,6 +502,176 @@ class TestEngineEntry:
         assert entry.model_type == "embedding"
         assert entry.engine_type == "embedding"
         assert entry.is_pinned is True
+
+
+class TestQwenCpuShareMemoryEstimate:
+    @staticmethod
+    def _write_config(path):
+        path.mkdir()
+        (path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5_text",
+                        "hidden_size": 256,
+                        "intermediate_size": 512,
+                        "num_hidden_layers": 4,
+                        "layer_types": [
+                            "linear_attention",
+                            "full_attention",
+                            "linear_attention",
+                            "linear_attention",
+                        ],
+                        "linear_num_key_heads": 1,
+                        "linear_key_head_dim": 64,
+                        "linear_num_value_heads": 2,
+                        "linear_value_head_dim": 64,
+                    },
+                }
+            )
+        )
+
+    def test_estimate_covers_gate_down_suffix_and_gdn_materialization(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_max_layers=3,
+            qwen35_ane_prefill_gdn=True,
+            qwen35_ane_prefill_gdn_max_layers=2,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.25,
+            qwen35_ane_prefill_cpu_down_fraction=0.25,
+            qwen35_ane_prefill_cpu_gdn_fraction=0.25,
+        )
+
+        estimated = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+
+        gate = 3 * 2 * 128 * 256 * 2
+        down = int(3 * ((64 * 512 * 2) + (192 * 512 * 1.0625)))
+        gdn = 2 * 64 * 256 * 2
+        assert estimated == int((gate + down + gdn) * 1.5)
+
+    def test_runtime_estimate_feeds_resident_memory_accounting(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_fraction=0.25,
+        )
+        entry = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        projected = pool._entry_runtime_resident_size(entry, settings)
+        extra = _qwen35_cpu_share_estimated_bytes(str(model), settings)
+
+        assert extra is not None and extra > 0
+        assert projected == entry.estimated_size + extra
+
+    @pytest.mark.asyncio
+    async def test_cpu_share_projection_participates_in_preload_admission(
+        self, tmp_path
+    ):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        self._write_config(model)
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+            qwen35_ane_prefill_cpu_down_fraction=0.25,
+        )
+        pool = _make_pool(ceiling=100_000)
+        pool._entries["qwen"] = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+
+        with (
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            pytest.raises(ModelTooLargeError) as exc_info,
+        ):
+            await pool.get_engine("qwen", runtime_settings=settings)
+
+        assert exc_info.value.model_size > 100_000
+
+    def test_enabled_cpu_share_fails_closed_when_geometry_is_unreadable(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        settings = ModelSettings(
+            qwen35_ane_prefill_enabled=True,
+            qwen35_ane_prefill_cpu_enabled=True,
+        )
+        entry = EngineEntry(
+            model_id="qwen",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1000,
+        )
+        pool = _make_pool()
+
+        assert pool._entry_runtime_resident_size(entry, settings) == 2000
+
+    def test_qwen4_ple_offload_reduces_resident_projection(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        settings = ModelSettings(qwen4_ple_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=1000,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._entries[entry.model_id] = entry
+
+        with patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(entry, settings)
+            effective = pool._effective_qwen4_model_settings(entry, settings)
+            signature = dict(pool._engine_runtime_signature("qwen4", settings))
+
+        assert projected == 400
+        assert settings.qwen4_ple_ssd_offload is False
+        assert effective.qwen4_ple_ssd_offload is True
+        assert signature["qwen4_ple_ssd_offload"] == "True"
 
 
 class TestApplySettingsOverrides:
@@ -2035,6 +2209,137 @@ class TestEnginePoolPrefillEviction:
         assert admitted is False
         # Reclaim was attempted exactly once, then plain rejection.
         scheduler._reclaim_prefill_headroom.assert_called_once()
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_releases_ane_banks_when_reclaim_is_not_enough(self):
+        """No idle victim and the pooled reclaim frees nothing, but the
+        requesting model carries ANE prefill banks -> shed them on the
+        engine thread (latching GPU fallback), then admit."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # 45GB resident against a 40GB target with a 10GB transient: the
+        # pooled reclaim frees nothing, then shedding the banks drops the
+        # footprint to 29GB and 29 + 10 fits under the cap.
+        phys = [45 * gb]
+        scheduler = self._reclaim_scheduler(lambda: None)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="adaptive_prefill_throttle",
+        )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] = 29 * gb
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        # The ladder ran in order: reclaim first, then the bank release on
+        # the requesting model itself; no model was unloaded.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
+        """A long prompt refills the buffer cache continuously, so the
+        pooled reclaim can 'succeed' marginally on every pass and starve
+        the durable rung. The second pass for the same request must go
+        straight to the bank release instead of reclaiming again first."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        phys = [45 * gb]
+
+        def reclaim():
+            phys[0] = 38 * gb  # marginal: 38 + 10 fits the 49GB target
+
+        scheduler = self._reclaim_scheduler(reclaim)
+
+        def make_req():
+            return PrefillEvictionRequest(
+                request_id="req-long",
+                model_id="target",
+                current_bytes=phys[0],
+                target_cap_bytes=49 * gb,
+                predicted_transient_bytes=10 * gb,
+                requested_tokens=2048,
+                reason="adaptive_prefill_throttle",
+            )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] -= 13 * gb  # the banks
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 20 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                # Pass 1: the marginal reclaim satisfies the target check.
+                first = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+                # KV growth brings the pressure back on the same request.
+                phys[0] = 45 * gb
+                second = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+
+        assert first is True and second is True
+        # One reclaim (pass 1 only); pass 2 escalated straight to release.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio

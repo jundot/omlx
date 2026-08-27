@@ -40,6 +40,9 @@ class CacheType(Enum):
     BATCH_POOLING_CACHE = "BatchPoolingCache"
     MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
     MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
+    QWEN4_QSA_KVCACHE = "QSAKVCache"
+    QWEN4_QSA_QUANTIZED_KVCACHE = "QSAQuantizedKVCache"
+    QWEN4_BATCH_QSA_KVCACHE = "BatchQSAKVCache"
 
 
 @dataclass
@@ -1417,6 +1420,298 @@ class MiniMaxM3BatchKVCacheHandler(_MiniMaxM3CacheHandlerBase):
                 state.get("offset"),
                 state.get("left_padding"),
                 state.get("index_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+def _serialize_qsa_positions(position_ids: Any) -> Any:
+    """Normalize text/MRoPE positions to a fixed ``[B, C, S]`` layout."""
+    if position_ids is None or not hasattr(position_ids, "ndim"):
+        return position_ids
+    if position_ids.ndim == 2:
+        return position_ids[:, None, :]
+    if position_ids.ndim == 3:
+        return position_ids.transpose(1, 0, 2)
+    raise ValueError(
+        "QSA position IDs must be [B, S] or [3, B, S], got " f"{position_ids.shape}."
+    )
+
+
+def _deserialize_qsa_positions(position_ids: Any) -> Any:
+    """Restore the model-facing text/MRoPE position layout."""
+    if position_ids is None or not hasattr(position_ids, "ndim"):
+        return position_ids
+    if position_ids.ndim != 3:
+        raise ValueError(
+            "Serialized QSA position IDs must be [B, C, S], got "
+            f"{position_ids.shape}."
+        )
+    if position_ids.shape[1] == 1:
+        return position_ids[:, 0, :]
+    return position_ids.transpose(1, 0, 2)
+
+
+class Qwen4QSAKVCacheHandler(CacheTypeHandler):
+    """Handler for Qwen4 QSA caches with raw index keys and positions."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_QSA_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return True
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("index_keys", 1, True),
+            CacheStateAxisInfo("index_position_ids", 2, True),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        keys, values, index_keys, position_ids = cache_obj.state
+        return (
+            keys,
+            values,
+            index_keys,
+            _serialize_qsa_positions(position_ids),
+        )
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        elements = self.serialize_state(cache_obj)
+        return {
+            "keys": elements[0],
+            "values": elements[1],
+            "index_keys": elements[2],
+            "index_position_ids": elements[3],
+            "states": elements,
+            "offset": getattr(cache_obj, "offset", 0),
+            "cache_type": self.cache_type.value,
+        }
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        return int(keys.shape[2]) if keys is not None else 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
+            )
+        seq_len = self.get_state_seq_len_from_tuple(tuple(elements))
+        actual_end = min(end_idx, seq_len)
+        if seq_len <= 0 or start_idx >= actual_end:
+            return None
+        sliced = []
+        for info, element in zip(self.get_state_axis_info(), elements):
+            if element is None:
+                sliced.append(None)
+                continue
+            slices = [slice(None)] * element.ndim
+            slices[info.sequence_axis] = slice(start_idx, actual_end)
+            sliced.append(element[tuple(slices)])
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), sliced)
+            },
+            "states": tuple(sliced),
+            "cache_type": self.cache_type.value,
+        }
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+        grouped: list[list[Any]] = [[] for _ in self.get_state_axis_info()]
+        for state in states:
+            elements = state.get("states")
+            if elements is None:
+                elements = tuple(
+                    state.get(info.name) for info in self.get_state_axis_info()
+                )
+            for index, element in enumerate(elements):
+                if element is not None:
+                    grouped[index].append(element)
+        concatenated = []
+        for info, elements in zip(self.get_state_axis_info(), grouped):
+            concatenated.append(
+                mx.concatenate(elements, axis=info.sequence_axis) if elements else None
+            )
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), concatenated)
+            },
+            "states": tuple(concatenated),
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        del meta_state
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Qwen4 QSAKVCache unavailable: %s", exc)
+            return None
+
+        padded = tuple(elements) + (None,) * max(0, 4 - len(elements))
+        keys, values, index_keys, position_ids = padded[:4]
+        cache = QSAKVCache()
+        cache.state = (
+            keys,
+            values,
+            index_keys,
+            _deserialize_qsa_positions(position_ids),
+        )
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+class Qwen4QSAQuantizedKVCacheHandler(Qwen4QSAKVCacheHandler):
+    """Store Qwen4 quantized QSA caches as dense APC-compatible blocks."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_QSA_QUANTIZED_KVCACHE
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        keys, values = cache_obj.dequantize_for_apc()
+        return (
+            keys,
+            values,
+            cache_obj.index_keys,
+            _serialize_qsa_positions(cache_obj.index_position_ids),
+        )
+
+
+class Qwen4BatchQSAKVCacheHandler(CacheTypeHandler):
+    """Full-state handler for batched Qwen4 QSA caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_BATCH_QSA_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return False
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("offset", None, False),
+            CacheStateAxisInfo("left_padding", None, False),
+            CacheStateAxisInfo("index_keys", 1, False),
+            CacheStateAxisInfo("index_position_ids", 2, False),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_keys, position_ids = cache_obj.state
+        keys, values, offset, left_padding = kv_state
+        return (
+            keys,
+            values,
+            offset,
+            left_padding,
+            index_keys,
+            _serialize_qsa_positions(position_ids),
+        )
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        elements = self.serialize_state(cache_obj)
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), elements)
+            },
+            "states": elements,
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        return int(keys.shape[2]) if keys is not None else 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        del start_idx, end_idx
+        return {**state, "is_full_state": True}
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        return states[-1] if states else {}
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        del meta_state
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Qwen4 BatchQSAKVCache unavailable: %s", exc)
+            return None
+
+        padded = tuple(elements) + (None,) * max(0, 6 - len(elements))
+        keys, values, offset, left_padding, index_keys, position_ids = padded[:6]
+        left_padding_arg = left_padding if left_padding is not None else [0]
+        cache = BatchQSAKVCache(left_padding_arg)
+        cache.state = (
+            (keys, values, offset, left_padding_arg),
+            index_keys,
+            _deserialize_qsa_positions(position_ids),
+        )
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
             )
         return self.deserialize_state(tuple(elements), meta_state)
 

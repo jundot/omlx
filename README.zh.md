@@ -90,7 +90,7 @@ pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
 OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4）。
+需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4/M5）。
 
 ## 快速开始
 

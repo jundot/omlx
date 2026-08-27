@@ -132,3 +132,185 @@ def test_bootstrap_authorizes_only_the_pinned_controller_address(
         'from="10.42.0.10",restrict '
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller\n"
     )
+
+
+def test_reenrollment_moves_the_controller_key_source_restriction(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cuda_worker_bootstrap.os, "chown", lambda *_args: None)
+    public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller"
+
+    cuda_worker_bootstrap._install_controller_key(
+        public_key,
+        controller_ip="10.42.0.10",
+        home=tmp_path,
+        uid=1000,
+        gid=1000,
+    )
+    authorized_keys = tmp_path / ".ssh" / "authorized_keys"
+    authorized_keys.write_text(
+        authorized_keys.read_text()
+        + "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAunrelated operator\n"
+    )
+    cuda_worker_bootstrap._install_controller_key(
+        public_key,
+        controller_ip="10.42.0.11",
+        home=tmp_path,
+        uid=1000,
+        gid=1000,
+    )
+
+    authorized = authorized_keys.read_text()
+    assert authorized == (
+        'from="10.42.0.11",restrict '
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller\n"
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAunrelated operator\n"
+    )
+
+
+def test_bootstrap_refuses_a_symlinked_authorized_keys(monkeypatch, tmp_path):
+    monkeypatch.setattr(cuda_worker_bootstrap.os, "chown", lambda *_args: None)
+    target = tmp_path / "unrelated"
+    target.write_text("must stay unchanged\n")
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "authorized_keys").symlink_to(target)
+
+    with pytest.raises(cuda_worker_bootstrap.BootstrapError, match="symbolic link"):
+        cuda_worker_bootstrap._install_controller_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller",
+            controller_ip="10.42.0.10",
+            home=tmp_path,
+            uid=1000,
+            gid=1000,
+        )
+
+    assert target.read_text() == "must stay unchanged\n"
+
+
+def test_bootstrap_refuses_a_symlinked_ssh_directory(tmp_path):
+    target = tmp_path / "outside-ssh"
+    target.mkdir()
+    authorized_keys = target / "authorized_keys"
+    authorized_keys.write_text("must stay unchanged\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".ssh").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(cuda_worker_bootstrap.BootstrapError, match="SSH directory"):
+        cuda_worker_bootstrap._install_controller_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAworker controller",
+            controller_ip="10.42.0.10",
+            home=home,
+            uid=1000,
+            gid=1000,
+        )
+
+    assert authorized_keys.read_text() == "must stay unchanged\n"
+
+
+def test_bootstrap_claims_before_slow_system_provisioning(monkeypatch, tmp_path):
+    events = []
+    source = b"worker-source"
+    source_digest = hashlib.sha256(source).hexdigest()
+    fingerprint = "SHA256:" + "A" * 43
+    controller_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAcontroller"
+
+    monkeypatch.setattr(cuda_worker_bootstrap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_controller_url",
+        lambda _value: ("http://10.42.0.10:8000", "10.42.0.10", 8000),
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_ssh_user",
+        lambda _value: ("worker", tmp_path, 1000, 1000),
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_ensure_system_packages",
+        lambda: events.append("packages"),
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap.socket, "gethostname", lambda: "worker"
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_local_address",
+        lambda *_args: "10.42.0.21",
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_machine_id",
+        lambda _value: "machine",
+    )
+
+    def request(url, _payload, *, bearer, timeout=30):
+        del bearer, timeout
+        if url.endswith("/claim"):
+            events.append("claim")
+            return {
+                "session_token": "session-token",
+                "source_digest": source_digest,
+                "controller_public_key": controller_key,
+                "controller_key_fingerprint": fingerprint,
+            }
+        events.append("complete")
+        return {"status": "joined"}
+
+    monkeypatch.setattr(cuda_worker_bootstrap, "_request_json", request)
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_ssh_fingerprint",
+        lambda _value: fingerprint,
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_install_controller_key",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(cuda_worker_bootstrap, "_start_sshd", lambda: None)
+
+    def download(_url, target, *, bearer):
+        del bearer
+        target.write_bytes(source)
+
+    monkeypatch.setattr(cuda_worker_bootstrap, "_download", download)
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_install_worker_source",
+        lambda *_args: tmp_path / "source",
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_ensure_worker_venv",
+        lambda _source: tmp_path / "venv" / "bin" / "python",
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_host_public_key",
+        lambda: ("ssh-ed25519 worker", "SHA256:" + "B" * 43),
+    )
+    monkeypatch.setattr(
+        cuda_worker_bootstrap,
+        "_distribution_versions",
+        lambda _python: {},
+    )
+
+    assert (
+        cuda_worker_bootstrap.main(
+            [
+                "--controller",
+                "http://10.42.0.10:8000",
+                "--join-key",
+                "join-key",
+                "--controller-key-fingerprint",
+                fingerprint,
+                "--source-digest",
+                source_digest,
+            ]
+        )
+        == 0
+    )
+    assert events.index("claim") < events.index("packages")

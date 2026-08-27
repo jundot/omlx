@@ -53,6 +53,8 @@ class TestServerSettings:
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
         assert settings.distributed_inference_enabled is False
+        assert settings.max_audio_upload_size == "100MB"
+        assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
 
     def test_custom_values(self):
         """Test custom values."""
@@ -82,6 +84,7 @@ class TestServerSettings:
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
             "distributed_inference_enabled": False,
+            "max_audio_upload_size": "100MB",
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):
@@ -128,6 +131,25 @@ class TestServerSettings:
         settings = ServerSettings.from_dict({"auto_start_on_launch": False})
         assert settings.auto_start_on_launch is False
         assert settings.to_dict()["auto_start_on_launch"] is False
+
+    def test_from_dict_max_audio_upload_size(self):
+        """max_audio_upload_size round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"max_audio_upload_size": "500MB"})
+        assert settings.max_audio_upload_size == "500MB"
+        assert settings.max_audio_upload_bytes() == 500 * 1024 * 1024
+        assert settings.to_dict()["max_audio_upload_size"] == "500MB"
+
+    def test_from_dict_max_audio_upload_size_default(self):
+        """A settings.json without max_audio_upload_size keeps the 100MB default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.max_audio_upload_size == "100MB"
+
+    def test_max_audio_upload_bytes_rejects_non_positive(self):
+        """0MB / negative sizes parse as integers but are not usable limits."""
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_audio_upload_size="0MB").max_audio_upload_bytes()
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_audio_upload_size="-1MB").max_audio_upload_bytes()
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -397,6 +419,7 @@ class TestCacheSettings:
         assert settings.get_gdn_ssd_split_enabled() is True
         assert settings.gdn_ssd_pending_max_size == "512MB"
         assert settings.gdn_sidecar_state_dtype == "fp32"
+        assert settings.ane_compile_cache is False
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -441,6 +464,8 @@ class TestCacheSettings:
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
+            "hot_cache_write_through": False,
+            "ane_compile_cache": False,
             "initial_cache_blocks": 256,
         }
 
@@ -745,6 +770,31 @@ class TestMCPSettings:
 
         restored = GlobalSettings.load(base_path=tmp_path)
         assert restored.mcp.expose_tools is True
+
+    def test_global_settings_save_is_atomic(self, tmp_path):
+        """save() must never leave a temp file or a torn settings.json."""
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+
+        settings_file = tmp_path / "settings.json"
+        assert settings_file.exists()
+        json.loads(settings_file.read_text())  # parses cleanly
+        assert not list(tmp_path.glob("settings.json*.tmp"))
+        if os.name == "posix":
+            assert (settings_file.stat().st_mode & 0o777) == 0o600
+
+    def test_global_settings_corrupt_file_is_moved_aside(self, tmp_path):
+        """A corrupt settings.json is preserved as evidence, not silently eaten."""
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"server": {"port": 9999}}garbage-tail')
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+
+        assert restored.server.port == 8000  # defaults, not the torn file
+        assert not settings_file.exists()
+        backups = list(tmp_path.glob("settings.json.corrupt-*"))
+        assert len(backups) == 1
+        assert "garbage-tail" in backups[0].read_text()
 
 
 class TestHuggingFaceSettings:
@@ -1406,6 +1456,25 @@ class TestGlobalSettings:
             errors = settings.validate()
             assert errors == []
 
+    def test_validate_invalid_max_audio_upload_size(self):
+        """Validation rejects unparseable or non-positive audio upload limits."""
+        settings = GlobalSettings()
+        settings.server.max_audio_upload_size = "bogus"
+        errors = settings.validate()
+        assert any("max_audio_upload_size" in e for e in errors)
+
+        settings = GlobalSettings()
+        settings.server.max_audio_upload_size = "0MB"
+        errors = settings.validate()
+        assert any("max_audio_upload_size" in e for e in errors)
+
+    def test_validate_valid_max_audio_upload_size(self):
+        """Validation accepts human-readable audio upload sizes."""
+        settings = GlobalSettings()
+        settings.server.max_audio_upload_size = "250MB"
+        errors = settings.validate()
+        assert not any("max_audio_upload_size" in e for e in errors)
+
     def test_validate_memory_guard_tier_valid(self):
         """Test validation accepts each known tier."""
         for tier in ("safe", "balanced", "aggressive"):
@@ -1615,6 +1684,30 @@ class TestGlobalSettings:
                 assert settings.server.host == "0.0.0.0"
                 assert settings.server.port == 9999
                 assert settings.server.log_level == "debug"
+
+    def test_env_override_max_audio_upload_size(self):
+        """OMLX_MAX_AUDIO_UPLOAD_SIZE overrides the default 100MB cap."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_MAX_AUDIO_UPLOAD_SIZE": "250MB"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.server.max_audio_upload_size == "250MB"
+                assert settings.server.max_audio_upload_bytes() == 250 * 1024 * 1024
+
+    def test_cli_override_max_audio_upload_size(self):
+        """--max-audio-upload-size is applied via CLI overrides."""
+        from argparse import Namespace
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings.load(
+                base_path=tmpdir,
+                cli_args=Namespace(max_audio_upload_size="500MB"),
+            )
+            assert settings.server.max_audio_upload_size == "500MB"
+            assert settings.server.max_audio_upload_bytes() == 500 * 1024 * 1024
 
     def test_env_override_model(self):
         """Test environment variable override for model settings."""

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fuse Qwen3.5/3.6 MoE routed gate/up projections into one gather_qmm.
+"""Fuse supported MoE routed gate/up projections into one gather_qmm.
 
 At single-token decode the routed-expert path runs three tiny
 ``gather_qmm`` launches per MoE layer (gate, up, down). Affine
@@ -45,10 +45,17 @@ logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
 
-# Loaded model classes whose module path marks a supported SwitchGLU family
-# (mlx_lm qwen3_5 / qwen3_5_moe, the omlx single-checkpoint MTP wrapper, and
-# the vendored laguna module).
-_FAMILY_TOKENS = ("qwen3_5", "qwen3_6", "qwen35", "laguna")
+# Loaded model classes whose module path marks a supported SwitchGLU family:
+# mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
+# single-checkpoint MTP wrapper, and the vendored Laguna module.
+_FAMILY_TOKENS = (
+    "qwen3_5",
+    "qwen3_6",
+    "qwen35",
+    "qwen4_exp",
+    "laguna",
+    "hy_v3",
+)
 
 
 def _is_supported_family(model: Any) -> bool:
@@ -188,7 +195,7 @@ def _ensure_call_patch() -> None:
 
 
 def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
-    """Fuse gate+up expert projections on a loaded Qwen3.5/3.6 MoE model.
+    """Fuse gate+up expert projections on a supported loaded MoE model.
 
     Returns the number of fused ``SwitchGLU`` instances (0 when disabled
     via ``OMLX_QWEN35_MOE_GATE_UP=0``, the model family is unsupported,
@@ -213,7 +220,7 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
         # ~2/3 of the expert bytes (#2304). Drain per fused layer to bound
         # the transient to a single layer's worth.
         _sync_and_clear_cache()
-    logger.info("Qwen MoE gate+up fusion applied: %d layers", len(targets))
+    logger.info("MoE gate+up fusion applied: %d layers", len(targets))
     return len(targets)
 
 

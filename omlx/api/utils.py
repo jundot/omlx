@@ -8,6 +8,7 @@ import json
 import re
 from typing import Any, List
 
+from ..exceptions import InvalidRequestError
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
@@ -239,6 +240,11 @@ def _extract_multimodal_content_list(content: list) -> list:
                             "input_audio": input_audio,
                         }
                     )
+            elif item_type in ("video_url", "input_video"):
+                raise InvalidRequestError(
+                    "Video input is not supported by oMLX.",
+                    field="messages",
+                )
     return parts
 
 

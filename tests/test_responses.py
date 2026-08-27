@@ -538,6 +538,126 @@ class TestConvertResponsesInput:
         assert messages[0]["reasoning_content"] == "thinking"
 
 
+IMAGE_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+
+class TestFunctionCallOutputMultimodal:
+    """Images in function_call_output lists route to VLM, not the prompt (#2989)."""
+
+    def _tool_round(self, outputs):
+        items = [InputItem(type="message", role="user", content="take screenshots")]
+        for i in range(len(outputs)):
+            items.append(
+                InputItem(
+                    type="function_call",
+                    call_id=f"call_{i}",
+                    name="screenshot",
+                    arguments="{}",
+                )
+            )
+        for i, output in enumerate(outputs):
+            items.append(
+                InputItem(
+                    type="function_call_output",
+                    call_id=f"call_{i}",
+                    output=output,
+                )
+            )
+        return items
+
+    def test_image_extracted_to_user_message(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output]), preserve_images=True
+        )
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
+        assert messages[2]["content"] == "screenshot result"
+        assert messages[3]["content"] == [
+            {"type": "input_image", "image_url": IMAGE_URI, "detail": "auto"}
+        ]
+
+    def test_parallel_outputs_keep_tool_messages_contiguous(self):
+        output = [
+            {"type": "input_text", "text": "shot"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(
+            self._tool_round([output, output]), preserve_images=True
+        )
+        # Images flush once after the tool run, never between tool messages
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
+        ]
+        assert len(messages[4]["content"]) == 2
+        for msg in messages[2:4]:
+            assert IMAGE_URI not in msg["content"]
+
+    def test_images_flush_before_next_tool_round(self):
+        items = self._tool_round(
+            [[{"type": "input_image", "detail": "auto", "image_url": IMAGE_URI}]]
+        )
+        items.extend(
+            [
+                InputItem(
+                    type="function_call",
+                    call_id="call_next",
+                    name="lookup",
+                    arguments="{}",
+                ),
+                InputItem(
+                    type="function_call_output",
+                    call_id="call_next",
+                    output="done",
+                ),
+            ]
+        )
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
+        assert [m["role"] for m in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert messages[3]["content"][0]["type"] == "input_image"
+        assert messages[5]["content"] == "done"
+
+    def test_placeholder_without_preserve_images(self):
+        output = [
+            {"type": "input_text", "text": "screenshot result"},
+            {"type": "input_image", "detail": "auto", "image_url": IMAGE_URI},
+        ]
+        messages = convert_responses_input_to_messages(self._tool_round([output]))
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[2]["content"] == "screenshot result\n(see attached image)"
+        assert IMAGE_URI not in json.dumps(messages)
+
+    def test_plain_json_list_falls_back_to_dumps(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[1, 2, 3]]), preserve_images=True
+        )
+        assert messages[2]["content"] == "[1, 2, 3]"
+        messages = convert_responses_input_to_messages(
+            self._tool_round([["a", "b"]]), preserve_images=True
+        )
+        assert messages[2]["content"] == '["a", "b"]'
+
+    def test_text_only_typed_list_extracted(self):
+        messages = convert_responses_input_to_messages(
+            self._tool_round([[{"type": "input_text", "text": "hello"}]]),
+            preserve_images=True,
+        )
+        assert messages[2]["content"] == "hello"
+
+
 # =============================================================================
 # Tool Conversion Tests
 # =============================================================================
@@ -605,17 +725,17 @@ class TestConvertResponsesTools:
 
 
 class TestInputItemOutputSerialization:
-    """InputItem should accept list/dict in output and serialize to JSON string."""
+    """InputItem should accept list/dict output; dict serializes, list survives."""
 
-    def test_list_output_serialized_to_json(self):
+    def test_list_output_preserved(self):
+        # Lists pass through so multimodal parts stay extractable (#2989)
         item = InputItem(
             type="function_call_output",
             call_id="call_123",
             output=[{"type": "input_image", "image_url": "data:image/jpeg;base64,abc"}],
         )
-        assert isinstance(item.output, str)
-        parsed = json.loads(item.output)
-        assert parsed[0]["type"] == "input_image"
+        assert isinstance(item.output, list)
+        assert item.output[0]["type"] == "input_image"
 
     def test_dict_output_serialized_to_json(self):
         item = InputItem(
@@ -718,6 +838,26 @@ class TestResponseObject:
         )
         assert len(resp.output) == 1
         assert resp.usage.total_tokens == 15
+
+    def test_incomplete_details_on_truncation(self):
+        # A max_output_tokens truncation must surface as status="incomplete"
+        # with incomplete_details.reason, so clients can distinguish an
+        # incomplete turn from a natural stop (the Responses API has no
+        # finish_reason field).
+        resp = ResponseObject(
+            model="test-model",
+            status="incomplete",
+            incomplete_details={"reason": "max_output_tokens"},
+        )
+        assert resp.status == "incomplete"
+        assert resp.incomplete_details == {"reason": "max_output_tokens"}
+        dumped = resp.model_dump(exclude_none=True)
+        assert dumped["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    def test_completed_response_omits_incomplete_details(self):
+        resp = ResponseObject(model="test-model")
+        dumped = resp.model_dump(exclude_none=True)
+        assert "incomplete_details" not in dumped
 
 
 # =============================================================================

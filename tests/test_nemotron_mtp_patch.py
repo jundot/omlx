@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -75,6 +77,32 @@ class TestApply:
         assert getattr(nh.NemotronHMamba2Mixer.__call__, "_omlx_nh_chain", False)
         assert getattr(nh.Model.mtp_forward, "_omlx_nh_chain", False)
         assert callable(getattr(nh.Model, "mtp_partial_rollback", None))
+
+    def test_reapply_rewraps_a_reinstalled_surface(self):
+        # A module reload or a monkeypatched teardown can put a non-chain
+        # mtp_forward back on the class while the one-shot class flag
+        # survives. apply() must heal that surface via the per-surface
+        # markers, not trust the flag (cross-module test ordering in CI hit
+        # exactly this).
+        def foreign(self, *args, **kwargs):
+            raise AssertionError("unwrapped mtp_forward must not be called")
+
+        foreign._omlx_nh_mtp = True  # base-shaped, not chain-wrapped
+        nh.Model.mtp_forward = foreign
+
+        assert nemotron_h_chain.apply()
+        assert getattr(nh.Model.mtp_forward, "_omlx_nh_chain", False)
+
+    def test_repeat_apply_is_silent(self, caplog):
+        with caplog.at_level(
+            logging.INFO, logger="omlx.patches.mlx_lm_mtp.nemotron_h_chain"
+        ):
+            assert nemotron_h_chain.apply()
+        assert not [
+            record
+            for record in caplog.records
+            if "chain patch applied" in record.message
+        ]
 
 
 class TestModelStamps:

@@ -124,8 +124,8 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
             "system_profiler": (0, NO_PEER_THUNDERBOLT, ""),
             "route": (
                 0,
-                "   route to: 192.168.100.197\n"
-                "destination: 192.168.100.197\n"
+                "   route to: 198.51.100.197\n"
+                "destination: 198.51.100.197\n"
                 "  interface: en7\n",
                 "",
             ),
@@ -133,7 +133,7 @@ def test_collect_status_distinguishes_enabled_from_linked(monkeypatch):
     )
 
     status = probe.collect_cluster_status(
-        route_to="192.168.100.197",
+        route_to="198.51.100.197",
         runner=runner,
         now=lambda: datetime(2026, 7, 26, 12, 0, tzinfo=UTC),
     )
@@ -202,6 +202,14 @@ def test_parse_invalid_thunderbolt_payload_returns_no_ports():
         stdout="{not-json",
     )
     assert probe.parse_thunderbolt_ports(result) == ()
+
+
+def test_collect_status_does_not_advertise_an_ssh_user():
+    # Dropped until a consumer lands: an unvalidated login-name string on the
+    # wire is exactly the shape the validate_ssh_target fix exists to keep out
+    # of ssh argv construction.
+    status = probe.collect_cluster_status()
+    assert "ssh_user" not in status.to_dict()["node"]
 
 
 def test_mlx_version_uses_core_module_version(monkeypatch):

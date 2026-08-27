@@ -381,6 +381,31 @@ def _warning_for(result: CommandResult, label: str) -> str | None:
     return f"{label} probe unavailable: {detail}"
 
 
+def _advertised_python_executable() -> str:
+    """The interpreter another Mac should run over SSH to reach this node.
+
+    ``sys.executable`` loses the environment a launcher (the packaged app or a
+    run-from-source script) assembled, so running it bare over SSH cannot import
+    oMLX. The worker shim published at server start re-creates that environment.
+    Advertise the shim only when it wraps THIS interpreter — a shim rewritten by
+    a different install must not be advertised.
+    """
+
+    from pathlib import Path
+
+    shim = Path.home() / ".omlx" / "bin" / "omlx-cluster-python"
+    try:
+        if (
+            shim.is_file()
+            and os.access(shim, os.X_OK)
+            and sys.executable in shim.read_text(encoding="utf-8")
+        ):
+            return str(shim)
+    except OSError:
+        pass
+    return sys.executable
+
+
 def collect_cluster_status(
     *,
     route_to: str | None = None,
@@ -573,7 +598,7 @@ def collect_cluster_status(
             macos_version=platform.mac_ver()[0] or "unknown",
             os_name=platform.system().lower() or "unknown",
             os_version=platform.release() or "unknown",
-            python_executable=sys.executable,
+            python_executable=_advertised_python_executable(),
         ),
         transport_state=transport_state,
         rdma=RDMACapability(
