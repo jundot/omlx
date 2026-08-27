@@ -6612,6 +6612,10 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+                        // Baseline for saveClaudeCodeSettings() to revert to on a
+                        // failed save — must be captured from the server response,
+                        // not from the optimistically-mutated live object.
+                        this._lastGoodClaudeCode = { ...this.globalSettings.claude_code };
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -8794,6 +8798,12 @@
             },
 
             async saveClaudeCodeSettings() {
+                // The caller has already applied its change optimistically
+                // (toggle flipped, select updated) before calling this, so on
+                // a rejected or failed save the control must be reverted to
+                // the last value the server actually confirmed — not to
+                // anything captured here, since by this point the live
+                // object already holds the new, unconfirmed value.
                 try {
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
@@ -8809,9 +8819,13 @@
                     });
                     if (!response.ok) {
                         console.error('Failed to save Claude Code settings');
+                        Object.assign(this.globalSettings.claude_code, this._lastGoodClaudeCode);
+                    } else {
+                        this._lastGoodClaudeCode = { ...this.globalSettings.claude_code };
                     }
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                    Object.assign(this.globalSettings.claude_code, this._lastGoodClaudeCode);
                 }
             },
 
