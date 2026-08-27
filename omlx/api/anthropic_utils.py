@@ -853,7 +853,9 @@ def _extract_tool_result_content(
                 continue
             item_dict = _content_block_to_dict(item)
             if item_dict is not None and item_dict.get("type") == "text":
-                text_parts.append(item_dict.get("text", ""))
+                text = item_dict.get("text", "")
+                if isinstance(text, str):
+                    text_parts.append(text)
         result_text = "\n".join(text_parts)
     elif isinstance(content, dict):
         if content.get("type") == "text":
