@@ -2883,6 +2883,46 @@ class TestClaudeCodeRouteIntegration:
         assert settings.claude_code.classifier_model_tier == "sonnet"
         settings.save.assert_called_once()
 
+    def test_update_global_settings_reverts_classifier_steering_on_validation_failure(
+        self,
+    ):
+        """A validation error must not leave steer_classifier_requests or
+        classifier_model_tier applied to the live settings object — mirrors
+        the existing embedding_batch_size revert-on-failure behavior."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        import pytest
+        from fastapi import HTTPException
+
+        from omlx.admin import routes
+
+        settings = MagicMock()
+        settings.claude_code.mode = "cloud"
+        settings.claude_code.steer_classifier_requests = False
+        settings.claude_code.classifier_model_tier = "haiku"
+        settings.validate.return_value = ["classifier_model_tier invalid"]
+        original = routes._get_global_settings
+        routes._get_global_settings = lambda: settings
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    routes.update_global_settings(
+                        request=routes.GlobalSettingsRequest(
+                            claude_code_steer_classifier_requests=True,
+                            claude_code_classifier_model_tier="sonoma",
+                        ),
+                        is_admin=True,
+                    )
+                )
+        finally:
+            routes._get_global_settings = original
+
+        assert exc_info.value.status_code == 400
+        assert settings.claude_code.steer_classifier_requests is False
+        assert settings.claude_code.classifier_model_tier == "haiku"
+        settings.save.assert_not_called()
+
 
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""

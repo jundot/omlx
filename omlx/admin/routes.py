@@ -3688,6 +3688,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    previous_steer_classifier_requests: bool | None = None
+    previous_classifier_model_tier: str | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -4321,11 +4323,15 @@ async def update_global_settings(
     # steer_classifier_requests / classifier_model_tier: like mode, these have
     # no null state — is-not-None is correct here, not model_fields_set.
     if request.claude_code_steer_classifier_requests is not None:
+        previous_steer_classifier_requests = (
+            global_settings.claude_code.steer_classifier_requests
+        )
         global_settings.claude_code.steer_classifier_requests = (
             request.claude_code_steer_classifier_requests
         )
         claude_code_changed = True
     if request.claude_code_classifier_model_tier is not None:
+        previous_classifier_model_tier = global_settings.claude_code.classifier_model_tier
         global_settings.claude_code.classifier_model_tier = (
             request.claude_code_classifier_model_tier
         )
@@ -4564,6 +4570,14 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_steer_classifier_requests is not None:
+            global_settings.claude_code.steer_classifier_requests = (
+                previous_steer_classifier_requests
+            )
+        if previous_classifier_model_tier is not None:
+            global_settings.claude_code.classifier_model_tier = (
+                previous_classifier_model_tier
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -4573,6 +4587,14 @@ async def update_global_settings(
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
+            )
+        if previous_steer_classifier_requests is not None:
+            global_settings.claude_code.steer_classifier_requests = (
+                previous_steer_classifier_requests
+            )
+        if previous_classifier_model_tier is not None:
+            global_settings.claude_code.classifier_model_tier = (
+                previous_classifier_model_tier
             )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
