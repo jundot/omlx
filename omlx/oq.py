@@ -3856,6 +3856,12 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_glm5_next_compat_patch()
+                if model_type == "qwen4_exp" or text_model_type == "qwen4_exp_text":
+                    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+                        apply_mlx_vlm_qwen4_exp_compat_patch,
+                    )
+
+                    apply_mlx_vlm_qwen4_exp_compat_patch()
             except Exception as patch_err:
                 logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
