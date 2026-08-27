@@ -298,6 +298,26 @@ class TestModelSettings:
         settings = ModelSettings()
         assert "vlm_mtp_draft_block_size" not in settings.to_dict()
 
+    def test_reasoning_parser_docs_do_not_use_invalid_qwen_example(self):
+        """model_settings.py:107/221 must not show the invalid "qwen" example
+        (#3) — "qwen" alone is not a real xgrammar builtin name, only
+        versioned variants like "qwen_3_5" are."""
+        import inspect
+
+        import omlx.model_settings as ms_module
+
+        class_doc = ModelSettings.__doc__ or ""
+        assert '"qwen"' not in class_doc
+
+        source = inspect.getsource(ms_module)
+        field_comment_line = next(
+            line
+            for line in source.splitlines()
+            if "xgrammar builtin name" in line
+        )
+        assert '"qwen"' not in field_comment_line
+        assert '"qwen_3' in field_comment_line or "qwen_3" in field_comment_line
+
 
 class TestModelSettingsManager:
     """Tests for ModelSettingsManager class."""

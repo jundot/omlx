@@ -7,7 +7,7 @@ Tests grammar correctness and measures performance across model families
 Prerequisites:
   - oMLX server running on OMLX_TEST_URL (default: http://127.0.0.1:8899)
   - Models loaded: Qwen3.5-4B-4bit, gemma-3-4b-it-qat-4bit, gpt-oss-20b-MXFP4-Q4
-  - reasoning_parser set via admin UI: qwen, (none), harmony respectively
+  - reasoning_parser set via admin UI: qwen_3_5, (none), harmony respectively
 
 Run:
   pytest tests/test_grammar_live.py -v -s

@@ -587,6 +587,74 @@ class TestCompileGrammarForRequest:
         assert exc_info.value.status_code == 400
         assert "bad schema" in exc_info.value.detail
 
+    @requires_xgrammar
+    def test_invalid_reasoning_parser_raises_distinguishable_400_for_structured_outputs(self):
+        """An unknown reasoning_parser (bad config) must read differently from
+        a generic grammar-compilation failure (#4) — the message should name
+        reasoning_parser, not just say "Grammar compilation error"."""
+        from fastapi import HTTPException
+
+        compiler = MagicMock()
+        engine = _make_engine(grammar_compiler=compiler)
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call(
+                engine,
+                structured_outputs={"json": {"type": "object"}},
+                reasoning_parser="qwen",
+            )
+        assert exc_info.value.status_code == 400
+        assert "reasoning_parser" in exc_info.value.detail
+        assert "qwen" in exc_info.value.detail
+
+    @requires_xgrammar
+    def test_invalid_reasoning_parser_logs_distinguishable_warning_for_response_format(
+        self, caplog
+    ):
+        """response_format degrades gracefully (established #1241 behavior),
+        but the log must say the reasoning_parser config is bad rather than a
+        generic 'grammar-constrained decoding is unavailable' (#4)."""
+        compiler = MagicMock()
+        engine = _make_engine(grammar_compiler=compiler)
+
+        with caplog.at_level("WARNING"):
+            result = self._call(
+                engine,
+                response_format={"type": "json_object"},
+                reasoning_parser="qwen",
+            )
+        assert result is None
+        assert any(
+            "reasoning_parser" in record.message and "qwen" in record.message
+            for record in caplog.records
+        )
+
+    @requires_xgrammar
+    def test_invalid_reasoning_parser_preserves_strict_distinction_in_log(
+        self, caplog
+    ):
+        """The InvalidReasoningParserError degrade path must go through the
+        shared _warn_response_format_not_enforced helper so a strict
+        json_schema request still gets the strict-specific wording (#1241),
+        not a bespoke message that drops that distinction."""
+        compiler = MagicMock()
+        engine = _make_engine(grammar_compiler=compiler)
+        strict_rf = {
+            "type": "json_schema",
+            "json_schema": {"name": "t", "strict": True, "schema": {}},
+        }
+
+        with caplog.at_level("WARNING"):
+            self._call(
+                engine,
+                response_format=strict_rf,
+                reasoning_parser="qwen",
+            )
+        assert any(
+            "strict" in record.message and "qwen" in record.message
+            for record in caplog.records
+        )
+
     def test_compilation_error_returns_none_for_response_format(self):
         """response_format compilation errors → graceful fallback to None."""
         compiler = MagicMock()

@@ -1800,9 +1800,9 @@ def _models_from_docstring(fn) -> list[str]:
     ]
 
 
-@router.get("/api/grammar/parsers")
-async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
-    """Return available reasoning parser names from xgrammar.
+def _reasoning_parser_registry() -> dict[str, list[str]] | None:
+    """Return ``{style: supported_model_names}`` for xgrammar's builtin
+    reasoning parsers, or ``None`` if the registry can't be determined.
 
     Supports both API generations:
 
@@ -1812,8 +1812,11 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     - **xgrammar 0.1.32–0.1.33** exposes the now-removed helper
       ``get_builtin_structural_tag_supported_models()``.
 
-    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
-    binding on macOS arm64), or has neither API available.
+    Returns ``None`` if xgrammar is missing, fails to load (e.g. broken
+    native binding on macOS arm64), or has neither API available. Shared by
+    :func:`list_grammar_parsers` (the admin UI dropdown) and
+    ``update_model_settings`` (write-time validation) so both check the same
+    source of truth (#4).
     """
     # Install the torch stub BEFORE any xgrammar import. If this lives
     # inside the first try-block, a failure on the 0.1.34+ path can leave
@@ -1831,10 +1834,10 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     try:
         from xgrammar.builtin_structural_tag import _structural_tag_registry
 
-        return [
-            {"value": style, "label": style, "models": _models_from_docstring(fn)}
+        return {
+            style: _models_from_docstring(fn)
             for style, fn in _structural_tag_registry.items()
-        ]
+        }
     except Exception as e:
         logger.debug("xgrammar 0.1.34+ registry unavailable: %s", e)
 
@@ -1842,14 +1845,26 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
     try:
         from xgrammar import get_builtin_structural_tag_supported_models
 
-        supported = get_builtin_structural_tag_supported_models()
-        return [
-            {"value": style, "label": style, "models": models}
-            for style, models in supported.items()
-        ]
+        return dict(get_builtin_structural_tag_supported_models())
     except Exception as e:
         logger.warning("xgrammar parser discovery unavailable: %s", e)
+        return None
+
+
+@router.get("/api/grammar/parsers")
+async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
+    """Return available reasoning parser names from xgrammar.
+
+    Returns ``[]`` if xgrammar is missing, fails to load (e.g. broken native
+    binding on macOS arm64), or has neither API available.
+    """
+    registry = _reasoning_parser_registry()
+    if registry is None:
         return []
+    return [
+        {"value": style, "label": style, "models": models}
+        for style, models in registry.items()
+    ]
 
 
 # =============================================================================
@@ -2204,6 +2219,319 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+def _validate_draft_model_path(
+    value: str, field_name: str, *, check_dflash_compat: bool = False
+) -> None:
+    """Reject an obviously-bad local path for a ``*_draft_model`` field.
+
+    ``value`` is either a local filesystem path or a Hugging Face repo id
+    (``lm_load_compat`` accepts both). Only an absolute path (after ``~``
+    expansion) is checked here — a repo id is never absolute, and confirming
+    a repo id exists would require a network round-trip on every settings
+    write.
+    """
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return
+    if not (path / "config.json").exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} '{value}' does not exist or has no config.json.",
+        )
+    if check_dflash_compat:
+        from ..engine.dflash import is_dflash_compatible
+
+        compat_ok, compat_reason = is_dflash_compatible(path)
+        if not compat_ok:
+            raise HTTPException(
+                status_code=400, detail=f"{field_name} '{value}': {compat_reason}"
+            )
+
+
+def _validate_dflash_verify_mode(value: str | None) -> None:
+    valid_verify_modes = ("dflash", "adaptive", "ddtree", "off")
+    if value is not None and value not in valid_verify_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid dflash_verify_mode '{value}'. "
+                f"Valid options: {', '.join(valid_verify_modes)}"
+            ),
+        )
+
+
+def _validate_reasoning_parser(value: str | None, *, model_id: str) -> None:
+    if value is None:
+        return
+    registry = _reasoning_parser_registry()
+    if registry is None:
+        logger.warning(
+            "Saving reasoning_parser=%r for model %s without validation "
+            "(xgrammar registry unavailable).",
+            value,
+            model_id,
+        )
+        return
+    if value not in registry:
+        valid = ", ".join(sorted(registry))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid reasoning_parser '{value}'. Valid options: {valid}",
+        )
+
+
+_MODEL_SPECIFIC_STR_FIELDS = (
+    "dflash_verify_mode",
+    "specprefill_draft_model",
+    "dflash_draft_model",
+    "vlm_mtp_draft_model",
+    "reasoning_parser",
+)
+
+
+def _validate_mtp_compatibility(model_path: str) -> None:
+    """Raise if ``model_path`` cannot support native MTP (mlx-lm PR 990/PR 15).
+
+    Shared between ``update_model_settings`` and the profile create/update
+    handlers (#18) so both write paths enforce the identical config.json and
+    weight-presence checks instead of only one of them catching an
+    MTP-incompatible model.
+    """
+    import json
+    from pathlib import Path
+
+    from ..utils.model_loading import (
+        _checkpoint_has_mtp_weights,
+        _is_mtp_compatible,
+    )
+
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        logger.warning("MTP compatibility check: config.json missing at %s", cfg_path)
+        raise HTTPException(
+            status_code=400,
+            detail="MTP enabled but the model config could not be read; see server logs.",
+        )
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        logger.warning(
+            "MTP compatibility check: failed to read %s", cfg_path, exc_info=True
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="MTP enabled but the model config could not be read; see server logs.",
+        ) from None
+    model_type = cfg.get("model_type")
+    # qwen4_exp routes through the dedicated VLM Lightning MTP path
+    # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
+    # keep the mtp.* weight check below.
+    if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model is not MTP-compatible (model_type={model_type!r}, "
+                f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
+                "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
+                "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
+                "MTP heads."
+            ),
+        )
+    if not _checkpoint_has_mtp_weights(model_path):
+        if model_type == "qwen4_exp":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Qwen4-Exp Lightning MTP requires embedded mtp.* "
+                    "tensors; native nextn layers are not supported by "
+                    "its dedicated runtime."
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Config declares MTP layers but the weight files contain "
+                "neither mtp.* tensors nor native nextn layers. Re-convert "
+                "from HF with a converter that preserves MTP weights. The "
+                "default mlx-lm sanitize() path strips them."
+            ),
+        )
+
+
+async def _validate_model_specific_settings_dict(
+    settings: dict[str, Any], *, model_id: str, entry, settings_manager
+) -> None:
+    """Validate the subset of ``ModelSettings`` fields present in a raw
+    settings dict, using the same rules as ``update_model_settings``.
+
+    Shared with the profile create/update handlers so a profile write
+    enforces the same checks as the settings endpoint for these fields
+    (#14, #18) — a profile write bypassed them entirely before this,
+    writing them straight from request data instead of going through
+    ``update_model_settings``.
+
+    ``dflash_ssd_cache`` and ``vlm_mtp_enabled``'s draft-model requirement
+    both depend on a cross-field check against settings the profile itself
+    doesn't set. ``apply_model_profile`` always merges a profile's
+    model-specific fields onto *this same* ``model_id``'s current live
+    settings as an additive overlay (never a different model), so this
+    mirrors ``update_model_settings``'s own merge: a field the profile sets
+    wins, otherwise ``entry``'s current stored setting is used. That merge
+    is necessarily a snapshot at write time — the model's live settings can
+    still change before the profile is applied — the same limitation
+    ``update_model_settings`` already has for its own request-time merge.
+
+    A value must arrive as its expected type (unvalidated dict input
+    from JSON, unlike ``update_model_settings``'s typed pydantic model) —
+    a falsy non-string/non-number (``0``, ``False``, ``[]``) must not
+    silently bypass validation via a truthiness check and then still get
+    persisted by ``filter_profile_fields``, which only treats ``None``
+    and ``""`` as unset.
+    """
+    for field_name in _MODEL_SPECIFIC_STR_FIELDS:
+        if field_name not in settings:
+            continue
+        value = settings[field_name]
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a string, got {type(value).__name__}.",
+            )
+        if field_name == "dflash_verify_mode":
+            _validate_dflash_verify_mode(value)
+        elif field_name == "reasoning_parser":
+            _validate_reasoning_parser(value, model_id=model_id)
+        elif field_name == "dflash_draft_model":
+            _validate_draft_model_path(value, field_name, check_dflash_compat=True)
+        else:
+            _validate_draft_model_path(value, field_name)
+
+    if "dflash_in_memory_cache_max_entries" in settings:
+        value = settings["dflash_in_memory_cache_max_entries"]
+        if value is not None and value != "":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "dflash_in_memory_cache_max_entries must be a number, "
+                        f"got {type(value).__name__}."
+                    ),
+                )
+            if value < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid dflash_in_memory_cache_max_entries '{value}'. "
+                        "Must be a positive integer (0 or unset resets to the "
+                        "default of 4)."
+                    ),
+                )
+
+    def _validated_bool(field_name: str) -> bool | None:
+        """settings[field_name] as bool, or None if absent/null.
+
+        A stringly-typed value (e.g. ``"false"``) is truthy and would
+        otherwise silently enable a field the operator meant to disable.
+        """
+        if field_name not in settings:
+            return None
+        value = settings[field_name]
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a boolean, got {type(value).__name__}.",
+            )
+        return value
+
+    is_diffusion_model = _entry_is_diffusion_model(entry)
+    current_settings = settings_manager.get_settings(model_id)
+
+    if _validated_bool("dflash_enabled") and not is_diffusion_model:
+        from ..engine.dflash import is_dflash_compatible
+
+        compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+        if not compat_ok:
+            raise HTTPException(status_code=400, detail=compat_reason)
+
+    if _validated_bool("dflash_ssd_cache") and not is_diffusion_model:
+        in_mem_value = _validated_bool("dflash_in_memory_cache")
+        in_mem_after = (
+            in_mem_value
+            if in_mem_value is not None
+            else current_settings.dflash_in_memory_cache
+        )
+        if not in_mem_after:
+            raise HTTPException(
+                status_code=400,
+                detail="DFlash SSD cache requires the in-memory cache to be enabled.",
+            )
+        ssd_dir = getattr(
+            getattr(_get_engine_pool(), "_scheduler_config", None),
+            "paged_ssd_cache_dir",
+            None,
+        )
+        if not ssd_dir:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
+                    "(set --paged-ssd-cache-dir or configure it in settings)."
+                ),
+            )
+
+    if _validated_bool("mtp_enabled") and not is_diffusion_model:
+        await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
+        dflash_value = _validated_bool("dflash_enabled")
+        dflash_after = (
+            dflash_value
+            if dflash_value is not None
+            else current_settings.dflash_enabled
+        )
+        if dflash_after:
+            raise HTTPException(
+                status_code=400,
+                detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
+            )
+
+    if _validated_bool("vlm_mtp_enabled") and not is_diffusion_model:
+        drafter_after = settings.get(
+            "vlm_mtp_draft_model", current_settings.vlm_mtp_draft_model
+        )
+        if not drafter_after:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "vlm_mtp_enabled requires vlm_mtp_draft_model "
+                    "(path to a gemma4_assistant drafter, "
+                    "e.g. 'gemma-4-26B-A4B-it-assistant')."
+                ),
+            )
+        for other_field, other_label in (
+            ("dflash_enabled", "DFlash"),
+            ("specprefill_enabled", "SpecPrefill"),
+            ("mtp_enabled", "MTP"),
+            ("turboquant_kv_enabled", "TurboQuant KV"),
+        ):
+            other_value = _validated_bool(other_field)
+            other_after = (
+                other_value
+                if other_value is not None
+                else getattr(current_settings, other_field)
+            )
+            if other_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"vlm_mtp_enabled and {other_label} cannot both be "
+                        "enabled; choose one speculative-decoding path."
+                    ),
+                )
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,
@@ -2375,7 +2703,18 @@ async def update_model_settings(
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+        new_turboquant_bits = request.turboquant_kv_bits or 4
+        valid_turboquant_bits = (2, 2.5, 3, 3.5, 4, 6, 8)
+        if new_turboquant_bits not in valid_turboquant_bits:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid turboquant_kv_bits '{new_turboquant_bits}'. "
+                    f"Valid options: "
+                    f"{', '.join(str(b) for b in valid_turboquant_bits)}"
+                ),
+            )
+        current_settings.turboquant_kv_bits = new_turboquant_bits
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.
@@ -2543,9 +2882,10 @@ async def update_model_settings(
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
     if "specprefill_draft_model" in sent:
-        current_settings.specprefill_draft_model = (
-            request.specprefill_draft_model or None
-        )
+        new_specprefill_draft = request.specprefill_draft_model or None
+        if new_specprefill_draft is not None:
+            _validate_draft_model_path(new_specprefill_draft, "specprefill_draft_model")
+        current_settings.specprefill_draft_model = new_specprefill_draft
     if "specprefill_keep_pct" in sent:
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
@@ -2563,7 +2903,12 @@ async def update_model_settings(
                 raise HTTPException(status_code=400, detail=compat_reason)
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
-        current_settings.dflash_draft_model = request.dflash_draft_model or None
+        new_dflash_draft = request.dflash_draft_model or None
+        if new_dflash_draft is not None:
+            _validate_draft_model_path(
+                new_dflash_draft, "dflash_draft_model", check_dflash_compat=True
+            )
+        current_settings.dflash_draft_model = new_dflash_draft
     if "dflash_draft_quant_enabled" in sent:
         current_settings.dflash_draft_quant_enabled = (
             bool(request.dflash_draft_quant_enabled)
@@ -2596,6 +2941,15 @@ async def update_model_settings(
         current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
     if "dflash_in_memory_cache_max_entries" in sent:
         value = request.dflash_in_memory_cache_max_entries
+        if value is not None and value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid dflash_in_memory_cache_max_entries '{value}'. "
+                    "Must be a positive integer (0 or unset resets to the "
+                    "default of 4)."
+                ),
+            )
         current_settings.dflash_in_memory_cache_max_entries = (
             int(value) if value and value > 0 else 4
         )
@@ -2657,12 +3011,9 @@ async def update_model_settings(
             int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
-        value = request.dflash_verify_mode
-        # dflash-mlx accepts: dflash | adaptive | ddtree | off.
-        # Anything else (including empty string) → revert to dflash default.
-        current_settings.dflash_verify_mode = (
-            value if value in ("dflash", "adaptive", "ddtree", "off") else None
-        )
+        new_verify_mode = request.dflash_verify_mode or None
+        _validate_dflash_verify_mode(new_verify_mode)
+        current_settings.dflash_verify_mode = new_verify_mode
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -2674,64 +3025,7 @@ async def update_model_settings(
             # nextn layers). The last check is the one that catches
             # mlx-community converted weights where the default sanitize
             # path stripped the MTP heads.
-            import json
-            from pathlib import Path
-
-            from ..utils.model_loading import (
-                _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
-            )
-
-            cfg_path = Path(entry.model_path) / "config.json"
-            if not cfg_path.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"MTP enabled but config.json missing at {cfg_path}; "
-                        "cannot verify MTP compatibility."
-                    ),
-                )
-            try:
-                cfg = json.loads(cfg_path.read_text())
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MTP enabled but failed to read model config: {e}",
-                )
-            model_type = cfg.get("model_type")
-            # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model is not MTP-compatible (model_type={model_type!r}, "
-                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
-                    ),
-                )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                if model_type == "qwen4_exp":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
-                        ),
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Config declares MTP layers but the weight files contain "
-                        "neither mtp.* tensors nor native nextn layers. Re-convert "
-                        "from HF with a converter that preserves MTP weights. The "
-                        "default mlx-lm sanitize() path strips them."
-                    ),
-                )
+            await asyncio.to_thread(_validate_mtp_compatibility, entry.model_path)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
@@ -2787,12 +3081,17 @@ async def update_model_settings(
                     )
         current_settings.vlm_mtp_enabled = new_vlm_mtp
     if "vlm_mtp_draft_model" in sent:
-        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
+        new_vlm_mtp_draft = request.vlm_mtp_draft_model or None
+        if new_vlm_mtp_draft is not None:
+            _validate_draft_model_path(new_vlm_mtp_draft, "vlm_mtp_draft_model")
+        current_settings.vlm_mtp_draft_model = new_vlm_mtp_draft
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
     if "reasoning_parser" in sent:
-        current_settings.reasoning_parser = request.reasoning_parser or None
+        new_reasoning_parser = request.reasoning_parser or None
+        _validate_reasoning_parser(new_reasoning_parser, model_id=model_id)
+        current_settings.reasoning_parser = new_reasoning_parser
     if "guided_grammar_enabled" in sent:
         current_settings.guided_grammar_enabled = (
             request.guided_grammar_enabled or False
@@ -3062,8 +3361,11 @@ async def create_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
+    await _validate_model_specific_settings_dict(
+        request.settings or {}, model_id=model_id, entry=entry, settings_manager=mgr
+    )
     try:
         profile = mgr.save_profile(
             model_id=model_id,
@@ -3106,8 +3408,12 @@ async def update_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
     engine_pool = _get_engine_pool()
+    if request.settings is not None:
+        await _validate_model_specific_settings_dict(
+            request.settings, model_id=model_id, entry=entry, settings_manager=mgr
+        )
     try:
         updated = mgr.update_profile(
             model_id=model_id,
