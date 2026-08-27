@@ -80,6 +80,24 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv.count(model) == 1
 
 
+def test_launcher_argv_carries_the_hostfile_ips_alongside_ssh_targets(tmp_path):
+    """§C1/2.3: the worker's own view of health only has SSH targets today
+    (--peer-hosts); a data-plane check needs the fabric addresses too, in
+    the same rank order, or it has nothing to check against."""
+
+    deployment = _deployment()
+    argv = build_mlx_launch_argv(
+        deployment,
+        hostfile=(tmp_path / "hosts.json").resolve(),
+        api_port=32100,
+        collective_port=32120,
+        python_executable="/opt/omlx/bin/python",
+    )
+
+    assert argv[argv.index("--peer-hosts") + 1] == "127.0.0.1,user@studio.local"
+    assert argv[argv.index("--peer-ips") + 1] == "10.0.0.1;10.0.0.2"
+
+
 def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
     with pytest.raises(ValueError, match="must be distinct"):
         build_mlx_launch_argv(
@@ -1472,6 +1490,22 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
     args = build_parser().parse_args(worker_argv[3:])
     plan_hash, assignments, _profiles, _tp = decode_worker_contract(args.plan)
     return args, plan_hash, assignments
+
+
+def test_peer_ips_round_trip_from_launcher_argv_to_the_worker_parser(tmp_path):
+    """§C1/2.3: the worker's data-plane check needs the fabric addresses,
+    not just SSH targets -- confirm the full path from a real deployment's
+    ClusterHost.ips through the launcher argv to what the worker parses,
+    not just the argv shape in isolation."""
+
+    from omlx.cluster.inference_worker import _parse_peer_ips, build_parser
+
+    deployment = _deployment()
+    args = build_parser().parse_args(_worker_argv(deployment, tmp_path)[3:])
+
+    assert _parse_peer_ips(args.peer_ips) == [
+        tuple(host.ips) for host in deployment.hosts
+    ]
 
 
 def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):

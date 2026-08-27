@@ -1309,3 +1309,81 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+# --- §C1/2.3: the peer-IPs plumbing --peer-hosts never needed. -------------
+
+
+def test_parse_peer_ips_splits_hosts_on_semicolon_and_addresses_on_comma():
+    from omlx.cluster.inference_worker import _parse_peer_ips
+
+    assert _parse_peer_ips("10.0.0.1;10.0.0.2,10.0.1.2") == [
+        ("10.0.0.1",),
+        ("10.0.0.2", "10.0.1.2"),
+    ]
+
+
+def test_parse_peer_ips_empty_string_is_no_ranks_not_one_empty_rank():
+    """An older launcher never sending --peer-ips must look like "nothing
+    known for any rank", not "rank 0 has an empty tuple" -- the latter
+    would misindex every rank after it."""
+
+    from omlx.cluster.inference_worker import _parse_peer_ips
+
+    assert _parse_peer_ips("") == []
+
+
+def test_parse_peer_ips_preserves_a_rank_with_no_recorded_ips():
+    from omlx.cluster.inference_worker import _parse_peer_ips
+
+    assert _parse_peer_ips(";10.0.1.2") == [(), ("10.0.1.2",)]
+
+
+def test_peer_ips_by_rank_excludes_self_and_skips_ranks_with_no_ips():
+    from omlx.cluster.inference_worker import _peer_ips_by_rank
+
+    assignments = (
+        PipelineAssignment("local", 0, 0, 2, 2, 0, 0, 6),
+        PipelineAssignment("studio", 1, 2, 4, 2, 1, 0, 6),
+        PipelineAssignment("mini", 2, 4, 6, 2, 2, 0, 6),
+    )
+    ips = [("10.0.0.1",), (), ("10.0.0.3", "10.0.1.3")]
+
+    assert _peer_ips_by_rank(assignments, ips, rank=0) == {
+        2: ("10.0.0.3", "10.0.1.3"),
+    }
+
+
+def test_start_peer_watchdog_threads_peer_ips_into_the_watchdog(tmp_path):
+    from omlx.cluster.inference_worker import RuntimeMarker, _start_peer_watchdog
+
+    marker = RuntimeMarker(
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        rank=0,
+        world_size=2,
+        model="org/model",
+        backend="ring",
+        plan_hash="e" * 64,
+    )
+    assignments = (
+        PipelineAssignment("local", 0, 0, 2, 2, 0, 0, 4),
+        PipelineAssignment("studio", 1, 2, 4, 2, 1, 0, 4),
+    )
+
+    watchdog = _start_peer_watchdog(
+        marker,
+        assignments,
+        ["127.0.0.1", "studio.local"],
+        "d",
+        str(tmp_path),
+        rank=0,
+        peer_ips=[("10.0.0.1",), ("10.0.0.2",)],
+    )
+
+    try:
+        assert watchdog is not None
+        assert watchdog._peer_ips_by_rank == {1: ("10.0.0.2",)}
+    finally:
+        if watchdog is not None:
+            watchdog.stop()

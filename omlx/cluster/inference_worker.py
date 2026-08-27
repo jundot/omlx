@@ -550,6 +550,44 @@ def _peer_hosts_by_rank(
     }
 
 
+def _parse_peer_ips(raw: str) -> list[tuple[str, ...]]:
+    """Reverse of ``--peer-ips``' encoding: ``";".join(",".join(host.ips)
+    for host in deployment.hosts)`` (``launch.py``). Empty input means an
+    older launcher that never sent this flag -- an empty list, not one
+    accidental empty group, so callers treat it identically to "no IPs
+    known for any rank" rather than misindexing rank 0."""
+
+    if not raw:
+        return []
+    return [
+        tuple(ip for ip in group.split(",") if ip) for group in raw.split(";")
+    ]
+
+
+def _peer_ips_by_rank(
+    assignments: Sequence[PipelineAssignment],
+    ips: Sequence[tuple[str, ...]],
+    *,
+    rank: int,
+) -> dict[int, tuple[str, ...]]:
+    """The other ranks' hostfile IPs, by rank. Mirrors _peer_hosts_by_rank.
+
+    A rank with no recorded IPs (an empty group in --peer-ips, or an argv
+    from before this field existed) is simply absent from the result --
+    PeerWatchdog treats a missing entry as "no data-plane check for this
+    rank" rather than an error, so this stays safe to thread through
+    unconditionally.
+    """
+
+    return {
+        assignment.rank: ips[assignment.rank]
+        for assignment in assignments
+        if assignment.rank != rank
+        and 0 <= assignment.rank < len(ips)
+        and ips[assignment.rank]
+    }
+
+
 def _start_peer_watchdog(
     marker: RuntimeMarker,
     assignments: Sequence[PipelineAssignment],
@@ -558,6 +596,7 @@ def _start_peer_watchdog(
     state_dir: str,
     *,
     rank: int,
+    peer_ips: Sequence[tuple[str, ...]] = (),
 ) -> PeerWatchdog | None:
     """End the job when a peer stops answering, instead of blocking forever.
 
@@ -579,6 +618,12 @@ def _start_peer_watchdog(
     minutes to load and a peer that goes away during those twenty minutes used
     to leave every other rank blocked in the first collective with nothing
     watching.
+
+    ``peer_ips`` (§C1/2.3) enables an additional data-plane check: SSH can
+    stay green while the collectives' actual fabric (the Thunderbolt/RDMA
+    hostfile IPs) is down, which the SSH-only check above cannot see.
+    Optional -- an empty/short sequence just means that check never runs,
+    same as before this feature existed.
     """
 
     if rank != 0:
@@ -588,6 +633,7 @@ def _start_peer_watchdog(
     hosts_by_rank = _peer_hosts_by_rank(assignments, hosts, rank=rank)
     if not hosts_by_rank:
         return None
+    ips_by_rank = _peer_ips_by_rank(assignments, peer_ips, rank=rank)
 
     def on_lost(reason: str) -> None:
         marker.update("peer_lost", error=reason)
@@ -599,6 +645,7 @@ def _start_peer_watchdog(
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
+        peer_ips_by_rank=ips_by_rank,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -998,6 +1045,7 @@ def run_worker(args: argparse.Namespace) -> int:
         args.deployment_id,
         args.state_dir,
         rank=rank,
+        peer_ips=_parse_peer_ips(args.peer_ips),
     )
 
     preserve_failure_marker = False
@@ -1294,6 +1342,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated SSH targets in rank order. Used only to notice a "
             "peer going away; a collective otherwise blocks forever."
+        ),
+    )
+    parser.add_argument(
+        "--peer-ips",
+        default="",
+        help=(
+            "Semicolon-separated per-host groups of comma-separated hostfile "
+            "IPs, in the same rank order as --peer-hosts. The data-plane the "
+            "collectives actually ride, as opposed to the SSH control plane "
+            "--peer-hosts checks -- a cable pull with SSH still up leaves "
+            "that check green and the collective blocked forever (§C1)."
         ),
     )
     parser.add_argument(

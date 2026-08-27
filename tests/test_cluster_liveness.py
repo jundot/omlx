@@ -395,12 +395,13 @@ class _Clock:
         return self.value
 
 
-def _active(rank, ticks, *, node_id="peer"):
+def _active(rank, ticks, *, node_id="peer", phase="ready"):
     return PeerHealth(
         node_id,
         rank,
         True,
         1.0,
+        phase=phase,
         heartbeat_required=True,
         active_requests=1,
         progress_ticks=ticks,
@@ -515,6 +516,171 @@ def test_run_populates_last_health_with_the_observed_snapshot(tmp_path):
     assert watchdog.last_health[0].stalled is True, (
         "unchanged ticks across every poll, well past the threshold"
     )
+
+
+# ---------------------------------------------------------------------------
+# §C1/2.3: SSH green, fabric down. Kill only combined with no progress.
+# ---------------------------------------------------------------------------
+
+
+_PEER_ONLY = {1: ("mac-studio", "Studio.local")}
+
+
+def _watchdog(tmp_path, clock, *, check_data_plane, failure_tolerance=2, on_lost=None):
+    return PeerWatchdog(
+        _PEER_ONLY,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        stalled_after=1.0,
+        clock=clock,
+        failure_tolerance=failure_tolerance,
+        peer_ips_by_rank={1: ("10.0.1.2",)},
+        check_data_plane=check_data_plane,
+        on_lost=on_lost,
+    )
+
+
+def _run_ticks(watchdog, clock, poll_count, *, stop_after=None):
+    calls = [0]
+
+    def fake_sleep(_seconds):
+        calls[0] += 1
+        clock.value += 2.0
+        if stop_after is not None and calls[0] >= stop_after:
+            watchdog.stop()
+        elif calls[0] > poll_count:
+            raise AssertionError("watchdog never settled")
+
+    watchdog.run(sleep=fake_sleep)
+
+
+def test_watchdog_kills_on_data_plane_down_while_stalled(tmp_path):
+    """The headline scenario: SSH green (every marker fresh), fabric down,
+    and no generation progress -- the C1 wedge, on any backend, by
+    construction."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric path to peer is down" in losses[0]
+    assert "SSH still answers" in losses[0]
+
+
+def test_watchdog_does_not_kill_while_progress_is_advancing(tmp_path):
+    """A failed ping alone -- ICMP dropped on a saturated link mid-
+    collective -- must not kill a cluster that is demonstrably still
+    working."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    ticks = [0]
+
+    def fake_run_once():
+        ticks[0] += 1
+        return (_active(1, ticks[0]),)  # progress_ticks advances every poll
+
+    watchdog.run_once = fake_run_once  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 5, stop_after=6)
+
+    assert losses == []
+
+
+def test_watchdog_kills_on_data_plane_down_while_still_loading(tmp_path):
+    """No progress signal exists before the deployment finishes loading --
+    the load-window exemption from the stalled gate, not a bypass of it."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        _active(1, None, phase="loading"),
+    )
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric path to peer is down" in losses[0]
+
+
+def test_watchdog_tolerates_a_transient_data_plane_blip(tmp_path):
+    """Fewer than failure_tolerance consecutive failures must not kill --
+    and a later success resets the count, matching the SSH-side
+    _consecutive_failures pattern this mirrors."""
+
+    clock = _Clock()
+    losses = []
+    answers = iter(
+        [False, True, False, True, False, True, False, True, False, True]
+    )
+    watchdog = _watchdog(
+        tmp_path,
+        clock,
+        check_data_plane=lambda ip: (
+            next(answers, True),
+            "did not answer",
+        ),
+    )
+    watchdog._on_lost = losses.append
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 10, stop_after=11)
+
+    assert losses == []
+
+
+def test_watchdog_skips_the_data_plane_check_when_ssh_is_already_unhealthy(
+    tmp_path,
+):
+    clock = _Clock()
+    losses = []
+    checked = []
+    watchdog = _watchdog(
+        tmp_path,
+        clock,
+        check_data_plane=lambda ip: checked.append(ip) or (False, "unreachable"),
+        failure_tolerance=1,
+    )
+    watchdog._on_lost = losses.append
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        PeerHealth("peer", 1, False, None, heartbeat_required=True, detail="gone"),
+    )
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric" not in losses[0], "the SSH-side failure already explains it"
+    assert checked == []
+
+
+def test_watchdog_ignores_ranks_with_no_recorded_ips(tmp_path):
+    """peer_ips_by_rank is optional -- a rank missing from it (older
+    launcher argv, no hostfile IPs recorded) must not crash, just skip."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = PeerWatchdog(
+        _PEER_ONLY, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0, clock=clock, failure_tolerance=1, on_lost=losses.append,
+    )
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 3, stop_after=4)
+
+    assert losses == []
 
 
 # ---------------------------------------------------------------------------

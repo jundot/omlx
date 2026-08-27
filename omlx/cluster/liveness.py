@@ -26,6 +26,7 @@ absent.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -36,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from .ssh_policy import cluster_ssh_options
+
+logger = logging.getLogger(__name__)
 
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
@@ -473,6 +476,12 @@ _DEFAULT_FAILURE_TOLERANCE = 2
 _DEFAULT_SERVING_INTERVAL = 3.0
 
 
+def _default_check_data_plane(peer_ip: str) -> tuple[bool | None, str]:
+    from .transport import check_data_plane_reachability
+
+    return check_data_plane_reachability(peer_ip)
+
+
 class PeerWatchdog:
     """Fail a rank when a peer it depends on stops answering.
 
@@ -500,12 +509,22 @@ class PeerWatchdog:
         failure_tolerance: int = _DEFAULT_FAILURE_TOLERANCE,
         stalled_after: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        peer_ips_by_rank: dict[int, tuple[str, ...]] | None = None,
+        check_data_plane: Callable[[str], tuple[bool | None, str]] | None = None,
     ) -> None:
         self._hosts = hosts_by_rank
         self._deployment_id = deployment_id
         self._state_dir = state_dir
         self._interval = max(0.0, float(interval))
         self._clock = clock
+        # §C1/2.3: SSH-side health can stay green while the fabric the
+        # collectives actually ride is down. peer_ips_by_rank is optional
+        # (older callers, or a rank with no hostfile IPs recorded) --
+        # without it this check simply never runs, same as before this
+        # feature existed.
+        self._peer_ips_by_rank = peer_ips_by_rank or {}
+        self._check_data_plane = check_data_plane or _default_check_data_plane
+        self._data_plane_failures: dict[int, int] = {}
         # Loading a very large model is a noisy, minutes-long cold-start lane:
         # probing it aggressively creates false failures and needless SSH
         # traffic. Once every peer reports ready, a dead cable or process is
@@ -621,9 +640,68 @@ class PeerWatchdog:
                 for rank, count in self._consecutive_failures.items()
                 if count >= self._failure_tolerance
             }
-            if not failed_ranks:
+            data_plane_rank = None
+            data_plane_detail = ""
+            for rank, item in by_rank.items():
+                # §C1/2.3: only worth checking (and only trusted to kill)
+                # when SSH-side health already looks fine -- an
+                # SSH-unhealthy rank is already covered by failed_ranks
+                # above, and checking the fabric on top would just
+                # restate a problem already diagnosed there.
+                if rank in failed_ranks or item is None or not item.healthy:
+                    self._data_plane_failures.pop(rank, None)
+                    continue
+                ips = self._peer_ips_by_rank.get(rank)
+                if not ips:
+                    continue
+                detail = self._rank_data_plane_failure_detail(ips)
+                if detail is None:
+                    self._data_plane_failures[rank] = 0
+                    continue
+                self._data_plane_failures[rank] = (
+                    self._data_plane_failures.get(rank, 0) + 1
+                )
+                if self._data_plane_failures[rank] < self._failure_tolerance:
+                    continue
+                # A failed ping alone (a saturated link dropping ICMP mid-
+                # collective) must not kill a cluster that is
+                # demonstrably still working -- only kill when combined
+                # with evidence generation cannot actually progress:
+                # stalled, or the deployment has not finished loading yet
+                # (no progress signal exists to gate on during that
+                # window, and §A1's own scenario is exactly a wedge with
+                # nothing else watching before the first request ever
+                # lands).
+                if item.stalled or item.phase != "ready":
+                    data_plane_rank = rank
+                    data_plane_detail = detail
+                    break
+            if not failed_ranks and data_plane_rank is None:
                 continue
-            failed = tuple(item for item in health if item.rank in failed_ranks)
             if self._on_lost is not None:
-                self._on_lost(describe_failure(failed))
+                if failed_ranks:
+                    failed = tuple(
+                        item for item in health if item.rank in failed_ranks
+                    )
+                    self._on_lost(describe_failure(failed))
+                else:
+                    node_id = by_rank[data_plane_rank].node_id
+                    self._on_lost(
+                        f"the fabric path to {node_id} is down "
+                        f"({data_plane_detail}); SSH still answers"
+                    )
             return
+
+    def _rank_data_plane_failure_detail(self, ips: tuple[str, ...]) -> str | None:
+        """None when every address is reachable or inconclusive; the first
+        confirmed-failed address's detail otherwise."""
+
+        for ip in ips:
+            try:
+                ok, detail = self._check_data_plane(ip)
+            except Exception as exc:  # noqa: BLE001 - probe plumbing
+                logger.debug("data-plane probe failed for %s: %s", ip, exc)
+                continue
+            if ok is False:
+                return detail
+        return None

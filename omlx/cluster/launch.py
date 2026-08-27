@@ -384,6 +384,8 @@ def build_mlx_launch_argv(
             deployment.encode_worker_plan(),
             "--peer-hosts",
             ",".join(host.ssh for host in deployment.hosts),
+            "--peer-ips",
+            ";".join(",".join(host.ips) for host in deployment.hosts),
             "--state-dir",
             state_dir,
             "--execution-profile",
