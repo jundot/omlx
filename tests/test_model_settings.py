@@ -349,6 +349,68 @@ class TestModelSettingsManager:
             settings_file = Path(tmpdir) / "model_settings.json"
             assert settings_file.exists()
 
+    def test_set_settings_bumps_revision_each_write(self):
+        """settings_revision increments on every set_settings call, starting
+        at 1 for a model's first write, and the bumped value is visible on
+        both the caller's object and the stored copy (see
+        docs/dashboard-model-config-sync.md)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            first = ModelSettings(temperature=0.5)
+            manager.set_settings("test-model", first)
+            assert first.settings_revision == 1
+            assert manager.get_settings("test-model").settings_revision == 1
+
+            second = ModelSettings(temperature=0.7)
+            manager.set_settings("test-model", second)
+            assert second.settings_revision == 2
+            assert manager.get_settings("test-model").settings_revision == 2
+
+    def test_unconfigured_model_has_revision_zero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("never-configured").settings_revision == 0
+
+    def test_revision_survives_reload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("test-model", ModelSettings(temperature=0.5))
+            manager.set_settings("test-model", ModelSettings(temperature=0.6))
+
+            manager2 = ModelSettingsManager(Path(tmpdir))
+            assert manager2.get_settings("test-model").settings_revision == 2
+
+    def test_apply_profile_bumps_revision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("test-model", ModelSettings(temperature=0.5))
+            before = manager.get_settings("test-model").settings_revision
+
+            manager.save_profile(
+                "test-model", name="p1", display_name="P1", description=None,
+                settings={"temperature": 0.8},
+            )
+            after_create = manager.get_settings("test-model").settings_revision
+            assert after_create == before, (
+                "creating a profile must not touch the model's live settings"
+            )
+
+            manager.apply_profile("test-model", "p1")
+            assert manager.get_settings("test-model").settings_revision == before + 1
+
+    def test_inbound_settings_revision_is_ignored(self):
+        """A caller cannot set settings_revision directly through
+        set_settings — the manager is the sole authority (B1 in the design
+        doc: inbound revision values must be stripped/ignored, not trusted)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("test-model", ModelSettings(temperature=0.5))
+
+            forged = ModelSettings(temperature=0.9, settings_revision=999)
+            manager.set_settings("test-model", forged)
+            assert manager.get_settings("test-model").settings_revision == 2
+
     def test_delete_settings_releases_alias(self):
         """Deleting a model's settings frees its alias for reuse (issue #1321)."""
         with tempfile.TemporaryDirectory() as tmpdir:

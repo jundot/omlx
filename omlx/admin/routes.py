@@ -112,6 +112,13 @@ class CacheProbeRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
+    # Optional optimistic-concurrency check: when sent, the write is rejected
+    # with 409 if it no longer matches the model's current settings_revision
+    # (someone else wrote in between). Omitted by scripts/raw curl/older
+    # clients — behavior for them is unchanged. See
+    # docs/dashboard-model-config-sync.md.
+    expected_settings_revision: int | None = None
+
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
@@ -663,11 +670,16 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str, bool]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
-    Returns ``(compatible, reason)``. Reason is empty on success and
-    suitable for surfacing to users (admin UI shows it under the toggle).
+    Returns ``(compatible, reason, mtplx_sidecar_available)``. Reason is
+    empty on success and suitable for surfacing to users (admin UI shows
+    it under the toggle). ``mtplx_sidecar_available`` is a structured
+    signal for whether the one-click MTPLX side-car import button should
+    show — the UI used to pattern-match the reason string for "MTPLX
+    side-car", which broke if this text ever changed and threw outright
+    when no model was selected (reason undefined).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -688,43 +700,41 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
-        return False, paro_reason
+        return False, paro_reason, False
 
     model_path = model_info.get("model_path") or ""
     if not model_path:
-        return False, "model_path missing"
+        return False, "model_path missing", False
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
-        return False, "config.json not found"
+        return False, "config.json not found", False
     try:
         cfg = json.loads(cfg_path.read_text())
     except Exception as e:
-        return False, f"failed to read config: {e}"
+        return False, f"failed to read config: {e}", False
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
-        return False, "model has no MTP heads in config"
+        return False, "model has no MTP heads in config", False
     if not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
             "gemma4, gemma4_unified)"
-        )
+        ), False
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
 
         if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
-            # The dashboard keys the one-click import button off this
-            # "MTPLX side-car" marker (models.js).
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
-            )
+            ), True
         return False, (
             "Config declares MTP layers but the weight files contain neither "
             "mtp.* tensors nor native nextn layers. Re-convert from HF with a "
             "converter that preserves MTP weights."
-        )
-    return True, ""
+        ), False
+    return True, "", False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -1912,7 +1922,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason, mtplx_sidecar_available = _mtp_compat_for_model(model_info)
 
         model_data = {
             "id": model_id,
@@ -1963,6 +1973,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "mtplx_sidecar_available": mtplx_sidecar_available,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2008,6 +2019,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_ssd_cache_available": False,
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
+                "mtplx_sidecar_available": False,
                 "is_paroquant": False,
                 "paroquant_reason": "",
                 "virtual": True,
@@ -2186,6 +2198,27 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
+
+    # Optimistic-concurrency check: reject before touching anything if the
+    # caller's view is stale. Opt-in — omitted entirely by scripts/raw curl,
+    # so this can never break a client that doesn't know about it. See
+    # docs/dashboard-model-config-sync.md.
+    if (
+        request.expected_settings_revision is not None
+        and request.expected_settings_revision != current_settings.settings_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Settings for '{model_id}' changed since this form was "
+                    "loaded (expected revision "
+                    f"{request.expected_settings_revision}, current "
+                    f"{current_settings.settings_revision})."
+                ),
+                "current_settings": current_settings.to_dict(),
+            },
+        )
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -2968,6 +3001,24 @@ def _raise_if_alias_conflicts_exposed_profiles(
                     f"model ID '{candidate_id}'"
                 ),
             )
+
+
+@router.get("/api/models/{model_id}/settings")
+async def get_model_settings(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Fresh read of one model's persisted settings.
+
+    Exists so the dashboard's Model Settings modal can build its form from
+    truth at open time instead of the possibly-stale snapshot embedded in
+    the last `GET /api/models` list response — see
+    docs/dashboard-model-config-sync.md. Includes `settings_revision` for
+    the optimistic-concurrency check on save.
+    """
+    _require_model(model_id)
+    settings_manager = _require_settings_manager()
+    return {"model_id": model_id, "settings": settings_manager.get_settings(model_id).to_dict()}
 
 
 @router.get("/api/models/{model_id}/profiles")

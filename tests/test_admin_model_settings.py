@@ -247,3 +247,100 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+# =============================================================================
+# Optimistic-concurrency check (expected_settings_revision) — see
+# docs/dashboard-model-config-sync.md
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_stale_expected_revision_returns_409_without_persisting():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(temperature=0.5, settings_revision=5)
+    manager = MagicMock()
+    manager.get_settings.return_value = settings
+    state = MagicMock()
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=state),
+    ):
+        with pytest.raises(admin_routes.HTTPException) as exc_info:
+            await admin_routes.update_model_settings(
+                "ling",
+                admin_routes.ModelSettingsRequest(
+                    expected_settings_revision=3, temperature=0.9
+                ),
+                is_admin=True,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["current_settings"]["settings_revision"] == 5
+    manager.set_settings.assert_not_called()
+    # Nothing should have been mutated on the object the (mocked) store holds.
+    assert settings.temperature == 0.5
+
+
+@pytest.mark.asyncio
+async def test_matching_expected_revision_succeeds():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(temperature=0.5, settings_revision=5)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expected_settings_revision=5, temperature=0.9
+        ),
+    )
+
+    assert settings.temperature == 0.9
+    assert result["settings"]["temperature"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_omitted_expected_revision_skips_the_check():
+    """Raw API/script clients that never send expected_settings_revision keep
+    working exactly as before — the check is opt-in by the sender."""
+    pool, entry = _failed_pool()
+    settings = ModelSettings(temperature=0.5, settings_revision=5)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(temperature=0.9),
+    )
+
+    assert settings.temperature == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_model_settings_returns_fresh_settings():
+    pool, entry = _failed_pool()
+    settings = ModelSettings(temperature=0.5, settings_revision=7)
+    manager = MagicMock()
+    manager.get_settings.return_value = settings
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._require_settings_manager", return_value=manager),
+    ):
+        result = await admin_routes.get_model_settings("ling", is_admin=True)
+
+    assert result["model_id"] == "ling"
+    assert result["settings"]["settings_revision"] == 7
+    assert result["settings"]["temperature"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_get_model_settings_404s_for_unknown_model():
+    pool, _entry = _failed_pool()
+
+    with patch("omlx.admin.routes._get_engine_pool", return_value=pool):
+        with pytest.raises(admin_routes.HTTPException) as exc_info:
+            await admin_routes.get_model_settings("does-not-exist", is_admin=True)
+
+    assert exc_info.value.status_code == 404

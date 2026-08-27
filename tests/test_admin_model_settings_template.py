@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from omlx.admin.routes import _load_locale
+
 
 def _model_settings_template() -> str:
     root = Path(__file__).resolve().parents[1]
@@ -293,6 +295,98 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0" in state
     assert "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
     assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
+
+
+def test_apply_profile_refreshes_dirty_check_snapshot():
+    # §A4/Phase 1.3 of docs/dashboard-model-config-sync.md: applying a
+    # profile persists server-side and rebuilds `modelSettings`, so the
+    # dirty-check baseline must move with it or closing right after raises
+    # a false "discard unsaved changes?" confirm.
+    script = _dashboard_script()
+    method = script.split("async applyProfileToForm(profile) {", 1)[1].split(
+        "\n            async applyTemplateToForm", 1
+    )[0]
+    assert "this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);" in method
+
+
+def test_apply_ane_tuning_refreshes_dirty_check_snapshot():
+    script = _dashboard_script()
+    method = script.split("async applyANETuningRecommendation() {", 1)[1].split(
+        "\n            async fetchModelAutoContext", 1
+    )[0]
+    assert "this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);" in method
+
+
+def test_mtplx_import_confirms_before_discarding_unsaved_edits():
+    # importMtplxSidecar reopens the settings modal on success, which
+    # silently rebuilds `modelSettings` from the server — same discard
+    # hazard as any other forced reload, so it needs the same dirty-check
+    # confirm as closeModelSettingsModal before it starts.
+    script = _dashboard_script()
+    method = script.split("async importMtplxSidecar() {", 1)[1].split(
+        "\n            async validateQwenAneSettings", 1
+    )[0]
+    assert "modal.model_settings.discard_confirm" in method
+    assert method.index("confirm(window.t('modal.model_settings.discard_confirm'))") < method.index(
+        "this.importingMtplx = true;"
+    )
+
+
+def test_conflict_load_latest_refreshes_dirty_check_snapshot():
+    script = _dashboard_script()
+    method = script.split("async handleModelSettingsConflict(errorBody) {", 1)[1].split(
+        "\n            async loadGenerationDefaults", 1
+    )[0]
+    assert "this._modelSettingsSnapshot = JSON.stringify(this.modelSettings);" in method
+    assert "this.modelSettingsStaleBanner = false;" in method
+
+
+def test_visibility_recheck_rebuilds_clean_form_and_banners_dirty_form():
+    # §B3/Phase 3: on becoming visible again with the settings modal open,
+    # a clean form is rebuilt from the server silently; a dirty form must
+    # never be silently merged into — it gets the banner instead.
+    script = _dashboard_script()
+    assert "this.checkModelSettingsFreshness();" in script
+
+    method = script.split("async checkModelSettingsFreshness() {", 1)[1].split(
+        "\n            async reloadModelSettingsFromServer", 1
+    )[0]
+    assert "this.modelSettingsStaleBanner = true;" in method
+    assert "this.modelSettings = this.buildModelSettingsState(this.selectedModel, fresh);" in method
+    # Dirty-form branch must not silently overwrite modelSettings.
+    dirty_branch = method.split("} else {", 1)[1]
+    assert "this.modelSettings =" not in dirty_branch
+
+
+def test_reload_settings_banner_action_confirms_before_discarding():
+    script = _dashboard_script()
+    method = script.split("async reloadModelSettingsFromServer() {", 1)[1].split(
+        "\n            /// Close the Model Settings modal", 1
+    )[0]
+    assert "modal.model_settings.discard_confirm" in method
+    assert "this.modelSettingsStaleBanner = false;" in method
+
+
+def test_close_and_save_clear_stale_banner():
+    script = _dashboard_script()
+    close_method = script.split("closeModelSettingsModal() {", 1)[1].split(
+        "\n\n", 1
+    )[0]
+    assert "this.modelSettingsStaleBanner = false;" in close_method
+
+
+def test_stale_banner_wired_in_template():
+    html = _model_settings_template()
+    assert 'x-show="modelSettingsStaleBanner"' in html
+    assert '@click="reloadModelSettingsFromServer()"' in html
+    assert "modal.model_settings.stale_banner" in html
+    assert "modal.model_settings.stale_banner_reload" in html
+
+
+def test_stale_banner_i18n_keys_present():
+    en = _load_locale("en")
+    assert en["modal.model_settings.stale_banner"]
+    assert en["modal.model_settings.stale_banner_reload"]
 
 
 def test_js_embedded_translations_escape_apostrophes():
