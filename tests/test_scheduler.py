@@ -6289,3 +6289,144 @@ class TestSupportsSkipLmHead:
 
         scheduler = self._scheduler_with_model(NoCall())
         assert scheduler._supports_skip_lm_head() is False
+
+
+class TestFailAllRequestsSnapshotCleanup:
+    """fail_all_requests must release boundary snapshots and block refs.
+
+    Regression tests for the failure-path leak (#3226): every engine-loop
+    error used to strand the failed requests' boundary snapshot sets (live
+    mx.arrays in the in-memory fallback, orphaned dirs on SSD) and their
+    paged-cache reservations until process exit.
+    """
+
+    def _scheduler(self, mock_model, mock_tokenizer):
+        config = SchedulerConfig(paged_cache_block_size=4)
+        return Scheduler(
+            model=mock_model, tokenizer=mock_tokenizer, config=config
+        )
+
+    def test_fail_all_requests_drops_boundary_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            request_id="req-fail",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.running["req-fail"] = request
+        scheduler.requests["req-fail"] = request
+        scheduler._boundary_cache_snapshots["req-fail"] = {4: [MagicMock()]}
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        with patch.object(
+            scheduler, "_release_paged_cache_for_request"
+        ) as release:
+            failed = scheduler.fail_all_requests()
+
+        assert failed == ["req-fail"]
+        assert "req-fail" not in scheduler._boundary_cache_snapshots
+        store.cleanup_request.assert_called_once_with("req-fail")
+        release.assert_called_once_with("req-fail")
+
+    def test_fail_all_requests_keeps_inflight_store_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            request_id="req-storing",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests["req-storing"] = request
+        scheduler._inflight_store_futures["req-storing"] = MagicMock()
+        scheduler._boundary_cache_snapshots["req-storing"] = {4: None}
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        failed = scheduler.fail_all_requests()
+
+        assert "req-storing" not in failed
+        assert "req-storing" in scheduler._boundary_cache_snapshots
+        store.cleanup_request.assert_not_called()
+
+    def test_drop_helper_tolerates_store_errors(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._scheduler(mock_model, mock_tokenizer)
+        scheduler._boundary_cache_snapshots["req-x"] = {4: None}
+        store = MagicMock()
+        store.cleanup_request.side_effect = OSError("disk gone")
+        scheduler._boundary_snapshot_store = store
+
+        scheduler._drop_boundary_snapshots_for_request("req-x")
+
+        assert "req-x" not in scheduler._boundary_cache_snapshots
+
+
+class TestPeriodicClearThresholdCap:
+    """The periodic-clear byte gate must stay reachable on big machines."""
+
+    def test_threshold_capped_at_16gib(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(),
+        )
+        scheduler._memory_limit_bytes = 438 * 1024**3  # 512GB-class soft limit
+        assert scheduler._periodic_clear_threshold_bytes() == 16 * 1024**3
+
+    def test_threshold_small_limits_unchanged(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(),
+        )
+        scheduler._memory_limit_bytes = 24 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 8 * 1024**3
+        scheduler._memory_limit_bytes = 0
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+
+class TestHybridDecodeKvEvalDefault:
+    """ArraysCache hybrids get periodic decode KV materialization by default.
+
+    Regression test for the Metal resource-count exhaustion (#3226): the
+    lazily rebound recurrent state of ArraysCache hybrid models (GLM-5.3,
+    Qwen3.5-Next, ...) pins one buffer chain per decode step unless it is
+    periodically materialized; the interval used to default on only for
+    MiniMax by name.
+    """
+
+    class _ArraysCacheStub:
+        pass
+
+    def _model_with_cache(self, cache_objs):
+        model = MagicMock()
+        model.make_cache = MagicMock(return_value=cache_objs)
+        model.config = SimpleNamespace(model_type="test")
+        return model
+
+    def test_arrays_cache_model_defaults_to_256(self, mock_tokenizer):
+        stub = type("ArraysCache", (), {})()
+        model = self._model_with_cache([stub])
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 256
+
+    def test_plain_kv_model_defaults_to_0(self, mock_tokenizer):
+        stub = type("KVCache", (), {})()
+        model = self._model_with_cache([stub])
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 0
+
+    def test_no_make_cache_defaults_to_0(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(
+            model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+        assert scheduler._decode_eval_kv_cache_interval == 0

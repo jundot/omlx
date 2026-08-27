@@ -1990,8 +1990,21 @@ class Scheduler:
         # can log their divergence point at INFO (#2333).
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(maxlen=4)
 
+        # Hybrid models whose recurrent state is REBOUND per decode step
+        # (ArraysCache/SizedArraysCache: MiniMax, Qwen3.5-Next, GLM-5.3, ...)
+        # never materialize those states through mx.async_eval alone. The
+        # unevaluated per-step chain pins every intermediate Metal buffer,
+        # and the allocator's per-process resource count (499,000 buffers)
+        # is exhausted long before any byte limit — the
+        # "[metal::malloc] Resource limit (499000) exceeded" failure (#3226).
+        # Periodic materialization collapses the chain; enable it for every
+        # ArraysCache hybrid, not just MiniMax.
         model_name_lower = (self.config.model_name or "").lower()
-        default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
+        default_kv_eval_interval = (
+            256
+            if "minimax" in model_name_lower or self._model_has_arrays_cache()
+            else 0
+        )
         self._decode_eval_kv_cache_interval: int = max(
             0,
             _env_int(
@@ -2285,9 +2298,18 @@ class Scheduler:
         the entire MLX buffer pool in one batch; gating it on accumulated
         bytes avoids producing IOGPUFamily refcount bursts when the pool
         is already small.
+
+        The memory_limit/3 term is additionally capped at 16 GiB: on
+        large-memory machines (soft limit ~438 GB on a 512 GB Studio) an
+        uncapped threshold (~146 GB) meant the periodic clear effectively
+        never fired, letting the pool hoard buffer *handles* against the
+        Metal per-process resource count even while byte usage stayed
+        modest (#3226).
         """
+        cap = 16 * 1024**3
         if self._memory_limit_bytes > 0:
-            return max(self._memory_limit_bytes // 3, 2 * 1024**3)
+            return min(max(self._memory_limit_bytes // 3, 2 * 1024**3), cap)
+
         return 2 * 1024**3
 
     def _should_periodic_clear_cache(self) -> bool:
@@ -2767,6 +2789,21 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+
+    def _model_has_arrays_cache(self) -> bool:
+        """Whether the model's cache layout contains ArraysCache layers."""
+        if not hasattr(self.model, "make_cache"):
+            return False
+        try:
+            cache_list = self.model.make_cache()
+        except Exception:
+            return False
+        if not cache_list:
+            return False
+
+        return any(
+            self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
+        )
 
     @staticmethod
     def _cache_tree_has_arrays_cache(cache_obj: Any) -> bool:
@@ -5450,6 +5487,7 @@ class Scheduler:
                 logger.error("Chunked prefill capacity rejected for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -5460,6 +5498,7 @@ class Scheduler:
                 logger.error("Chunked prefill failed for %s: %s", rid, e)
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
+                self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
@@ -9129,6 +9168,26 @@ class Scheduler:
             return 1
         return max(1, self.config.max_num_seqs)
 
+    def _drop_boundary_snapshots_for_request(self, request_id: str) -> None:
+        """Release a failed request's boundary snapshots (RAM and SSD).
+
+        The in-memory dict values can hold live mx.arrays (the SSD-store
+        fallback path), and the store keeps a per-request snapshot dir on
+        disk. Both are normally released in _cleanup_finished; error paths
+        must do the same or every failure strands a snapshot set until
+        process exit (#3226).
+        """
+        self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            try:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            except Exception as e:
+                logger.debug(
+                    "Boundary snapshot store cleanup failed for %s: %s",
+                    request_id,
+                    e,
+                )
+
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
 
@@ -9205,6 +9264,16 @@ class Scheduler:
             if uid is not None:
                 self.uid_to_request_id.pop(uid, None)
         self._generation_overflow_recovery_ids.difference_update(failed_ids)
+        # Drop boundary snapshots and paged-cache reservations for every
+        # failed request. Without this, each engine-loop failure strands a
+        # full per-request snapshot set (live mx.arrays for the in-memory
+        # fallback, orphaned snapshot dirs on SSD) and its block refs until
+        # process exit — a Metal buffer/byte ratchet across failures (#3226).
+        # failed_ids excludes _inflight_store_futures ids, so snapshots the
+        # async store worker still reads are left intact.
+        for rid in failed_ids:
+            self._drop_boundary_snapshots_for_request(rid)
+            self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
         # with it; survivors re-register at re-insert.
         _unregister_uid_rows_for_model(self.model)
@@ -11714,6 +11783,13 @@ class Scheduler:
                     if self._tokens_since_clear_cache >= 1024:
                         _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
+                        # Refresh the executor-owned MLX active-memory sample.
+                        # The background enforcer reads this cached value
+                        # during active decode; without a decode-side refresh
+                        # it stays frozen at the last prefill's reading for
+                        # the whole generation, blinding the hard-watermark
+                        # abort to decode-time growth (#3226).
+                        self._current_usage_bytes()
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.

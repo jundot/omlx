@@ -1933,7 +1933,16 @@ class BlockAwarePrefixCache(CacheManager):
         if self.paged_ssd_cache is None or not HAS_MLX:
             return True
         try:
-            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            # Inspection load only: do not promote into the hot cache. A
+            # legacy-cumulative block (pm-ineligible CacheList layouts, e.g.
+            # CacheList(KVCache, PoolingCache)) carries the full cumulative
+            # KV prefix; promoting every inspected block retains those
+            # oversized payloads in RAM for nothing when the common outcome
+            # is "payload already real, no rewrite" (#3226).
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
             if not data or not meta:
                 return False
             types = meta.get("layer_cache_types") or []
