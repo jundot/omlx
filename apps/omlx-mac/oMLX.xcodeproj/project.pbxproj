@@ -133,6 +133,7 @@
 		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
 		DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000113 /* PerformanceScreenVMTests.swift */; };
 		DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000114 /* UpdateInstallerTests.swift */; };
+		DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000115 /* AppUpdaterTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
@@ -277,6 +278,7 @@
 		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000113 /* PerformanceScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVMTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000114 /* UpdateInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstallerTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000115 /* AppUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdaterTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -347,6 +349,7 @@
 				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
 				DCC000000000000000000113 /* PerformanceScreenVMTests.swift */,
 				DCC000000000000000000114 /* UpdateInstallerTests.swift */,
+				DCC000000000000000000115 /* AppUpdaterTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -815,6 +818,7 @@
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
 				DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */,
+				DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
