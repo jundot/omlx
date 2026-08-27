@@ -1137,7 +1137,17 @@ def materialize_lazy_state(model: Any) -> None:
                 _scan_plain_object(value)
 
     if arrays:
-        mx.eval(arrays)
+        # Evaluate in bounded chunks rather than one mx.eval(arrays). A single
+        # eval over the whole parameter tree submits one Metal command buffer
+        # spanning every array; on a multi-hundred-GB checkpoint (e.g. the raw
+        # BF16 Qwen3.8-Flash-Next base, ~336 GB / 1676 arrays) that buffer
+        # exceeds the GPU command-buffer watchdog and aborts the process with
+        # "[METAL] Command buffer execution failed: Caused GPU Timeout Error
+        # (kIOGPUCommandBufferCallbackErrorTimeout)". Chunking bounds each
+        # command buffer; small models see only a handful of chunks. See #3179.
+        _MATERIALIZE_EVAL_CHUNK = 8
+        for start in range(0, len(arrays), _MATERIALIZE_EVAL_CHUNK):
+            mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
