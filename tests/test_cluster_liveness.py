@@ -25,10 +25,14 @@ from omlx.cluster.liveness import (
 HOSTS = {0: ("test-mbp", "127.0.0.1"), 1: ("mac-studio", "Studio.local")}
 
 
-def _marker(state_dir, deployment, rank, *, age_seconds=0.0, phase="ready", pid=None):
+def _marker(
+    state_dir, deployment, rank, *, age_seconds=0.0, phase="ready", pid=None, metrics=None
+):
     stamp = datetime.now(UTC) - timedelta(seconds=age_seconds)
     payload = {"phase": phase, "updated_at": stamp.isoformat(), "rank": rank}
     payload["pid"] = os.getpid() if pid is None else pid
+    if metrics is not None:
+        payload["metrics"] = metrics
     (state_dir / f"{deployment}-rank-{rank}.json").write_text(json.dumps(payload))
 
 
@@ -132,6 +136,113 @@ def test_a_remote_rank_without_a_local_marker_is_not_called_stale(tmp_path):
     assert remote.seconds_since_heartbeat is None
     assert remote.stale is False
     assert remote.healthy is True
+
+
+def test_a_successful_marker_read_skips_the_separate_probe(tmp_path):
+    """C3: a marker read already proves reachability -- don't pay for both."""
+
+    _marker(tmp_path, "d", 0, age_seconds=0)
+    _marker(tmp_path, "d", 1, age_seconds=0)
+
+    def explode(_target):
+        raise AssertionError("probe_peer must not run when the marker read succeeded")
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=explode, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+
+    assert all(h.reachable for h in health)
+    assert all(h.healthy for h in health)
+
+
+def test_a_failed_marker_read_falls_back_to_the_probe(tmp_path):
+    """A marker problem on an otherwise-reachable Mac must not read as a cable pull."""
+
+    probed = []
+
+    def probe(target):
+        probed.append(target)
+        return True
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=probe, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "not found"),
+    )
+
+    assert probed == ["Studio.local"], "the fallback probe must still run"
+    assert health[0].reachable is True
+    assert "no observable runtime heartbeat" in health[0].detail
+
+
+def test_a_failed_marker_read_and_a_failed_probe_is_still_a_cable_pull(tmp_path):
+    """Both signals failing must still report host-down, not a marker problem."""
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=lambda _target: False, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "connection refused"),
+    )
+
+    assert health[0].reachable is False
+    assert "Studio.local did not answer" in health[0].detail
+
+
+# --- §A1 part 2 / 2.2: raw progress metrics carried through from the marker.
+
+
+def test_progress_metrics_are_read_from_the_marker(tmp_path):
+    _marker(tmp_path, "d", 0, metrics={"active_requests": 1, "progress_ticks": 5})
+    _marker(tmp_path, "d", 1, metrics={"active_requests": 2, "progress_ticks": 17})
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    by_rank = {h.rank: h for h in health}
+
+    assert by_rank[0].active_requests == 1
+    assert by_rank[0].progress_ticks == 5
+    assert by_rank[1].active_requests == 2
+    assert by_rank[1].progress_ticks == 17
+    # A bare check_peers() call has no cross-poll history to judge staleness
+    # from -- only a caller holding that history (PeerWatchdog) may set it.
+    assert by_rank[0].stalled is False
+    assert by_rank[1].stalled is False
+
+
+def test_a_marker_with_no_metrics_yet_defaults_sensibly(tmp_path):
+    """A rank that has never served a request (or an older marker format
+    from before this field existed) must not be misread as "0 progress,
+    something's wrong" -- progress_ticks stays None (unknown), not 0."""
+
+    _marker(tmp_path, "d", 0)
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    rank0 = next(h for h in health if h.rank == 0)
+
+    assert rank0.active_requests == 0
+    assert rank0.progress_ticks is None
+
+
+def test_malformed_progress_metrics_are_ignored_not_crashed_on(tmp_path):
+    _marker(
+        tmp_path,
+        "d",
+        0,
+        metrics={"active_requests": "two", "progress_ticks": None},
+    )
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    rank0 = next(h for h in health if h.rank == 0)
+
+    assert rank0.active_requests == 0
+    assert rank0.progress_ticks is None
 
 
 def test_marker_age_survives_a_missing_or_broken_timestamp():
@@ -269,6 +380,141 @@ def test_a_healthy_cluster_keeps_the_watchdog_quiet(tmp_path):
 
     watchdog.run(sleep=fake_sleep)
     assert losses == []
+
+
+# ---------------------------------------------------------------------------
+# §A1 part 2 / 2.2: cross-poll stall detection is observability, not control.
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _active(rank, ticks, *, node_id="peer"):
+    return PeerHealth(
+        node_id,
+        rank,
+        True,
+        1.0,
+        heartbeat_required=True,
+        active_requests=1,
+        progress_ticks=ticks,
+    )
+
+
+def test_observe_marks_stalled_once_ticks_are_unchanged_past_the_threshold(tmp_path):
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    first = watchdog.observe((_active(1, 5),), now=0.0)
+    assert first[0].stalled is False
+
+    second = watchdog.observe((_active(1, 5),), now=0.5)
+    assert second[0].stalled is False, "not past the threshold yet"
+
+    third = watchdog.observe((_active(1, 5),), now=1.5)
+    assert third[0].stalled is True
+
+
+def test_observe_does_not_mark_stalled_while_ticks_advance(tmp_path):
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    for moment, ticks in ((0.0, 1), (2.0, 2), (4.0, 3), (6.0, 4)):
+        health = watchdog.observe((_active(1, ticks),), now=moment)
+        assert health[0].stalled is False
+
+
+def test_observe_never_flags_an_idle_rank_as_stalled(tmp_path):
+    """active_requests == 0 means there is nothing to make progress on --
+    unchanged ticks there is normal, not a wedge."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+    idle = PeerHealth(
+        "peer", 1, True, 1.0, heartbeat_required=True,
+        active_requests=0, progress_ticks=5,
+    )
+
+    watchdog.observe((idle,), now=0.0)
+    health = watchdog.observe((idle,), now=5.0)
+
+    assert health[0].stalled is False
+
+
+def test_observe_forgets_history_once_a_rank_goes_idle(tmp_path):
+    """Going idle then becoming active again must not inherit a stale
+    "last changed at" timestamp from a completely different request."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+    idle = PeerHealth(
+        "peer", 1, True, 1.0, heartbeat_required=True,
+        active_requests=0, progress_ticks=5,
+    )
+
+    watchdog.observe((_active(1, 5),), now=0.0)
+    watchdog.observe((idle,), now=100.0)  # goes idle; history should clear
+    health = watchdog.observe((_active(1, 5),), now=100.1)  # active again, same ticks
+
+    assert health[0].stalled is False, "fresh history, not 100s of fake staleness"
+
+
+def test_stalled_never_influences_healthy_or_status(tmp_path):
+    """Purely observational: run()'s failure-tolerance tracking must not
+    change behavior based on this signal."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    watchdog.observe((_active(1, 5),), now=0.0)
+    health = watchdog.observe((_active(1, 5),), now=5.0)
+
+    assert health[0].stalled is True
+    assert health[0].healthy is True
+    assert health[0].status == "healthy"
+
+
+def test_run_populates_last_health_with_the_observed_snapshot(tmp_path):
+    clock = _Clock()
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0, clock=clock,
+    )
+    calls = [0]
+
+    def fake_run_once():
+        calls[0] += 1
+        return (_active(1, 5),)
+
+    watchdog.run_once = fake_run_once  # type: ignore[method-assign]
+
+    def fake_sleep(_seconds):
+        clock.value += 2.0
+        if calls[0] >= 3:
+            watchdog.stop()
+
+    watchdog.run(sleep=fake_sleep)
+
+    assert watchdog.last_health[0].rank == 1
+    assert watchdog.last_health[0].stalled is True, (
+        "unchanged ticks across every poll, well past the threshold"
+    )
 
 
 # ---------------------------------------------------------------------------

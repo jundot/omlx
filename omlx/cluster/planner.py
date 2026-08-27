@@ -581,6 +581,36 @@ def _config_int(
     )
 
 
+def _config_truthy(config: dict[str, Any], key: str) -> bool:
+    """Whether a boolean/optional field is set anywhere ``_config_int``'s
+    text-config nesting would look for it."""
+
+    candidates = [config]
+    for nested in ("text_config", "language_config", "llm_config"):
+        value = config.get(nested)
+        if isinstance(value, dict):
+            candidates.append(value)
+    return any(bool(candidate.get(key)) for candidate in candidates)
+
+
+def _nemotron_h_tp_bias_unsafe(config: dict[str, Any]) -> bool:
+    """True if this nemotron_h config's biases would be silently wrong under
+    tensor parallelism.
+
+    ``shard_inplace`` + the external ``all_sum`` oMLX's MoE strategy wraps
+    around it (``_wrap_sharded_moe``) sums any per-rank bias retained inside
+    the wrapped module ``world_size`` times -- ``shared_experts`` with
+    ``mlp_bias`` and the unsharded ``fc2_latent_proj`` with ``mlp_bias`` both
+    hit this. The failure is silent (wrong outputs by a bias offset, nothing
+    crashes), so refuse TP outright rather than shipping it.
+    See docs/cluster-hardening-and-optimization.md §B1.
+    """
+
+    return _config_truthy(config, "mlp_bias") or _config_truthy(
+        config, "moe_latent_size"
+    )
+
+
 def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """Whether this architecture has a runtime-safe tensor strategy.
 
@@ -592,6 +622,8 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
 
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
+        return False
+    if model_type == "nemotron_h" and _nemotron_h_tp_bias_unsafe(config):
         return False
     if supports_model_type(model_type):
         return True

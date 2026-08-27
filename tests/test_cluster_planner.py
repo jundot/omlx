@@ -609,6 +609,75 @@ def test_nemotron_h_per_module_quant_overrides_tighten_the_guard():
     assert 29 in divisors  # 3712 / 128 under the override
 
 
+def test_nemotron_h_tp_refused_when_mlp_bias_set():
+    """§B1: shard_inplace + the external all_sum around _wrap_sharded_moe
+    sums any per-rank bias world_size times -- silently wrong outputs, not a
+    crash. Refuse TP outright for mlp_bias=true rather than ship the bug."""
+
+    from omlx.cluster.planner import _supports_tensor_parallel
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mlp_bias": True,
+    }
+    assert _supports_tensor_parallel(config) is False
+
+
+def test_nemotron_h_tp_refused_when_moe_latent_size_set():
+    """§B1: fc2_latent_proj is left unsharded/replicated; with mlp_bias that
+    is also summed world_size times through the same wrapper -- same refusal
+    as the mlp_bias case, on the other exposed site."""
+
+    from omlx.cluster.planner import _supports_tensor_parallel
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "moe_latent_size": 512,
+    }
+    assert _supports_tensor_parallel(config) is False
+
+
+def test_nemotron_h_tp_refusal_checks_nested_text_config():
+    """Mirrors _config_int's own nested-config walk (mamba_num_heads etc.
+    already rely on it for wrapped checkpoints) so a config that nests its
+    decoder fields under text_config is not silently treated as safe."""
+
+    from omlx.cluster.planner import _supports_tensor_parallel
+
+    config = {
+        "model_type": "nemotron_h",
+        "text_config": {
+            "num_attention_heads": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "mlp_bias": True,
+        },
+    }
+    assert _supports_tensor_parallel(config) is False
+
+
+def test_nemotron_h_tp_allowed_without_biased_or_latent_moe():
+    """The common case -- the checkpoint actually staged on this coordinator
+    (mlp_bias=false, no moe_latent_size) -- must not regress to refused."""
+
+    from omlx.cluster.planner import _supports_tensor_parallel
+
+    config = {
+        "model_type": "nemotron_h",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "mlp_bias": False,
+    }
+    assert _supports_tensor_parallel(config) is True
+
+
 def test_nemotron_h_head_dim_falls_back_to_hidden_over_heads():
     """A config without head_dim must not silently drop the attention
     constraint; the runtime falls back to hidden_size // heads and so must

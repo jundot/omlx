@@ -31,7 +31,7 @@ import shlex
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,18 @@ class PeerHealth:
     detail: str = ""
     heartbeat_required: bool = False
     process_live: bool | None = None
+    # §A1 part 2 / 2.2: raw values from the rank's published
+    # RuntimeTelemetry snapshot (``metrics.active_requests`` /
+    # ``metrics.progress_ticks``), carried through for observability. A
+    # single snapshot cannot tell "stalled" from "just started" -- that
+    # needs comparing consecutive polls, which only a caller holding
+    # cross-poll state (``PeerWatchdog``) can do. ``stalled`` defaults to
+    # False and is set True only by such a caller; a bare ``check_peers()``
+    # call (e.g. the dashboard's one-shot per-request reads) has no
+    # history to judge from and reports False honestly rather than guess.
+    active_requests: int = 0
+    progress_ticks: int | None = None
+    stalled: bool = False
 
     @property
     def healthy(self) -> bool:
@@ -116,6 +128,9 @@ class PeerHealth:
             "heartbeat_required": self.heartbeat_required,
             "process_live": self.process_live,
             "detail": self.detail,
+            "active_requests": self.active_requests,
+            "progress_ticks": self.progress_ticks,
+            "stalled": self.stalled,
         }
 
 
@@ -304,6 +319,22 @@ def marker_age_seconds(marker: dict[str, Any], *, now: float | None = None) -> f
     return max(0.0, current - stamp.timestamp())
 
 
+def _marker_metric_int(marker: dict[str, Any] | None, key: str) -> int | None:
+    """An integer field from the marker's published ``RuntimeTelemetry``
+    snapshot (``marker["metrics"][key]``), or None when absent/malformed --
+    an older marker, or a rank that has not published a snapshot yet."""
+
+    if not marker:
+        return None
+    metrics = marker.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def check_peers(
     hosts_by_rank: dict[int, tuple[str, str]],
     *,
@@ -331,18 +362,23 @@ def check_peers(
     A marker whose writing process is gone is treated as absent rather than
     stale. It is the debris of a crashed run, not evidence about this one, and
     calling it stale wedged every subsequent activation of the same model.
+
+    When a runtime heartbeat is required, the marker is read *before* the
+    separate SSH probe: a successful read already proves reachability, so the
+    probe only runs to tell "host down" from "marker problem" when the read
+    fails. On the healthy path this halves the SSH round trips per refresh.
     """
 
     local_root = Path(state_dir).expanduser()
     remote_root = Path(state_dir)
     health = []
     for rank, (node_id, ssh_target) in sorted(hosts_by_rank.items()):
-        reachable = probe(ssh_target)
         marker: dict[str, Any] | None = None
         process_live: bool | None = None
         marker_error = ""
         marker_clock = now
-        if reachable and require_heartbeat and deployment_id:
+        heartbeat_wanted = require_heartbeat and bool(deployment_id)
+        if heartbeat_wanted:
             name = f"{deployment_id}-rank-{rank}.json"
             if ssh_target in _LOOPBACK_TARGETS:
                 marker = read_marker(local_root / name)
@@ -351,6 +387,9 @@ def check_peers(
                 marker, process_live, marker_clock, marker_error = remote_reader(
                     ssh_target, str(remote_root / name)
                 )
+        reachable = marker is not None if heartbeat_wanted else False
+        if not reachable:
+            reachable = probe(ssh_target)
         age = marker_age_seconds(marker, now=marker_clock) if marker else None
         if not reachable:
             detail = f"{ssh_target} did not answer"
@@ -371,6 +410,8 @@ def check_peers(
                 detail=detail,
                 heartbeat_required=require_heartbeat,
                 process_live=process_live,
+                active_requests=_marker_metric_int(marker, "active_requests") or 0,
+                progress_ticks=_marker_metric_int(marker, "progress_ticks"),
             )
         )
     return tuple(health)
@@ -457,11 +498,14 @@ class PeerWatchdog:
         serving_interval: float | None = None,
         on_lost: Callable[[str], None] | None = None,
         failure_tolerance: int = _DEFAULT_FAILURE_TOLERANCE,
+        stalled_after: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._hosts = hosts_by_rank
         self._deployment_id = deployment_id
         self._state_dir = state_dir
         self._interval = max(0.0, float(interval))
+        self._clock = clock
         # Loading a very large model is a noisy, minutes-long cold-start lane:
         # probing it aggressively creates false failures and needless SSH
         # traffic. Once every peer reports ready, a dead cable or process is
@@ -477,6 +521,17 @@ class PeerWatchdog:
         self._consecutive_failures: dict[int, int] = {
             rank: 0 for rank in hosts_by_rank
         }
+        # §A1 part 2 / 2.2: three missed serving-lane polls, matching the
+        # "three missed intervals" convention _DEFAULT_STALE_AFTER already
+        # uses -- the fast lane because a stall matters most while actively
+        # serving, which is exactly when that lane is active.
+        self._stalled_after = (
+            3 * self._serving_interval
+            if stalled_after is None
+            else max(0.0, float(stalled_after))
+        )
+        self._progress_history: dict[int, tuple[int, float]] = {}
+        self.last_health: tuple[PeerHealth, ...] = ()
         self._stop = False
 
     def stop(self) -> None:
@@ -490,6 +545,48 @@ class PeerWatchdog:
             require_heartbeat=True,
         )
 
+    def observe(
+        self, health: tuple[PeerHealth, ...], *, now: float | None = None
+    ) -> tuple[PeerHealth, ...]:
+        """Augment a health snapshot with cross-poll stall detection.
+
+        A single ``PeerHealth`` snapshot cannot tell "stalled" from "just
+        started" or "not serving anything" -- that needs comparing
+        consecutive polls, which only a caller holding history across
+        calls (this watchdog) can do. Observability only:
+        ``PeerHealth.stalled`` never feeds ``healthy``/``status``, so it
+        cannot affect ``run()``'s failure-tolerance tracking or
+        ``on_lost`` -- a stalled rank is still reported healthy here, on
+        purpose (§A1 part 2 is explicitly "no automatic kill from this
+        signal at first").
+        """
+
+        moment = self._clock() if now is None else now
+        augmented = []
+        for item in health:
+            stalled = False
+            if (
+                item.heartbeat_required
+                and item.active_requests > 0
+                and item.progress_ticks is not None
+            ):
+                previous = self._progress_history.get(item.rank)
+                if previous is None or previous[0] != item.progress_ticks:
+                    self._progress_history[item.rank] = (item.progress_ticks, moment)
+                else:
+                    _, changed_at = previous
+                    stalled = (moment - changed_at) >= self._stalled_after
+            else:
+                # Idle, unreachable, or a marker with no metrics yet: any
+                # past history is not evidence about the current state, and
+                # keeping it risks a stale timestamp reading as an instant
+                # "stalled" the moment this rank starts a new request that
+                # happens to land on the same tick count it had before.
+                self._progress_history.pop(item.rank, None)
+            augmented.append(replace(item, stalled=stalled) if stalled else item)
+        self.last_health = tuple(augmented)
+        return self.last_health
+
     def run(self, *, sleep: Callable[[float], None] = time.sleep) -> None:
         if not self._hosts:
             # Nothing to watch. A rank alone in its own host map used to watch
@@ -500,7 +597,7 @@ class PeerWatchdog:
             sleep(poll_interval)
             if self._stop:
                 return
-            health = self.run_once()
+            health = self.observe(self.run_once())
             # Change lanes only on an entirely healthy observation. A timeout
             # has no phase, and must not silently restore the long cold-start
             # cadence immediately after a ready cluster loses its cable.

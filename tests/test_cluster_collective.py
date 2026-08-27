@@ -2,6 +2,7 @@
 """Tests for the local MLX collective diagnostic."""
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -10,6 +11,7 @@ from omlx.cluster.collective import (
     CollectiveSmokeError,
     _run_local_minimax_decode_smoke,
     run_local_collective_smoke,
+    run_local_generation_wedge_smoke,
     run_local_pipeline_smoke,
 )
 
@@ -176,3 +178,103 @@ def test_local_minimax_decode_smoke_validates_real_rank_roles():
     assert result["steps"] == 3
     assert result["ranks"][0]["skip_logits"] is False
     assert result["ranks"][1]["skip_logits"] is True
+
+
+def test_generation_wedge_smoke_rejects_unknown_mode(tmp_path):
+    with pytest.raises(ValueError, match="mode"):
+        run_local_generation_wedge_smoke(mode="exploded", state_dir=tmp_path)
+
+
+def test_generation_wedge_smoke_rejects_invalid_port(tmp_path):
+    with pytest.raises(ValueError, match="starting_port"):
+        run_local_generation_wedge_smoke(
+            mode="caught", state_dir=tmp_path, starting_port=65535
+        )
+
+
+def test_generation_wedge_smoke_reports_a_clean_stop_as_not_wedged(tmp_path):
+    def runner(argv, *, timeout):
+        assert "omlx.cluster.generation_wedge_worker" in argv
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    result = run_local_generation_wedge_smoke(
+        mode="caught", state_dir=tmp_path, runner=runner, starting_port=43000
+    )
+
+    assert result == {
+        "mode": "caught",
+        "wedged": False,
+        "ok": True,
+        "elapsed_seconds": pytest.approx(0.0, abs=5.0),
+        "returncode": 0,
+    }
+
+
+def test_generation_wedge_smoke_reports_a_launcher_timeout_as_wedged(tmp_path):
+    def runner(argv, *, timeout):
+        raise CollectiveSmokeError("MLX collective did not finish within 6.00s")
+
+    result = run_local_generation_wedge_smoke(
+        mode="killed", state_dir=tmp_path, runner=runner, starting_port=43000
+    )
+
+    assert result["wedged"] is True
+    assert result["ok"] is False
+    assert result["returncode"] is None
+
+
+def test_generation_wedge_smoke_configures_the_worker_through_the_environment(
+    tmp_path,
+):
+    """The worker reads its config from the environment, not argv (simpler
+    than threading extra args through mlx's own launcher CLI) -- confirm the
+    right variables reach the runner's environment at call time and are
+    fully restored afterward, since this mutates process-global state."""
+
+    os.environ["OMLX_WEDGE_MODE"] = "leftover-from-a-previous-run"
+    seen = {}
+
+    def runner(argv, *, timeout):
+        seen.update(
+            {key: os.environ.get(key) for key in os.environ if key.startswith("OMLX_WEDGE_")}
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    run_local_generation_wedge_smoke(
+        mode="killed",
+        state_dir=tmp_path,
+        deployment_id="probe-run",
+        steps=7,
+        fatal_step=3,
+        fatal_rank=0,
+        runner=runner,
+        starting_port=43000,
+    )
+
+    assert seen == {
+        "OMLX_WEDGE_MODE": "killed",
+        "OMLX_WEDGE_STEPS": "7",
+        "OMLX_WEDGE_FATAL_STEP": "3",
+        "OMLX_WEDGE_FATAL_RANK": "0",
+        "OMLX_WEDGE_STATE_DIR": str(tmp_path),
+        "OMLX_WEDGE_DEPLOYMENT_ID": "probe-run",
+    }
+    # The pre-existing (unrelated) value is restored, not left as "killed".
+    assert os.environ.pop("OMLX_WEDGE_MODE") == "leftover-from-a-previous-run"
+
+
+def test_generation_wedge_smoke_leaves_no_env_vars_behind_when_none_preexisted(
+    tmp_path,
+):
+    for key in list(os.environ):
+        if key.startswith("OMLX_WEDGE_"):
+            del os.environ[key]
+
+    def runner(argv, *, timeout):
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    run_local_generation_wedge_smoke(
+        mode="caught", state_dir=tmp_path, runner=runner, starting_port=43000
+    )
+
+    assert not any(key.startswith("OMLX_WEDGE_") for key in os.environ)

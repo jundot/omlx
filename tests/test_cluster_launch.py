@@ -223,6 +223,79 @@ def test_supervisor_preserves_structured_peer_loss_reason():
     assert "generic launcher noise" not in supervisor._exit_detail(1)
 
 
+def test_supervisor_recognizes_launcher_lost_as_fatal():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    reason = "rank launcher parent changed from 1 to 1; the rank cannot safely continue"
+
+    supervisor._drain(
+        io.StringIO(
+            f'{launch._EVENT_PREFIX}{{"type":"launcher_lost","reason":"{reason}"}}\n'
+        ),
+        supervisor._stdout,
+        True,
+    )
+
+    assert supervisor.failure_event == {"type": "launcher_lost", "reason": reason}
+
+
+def test_an_informational_event_with_a_reason_key_does_not_latch_failure(caplog):
+    """E2: matching on type, not key presence -- an unrecognized event with a
+    ``reason``/``error`` key must not brick a healthy deployment, but should
+    still be logged so a genuinely new fatal type isn't silently swallowed."""
+
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+
+    with caplog.at_level("WARNING", logger="omlx.cluster.launch"):
+        supervisor._drain(
+            io.StringIO(
+                f'{launch._EVENT_PREFIX}'
+                '{"type":"progress","reason":"loading shard 2 of 8"}\n'
+            ),
+            supervisor._stdout,
+            True,
+        )
+
+    assert supervisor.failure_event is None
+    assert any("not a recognized fatal type" in message for message in caplog.messages)
+
+
+def test_fatal_event_types_covers_every_reason_or_error_carrying_emitter():
+    """The allow-list must not silently fall behind the emitters it guards."""
+
+    import ast
+
+    from omlx.cluster import inference_worker
+
+    source = Path(inference_worker.__file__).read_text()
+    tree = ast.parse(source)
+
+    emitted_fatal_types = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else None
+        if name not in ("emit_event", "_emit_event"):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Dict):
+            continue
+        payload = node.args[0]
+        keys = [k.value for k in payload.keys if isinstance(k, ast.Constant)]
+        if "reason" not in keys and "error" not in keys:
+            continue
+        type_index = keys.index("type") if "type" in keys else None
+        if type_index is None:
+            continue
+        type_value = payload.values[type_index]
+        assert isinstance(type_value, ast.Constant), (
+            "a literal event type is required for this test to enumerate it"
+        )
+        emitted_fatal_types.add(type_value.value)
+
+    assert emitted_fatal_types, "no reason/error-carrying emit_event call found -- test is stale"
+    assert emitted_fatal_types == launch._FATAL_EVENT_TYPES
+
+
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     supervisor._stderr.append(
@@ -249,6 +322,70 @@ def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
 
     assert "rank 0 (local): InsufficientMemoryError" in detail
     assert "CalledProcessError" not in detail
+
+
+def test_supervisor_status_snapshot_is_serialized_against_concurrent_drain_appends():
+    """§C2 deterministic repro: pause status()'s _stderr iteration exactly
+    mid-flight (via a deque subclass) and, from a second thread, perform a
+    real _drain-style append while paused.
+
+    If status() holds ``self._condition`` across the whole snapshot, the
+    append blocks until status() finishes -- no crash, no interleaving. If
+    it doesn't, the append lands mid-iteration and the real deque's own
+    mutation-during-iteration check raises ``RuntimeError`` -- which sits on
+    status()'s per-request call path and would fail an unrelated request.
+    A GIL-timing race (hammering both concurrently) is not reliable enough
+    to trust either way; this forces the interleaving instead of hoping for
+    it.
+    """
+
+    import collections
+    import threading
+    import time
+
+    paused = threading.Event()
+    resume = threading.Event()
+
+    class _PausingDeque(collections.deque):
+        def __iter__(self):
+            it = super().__iter__()
+            first = next(it)
+            paused.set()
+            assert resume.wait(timeout=5), "test deadlocked waiting for resume"
+            yield first
+            yield from it
+
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor._stderr = _PausingDeque(f"line {i}" for i in range(5))
+
+    status_result = {}
+
+    def _call_status():
+        try:
+            status_result["value"] = supervisor.status()
+        except BaseException as exc:  # noqa: BLE001 - captured for the assert
+            status_result["error"] = exc
+
+    status_thread = threading.Thread(target=_call_status)
+    status_thread.start()
+    assert paused.wait(timeout=5), "status() never reached mid-iteration"
+
+    append_thread = threading.Thread(
+        target=supervisor._drain,
+        args=(iter(["extra launcher line\n"]), supervisor._stderr, False),
+    )
+    append_thread.start()
+    # Give the append a moment to either land immediately (unfixed) or block
+    # on the lock status() holds (fixed) before letting status() resume.
+    time.sleep(0.05)
+    resume.set()
+
+    status_thread.join(timeout=5)
+    append_thread.join(timeout=5)
+
+    assert not status_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert "error" not in status_result, status_result.get("error")
 
 
 def test_supervisor_collects_every_rank_ready_event():
