@@ -788,21 +788,30 @@ def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
     is why the match is kept narrow. Giving the classifier its own small, fast
     model is the better long-term answer and is tracked in #2.
 
-    Three conditions must all hold:
+    Four conditions must all hold:
 
     1. the system prompt contains the security-monitor marker anywhere,
     2. the request is not streaming — the classifier never streams,
     3. the request carries no tools — an ordinary conversation turn that merely
-       *discusses* the classifier still has Claude Code's tool array attached.
+       *discusses* the classifier still has Claude Code's tool array attached,
+    4. at least one of the envelope traits in ``classifier_envelope_drift``
+       still holds — a request sharing *only* the marker sentence with the
+       real classifier envelope (every trait drifted) is not corroborated as
+       the classifier and is treated as an ordinary turn instead. Partial
+       drift (Claude Code changed one trait) still matches, by design: that
+       is the whole point of tracking drift separately from the match.
 
-    Conditions 2 and 3 are what keep a normal turn from ever matching.
+    Conditions 2 through 4 are what keep a normal turn — including one that
+    merely echoes the marker sentence in unrelated content — from matching.
     """
     system_text = _extract_system_text(request.system) if request.system else ""
     if _CLASSIFIER_SYSTEM_MARKER not in system_text.lower():
         return False
     if request.stream is True:
         return False
-    return not request.tools
+    if request.tools:
+        return False
+    return len(classifier_envelope_drift(request)) < 3
 
 
 def classifier_envelope_drift(request: MessagesRequest) -> list[str]:

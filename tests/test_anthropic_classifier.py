@@ -138,6 +138,26 @@ class TestIsAutoModeClassifierRequest:
         )
         assert is_auto_mode_classifier_request(req) is False
 
+    def test_rejects_total_envelope_drift(self):
+        """The marker alone is not enough: a request sharing only the marker
+        sentence with zero other classifier envelope traits (oversized
+        max_tokens, no matching stop_sequence, no transcript tags) is not
+        corroborated as the classifier."""
+        req = _request(
+            _classifier_payload(
+                max_tokens=99999,
+                stop_sequences=[],
+                messages=[{"role": "user", "content": "no tags here"}],
+            )
+        )
+        assert is_auto_mode_classifier_request(req) is False
+
+    def test_matches_on_partial_envelope_drift(self):
+        """A single drifted trait (Claude Code changed one envelope detail)
+        must still match — only total drift disqualifies the marker match."""
+        req = _request(_classifier_payload(max_tokens=99999))
+        assert is_auto_mode_classifier_request(req) is True
+
     def test_rejects_billing_header_alone(self):
         """Regression guard for issue #1.
 
