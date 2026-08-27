@@ -11,7 +11,11 @@ generative (hypothesis) tests (#5).
 from hypothesis import given
 from hypothesis import strategies as st
 
-from omlx.api.anthropic_models import ContentBlockText, ContentBlockToolUse, SystemContent
+from omlx.api.anthropic_models import (
+    ContentBlockText,
+    ContentBlockToolUse,
+    SystemContent,
+)
 from omlx.api.anthropic_utils import (
     _BILLING_HEADER_PREFIX,
     _extract_system_text,
@@ -91,7 +95,9 @@ def test_extract_system_text_always_drops_billing_header_blocks(blocks):
     """Every non-billing-header block's text survives, joined in order; every
     billing-header block's text never appears as a joined line (#8)."""
     result = _extract_system_text(blocks)
-    expected = "\n".join(b.text for b in blocks if not b.text.startswith(_BILLING_HEADER_PREFIX))
+    expected = "\n".join(
+        b.text for b in blocks if not b.text.startswith(_BILLING_HEADER_PREFIX)
+    )
     assert result == expected
 
 

@@ -763,7 +763,9 @@ def _normalize_in_messages_system(
             if content:
                 extracted_parts.append(content)
         elif isinstance(content, list):
-            extracted_parts.extend(text for text in _text_from_content_blocks(content) if text)
+            extracted_parts.extend(
+                text for text in _text_from_content_blocks(content) if text
+            )
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:

@@ -172,7 +172,9 @@ class TestTruncateToolResult:
     # from the line-boundary heuristic (already covered by the example tests
     # above).
     _word = st.text(
-        alphabet=st.characters(blacklist_characters=" \n\t", blacklist_categories=("Cs",)),
+        alphabet=st.characters(
+            blacklist_characters=" \n\t", blacklist_categories=("Cs",)
+        ),
         min_size=1,
         max_size=8,
     )
