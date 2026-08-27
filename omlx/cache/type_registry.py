@@ -18,6 +18,7 @@ from .type_handlers import (
     KVCacheHandler,
     MiniMaxM3BatchKVCacheHandler,
     MiniMaxM3KVCacheHandler,
+    QSAKVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -73,6 +74,7 @@ class CacheTypeRegistry:
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
         "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
         "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
+        "QSAKVCache": CacheType.QSA_KVCACHE,
     }
 
     # Default handler instance
@@ -263,6 +265,7 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(CacheListHandler())
     CacheTypeRegistry.register(MiniMaxM3KVCacheHandler())
     CacheTypeRegistry.register(MiniMaxM3BatchKVCacheHandler())
+    CacheTypeRegistry.register(QSAKVCacheHandler())
 
 
 # Initialize handlers when module is imported

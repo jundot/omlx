@@ -40,6 +40,7 @@ class CacheType(Enum):
     BATCH_POOLING_CACHE = "BatchPoolingCache"
     MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
     MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
+    QSA_KVCACHE = "QSAKVCache"
 
 
 @dataclass
@@ -422,6 +423,189 @@ class KVCacheHandler(CacheTypeHandler):
         cache.offset = keys.shape[2]
 
         return cache
+
+
+class QSAKVCacheHandler(KVCacheHandler):
+    """Handler for Qwen sparse-attention KV plus side-indexer state."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QSA_KVCACHE
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("indexer_keys", 1, True),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        offset = int(getattr(cache_obj, "offset", 0) or 0)
+        keys = getattr(cache_obj, "keys", None)
+        values = getattr(cache_obj, "values", None)
+        if keys is not None:
+            keys = keys[..., :offset, :]
+        if values is not None:
+            values = values[..., :offset, :]
+
+        indexer_offset = int(getattr(cache_obj, "indexer_offset", 0) or 0)
+        indexer_keys = getattr(cache_obj, "indexer_keys", None)
+        if indexer_keys is not None:
+            indexer_keys = indexer_keys[:, :indexer_offset, :]
+        return (keys, values, indexer_keys)
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        return (
+            int(getattr(cache_obj, "offset", 0) or 0),
+            int(getattr(cache_obj, "indexer_offset", 0) or 0),
+        )
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        keys, values, indexer_keys = self.serialize_state(cache_obj)
+        return {
+            "keys": keys,
+            "values": values,
+            "indexer_keys": indexer_keys,
+            "states": (keys, values, indexer_keys),
+            "offset": int(getattr(cache_obj, "offset", 0) or 0),
+            "indexer_offset": int(
+                getattr(cache_obj, "indexer_offset", 0) or 0
+            ),
+            "cache_type": self.cache_type.value,
+        }
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
+            return int(keys.shape[2])
+        indexer_keys = state.get("indexer_keys")
+        if (
+            indexer_keys is not None
+            and hasattr(indexer_keys, "shape")
+            and len(indexer_keys.shape) >= 2
+        ):
+            return int(indexer_keys.shape[1])
+        return 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+        keys = state.get("keys")
+        values = state.get("values")
+        indexer_keys = state.get("indexer_keys")
+        if keys is None or values is None or indexer_keys is None:
+            return None
+        try:
+            seq_len = int(keys.shape[2])
+            actual_end = min(end_idx, seq_len, int(indexer_keys.shape[1]))
+            if start_idx >= actual_end:
+                return None
+            keys_slice = keys[:, :, start_idx:actual_end, :]
+            values_slice = values[:, :, start_idx:actual_end, :]
+            indexer_slice = indexer_keys[:, start_idx:actual_end, :]
+            return {
+                "keys": keys_slice,
+                "values": values_slice,
+                "indexer_keys": indexer_slice,
+                "states": (keys_slice, values_slice, indexer_slice),
+                "cache_type": self.cache_type.value,
+            }
+        except Exception as e:
+            logger.warning("Failed to slice QSAKVCache state: %s", e)
+            return None
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+        keys_list = [s.get("keys") for s in states if s.get("keys") is not None]
+        values_list = [
+            s.get("values") for s in states if s.get("values") is not None
+        ]
+        indexer_list = [
+            s.get("indexer_keys")
+            for s in states
+            if s.get("indexer_keys") is not None
+        ]
+        if (
+            not keys_list
+            or len(values_list) != len(keys_list)
+            or len(indexer_list) != len(keys_list)
+        ):
+            return {}
+        keys = mx.concatenate(keys_list, axis=2)
+        values = mx.concatenate(values_list, axis=2)
+        indexer_keys = mx.concatenate(indexer_list, axis=1)
+        return {
+            "keys": keys,
+            "values": values,
+            "indexer_keys": indexer_keys,
+            "states": (keys, values, indexer_keys),
+            "offset": int(keys.shape[2]),
+            "indexer_offset": int(indexer_keys.shape[1]),
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+        except Exception as e:  # noqa: BLE001
+            logger.error("mlx-vlm QSAKVCache unavailable: %s", e)
+            return None
+
+        keys = elements[0] if len(elements) > 0 else None
+        values = elements[1] if len(elements) > 1 else None
+        indexer_keys = elements[2] if len(elements) > 2 else None
+        if keys is None or values is None or indexer_keys is None:
+            return None
+        if int(keys.shape[2]) != int(indexer_keys.shape[1]):
+            logger.error(
+                "QSAKVCache state length mismatch: kv=%d indexer=%d",
+                int(keys.shape[2]),
+                int(indexer_keys.shape[1]),
+            )
+            return None
+
+        cache = QSAKVCache()
+        cache.keys = keys
+        cache.values = values
+        cache.offset = int(keys.shape[2])
+        cache.indexer_keys = indexer_keys
+        cache.indexer_offset = int(indexer_keys.shape[1])
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = (
+                state.get("keys"),
+                state.get("values"),
+                state.get("indexer_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+    def _get_state_keys(self) -> tuple[str, ...]:
+        return ("keys", "values", "indexer_keys")
+
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
+        return ("offset", "indexer_offset")
 
 
 class RotatingKVCacheHandler(CacheTypeHandler):
