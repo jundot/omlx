@@ -1169,3 +1169,44 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
         await engine.preflight_chat([{"role": "user", "content": "hi"}])
     finally:
         await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_peer_health_refresh_logs_its_elapsed_time(monkeypatch, caplog):
+    """0.2: one log line per refresh, so a day of normal serving traffic can
+    validate D1's priority and 1.4's claimed halving without extra tooling."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed, "check_peers", lambda hosts, **kwargs: (SimpleNamespace(healthy=True),)
+    )
+    try:
+        with caplog.at_level("INFO", logger="omlx.engine.distributed"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+            await engine.preflight_completion("hi")  # served from cache, no 2nd line
+        matches = [m for m in caplog.messages if "peer health refresh took" in m]
+        assert len(matches) == 1
+        assert "2 peer(s)" in matches[0]
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_peer_health_refresh_logs_even_when_the_probe_breaks(monkeypatch, caplog):
+    """The timing line must survive a broken probe: placed after the
+    try/except/else, not something only the success branch reaches."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+
+    def broken_check_peers(hosts, **kwargs):
+        raise OSError("ssh binary missing")
+
+    monkeypatch.setattr(distributed, "check_peers", broken_check_peers)
+    try:
+        with caplog.at_level("INFO", logger="omlx.engine.distributed"):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert any("peer health refresh took" in m for m in caplog.messages)
+    finally:
+        await engine._client.aclose()
