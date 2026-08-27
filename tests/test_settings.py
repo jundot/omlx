@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from omlx.config import OMLXConfig
 from omlx.settings import (
@@ -2796,6 +2798,36 @@ class TestClaudeCodeRouteIntegration:
         reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
         assert reloaded.mode == "cloud"
         assert reloaded.opus_model is None
+
+    @given(
+        mode=st.text(),
+        opus_model=st.none() | st.text(),
+        sonnet_model=st.none() | st.text(),
+        haiku_model=st.none() | st.text(),
+        steer_classifier_requests=st.booleans(),
+        classifier_model_tier=st.text(),
+    )
+    def test_claude_code_settings_round_trip_property(
+        self,
+        mode,
+        opus_model,
+        sonnet_model,
+        haiku_model,
+        steer_classifier_requests,
+        classifier_model_tier,
+    ):
+        """from_dict(to_dict(x)) == x for arbitrary field combinations,
+        across all six ClaudeCodeSettings fields."""
+        original = ClaudeCodeSettings(
+            mode=mode,
+            opus_model=opus_model,
+            sonnet_model=sonnet_model,
+            haiku_model=haiku_model,
+            steer_classifier_requests=steer_classifier_requests,
+            classifier_model_tier=classifier_model_tier,
+        )
+        reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
+        assert reloaded == original
 
     def test_post_handler_model_fields_set_explicit_null(self):
         """
