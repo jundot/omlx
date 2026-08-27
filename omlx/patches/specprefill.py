@@ -26,6 +26,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -349,6 +350,7 @@ def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None)
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
+    chunks = 0
     while n - processed > 1:
         chunk = min(step_size, n - processed - 1)
         if progress_callback is not None:
@@ -359,8 +361,13 @@ def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None)
         model(prompt[processed : processed + chunk][None], cache=cache)
         mx.eval([c.state for c in cache])
         processed += chunk
+        chunks += 1
         if progress_callback is not None:
             progress_callback(processed, n)
+        retain_one = os.environ.get("OMLX_SPECPREFILL_DRAFT_CLEAR_EVERY_2") == "1"
+        if not retain_one or chunks % 2 == 0:
+            mx.clear_cache()
+    if chunks % 2:
         mx.clear_cache()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
@@ -503,8 +510,19 @@ def score_tokens(
         query_extractor = _detect_query_extractor(attn_obj)
 
     # Phase 1: Prefill (full or suffix-only if cache provided)
+    preallocate_draft_kv = (
+        os.environ.get("OMLX_SPECPREFILL_DRAFT_PREALLOCATE") == "1"
+    )
+
+    def configure_draft_cache(cache):
+        if preallocate_draft_kv:
+            for cache_layer in cache:
+                if type(cache_layer).__name__ == "KVCache":
+                    cache_layer.step = max(int(cache_layer.step), n_prompt)
+        return cache
+
     if existing_cache is not None:
-        cache = existing_cache
+        cache = configure_draft_cache(existing_cache)
         cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
@@ -524,7 +542,7 @@ def score_tokens(
             logits = model(mx.array([tokens[-1]])[None], cache=cache)
             mx.eval(logits)
     else:
-        cache = make_prompt_cache(model)
+        cache = configure_draft_cache(make_prompt_cache(model))
         logits = _prefill_draft(
             model,
             tokens,

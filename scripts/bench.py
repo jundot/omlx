@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -79,6 +80,28 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Warmup runs before timing (default: 1)",
+    )
+    p.add_argument(
+        "--settings-base",
+        type=Path,
+        default=None,
+        help=(
+            "Load persisted per-model settings from this oMLX base directory "
+            "(for example ~/.omlx); default: benchmark model defaults"
+        ),
+    )
+    p.add_argument(
+        "--repeats",
+        metavar="N",
+        type=int,
+        default=1,
+        help="Measured trials per single-request PP length (default: 1)",
+    )
+    p.add_argument(
+        "--context-profile",
+        choices=("code_python", "code_mixed", "novel_ko", "novel_en", "novel_ja"),
+        default="code_python",
+        help="Bundled benchmark corpus profile (default: code_python)",
     )
     return p.parse_args()
 
@@ -125,6 +148,9 @@ async def _bench_model(
     gen_tokens: int,
     batch_sizes: list[int],
     warmup: int,
+    model_settings=None,
+    repeats: int = 1,
+    context_profile: str = "code_python",
 ) -> tuple[list[dict], list[dict]]:
     """Load one model, run all tests, unload.  Returns (single_results, batch_results)."""
     from omlx.admin.benchmark import (
@@ -136,33 +162,50 @@ async def _bench_model(
 
     print(f"\nLoading {model_path} …")
     t0 = time.perf_counter()
-    engine = VLMBatchedEngine(model_path)
+    engine = VLMBatchedEngine(model_path, model_settings=model_settings)
     await engine.start()
     print(f"Loaded in {time.perf_counter() - t0:.1f}s")
 
     tokenizer = engine.tokenizer
-    prompts: dict[int, str] = {pp: _generate_prompt(tokenizer, pp) for pp in sorted(set(pp_lengths))}
 
     if warmup > 0 and pp_lengths:
         warmup_pp = min(pp_lengths)
         print(f"Warming up ({warmup}× pp={warmup_pp}) …")
         for _ in range(warmup):
-            await _run_single_test(engine, prompts[warmup_pp], gen_tokens, warmup_pp)
+            warmup_prompt = _generate_prompt(tokenizer, warmup_pp, context_profile)
+            await _run_single_test(engine, warmup_prompt, gen_tokens, warmup_pp)
 
     single_results: list[dict] = []
     for pp in sorted(pp_lengths):
-        print(f"  pp={pp} gen={gen_tokens} …", end="", flush=True)
-        r = await _run_single_test(engine, prompts[pp], gen_tokens, pp)
-        single_results.append(r)
-        print(
-            f"  ttft={_fmt_metric(r['ttft_ms'], 0)}ms  "
-            f"{_fmt_metric(r['gen_tps'])} t/s"
+        trials: list[dict] = []
+        for trial in range(repeats):
+            # Generate each measured prompt independently. Speculative acceptance
+            # depends on the UUID-prefixed continuation, so reusing one prompt
+            # makes repeated MTP results precise but systematically optimistic.
+            prompt = _generate_prompt(tokenizer, pp, context_profile)
+            suffix = f" [{trial + 1}/{repeats}]" if repeats > 1 else ""
+            print(f"  pp={pp} gen={gen_tokens}{suffix} …", end="", flush=True)
+            r = await _run_single_test(engine, prompt, gen_tokens, pp)
+            trials.append(r)
+            print(
+                f"  ttft={_fmt_metric(r['ttft_ms'], 0)}ms  "
+                f"{_fmt_metric(r['gen_tps'])} t/s"
+            )
+        result = trials[-1].copy()
+        for key in ("ttft_ms", "tpot_ms", "gen_tps", "processing_tps"):
+            values = [trial[key] for trial in trials if trial.get(key) is not None]
+            result[key] = statistics.median(values) if values else None
+        result["peak_memory_bytes"] = max(
+            trial["peak_memory_bytes"] for trial in trials
         )
+        single_results.append(result)
 
     batch_results: list[dict] = []
     batch_pp = sorted(pp_lengths)[0] if pp_lengths else 1024
     for bs in sorted(batch_sizes):
-        batch_prompts = [_generate_prompt(tokenizer, batch_pp) for _ in range(bs)]
+        batch_prompts = [
+            _generate_prompt(tokenizer, batch_pp, context_profile) for _ in range(bs)
+        ]
         print(f"  batch={bs} pp={batch_pp} gen={gen_tokens} …", end="", flush=True)
         r = await _run_batch_test(engine, batch_prompts, batch_pp, gen_tokens, bs)
         batch_results.append(r)
@@ -276,6 +319,8 @@ def _print_batch_comparison(
 # ── main ──────────────────────────────────────────────────────────────────────
 
 async def _run(args: argparse.Namespace) -> None:
+    if args.repeats < 1:
+        raise ValueError("--repeats must be at least 1")
     model_paths = [str(Path(m).expanduser().resolve()) for m in args.models]
     labels = [_short_name(p) for p in model_paths]
     pp_lengths = sorted(set(args.pp))
@@ -283,9 +328,31 @@ async def _run(args: argparse.Namespace) -> None:
     all_single: list[list[dict]] = []
     all_batch: list[list[dict]] = []
 
+    settings_manager = None
+    if args.settings_base is not None:
+        from omlx.model_settings import ModelSettingsManager
+
+        settings_manager = ModelSettingsManager(args.settings_base.expanduser())
+
     for path in model_paths:
+        model_settings = None
+        if settings_manager is not None:
+            model_settings = settings_manager.get_settings(Path(path).name)
+            enabled = [
+                name
+                for name in ("mtp_enabled", "dflash_enabled", "turboquant_kv_enabled")
+                if getattr(model_settings, name, False)
+            ]
+            print(f"Settings: {', '.join(enabled) if enabled else 'defaults'}")
         single, batch = await _bench_model(
-            path, pp_lengths, args.gen, sorted(args.batch), args.warmup
+            path,
+            pp_lengths,
+            args.gen,
+            sorted(args.batch),
+            args.warmup,
+            model_settings,
+            args.repeats,
+            args.context_profile,
         )
         all_single.append(single)
         all_batch.append(batch)

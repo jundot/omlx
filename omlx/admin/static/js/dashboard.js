@@ -226,7 +226,7 @@
                 qwen35_ane_prefill_enabled: false,
                 qwen35_ane_prefill_sequence_length: 2048,
                 qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_fraction: 0.5,
                 qwen35_ane_prefill_fused_down: false,
                 qwen35_ane_prefill_max_layers: 64,
                 qwen35_ane_prefill_dual_ane: true,
@@ -7387,7 +7387,7 @@
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
-                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.5,
                     qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
                     qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
@@ -8319,7 +8319,7 @@
                                 qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
                                     : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.5,
                                 qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
@@ -8428,7 +8428,7 @@
                                     qwen35_ane_prefill_enabled: false,
                                     qwen35_ane_prefill_sequence_length: 2048,
                                     qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                                    qwen35_ane_prefill_fraction: 0.53,
+                                    qwen35_ane_prefill_fraction: 0.5,
                                     qwen35_ane_prefill_max_layers: 64,
                                     qwen35_ane_prefill_dual_ane: true,
                                     qwen35_ane_prefill_gdn: true,
@@ -8532,7 +8532,7 @@
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
                         this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
-                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
+                        this.modelSettings.qwen35_ane_prefill_fraction = 0.5;
                         this.modelSettings.qwen35_ane_prefill_max_layers = 64;
                         this.modelSettings.qwen35_ane_prefill_dual_ane = true;
                         this.modelSettings.qwen35_ane_prefill_gdn = true;

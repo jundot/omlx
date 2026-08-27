@@ -86,7 +86,7 @@ from . import prompt_priming as _prompt_priming
 logger = logging.getLogger(__name__)
 
 
-def _set_verify_qmm_armed(flag: bool) -> None:
+def _set_verify_qmm_armed(flag: bool, *, exact: bool = False) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
     Import is deferred and failure-tolerant: the kernel module is optional
@@ -95,7 +95,7 @@ def _set_verify_qmm_armed(flag: bool) -> None:
     try:
         from ..qwen35_verify_qmm import set_verify_qmm_armed
 
-        set_verify_qmm_armed(flag)
+        set_verify_qmm_armed(flag, exact=exact)
     except Exception:
         pass
 
@@ -734,6 +734,9 @@ class _MtpState:
     # logprobs (PR 990 contract) — and sampler-filtered rows for stochastic
     # acceptance. Lazy arrays; only evaluated if a consumer touches them.
     draft_lps: List[Any] = field(default_factory=list)
+    # Greedy drafting stores processed logits and normalizes only accepted
+    # rows when they enter the emit queue. Stochastic rows stay normalized.
+    draft_lps_are_logits: bool = False
     draft_accept_lps: List[Any] = field(default_factory=list)
     # MTP-head cache offset at cycle start. Chain entries beyond this offset
     # are speculative and trimmed at commit; committed history is re-appended
@@ -1526,10 +1529,19 @@ def _call_backbone(
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
     dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
+    exact_verify = any(
+        bool(getattr(candidate, "_omlx_mtp_exact_verify", False))
+        for candidate in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "_language_model", None),
+        )
+        if candidate is not None
+    )
     _rollback_mod.set_undo_armed(True)
-    # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
-    # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # DeepSeek keeps its native route; marked Qwen instances use serial-exact
+    # cross-row kernels while other compatible models retain the legacy route.
+    _set_verify_qmm_armed(not dspark_verify, exact=exact_verify)
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
@@ -2319,6 +2331,7 @@ def _chain_next_drafts(
             prev_buf,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
+    is_greedy = _is_greedy(gen_batch)
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
@@ -2331,6 +2344,7 @@ def _chain_next_drafts(
         # cache stays consistent for re-entry.
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
+        state.draft_lps_are_logits = False
         state.draft_accept_lps = []
         return
 
@@ -2383,11 +2397,16 @@ def _chain_next_drafts(
                 + [t.reshape(1).astype(mx.int32) for t in draft_toks]
             )
             logits_2d = _apply_processors(procs, prev, logits_2d)
-        lp_2d = _logprobs(logits_2d)
-        tok = _ensure_uint32(sampler(lp_2d))
-        draft_toks.append(tok)
-        draft_lps.append(lp_2d.squeeze(0))
-        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
+        if is_greedy:
+            tok = _ensure_uint32(sampler(logits_2d))
+            draft_toks.append(tok)
+            draft_lps.append(logits_2d.squeeze(0))
+        else:
+            lp_2d = _logprobs(logits_2d)
+            tok = _ensure_uint32(sampler(lp_2d))
+            draft_toks.append(tok)
+            draft_lps.append(lp_2d.squeeze(0))
+            draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
         if j + 1 == depth:
             break
         logits, head_hidden = model.mtp_forward(
@@ -2412,6 +2431,7 @@ def _chain_next_drafts(
         # above still ran so head-history models stay warm for re-entry.
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
     state.draft_lps = draft_lps
+    state.draft_lps_are_logits = is_greedy
     state.draft_accept_lps = draft_accept_lps
 
 
@@ -2482,7 +2502,16 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if depth > 1:
+        fixed_depth = any(
+            bool(getattr(candidate, "_omlx_mtp_fixed_depth", False))
+            for candidate in (
+                gen_batch.model,
+                getattr(gen_batch.model, "language_model", None),
+                getattr(gen_batch.model, "_language_model", None),
+            )
+            if candidate is not None
+        )
+        if depth > 1 and not fixed_depth:
             state.controller = _DepthController(
                 depth,
                 marginal_ms=getattr(
@@ -3075,8 +3104,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
 
     # --- commit: queue emits + cache rollback ---
     t0 = time.perf_counter()
+    accepted_lps = state.draft_lps[:m]
+    if accepted_lps and state.draft_lps_are_logits:
+        accepted_lps = _logprobs(mx.stack(accepted_lps))
     for j in range(m):
-        state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+        state.queue.append((int(draft_ids[j]), accepted_lps[j], "draft"))
     if m == k:
         state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
         _clear_rollback(gen_batch.prompt_cache)

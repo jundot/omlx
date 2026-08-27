@@ -49,6 +49,7 @@ The patch is intentionally limited to ``mlx_lm.models.qwen3_5``; mlx-vlm's
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 from . import prompt_priming
@@ -476,6 +477,10 @@ def _patch_text_model(q35: Any) -> None:
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_fixed_depth = True
+            self._omlx_mtp_exact_verify = (
+                os.environ.get("OMLX_QWEN35_EXACT_VERIFY") == "1"
+            )
 
     def __call__(
         self,

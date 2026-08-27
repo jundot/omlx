@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
@@ -111,10 +112,13 @@ def run_specprefill_draft_scoring(
         )
         scoring_started_at = time.monotonic()
         with mx.stream(stream):
+            draft_step_size = int(
+                os.environ.get("OMLX_SPECPREFILL_DRAFT_STEP", prefill_step_size)
+            )
             importance, used_cache = score_tokens(
                 draft_model,
                 tokens_to_score,
-                prefill_step_size=prefill_step_size,
+                prefill_step_size=draft_step_size,
                 existing_cache=draft_cache,
                 progress_callback=report_score_progress,
             )

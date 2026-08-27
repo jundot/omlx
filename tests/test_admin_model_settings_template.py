@@ -199,7 +199,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
     assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
     assert 'min="0.05" max="0.90" step="0.005"' in html
-    assert 'placeholder="0.53"' in html
+    assert 'placeholder="0.50"' in html
     assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
 
@@ -281,7 +281,7 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     )[0]
 
     assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
-    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
+    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.5" in state
     assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
     assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state

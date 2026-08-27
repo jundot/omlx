@@ -1670,6 +1670,33 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
+        # Dense Qwen gate+up regroup: affine output rows are independent, so
+        # one fused projection preserves arithmetic while halving qmm launches.
+        try:
+            from ..patches.qwen35_dense_gate_up import (
+                apply_qwen35_attention_kv_fusion,
+                apply_qwen35_dense_gate_up_fusion,
+                apply_qwen35_mtp_qkv_fusion,
+            )
+
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_qwen35_dense_gate_up_fusion,
+                self._vlm_model,
+            )
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_qwen35_attention_kv_fusion,
+                self._vlm_model,
+            )
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                apply_qwen35_mtp_qkv_fusion,
+                self._vlm_model,
+            )
+        except Exception:
+            logger.debug("Qwen dense gate+up fusion not applied", exc_info=True)
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:
@@ -1902,7 +1929,7 @@ class VLMBatchedEngine(BaseEngine):
                         fraction=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_fraction",
-                            0.53,
+                            0.50,
                         ),
                         max_layers=getattr(
                             self._model_settings,
@@ -1933,7 +1960,7 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fraction",
-                                0.53,
+                                0.50,
                             )
                             if getattr(
                                 self._model_settings,

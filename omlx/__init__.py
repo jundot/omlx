@@ -12,7 +12,13 @@ Features:
 - Tiered cache (GPU + paged SSD offloading)
 """
 
+# Apply Metal scheduling defaults before any lazily imported engine can import
+# mlx.core. Individual environment variables and the policy itself remain
+# operator-overridable; see omlx._mlx_runtime.
+from omlx._mlx_runtime import configure_mlx_runtime_environment
 from omlx._version import __version__
+
+configure_mlx_runtime_environment()
 
 _LAZY = {
     "Request": "omlx.request",

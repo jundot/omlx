@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -131,6 +132,11 @@ def run_specprefill_target_prefill(
                 )
         if prompt_cache is None:
             prompt_cache = make_prompt_cache(target_model)
+        requested_step = int(os.environ.get("OMLX_SPECPREFILL_KV_STEP", "0") or 0)
+        if requested_step > 0:
+            for cache_layer in prompt_cache:
+                if type(cache_layer).__name__ == "KVCache":
+                    cache_layer.step = max(int(cache_layer.step), requested_step)
 
         if system_token_count > 0 and static_prefix_cached_tokens == 0:
             sys_arr = mx.array(all_tokens[:system_token_count])

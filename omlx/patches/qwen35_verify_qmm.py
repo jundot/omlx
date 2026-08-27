@@ -64,13 +64,18 @@ _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 _MIN_ROUTE_N = 16384
 
 
-def set_verify_qmm_armed(flag: bool) -> None:
-    """Arm/disarm verify-qmm routing (MTP verify forwards only)."""
+def set_verify_qmm_armed(flag: bool, *, exact: bool = False) -> None:
+    """Arm verify routing and optionally select Qwen's exact implementation."""
     _ROUTE_ARMED.value = bool(flag)
+    _ROUTE_ARMED.exact = bool(flag and exact)
 
 
 def _is_armed() -> bool:
     return getattr(_ROUTE_ARMED, "value", False)
+
+
+def _is_exact_armed() -> bool:
+    return getattr(_ROUTE_ARMED, "exact", False)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +374,7 @@ def _pad_rows(mx, x2, m: int):
     if M < m:
         pad = mx.zeros((m - M, x2.shape[1]), dtype=x2.dtype)
         return mx.contiguous(mx.concatenate([x2, pad], axis=0)), M
-    return mx.contiguous(x2), M
+    return x2, M
 
 
 def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
@@ -432,6 +437,28 @@ def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bo
     )
 
 
+def _fast_linear_meta(linear):
+    """Cache immutable fast-route geometry; never retain activation arrays."""
+    meta = getattr(linear, "_omlx_fast_verify_meta", None)
+    if meta is not None:
+        return meta
+    bits = int(getattr(linear, "bits", 0))
+    group_size = int(getattr(linear, "group_size", 0))
+    n = int(linear.weight.shape[0])
+    k = int(linear.weight.shape[1]) * 32 // max(bits, 1)
+    supported = (
+        bits in (4, 8)
+        and group_size in (32, 64, 128)
+        and getattr(linear, "mode", "affine") == "affine"
+        and k % 64 == 0
+        and n % 4 == 0
+        and n >= _MIN_ROUTE_N
+    )
+    meta = (supported, k, n, bits, group_size)
+    linear._omlx_fast_verify_meta = meta
+    return meta
+
+
 # ---------------------------------------------------------------------------
 # QuantizedLinear routing patch.
 # ---------------------------------------------------------------------------
@@ -460,31 +487,41 @@ def apply_verify_qmm_patch() -> bool:
         return True
 
     orig_call = cls.__call__
+    from .qwen35_exact_crossrow_qmm import exact_crossrow
 
     def patched_call(self, x):
         if (
-            _is_armed()
+            _is_exact_armed()
             and x.ndim == 3
             and x.shape[0] == 1
             and 2 <= x.shape[1] <= 6
             and getattr(self, "mode", "affine") == "affine"
-            and vk_eligible(
-                x.shape[1],
-                x.shape[-1],
-                self.scales.shape[0],
-                self.bits,
-                self.group_size,
-                x.dtype,
-            )
         ):
+            exact = exact_crossrow(self, x)
+            if exact is not None:
+                return exact
+            return mx.concatenate(
+                [orig_call(self, x[:, row : row + 1]) for row in range(x.shape[1])],
+                axis=1,
+            )
+        if (
+            _is_armed()
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 3 <= x.shape[1] <= 6
+            and x.dtype in (mx.bfloat16, mx.float16)
+        ):
+            supported, expected_k, _, bits, group_size = _fast_linear_meta(self)
+            if not supported or x.shape[-1] != expected_k:
+                return orig_call(self, x)
             try:
                 y = vk_qmm(
                     x[0],
                     self.weight,
                     self.scales,
                     self.biases,
-                    bits=self.bits,
-                    group_size=self.group_size,
+                    bits=bits,
+                    group_size=group_size,
                 )
                 if hasattr(self, "bias"):
                     y = y + self.bias
