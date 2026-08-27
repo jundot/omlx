@@ -237,6 +237,39 @@ async def test_qwen_ane_prefill_allows_fused_down_at_half_fraction():
 
 
 @pytest.mark.asyncio
+async def test_mtp_num_draft_tokens_is_persisted():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+    )
+
+    assert settings.mtp_num_draft_tokens == 8
+
+
+@pytest.mark.asyncio
+async def test_mtp_num_draft_tokens_change_unloads_a_loaded_engine():
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings(mtp_enabled=True)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_rejects_other_model_families():
     pool, entry = _failed_pool()
     entry.config_model_type = "gemma4"

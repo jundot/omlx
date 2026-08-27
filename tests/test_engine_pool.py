@@ -1337,6 +1337,32 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+    def test_runtime_signature_covers_mtp_num_draft_tokens_only_when_mtp_active(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+
+        depth_3 = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+        depth_8 = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=8)
+        mtp_off_depth_3 = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=3)
+        mtp_off_depth_8 = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=8)
+
+        # A load-time engine-construction setting: changing the draft depth
+        # while MTP is active must be visible in the signature so the admin
+        # route's auto-unload-and-reload actually picks it up (issue: PUT
+        # silently accepted the field but never triggered a reload).
+        assert pool._engine_runtime_signature(
+            "model-a", depth_3
+        ) != pool._engine_runtime_signature("model-a", depth_8)
+
+        # Irrelevant while the feature is disabled -- must not force a
+        # reload for a value that has no runtime effect.
+        assert pool._engine_runtime_signature(
+            "model-a", mtp_off_depth_3
+        ) == pool._engine_runtime_signature("model-a", mtp_off_depth_8)
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines

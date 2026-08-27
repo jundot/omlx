@@ -175,6 +175,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    mtp_num_draft_tokens: int | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -2672,6 +2673,9 @@ async def update_model_settings(
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+
+    if "mtp_num_draft_tokens" in sent:
+        current_settings.mtp_num_draft_tokens = request.mtp_num_draft_tokens
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
