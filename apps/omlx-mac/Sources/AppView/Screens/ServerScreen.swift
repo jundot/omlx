@@ -640,10 +640,10 @@ private struct APIEndpointsList: View {
 // MARK: - Advanced disclosure
 
 /// Phase 4 — Server identity / protocol knobs that the average user never
-/// touches: `server_aliases` (extra host names the server identifies as for
-/// cookie + host-header purposes) and `sse_keepalive_mode`. Hidden behind a
-/// chevron so they don't crowd the main ServerScreen surface, but rendered
-/// inline (not in a popover) so power users can scroll-find them.
+/// touches: request limits, `server_aliases` (extra host names the server
+/// identifies as for cookie + host-header purposes), and SSE keep-alive.
+/// Hidden behind a chevron so they don't crowd the main ServerScreen surface,
+/// but rendered inline (not in a popover) so power users can scroll-find them.
 private struct ServerAdvancedSection: View {
     @Bindable var vm: ServerScreenVM
 
@@ -683,6 +683,21 @@ private struct ServerAdvancedSection: View {
 
             if expanded {
                 ListGroup {
+                    Row(
+                        label: String(localized: "server.advanced.max_audio_upload_size",
+                                      defaultValue: "Maximum Audio Upload Size",
+                                      comment: "Advanced row label for the audio upload size limit"),
+                        sublabel: String(localized: "server.advanced.max_audio_upload_size.sub",
+                                         defaultValue: "Maximum file size accepted by audio transcription and processing endpoints. Higher values can increase memory use for concurrent requests.",
+                                         comment: "Sublabel describing the audio upload size limit")
+                    ) {
+                        TextInput(
+                            text: $vm.maxAudioUploadSizeText,
+                            placeholder: "100MB",
+                            mono: true,
+                            width: 130
+                        )
+                    }
                     Row(
                         label: String(localized: "server.advanced.sse_keepalive",
                                       defaultValue: "SSE Keep-Alive Mode",

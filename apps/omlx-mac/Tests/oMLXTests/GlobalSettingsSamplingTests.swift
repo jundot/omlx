@@ -201,4 +201,31 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertTrue(str.contains("\"port\":9000"))
         XCTAssertFalse(str.contains("sampling_"))
     }
+
+    func testServerDecodesAudioUploadSize() throws {
+        let json = """
+        {
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8080,
+                "log_level": "info",
+                "server_aliases": [],
+                "max_audio_upload_size": "500MB"
+            }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try decoder.decode(GlobalSettingsDTO.self, from: json)
+        XCTAssertEqual(dto.server.maxAudioUploadSize, "500MB")
+    }
+
+    func testPatchEncodesAudioUploadSizeAsFlatSnakeCaseKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.maxAudioUploadSize = "1GB"
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["max_audio_upload_size"] as? String, "1GB")
+    }
 }

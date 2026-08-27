@@ -711,6 +711,30 @@ private struct AdvancedTab: View {
                     Toggle("", isOn: vm.bindProfile($vm.enableThinking))
                         .labelsHidden().toggleStyle(.switch)
                 }
+                if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
+                    Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
+                                      defaultValue: "SSD N-gram Offload (Qwen4 only)",
+                                      comment: "Row label for the Qwen4 PLE SSD mmap toggle"),
+                        sublabel: vm.qwen4PleSsdOffloadForced
+                            ? String(localized: "settings.advanced.qwen4_ssd_offload.forced",
+                                     defaultValue: "Required because resident loading exceeds the configured model-memory limit.",
+                                     comment: "Sublabel when Qwen4 PLE SSD offload is forced by memory limits")
+                            : String(localized: "settings.advanced.qwen4_ssd_offload.sub",
+                                     defaultValue: "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes.",
+                                     comment: "Sublabel for the Qwen4 PLE SSD mmap toggle")) {
+                        Toggle("", isOn: vm.bind(
+                            $vm.qwen4PleSsdOffload,
+                            save: {
+                                Task {
+                                    await vm.save(.qwen4PleSsdOffload, client: client)
+                                }
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(vm.qwen4PleSsdOffloadForced)
+                    }
+                }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
@@ -1763,10 +1787,10 @@ private struct ExperimentalSection: View {
         _ recommendation: ANETuningRecommendationDTO
     ) -> String {
         if !recommendation.enabled {
-            return String(
-                format: "GPU-only recommended (%.1f tok/s)",
-                recommendation.processingTps
-            )
+            guard let tps = recommendation.processingTps else {
+                return "GPU-only recommended"
+            }
+            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
         var parts = [
@@ -1789,12 +1813,12 @@ private struct ExperimentalSection: View {
         if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
             parts.append("Pad tails ≥\(threshold)")
         }
-        return String(
-            format: "%@ · %.1f tok/s (%+.1f%%)",
-            parts.joined(separator: " · "),
-            recommendation.processingTps,
-            recommendation.speedupPercent
-        )
+        let summary = parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps,
+              let speedup = recommendation.speedupPercent else {
+            return summary
+        }
+        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
     }
 
     private func aneCandidateResultText(

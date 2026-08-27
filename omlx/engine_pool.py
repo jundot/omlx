@@ -14,10 +14,12 @@ when memory limits are exceeded. It supports:
 from __future__ import annotations
 
 import asyncio
+import copy
 import gc
 import json
 import logging
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -286,6 +288,13 @@ class EnginePool:
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        # Requests whose prefill already got a pooled-buffer reclaim pass.
+        # Prefill continuously refills MLX's buffer cache, so the reclaim
+        # rung can "succeed" marginally on every pass of a long prompt while
+        # the durable rung behind it (ANE bank release) is never reached; a
+        # request coming back for more headroom escalates instead of
+        # reclaiming again first. Bounded FIFO — request ids are transient.
+        self._prefill_headroom_recurring: OrderedDict[str, None] = OrderedDict()
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
@@ -340,6 +349,11 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
+            entry, runtime_settings
+        )
+        if qwen4_offload and qwen4_estimate is not None:
+            base = min(base, qwen4_estimate.mmap_bytes)
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -358,6 +372,52 @@ class EnginePool:
                 entry.model_id,
             )
         return base + extra
+
+    def _qwen4_ple_offload_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
+
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "qwen4_exp":
+            return False, False, None
+        try:
+            from .patches.mlx_vlm_qwen4_exp_compat.residency import (
+                qwen4_exp_residency_estimate,
+            )
+
+            estimate = qwen4_exp_residency_estimate(entry.model_path)
+        except (OSError, TypeError, ValueError):
+            logger.debug(
+                "Could not inspect Qwen4-Exp PLE residency for %s",
+                entry.model_id,
+                exc_info=True,
+            )
+            return False, False, None
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        forced = estimate.force_ssd_offload(ceiling)
+        requested = bool(
+            settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
+        )
+        return requested or forced, forced, estimate if estimate.supported else None
+
+    def _effective_qwen4_model_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> object | None:
+        """Apply a forced mmap decision without mutating persisted settings."""
+
+        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
+        if not enabled or not forced or settings is None:
+            return settings
+        effective = copy.copy(settings)
+        setattr(effective, "qwen4_ple_ssd_offload", True)
+        return effective
 
     @property
     def current_model_memory(self) -> int:
@@ -526,6 +586,9 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        if entry is not None:
+            qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
+            add("qwen4_ple_ssd_offload", qwen4_offload)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -1846,6 +1909,10 @@ class EnginePool:
 
         evicted_any = False
         reclaim_attempted = False
+        ane_release_attempted = False
+        # Snapshot once per call: "a PREVIOUS pass for this request already
+        # got a reclaim". Marking inside this call must not flip it.
+        recurring = request_id in self._prefill_headroom_recurring
         async with self._lock:
             while True:
                 current = max(
@@ -1861,7 +1928,7 @@ class EnginePool:
                     # process-wide and can be masked by concurrent
                     # allocation, but reaching this check with headroom
                     # after an attempt means admission will now succeed.
-                    return evicted_any or reclaim_attempted
+                    return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -1869,14 +1936,34 @@ class EnginePool:
                 if victim is None:
                     # No idle model left to evict -- the "No idle model
                     # evicted" case that used to reject outright even when
-                    # tens of GB were reclaimable. Try the cheaper reclaim
-                    # once before giving up: return MLX's pooled Metal buffers
-                    # (freed by finished requests but still cached, so
-                    # get_phys_footprint stays high) to the OS on the
-                    # requesting engine's own MLX thread, then let the loop
-                    # re-measure.
+                    # tens of GB were reclaimable. Two rungs remain: the
+                    # cheap pooled-buffer reclaim, and shedding the
+                    # requesting model's own ANE prefill banks. Ordering
+                    # matters: prefill continuously refills MLX's buffer
+                    # cache, so on a long prompt the reclaim can "succeed"
+                    # by a marginal few GB on every pass while the durable
+                    # rung is never reached — a request that already had a
+                    # reclaim pass and is back for more headroom escalates
+                    # straight to the bank release instead.
+                    if recurring and not ane_release_attempted:
+                        ane_release_attempted = True
+                        await self._release_ane_prefill_for_headroom(
+                            exclude_model_id, request_id
+                        )
+                        # Re-measure regardless of the reported delta: the
+                        # footprint reading is process-wide, so concurrent
+                        # allocation can mask a real release as 0 bytes.
+                        continue
                     if not reclaim_attempted:
+                        # Return MLX's pooled Metal buffers (freed by
+                        # finished requests but still cached, so
+                        # get_phys_footprint stays high) to the OS on the
+                        # requesting engine's own MLX thread, then let the
+                        # loop re-measure.
                         reclaim_attempted = True
+                        self._prefill_headroom_recurring[request_id] = None
+                        while len(self._prefill_headroom_recurring) > 512:
+                            self._prefill_headroom_recurring.popitem(last=False)
                         await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
                         )
@@ -1886,6 +1973,23 @@ class EnginePool:
                         # real reclaim as 0 bytes freed. The loop re-checks
                         # the target with a fresh reading; reclaim_attempted
                         # keeps this branch from running twice.
+                        continue
+                    if not ane_release_attempted:
+                        # Last rung before giving up: shed the requesting
+                        # model's own ANE prefill banks. They hold the packed
+                        # weight blobs mapped into the native programs (~13 GB
+                        # for a 27B at the default fractions) and are purely
+                        # an accelerator — the per-module failure-latch
+                        # fallback serves the same modules on GPU — so at
+                        # long context the trade is a slower-but-unthrottled
+                        # prefill instead of chunks collapsing to the floor.
+                        # Banks come back at the model's next load.
+                        ane_release_attempted = True
+                        await self._release_ane_prefill_for_headroom(
+                            exclude_model_id, request_id
+                        )
+                        # Re-measure regardless of the reported delta, for
+                        # the same reason as the pooled reclaim above.
                         continue
                     if evicted_any:
                         logger.info(
@@ -1987,6 +2091,104 @@ class EnginePool:
                 format_size(freed),
                 request_id,
             )
+        return freed
+
+    async def _release_ane_prefill_for_headroom(
+        self, model_id: str, request_id: str
+    ) -> int:
+        """Release the requesting model's ANE prefill banks; report bytes freed.
+
+        The compiled banks keep the packed weight blobs mapped into the
+        native ANE programs for the model's whole residency, so a config
+        tuned at a short calibration length silently competes with the KV
+        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
+        hold ~13 GB, which is the difference between full 2048-token prefill
+        chunks and the guard throttling to the floor. Shedding them is safe:
+        the release latches every sliced module through the existing
+        per-module failure flags, so the dispatch sites fall back to stock
+        GPU compute exactly as they do after a warmup failure. The banks are
+        rebuilt at the model's next load.
+
+        Runs on the requesting engine's own MLX thread; its step loop is
+        parked awaiting this eviction callback, so no prefill dispatch is in
+        flight while references are dropped. A failing release is contained:
+        the request is then throttled exactly as if nothing had been
+        releasable.
+
+        Returns:
+            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0),
+            0 when nothing was released.
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        core = (
+            self._resolve_engine_core_from_engine(engine)
+            if engine is not None
+            else None
+        )
+        executor = getattr(core, "_mlx_executor", None)
+        model = (
+            getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
+            if engine is not None
+            else None
+        )
+        if executor is None or model is None:
+            logger.info(
+                "ANE bank release skipped for request %s: %s not resolvable "
+                "on '%s'",
+                request_id,
+                "executor" if executor is None else "model object",
+                model_id,
+            )
+            return 0
+        try:
+            from .patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+        except Exception:  # noqa: BLE001 - patch optional at runtime
+            return 0
+
+        def _release_on_engine_thread() -> tuple[int, int]:
+            released, programs = release_qwen35_ane_prefill(model)
+            if released:
+                gc.collect()
+            return released, programs
+
+        before = get_phys_footprint()
+        loop = asyncio.get_running_loop()
+        try:
+            released, programs = await loop.run_in_executor(
+                executor, _release_on_engine_thread
+            )
+        except Exception as e:
+            logger.warning(
+                "ANE prefill bank release failed for request %s: %s",
+                request_id,
+                e,
+            )
+            return 0
+        if not released:
+            logger.info(
+                "No ANE prefill slices to release on '%s' for request %s",
+                model_id,
+                request_id,
+            )
+            return 0
+        freed = max(0, before - get_phys_footprint())
+        # The load-time admission reservation priced these I/O surfaces; drop
+        # it so later passes stop pausing for memory that no longer exists.
+        # The next load re-prices it from the rebuilt banks.
+        monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
+        if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
+            monitor.clear_ane_prefill_transient()
+        logger.warning(
+            "Released ANE prefill banks on '%s' for prefill headroom "
+            "(request=%s, %d modules, %d programs, freed %s); the model "
+            "serves GPU-only prefill until its next load",
+            model_id,
+            request_id,
+            released,
+            programs,
+            format_size(freed),
+        )
         return freed
 
     def _other_entries_serving(self, model_id: str) -> bool:
@@ -2314,6 +2516,7 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            model_settings = self._effective_qwen4_model_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)

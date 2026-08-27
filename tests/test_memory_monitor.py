@@ -1075,3 +1075,17 @@ class TestAnePrefillTransientReserve:
         # a following model without ANE must not inherit the reserve
         monitor.set_model_info(num_layers=2, num_kv_heads=2, head_dim=64, dtype_size=2)
         assert monitor._ane_prefill_transient_bytes == 0
+
+    def test_clear_drops_the_reservation_after_a_shed(self):
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+            ane_prefill_transient_bytes=123,
+        )
+        monitor.clear_ane_prefill_transient()
+        assert monitor._ane_prefill_transient_bytes == 0

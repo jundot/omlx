@@ -451,6 +451,30 @@
                                    x-text="'{{ t('modal.model_settings.enable_thinking_reset')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                             </div>
 
+                            <!-- Qwen4 PLE SSD Offload -->
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-2"
+                                 x-show="modelSettings.qwen4_ple_ssd_offload_supported" x-cloak>
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen4_ple_ssd_offload') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen4_ple_ssd_offload_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="if (!modelSettings.qwen4_ple_ssd_offload_forced) modelSettings.qwen4_ple_ssd_offload = !modelSettings.qwen4_ple_ssd_offload"
+                                            :disabled="modelSettings.qwen4_ple_ssd_offload_forced"
+                                            :class="[
+                                                modelSettings.qwen4_ple_ssd_offload ? 'bg-black' : 'bg-neutral-200',
+                                                modelSettings.qwen4_ple_ssd_offload_forced ? 'opacity-50 cursor-not-allowed' : ''
+                                            ]"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.qwen4_ple_ssd_offload ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <p x-show="modelSettings.qwen4_ple_ssd_offload_forced"
+                                   class="text-xs text-amber-600">{{ t('modal.model_settings.qwen4_ple_ssd_offload_forced') }}</p>
+                            </div>
+
                             <!-- Thinking Budget -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>

@@ -81,6 +81,58 @@ class TestListModelsSettings:
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
 
+    def test_list_models_reports_forced_qwen4_ple_offload(self, tmp_path):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model_path = tmp_path / "qwen4"
+        model_path.mkdir()
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "qwen4",
+                    "model_path": str(model_path),
+                    "config_model_type": "qwen4_exp",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(admin_routes, "_dflash_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_mtp_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_paroquant_compat_for_model", return_value=(False, "")),
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["qwen4_ple_ssd_offload_supported"] is True
+        assert model["qwen4_ple_ssd_offload_forced"] is True
+        assert model["qwen4_ple_resident_bytes"] == 1000
+        assert model["qwen4_ple_mmap_bytes"] == 400
+
     def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
         """Ensure nested model paths only affect UI display names."""
         model_root = tmp_path / "models"

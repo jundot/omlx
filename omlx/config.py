@@ -10,6 +10,7 @@ This module provides unified configuration management with:
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,10 @@ def parse_size(size_str: str) -> int:
         if size_str.endswith(unit):
             try:
                 value = float(size_str[: -len(unit)])
-                return int(value * multiplier)
+                byte_value = value * multiplier
+                if not math.isfinite(byte_value):
+                    raise ValueError
+                return int(byte_value)
             except ValueError:
                 pass
 

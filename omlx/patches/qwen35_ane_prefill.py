@@ -7,6 +7,7 @@ token counts, dtypes, and decode/verify calls fall through unchanged.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import logging
 import os
@@ -20,6 +21,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
+
+from omlx.utils import hardware, proc_memory
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,47 @@ _ANE_RESIDENT_PROGRAM_LIMIT = 120
 # ~4 GiB device address window, so single-die chips reject two monolithic
 # dual banks; 1 GiB spans keep every create well under the window.
 _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
+# A failed compile attempt's already-loaded partial banks are dropped
+# (models cleared to []), but the ANE driver's own device-mapping release
+# is asynchronous and sometimes lags the retry (observed directly: kernel
+# log lines "ReleaseProgramResource: WARN: waitForPendingUpdate failed").
+# Retrying immediately races that cleanup, so a machine with tight headroom
+# can climb across attempts even though each individual attempt drops its
+# references correctly. Gate every attempt (including the first) on real
+# phys_footprint headroom against total system memory -- the same ledger
+# the kernel's jetsam killer uses -- and give the driver a moment to catch
+# up between attempts, instead of shrinking-and-retrying blind. Confirmed
+# necessary live: a 4-attempt retry ladder (each individually bounded)
+# still grew process RSS to 48.3GB on a 48GB machine and was jetsam-killed
+# mid-retry.
+_ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
+_ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
+
+
+def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
+    """``(current phys_footprint, total system memory)`` in bytes for the
+    headroom gate and its skip-warning log, so "why did ANE bank compile
+    stop retrying on this box" is answerable from one log line instead of
+    just the fixed 70% threshold. Best-effort: returns ``(0, 0)`` if either
+    measurement is unavailable."""
+    try:
+        return proc_memory.get_phys_footprint(), hardware.get_total_memory_bytes()
+    except Exception:
+        return 0, 0
+
+
+def _ane_bank_memory_headroom_ok() -> bool:
+    """True if phys_footprint has enough room left for another ANE procedure
+    bank compile attempt. Defaults to allowing the attempt (returns True) if
+    the measurement is unavailable, so a query failure never blocks the fast
+    path -- this is a circuit breaker for a known failure mode, not a new
+    hard dependency."""
+    current, total = _ane_bank_memory_footprint_snapshot()
+    if total <= 0:
+        return True
+    return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+
+
 @dataclass(frozen=True)
 class _AnePrefillConfig:
     sequence_length: int
@@ -976,6 +1020,27 @@ def _eligible_gdn(gdn: Any) -> bool:
     )
 
 
+def _recurrent_safe_gdn_ane_outputs(
+    z_outputs: int,
+    qkv_outputs: int,
+    fraction: float,
+    alignment: int,
+) -> int:
+    """Return an aligned ANE slice that never enters recurrent QKV rows.
+
+    The ANE compiler requantizes its source slice to per-output-channel INT8.
+    Applying that approximation to QKV changes the recurrent state at every
+    token, so the error can accumulate over a long prompt. Z is a token-local
+    output gate: offloading all of it preserves useful ANE/GPU overlap without
+    feeding approximate values back into the next recurrent step.
+    """
+    if z_outputs <= 0 or qkv_outputs <= 0 or z_outputs % alignment:
+        return 0
+    total_outputs = z_outputs + qkv_outputs
+    requested = (int(total_outputs * fraction) // alignment) * alignment
+    return z_outputs if requested >= z_outputs else 0
+
+
 def _pack_affine_gdn_suffix(
     qkv: Any,
     b: Any,
@@ -1020,9 +1085,9 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         cache = {}
         gdn._omlx_ane_gdn_cache = cache
 
-    # Put z first in the logical concatenation. At the 40% split this keeps
-    # almost all recurrent q/k/v channels on the exact q5 GPU path while ANE
-    # handles the output gate plus a small qkv prefix.
+    # Put z first so the approximate ANE slice can stop at the token-local
+    # gate boundary. Recurrent q/k/v channels remain on the source-precision
+    # GPU path (or the explicitly configured FP16 CPU path).
     logical = (z, qkv)
     z_outputs = int(z.weight.shape[0])
     qkv_outputs = int(qkv.weight.shape[0])
@@ -1034,7 +1099,12 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     qkv_bits, qkv_group_size = qkv_spec
     dual_ane = bool(config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t"))
     alignment = 128 if dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and qkv.scales.dtype == mx.float16
@@ -1046,9 +1116,9 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    # The native GPU suffix accepts one quantization format. Put all of z on
-    # ANE so an oQ4e-style q5-z/q4-qkv mix leaves a homogeneous qkv suffix.
-    if ane_outputs < z_outputs:
+    # The native GPU suffix accepts one quantization format. The quality-safe
+    # split puts exactly all of z on ANE, leaving homogeneous qkv on the GPU.
+    if ane_outputs != z_outputs:
         return None
     qkv_offset = ane_outputs - z_outputs
     packed_suffix = (
@@ -1166,6 +1236,96 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
         return state
 
 
+def _min_viable_gdn_fraction(gdn: Any, alignment: int) -> float | None:
+    """Smallest fraction whose aligned slice covers exactly z on ``gdn``.
+
+    Wider requests are capped at z so approximate ANE rows never enter the
+    recurrent qkv projection. ``None`` means z cannot be represented exactly
+    with this ANE alignment.
+    """
+    qkv, z, _, _ = _gdn_linears(gdn)
+    if qkv is None or z is None:
+        return None
+    z_outputs = int(z.weight.shape[0])
+    total_outputs = z_outputs + int(qkv.weight.shape[0])
+    if total_outputs <= 0 or z_outputs <= 0 or z_outputs % alignment:
+        return None
+    ane_min = z_outputs
+    fraction = ane_min / total_outputs
+    if (int(total_outputs * fraction) // alignment) * alignment < ane_min:
+        fraction = (ane_min + 1) / total_outputs
+    return fraction
+
+
+def _log_gdn_recurrent_safe_cap(
+    model: Any,
+    requested_fraction: float,
+    gdn_count: int,
+    dual_ane: bool,
+) -> None:
+    """Report when a wider requested GDN slice is precision-capped at z."""
+    if not gdn_count:
+        return
+    gdn = next(
+        (
+            module
+            for module in (model.modules() if hasattr(model, "modules") else ())
+            if getattr(module, "_omlx_ane_gdn_state", None) is not None
+        ),
+        None,
+    )
+    if gdn is None:
+        return
+    qkv, z, _, _ = _gdn_linears(gdn)
+    z_outputs = int(z.weight.shape[0])
+    qkv_outputs = int(qkv.weight.shape[0])
+    total_outputs = z_outputs + qkv_outputs
+    alignment = 128 if dual_ane else 64
+    requested_outputs = (
+        int(total_outputs * requested_fraction) // alignment
+    ) * alignment
+    if requested_outputs <= z_outputs:
+        return
+    logger.info(
+        "Capped ANE GDN output rows from requested %.3f to %.3f: ANE handles "
+        "only token-local z while recurrent qkv stays off the approximate "
+        "ANE INT8 path",
+        requested_fraction,
+        z_outputs / total_outputs,
+    )
+
+
+def _warn_gdn_below_floor(
+    model: Any, requested: bool, gdn_count: int, gdn_fraction: float, dual_ane: bool
+) -> None:
+    """Name the floor when a too-small fraction compiled no GDN procedure.
+
+    Without this the only symptom of a below-floor fraction is gdn_layers=0
+    in the status payload, which reads the same as a compile failure.
+    """
+    if not requested or gdn_count:
+        return
+    gdn = next(
+        (
+            module
+            for module in (model.modules() if hasattr(model, "modules") else ())
+            if _eligible_gdn(module)
+        ),
+        None,
+    )
+    if gdn is None:
+        return
+    floor = _min_viable_gdn_fraction(gdn, 128 if dual_ane else 64)
+    if floor is None or gdn_fraction >= floor:
+        return
+    logger.warning(
+        "ANE GDN prefill fraction %.3f is below this model's %.3f floor, so "
+        "no GDN procedure could be compiled and GDN prefill stays on GPU",
+        gdn_fraction,
+        floor,
+    )
+
+
 def _prepare_gdn_for_bank(
     gdn: Any, config: _AneGDNConfig
 ) -> tuple[_CombinedGDNState, mx.array, mx.array | None] | None:
@@ -1183,7 +1343,12 @@ def _prepare_gdn_for_bank(
     qkv_bits, qkv_group_size = qkv_spec
     dual_ane = bool(config.dual_ane)
     alignment = 128 if dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     from omlx.custom_kernels.qwen35_prefill import fast
 
     cpu_enabled = bool(
@@ -1197,7 +1362,7 @@ def _prepare_gdn_for_bank(
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs != z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
         return None
     qkv_offset = ane_outputs - z_outputs
     packed_suffix = (
@@ -1305,7 +1470,12 @@ def _prepare_gdn_runtime_state(
     qkv_outputs = int(qkv.weight.shape[0])
     total_outputs = z_outputs + qkv_outputs
     alignment = 128 if config.dual_ane else 64
-    ane_outputs = (int(total_outputs * config.fraction) // alignment) * alignment
+    ane_outputs = _recurrent_safe_gdn_ane_outputs(
+        z_outputs,
+        qkv_outputs,
+        config.fraction,
+        alignment,
+    )
     cpu_enabled = bool(
         config.cpu_fraction > 0
         and qkv.scales.dtype == mx.float16
@@ -1319,7 +1489,7 @@ def _prepare_gdn_runtime_state(
         else 0
     )
     gpu_outputs = total_outputs - ane_outputs - cpu_outputs
-    if ane_outputs < z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
+    if ane_outputs != z_outputs or gpu_outputs <= 0 or gpu_outputs % 64:
         return None
     qkv_offset = ane_outputs - z_outputs
     gpu_offset = qkv_offset + cpu_outputs
@@ -1541,10 +1711,17 @@ def _gdn_backend(
                 )
             )
 
-    return tuple(
+    result = tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
         for index in range(4)
     )
+    # The four tiled projections are sibling consumers of the same native
+    # hybrid outputs. Schedule them together before the recurrent GDN graph
+    # consumes individual branches; otherwise MLX can interleave their Metal
+    # merge/lifetime boundaries after a prefix-cache restore (#3117). This is
+    # asynchronous, so ANE/GPU overlap is preserved without a host fence.
+    mx.async_eval(*result)
+    return result
 
 
 def _backend_exact(
@@ -2016,7 +2193,20 @@ def _bank_split_ladder(
     total_bytes = sum(source_bytes)
     largest_bytes = max(source_bytes, default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping ANE procedure bank compile attempt %d/4: phys "
+                "footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            return None
         spans = (
             [(0, len(source_bytes))]
             if cap <= 0
@@ -2031,8 +2221,16 @@ def _bank_split_ladder(
                 models1.extend(span1)
         except Exception:
             # Drop banks that loaded before the failure so their device
-            # mappings are released before the smaller retry.
+            # mappings are released before the smaller retry. The ANE
+            # driver's own release is asynchronous, so force a GC pass and
+            # give it a moment to actually land before the next attempt's
+            # headroom check measures phys_footprint -- otherwise the check
+            # can see this attempt's not-yet-reclaimed memory and either
+            # falsely block the next attempt or (worse) not yet reflect it
+            # and let the next attempt pile on top.
             models0 = models1 = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "ANE procedure bank compilation failed (%d banks per "
                 "instance, %d procedures, %.2f GiB per instance)",
@@ -2118,7 +2316,20 @@ def _compile_single_banks(
     total_bytes = sum(weight.nbytes for weight in weights)
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
-    for _ in range(4):
+    for attempt in range(4):
+        if not _ane_bank_memory_headroom_ok():
+            current, total = _ane_bank_memory_footprint_snapshot()
+            logger.warning(
+                "Skipping single-ANE procedure bank compile attempt %d/4: "
+                "phys footprint %.2f GiB / %.2f GiB total already past the "
+                "%.0f%% safety fraction of system memory. Falling back to "
+                "per-layer programs instead of risking a jetsam kill.",
+                attempt + 1,
+                current / (1 << 30),
+                total / (1 << 30),
+                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+            )
+            return None
         spans = (
             [(0, len(weights))] if cap <= 0 else _bank_chunk_spans(weights, cap)
         )
@@ -2132,6 +2343,8 @@ def _compile_single_banks(
                 )
         except Exception:
             models = []
+            gc.collect()
+            time.sleep(_ANE_BANK_RETRY_SETTLE_SECONDS)
             logger.warning(
                 "Single-ANE procedure bank compilation failed (%d banks, "
                 "%d procedures, %.2f GiB)",
@@ -2746,10 +2959,21 @@ def _prepare_fused_down_for_bank(
             ).astype(mx.float32)
         )
 
+    # Only columns [0:gpu_start] of the down matrix are ever consumed below
+    # (down0/down1/cpu_down_weight); the GPU portion reads down.weight
+    # directly, still quantized, at gate_up_weight/down_weight below.
+    # Dequantizing the full matrix wasted a ~(hidden - gpu_start)-column
+    # fp32 transient (~0.5GB/layer) that was computed and immediately
+    # discarded. gpu_start is a multiple of 128 (per_ane/cpu_hidden are
+    # both rounded down to 128 above), so slicing the packed axis at
+    # gpu_start // 8 (4-bit: 8 values/int32) and gpu_start // 128 (the
+    # quantization group_size) yields exactly the first gpu_start
+    # unpacked columns -- same values as before, just without the wasted
+    # suffix. See docs/qwen35-hardening-and-optimization.md C3.
     dense_down = mx.dequantize(
-        down.weight,
-        down.scales,
-        down.biases,
+        down.weight[:, : gpu_start // 8],
+        down.scales[:, : gpu_start // 128],
+        down.biases[:, : gpu_start // 128],
         group_size=128,
         bits=4,
     ).astype(mx.float32)
@@ -2917,6 +3141,9 @@ def enable_qwen35_ane_prefill(
         raise ValueError("ANE prefill max_layers must be positive")
     if not 0.05 <= gdn_fraction <= 0.90:
         raise ValueError("ANE GDN prefill fraction must be between 0.05 and 0.90")
+    if getattr(model, "_omlx_ane_prefill_shed", False):
+        # A fresh enable supersedes a runtime shed on this object.
+        model._omlx_ane_prefill_shed = False
     if gdn_max_layers < 0:
         raise ValueError("ANE GDN prefill max_layers must be non-negative")
     if not 0.0 <= cpu_fraction <= 0.25:
@@ -3061,6 +3288,16 @@ def enable_qwen35_ane_prefill(
             model._omlx_ane_dual_prefill_count = count
             model._omlx_ane_resident_program_count = resident_programs
             model._omlx_ane_procedure_count = count + gdn_count
+            _warn_gdn_below_floor(
+                model,
+                bool(gdn and gdn_max_layers),
+                gdn_count,
+                gdn_fraction,
+                dual_ane,
+            )
+            _log_gdn_recurrent_safe_cap(
+                model, gdn_fraction, gdn_count, dual_ane
+            )
             logger.info(
                 "Eagerly compiled %d fused MLP/down and %d GDN procedures "
                 "into %d "
@@ -3121,6 +3358,10 @@ def enable_qwen35_ane_prefill(
         model._omlx_ane_resident_program_count = resident_programs
         down_count = int(getattr(model, "_omlx_ane_down_prefill_count", 0))
         model._omlx_ane_procedure_count = count + gdn_count + down_count
+        _warn_gdn_below_floor(
+            model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
+        )
+        _log_gdn_recurrent_safe_cap(model, gdn_fraction, gdn_count, dual_ane)
         if count or gdn_count:
             logger.info(
                 "Eagerly compiled %d MLP and %d GDN procedures into %d "
@@ -3208,6 +3449,10 @@ def enable_qwen35_ane_prefill(
     model._omlx_ane_down_prefill_count = 0
     model._omlx_ane_resident_program_count = resident_programs
     model._omlx_ane_procedure_count = count + gdn_count
+    _warn_gdn_below_floor(
+        model, bool(gdn and gdn_max_layers), gdn_count, gdn_fraction, dual_ane
+    )
+    _log_gdn_recurrent_safe_cap(model, gdn_fraction, gdn_count, dual_ane)
 
     if count:
         logger.info(
@@ -3293,6 +3538,7 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
     return {
         "attempted": attempted,
         "configured": bool(mlp or gdn),
+        "shed": bool(getattr(model, "_omlx_ane_prefill_shed", False)),
         "mlp_layers": mlp,
         "gdn_layers": gdn,
         "dual_ane_layers": int(
@@ -3305,3 +3551,54 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
             getattr(model, "_omlx_ane_tail_padding_min_tokens", 0) or 0
         ),
     }
+
+
+def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
+    """Drop every compiled ANE prefill slice on ``model``; GPU-only from here.
+
+    The compiled procedure banks keep the packed weight blobs they were built
+    from mapped for the lifetime of the native programs (roughly 13 GB for a
+    27B at mlp 0.35 / gdn 0.45) — exactly the resident memory a long-context
+    prefill needs back once the KV cache has grown into the guard's sizing
+    target. Latches every sliced module through the existing per-module
+    failure flags first (so the dispatch sites fall back to stock GPU compute
+    and never lazily recompile), then drops the state references; the native
+    models free their programs and mapped blobs when the last reference dies.
+    Idempotent, and scoped to this engine instance: the next load of the
+    model rebuilds the banks from its settings.
+
+    Returns ``(modules_released, resident_programs_before)``.
+    """
+    modules_released = 0
+    programs_before = int(
+        getattr(model, "_omlx_ane_resident_program_count", 0) or 0
+    )
+    for module in model.modules() if hasattr(model, "modules") else ():
+        for state_attr, failed_attr in (
+            ("_omlx_ane_prefill_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_fused_down_state", "_omlx_ane_prefill_failed"),
+            ("_omlx_ane_gdn_state", "_omlx_ane_gdn_failed"),
+        ):
+            if getattr(module, state_attr, None) is None:
+                continue
+            # Latch BEFORE dropping the state: the fetch sites lazily
+            # recompile a missing state, and the failure flag is the one
+            # switch they all check first.
+            setattr(module, failed_attr, True)
+            setattr(module, state_attr, None)
+            modules_released += 1
+    if modules_released:
+        # Zero (not delete) the status counters and set the shed marker:
+        # attempted=True/configured=False alone is indistinguishable from a
+        # load-time compile failure, and a shed changes serving behavior
+        # until the next load.
+        model._omlx_ane_prefill_shed = True
+        for counter in (
+            "_omlx_ane_mlp_prefill_count",
+            "_omlx_ane_gdn_prefill_count",
+            "_omlx_ane_dual_prefill_count",
+            "_omlx_ane_resident_program_count",
+        ):
+            if hasattr(model, counter):
+                setattr(model, counter, 0)
+    return modules_released, programs_before

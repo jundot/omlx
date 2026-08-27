@@ -477,6 +477,12 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     # engine exposes no _model and would skew every measurement (issue #2914).
     if hasattr(settings, "dflash_enabled"):
         settings.dflash_enabled = False
+    # SpecPrefill compresses the measurement prompt to a sparse subset before
+    # prefill, so delivered chunks run narrower than the compiled ANE tile
+    # width: the ANE never executes and the idle guard aborts the run. Tune
+    # against the full dense prefill the ANE path is compiled for.
+    if hasattr(settings, "specprefill_enabled"):
+        settings.specprefill_enabled = False
     return settings
 
 
@@ -707,22 +713,10 @@ def _balanced_fractions(
 def _min_viable_gdn_fraction(patch: Any, gdn: Any, alignment: int) -> float | None:
     """Smallest gdn_fraction that engages the ANE on ``gdn``.
 
-    Mirrors the bank rule: the aligned slice ``(int(total * f) // alignment)
-    * alignment`` must cover the z projection, otherwise every GDN layer is
-    rejected and 0 procedures compile, silently (issue #2899).
+    Delegates to the patch module, which owns the bank rule this mirrors, so
+    the tuner's floor and the one the enable path warns about cannot drift.
     """
-    qkv, z, _, _ = patch._gdn_linears(gdn)
-    z_outputs = int(z.weight.shape[0])
-    total = z_outputs + int(qkv.weight.shape[0])
-    if total <= 0:
-        return None
-    ane_min = ((z_outputs + alignment - 1) // alignment) * alignment
-    if ane_min > total:
-        return None
-    fraction = ane_min / total
-    if (int(total * fraction) // alignment) * alignment < ane_min:
-        fraction = (ane_min + 1) / total
-    return fraction
+    return patch._min_viable_gdn_fraction(gdn, alignment)
 
 
 def _profile_refinement(
@@ -782,21 +776,27 @@ def _profile_refinement(
             float(gdn.get("ane1_eval_ns", 0.0)),
         ) / gdn_ops
         gpu_time = float(gdn.get("gpu_completion_ns", 0.0)) / gdn_ops
-        widths = [float(gdn_fraction)]
-        times = [ane_time]
-        # Below the structural floor a fraction compiles 0 GDN procedures at
-        # apply time, so the refinement must not pick one (issue #2899).
-        gdn_grid = sorted(
-            set([*_gdn_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.53, 0.55])
+        # The production GDN path precision-caps ANE at the token-local z
+        # projection. Its structural floor is therefore also its only real
+        # ANE width; larger requested fractions compile the same z-only slice.
+        effective_gdn_fraction = (
+            float(gdn_floor) if gdn_floor is not None else float(gdn_fraction)
         )
-        if gdn_floor is not None:
-            gdn_grid = [value for value in gdn_grid if value >= gdn_floor]
+        widths = [effective_gdn_fraction]
+        times = [ane_time]
+        gdn_grid = (
+            [float(gdn_floor)]
+            if gdn_floor is not None
+            else sorted(
+                set([*_gdn_fraction_grid(), 0.35, 0.40, 0.465, 0.50, 0.53, 0.55])
+            )
+        )
         choices = [gdn_grid or [float(gdn_fraction)]]
         if cpu_gdn_fraction > 0:
             widths.append(cpu_gdn_fraction)
             times.append(float(gdn.get("cpu_completion_ns", 0.0)) / gdn_ops)
             choices.append(_cpu_gdn_fraction_grid())
-        widths.append(1.0 - float(gdn_fraction) - cpu_gdn_fraction)
+        widths.append(1.0 - effective_gdn_fraction - cpu_gdn_fraction)
         times.append(gpu_time)
         choices.append([widths[-1]])
         balanced = _balanced_fractions(widths, times, choices)
@@ -1031,7 +1031,11 @@ def _calibrate_fused_components_sync(
     calibration_threads = _CALIBRATION_CPU_THREADS
     fractions = _fused_fraction_grid()
     cpu_fractions = _fused_cpu_fraction_grid() if cpu_supported else [0.0]
-    gdn_fractions = _gdn_fraction_grid() if gdn is not None else []
+    gdn_fractions = (
+        [float(run.gdn_floor)]
+        if gdn is not None and run.gdn_floor is not None
+        else []
+    )
     gdn_cpu_fractions = _cpu_gdn_fraction_grid() if gdn_cpu_supported else [0.0]
 
     run.phase = "compiling_calibration"
@@ -1729,8 +1733,8 @@ def _calibrate_components_sync(
         if value is not None:
             state, dense0, dense1 = value
             prepared.append(("mlp", fraction, state, dense0, dense1))
-    if gdn is not None:
-        for fraction in fractions:
+    if gdn is not None and run.gdn_floor is not None:
+        for fraction in [float(run.gdn_floor)]:
             config = patch._AneGDNConfig(
                 run.request.sequence_length, fraction, 8, dual_ane
             )
@@ -1772,7 +1776,9 @@ def _calibrate_components_sync(
         fraction for fraction in fractions if ("mlp", fraction) in ane_models
     ]
     valid_gdn_fractions = [
-        fraction for fraction in fractions if ("gdn", fraction) in ane_models
+        fraction
+        for fraction in ([float(run.gdn_floor)] if run.gdn_floor is not None else [])
+        if ("gdn", fraction) in ane_models
     ]
     # The loaded private programs own their compiled weight blobs. Release the
     # much larger temporary FP32 source slices before allocating CPU variants.
@@ -1991,6 +1997,56 @@ def _calibrate_components_sync(
 
 
 async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    # The serve path skips ANE gracefully when the private runtime is
+    # missing, but the tuner used to find out only deep inside the
+    # bank-split ladder — failing the run and leaving the model unloaded
+    # (#3044, M2 Ultra). Probe up front, before anything is pinned or
+    # unloaded, and return a completed GPU-only verdict: on such a machine
+    # that IS the tuning answer, not an error.
+    try:
+        from ..custom_kernels.qwen35_prefill import fast
+
+        runtime_available = fast.qwen35_ane_available()
+        bank_available = fast.qwen35_ane_bank_compiler_available()
+    except Exception:
+        # Never let the guard itself break tuning; fail open and let the
+        # ladder report whatever is actually wrong.
+        runtime_available = True
+        bank_available = True
+    if not bank_available:
+        reason = (
+            "the private ANE runtime is unavailable on this machine"
+            if not runtime_available
+            else "the private ANE procedure-bank compiler is missing from "
+            "this build"
+        )
+        logger.warning(
+            "ANE tuning for %s skipped: %s; recommending GPU-only",
+            run.request.model_id,
+            reason,
+        )
+        for result in run.results:
+            result["state"] = "skipped"
+            result["error"] = f"ANE unavailable: {reason}"
+        run.recommendation = {
+            "enabled": False,
+            "mlp_fraction": None,
+            "gdn_enabled": False,
+            "gdn_fraction": None,
+            "fused_down": False,
+            "processing_tps": None,
+            "speedup_percent": None,
+            "sequence_length": run.request.sequence_length,
+            "tail_padding_min_tokens": 0,
+        }
+        run.status = "completed"
+        run.phase = "completed"
+        run.current = run.total
+        run.message = (
+            f"ANE prefill is not usable here ({reason}); GPU-only recommended"
+        )
+        return
+
     previous_speed_priority = _pin_speed_priority(engine_pool)
     active_slot = _GPU_SLOT
     try:

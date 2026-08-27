@@ -581,6 +581,25 @@ def _config_int(
     )
 
 
+def _config_nonnegative_int(config: dict[str, Any], key: str) -> int | None:
+    """Read an explicitly present, bounded integer that may be zero."""
+    candidates = [config]
+    for nested in ("text_config", "language_config", "llm_config"):
+        value = config.get(nested)
+        if isinstance(value, dict):
+            candidates.append(value)
+    return next(
+        (
+            value
+            for candidate in candidates
+            if isinstance((value := candidate.get(key)), int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 4096
+        ),
+        None,
+    )
+
+
 def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """Whether this architecture has a runtime-safe tensor strategy.
 
@@ -796,7 +815,7 @@ def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
 
     return (
         _config_int(config, "kv_lora_rank", 0) > 0
-        and _config_int(config, "qk_rope_head_dim", 0) > 0
+        and _config_nonnegative_int(config, "qk_rope_head_dim") is not None
     )
 
 
@@ -819,7 +838,29 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     if _kv_cache_replicated_across_tp(config):
         # One KV head holding latent + RoPE, not expanded K/V tensors.
         kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
-        rope_dim = _config_int(config, "qk_rope_head_dim", 0)
+        rope_dim = _config_nonnegative_int(config, "qk_rope_head_dim") or 0
+        text_config = config.get("text_config")
+        layer_config = text_config if isinstance(text_config, dict) else config
+        layer_types = layer_config.get("layer_types")
+        if config.get("model_type") == "glm5_next" and isinstance(
+            layer_types, list
+        ):
+            num_layers = _config_int(config, "num_hidden_layers", 0)
+            sparse_layers = sum(
+                layer_type != "linear_attention" for layer_type in layer_types
+            )
+            index_dim = _config_int(config, "index_head_dim", 0)
+            index_pool = _config_int(config, "index_kpool", 1)
+            if num_layers > 0 and sparse_layers > 0:
+                # ModelLayout stores one integral average per layer. Keep the
+                # exact full-model total conservative by rounding upward.
+                numerator = (
+                    sparse_layers
+                    * ((kv_lora_rank + rope_dim) * index_pool + index_dim)
+                    * dtype_size
+                )
+                denominator = num_layers * index_pool
+                return (numerator + denominator - 1) // denominator
         return (kv_lora_rank + rope_dim) * dtype_size
 
     heads = _config_int(config, "num_attention_heads", 0)

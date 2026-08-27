@@ -2102,6 +2102,61 @@ class TestAsyncBackgroundWrite:
         assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
 
+    def test_write_safetensors_no_mx_fsyncs_before_close(self, mx, tmp_path):
+        """The file must be durable on disk before any caller renames it
+        into place -- otherwise a crash between close() and the rename can
+        leave the renamed file pointing at data that was only ever in the
+        OS page cache, reading back as truncated/zero-filled garbage."""
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        t1 = mx.ones((4,), dtype=mx.float32)
+        mx.eval(t1)
+        tensors_raw = {"tensor_a": _extract_tensor_bytes(t1)}
+        out_path = str(tmp_path / "test.safetensors")
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _write_safetensors_no_mx(out_path, tensors_raw)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_fsyncs_the_directory(self, tmp_path):
+        """F1: renaming a file into place doesn't guarantee the directory
+        entry itself survives a crash until the containing directory is
+        fsynced too."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        target = tmp_path / "sub" / "file.txt"
+        target.parent.mkdir()
+        target.write_text("data")
+
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _fsync_parent_dir(target)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_tolerates_missing_directory(self, tmp_path):
+        """Must not raise if the directory vanished (e.g. concurrent
+        eviction) -- this is best-effort durability, not correctness."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        _fsync_parent_dir(str(tmp_path / "does-not-exist" / "file.txt"))
+
     def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
         """Verify bfloat16 safetensors file is loadable by mx.load."""
         original = mx.random.normal((8, 16, 32)).astype(mx.bfloat16)
@@ -2508,6 +2563,50 @@ class TestPreloadMatchedBlocks:
         # Verify blocks ARE in hot cache after preload
         for h in hashes:
             assert manager2._hot_cache_get(h) is not None
+
+        manager2.close()
+
+    def test_preload_mx_load_runs_serially_on_caller_thread(self, tmp_path, mx):
+        """Preload must not run mx.load() in worker threads -- a prior
+        ThreadPoolExecutor-based version caused deadlocks contesting Metal
+        GPU resources with the calling (inference) thread, the same failure
+        mode load_block's own discipline comment already documents. Every
+        mx.load() call during preload must happen on the calling thread,
+        one at a time."""
+        import threading
+
+        from omlx.cache import paged_ssd_cache as ssd_mod
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        caller_thread = threading.current_thread()
+        seen_threads = []
+        concurrent_calls = {"active": 0, "max_active": 0}
+        original_load = ssd_mod.mx.load
+
+        def spy_load(*args, **kwargs):
+            seen_threads.append(threading.current_thread())
+            concurrent_calls["active"] += 1
+            concurrent_calls["max_active"] = max(
+                concurrent_calls["max_active"], concurrent_calls["active"]
+            )
+            try:
+                return original_load(*args, **kwargs)
+            finally:
+                concurrent_calls["active"] -= 1
+
+        with patch.object(ssd_mod.mx, "load", spy_load):
+            loaded = manager2.preload_matched_blocks(hashes)
+
+        assert loaded == 4
+        assert len(seen_threads) == 4
+        assert all(t is caller_thread for t in seen_threads)
+        assert concurrent_calls["max_active"] == 1
 
         manager2.close()
 

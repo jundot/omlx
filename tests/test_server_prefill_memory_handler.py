@@ -189,6 +189,137 @@ class TestPostCommitPrefillMemorySurface:
         assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
 
 
+class TestJsonResponseOrKeepaliveFastPath:
+    """Regression for the bug where a request aborted mid-prefill by the
+    memory guard still reported HTTP 200: ``_with_json_keepalive`` yields a
+    keepalive space (committing the ASGI response to whatever status
+    ``StreamingResponse`` was built with, always 200) before it knows the
+    wrapped task will fail. ``_json_response_or_keepalive`` races the task
+    against a short grace period so fast failures -- the common case for a
+    memory-guard rejection -- get a real status code instead.
+    """
+
+    class _Request:
+        async def is_disconnected(self):
+            return False
+
+    @pytest.mark.asyncio
+    async def test_fast_failure_returns_400_not_200(self):
+        import omlx.server as srv
+
+        async def _raise_fast():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-fast",
+                estimated_bytes=123,
+                limit_bytes=100,
+            )
+
+        resp = await srv._json_response_or_keepalive(self._Request(), _raise_fast())
+        assert resp.status_code == 400
+        import json
+
+        body = json.loads(resp.body)
+        assert body["error"]["code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] == 123
+
+    @pytest.mark.asyncio
+    async def test_fast_success_returns_200_with_body(self):
+        import omlx.server as srv
+
+        async def _succeed_fast():
+            return '{"ok": true}'
+
+        resp = await srv._json_response_or_keepalive(
+            self._Request(), _succeed_fast()
+        )
+        assert resp.status_code == 200
+        assert resp.body == b'{"ok": true}'
+
+    @pytest.mark.asyncio
+    async def test_fast_failure_releases_lease(self):
+        import omlx.server as srv
+
+        released = []
+
+        class _FakeLease:
+            async def release(self):
+                released.append(True)
+
+        async def _raise_fast():
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-lease",
+            )
+
+        resp = await srv._json_response_or_keepalive(
+            self._Request(), _raise_fast(), lease=_FakeLease()
+        )
+        assert resp.status_code == 400
+        assert released == [True]
+
+    @pytest.mark.asyncio
+    async def test_grace_period_cancellation_drains_task_before_releasing_lease(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        import omlx.server as srv
+
+        monkeypatch.setattr(srv, "_JSON_KEEPALIVE_GRACE_S", 10.0)
+        started = asyncio.Event()
+        child_cancelled = asyncio.Event()
+        released = []
+
+        class _FakeLease:
+            async def release(self):
+                released.append(True)
+
+        async def _wait_forever():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cancelled.set()
+                raise
+
+        response_task = asyncio.create_task(
+            srv._json_response_or_keepalive(
+                self._Request(), _wait_forever(), lease=_FakeLease()
+            )
+        )
+        await started.wait()
+        response_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+        assert child_cancelled.is_set()
+        assert released == [True]
+
+    @pytest.mark.asyncio
+    async def test_slow_task_falls_back_to_streaming_response(self, monkeypatch):
+        import asyncio
+
+        import omlx.server as srv
+
+        monkeypatch.setattr(srv, "_JSON_KEEPALIVE_GRACE_S", 0.01)
+
+        async def _raise_slow():
+            await asyncio.sleep(0.05)
+            raise PrefillMemoryExceededError(
+                message="Prefill context too large for available memory",
+                request_id="req-slow",
+            )
+
+        resp = await srv._json_response_or_keepalive(self._Request(), _raise_slow())
+        assert isinstance(resp, srv.StreamingResponse)
+        # A task still running past the grace period necessarily commits to
+        # 200 once the stream starts -- this is the acknowledged, unfixable
+        # remainder of the bug for genuinely long-running failures.
+        assert resp.status_code == 200
+
+
 class TestResponsesEndpointReaches400:
     """End-to-end regression for ``/v1/responses``. The handler-shape tests
     above use a synthetic ``/v1/raise`` route, which proves the handler
@@ -293,3 +424,54 @@ class TestResponsesEndpointReaches400:
             srv._server_state.engine_pool = original_engine_pool
             srv.app.dependency_overrides.clear()
             srv.app.dependency_overrides.update(original_overrides)
+
+
+class TestStreamingErrorPayload:
+    """#3036: a prefill-guard rejection raised inside a streaming generator
+    must keep its structured body. The generators' blanket except is the
+    innermost handler, so the classification has to happen there — these
+    tests pin the payload the SSE error frame carries."""
+
+    def _exceeded(self):
+        return PrefillMemoryExceededError(
+            message=(
+                "Prefill context too large for available memory "
+                "(pre-chunk guard at 48000 tokens, kv_len=48000)"
+            ),
+            request_id="req-stream",
+            estimated_bytes=46_775_000_000,
+            limit_bytes=42_949_672_960,
+        )
+
+    def test_prefill_exceeded_keeps_structured_body(self):
+        import omlx.server as srv
+
+        body = srv._streaming_error_payload(self._exceeded(), "chat streaming")
+        assert body["type"] == "error"
+        assert body["error"]["omlx_code"] == "prefill_memory_exceeded"
+        assert body["error"]["estimated_bytes"] == 46_775_000_000
+        assert body["error"]["limit_bytes"] == 42_949_672_960
+        assert "prefill memory guard rejected" in body["error"]["message"]
+
+    def test_prefill_aborted_keeps_aborted_code(self):
+        import omlx.server as srv
+
+        e = PrefillMemoryAbortedError(
+            message=(
+                "Request aborted: process memory limit exceeded "
+                "(usage 4.4 GB, abort threshold (hard watermark) 4.1 GB, "
+                "dynamic ceiling 4.3 GB)."
+            ),
+            request_id="req-abort-stream",
+            limit_bytes=4_100_000_000,
+        )
+        body = srv._streaming_error_payload(e, "chat streaming")
+        assert body["type"] == "error"
+        assert body["error"]["omlx_code"] == "prefill_memory_aborted"
+        assert "aborted this request mid-prefill" in body["error"]["message"]
+
+    def test_generic_exception_stays_flat_server_error(self):
+        import omlx.server as srv
+
+        body = srv._streaming_error_payload(ValueError("boom"), "chat streaming")
+        assert body == {"error": {"message": "boom", "type": "server_error"}}

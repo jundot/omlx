@@ -70,12 +70,56 @@ class VLMModelAdapter(nn.Module):
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        close = getattr(self._vlm_model, "close", None)
+        if callable(close):
+            close()
         self._pending_embeds = None
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()
         self._batch_rope_deltas = None
         self._language_model = None
         self._vlm_model = None
+
+    @property
+    def mtp(self):
+        """Expose an attached Lightning MTP head, when the model provides one."""
+        language_model = self._language_model
+        getter = getattr(language_model, "get_mtp_module", None)
+        if callable(getter):
+            return getter()
+        return getattr(language_model, "mtp", None)
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        return self._language_model.mtp_forward(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            return_hidden=return_hidden,
+            logits_keep=logits_keep,
+        )
+
+    def make_mtp_cache(self):
+        make_cache = getattr(self._language_model, "make_mtp_cache", None)
+        return make_cache() if callable(make_cache) else []
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        return self._language_model.rollback_speculative_cache(
+            caches,
+            gdn_states,
+            accepted,
+            block_size,
+        )
+
+    # Runtime family patches use this marker to avoid installing an older,
+    # model-specific copy of the same adapter plumbing.
+    _omlx_mtp_adapter_patched = True
 
     @property
     def layers(self):

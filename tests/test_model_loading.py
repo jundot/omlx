@@ -801,6 +801,26 @@ class TestExpandPerLayerQuantKeys:
 
 
 class TestMaterializeLazyState:
+    def test_evaluates_arrays_in_bounded_chunks(self, monkeypatch):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.tensor_list = [mx.array(i) * 2 for i in range(17)]
+
+        chunk_sizes = []
+        monkeypatch.setattr(
+            model_loading.mx,
+            "eval",
+            lambda arrays: chunk_sizes.append(len(arrays)),
+        )
+
+        model_loading.materialize_lazy_state(_Model())
+
+        assert chunk_sizes == [8, 8, 1]
+
     def test_covers_arrays_in_plain_helper_objects(self):
         """Lazy arrays hidden in non-Module helpers must be materialized.
 

@@ -212,6 +212,10 @@ class ModelSettings:
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
+    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
+    # through mmap. The runtime may force this on when resident loading cannot
+    # fit under the configured model-memory ceiling but mmap loading can.
+    qwen4_ple_ssd_offload: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

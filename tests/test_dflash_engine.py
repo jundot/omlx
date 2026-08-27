@@ -366,6 +366,8 @@ class TestDFlashEngineInit:
             top_p=0.95,
             top_k=20,
             min_p=0.05,
+            repetition_penalty=1.2,
+            repetition_context_size=128,
         )
 
         assert list(event_iter) == []
@@ -377,6 +379,8 @@ class TestDFlashEngineInit:
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == 20
         assert captured["min_p"] == 0.05
+        assert captured["repetition_penalty"] == 1.2
+        assert captured["repetition_context_size"] == 128
         assert captured["block_tokens"] == 5
         assert fake_flow.snapshot is None
         assert prefix_kwargs["max_new_tokens"] == 3
@@ -1439,14 +1443,29 @@ class TestDFlashCachedTokensWiring:
         fake_flow = SimpleNamespace(hit_tokens=4273)
 
         def fake_stream_events(
-            *, prompt_tokens, max_tokens, temperature, top_p, top_k, min_p
+            *,
+            prompt_tokens,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            repetition_context_size,
         ):
             assert (temperature, top_p, top_k, min_p) == (0.7, 0.9, 0, 0.0)
+            assert repetition_penalty == 1.2
+            assert repetition_context_size == 128
             return iter([summary]), fake_flow, [2]
 
         monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)
 
-        out = await engine.generate("hello", max_tokens=4)
+        out = await engine.generate(
+            "hello",
+            max_tokens=4,
+            repetition_penalty=1.2,
+            repetition_context_size=128,
+        )
         assert out.cached_tokens == 4273
 
 

@@ -310,8 +310,14 @@ class TestExtractBlockTensorSliceLastBlock:
         assert keys1.shape == (1,)
         assert values1.shape == (1,)
 
-    def test_rotating_last_block_full_state(self, prefix_cache):
-        """Test RotatingKVCache last block stores full state."""
+    def test_rotating_last_block_without_snapshot_stores_placeholder(
+        self, prefix_cache
+    ):
+        """A1 fix: is_last_block alone no longer justifies storing live
+        state -- store_cache's last FULL block may sit behind trailing
+        tokens the live state has already ingested (skipped partial block),
+        so a missing boundary snapshot must fall to the placeholder even on
+        the last block. See docs/qwen35-hardening-and-optimization.md A1."""
         cache_data = [
             self._make_kvcache_layer(64),
             self._make_rotating_layer(256),
@@ -329,10 +335,42 @@ class TestExtractBlockTensorSliceLastBlock:
         keys0, values0 = result[0]
         assert keys0.shape == (1, 8, 4, 64)
 
-        # RotatingKVCache layer: full state
+        # RotatingKVCache layer: placeholder, no snapshot was provided
         keys1, values1 = result[1]
-        assert keys1.shape == (1, 8, 256, 64)  # Full RotatingKVCache state
-        assert values1.shape == (1, 8, 256, 64)
+        assert keys1.shape == (1,)
+        assert values1.shape == (1,)
+
+    def test_rotating_last_block_with_snapshot_stores_snapshot_state(
+        self, prefix_cache
+    ):
+        """With a matching boundary snapshot, the last block DOES store real
+        state -- sourced from the snapshot, never from live cache_data."""
+        cache_data = [
+            self._make_kvcache_layer(64),
+            self._make_rotating_layer(256),
+        ]
+        config = ModelCacheConfig.from_type_list(["KVCache", "RotatingKVCache"])
+        snapshot_keys = mx.zeros((1, 8, 256, 64))
+        snapshot_values = mx.ones((1, 8, 256, 64))
+        snapshot_cache_data = [
+            {},  # layer 0 (KVCache) is sliceable, no snapshot needed
+            {"state": (snapshot_keys, snapshot_values)},
+        ]
+
+        result = prefix_cache._extract_block_tensor_slice(
+            cache_data,
+            0,
+            4,
+            model_cache_config=config,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
+        )
+
+        assert result is not None
+        keys1, values1 = result[1]
+        assert keys1.shape == (1, 8, 256, 64)
+        assert bool((keys1 == snapshot_keys).all().item())
+        assert bool((values1 == snapshot_values).all().item())
 
     def test_hybrid_model_multiple_blocks(self, prefix_cache):
         """Test storing multiple blocks for a hybrid model."""
@@ -359,13 +397,14 @@ class TestExtractBlockTensorSliceLastBlock:
         assert block1[0][0].shape == (1, 8, 4, 64)
         assert block1[1][0].shape == (1,)
 
-        # Block 3 (last): KVCache sliced, RotatingKVCache full state
+        # Block 3 (last, no snapshot): KVCache sliced, RotatingKVCache
+        # placeholder too -- see A1, is_last_block alone is not enough.
         block3 = prefix_cache._extract_block_tensor_slice(
             cache_data, 12, 16, model_cache_config=config, is_last_block=True
         )
         assert block3 is not None
         assert block3[0][0].shape == (1, 8, 4, 64)
-        assert block3[1][0].shape == (1, 8, 256, 64)  # Full state
+        assert block3[1][0].shape == (1,)  # placeholder, no snapshot provided
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

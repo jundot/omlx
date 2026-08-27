@@ -1139,6 +1139,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         top_p: float = 1.0,
         top_k: int = 0,
         min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        repetition_context_size: int = 20,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
@@ -1184,6 +1186,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
             block_tokens=self._block_size,
             prompt_tokens_override=prompt_tokens,
             prefix_snapshot=prefix_flow.snapshot,
@@ -1228,6 +1232,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         top_p: float,
         top_k: int,
         min_p: float,
+        repetition_penalty: float,
+        repetition_context_size: int,
         seed: int | None,
         tools: list[dict] | None,
         queue: asyncio.Queue,
@@ -1258,6 +1264,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 top_p=top_p,
                 top_k=top_k,
                 min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                repetition_context_size=repetition_context_size,
             )
             cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
@@ -1447,6 +1455,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        repetition_context_size = kwargs.pop("repetition_context_size", None)
+        if repetition_context_size is None:
+            repetition_context_size = 20
 
         from ..engine_core import get_mlx_executor
 
@@ -1478,6 +1489,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     top_p=top_p,
                     top_k=top_k,
                     min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    repetition_context_size=int(repetition_context_size),
                 )
                 cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
@@ -1668,6 +1681,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        repetition_context_size = kwargs.pop("repetition_context_size", None)
+        if repetition_context_size is None:
+            repetition_context_size = 20
 
         prompt_len = len(prompt_tokens)
         loop = asyncio.get_running_loop()
@@ -1703,6 +1719,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             top_p,
             top_k,
             min_p,
+            repetition_penalty,
+            int(repetition_context_size),
             seed,
             tools,
             queue,

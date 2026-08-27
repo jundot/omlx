@@ -7,6 +7,10 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -111,10 +115,251 @@ void load_ane_framework() {
   }
 }
 
+// Opt-in persistent compile cache for private-ANE programs. The default
+// (unset or any value other than exactly "1") keeps the historical
+// temp-directory path that is deleted when the program unloads.
+bool ane_compile_cache_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("OMLX_QWEN35_ANE_COMPILE_CACHE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+NSString *ane_compile_cache_root_directory() {
+  NSArray *roots = NSSearchPathForDirectoriesInDomains(
+      NSCachesDirectory, NSUserDomainMask, YES);
+  NSString *root = roots.firstObject ?: NSTemporaryDirectory();
+  return [[[root stringByAppendingPathComponent:@"omlx"]
+      stringByAppendingPathComponent:@"ane"]
+      stringByAppendingPathComponent:@"v1"];
+}
+
+// ~/Library/Caches/omlx/ane/v1/<os-build>/<identifier>. The private ANE
+// runtime keys its compiled-program cache by this descriptor content hash.
+// oMLX only needs a matching cross-process lock; it must not assign this path
+// as the in-memory model URL (#3124).
+NSString *ane_compile_cache_lock_entry(NSString *identifier) {
+  NSString *os_build =
+      [[NSProcessInfo processInfo] operatingSystemVersionString];
+  os_build =
+      [os_build stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+  os_build =
+      [os_build stringByReplacingOccurrencesOfString:@":" withString:@"_"];
+  return [[ane_compile_cache_root_directory()
+      stringByAppendingPathComponent:os_build]
+      stringByAppendingPathComponent:identifier];
+}
+
+std::string error_text(NSString *prefix, NSError *error);
+
+// A suspended process holding the entry lock must not hang later loads of the
+// same identifier forever. Acquisition is bounded: the lock is taken
+// non-blocking and retried until the deadline, then the constructor throws so
+// the caller fails open to the historical temp-directory path.
+constexpr std::chrono::milliseconds kAneCacheLockTimeout{30000};
+constexpr std::chrono::milliseconds kAneCacheLockRetry{50};
+
+// One stable rendezvous file per cache entry, beside the entry directory.
+// Never unlink this path while the process is running: a waiter may already
+// hold the old inode open, and recreating the path would let a later process
+// lock a different inode and enter the same staging directory concurrently.
+NSString *ane_compile_cache_lock_path(NSString *entry_directory) {
+  return [entry_directory stringByAppendingString:@".lock"];
+}
+
+class ScopedAneCacheLock {
+public:
+  explicit ScopedAneCacheLock(NSString *entry_directory) {
+    NSString *parent = [entry_directory stringByDeletingLastPathComponent];
+    NSError *error = nil;
+    if (![[NSFileManager defaultManager]
+            createDirectoryAtPath:parent
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:&error]) {
+      throw std::runtime_error(
+          error_text(@"ANE compile cache parent creation failed", error));
+    }
+    NSString *lock_path = ane_compile_cache_lock_path(entry_directory);
+    fd_ = open(lock_path.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
+    if (fd_ < 0) {
+      throw std::runtime_error("ANE compile cache lock open failed.");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kAneCacheLockTimeout;
+    for (;;) {
+      if (flock(fd_, LOCK_EX | LOCK_NB) == 0) {
+        return;
+      }
+      if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      std::this_thread::sleep_for(kAneCacheLockRetry);
+    }
+    close(fd_);
+    fd_ = -1;
+    throw std::runtime_error("ANE compile cache lock acquisition timed out.");
+  }
+
+
+  ~ScopedAneCacheLock() {
+    if (fd_ >= 0) {
+      flock(fd_, LOCK_UN);
+      close(fd_);
+    }
+  }
+
+  ScopedAneCacheLock(const ScopedAneCacheLock &) = delete;
+  ScopedAneCacheLock &operator=(const ScopedAneCacheLock &) = delete;
+
+private:
+  int fd_ = -1;
+};
+
 std::string error_text(NSString *prefix, NSError *error) {
   NSString *value =
       error ? [NSString stringWithFormat:@"%@: %@", prefix, error] : prefix;
   return std::string([value UTF8String]);
+}
+
+void remove_ane_staging_directory(NSString *directory,
+                                  NSString *cache_lock_entry) noexcept {
+  if (directory == nil) {
+    return;
+  }
+  if (cache_lock_entry == nil) {
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    return;
+  }
+  try {
+    // Compile/load and cleanup mutate the same historical temp path. Keep
+    // cleanup in the descriptor-hash lock domain used by cache-enabled loads.
+    ScopedAneCacheLock cache_lock(cache_lock_entry);
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+  } catch (const std::exception &failure) {
+    // Cleanup must not make model teardown fail. Leaving staging behind is
+    // safer than deleting another process's in-progress compile inputs.
+    NSLog(@"oMLX: ANE compile cache cleanup deferred (%s)", failure.what());
+  }
+}
+
+struct AneLoadResult {
+  NSString *staging_directory;
+  NSString *cache_lock_entry;
+};
+
+// Cache-first load for one private-ANE program. The in-memory model already
+// derives its model URL and compiled-cache key from the descriptor content
+// hash. Overriding that URL breaks the per-file bundle hash verification added
+// by macOS 27, so both cache modes retain the historical temporary staging
+// path. With caching enabled, compiledModelExists probes Apple's persistent
+// cache directly; a hit skips materialization and compilation. A restored
+// program whose load fails is purged and recompiled exactly once. oMLX owns
+// only temporary MIL and weight inputs, deleting them on unload as before.
+AneLoadResult
+load_or_compile_ane_model(id model, NSString *identifier, int ane_instance,
+                          NSDictionary *execution_options, NSData *mil,
+                          NSDictionary<NSString *, NSData *> *weight_files,
+                          NSString *compile_what, NSString *load_what) {
+  NSString *directory =
+      [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
+  NSString *cache_lock_entry = nil;
+  bool restored = false;
+  bool staged = false;
+  std::unique_ptr<ScopedAneCacheLock> cache_lock;
+  if (ane_compile_cache_enabled()) {
+    try {
+      cache_lock_entry = ane_compile_cache_lock_entry(identifier);
+      // Hold the descriptor-hash lock from probe through load so a second
+      // process compiling the same program waits instead of racing writes to
+      // the framework-selected temporary staging path.
+      cache_lock = std::make_unique<ScopedAneCacheLock>(cache_lock_entry);
+      SEL exists_selector = @selector(compiledModelExists);
+      restored = [model respondsToSelector:exists_selector] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(model, exists_selector);
+      if (restored) {
+        NSLog(@"oMLX: ANE compile cache hit identifier=%@ instance=%d",
+              identifier, ane_instance);
+      } else {
+        NSLog(@"oMLX: ANE compile cache miss identifier=%@ instance=%d",
+              identifier, ane_instance);
+      }
+    } catch (const std::exception &failure) {
+      // Fail open: the cache only accelerates loads. An unusable root or
+      // lock must degrade to the historical temp path, never fail the load.
+      NSLog(@"oMLX: ANE compile cache unavailable (%s), using a temporary "
+            @"directory",
+            failure.what());
+      cache_lock.reset();
+      cache_lock_entry = nil;
+      restored = false;
+    }
+  }
+  auto compile_fresh = [&]() {
+    // Clear any stale or half-written entry first: a crash mid-compile can
+    // leave incomplete staging inputs, and they must never be reused.
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    NSString *weight_directory =
+        [directory stringByAppendingPathComponent:@"weights"];
+    [[NSFileManager defaultManager]
+        createDirectoryAtPath:weight_directory
+        withIntermediateDirectories:YES
+        attributes:nil
+        error:nil];
+    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
+          atomically:YES];
+    for (NSString *name in weight_files) {
+      [weight_files[name]
+          writeToFile:[weight_directory stringByAppendingPathComponent:name]
+               atomically:YES];
+    }
+    NSError *error = nil;
+    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(compileWithQoS:options:error:), 21,
+        execution_options, &error);
+    if (!ok) {
+      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+      throw std::runtime_error(error_text(
+          [compile_what stringByAppendingString:@" compilation failed"],
+          error));
+    }
+    staged = true;
+  };
+
+  if (!restored) {
+    compile_fresh();
+  }
+  NSError *error = nil;
+  BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+      model, @selector(loadWithQoS:options:error:), 21, execution_options,
+      &error);
+  if (!ok && restored) {
+    // Corrupt or incompatible native entry: purge it before compiling exactly
+    // once more, otherwise compiledModelExists would keep returning the same
+    // unusable artifact.
+    NSLog(@"oMLX: ANE compile cache fallback identifier=%@ instance=%d",
+          identifier, ane_instance);
+    SEL purge_selector = @selector(purgeCompiledModel);
+    if ([model respondsToSelector:purge_selector]) {
+      ((void (*)(id, SEL))objc_msgSend)(model, purge_selector);
+    }
+    compile_fresh();
+    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
+        model, @selector(loadWithQoS:options:error:), 21, execution_options,
+        &error);
+  }
+  if (!ok) {
+    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    throw std::runtime_error(error_text(
+        [load_what stringByAppendingString:@" load failed"], error));
+  }
+  return {
+      staged ? directory : nil,
+      staged ? cache_lock_entry : nil,
+  };
 }
 
 NSData *make_blob(const void *bytes, size_t byte_count) {
@@ -468,8 +713,11 @@ NSDictionary *ane_execution_options(int ane_instance) {
 
 class SharedAneProgram {
 public:
-  SharedAneProgram(id model, NSString *directory, NSDictionary *options)
-      : model_([model retain]), directory_([directory copy]),
+  SharedAneProgram(id model, const AneLoadResult &load_result,
+                   NSDictionary *options)
+      : model_([model retain]),
+        directory_([load_result.staging_directory copy]),
+        cache_lock_entry_([load_result.cache_lock_entry copy]),
         execution_options_([options copy]) {}
 
   ~SharedAneProgram() {
@@ -479,17 +727,17 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      if (directory_) {
-        [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
-      }
+      remove_ane_staging_directory(directory_, cache_lock_entry_);
       [model_ release];
       [directory_ release];
+      [cache_lock_entry_ release];
       [execution_options_ release];
     }
   }
 
   id model_;
   NSString *directory_;
+  NSString *cache_lock_entry_;
   NSDictionary *execution_options_;
   std::mutex evaluation_mutex_;
 };
@@ -577,40 +825,14 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory =
-          [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-      directory_ = [directory copy];
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      NSString *weight_directory =
-          [directory stringByAppendingPathComponent:@"weights"];
-      [[NSFileManager defaultManager] createDirectoryAtPath:weight_directory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
-      [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-            atomically:YES];
-      [data_blob
-          writeToFile:[weight_directory
-                          stringByAppendingPathComponent:@"weight_data.bin"]
-           atomically:YES];
-      [scale_blob
-          writeToFile:[weight_directory
-                          stringByAppendingPathComponent:@"weight_scale.bin"]
-           atomically:YES];
-
-      NSError *error = nil;
-      BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(compileWithQoS:options:error:), 21,
-          execution_options_, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE compilation failed", error));
-      }
-      ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(loadWithQoS:options:error:), 21,
-          execution_options_, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE model load failed", error));
-      }
+      AneLoadResult load_result = load_or_compile_ane_model(
+          model, identifier, ane_instance, execution_options_, mil, @{
+            @"weight_data.bin" : data_blob,
+            @"weight_scale.bin" : scale_blob,
+          },
+          @"ANE", @"ANE model");
+      directory_ = [load_result.staging_directory copy];
+      cache_lock_entry_ = [load_result.cache_lock_entry copy];
       model_ = [model retain];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
@@ -705,38 +927,14 @@ public:
 
       id identifier = ((id (*)(id, SEL))objc_msgSend)(
           model, @selector(hexStringIdentifier));
-      NSString *directory =
-          [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-      directory_ = [directory copy];
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      NSString *weight_directory =
-          [directory stringByAppendingPathComponent:@"weights"];
-      [[NSFileManager defaultManager] createDirectoryAtPath:weight_directory
-                                withIntermediateDirectories:YES
-                                                 attributes:nil
-                                                      error:nil];
-      [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-            atomically:YES];
-      NSDictionary *files = @{
-        @"weight.bin" : weight_blob,
-      };
-      for (NSString *name in files) {
-        [files[name]
-            writeToFile:[weight_directory stringByAppendingPathComponent:name]
-             atomically:YES];
-      }
+      AneLoadResult load_result = load_or_compile_ane_model(
+          model, identifier, ane_instance, @{}, mil, @{
+            @"weight.bin" : weight_blob,
+          },
+          @"ANE", @"ANE model");
+      directory_ = [load_result.staging_directory copy];
+      cache_lock_entry_ = [load_result.cache_lock_entry copy];
 
-      NSError *error = nil;
-      BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(compileWithQoS:options:error:), 21, @{}, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE compilation failed", error));
-      }
-      ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-          model, @selector(loadWithQoS:options:error:), 21, @{}, &error);
-      if (!ok) {
-        throw std::runtime_error(error_text(@"ANE model load failed", error));
-      }
       model_ = [model retain];
 
       input_surface_ = make_surface(static_cast<size_t>(input_dim_) *
@@ -852,9 +1050,7 @@ public:
         ((BOOL (*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
             model_, @selector(unloadWithQoS:error:), 21, &error);
       }
-      if (directory_) {
-        [[NSFileManager defaultManager] removeItemAtPath:directory_ error:nil];
-      }
+      remove_ane_staging_directory(directory_, cache_lock_entry_);
       [request_ release];
       [execution_options_ release];
       [event_ release];
@@ -868,6 +1064,7 @@ public:
         CFRelease(output_surface_);
       [model_ release];
       [directory_ release];
+      [cache_lock_entry_ release];
     }
   }
 
@@ -1032,6 +1229,7 @@ public:
   int sequence_length_;
   id model_ = nil;
   NSString *directory_ = nil;
+  NSString *cache_lock_entry_ = nil;
   IOSurfaceRef input_surface_ = nullptr;
   IOSurfaceRef output_surface_ = nullptr;
   id input_object_ = nil;
@@ -1108,6 +1306,80 @@ static std::string pack_buffer_error(MTL::CommandBuffer *producer_buffer) {
       @"ANE input pack command buffer failed; canceling this dispatch",
       buffer.error);
 }
+
+struct AneTicketPair {
+  AneLinearModel::Ticket first;
+  AneLinearModel::Ticket second;
+};
+
+static AneTicketPair begin_ane_ticket_pair(
+    const std::shared_ptr<AneLinearModel> &first,
+    const std::shared_ptr<AneLinearModel> &second,
+    MTL::CommandBuffer *producer_buffer) {
+  auto first_ticket = first->begin(producer_buffer);
+  try {
+    return {first_ticket, second->begin(producer_buffer)};
+  } catch (...) {
+    first->cancel_ticket(first_ticket);
+    throw;
+  }
+}
+
+// Rolls an in-flight ANE dispatch back if the stack unwinds after begin()
+// has handed out a ticket but before the detached evaluation thread(s) take
+// ownership of it (finding C1). The dangerous window is everything between
+// begin() and the spawn — most notably the qmm get_kernel() calls, which can
+// throw. Without this guard such a throw would leave submitted_ ahead of
+// completed_ forever and leak the retained producer command buffer, so the
+// next begin() throws "overlapping evaluations" and the program stays wedged
+// until the process restarts. On unwind the guard releases the producer
+// buffer (unless producer_released() already retired it at the pack step) and
+// cancels the outstanding ticket(s) to rebalance the counters. Call disarm()
+// once ownership has transferred to the evaluation thread(s).
+class AneDispatchGuard {
+public:
+  AneDispatchGuard(MTL::CommandBuffer *producer_buffer,
+                   std::shared_ptr<AneLinearModel> model0,
+                   AneLinearModel::Ticket ticket0,
+                   std::shared_ptr<AneLinearModel> model1 = nullptr,
+                   AneLinearModel::Ticket ticket1 = {})
+      : producer_buffer_(producer_buffer), model0_(std::move(model0)),
+        ticket0_(ticket0), model1_(std::move(model1)), ticket1_(ticket1) {}
+  AneDispatchGuard(const AneDispatchGuard &) = delete;
+  AneDispatchGuard &operator=(const AneDispatchGuard &) = delete;
+  // The producer command buffer is released mid-dispatch once packing has
+  // completed; tell the guard so it does not double-release on unwind.
+  void producer_released() { producer_buffer_ = nullptr; }
+  // Transfer one ticket only after its detached evaluation thread exists.
+  // Keeping ownership per ticket lets a later thread-constructor failure
+  // cancel the tickets that have not acquired a worker yet without racing
+  // workers that are already running.
+  void transfer_ticket0() noexcept { model0_.reset(); }
+  void transfer_ticket1() noexcept { model1_.reset(); }
+  void disarm() { armed_ = false; }
+  ~AneDispatchGuard() {
+    if (!armed_) {
+      return;
+    }
+    if (producer_buffer_) {
+      producer_buffer_->release();
+    }
+    if (model0_) {
+      model0_->cancel_ticket(ticket0_);
+    }
+    if (model1_) {
+      model1_->cancel_ticket(ticket1_);
+    }
+  }
+
+private:
+  MTL::CommandBuffer *producer_buffer_;
+  std::shared_ptr<AneLinearModel> model0_;
+  AneLinearModel::Ticket ticket0_;
+  std::shared_ptr<AneLinearModel> model1_;
+  AneLinearModel::Ticket ticket1_;
+  bool armed_ = true;
+};
 
 bool qwen35_ane_available() {
   @autoreleasepool {
@@ -1279,43 +1551,13 @@ AneLinearBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory =
-        [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    NSString *weight_directory =
-        [directory stringByAppendingPathComponent:@"weights"];
-    [[NSFileManager defaultManager]
-        createDirectoryAtPath:weight_directory
-        withIntermediateDirectories:YES
-        attributes:nil
-        error:nil];
-    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-          atomically:YES];
-    [weight_blob
-        writeToFile:[weight_directory stringByAppendingPathComponent:
-                                          @"weight.bin"]
-         atomically:YES];
-
-    NSError *error = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(compileWithQoS:options:error:), 21,
-        execution_options, &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE procedure bank compilation failed", error));
-    }
-    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(loadWithQoS:options:error:), 21, execution_options,
-        &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE procedure bank load failed", error));
-    }
-
-    auto program =
-        std::make_shared<SharedAneProgram>(model, directory, execution_options);
+    AneLoadResult load_result = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil, @{
+          @"weight.bin" : weight_blob,
+        },
+        @"ANE procedure bank", @"ANE procedure bank");
+    auto program = std::make_shared<SharedAneProgram>(model, load_result,
+                                                      execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
     result.reserve(span);
     for (int index = 0; index < span; ++index) {
@@ -1497,43 +1739,14 @@ AneFusedBankBuilder::compile(int ane_instance, int start, int stop) {
     }
     id identifier = ((id (*)(id, SEL))objc_msgSend)(
         model, @selector(hexStringIdentifier));
-    NSString *directory =
-        [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-    NSString *weight_directory =
-        [directory stringByAppendingPathComponent:@"weights"];
-    [[NSFileManager defaultManager]
-        createDirectoryAtPath:weight_directory
-        withIntermediateDirectories:YES
-        attributes:nil
-        error:nil];
-    [mil writeToFile:[directory stringByAppendingPathComponent:@"model.mil"]
-          atomically:YES];
-    [weight_blob
-        writeToFile:[weight_directory stringByAppendingPathComponent:
-                                          @"weight.bin"]
-         atomically:YES];
+    AneLoadResult load_result = load_or_compile_ane_model(
+        model, identifier, ane_instance, execution_options, mil, @{
+          @"weight.bin" : weight_blob,
+        },
+        @"ANE SwiGLU/down bank", @"ANE SwiGLU/down bank");
 
-    NSError *error = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(compileWithQoS:options:error:), 21,
-        execution_options, &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE SwiGLU/down bank compilation failed", error));
-    }
-    ok = ((BOOL (*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-        model, @selector(loadWithQoS:options:error:), 21, execution_options,
-        &error);
-    if (!ok) {
-      [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-      throw std::runtime_error(
-          error_text(@"ANE SwiGLU/down bank load failed", error));
-    }
-
-    auto program =
-        std::make_shared<SharedAneProgram>(model, directory, execution_options);
+    auto program = std::make_shared<SharedAneProgram>(model, load_result,
+                                                      execution_options);
     std::vector<std::shared_ptr<AneLinearModel>> result;
     result.reserve(shapes.size());
     for (size_t index = 0; index < shapes.size(); ++index) {
@@ -2126,7 +2339,18 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket = model_->begin(producer_buffer);
+    AneLinearModel::Ticket ticket{};
+    try {
+      ticket = model_->begin(producer_buffer);
+    } catch (...) {
+      // begin() throws before it increments the submission counter, so no
+      // ticket exists to cancel here — only the retained buffer must be freed.
+      producer_buffer->release();
+      throw;
+    }
+    // Cancel the ticket and free the buffer if anything below throws before the
+    // detached evaluation thread takes ownership (finding C1).
+    AneDispatchGuard ane_guard(producer_buffer, model_, ticket);
 
     // Submit the pack-and-signal buffer before encoding the GPU remainder.
     // On current Metal drivers, a shared-event signal embedded midway through
@@ -2139,12 +2363,11 @@ public:
     // still launched concurrently below.
     producer_buffer->waitUntilCompleted();
     if (pack_buffer_failed(producer_buffer)) {
-      const std::string reason = pack_buffer_error(producer_buffer);
-      producer_buffer->release();
-      model_->cancel_ticket(ticket);
-      throw std::runtime_error(reason);
+      // ane_guard releases the buffer and cancels the ticket on unwind.
+      throw std::runtime_error(pack_buffer_error(producer_buffer));
     }
     producer_buffer->release();
+    ane_guard.producer_released();
     if (profiling) {
       profile_add(profile_category, kPackNs,
                   profile_now_ns() - operation_start);
@@ -2183,6 +2406,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2194,12 +2418,6 @@ public:
                     profile_now_ns() - launch);
       }];
     }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
-    }
-
     // Keep the wait in a third command buffer. Metal may hold an entire
     // command buffer at an encoded wait, even when compute encoders precede
     // it, which serializes the otherwise independent GPU remainder behind
@@ -2219,6 +2437,8 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    // The evaluation thread now owns the ticket and will signal completion.
+    ane_guard.disarm();
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -2242,20 +2462,29 @@ public:
       // the GPU is still writing. The detached ANE thread holds its own
       // model reference and signals the ticket on its own.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order an independently committed GPU suffix
+    // command buffer before the merge encoder. This is observable on the
+    // first qmm dispatch, when pipeline setup lets ANE finish first: the merge
+    // can otherwise read a partially written suffix. Preserve ANE/GPU overlap,
+    // then join both branches explicitly before consuming either output.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"ANE hybrid GPU suffix command buffer failed", qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
@@ -2440,18 +2669,27 @@ public:
 
     auto *producer_buffer = encoder.get_command_buffer();
     producer_buffer->retain();
-    auto ticket0 = model0_->begin(producer_buffer);
-    auto ticket1 = model1_->begin(producer_buffer);
+    AneTicketPair tickets{};
+    try {
+      tickets = begin_ane_ticket_pair(model0_, model1_, producer_buffer);
+    } catch (...) {
+      producer_buffer->release();
+      throw;
+    }
+    const auto ticket0 = tickets.first;
+    const auto ticket1 = tickets.second;
+    // Cancel both tickets and free the buffer if anything below throws before
+    // the detached evaluation threads take ownership (finding C1).
+    AneDispatchGuard ane_guard(producer_buffer, model0_, ticket0, model1_,
+                               ticket1);
     encoder.commit();
     producer_buffer->waitUntilCompleted();
     if (pack_buffer_failed(producer_buffer)) {
-      const std::string reason = pack_buffer_error(producer_buffer);
-      producer_buffer->release();
-      model0_->cancel_ticket(ticket0);
-      model1_->cancel_ticket(ticket1);
-      throw std::runtime_error(reason);
+      // ane_guard releases the buffer and cancels both tickets on unwind.
+      throw std::runtime_error(pack_buffer_error(producer_buffer));
     }
     producer_buffer->release();
+    ane_guard.producer_released();
     if (profiling) {
       profile_add(profile_category, kPackNs,
                   profile_now_ns() - operation_start);
@@ -2488,6 +2726,7 @@ public:
     id<MTLCommandBuffer> qmm_buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(
             encoder.get_command_buffer()));
+    [qmm_buffer retain];
     if (profiling) {
       [qmm_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         const double duration = completed.GPUEndTime - completed.GPUStartTime;
@@ -2498,11 +2737,6 @@ public:
         profile_add(profile_category, kGpuCompletionNs,
                     profile_now_ns() - launch);
       }];
-    }
-    id<MTLCommandBuffer> cpu_gpu_buffer = nil;
-    if (cpu_weight) {
-      cpu_gpu_buffer = qmm_buffer;
-      [cpu_gpu_buffer retain];
     }
     encoder.commit();
 
@@ -2517,6 +2751,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     std::thread([model1, ticket1, profiling, profile_category, launch] {
       const uint64_t start = profiling ? profile_now_ns() : 0;
       model1->execute(ticket1);
@@ -2526,6 +2761,8 @@ public:
         profile_add(profile_category, kAne1EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket1();
+    ane_guard.disarm();
     try {
       if (cpu_weight) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;
@@ -2544,20 +2781,28 @@ public:
       // qmm before this frame's MLX arrays can be recycled. The detached ANE
       // threads hold their own model references.
       [qmm_buffer waitUntilCompleted];
-      if (cpu_gpu_buffer != nil) {
-        [cpu_gpu_buffer release];
-      }
+      [qmm_buffer release];
       throw;
     }
-    if (cpu_gpu_buffer != nil) {
-      [cpu_gpu_buffer waitUntilCompleted];
-      [cpu_gpu_buffer release];
+    // ANE completion does not order the separately committed GPU suffix
+    // before this primitive's merge. Join the already-overlapped branches so
+    // the merge cannot observe an in-flight qmm output on its first dispatch.
+    const bool gpu_finished_at_ane_done =
+        qmm_buffer.status == MTLCommandBufferStatusCompleted;
+    [qmm_buffer waitUntilCompleted];
+    if (qmm_buffer.status == MTLCommandBufferStatusError) {
+      const std::string error = error_text(
+          @"Dual ANE hybrid GPU suffix command buffer failed",
+          qmm_buffer.error);
+      [qmm_buffer release];
+      throw std::runtime_error(error);
     }
+    [qmm_buffer release];
     if (profiling) {
       const uint64_t done = profile_now_ns();
       profile_add(profile_category, kAneRegionNs, done - launch);
       g_previous_ane_done_ns.store(done, std::memory_order_relaxed);
-      if (qmm_buffer.status == MTLCommandBufferStatusCompleted) {
+      if (gpu_finished_at_ane_done) {
         profile_add(profile_category, kAneLast, 1);
       } else {
         profile_add(profile_category, kGpuLast, 1);
@@ -2776,26 +3021,30 @@ public:
     AneLinearModel::Ticket ticket{};
     AneLinearModel::Ticket ticket1{};
     try {
-      ticket = model_->begin(producer_buffer);
       if (model1_) {
-        ticket1 = model1_->begin(producer_buffer);
+        const auto tickets =
+            begin_ane_ticket_pair(model_, model1_, producer_buffer);
+        ticket = tickets.first;
+        ticket1 = tickets.second;
+      } else {
+        ticket = model_->begin(producer_buffer);
       }
     } catch (...) {
       producer_buffer->release();
       throw;
     }
+    // Cancel the tickets and free the buffer if anything below throws before
+    // the detached evaluation threads take ownership (finding C1).
+    AneDispatchGuard ane_guard(producer_buffer, model_, ticket, model1_,
+                               ticket1);
     encoder.commit();
     producer_buffer->waitUntilCompleted();
     if (pack_buffer_failed(producer_buffer)) {
-      const std::string reason = pack_buffer_error(producer_buffer);
-      producer_buffer->release();
-      model_->cancel_ticket(ticket);
-      if (model1_) {
-        model1_->cancel_ticket(ticket1);
-      }
-      throw std::runtime_error(reason);
+      // ane_guard releases the buffer and cancels the tickets on unwind.
+      throw std::runtime_error(pack_buffer_error(producer_buffer));
     }
     producer_buffer->release();
+    ane_guard.producer_released();
     if (profiling) {
       profile_add(profile_category, kPackNs,
                   profile_now_ns() - operation_start);
@@ -2873,6 +3122,7 @@ public:
         profile_add(profile_category, kAne0EvalNs, end - start);
       }
     }).detach();
+    ane_guard.transfer_ticket0();
     if (model1_) {
       auto model1 = model1_;
       std::thread([model1 = std::move(model1), ticket1, profiling, launch] {
@@ -2884,7 +3134,9 @@ public:
           profile_add(profile_category, kAne1EvalNs, end - start);
         }
       }).detach();
+      ane_guard.transfer_ticket1();
     }
+    ane_guard.disarm();
     try {
       if (cpu_fp16_) {
         const uint64_t cpu_start = profiling ? profile_now_ns() : 0;

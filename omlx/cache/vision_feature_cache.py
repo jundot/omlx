@@ -30,7 +30,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
-from .paged_ssd_cache import _extract_tensor_bytes, _write_safetensors_no_mx
+from .paged_ssd_cache import (
+    _extract_tensor_bytes,
+    _fsync_parent_dir,
+    _write_safetensors_no_mx,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +477,7 @@ class VisionFeatureSSDCache:
 
                 # Atomic rename
                 os.rename(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
 
                 # Update index with actual file size
                 with self._ssd_lock:

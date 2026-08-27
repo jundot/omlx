@@ -169,6 +169,35 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 
 
 @pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_ple_ssd_offload=True),
+    )
+
+    assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_rejects_invalid_block_size():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"

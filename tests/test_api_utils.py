@@ -56,6 +56,7 @@ from omlx.api.utils import (
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+from omlx.exceptions import InvalidRequestError
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -3108,6 +3109,13 @@ class TestExtractMultimodalContent:
         assert len(parts) == 1
         assert parts[0]["type"] == "input_audio"
         assert parts[0]["input_audio"]["format"] == "wav"
+
+    @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
+    def test_video_input_is_rejected(self, part_type):
+        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+            _extract_multimodal_content_list(
+                [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
+            )
 
 
 # =============================================================================

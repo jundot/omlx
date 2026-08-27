@@ -1264,7 +1264,6 @@ class TestProcessChatMessages:
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
 
-
 # ---------------------------------------------------------------------------
 # TestPrepareVisionInputs
 # ---------------------------------------------------------------------------
@@ -1603,6 +1602,58 @@ class TestFormatMessagesForVLMTemplate:
         # User message with image should be list
         assert isinstance(formatted[1]["content"], list)
         assert self._count_image_placeholders([formatted[1]]) == 1
+
+    def test_glm5_next_preserves_image_parts_for_native_template(self):
+        """GLM-5.3 image parts must survive mlx-vlm's generic fallback."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {"type": "image"},
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
+
+    def test_glm5_next_inserts_fallback_image_marker(self):
+        """Legacy GLM callers with separate images still receive a marker."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            [{"role": "user", "content": "Describe this"}], num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe this"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
 
     def test_reasoning_content_preserved_verbatim(self):
         """Assistant messages with reasoning_content must skip get_message_json.

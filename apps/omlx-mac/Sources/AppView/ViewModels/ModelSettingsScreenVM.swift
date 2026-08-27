@@ -28,7 +28,8 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, thinkingBudgetEnabled, thinkingBudgetTokens
+        case enableThinking, qwen4PleSsdOffload
+        case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode
@@ -237,6 +238,9 @@ final class ModelSettingsScreenVM {
 
     // Advanced
     var enableThinking: Bool = true
+    var qwen4PleSsdOffload: Bool = false
+    var qwen4PleSsdOffloadSupported: Bool = false
+    var qwen4PleSsdOffloadForced: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -368,11 +372,18 @@ final class ModelSettingsScreenVM {
         return Self.diffusionConfigModelTypes.contains(type)
     }
 
+    var isQwen4Exp: Bool {
+        (model?.configModelType ?? "")
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
+    }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .thinkingBudgetEnabled, .thinkingBudgetTokens:
+        case .enableThinking, .qwen4PleSsdOffload,
+             .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
@@ -499,6 +510,12 @@ final class ModelSettingsScreenVM {
                 self.presencePenalty = s?.presencePenalty.map { String($0) } ?? ""
                 self.ttlSeconds = s?.ttlSeconds.map(String.init) ?? ""
                 self.enableThinking = s?.enableThinking ?? true
+                self.qwen4PleSsdOffloadForced =
+                    m.qwen4PleSsdOffloadForced ?? false
+                self.qwen4PleSsdOffloadSupported =
+                    m.qwen4PleSsdOffloadSupported ?? false
+                self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
+                    || (s?.qwen4PleSsdOffload ?? false)
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -639,6 +656,10 @@ final class ModelSettingsScreenVM {
             }
         case .ttl:                     patch.ttlSeconds = Int(ttlSeconds)
         case .enableThinking:          patch.enableThinking = enableThinking
+        case .qwen4PleSsdOffload:
+            guard isQwen4Exp, qwen4PleSsdOffloadSupported,
+                  !qwen4PleSsdOffloadForced else { return }
+            patch.qwen4PleSsdOffload = qwen4PleSsdOffload
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:

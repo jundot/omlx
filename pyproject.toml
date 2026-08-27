@@ -121,7 +121,7 @@ dependencies = [
     # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.6 (b7f6255) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
     # fired upstream), the single-host-sync decode cycle (one D2H transfer
     # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
@@ -129,8 +129,9 @@ dependencies = [
     # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
     # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
     # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, and the sink=0 empty-chunk L2 write fix.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@b7f625504a733216d9e06caa3f7847a048241d94",
+    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
+    # repetition penalty support across speculative and fallback sampling.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 

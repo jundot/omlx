@@ -52,6 +52,11 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// Qwen4-Exp PLE mmap capability and server-side forced residency decision.
+    let qwen4PleSsdOffloadSupported: Bool?
+    let qwen4PleSsdOffloadForced: Bool?
+    let qwen4PleResidentBytes: Int64?
+    let qwen4PleMmapBytes: Int64?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -83,6 +88,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let forceSampling: Bool?
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
+    let qwen4PleSsdOffload: Bool?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -169,6 +175,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var repetitionPenalty: Double? = nil
     var ttlSeconds: Int? = nil
     var enableThinking: Bool? = nil
+    var qwen4PleSsdOffload: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
