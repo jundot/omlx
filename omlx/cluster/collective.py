@@ -276,6 +276,106 @@ def run_local_pipeline_smoke(
     }
 
 
+def run_local_generation_wedge_smoke(
+    *,
+    mode: str,
+    state_dir: str | os.PathLike[str],
+    deployment_id: str = "wedge-repro",
+    steps: int = 5,
+    fatal_step: int = 2,
+    fatal_rank: int = 1,
+    timeout: float = 10.0,
+    runner: LauncherRunner = _run_launcher,
+    starting_port: int | None = None,
+) -> dict[str, Any]:
+    """Phase 0.3: does a fatal rank crash the cluster or wedge it silently?
+
+    Runs two local ranks through a synthetic lockstep "generation" loop
+    (``generation_wedge_worker.py``). ``mode="caught"`` raises inside a
+    try/except that still casts an abort vote before returning (mirrors
+    §A2/1.1's pattern) -- every rank sees the vote and stops together.
+    ``mode="killed"`` abandons the generation thread without voting on
+    anything -- the fatal rank's *process* stays alive (so its marker and
+    heartbeat keep looking healthy) while its peer blocks forever in the
+    next collective, with nothing watching. This is the ground truth for
+    §A1's wedge-vs-crash question and the regression harness for the 2.1
+    fix.
+
+    Unlike the other smoke helpers here, a wedge does not raise --
+    ``mode="killed"`` wedging is the expected, documented result, not a
+    harness failure. Callers read ``wedged`` instead, and can inspect the
+    runtime marker files this writes under ``state_dir`` (one per rank,
+    ``{deployment_id}-rank-{rank}.json``) the same way the real liveness
+    code does, to see what each rank's last reported phase was.
+    """
+
+    if mode not in ("caught", "killed"):
+        raise ValueError(f"unknown mode: {mode!r}")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if starting_port is None:
+        starting_port = _find_loopback_port_span(2)
+    if not 1 <= starting_port <= 65534:
+        raise ValueError("starting_port must leave room for two ranks")
+
+    launcher = (
+        "from mlx._distributed_utils.launch import main; raise SystemExit(main() or 0)"
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        launcher,
+        "--backend",
+        "ring",
+        "--hosts",
+        "127.0.0.1",
+        "--repeat-hosts",
+        "2",
+        "--starting-port",
+        str(starting_port),
+        "--",
+        sys.executable,
+        "-m",
+        "omlx.cluster.generation_wedge_worker",
+    ]
+
+    env_overrides = {
+        "OMLX_WEDGE_MODE": mode,
+        "OMLX_WEDGE_STEPS": str(steps),
+        "OMLX_WEDGE_FATAL_STEP": str(fatal_step),
+        "OMLX_WEDGE_FATAL_RANK": str(fatal_rank),
+        "OMLX_WEDGE_STATE_DIR": str(state_dir),
+        "OMLX_WEDGE_DEPLOYMENT_ID": deployment_id,
+    }
+    # _run_launcher reads os.environ fresh at call time and forwards it to
+    # the launcher subprocess (which forwards it again to the two ranks it
+    # spawns), so the config rides the environment rather than argv --
+    # simpler than threading extra args through mlx's own launcher CLI.
+    previous_env = {key: os.environ.get(key) for key in env_overrides}
+    os.environ.update(env_overrides)
+    started_at = time.monotonic()
+    try:
+        completed = runner(argv, timeout=timeout)
+        wedged = False
+    except CollectiveSmokeError:
+        completed = None
+        wedged = True
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    return {
+        "mode": mode,
+        "wedged": wedged,
+        "ok": not wedged and completed is not None and completed.returncode == 0,
+        "elapsed_seconds": time.monotonic() - started_at,
+        "returncode": None if completed is None else completed.returncode,
+    }
+
+
 def _run_local_minimax_decode_smoke(
     *,
     timeout: float = 45.0,
