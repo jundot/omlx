@@ -423,6 +423,45 @@ def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
     ).item()
 
 
+def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    def qsa_row(length: int, start: int) -> QSAKVCache:
+        cache = QSAKVCache()
+        values = mx.arange(
+            start, start + 2 * length * 4, dtype=mx.float32
+        ).reshape(1, 2, length, 4)
+        cache.state = (
+            values,
+            values + 100,
+            mx.arange(start, start + length * 4, dtype=mx.float32).reshape(
+                1, length, 4
+            ),
+            mx.arange(start, start + length, dtype=mx.int32)[None],
+        )
+        return cache
+
+    left = qsa_row(3, 10)
+    right = qsa_row(1, 30)
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache([left], [right])
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].index_keys, caches[0].index_position_ids)
+    assert caches[0].offset.tolist() == [3, 1]
+    assert caches[0].index_offset == 3
+    assert caches[0].extract(0).offset == 3
+    assert caches[0].extract(1).offset == 1
+    assert mx.array_equal(
+        caches[0].extract(1).index_position_ids, right.index_position_ids
+    ).item()
+
+
 def test_qwen4_fp8_ple_dequantizes_only_selected_rows():
     _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
