@@ -1211,6 +1211,62 @@ PromptProcessingBatch._omlx_prompt_wrapper = _patched_ppb_prompt
 PromptProcessingBatch.prompt = _patched_ppb_prompt
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch BatchGenerator._next to reroute mlx-lm's decode-time cache
+# clear through omlx's synced, pressure-gated policy. Upstream runs
+#
+#     self._steps_counter += 1
+#     if self._steps_counter % 512 == 0:
+#         mx.clear_cache()
+#
+# — an UNSYNCED mx.clear_cache() every 512 decode steps, the exact
+# in-flight-buffer race class documented in #300/#888/#1106: the generation
+# stream may still hold command buffers referencing the pool entries being
+# released. omlx's own decode-time clear in Scheduler.step already drains
+# the stream first via _sync_and_clear_cache, so the upstream clear is both
+# unsafe and redundant.
+#
+# _steps_counter exists solely to drive that cadence, so the patch bumps it
+# past the boundary before delegating (the original body then skips the
+# clear) and restores it afterwards — the 512-step cadence is preserved
+# exactly, but the clear is re-fired through _sync_and_clear_cache and only
+# when the MLX buffer pool exceeds the pressure threshold. The threshold
+# provider is attached per instance as _omlx_decode_clear_threshold_bytes
+# by Scheduler._create_batch_generator; generators without it (not created
+# by omlx) keep stock upstream behaviour. The 512 modulus mirrors the
+# installed mlx-lm; re-validate when bumping the dependency.
+# ---------------------------------------------------------------------------
+_original_batch_generator_next = BatchGenerator._next
+
+
+def _patched_batch_generator_next(self):
+    threshold = getattr(self, "_omlx_decode_clear_threshold_bytes", None)
+    steps = getattr(self, "_steps_counter", None)
+    if (
+        threshold is None
+        or steps is None
+        or len(self._generation_batch) == 0
+        or (steps + 1) % 512 != 0
+    ):
+        return _original_batch_generator_next(self)
+
+    # This call would cross the upstream unsynced-clear boundary. Pre-set
+    # the counter past it so the original body skips the clear, restore the
+    # logical count afterwards (exactly one decode step elapsed either
+    # way), and re-fire the clear through the synced policy instead.
+    self._steps_counter = steps + 1
+    try:
+        result = _original_batch_generator_next(self)
+    finally:
+        self._steps_counter = steps + 1
+    if mx.get_cache_memory() > threshold():
+        _sync_and_clear_cache(self._stream)
+    return result
+
+
+BatchGenerator._next = _patched_batch_generator_next
+
+
 # Cache class names known to be sliceable (no boundary snapshots needed).
 # ChunkedKVCache is included once the batch=1 patch above installs its
 # extract/filter/size pass-throughs; without it Llama-4 requests fall
@@ -3031,6 +3087,12 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+
+        # Reroute mlx-lm's every-512-steps unsynced decode-time clear
+        # through omlx's synced, pressure-gated policy (see
+        # _patched_batch_generator_next). Bound method, so the patch reads
+        # the live threshold as _memory_limit_bytes changes.
+        bg._omlx_decode_clear_threshold_bytes = self._periodic_clear_threshold_bytes
 
         return bg
 
@@ -11708,12 +11770,27 @@ class Scheduler:
                     # there is no race window. Decode-only path —
                     # next_generated() returns nothing during prefill, so
                     # we never disrupt prefill activation buffers.
+                    #
+                    # The clear is pressure-gated on the MLX buffer pool
+                    # (same threshold as _should_periodic_clear_cache):
+                    # _sync_and_clear_cache drains the GPU pipeline, a
+                    # full stall for every in-flight request, so a decode
+                    # whose pool holds little to release should not pay it
+                    # every 1024 tokens. The 1024-token counter still
+                    # drives the *check* cadence; when the pool does exceed
+                    # the threshold the synced clear fires at the same
+                    # cadence as before, preserving the IOGPU residency
+                    # invariant above.
                     self._tokens_since_clear_cache = getattr(
                         self, "_tokens_since_clear_cache", 0
                     ) + len(responses)
                     if self._tokens_since_clear_cache >= 1024:
-                        _sync_and_clear_cache(self._stream)
                         self._tokens_since_clear_cache = 0
+                        if (
+                            mx.get_cache_memory()
+                            > self._periodic_clear_threshold_bytes()
+                        ):
+                            _sync_and_clear_cache(self._stream)
 
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
