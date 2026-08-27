@@ -547,6 +547,283 @@ def test_qsa_indexer_selects_best_complete_block_and_keeps_tail():
     assert selected.tolist() == [0, 1, 6]
 
 
+def test_qsa_indexer_uses_causal_fast_path_while_budget_covers_context(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import QSAIndexer, QSAKVCache
+
+    args = SimpleNamespace(
+        hidden_size=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=2,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        rms_norm_eps=1e-6,
+        head_dim=4,
+        max_position_embeddings=128,
+        rope_parameters={
+            "partial_rotary_factor": 0.0,
+            "rope_theta": 10000,
+            "mrope_section": [0, 0, 0],
+        },
+    )
+    indexer = QSAIndexer(args, layer_idx=3)
+    cache = QSAKVCache()
+
+    def fail_sparse_selection(*_args, **_kwargs):
+        raise AssertionError("sparse block selection should be skipped")
+
+    monkeypatch.setattr(indexer, "select_token_indices", fail_sparse_selection)
+    mask = indexer(
+        mx.arange(16, dtype=mx.float32).reshape(1, 4, 4),
+        cache=cache,
+        position_ids=mx.arange(4, dtype=mx.int64)[None, :],
+    )
+    mx.eval(mask, cache.indexer_keys)
+
+    assert mask.shape == (1, 1, 4, 4)
+    assert mx.array_equal(mask[0, 0] == 0, mx.tri(4, 4, dtype=mx.bool_)).item()
+    assert cache.indexer_offset == 4
+
+
+def test_qsa_indexer_vectorizes_sparse_prefill_without_scalar_selector(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import QSAIndexer, QSAKVCache
+
+    args = SimpleNamespace(
+        hidden_size=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=2,
+        indexer_budget=2,
+        indexer_compress_ratio=2,
+        rms_norm_eps=1e-6,
+        head_dim=4,
+        max_position_embeddings=128,
+        rope_parameters={
+            "partial_rotary_factor": 0.0,
+            "rope_theta": 10000,
+            "mrope_section": [0, 0, 0],
+        },
+    )
+    indexer = QSAIndexer(args, layer_idx=3)
+    indexer.index_qk_proj.weight = mx.eye(4)
+    cache = QSAKVCache()
+    cache.update_indexer(mx.array([[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]]))
+    hidden_states = mx.array([[[1.0, 0.0, -1.0, 0.0], [0.0, 1.0, -1.0, 0.0]]])
+
+    def fail_scalar_selection(*_args, **_kwargs):
+        raise AssertionError("sparse prefill selection should be vectorized")
+
+    monkeypatch.setattr(indexer, "select_token_indices", fail_scalar_selection)
+    mask = indexer(
+        hidden_states,
+        cache=cache,
+        position_ids=mx.array([[4, 5]], dtype=mx.int64),
+    )
+    mx.eval(mask, cache.indexer_keys)
+
+    expected = mx.array(
+        [
+            [True, True, False, False, True, False],
+            [False, False, True, True, False, False],
+        ]
+    )
+    assert mx.array_equal(mask[0, 0] == 0, expected).item()
+    assert cache.indexer_offset == 6
+
+
+def test_qsa_indexer_vectorized_sparse_prefill_keeps_early_rows_causal(
+    monkeypatch,
+):
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import QSAIndexer
+
+    args = SimpleNamespace(
+        hidden_size=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=2,
+        indexer_budget=2,
+        indexer_compress_ratio=2,
+        rms_norm_eps=1e-6,
+        head_dim=4,
+        max_position_embeddings=128,
+        rope_parameters={
+            "partial_rotary_factor": 0.0,
+            "rope_theta": 10000,
+            "mrope_section": [0, 0, 0],
+        },
+    )
+    indexer = QSAIndexer(args, layer_idx=3)
+    indexer.index_qk_proj.weight = mx.eye(4)
+    hidden_states = mx.array(
+        [
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ]
+        ]
+    )
+
+    def fail_scalar_selection(*_args, **_kwargs):
+        raise AssertionError("sparse prefill selection should be vectorized")
+
+    monkeypatch.setattr(indexer, "select_token_indices", fail_scalar_selection)
+    mask = indexer(
+        hidden_states,
+        position_ids=mx.arange(4, dtype=mx.int64)[None, :],
+    )
+    mx.eval(mask)
+
+    expected = mx.array(
+        [
+            [True, False, False, False],
+            [True, True, False, False],
+            [True, True, True, False],
+            [False, False, True, True],
+        ]
+    )
+    assert mx.array_equal(mask[0, 0] == 0, expected).item()
+
+
+def test_qsa_indexer_vectorized_sparse_prefill_matches_scalar_selection():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import QSAIndexer
+
+    args = SimpleNamespace(
+        hidden_size=24,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=4,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        rms_norm_eps=1e-6,
+        head_dim=4,
+        max_position_embeddings=128,
+        rope_parameters={
+            "partial_rotary_factor": 1.0,
+            "rope_theta": 10000,
+            "mrope_section": [2, 0, 0],
+        },
+    )
+    indexer = QSAIndexer(args, layer_idx=3)
+    mx.random.seed(19)
+    queries = mx.random.normal((1, 8, 2, 4))
+    raw_keys = mx.random.normal((1, 16, 4))
+    position_ids = mx.arange(8, 16, dtype=mx.int64)[None, :]
+
+    actual = indexer._select_token_mask_vectorized(
+        queries,
+        raw_keys,
+        previous_length=8,
+        position_ids=position_ids,
+    )
+    expected = mx.zeros((1, 8, 16), dtype=mx.bool_)
+    for query_index in range(8):
+        selected = indexer.select_token_indices(
+            queries[0, query_index],
+            raw_keys[0],
+            visible_length=9 + query_index,
+            query_position=8 + query_index,
+        )
+        expected = expected.at[0, query_index, selected].add(
+            mx.ones(selected.shape, dtype=mx.bool_)
+        )
+    mx.eval(actual, expected)
+
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qsa_indexer_sparse_decode_broadcasts_shared_position_ids():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+    from mlx_vlm.models.qwen4_exp.language import QSAIndexer, QSAKVCache
+
+    args = SimpleNamespace(
+        hidden_size=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=2,
+        indexer_budget=2,
+        indexer_compress_ratio=2,
+        rms_norm_eps=1e-6,
+        head_dim=2,
+        max_position_embeddings=128,
+        rope_parameters={
+            "partial_rotary_factor": 1.0,
+            "rope_theta": 10000,
+            "mrope_section": [1, 0, 0],
+        },
+    )
+    indexer = QSAIndexer(args, layer_idx=3)
+    indexer.index_qk_proj.weight = mx.eye(4)
+    previous_keys = mx.broadcast_to(
+        mx.array([[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]]),
+        (2, 4, 2),
+    )
+    hidden_states = mx.array([[[1.0, 0.0, -1.0, 0.0]], [[0.0, 1.0, -1.0, 0.0]]])
+
+    def decode(position_ids):
+        cache = QSAKVCache()
+        cache.update_indexer(previous_keys)
+        mask = indexer(
+            hidden_states,
+            cache=cache,
+            position_ids=position_ids,
+        )
+        mx.eval(mask, cache.indexer_keys)
+        assert cache.indexer_offset == 5
+        return mask
+
+    expected = decode(mx.array([[4], [4]], dtype=mx.int64))
+    for shared_positions in (
+        mx.array([4], dtype=mx.int64),
+        mx.array([[4]], dtype=mx.int64),
+    ):
+        assert mx.array_equal(decode(shared_positions), expected).item()
+
+
 def test_tiny_qwen4_exp_language_model_prefill_and_decode():
     import mlx.core as mx
 

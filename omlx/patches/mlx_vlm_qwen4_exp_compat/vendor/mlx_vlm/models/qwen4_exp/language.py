@@ -864,6 +864,31 @@ class QSAIndexer(nn.Module):
         half = x.shape[-1] // 2
         return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
+    @staticmethod
+    def _normalize_position_ids(
+        position_ids: mx.array | None, batch_size: int
+    ) -> mx.array | None:
+        if position_ids is None:
+            return None
+        if position_ids.ndim == 3:
+            position_ids = position_ids[0]
+        if position_ids.ndim == 1:
+            position_ids = position_ids[None]
+        if position_ids.ndim != 2:
+            raise ValueError(
+                "QSA position_ids must have shape [seq], [batch, seq], or "
+                "[modality, batch, seq]"
+            )
+        if position_ids.shape[0] == 1 and batch_size > 1:
+            position_ids = mx.broadcast_to(
+                position_ids, (batch_size, position_ids.shape[1])
+            )
+        elif position_ids.shape[0] != batch_size:
+            raise ValueError(
+                "QSA position_ids batch dimension does not match hidden states"
+            )
+        return position_ids
+
     def _apply_rope(self, x: mx.array, positions: mx.array | int) -> mx.array:
         if self.rotary_dim == 0:
             return x
@@ -898,10 +923,9 @@ class QSAIndexer(nn.Module):
             pooled_keys = self._apply_rope(pooled_keys, block_tokens[:, 0])
             query = self.q_layernorm(query)
             query = self._apply_rope(query, query_position)
-            scores = mx.sum(
-                query[:, None, :].astype(mx.float32)
-                * pooled_keys[None, :, :].astype(mx.float32),
-                axis=-1,
+            scores = mx.matmul(
+                query.astype(mx.float32),
+                mx.swapaxes(pooled_keys.astype(mx.float32), -1, -2),
             )
             scores = mx.sum(mx.maximum(scores, 0), axis=0) / math.sqrt(
                 self.index_head_dim
@@ -918,6 +942,124 @@ class QSAIndexer(nn.Module):
             dtype=mx.int32,
         )
         return mx.concatenate([selected, tail])
+
+    def _select_token_mask_vectorized(
+        self,
+        queries: mx.array,
+        raw_keys: mx.array,
+        *,
+        previous_length: int,
+        position_ids: mx.array | None,
+    ) -> mx.array:
+        batch_size, seq_length, _, _ = queries.shape
+        key_length = raw_keys.shape[1]
+        block_count = key_length // self.compress_ratio
+        block_tokens = mx.arange(
+            block_count * self.compress_ratio, dtype=mx.int32
+        ).reshape(block_count, self.compress_ratio)
+        pooled_keys = mx.mean(
+            raw_keys[:, : block_count * self.compress_ratio]
+            .reshape(
+                batch_size,
+                block_count,
+                self.compress_ratio,
+                self.index_head_dim,
+            )
+            .astype(mx.float32),
+            axis=2,
+        ).astype(raw_keys.dtype)
+        pooled_keys = self.k_layernorm(pooled_keys)
+        pooled_keys = self._apply_rope(pooled_keys, block_tokens[:, 0])
+        pooled_keys = mx.swapaxes(pooled_keys[:, None].astype(mx.float32), -1, -2)
+
+        text_positions = self._normalize_position_ids(position_ids, batch_size)
+
+        # Bound the temporary [batch, query, head, block] score tensor. At
+        # ordinary 2K chunks this remains one operation; very long contexts
+        # use a handful of query tiles instead of returning to a token loop.
+        score_element_budget = 8 * 1024 * 1024
+        score_elements_per_query = max(batch_size * self.index_n_heads * block_count, 1)
+        tile_size = max(
+            1, min(seq_length, score_element_budget // score_elements_per_query)
+        )
+        block_indices = mx.arange(block_count, dtype=mx.int32)
+        token_offsets = mx.arange(self.compress_ratio, dtype=mx.int32)
+        tail_offsets = mx.arange(self.compress_ratio - 1, dtype=mx.int32)
+        masks = []
+
+        for start in range(0, seq_length, tile_size):
+            end = min(start + tile_size, seq_length)
+            query_tile = self.q_layernorm(queries[:, start:end])
+            if text_positions is None:
+                query_positions = previous_length + mx.arange(
+                    start, end, dtype=mx.int32
+                )
+                query_positions = mx.broadcast_to(
+                    query_positions[None, :], (batch_size, end - start)
+                )
+            else:
+                query_positions = text_positions[:, start:end]
+            query_tile = self._apply_rope(query_tile, query_positions[..., None])
+
+            scores = mx.matmul(query_tile.astype(mx.float32), pooled_keys)
+            scores = mx.sum(mx.maximum(scores, 0), axis=2) / math.sqrt(
+                self.index_head_dim
+            )
+            visible_lengths = previous_length + mx.arange(
+                start + 1, end + 1, dtype=mx.int32
+            )
+            complete_blocks = visible_lengths // self.compress_ratio
+            visible_blocks = (
+                block_indices[None, None, :] < complete_blocks[None, :, None]
+            )
+            scores = mx.where(
+                visible_blocks,
+                scores,
+                mx.array(-1e9, dtype=scores.dtype),
+            )
+            selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
+                ..., -self.block_topk :
+            ].astype(mx.int32)
+            selected_block_tokens = (
+                selected_blocks[..., None] * self.compress_ratio + token_offsets
+            ).reshape(batch_size, end - start, -1)
+            selected_block_valid = mx.broadcast_to(
+                (selected_blocks < complete_blocks[None, :, None])[..., None],
+                (
+                    batch_size,
+                    end - start,
+                    self.block_topk,
+                    self.compress_ratio,
+                ),
+            ).reshape(batch_size, end - start, -1)
+
+            tail_starts = complete_blocks * self.compress_ratio
+            tail_lengths = visible_lengths - tail_starts
+            tail_tokens = tail_starts[None, :, None] + tail_offsets
+            tail_tokens = mx.broadcast_to(
+                tail_tokens,
+                (batch_size, end - start, self.compress_ratio - 1),
+            )
+            tail_valid = tail_offsets[None, None, :] < tail_lengths[None, :, None]
+            tail_valid = mx.broadcast_to(tail_valid, tail_tokens.shape)
+
+            selected_tokens = mx.concatenate(
+                [selected_block_tokens, tail_tokens], axis=-1
+            )
+            selected_valid = mx.concatenate([selected_block_valid, tail_valid], axis=-1)
+            safe_tokens = mx.where(selected_valid, selected_tokens, key_length)
+            selected_mask = mx.zeros(
+                (batch_size, end - start, key_length + 1), dtype=mx.bool_
+            )
+            selected_mask = mx.put_along_axis(
+                selected_mask,
+                safe_tokens,
+                mx.ones(safe_tokens.shape, dtype=mx.bool_),
+                axis=-1,
+            )
+            masks.append(selected_mask[..., :key_length])
+
+        return mx.concatenate(masks, axis=1)
 
     def __call__(
         self,
@@ -939,14 +1081,42 @@ class QSAIndexer(nn.Module):
         else:
             all_raw_keys = raw_keys
         previous_length = all_raw_keys.shape[1] - seq_length
+        position_ids = self._normalize_position_ids(position_ids, batch_size)
 
         key_length = all_raw_keys.shape[1]
+        if key_length <= self.token_budget:
+            query_positions = previous_length + mx.arange(seq_length, dtype=mx.int32)
+            key_positions = mx.arange(key_length, dtype=mx.int32)
+            selected_mask = key_positions[None, :] <= query_positions[:, None]
+            selected_mask = mx.broadcast_to(
+                selected_mask[None, None, :, :],
+                (batch_size, 1, seq_length, key_length),
+            )
+            minimum = mx.array(-1e9, dtype=hidden_states.dtype)
+            return mx.where(
+                selected_mask,
+                mx.array(0, hidden_states.dtype),
+                minimum,
+            )
+
+        if seq_length > 1:
+            selected_mask = self._select_token_mask_vectorized(
+                queries,
+                all_raw_keys,
+                previous_length=previous_length,
+                position_ids=position_ids,
+            )[:, None]
+            minimum = mx.array(-1e9, dtype=hidden_states.dtype)
+            return mx.where(
+                selected_mask,
+                mx.array(0, hidden_states.dtype),
+                minimum,
+            )
+
         selected_mask = mx.zeros(
             (batch_size, 1, seq_length, key_length), dtype=mx.bool_
         )
         text_positions = position_ids
-        if text_positions is not None and text_positions.ndim == 3:
-            text_positions = text_positions[0]
         for batch_index in range(batch_size):
             for query_index in range(seq_length):
                 visible_length = previous_length + query_index + 1
