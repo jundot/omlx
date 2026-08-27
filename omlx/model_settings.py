@@ -104,7 +104,8 @@ class ModelSettings:
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
-        reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
+        reasoning_parser: xgrammar builtin name: "harmony", "llama", "qwen_3_5", etc.
+            Names are versioned; a bare family-name prefix on its own is never valid.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
@@ -222,7 +223,7 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = (
-        None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+        None  # xgrammar builtin name: "harmony", "llama", "qwen_3_5", etc.
     )
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None

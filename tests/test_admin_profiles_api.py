@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for admin profile/template API routes."""
 
+import json
+from unittest.mock import patch
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from omlx.admin import routes as admin_routes
 from omlx.model_settings import ModelSettings, ModelSettingsManager
@@ -267,14 +272,18 @@ class TestProfileRoutes:
                 vlm_mtp_draft_model="qwen-mtp-drafter",
             ),
         )
-        c.post(
-            "/admin/api/models/model-a/profiles",
-            json={
-                "name": "dflash",
-                "display_name": "DFlash",
-                "settings": {"dflash_enabled": True},
-            },
-        )
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(True, ""),
+        ):
+            c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "dflash",
+                    "display_name": "DFlash",
+                    "settings": {"dflash_enabled": True},
+                },
+            )
 
         r = c.post("/admin/api/models/model-a/profiles/dflash/apply")
 
@@ -416,9 +425,7 @@ class TestApplySnapshotSemantics:
             },
         )
         r = c.post("/admin/api/models/model-a/profiles/p/apply")
-        assert r.json()["settings"]["chat_template_kwargs"] == {
-            "enable_thinking": True
-        }
+        assert r.json()["settings"]["chat_template_kwargs"] == {"enable_thinking": True}
 
         c.put(
             "/admin/api/models/model-a/profiles/p",
@@ -771,15 +778,19 @@ class TestExposeAsModelAPI:
         """Creating with expose_as_model persists it; list_profiles enriches
         each entry with the derived model_id and has_engine_fields."""
         c, _ = client
-        c.post(
-            "/admin/api/models/model-a/profiles",
-            json={
-                "name": "thinking",
-                "display_name": "thinking",
-                "settings": {"temperature": 0.6, "dflash_enabled": True},
-                "expose_as_model": True,
-            },
-        )
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(True, ""),
+        ):
+            c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "thinking",
+                    "display_name": "thinking",
+                    "settings": {"temperature": 0.6, "dflash_enabled": True},
+                    "expose_as_model": True,
+                },
+            )
         profiles = c.get("/admin/api/models/model-a/profiles").json()["profiles"]
         prof = next(p for p in profiles if p["name"] == "thinking")
         assert prof["expose_as_model"] is True
@@ -1012,3 +1023,696 @@ class TestExposeAsModelAPI:
         assert "modal.model_settings.profiles.expose_as_model" in html
         assert "modal.model_settings.profiles.exposed_as" in en
         assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
+
+
+_FAKE_REASONING_PARSER_REGISTRY = {"harmony": ["gpt-oss"], "llama": ["Llama-3"]}
+
+
+class TestProfileWriteTimeValidation:
+    """Profile create/update must enforce the same per-field rules as
+    update_model_settings (#14) — a profile write is a ModelSettings write
+    path too, and previously bypassed every check #9/#10 added."""
+
+    def test_create_rejects_unknown_dflash_verify_mode(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": "bogus"},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+
+    def test_create_accepts_valid_dflash_verify_mode(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": "adaptive"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["dflash_verify_mode"] == "adaptive"
+
+    def test_update_rejects_unknown_dflash_verify_mode(self, client):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={"name": "coding", "display_name": "Coding", "settings": {}},
+        )
+        r = c.put(
+            "/admin/api/models/model-a/profiles/coding",
+            json={"settings": {"dflash_verify_mode": "bogus"}},
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+
+    def test_create_rejects_nonexistent_specprefill_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"specprefill_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "specprefill_draft_model" in r.text
+
+    def test_create_accepts_existing_specprefill_draft_model(self, client, tmp_path):
+        c, _ = client
+        draft_dir = tmp_path / "draft-model"
+        draft_dir.mkdir()
+        (draft_dir / "config.json").write_text("{}")
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"specprefill_draft_model": str(draft_dir)},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_create_rejects_nonexistent_dflash_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_draft_model" in r.text
+
+    def test_create_rejects_nonexistent_vlm_mtp_draft_model(self, client, tmp_path):
+        c, _ = client
+        missing = tmp_path / "does-not-exist"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"vlm_mtp_draft_model": str(missing)},
+            },
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_draft_model" in r.text
+
+    def test_update_rejects_nonexistent_vlm_mtp_draft_model(self, client, tmp_path):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={"name": "coding", "display_name": "Coding", "settings": {}},
+        )
+        missing = tmp_path / "does-not-exist"
+        r = c.put(
+            "/admin/api/models/model-a/profiles/coding",
+            json={"settings": {"vlm_mtp_draft_model": str(missing)}},
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_draft_model" in r.text
+
+    def test_create_rejects_unknown_reasoning_parser(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setattr(
+            admin_routes,
+            "_reasoning_parser_registry",
+            lambda: _FAKE_REASONING_PARSER_REGISTRY,
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "qwen"},
+            },
+        )
+        assert r.status_code == 400
+        assert "harmony" in r.text
+        assert "llama" in r.text
+
+    def test_create_accepts_valid_reasoning_parser(self, client, monkeypatch):
+        c, _ = client
+        monkeypatch.setattr(
+            admin_routes,
+            "_reasoning_parser_registry",
+            lambda: _FAKE_REASONING_PARSER_REGISTRY,
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "harmony"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["reasoning_parser"] == "harmony"
+
+    def test_create_skips_reasoning_parser_validation_when_registry_unavailable(
+        self, client, monkeypatch
+    ):
+        """Fail open like update_model_settings does when xgrammar is
+        unavailable (#4) — must not block every profile save."""
+        c, _ = client
+        monkeypatch.setattr(admin_routes, "_reasoning_parser_registry", lambda: None)
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": "qwen"},
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["profile"]["settings"]["reasoning_parser"] == "qwen"
+
+    def test_create_rejects_non_string_dflash_verify_mode(self, client):
+        """A falsy non-string (0, False, []) must not silently skip
+        validation via the `value or None` idiom and then get persisted
+        by filter_profile_fields, which only treats None/"" as unset."""
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_verify_mode": 0},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_verify_mode" in r.text
+        assert "string" in r.text
+
+    def test_create_rejects_non_string_reasoning_parser(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"reasoning_parser": False},
+            },
+        )
+        assert r.status_code == 400
+        assert "reasoning_parser" in r.text
+        assert "string" in r.text
+
+    def test_create_rejects_negative_dflash_in_memory_cache_max_entries(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": -1},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache_max_entries" in r.text
+
+    def test_create_rejects_non_numeric_dflash_in_memory_cache_max_entries(
+        self, client
+    ):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": "lots"},
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache_max_entries" in r.text
+
+    def test_create_accepts_valid_dflash_in_memory_cache_max_entries(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_in_memory_cache_max_entries": 8},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    # -- dflash_enabled: diffusion-aware compat check (#18) -----------------
+
+    def test_create_skips_dflash_compat_check_for_diffusion_model(self, client):
+        """A diffusion model's profile may store dflash_enabled=True without
+        tripping the compat check — apply_model_profile's diffusion sanitizer
+        forces it off at apply time regardless, matching update_model_settings
+        (#14's fixup attempted a naive compat check here and was reverted for
+        wrongly rejecting diffusion-model profiles)."""
+        c, _ = client
+        admin_routes._get_engine_pool()._entries[
+            "model-a"
+        ].config_model_type = "diffusion_gemma"
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(False, "diffusion models are never dflash-compatible"),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"dflash_enabled": True},
+                },
+            )
+        assert r.status_code == 200, r.text
+
+    def test_create_rejects_dflash_incompatible_model(self, client):
+        c, _ = client
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(False, "not a supported model_type"),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"dflash_enabled": True},
+                },
+            )
+        assert r.status_code == 400
+        assert "not a supported model_type" in r.text
+
+    def test_create_accepts_dflash_compatible_model(self, client):
+        c, _ = client
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(True, ""),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"dflash_enabled": True},
+                },
+            )
+        assert r.status_code == 200, r.text
+
+    # -- dflash_ssd_cache: merges against model-a's current settings (#18) --
+
+    def test_create_rejects_ssd_cache_when_no_paged_dir_configured(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_ssd_cache": True},
+            },
+        )
+        assert r.status_code == 400
+        assert "paged SSD cache" in r.text
+
+    def test_create_rejects_ssd_cache_when_current_settings_in_memory_cache_is_off(
+        self, client
+    ):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(dflash_in_memory_cache=False))
+        pool = admin_routes._get_engine_pool()
+        pool._scheduler_config = type(
+            "_Cfg", (), {"paged_ssd_cache_dir": "/tmp/ssd-cache"}
+        )()
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_ssd_cache": True},
+            },
+        )
+        assert r.status_code == 400
+        assert "in-memory cache" in r.text
+
+    def test_create_accepts_ssd_cache_when_profile_also_sets_in_memory_cache(
+        self, client
+    ):
+        """The incoming profile's own dflash_in_memory_cache wins over the
+        model's stale current setting, mirroring update_model_settings's
+        in_mem_after merge."""
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(dflash_in_memory_cache=False))
+        pool = admin_routes._get_engine_pool()
+        pool._scheduler_config = type(
+            "_Cfg", (), {"paged_ssd_cache_dir": "/tmp/ssd-cache"}
+        )()
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_ssd_cache": True, "dflash_in_memory_cache": True},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_create_accepts_ssd_cache_when_current_settings_already_has_it_on(
+        self, client
+    ):
+        """dflash_in_memory_cache defaults to True, so a profile that only
+        sets dflash_ssd_cache passes without needing to also set it."""
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._scheduler_config = type(
+            "_Cfg", (), {"paged_ssd_cache_dir": "/tmp/ssd-cache"}
+        )()
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"dflash_ssd_cache": True},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    # -- mtp_enabled: compatibility + weights check, shared with
+    #    update_model_settings (#18) -----------------------------------------
+
+    def test_create_rejects_mtp_enabled_when_config_json_missing(
+        self, client, tmp_path
+    ):
+        c, _ = client
+        model_dir = tmp_path / "no-config"
+        model_dir.mkdir()
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"mtp_enabled": True},
+            },
+        )
+        assert r.status_code == 400
+        assert "model config could not be read" in r.text
+
+    def test_create_rejects_mtp_enabled_when_model_not_mtp_compatible(
+        self, client, tmp_path
+    ):
+        c, _ = client
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type": "llama"}')
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+        with patch("omlx.utils.model_loading._is_mtp_compatible", return_value=False):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"mtp_enabled": True},
+                },
+            )
+        assert r.status_code == 400
+        assert "not MTP-compatible" in r.text
+
+    def test_create_rejects_mtp_enabled_when_weights_missing_mtp_tensors(
+        self, client, tmp_path
+    ):
+        c, _ = client
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type": "qwen3_5"}')
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+        with (
+            patch("omlx.utils.model_loading._is_mtp_compatible", return_value=True),
+            patch(
+                "omlx.utils.model_loading._checkpoint_has_mtp_weights",
+                return_value=False,
+            ),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"mtp_enabled": True},
+                },
+            )
+        assert r.status_code == 400
+        assert "neither mtp.* tensors nor native nextn layers" in r.text
+
+    def test_create_accepts_mtp_enabled_for_compatible_model(self, client, tmp_path):
+        c, _ = client
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type": "qwen3_5"}')
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+        with (
+            patch("omlx.utils.model_loading._is_mtp_compatible", return_value=True),
+            patch(
+                "omlx.utils.model_loading._checkpoint_has_mtp_weights",
+                return_value=True,
+            ),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"mtp_enabled": True},
+                },
+            )
+        assert r.status_code == 200, r.text
+
+    def test_create_rejects_mtp_enabled_when_dflash_also_enabled_in_profile(
+        self, client, tmp_path
+    ):
+        c, _ = client
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type": "qwen3_5"}')
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+        with (
+            patch("omlx.utils.model_loading._is_mtp_compatible", return_value=True),
+            patch(
+                "omlx.utils.model_loading._checkpoint_has_mtp_weights",
+                return_value=True,
+            ),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {"mtp_enabled": True, "dflash_enabled": True},
+                },
+            )
+        assert r.status_code == 400
+        assert "cannot both be enabled" in r.text
+
+    def test_create_skips_mtp_check_for_diffusion_model(self, client, tmp_path):
+        c, _ = client
+        admin_routes._get_engine_pool()._entries[
+            "model-a"
+        ].config_model_type = "diffusion_gemma"
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"mtp_enabled": True},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    # -- vlm_mtp_enabled: draft-model requirement, merges against model-a's
+    #    current settings (#18) ----------------------------------------------
+
+    def test_create_rejects_vlm_mtp_enabled_without_draft_model(self, client):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"vlm_mtp_enabled": True},
+            },
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_draft_model" in r.text
+
+    def test_create_accepts_vlm_mtp_enabled_with_draft_model_in_same_profile(
+        self, client
+    ):
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {
+                    "vlm_mtp_enabled": True,
+                    "vlm_mtp_draft_model": "gemma-4-26B-A4B-it-assistant",
+                },
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_create_accepts_vlm_mtp_enabled_when_current_settings_has_draft_model(
+        self, client
+    ):
+        c, mgr = client
+        mgr.set_settings(
+            "model-a",
+            ModelSettings(vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant"),
+        )
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {"vlm_mtp_enabled": True},
+            },
+        )
+        assert r.status_code == 200, r.text
+
+    def test_create_rejects_vlm_mtp_enabled_with_dflash_in_same_profile(self, client):
+        """vlm_mtp_enabled's mutex conflicts (dflash/specprefill/mtp/turboquant)
+        are backstopped by ModelSettings.__post_init__ at apply time, but
+        surfacing a clearer error at write time matches what
+        update_model_settings already does (#18 variant-bug-hunter finding)."""
+        c, _ = client
+        with patch(
+            "omlx.engine.dflash.is_dflash_compatible",
+            return_value=(True, ""),
+        ):
+            r = c.post(
+                "/admin/api/models/model-a/profiles",
+                json={
+                    "name": "coding",
+                    "display_name": "Coding",
+                    "settings": {
+                        "vlm_mtp_enabled": True,
+                        "vlm_mtp_draft_model": "gemma-4-26B-A4B-it-assistant",
+                        "dflash_enabled": True,
+                    },
+                },
+            )
+        assert r.status_code == 400
+        assert "vlm_mtp_enabled and DFlash" in r.text
+
+    def test_create_rejects_vlm_mtp_enabled_when_current_settings_has_specprefill(
+        self, client
+    ):
+        c, mgr = client
+        mgr.set_settings("model-a", ModelSettings(specprefill_enabled=True))
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {
+                    "vlm_mtp_enabled": True,
+                    "vlm_mtp_draft_model": "gemma-4-26B-A4B-it-assistant",
+                },
+            },
+        )
+        assert r.status_code == 400
+        assert "vlm_mtp_enabled and SpecPrefill" in r.text
+
+    # -- boolean fields must arrive typed, not stringly (#18 security-audit) --
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["dflash_enabled", "dflash_ssd_cache", "mtp_enabled", "vlm_mtp_enabled"],
+    )
+    def test_create_rejects_stringly_typed_boolean_field(self, client, field_name):
+        """A truthy non-bool string (e.g. "false") must not silently enable
+        the field — every other value in this validator is type-checked,
+        this closes the one gap that wasn't."""
+        c, _ = client
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {field_name: "false"},
+            },
+        )
+        assert r.status_code == 400
+        assert field_name in r.text
+        assert "boolean" in r.text
+
+    def test_create_rejects_stringly_typed_dflash_in_memory_cache(self, client):
+        c, _ = client
+        pool = admin_routes._get_engine_pool()
+        pool._scheduler_config = type(
+            "_Cfg", (), {"paged_ssd_cache_dir": "/tmp/ssd-cache"}
+        )()
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "coding",
+                "display_name": "Coding",
+                "settings": {
+                    "dflash_ssd_cache": True,
+                    "dflash_in_memory_cache": "no",
+                },
+            },
+        )
+        assert r.status_code == 400
+        assert "dflash_in_memory_cache" in r.text
+        assert "boolean" in r.text
+
+    # -- _validate_mtp_compatibility must never crash on arbitrary config.json
+    #    content (#18 property-test-gap-finder) ------------------------------
+
+    @settings(
+        suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None
+    )
+    @given(
+        config=st.dictionaries(
+            st.text(min_size=1, max_size=20),
+            st.one_of(
+                st.none(),
+                st.booleans(),
+                st.integers(min_value=-1000, max_value=1000),
+                st.text(max_size=50),
+                st.lists(st.integers(), max_size=5),
+            ),
+            max_size=10,
+        )
+    )
+    def test_mtp_compatibility_check_never_crashes_on_arbitrary_config_json(
+        self, client, tmp_path, config
+    ):
+        import uuid
+
+        c, _ = client
+        unique = uuid.uuid4().hex
+        model_dir = tmp_path / f"model-{unique}"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(config))
+        admin_routes._get_engine_pool()._entries["model-a"].model_path = str(model_dir)
+
+        r = c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": f"p{unique}",
+                "display_name": "P",
+                "settings": {"mtp_enabled": True},
+            },
+        )
+
+        assert r.status_code in (200, 400)
