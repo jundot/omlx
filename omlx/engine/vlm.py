@@ -2479,6 +2479,11 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
+            elif model_type == "glm5_next" and msg_num_images == 0:
+                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
+                # get_message_json() rejects even ordinary text messages. Keep
+                # them on the checkpoint's native chat-template path too.
+                formatted_messages.append({"role": role, "content": content})
             elif model_type == "glm5_next" and msg_num_images > 0:
                 # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
                 # get_message_json() treats it as unsupported and its generic
