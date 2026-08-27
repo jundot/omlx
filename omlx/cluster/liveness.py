@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .ssh_policy import cluster_ssh_options
+from .ssh_policy import cluster_ssh_options, run_ssh_retrying
 
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
@@ -123,36 +123,6 @@ class PeerLostError(RuntimeError):
     """A rank this deployment depends on is no longer answering."""
 
 
-def _run_retrying(
-    runner: Callable[..., Any],
-    argv: list[str],
-    *,
-    timeout: float,
-    attempts: int = 3,
-    delay: float = 0.5,
-) -> Any:
-    """Call ``runner`` a bounded few times, retrying on failure.
-
-    A single dropped mDNS round trip resolving a ``.local`` peer must not be
-    mistaken for that peer being gone. Every caller here is a read-only
-    liveness query, so retrying is always safe — even the case of a rank
-    that genuinely has no marker yet just takes a little longer to be
-    correctly reported that way, rather than being misread as unreachable.
-    """
-
-    result: Any = None
-    for attempt in range(attempts):
-        try:
-            result = runner(argv, capture_output=True, timeout=timeout, check=False)
-        except (OSError, subprocess.SubprocessError) as exc:
-            result = subprocess.CompletedProcess(argv, 255, "", str(exc))
-        if getattr(result, "returncode", 1) == 0:
-            return result
-        if attempt < attempts - 1:
-            time.sleep(delay)
-    return result
-
-
 def probe_peer(
     ssh_target: str,
     *,
@@ -163,8 +133,7 @@ def probe_peer(
 
     if ssh_target in _LOOPBACK_TARGETS:
         return True
-    result = _run_retrying(
-        runner,
+    result = run_ssh_retrying(
         [
             "ssh",
             *cluster_ssh_options(connect_timeout=timeout),
@@ -172,6 +141,7 @@ def probe_peer(
             "true",
         ],
         timeout=timeout + 2,
+        runner=runner,
     )
     return getattr(result, "returncode", 1) == 0
 
@@ -231,8 +201,7 @@ def read_remote_marker(
             shlex.quote(path),
         )
     )
-    result = _run_retrying(
-        runner,
+    result = run_ssh_retrying(
         [
             "ssh",
             *cluster_ssh_options(connect_timeout=timeout),
@@ -240,6 +209,7 @@ def read_remote_marker(
             command,
         ],
         timeout=timeout + 2,
+        runner=runner,
     )
     if getattr(result, "returncode", 1) != 0:
         error = getattr(result, "stderr", b"")

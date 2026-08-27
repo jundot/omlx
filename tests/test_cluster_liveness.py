@@ -71,7 +71,7 @@ def test_probe_peer_retries_a_flaky_mdns_resolution(monkeypatch):
     peer — the exact false negative that made a healthy just-activated
     cluster report a peer as unreachable a moment later."""
 
-    monkeypatch.setattr("omlx.cluster.liveness.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
     calls = []
 
     def flaky(argv, **_kwargs):
@@ -90,7 +90,7 @@ def test_read_remote_marker_retries_a_flaky_mdns_resolution(monkeypatch):
 
     from omlx.cluster.liveness import read_remote_marker
 
-    monkeypatch.setattr("omlx.cluster.liveness.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
     calls = []
     payload = b'{"marker":{"rank":1},"process_live":true,"peer_now":123.0}'
 
@@ -114,7 +114,7 @@ def test_read_remote_marker_retries_a_flaky_mdns_resolution(monkeypatch):
 def test_read_remote_marker_gives_up_after_exhausting_retries(monkeypatch):
     from omlx.cluster.liveness import read_remote_marker
 
-    monkeypatch.setattr("omlx.cluster.liveness.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
     calls = []
 
     def always_fails(argv, **_kwargs):

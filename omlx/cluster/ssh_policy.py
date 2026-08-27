@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 _MANAGED_IDENTITY = "~/.ssh/omlx_cluster"
 
@@ -92,24 +93,35 @@ def run_ssh_retrying(
     timeout: float,
     attempts: int = 3,
     delay: float = 0.5,
+    runner: Callable[..., Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one subprocess, retrying a bounded few times on failure.
 
     mDNS resolution for a ``.local`` peer is intermittently flaky — one
     dropped multicast round trip should not be mistaken for a permanently
     unreachable host. Every caller across this module's users is a read-only
-    remote query (interface/inventory/shard/layout/RDMA-device probes), so
-    retrying is always safe. An exception raised by ``subprocess.run`` itself
-    (the ``ssh``/``scp`` binary missing, say) is folded into a failed
-    ``CompletedProcess`` the same as a nonzero exit, so callers only ever
-    need to check ``returncode``.
+    remote query (interface/inventory/shard/layout/RDMA-device/heartbeat
+    probes), so retrying is always safe — even a peer that genuinely has no
+    marker yet just takes a little longer to be correctly reported that way,
+    rather than being misread as unreachable. An exception raised by
+    ``subprocess.run`` itself (the ``ssh``/``scp`` binary missing, say) is
+    folded into a failed ``CompletedProcess`` the same as a nonzero exit, so
+    callers only ever need to check ``returncode``.
+
+    ``runner`` defaults to the real ``subprocess.run``, resolved fresh on
+    every call rather than captured once as a default argument — a captured
+    default would keep pointing at the original function object even after a
+    test replaces ``subprocess.run``, silently reaching a real network call
+    instead of the test double. Pass ``runner`` explicitly for a seam the
+    liveness probes need to simulate a peer's SSH response.
     """
 
+    run = runner if runner is not None else subprocess.run
     argv = list(argv)
     result = subprocess.CompletedProcess(argv, 255, "", "")
     for attempt in range(attempts):
         try:
-            result = subprocess.run(
+            result = run(
                 argv, capture_output=True, text=True, check=False, timeout=timeout
             )
         except (OSError, subprocess.SubprocessError) as exc:
