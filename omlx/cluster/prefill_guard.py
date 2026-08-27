@@ -33,6 +33,71 @@ logger = logging.getLogger(__name__)
 # is set by the chunk, not the prompt.
 _DEFAULT_PREFILL_STEP = 2048
 
+_LOCKSTEP_SAFE_ATTR = "_omlx_lockstep_safe"
+
+
+def mark_lockstep_safe(exc: BaseException) -> BaseException:
+    """Mark that every rank's collectives completed identically before
+    ``exc`` was raised, so it is safe to treat as a per-request rejection
+    rather than fail-stop the rank (§A1's fail-stop hook in telemetry.py).
+
+    This has to be an instance mark, not a type check: ``check_collective``
+    re-raises the *original* local exception after voting, so its type
+    carries no information about whether the vote happened. A fixed
+    exception-type allowlist would treat an already-synced rejection whose
+    original exception happened to be, say, a ``TypeError`` as unilateral --
+    and fail-stop a rank that is actually still perfectly in sync with its
+    peers, which is worse than the bug this is fixing.
+    """
+
+    setattr(exc, _LOCKSTEP_SAFE_ATTR, True)
+    return exc
+
+
+def is_lockstep_safe(exc: BaseException) -> bool:
+    return bool(getattr(exc, _LOCKSTEP_SAFE_ATTR, False))
+
+
+def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a config that may be a dict or an attribute object.
+
+    ``model.args`` on a live mlx-lm model is an attribute object, not a
+    dict — a dict-shaped ``.get()`` predicate against it would silently
+    return the default for every field and no-op the check it guards.
+    Mirrors ``memory_monitor._cfg_get``.
+    """
+
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _model_config(model: Any) -> Any | None:
+    """The same config object ``set_model_info_from_model`` reads from
+    ``model``: ``model.config`` when present, else ``model.args``."""
+
+    if hasattr(model, "config"):
+        return model.config
+    return getattr(model, "args", None)
+
+
+def _kv_cache_replicated_across_tp(config: Any) -> bool:
+    """Whether every tensor-parallel member holds this model's full KV cache.
+
+    Mirrors ``planner._kv_cache_replicated_across_tp`` for the live-model
+    path here: MLA-style latent KV (``kv_lora_rank``/``qk_rope_head_dim``)
+    is not per-head, so a ``kv_bytes_per_token`` override for one must not
+    be divided by the TP degree the way per-head KV is.
+    See docs/cluster-hardening-and-optimization.md §B2.
+    """
+
+    def _pos_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    return _pos_int(_cfg_get(config, "kv_lora_rank", 0)) and _pos_int(
+        _cfg_get(config, "qk_rope_head_dim", 0)
+    )
+
 
 def rank_monitor(
     model: Any,
@@ -76,7 +141,7 @@ def rank_monitor(
     if tp > 1:
         kv_heads = max(1, kv_heads // tp)
         heads = max(1, heads // tp)
-        if kv_override:
+        if kv_override and not _kv_cache_replicated_across_tp(_model_config(model)):
             kv_override = float(kv_override) / tp
 
     monitor.set_model_info(
@@ -178,11 +243,19 @@ class RankPrefillGuard:
         the model collective and hang. Instead, every rank measures its own
         resident slice, exchanges a one-hot rejection vote, and raises before
         model execution if any rank refused the prompt.
+
+        Any local exception -- not just the expected
+        ``PrefillMemoryExceededError`` -- must still cast this rank's vote
+        before propagating: an unexpected error (a malformed monitor field, a
+        stripped-worker import error) that raised straight out of ``check()``
+        would otherwise skip the collective entirely, leaving peer ranks
+        blocked in ``all_sum`` forever (§A2).
         """
 
         from omlx.exceptions import PrefillMemoryExceededError
 
         local_error: PrefillMemoryExceededError | None = None
+        local_exc: Exception | None = None
         try:
             self.check(
                 num_prompt_tokens,
@@ -192,6 +265,8 @@ class RankPrefillGuard:
             )
         except PrefillMemoryExceededError as exc:
             local_error = exc
+        except Exception as exc:  # noqa: BLE001 - re-raised below, after voting
+            local_exc = exc
 
         if mx_module is None:
             import mlx.core as collective_mx
@@ -201,13 +276,15 @@ class RankPrefillGuard:
         group = collective_mx.distributed.init()
         world_size = int(group.size())
         if world_size <= 1:
+            if local_exc is not None:
+                raise mark_lockstep_safe(local_exc)
             if local_error is not None:
-                raise local_error
+                raise mark_lockstep_safe(local_error)
             return
 
         rank = int(group.rank())
         votes = [0] * world_size
-        if local_error is not None:
+        if local_error is not None or local_exc is not None:
             votes[rank] = 1
         agreed_votes = collective_mx.distributed.all_sum(
             collective_mx.array(votes)
@@ -217,17 +294,24 @@ class RankPrefillGuard:
         ]
         if not rejecting_ranks:
             return
+        # Every raise from here on happens only after the vote collective
+        # above completed on every rank -- lockstep is intact regardless of
+        # which exception type is about to propagate.
+        if local_exc is not None:
+            raise mark_lockstep_safe(local_exc)
         if local_error is not None:
-            raise local_error
+            raise mark_lockstep_safe(local_error)
 
         rejecting = rejecting_ranks[0]
-        raise PrefillMemoryExceededError(
-            message=(
-                f"Cluster prefill rejected by rank {rejecting}: its local model "
-                "slice would exceed the host memory limit. Reduce context length "
-                "or free memory on that node."
-            ),
-            request_id=request_id,
+        raise mark_lockstep_safe(
+            PrefillMemoryExceededError(
+                message=(
+                    f"Cluster prefill rejected by rank {rejecting}: its local model "
+                    "slice would exceed the host memory limit. Reduce context length "
+                    "or free memory on that node."
+                ),
+                request_id=request_id,
+            )
         )
 
 
