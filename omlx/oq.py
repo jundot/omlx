@@ -8313,12 +8313,30 @@ def _streamed_source_plan(model_path, config: dict) -> "_DiscoveredPlan":
     return _DiscoveredPlan(plan, lazy_index)
 
 
-def _streamed_layer_items(dp: "_DiscoveredPlan", layer_idx: int) -> list:
-    """Pop every tensor of one text layer, keyed relative to the bare block."""
+def _streamed_layer_items(dp: "_DiscoveredPlan", layer_idx: int, skip_key=None) -> list:
+    """Pop every tensor of one text layer, keyed relative to the bare block.
+
+    ``skip_key`` (relative-key predicate) filters BEFORE the pop: a skipped
+    tensor is never materialized and never read from disk. The qwen4_exp
+    mmap path uses it for the ~100 GB of N-gram shard tensors its PLE block
+    self-sources — popping them first and discarding after would read the
+    whole table every round and spike process memory by the table's size.
+    """
     prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
     keys = sorted(k for k in dp if k.startswith(prefix))
     if not keys:
         raise KeyError(f"no checkpoint tensors for text layer {layer_idx}")
+    if skip_key is not None:
+        kept = [k for k in keys if not skip_key(k[len(prefix) :])]
+        dropped = len(keys) - len(kept)
+        if dropped:
+            logger.info(
+                "streamed layer %d: skipped %d tensors before sourcing "
+                "(mmap-mode PLE reads them straight from the checkpoint)",
+                layer_idx,
+                dropped,
+            )
+        keys = kept
     return [(k[len(prefix) :], dp.pop(k)) for k in keys]
 
 
@@ -8376,10 +8394,13 @@ def _iter_streamed_layer_blocks(
         _qwen4_exp_stream_language_module(layer_cls, source) if is_qwen4_exp else None
     )
     dp = _streamed_source_plan(source, config)
+    skip_key = (
+        _qwen4_exp_mmap_skip_key
+        if lang_module is not None and lang_module.get_ple_runtime_mode() == "mmap"
+        else None
+    )
     for layer_idx in range(args.num_hidden_layers):
-        items = _streamed_layer_items(dp, layer_idx)
-        if lang_module is not None and lang_module.get_ple_runtime_mode() == "mmap":
-            items = _qwen4_exp_drop_mmap_ple_shards(items, layer_idx)
+        items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
         block = layer_cls(args, layer_idx)
         # Freshly constructed modules default to training mode; loaded models
         # run in eval mode. Layer implementations may branch on the flag
@@ -8459,27 +8480,19 @@ def _qwen4_exp_stream_language_module(layer_cls, source):
     return lang
 
 
-def _qwen4_exp_drop_mmap_ple_shards(items: list, layer_idx: int) -> list:
-    """Drop the N-gram shard tensors an mmap-mode PLE block self-sources.
+def _qwen4_exp_mmap_skip_key(relative_key: str) -> bool:
+    """True for the N-gram shard tensors an mmap-mode PLE block self-sources.
 
     The sanitize plan keeps the ``ple.ple_embedding.ngram_embedding.shards.*``
     weights (the quantizer needs them), but an mmap-mode block exposes no
     matching parameters — DiskBackedShardedEmbedding reads them straight from
-    the checkpoint and only registers its scale/offset metadata. Leaving the
-    shard tensors in the item list would make the strict block load raise on
-    ``extra``. Everything else (weight_scale, ngram_heads_*) matches real
-    block parameters and stays.
+    the checkpoint and only registers its scale/offset metadata. Sourcing
+    them would make the strict block load raise on ``extra``, and merely
+    popping them materializes the whole ~100 GB table once per round, so the
+    filter runs BEFORE the pop. Everything else (weight_scale, ngram_heads_*)
+    matches real block parameters and stays.
     """
-    kept = [(k, v) for k, v in items if not _QWEN4_EXP_PLE_SHARD_KEY_RE.match(k)]
-    dropped = len(items) - len(kept)
-    if dropped:
-        logger.info(
-            "streamed layer %d: dropped %d N-gram shard tensors "
-            "(mmap-mode PLE reads them straight from the checkpoint)",
-            layer_idx,
-            dropped,
-        )
-    return kept
+    return bool(_QWEN4_EXP_PLE_SHARD_KEY_RE.match(relative_key))
 
 
 def _streamed_qwen4_exp_state(config: dict, calib_data, embedded):

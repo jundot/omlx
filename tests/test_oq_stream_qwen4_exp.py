@@ -13,8 +13,9 @@ import pytest
 import omlx.oq as oq
 from omlx.oq import (
     OQImatrixEntry,
-    _qwen4_exp_drop_mmap_ple_shards,
+    _qwen4_exp_mmap_skip_key,
     _resolve_stream_calibration,
+    _streamed_layer_items,
     _streamed_qwen4_exp_slot_state,
     _streamed_qwen4_exp_state,
 )
@@ -123,43 +124,72 @@ def test_qwen4_exp_slot_state_slices_like_the_resident_walk():
 # --- mmap-mode PLE shard drop (amendment 5) ---------------------------------
 
 
-def _ple_items():
-    items = [
-        (f"ple.ple_embedding.ngram_embedding.shards.{i}.weight", i) for i in range(128)
-    ]
-    items += [
-        ("ple.ple_embedding.ngram_embedding.weight_scale", "scale"),
-        ("ple.ple_embedding.ngram_embedding.ngram_heads_offsets", "off"),
-        ("ple.ple_embedding.ngram_embedding.ngram_heads_vocab_sizes", "vs"),
-        ("ple.norm_in.weight", "norm"),
-        ("mlp.shared_expert.gate_proj.weight", "mlp"),
-    ]
-    return items
+class _PoisonValue:
+    """A plan value that fails the test if it is ever materialized (popped)."""
+
+    def __init__(self, key):
+        self.key = key
 
 
-def test_ple_shard_drop_removes_exactly_the_shard_weights():
-    items = _ple_items()
-    kept = _qwen4_exp_drop_mmap_ple_shards(items, layer_idx=1)
-    kept_keys = [k for k, _ in kept]
-    assert len(kept) == len(items) - 128
+def _fake_plan(layer_idx=1):
+    prefix = f"language_model.model.layers.{layer_idx}."
+    rel_keys = [
+        f"ple.ple_embedding.ngram_embedding.shards.{i}.weight" for i in range(128)
+    ] + [
+        "ple.ple_embedding.ngram_embedding.weight_scale",
+        "ple.ple_embedding.ngram_embedding.ngram_heads_offsets",
+        "ple.ple_embedding.ngram_embedding.ngram_heads_vocab_sizes",
+        "ple.norm_in.weight",
+        "mlp.shared_expert.gate_proj.weight",
+    ]
+    return {f"{prefix}{rel}": _PoisonValue(rel) for rel in rel_keys}
+
+
+def test_skip_key_matches_exactly_the_shard_weights():
+    assert _qwen4_exp_mmap_skip_key(
+        "ple.ple_embedding.ngram_embedding.shards.17.weight"
+    )
+    for rel in (
+        "ple.ple_embedding.ngram_embedding.weight_scale",
+        "ple.ple_embedding.ngram_embedding.ngram_heads_offsets",
+        "ple.ple_embedding.ngram_embedding.ngram_heads_vocab_sizes",
+        "ple.norm_in.weight",
+        "mlp.shared_expert.gate_proj.weight",
+        "self_attn.q_proj.weight",
+    ):
+        assert not _qwen4_exp_mmap_skip_key(rel)
+
+
+def test_layer_items_skip_filters_before_the_pop():
+    # The shard tensors must never be popped (never read from disk): the
+    # filtered keys stay in the plan and the kept ones come through intact.
+    plan = _fake_plan(layer_idx=1)
+    items = _streamed_layer_items(plan, 1, skip_key=_qwen4_exp_mmap_skip_key)
+    kept_keys = [k for k, _ in items]
+    assert len(items) == 5
     assert not any(".shards." in k and k.endswith(".weight") for k in kept_keys)
-    # The metadata tensors that DO match block parameters must survive.
     assert "ple.ple_embedding.ngram_embedding.weight_scale" in kept_keys
-    assert "ple.ple_embedding.ngram_embedding.ngram_heads_offsets" in kept_keys
-    assert "ple.ple_embedding.ngram_embedding.ngram_heads_vocab_sizes" in kept_keys
-    assert "ple.norm_in.weight" in kept_keys
     assert "mlp.shared_expert.gate_proj.weight" in kept_keys
+    # Skipped keys were left un-popped in the plan.
+    remaining = [k for k in plan if ".shards." in k]
+    assert len(remaining) == 128
 
 
-def test_ple_shard_drop_is_identity_on_non_ple_layers():
-    # Positive control: a layer without ngram shards passes through unchanged,
-    # so the strict block load stays strict there.
-    items = [
-        ("self_attn.q_proj.weight", 1),
-        ("mlp.gate_proj.weight", 2),
-        ("input_layernorm.weight", 3),
+def test_layer_items_without_skip_is_unchanged():
+    # Positive control: a non-PLE layer sources every tensor, strictly.
+    prefix = "language_model.model.layers.0."
+    plan = {
+        f"{prefix}self_attn.q_proj.weight": 1,
+        f"{prefix}mlp.gate_proj.weight": 2,
+        f"{prefix}input_layernorm.weight": 3,
+    }
+    items = _streamed_layer_items(plan, 0, skip_key=_qwen4_exp_mmap_skip_key)
+    assert sorted(k for k, _ in items) == [
+        "input_layernorm.weight",
+        "mlp.gate_proj.weight",
+        "self_attn.q_proj.weight",
     ]
-    assert _qwen4_exp_drop_mmap_ple_shards(list(items), layer_idx=0) == items
+    assert not plan
 
 
 # --- table-preserve flag predicate ------------------------------------------
