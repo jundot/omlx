@@ -695,10 +695,13 @@ class TestUpdateGlobalSettingsSampling:
     """update_global_settings: saving and hot-applying sampling defaults."""
 
     @staticmethod
-    def _make_sampling_settings(policy: int | None = None):
+    def _make_sampling_settings(
+        policy: int | None = None, hard_cap: int | None = None
+    ):
         return SimpleNamespace(
             max_context_window=32768,
             max_context_window_policy=policy,
+            max_context_window_hard_cap=hard_cap,
             max_tokens=32768,
             temperature=1.0,
             top_p=0.95,
@@ -759,6 +762,55 @@ class TestUpdateGlobalSettingsSampling:
         assert "sampling" in result["runtime_applied"]
         assert gs.sampling.max_context_window_policy is None
         assert server_state.sampling.max_context_window_policy is None
+        gs.save.assert_called_once()
+
+    def test_saves_and_hot_applies_context_window_hard_cap(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(sampling=self._make_sampling_settings())
+        request = GlobalSettingsRequest(
+            sampling_max_context_window_hard_cap=1_048_576
+        )
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_hard_cap == 1_048_576
+        assert server_state.sampling.max_context_window_hard_cap == 1_048_576
+        gs.save.assert_called_once()
+
+    def test_explicit_null_clears_context_window_hard_cap(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings(hard_cap=1_048_576)
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(
+            sampling=self._make_sampling_settings(hard_cap=1_048_576)
+        )
+        request = GlobalSettingsRequest(sampling_max_context_window_hard_cap=None)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert "sampling_max_context_window_hard_cap" in request.model_fields_set
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_hard_cap is None
+        assert server_state.sampling.max_context_window_hard_cap is None
         gs.save.assert_called_once()
 
 

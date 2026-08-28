@@ -728,6 +728,10 @@ class SamplingSettings:
     # default so no install behavior changes implicitly. Per-model
     # overrides and the fallback default above are not affected.
     max_context_window_policy: int | None = None
+    # Optional absolute cap applied after native, per-model, or fallback
+    # context-window resolution. Unlike the soft policy above, explicit
+    # per-model overrides cannot exceed it.
+    max_context_window_hard_cap: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -739,6 +743,7 @@ class SamplingSettings:
         return {
             "max_context_window": self.max_context_window,
             "max_context_window_policy": self.max_context_window_policy,
+            "max_context_window_hard_cap": self.max_context_window_hard_cap,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -752,6 +757,7 @@ class SamplingSettings:
         return cls(
             max_context_window=data.get("max_context_window", 32768),
             max_context_window_policy=data.get("max_context_window_policy"),
+            max_context_window_hard_cap=data.get("max_context_window_hard_cap"),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
@@ -1620,6 +1626,14 @@ class GlobalSettings:
             errors.append(
                 "Invalid sampling max_context_window_policy: "
                 f"{self.sampling.max_context_window_policy} (must be > 0)"
+            )
+        if (
+            self.sampling.max_context_window_hard_cap is not None
+            and self.sampling.max_context_window_hard_cap <= 0
+        ):
+            errors.append(
+                "Invalid sampling max_context_window_hard_cap: "
+                f"{self.sampling.max_context_window_hard_cap} (must be > 0)"
             )
         if self.sampling.max_tokens <= 0:
             errors.append(

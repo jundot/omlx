@@ -12,9 +12,7 @@ from omlx.model_settings import ModelSettings
 class TestGetMaxContextWindow:
     """Tests for get_max_context_window() priority logic."""
 
-    def _make_server_state(
-        self, global_max_ctx=32768, policy_cap=None
-    ):
+    def _make_server_state(self, global_max_ctx=32768, policy_cap=None, hard_cap=None):
         """Create a mock server state with given global
         ``max_context_window`` fallback and optional
         ``max_context_window_policy`` cap."""
@@ -24,6 +22,7 @@ class TestGetMaxContextWindow:
         state.sampling = SamplingDefaults(
             max_context_window=global_max_ctx,
             max_context_window_policy=policy_cap,
+            max_context_window_hard_cap=hard_cap,
         )
         state.settings_manager = None
         # Discovery-tier (#1308) lookups are exercised in TestGetMaxContextWindow
@@ -174,6 +173,43 @@ class TestGetMaxContextWindow:
         with patch("omlx.server._server_state", state):
             # Fallback (32768) returned, not the policy (16_000).
             assert get_max_context_window("no-native-model") == 32_768
+
+    def test_hard_cap_clamps_per_model_override(self):
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(hard_cap=150_000)
+        state.settings_manager = MagicMock()
+        state.settings_manager.get_settings_for_request.return_value = ModelSettings(
+            max_context_window=262_144
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("override-model") == 150_000
+
+    def test_hard_cap_clamps_native_context(self):
+        from omlx.server import get_max_context_window
+
+        state = self._mount_native_and_policy(native_ctx=1_048_576, policy_cap=None)
+        state.sampling.max_context_window_hard_cap = 262_144
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("native-model") == 262_144
+
+    def test_hard_cap_clamps_fallback(self):
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(global_max_ctx=262_144, hard_cap=65_536)
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window() == 65_536
+
+    def test_soft_policy_still_allows_override_below_hard_cap(self):
+        from omlx.server import get_max_context_window
+
+        state = self._make_server_state(policy_cap=65_536, hard_cap=1_048_576)
+        state.settings_manager = MagicMock()
+        state.settings_manager.get_settings_for_request.return_value = ModelSettings(
+            max_context_window=262_144
+        )
+        with patch("omlx.server._server_state", state):
+            assert get_max_context_window("selected-model") == 262_144
 
 
 class TestValidateContextWindow:

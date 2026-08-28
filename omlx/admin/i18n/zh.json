@@ -460,6 +460,8 @@
   "settings.generation.max_context_window_hint": "仅在模型未声明原生上下文长度时使用。",
   "settings.generation.max_context_window_policy": "全局上下文窗口上限",
   "settings.generation.max_context_window_policy_hint": "对已检测到的模型上下文窗口应用的可选上限。留空表示不限制；单模型设置可以超过它。",
+  "settings.generation.max_context_window_hard_cap": "上下文窗口绝对上限",
+  "settings.generation.max_context_window_hard_cap_hint": "在模型和备用值解析后应用的硬性上限。留空表示不设置绝对上限。",
   "settings.generation.max_tokens": "最大 Token 数",
   "settings.generation.temperature": "温度",
   "settings.generation.temperature_hint": "0.0 = 确定性，2.0 = 最大随机性",

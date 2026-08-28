@@ -460,6 +460,8 @@
   "settings.generation.max_context_window_hint": "Se usa solo cuando un modelo no declara su longitud de contexto nativa.",
   "settings.generation.max_context_window_policy": "Límite global de ventana de contexto",
   "settings.generation.max_context_window_policy_hint": "Límite opcional para ventanas de contexto detectadas. Déjalo vacío para no aplicar límite; los ajustes por modelo pueden superarlo.",
+  "settings.generation.max_context_window_hard_cap": "Límite absoluto de ventana de contexto",
+  "settings.generation.max_context_window_hard_cap_hint": "Límite estricto aplicado después de resolver el modelo y el valor de respaldo. Déjalo vacío para no aplicar límite absoluto.",
   "settings.generation.max_tokens": "Tokens Máximos",
   "settings.generation.temperature": "Temperatura",
   "settings.generation.temperature_hint": "0.0 = determinista, 2.0 = máxima aleatoriedad",

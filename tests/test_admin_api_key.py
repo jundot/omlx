@@ -1199,3 +1199,16 @@ class TestGlobalSettingsValidation:
         )
         assert req.sampling_max_context_window_policy is None
         assert "sampling_max_context_window_policy" in req.model_fields_set
+
+    def test_context_window_hard_cap_rejects_negative(self):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(
+                sampling_max_context_window_hard_cap=-1
+            )
+
+    def test_context_window_hard_cap_accepts_null(self):
+        req = admin_routes.GlobalSettingsRequest(
+            sampling_max_context_window_hard_cap=None
+        )
+        assert req.sampling_max_context_window_hard_cap is None
+        assert "sampling_max_context_window_hard_cap" in req.model_fields_set

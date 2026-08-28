@@ -4802,6 +4802,7 @@
                     ddgsBackendsSet: Boolean(integrations.web_search_ddgs_backends),
                 };
                 this._globalMaxContextWindow = settingsData.sampling?.max_context_window || 32768;
+                this._globalMaxContextWindowHardCap = settingsData.sampling?.max_context_window_hard_cap || null;
             }
             this._mirrorAliasModelTypes();
 
@@ -7423,15 +7424,18 @@
     },
 
     contextWindowForCurrentModel() {
-        // Per-model max_context_window from admin settings, then global fallback, then 32768.
+        // Prefer the server-resolved effective limit, which includes the hard cap.
         try {
             const list = this._adminModelsList || [];
             const gw = this.aliasToGateway?.[this.currentModel] || this.currentModel;
             const m = list.find(x => x.id === gw || x.id === this.currentModel);
-            const perModel = m?.settings?.max_context_window ?? m?.max_context_window;
+            const perModel = m?.max_context_window ?? m?.settings?.max_context_window;
             if (perModel) return perModel;
         } catch (e) { /* ignore */ }
-        return this._globalMaxContextWindow || 32768;
+        const fallback = this._globalMaxContextWindow || 32768;
+        return this._globalMaxContextWindowHardCap
+            ? Math.min(fallback, this._globalMaxContextWindowHardCap)
+            : fallback;
     },
 
     // Cache the latest known context-token count on the conversation so the meter

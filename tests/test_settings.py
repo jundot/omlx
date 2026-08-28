@@ -1412,6 +1412,16 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("max_context_window_policy" in e for e in errors)
 
+    def test_validate_context_window_hard_cap(self):
+        """Sampling hard cap must be positive when set."""
+        settings = GlobalSettings()
+        settings.sampling.max_context_window_hard_cap = 1_048_576
+        assert settings.validate() == []
+
+        settings.sampling.max_context_window_hard_cap = 0
+        errors = settings.validate()
+        assert any("max_context_window_hard_cap" in e for e in errors)
+
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""
         settings = GlobalSettings()
@@ -2383,6 +2393,7 @@ class TestSamplingSettings:
         # operator policy cap (None by default).
         assert settings.max_context_window == 32768
         assert settings.max_context_window_policy is None
+        assert settings.max_context_window_hard_cap is None
         assert settings.max_tokens == 32768
         assert settings.temperature == 1.0
         assert settings.top_p == 0.95
@@ -2414,6 +2425,7 @@ class TestSamplingSettings:
         settings = SamplingSettings.from_dict({})
         assert settings.max_context_window == 32768
         assert settings.max_context_window_policy is None
+        assert settings.max_context_window_hard_cap is None
         assert settings.repetition_penalty == 1.0
 
     def test_policy_field_round_trip(self):
@@ -2428,6 +2440,17 @@ class TestSamplingSettings:
         with_policy = SamplingSettings.from_dict({"max_context_window_policy": 128_000})
         assert with_policy.max_context_window_policy == 128_000
         assert with_policy.to_dict()["max_context_window_policy"] == 128_000
+
+    def test_hard_cap_field_round_trip(self):
+        unset = SamplingSettings.from_dict({})
+        assert unset.max_context_window_hard_cap is None
+        assert unset.to_dict()["max_context_window_hard_cap"] is None
+
+        capped = SamplingSettings.from_dict(
+            {"max_context_window_hard_cap": 1_048_576}
+        )
+        assert capped.max_context_window_hard_cap == 1_048_576
+        assert capped.to_dict()["max_context_window_hard_cap"] == 1_048_576
 
 
 class TestClaudeCodeSettings:

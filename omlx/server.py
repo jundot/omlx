@@ -234,6 +234,11 @@ class SamplingDefaults:
     # without surprising migration semantics for existing
     # ``settings.json`` files.
     max_context_window_policy: int | None = None
+    # Optional absolute safety cap, applied after every resolution path,
+    # including explicit per-model overrides and the fallback default.
+    # This is separate from the soft policy above so operators can keep a
+    # conservative default while allowing selected models larger windows.
+    max_context_window_hard_cap: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -1764,9 +1769,8 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     Get effective max context window limit.
 
     Resolution:
-        1. **Per-model override** (admin UI / settings.json) — always
-           wins. An operator who has set a per-model number knows what
-           they want; ``max_context_window_policy`` does not clamp it.
+        1. **Per-model override** (admin UI / settings.json) — wins over
+           the soft policy.
         2. **Model-config-discovered native context length** (#1308),
            optionally clamped by the operator policy: if
            ``sampling.max_context_window_policy`` is set, return
@@ -1777,11 +1781,15 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
            ``settings.json`` files carrying the historical ``32768``
            default keep working unchanged after upgrade.
 
-    The policy field is intentionally nullable and unset by default so
-    no existing install behavior shifts. Setting it engages
+    Finally, ``max_context_window_hard_cap`` clamps whichever value the
+    three resolution tiers select. It is intentionally separate from the
+    soft policy so selected per-model overrides can exceed the default but
+    can never exceed the installation-wide safety ceiling.
+
+    Both policy fields are nullable and unset by default so no existing
+    install behavior shifts. Setting the soft policy engages
     ``min(native, policy)`` across every model whose native context is
-    discoverable; per-model overrides remain the operator's escape
-    hatch for individual models that should exceed the policy.
+    discoverable; per-model overrides remain the operator's escape hatch.
 
     Returns:
         Max context window token count, or ``None`` if no tier resolves
@@ -1793,9 +1801,16 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     model_settings = get_model_settings_for_request(requested_model_id)
     model_id = resolve_model_id(model_id)
 
-    # Priority 1: explicit per-model override (not capped by policy)
+    hard_cap = getattr(_server_state.sampling, "max_context_window_hard_cap", None)
+
+    def apply_hard_cap(value: int | None) -> int | None:
+        if value is None or hard_cap is None or hard_cap <= 0:
+            return value
+        return min(value, hard_cap)
+
+    # Priority 1: explicit per-model override (not capped by soft policy)
     if model_settings and model_settings.max_context_window is not None:
-        return model_settings.max_context_window
+        return apply_hard_cap(model_settings.max_context_window)
 
     # Priority 2: model-native context, optionally clamped by policy
     pool = _server_state.engine_pool
@@ -1805,12 +1820,12 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
             native = entry.model_context_length
             policy = getattr(_server_state.sampling, "max_context_window_policy", None)
             if policy is not None and policy > 0:
-                return min(native, policy)
-            return native
+                return apply_hard_cap(min(native, policy))
+            return apply_hard_cap(native)
 
     # Priority 3: fallback default (not capped — preserves legacy
     # settings.json behavior).
-    return _server_state.sampling.max_context_window
+    return apply_hard_cap(_server_state.sampling.max_context_window)
 
 
 def get_embedding_max_length(
@@ -1941,6 +1956,9 @@ def init_server(
             max_context_window=global_settings.sampling.max_context_window,
             max_context_window_policy=getattr(
                 global_settings.sampling, "max_context_window_policy", None
+            ),
+            max_context_window_hard_cap=getattr(
+                global_settings.sampling, "max_context_window_hard_cap", None
             ),
             max_tokens=global_settings.sampling.max_tokens,
             temperature=global_settings.sampling.temperature,

@@ -306,6 +306,9 @@ class GlobalSettingsRequest(BaseModel):
     # Sampling defaults
     sampling_max_context_window: int | None = None
     sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
+    sampling_max_context_window_hard_cap: int | None = Field(
+        default=None, ge=1
+    )
     sampling_max_tokens: int | None = None
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
@@ -1071,6 +1074,8 @@ def _apply_sampling_settings_runtime(
     max_context_window: int | None,
     max_context_window_policy: int | None,
     max_context_window_policy_set: bool,
+    max_context_window_hard_cap: int | None,
+    max_context_window_hard_cap_set: bool,
     max_tokens: int | None,
     temperature: float | None,
     top_p: float | None,
@@ -1096,6 +1101,12 @@ def _apply_sampling_settings_runtime(
     if max_context_window_policy_set:
         _server_state.sampling.max_context_window_policy = max_context_window_policy
         changes.append(f"max_context_window_policy={max_context_window_policy}")
+
+    if max_context_window_hard_cap_set:
+        _server_state.sampling.max_context_window_hard_cap = (
+            max_context_window_hard_cap
+        )
+        changes.append(f"max_context_window_hard_cap={max_context_window_hard_cap}")
 
     if max_tokens is not None:
         _server_state.sampling.max_tokens = max_tokens
@@ -3615,6 +3626,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "max_context_window_policy": (
                 global_settings.sampling.max_context_window_policy
             ),
+            "max_context_window_hard_cap": (
+                global_settings.sampling.max_context_window_hard_cap
+            ),
             "max_tokens": global_settings.sampling.max_tokens,
             "temperature": global_settings.sampling.temperature,
             "top_p": global_settings.sampling.top_p,
@@ -4290,6 +4304,11 @@ async def update_global_settings(
             request.sampling_max_context_window_policy
         )
         sampling_changed = True
+    if "sampling_max_context_window_hard_cap" in request.model_fields_set:
+        global_settings.sampling.max_context_window_hard_cap = (
+            request.sampling_max_context_window_hard_cap
+        )
+        sampling_changed = True
     if request.sampling_max_tokens is not None:
         global_settings.sampling.max_tokens = request.sampling_max_tokens
         sampling_changed = True
@@ -4313,6 +4332,8 @@ async def update_global_settings(
             request.sampling_max_context_window,
             request.sampling_max_context_window_policy,
             "sampling_max_context_window_policy" in request.model_fields_set,
+            request.sampling_max_context_window_hard_cap,
+            "sampling_max_context_window_hard_cap" in request.model_fields_set,
             request.sampling_max_tokens,
             request.sampling_temperature,
             request.sampling_top_p,
