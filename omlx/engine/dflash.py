@@ -88,7 +88,17 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 
     model_type = str(cfg.get("model_type") or "").lower()
 
-    is_qwen = "qwen" in model_type
+    # Substring match let every "qwen*" through, including qwen4_exp — the
+    # dashboard offered the toggle, the loader then raised
+    # "Model type qwen4_exp not supported" and engine_pool swallowed it, so
+    # the operator saw the switch turn on and silently fall back (v8 F2.7).
+    # The list is what mlx_lm actually resolves for dflash.
+    is_qwen = model_type in (
+        "qwen2", "qwen2_moe",
+        "qwen3", "qwen3_moe",
+        "qwen3_next",
+        "qwen3_5", "qwen3_5_moe",
+    )
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
