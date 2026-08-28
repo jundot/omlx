@@ -95,6 +95,39 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
 }
 
 
+def _runtime_patches_for(model_type: str | None) -> tuple[str, ...] | None:
+    """Sub-patches owning ``model_type``, or None to keep the historical sweep.
+
+    Exact match first, then the longest declared prefix: family variants
+    (``qwen3_5_moe_*`` and friends, which ``_is_mtp_compatible`` admits by
+    prefix) subclass the same shared parents as the family they extend, so
+    the family's entry owns them. Without the prefix step such a variant
+    falls through to the apply-everything sweep and rebinds architectures
+    this load has nothing to do with, which is the failure the table exists
+    to prevent.
+    """
+    if not model_type:
+        return None
+    if model_type is not None and model_type not in _RUNTIME_PATCHES_BY_TYPE:
+        # _is_mtp_compatible admits model_type prefixes (qwen3_5*, qwen3_6*),
+        # so a variant can reach this with no table entry and fall back to the
+        # unscoped sweep. Say so rather than doing it silently.
+        logger.debug(
+            "mlx-vlm MTP runtime patch: no entry for model_type=%s, applying "
+            "every architecture's runtime",
+            model_type,
+        )
+
+    if model_type in _RUNTIME_PATCHES_BY_TYPE:
+        return _RUNTIME_PATCHES_BY_TYPE[model_type]
+    family = max(
+        (k for k in _RUNTIME_PATCHES_BY_TYPE if model_type.startswith(k)),
+        key=len,
+        default=None,
+    )
+    return _RUNTIME_PATCHES_BY_TYPE[family] if family is not None else None
+
+
 def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
     """Apply the mlx-vlm runtime MTP patches (attach MTPModule, mtp_forward).
 
@@ -122,9 +155,10 @@ def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
     """
     import importlib
 
-    if model_type in _RUNTIME_PATCHES_BY_TYPE:
+    scoped = _runtime_patches_for(model_type)
+    if scoped is not None:
         applied = False
-        for name in _RUNTIME_PATCHES_BY_TYPE[model_type]:
+        for name in scoped:
             if importlib.import_module(f".{name}", __name__).apply():
                 applied = True
             else:

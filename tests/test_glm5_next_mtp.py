@@ -500,3 +500,28 @@ def test_runtime_sweep_applies_everything_for_an_unknown_model_type(monkeypatch)
     apply_mlx_vlm_mtp_runtime_patch(None)
 
     assert sorted(applied) == sorted(_RUNTIME_MODULES)
+
+
+def test_rollback_refuses_when_the_capture_is_short(applied, config, monkeypatch):
+    """A sink shorter than the recurrent layer count means the capture patch
+    never ran. Rolling back part of the cache and reporting success is worse
+    than declining, because the caller cannot tell the difference.
+    """
+    import mlx_lm.models.cache as cache_mod
+
+    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None,
+                 mask=None):
+        return None, mx.zeros((1, 1, 1, 1))
+
+    monkeypatch.setattr(applied, "gated_delta_update", fake_gdu, raising=False)
+
+    sparse = _FakeSparse(can_undo=True)
+    recurrent = cache_mod.ArraysCache(size=2)
+
+    host = _Host(config)
+    with pytest.raises(RuntimeError):
+        applied.LanguageModel.rollback_speculative_cache(
+            host, [sparse, recurrent], [], 0, 4
+        )
+
+    assert sparse.trimmed == [], "no layer may be trimmed once the capture is short"

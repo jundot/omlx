@@ -540,12 +540,21 @@ def _patch_language_model(g5_lang: Any) -> None:
         n = max_a + 1
         trim = int(block_size) - n
 
-        # Check every sparse layer before mutating anything. A trim that
-        # fails on one layer after earlier layers already trimmed leaves the
-        # cache at mixed lengths; declining the whole rollback raises here,
-        # and the generator falls back to a standard step with every cache
-        # still intact. Same contract as mtp_partial_rollback on the mlx-lm
-        # path, which also refuses before it touches anything.
+        # Check the whole rollback before mutating anything. Trimming some
+        # layers and then giving up leaves the cache at mixed lengths, and
+        # the caller reports success either way, so both the missing-capture
+        # case and an unrecoverable sparse layer have to be caught here.
+        # Refusing raises, and the generator falls back to a standard step
+        # with every cache still intact. Same contract as
+        # mtp_partial_rollback on the mlx-lm path.
+        n_recurrent = sum(
+            1 for c in caches if c is not None and _is_recurrent(c)
+        )
+        if n_recurrent and len(gdn_states or ()) < n_recurrent:
+            raise RuntimeError(
+                f"glm5_next rollback: {len(gdn_states or ())} captured gdn "
+                f"state(s) for {n_recurrent} recurrent layers"
+            )
         if trim > 0:
             blocked = [
                 type(c).__name__
@@ -563,12 +572,6 @@ def _patch_language_model(g5_lang: Any) -> None:
             if c is None:
                 continue
             if _is_recurrent(c):
-                if gdn_states is None or gdn_idx >= len(gdn_states):
-                    logger.warning(
-                        "glm5_next rollback: missing gdn state for KDA layer %d",
-                        gdn_idx,
-                    )
-                    return 0
                 entry = gdn_states[gdn_idx]
                 # The gate mask joined the capture tuple later; older callers
                 # can still hand over the 11-element form.
