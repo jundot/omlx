@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mmap
 import os
@@ -649,6 +650,9 @@ class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
 class Qwen4ExpQSAIndexer(nn.Module):
     """Select compressed key blocks using Qwen Sparse Attention scores."""
 
+    # Rate-limited counter for the defensive seq clamp below.
+    _seq_clamp_hits = 0
+
     def __init__(self, config: TextConfig, rotary_emb):
         super().__init__()
         self.n_heads = config.indexer_n_heads
@@ -714,6 +718,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
         max_complete_blocks = key_len // self.compress_ratio
         if max_complete_blocks <= self.block_topk:
             return None
+
+        # Defensive seq clamp: under multi-row batched decode with the sparse
+        # path active, a stale MTP-verify position can leak into the batched
+        # query — put_along_axis broadcasts the stale seq axis and the tail
+        # concatenate below then raises, killing every concurrent stream.
+        # Keep the freshest query row; the selection is at most one position
+        # stale, which is acceptance-neutral.
+        if selected_blocks.shape[1] != seq_len:
+            Qwen4ExpQSAIndexer._seq_clamp_hits += 1
+            if Qwen4ExpQSAIndexer._seq_clamp_hits % 256 == 1:
+                logging.getLogger("omlx.qwen4_exp").warning(
+                    "QSA mask seq clamp fired x%d", Qwen4ExpQSAIndexer._seq_clamp_hits,
+                )
+            selected_blocks = selected_blocks[:, -seq_len:, :]
 
         query = self._apply_rope(query, position_ids)
         complete_key_len = max_complete_blocks * self.compress_ratio
