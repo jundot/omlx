@@ -420,6 +420,37 @@ def test_chain_depth_stays_inside_the_pooling_undo_window(applied, config):
     assert model._omlx_mtp_depth == 7
 
 
+def test_head_cache_is_committed_only(applied, config):
+    """The chain must run its speculative head steps on a per-cycle clone.
+
+    The head pairs each block with a PoolingCache, whose ``offset`` counts
+    pooled rows and not tokens, so ``_mtp_head_trim_to`` cannot rewind it:
+    with head_clone False the paired KVCache rewinds every cycle while the
+    indexer pool keeps the rejected draft rows.
+    """
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.mlx_lm_mtp.batch_generator import _resolve_mtp_chain_depth
+
+    prev_active = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = applied.LanguageModel(config)
+    finally:
+        mlx_lm_mtp.set_mtp_active(prev_active)
+
+    assert model._omlx_mtp_head_clone is True
+    assert _resolve_mtp_chain_depth(model)[2] is True
+
+    head_cache = model.make_mtp_cache()
+    pools = [c for c in head_cache if getattr(c, "ratio", None) is not None]
+    assert pools, "the head cache is expected to hold the indexer pool"
+    for pool in pools:
+        # `offset` is the pooled row count; _mtp_head_trim_to would compare it
+        # against a token history offset. Guard the premise of the fix.
+        assert pool.offset == 0
+        assert hasattr(pool, "remainder")
+
+
 def _gdn_capture(gate_mask=None, block=4, K=4):
     """One layer's capture tuple, shaped as the verify forward records it."""
     return [(mx.zeros((1, block, 1, 1)),) * 5 + (
@@ -474,6 +505,9 @@ def _record_runtime_applies(monkeypatch):
         # qwen4_exp runs its own MTP and subclasses the qwen3_5 classes these
         # patches rebind, so the sweep must not reach it.
         ("qwen4_exp", []),
+        # _is_mtp_compatible admits the family by prefix, so a variant has to
+        # resolve to its family rather than falling back to the full sweep.
+        ("qwen3_5_moe_variant", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
     ],
 )
 def test_runtime_sweep_applies_only_the_loaded_architecture(

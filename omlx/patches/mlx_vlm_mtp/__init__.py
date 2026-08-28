@@ -18,6 +18,7 @@ building the VLM sanitizer. The patches are idempotent.
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ def set_mtp_attach_enabled(enabled: bool) -> None:
 def is_mtp_attach_enabled() -> bool:
     return _MTP_ATTACH_ENABLED
 
+
 def apply_mlx_vlm_mtp_patch() -> bool:
     """Apply the mlx-vlm MTP sanitize monkey-patches.
 
@@ -77,6 +79,16 @@ def apply_mlx_vlm_mtp_patch() -> bool:
     return True
 
 
+# The unscoped sweep, in the order it has always run. Every entry in
+# ``_RUNTIME_PATCHES_BY_TYPE`` below is drawn from this tuple.
+_RUNTIME_PATCHES: tuple[str, ...] = (
+    "qwen35_moe_vlm_runtime",
+    "qwen35_vlm_runtime",
+    "gemma4_vlm_runtime",
+    "inkling_vlm_runtime",
+    "glm5_next_vlm_runtime",
+)
+
 # Which runtime sub-patch belongs to which ``model_type``. These patches
 # rebind methods on shared parent classes and other architectures subclass
 # them, so applying all of them reaches models this load has nothing to do
@@ -95,7 +107,11 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
 }
 
 
-def _runtime_patches_for(model_type: str | None) -> tuple[str, ...] | None:
+def _patches_for(
+    model_type: str | None,
+    table: dict[str, tuple[str, ...]],
+    kind: str,
+) -> tuple[str, ...] | None:
     """Sub-patches owning ``model_type``, or None to keep the historical sweep.
 
     Exact match first, then the longest declared prefix: family variants
@@ -108,24 +124,23 @@ def _runtime_patches_for(model_type: str | None) -> tuple[str, ...] | None:
     """
     if not model_type:
         return None
-    if model_type is not None and model_type not in _RUNTIME_PATCHES_BY_TYPE:
-        # _is_mtp_compatible admits model_type prefixes (qwen3_5*, qwen3_6*),
-        # so a variant can reach this with no table entry and fall back to the
-        # unscoped sweep. Say so rather than doing it silently.
-        logger.debug(
-            "mlx-vlm MTP runtime patch: no entry for model_type=%s, applying "
-            "every architecture's runtime",
-            model_type,
-        )
-
-    if model_type in _RUNTIME_PATCHES_BY_TYPE:
-        return _RUNTIME_PATCHES_BY_TYPE[model_type]
+    if model_type in table:
+        return table[model_type]
     family = max(
-        (k for k in _RUNTIME_PATCHES_BY_TYPE if model_type.startswith(k)),
-        key=len,
-        default=None,
+        (k for k in table if model_type.startswith(k)), key=len, default=None
     )
-    return _RUNTIME_PATCHES_BY_TYPE[family] if family is not None else None
+    if family is not None:
+        return table[family]
+    # _is_mtp_compatible admits model_type prefixes (qwen3_5*, qwen3_6*), so a
+    # variant can reach this with no entry and no declared family, and fall
+    # back to the unscoped sweep. Say so rather than doing it silently.
+    logger.debug(
+        "mlx-vlm MTP %s patch: no entry for model_type=%s, applying every "
+        "architecture's patch",
+        kind,
+        model_type,
+    )
+    return None
 
 
 def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
@@ -153,44 +168,17 @@ def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
     request fails with "Qwen4 Lightning MTP expects hidden shape
     [batch, tokens, hc_count * hidden_size]" until the server restarts.
     """
-    import importlib
-
-    scoped = _runtime_patches_for(model_type)
+    scoped = _patches_for(model_type, _RUNTIME_PATCHES_BY_TYPE, "runtime")
     if scoped is not None:
-        applied = False
-        for name in scoped:
-            if importlib.import_module(f".{name}", __name__).apply():
-                applied = True
-            else:
-                logger.debug("%s MTP runtime patch did not apply", name)
         logger.debug(
             "mlx-vlm MTP runtime patch scoped to model_type=%s", model_type
         )
-        return applied
 
-    from . import (
-        gemma4_vlm_runtime,
-        glm5_next_vlm_runtime,
-        inkling_vlm_runtime,
-        qwen35_moe_vlm_runtime,
-        qwen35_vlm_runtime,
-    )
+    applied = False
+    for name in _RUNTIME_PATCHES if scoped is None else scoped:
+        if importlib.import_module(f".{name}", __name__).apply():
+            applied = True
+        else:
+            logger.debug("%s MTP runtime patch did not apply", name)
 
-    moe_ok = qwen35_moe_vlm_runtime.apply()
-    if not moe_ok:
-        logger.debug("Qwen3.5-MoE VLM runtime MTP patch did not apply")
-    dense_ok = qwen35_vlm_runtime.apply()
-    if not dense_ok:
-        logger.debug("Qwen3.5 (dense) VLM runtime MTP patch did not apply")
-    gemma4_ok = gemma4_vlm_runtime.apply()
-    if not gemma4_ok:
-        logger.debug("Gemma 4 VLM runtime MTP patch did not apply")
-    inkling_ok = inkling_vlm_runtime.apply()
-    if not inkling_ok:
-        logger.debug("Inkling VLM runtime MTP patch did not apply")
-
-    glm5_ok = glm5_next_vlm_runtime.apply()
-    if not glm5_ok:
-        logger.debug("GLM-5.3 (glm5_next) VLM runtime MTP patch did not apply")
-
-    return moe_ok or dense_ok or gemma4_ok or inkling_ok or glm5_ok
+    return applied

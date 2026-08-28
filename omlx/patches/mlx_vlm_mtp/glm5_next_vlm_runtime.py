@@ -459,7 +459,17 @@ def _patch_language_model(g5_lang: Any) -> None:
                     "indexer PoolingCache cannot undo a %d-row verify block",
                     _MAX_CHAIN_DEPTH, requested_depth, requested_depth + 1,
                 )
-            self._omlx_mtp_head_clone = False
+            # ``make_mtp_cache`` pairs each block with a PoolingCache, whose
+            # ``offset`` is the pooled row count and not a token count. The
+            # chain's ``_mtp_head_trim_to`` compares that offset against a
+            # token history offset, so with head_clone False the paired
+            # KVCache rewinds every cycle while the indexer pool keeps the
+            # rejected draft rows; a pool trim could not undo them anyway,
+            # since the undo log only ever covers one update and the chain
+            # appends its drafts one token at a time. Keep the persistent
+            # head cache committed-only and run the speculative steps on a
+            # per-cycle clone, as DeepSeek-V4 does for its own head cache.
+            self._omlx_mtp_head_clone = True
             # Same 8-of-N routing economics as GLM-5.2: each extra verify row
             # pulls a nearly disjoint expert set, so the adaptive depth
             # controller needs a high marginal-cost prior or it over-drafts.
@@ -633,7 +643,12 @@ def _patch_language_model(g5_lang: Any) -> None:
         same cache shape ``make_cache`` builds for a sparse backbone layer:
         latent KV plus the indexer's pooling cache. A flat list (rather than
         a CacheList) keeps each cache's ``offset``/``trim`` directly visible
-        to the chain's trim helper, matching glm_moe_dsa.
+        to ``mtp_forward``, which re-slices pairs per block.
+
+        Unlike glm_moe_dsa, which pairs two plain KVCaches, the second half
+        here is a PoolingCache: its ``offset`` counts pooled rows, not
+        tokens, so the chain's ``_mtp_head_trim_to`` cannot rewind it. That
+        is why ``__init__`` sets ``_omlx_mtp_head_clone``.
         """
         if not hasattr(self, "mtp"):
             return None
