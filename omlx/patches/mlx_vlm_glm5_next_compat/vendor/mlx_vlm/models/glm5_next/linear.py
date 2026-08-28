@@ -13,7 +13,13 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
         return None
     if getattr(linear, "mode", None) != "affine" or "bias" in linear:
         return None
-    min_tokens = 1024 if bits == 8 else 128
+    # The q8 tile miscomputes these projections and corrupts the hidden
+    # states, so any prompt that reaches the 1024-row prefill threshold
+    # comes out as unrelated text. Keep 8-bit on mx.quantized_matmul
+    # until the kernel is fixed; 4-bit is unaffected.
+    if bits == 8:
+        return None
+    min_tokens = 128
     if x.ndim < 2 or x.shape[-2] < min_tokens:
         return None
 
