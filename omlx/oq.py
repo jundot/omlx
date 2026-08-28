@@ -6266,12 +6266,25 @@ def quantize_oq_streaming(
     )
 
     # --- Sanitize-plan discovery ------------------------------------------
+    if _stream_source_model_type(config) == "qwen4_exp":
+        # The write path may reach here without any collection having run
+        # (imatrix cache hit + sensitivity override), so the vendored
+        # mlx_vlm.models.qwen4_exp package may not be exposed yet. Without
+        # it the sanitizer build fails and the write would silently fall
+        # back to raw checkpoint keys: no expert stacking, predicate rules
+        # matching nothing, and a passthrough-sized output.
+        _qwen4_exp_apply_compat_patch()
     sanitize_fn = _build_model_sanitizer(
         config,
         text_only=text_only,
         model_path=source,
         preserve_mtp=preserve_mtp,
     )
+    if sanitize_fn is None and _stream_source_model_type(config) == "qwen4_exp":
+        raise RuntimeError(
+            "no model sanitizer for qwen4_exp: refusing to quantize on raw "
+            "checkpoint keys (the recipe's tensor rules would not match)"
+        )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     # When preserve_mtp is True, the patched sanitize functions
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
