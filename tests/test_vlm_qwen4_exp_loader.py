@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -57,6 +58,50 @@ def test_qwen4_exp_mlx_metadata_is_hidden_during_load(tmp_path, monkeypatch):
             assert handle.metadata() == {"source": "test"}
 
     assert safetensors.safe_open is original
+
+
+def test_qwen4_exp_mlx_metadata_is_hidden_for_symlinked_shards(
+    tmp_path, monkeypatch
+):
+    """Symlinked shards must still get the sanitize override.
+
+    Checkpoint layouts that keep shards as symlinks into a content-addressed
+    store resolve outside the model directory, so a ``Path.resolve()``
+    comparison leaves ``format=mlx`` visible, skips ``Model.sanitize``, and
+    the load dies on the self-managed tensors sanitize was removing.
+    """
+    store = tmp_path / "blobs"
+    snapshot = tmp_path / "snapshots" / "rev"
+    store.mkdir()
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+    blob = store / "blob-1"
+    blob.write_bytes(b"\x00")
+    shard = snapshot / "model-00001-of-00021.safetensors"
+    os.symlink(blob, shard)
+
+    class FakeHandle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def metadata(self):
+            return {"format": "mlx", "source": "test"}
+
+    import safetensors
+
+    monkeypatch.setattr(safetensors, "safe_open", lambda *_a, **_k: FakeHandle())
+
+    with vlm_module._force_qwen4_exp_sanitize_on_load(snapshot):
+        with safetensors.safe_open(shard) as handle:
+            assert handle.metadata() == {"source": "test"}
+        # Files outside the model keep their marker untouched.
+        with safetensors.safe_open(blob) as handle:
+            assert handle.metadata() == {"format": "mlx", "source": "test"}
 
 
 @pytest.mark.asyncio
