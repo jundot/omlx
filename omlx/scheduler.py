@@ -985,6 +985,17 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         if all(a is b for a, b in zip(sub_caches, converted)):
             return cache_obj
         return type(cache_obj)(*converted)
+    # Model-owned batch conversion (qwen4_exp QSAKVCache etc.): singletons
+    # exposing `to_batch` convert to their batch variant before extend —
+    # without this `.extend()` raises AttributeError and the generation loop
+    # reports "Cache corruption not recoverable", killing every concurrent
+    # stream on qwen4_exp. Aligned with upstream PR #3215
+    # (fix(vlm): promote model caches before batch extension), which fixes
+    # the same seam for issue #3222. QSAQuantizedKVCache has no conversion
+    # yet (quantized path stays single-stream).
+    model_owned_to_batch = getattr(cache_obj, "to_batch", None)
+    if callable(model_owned_to_batch):
+        return model_owned_to_batch([0])
     if isinstance(cache_obj, _REGULAR_SINGLETON_CACHE_TYPES):
         return cache_obj.merge([cache_obj])
     if (
@@ -2702,6 +2713,18 @@ class Scheduler:
                     # beats the 2048 default +3.2% at 4k prompts / +1.0% at
                     # 16k; 8192 is flat versus 4096. Keep 2048 on NAX/M5,
                     # where wider prefill regresses throughput (#2880).
+                    # oai-mlx patch (2026-08-27): env override for the batch
+                    # instance — its prefill is cache-dominated, and the 4096
+                    # floor doubles the block-cache hit threshold (K66 news
+                    # template sits at ~2400 tokens), killing the 98.9% hit
+                    # rate. OMLX_QWEN35_PREFILL_FLOOR=0 restores the 0.5.7
+                    # geometry (block 2048 == default prefill step).
+                    env_floor = os.environ.get("OMLX_QWEN35_PREFILL_FLOOR")
+                    if env_floor is not None:
+                        try:
+                            return max(0, int(env_floor))
+                        except ValueError:
+                            pass
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
@@ -3462,6 +3485,21 @@ class Scheduler:
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
         total_length = len(tokens)
+
+        # MTP prompt priming backfill: when a prefix cache hit loads KV for
+        # tokens [0, cached_tokens) without running the backbone forward,
+        # those tokens are invisible to the MTP head. Stash the FULL prompt
+        # tokens (not the suffix passed as ``tokens``) so maybe_capture can
+        # backfill the head cache over [0, cached_offset) on the first
+        # non-cached suffix forward.  ``tokens`` here is only the post-hit
+        # suffix (e.g. 955 of 27K) — passing it would leave the cached 26K
+        # tokens unprimed (#backfill-coverage).
+        if existing_cache is not None and getattr(request, "cached_tokens", 0) > 0:
+            try:
+                from omlx.patches.mlx_lm_mtp.prompt_priming import set_backfill_tokens
+                set_backfill_tokens(self.model, request.prompt_token_ids)
+            except Exception:
+                pass
 
         # Build the input row on the engine stream: the chunk forwards below
         # run inside mx.stream(self._stream), and a worker-default-stream
@@ -5072,6 +5110,14 @@ class Scheduler:
 
         if state.tokens_processed == 0:
             _sync_and_clear_cache(self._stream)
+            # MTP prompt priming backfill for chunked prefill: stash full
+            # prompt tokens when prefix cache hit skipped the backbone forward.
+            if state.base_size > 0:
+                try:
+                    from omlx.patches.mlx_lm_mtp.prompt_priming import set_backfill_tokens
+                    set_backfill_tokens(self.model, state.request.prompt_token_ids)
+                except Exception:
+                    pass
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
