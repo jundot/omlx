@@ -722,9 +722,11 @@ class SamplingSettings:
     # 32768 so existing ``settings.json`` files carrying the historical
     # default keep working unchanged after upgrade.
     max_context_window: int = 32768
-    # Optional operator hard cap. It is applied after resolving a per-model
-    # override, a native context length, or the fallback above. Unset (None)
-    # by default so no install behavior changes implicitly.
+    # Optional operator policy cap. When set, the server returns
+    # ``min(native_context, max_context_window_policy)`` for models
+    # whose native context length is discovered. Unset (None) by
+    # default so no install behavior changes implicitly. Per-model
+    # overrides and the fallback default above are not affected.
     max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0

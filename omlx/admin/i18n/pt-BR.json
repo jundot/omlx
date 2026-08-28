@@ -459,7 +459,7 @@
   "settings.generation.max_context_window": "Janela de Contexto Fallback",
   "settings.generation.max_context_window_hint": "Usada somente quando um modelo não declara seu tamanho de contexto nativo.",
   "settings.generation.max_context_window_policy": "Limite Global de Janela de Contexto",
-  "settings.generation.max_context_window_policy_hint": "Limite rígido aplicado após resolver o contexto por modelo, nativo ou de fallback. Deixe vazio para sem limite.",
+  "settings.generation.max_context_window_policy_hint": "Limite opcional para janelas de contexto de modelos descobertos. Deixe vazio para sem limite; substituições por modelo podem excedê-lo.",
   "settings.generation.max_tokens": "Máx. de Tokens",
   "settings.generation.temperature": "Temperatura",
   "settings.generation.temperature_hint": "0,0 = determinístico, 2,0 = máxima aleatoriedade",

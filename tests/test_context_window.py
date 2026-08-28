@@ -138,8 +138,11 @@ class TestGetMaxContextWindow:
         with patch("omlx.server._server_state", state):
             assert get_max_context_window("small-model") == 32_768
 
-    def test_policy_clamps_per_model_override(self):
-        """A stale per-model override cannot bypass the host safety cap."""
+    def test_per_model_override_escapes_policy(self):
+        """A per-model override is the operator's explicit per-model
+        choice; the global policy cap does NOT clamp it. This is the
+        operator's escape hatch for individual models that should
+        exceed the policy."""
         from omlx.server import get_max_context_window
 
         state = self._mount_native_and_policy(
@@ -151,12 +154,17 @@ class TestGetMaxContextWindow:
             max_context_window=200_000
         )
         with patch("omlx.server._server_state", state):
-            assert get_max_context_window("override-model") == 64_000, (
-                "The global policy must clamp a per-model override"
+            assert get_max_context_window("override-model") == 200_000, (
+                "Per-model override must escape the policy clamp"
             )
 
-    def test_policy_clamps_fallback_path(self):
-        """Unknown models cannot bypass the host cap through the fallback."""
+    def test_policy_does_not_apply_to_fallback_path(self):
+        """When the model has no discoverable native context AND no
+        per-model override, the fallback default applies — the policy
+        is documented as clamping the *native* path only. Existing
+        ``settings.json`` files with the historical 32768 fallback
+        therefore keep working unchanged even when a policy is later
+        added to the install."""
         from omlx.server import get_max_context_window
 
         # native_ctx=None: model config doesn't expose a context length
@@ -164,7 +172,8 @@ class TestGetMaxContextWindow:
             native_ctx=None, policy_cap=16_000
         )
         with patch("omlx.server._server_state", state):
-            assert get_max_context_window("no-native-model") == 16_000
+            # Fallback (32768) returned, not the policy (16_000).
+            assert get_max_context_window("no-native-model") == 32_768
 
 
 class TestValidateContextWindow:
