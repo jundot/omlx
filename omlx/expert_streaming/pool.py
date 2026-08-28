@@ -325,8 +325,8 @@ class StreamingSwitchGLU(nn.Module):
             )
             return [(expert, int(self._route_counts[expert])) for expert in experts]
 
-    def preload_hotlist(self, entries: list[tuple[int, int]]) -> int:
-        """Fill evictable slots from a prior run's learned route profile."""
+    def preload_hotlist(self, entries: list[tuple[int, int]]) -> tuple[int, int]:
+        """Populate every configured hot slot, prioritizing learned experts."""
         with self._lock:
             valid: list[tuple[int, int]] = []
             seen: set[int] = set()
@@ -346,11 +346,19 @@ class StreamingSwitchGLU(nn.Module):
             for expert, count in valid:
                 self._route_counts[expert] = min(count, int(np.iinfo(np.uint64).max))
             selected = valid[: self.cache_slots]
+            selected_experts = {expert for expert, _ in selected}
+            if len(selected) < self.cache_slots:
+                selected.extend(
+                    (expert, 0)
+                    for expert in range(self.num_experts)
+                    if expert not in self._pinned_set and expert not in selected_experts
+                )
+                selected = selected[: self.cache_slots]
             missing = [
                 expert for expert, _ in selected if expert not in self._expert_to_slot
             ]
             if not missing:
-                return 0
+                return 0, 0
             slots = self._allocate_misses(missing)
             self._load_into_slots(missing, slots, load_kind="warm_start")
             counts = dict(selected)
@@ -369,7 +377,8 @@ class StreamingSwitchGLU(nn.Module):
             self.stats.bank_materialize_seconds += (
                 time.perf_counter() - materialize_started
             )
-            return len(missing)
+            learned = sum(1 for expert in missing if counts[expert] > 0)
+            return learned, len(missing) - learned
 
     def _eviction_victim(self, protected: set[int]) -> tuple[int, int]:
         candidates = [

@@ -519,6 +519,7 @@ class TestRunSingleTest:
                     "execution_bank_slots": 32,
                     "execution_banks_per_layer": 4,
                     "hotlist_preloaded": 1536,
+                    "optimistic_preloaded": 0,
                     "route_lookups": self.lookups,
                     "cache_hits": self.lookups - 10,
                     "cache_misses": 10,
@@ -565,8 +566,10 @@ class TestRunSingleTest:
         assert streaming["execution_bank_slots"] == 32
         assert streaming["execution_banks_per_layer"] == 4
         assert streaming["hotlist_preloaded"] == 1536
+        assert streaming["optimistic_preloaded"] == 0
         assert streaming["resident_fill_rate"] == 1.0
         assert streaming["hotlist_preload_fill_rate"] == 0.25
+        assert streaming["startup_preload_fill_rate"] == 0.25
         assert metrics["metal_memory"] == {
             "active_start_bytes": 11,
             "active_end_bytes": 22,

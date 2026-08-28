@@ -39,6 +39,7 @@ class ExpertStreamingRuntime:
     hotlist_profile_path: Path | None = None
     hotlist_fingerprint: str | None = None
     hotlist_preloaded: int = 0
+    optimistic_preloaded: int = 0
     hotlist_profile_error: str | None = None
     execution: SpeculativeExecution | None = None
 
@@ -117,6 +118,7 @@ class ExpertStreamingRuntime:
                 str(self.hotlist_profile_path) if self.hotlist_profile_path else None
             ),
             "hotlist_preloaded": self.hotlist_preloaded,
+            "optimistic_preloaded": self.optimistic_preloaded,
             "hotlist_profile_error": self.hotlist_profile_error,
             **totals,
             **timing_totals,
@@ -179,16 +181,26 @@ def _load_hotlist(
     profile_path: Path | None,
     fingerprint: str | None,
     pools: list[StreamingSwitchGLU],
-) -> tuple[int, str | None]:
+) -> tuple[int, int, str | None]:
+    def fill(entries: dict[int, list[tuple[int, int]]] | None = None):
+        loaded = [
+            pool.preload_hotlist(entries.get(pool.layer, []) if entries else [])
+            for pool in pools
+        ]
+        return sum(value[0] for value in loaded), sum(value[1] for value in loaded)
+
     if profile_path is None or fingerprint is None or not profile_path.is_file():
-        return 0, None
+        learned, optimistic = fill()
+        return learned, optimistic, None
     try:
         payload = json.loads(profile_path.read_text())
         if payload.get("version") != 1 or payload.get("fingerprint") != fingerprint:
-            return 0, None
+            learned, optimistic = fill()
+            return learned, optimistic, None
         expected_experts = pools[0].num_experts if pools else 0
         if int(payload.get("num_experts", -1)) != expected_experts:
-            return 0, None
+            learned, optimistic = fill()
+            return learned, optimistic, None
         layers = payload.get("layers")
         if not isinstance(layers, dict):
             raise ValueError("layers must be an object")
@@ -207,9 +219,10 @@ def _load_hotlist(
         logger.warning(
             "Ignoring invalid expert hotlist profile %s: %s", profile_path, exc
         )
-        return 0, f"load: {exc}"
-    preloaded = sum(pool.preload_hotlist(parsed[pool.layer]) for pool in pools)
-    return preloaded, None
+        learned, optimistic = fill()
+        return learned, optimistic, f"load: {exc}"
+    learned, optimistic = fill(parsed)
+    return learned, optimistic, None
 
 
 def install_expert_streaming(
@@ -331,7 +344,7 @@ def install_expert_streaming(
         raise
 
     try:
-        hotlist_preloaded, hotlist_profile_error = _load_hotlist(
+        hotlist_preloaded, optimistic_preloaded, hotlist_profile_error = _load_hotlist(
             hotlist_profile_path, hotlist_fingerprint, pools
         )
     except Exception:
@@ -351,6 +364,7 @@ def install_expert_streaming(
         hotlist_profile_path=hotlist_profile_path,
         hotlist_fingerprint=hotlist_fingerprint,
         hotlist_preloaded=hotlist_preloaded,
+        optimistic_preloaded=optimistic_preloaded,
         hotlist_profile_error=hotlist_profile_error,
     )
     model._omlx_expert_streaming_runtime = runtime
@@ -361,11 +375,14 @@ def install_expert_streaming(
         runtime.attach_model(language_model)
     logger.info(
         "Expert streaming ready: mode=%s, %d layers, pinned range %s, "
-        "%d hot slots/layer, %.2f GiB bank",
+        "%d hot slots/layer, learned preload=%d, optimistic preload=%d, "
+        "%.2f GiB bank",
         streaming_mode,
         len(targets),
         manifest.pinned_count_range,
         pools[0].cache_slots if pools else 0,
+        hotlist_preloaded,
+        optimistic_preloaded,
         sum(
             pool.pool_size
             * sum(location.row_bytes for location in pool.locations.values())

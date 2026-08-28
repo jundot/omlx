@@ -688,6 +688,7 @@ _EXPERT_STREAMING_CONFIG_FIELDS = (
     "execution_policy",
     "hotlist_profile",
     "hotlist_preloaded",
+    "optimistic_preloaded",
     "hotlist_profile_error",
 )
 
@@ -752,6 +753,18 @@ def _expert_streaming_delta(
     )
     result["hotlist_preload_fill_rate"] = (
         min(1.0, int(result.get("hotlist_preloaded", 0) or 0) / hot_capacity)
+        if hot_capacity
+        else 1.0
+    )
+    result["startup_preload_fill_rate"] = (
+        min(
+            1.0,
+            (
+                int(result.get("hotlist_preloaded", 0) or 0)
+                + int(result.get("optimistic_preloaded", 0) or 0)
+            )
+            / hot_capacity,
+        )
         if hot_capacity
         else 1.0
     )
@@ -2115,7 +2128,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     "ssd_io_ms=%.3f decode_ms=%.3f bind_ms=%.3f "
                     "materialize_ms=%.3f expert_major=%d qmm_calls=%d "
                     "resident_fill=%.4f hotlist_preloaded=%s "
-                    "hotlist_fill=%.4f metal_start_gib=%.3f "
+                    "optimistic_preloaded=%s hotlist_fill=%.4f "
+                    "startup_fill=%.4f metal_start_gib=%.3f "
                     "metal_end_gib=%.3f metal_peak_gib=%.3f",
                     pp_len,
                     streaming_metrics.get("cache_slots_per_layer"),
@@ -2147,8 +2161,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                     int(streaming_metrics.get("qmm_calls", 0) or 0),
                     float(streaming_metrics.get("resident_fill_rate", 1.0) or 0.0),
                     streaming_metrics.get("hotlist_preloaded"),
+                    streaming_metrics.get("optimistic_preloaded"),
                     float(
                         streaming_metrics.get("hotlist_preload_fill_rate", 1.0)
+                        or 0.0
+                    ),
+                    float(
+                        streaming_metrics.get("startup_preload_fill_rate", 1.0)
                         or 0.0
                     ),
                     float(metrics["metal_memory"]["active_start_bytes"]) / 1024**3,

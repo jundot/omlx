@@ -244,6 +244,10 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
         assert runtime.streaming_mode == "cache_only"
         assert runtime.manifest.pinned_count_range == (0, 0)
         assert runtime.pools[0].pinned_count == 0
+        assert runtime.hotlist_preloaded == 0
+        assert runtime.optimistic_preloaded == 2
+        assert sum(runtime.pools[0].resident_mask.tolist()) == 2
+        assert not any(runtime.pools[0]._route_hotness)
     finally:
         runtime.close()
 
@@ -284,6 +288,7 @@ def test_learned_hotlist_warm_starts_evictable_cache(tmp_path):
     try:
         resident = second.pools[0].resident_mask.tolist()
         assert second.hotlist_preloaded == 2
+        assert second.optimistic_preloaded == 0
         assert second.pools[0].pinned_count == 0
         assert resident[4] is True
         assert resident[1] is True
@@ -340,8 +345,17 @@ def test_invalid_hotlist_profile_is_ignored(tmp_path):
     )
     try:
         assert second.hotlist_preloaded == 0
+        assert second.optimistic_preloaded == 2
         assert second.hotlist_profile_error.startswith("load:")
-        assert not any(second.pools[0].resident_mask.tolist())
+        assert second.pools[0].resident_mask.tolist() == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+        ]
+        assert not any(second.pools[0]._route_hotness)
     finally:
         second.close()
 

@@ -24,10 +24,14 @@ model's top-k so one decode route can always execute exactly.
 
 When the scheduler has an SSD cache directory, both modes also maintain a compact
 learned hotlist there. On clean shutdown, oMLX stores per-layer router selection
-counts. A later load pre-fills the fixed hot tier with the most-used experts. These
-entries remain fully evictable and do not change the configured expert count,
-resident memory, or Soft-REAP manifest. Profiles are checkpoint-fingerprinted,
-written atomically, and ignored if stale or malformed.
+counts. A later load prioritizes the most-used experts, then optimistically fills
+every remaining configured slot with unobserved experts. Both learned and
+optimistic entries remain fully evictable; optimistic entries start at zero
+hotness and are therefore the first eviction candidates when real routing data
+arrives. The configured RAM is fully populated without changing the expert count,
+pinning fallback experts, or altering the Soft-REAP manifest. Profiles are
+checkpoint-fingerprinted and written atomically. A missing, stale, or malformed
+profile falls back to a fully populated optimistic cache.
 
 ## Manifest
 
@@ -153,7 +157,9 @@ and execution-bank width, hotlist preload count, hit rate, misses, evictions,
 expert loads, SSD traffic, I/O and decode time, bank update time, expert-major
 calls, QMM calls, resident fill, and hotlist warm-start coverage. Analytical-cache
 runs with incomplete warm-start coverage are marked and should only be compared
-with a run having the same coverage.
+with a run having the same learned coverage. Optimistic preload count and total
+startup-fill coverage are reported separately; total startup fill should equal the
+user-configured capacity even when no learned profile exists.
 
 Further promising work, in priority order:
 

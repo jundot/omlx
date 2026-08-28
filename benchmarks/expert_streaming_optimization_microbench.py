@@ -305,13 +305,20 @@ class _Cache:
 
 
 class _DecodeModel:
-    def __init__(self, pools: list[StreamingSwitchGLU], top_k: int):
+    def __init__(
+        self,
+        pools: list[StreamingSwitchGLU],
+        top_k: int,
+        *,
+        route_groups: int = 4,
+    ):
         self.pools = pools
         self.top_k = top_k
+        self.route_groups = route_groups
 
     def __call__(self, input_ids: mx.array, cache: _Cache | None = None):
         token = int(input_ids.item())
-        start = (token % 4) * self.top_k
+        start = (token % self.route_groups) * self.top_k
         indices = mx.array(
             [[[start + route for route in range(self.top_k)]]], dtype=mx.int32
         )
@@ -332,6 +339,42 @@ class _UngatedSpeculativeExecution(SpeculativeExecution):
     """Former behavior retained only as a microbenchmark baseline."""
 
     def _cache_ready_for_speculation(self) -> bool:
+        return True
+
+
+class _WorkingSetSpeculativeExecution(SpeculativeExecution):
+    """Prototype readiness based on observed resident-route coverage."""
+
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        policy: str,
+        min_observed_tokens: int = 4,
+        minimum_coverage: float = 0.95,
+    ):
+        super().__init__(runtime, policy=policy)
+        self.min_observed_tokens = min_observed_tokens
+        self.minimum_coverage = minimum_coverage
+
+    def _cache_ready_for_speculation(self) -> bool:
+        if self._cache_fill_ready:
+            return True
+        for pool in self.runtime.pools:
+            if pool._route_tokens < self.min_observed_tokens:
+                return False
+            total = int(np.sum(pool._route_hotness, dtype=np.uint64))
+            if total <= 0:
+                return False
+            resident = int(
+                np.sum(
+                    pool._route_hotness[pool._resident_mask_np],
+                    dtype=np.uint64,
+                )
+            )
+            if resident / total < self.minimum_coverage:
+                return False
+        self._cache_fill_ready = True
         return True
 
 
@@ -435,6 +478,194 @@ def _fill_gated_speculation_benchmark(
             reader.close()
 
 
+def _capacity_scaling_benchmark(
+    index: SafetensorExpertIndex,
+    *,
+    experts: int,
+    top_k: int,
+    tokens: int,
+    prefill_tokens: int,
+) -> dict[str, Any]:
+    """Isolate hot-bank width and capacity-independent speculation readiness."""
+    readers = [ExpertReader(index) for _ in range(4)]
+    hot_pool_sets = [
+        [
+            _pool(
+                index,
+                readers[variant],
+                experts=experts,
+                top_k=top_k,
+                cache_slots=capacity,
+            )
+            for _ in range(4)
+        ]
+        for variant, capacity in enumerate((32, 128))
+    ]
+    gate_pool_sets = [
+        [
+            _pool(
+                index,
+                readers[variant + 2],
+                experts=experts,
+                top_k=top_k,
+                cache_slots=128,
+            )
+            for _ in range(4)
+        ]
+        for variant in range(2)
+    ]
+    hot_models = [_DecodeModel(pools, top_k, route_groups=3) for pools in hot_pool_sets]
+    gate_models = [_DecodeModel(pools, top_k) for pools in gate_pool_sets]
+    gate_runtimes = [SimpleNamespace(pools=pools) for pools in gate_pool_sets]
+    gate_executions = [
+        SpeculativeExecution(gate_runtimes[0], policy="speculative"),
+        _WorkingSetSpeculativeExecution(
+            gate_runtimes[1],
+            policy="speculative",
+            min_observed_tokens=4,
+        ),
+    ]
+    for execution, model in zip(gate_executions, gate_models, strict=True):
+        execution.attach(model)
+
+    try:
+        hot_count = top_k * 3
+        for pools in hot_pool_sets:
+            for pool in pools:
+                _preload(pool, hot_count)
+
+        def hot_run(model: _DecodeModel, run_tokens: int = tokens) -> list[mx.array]:
+            cache = _Cache()
+            outputs = []
+            for token in range(run_tokens):
+                result = model(mx.array([[token]], dtype=mx.int32), cache=cache)
+                mx.eval(result.logits)
+                outputs.append(result.logits)
+            assert cache.offset == run_tokens
+            return outputs
+
+        # Compile both fixed bank shapes before measuring identical hot routes.
+        mx.eval(hot_models[0](mx.array([[0]], dtype=mx.int32)).logits)
+        mx.eval(hot_models[1](mx.array([[0]], dtype=mx.int32)).logits)
+        hot_32 = _timed(lambda: hot_run(hot_models[0]))
+        hot_128 = _timed(lambda: hot_run(hot_models[1]))
+        hot_exact = all(
+            bool(mx.all(left == right).item())
+            for left, right in zip(hot_32[0], hot_128[0], strict=True)
+        )
+
+        prefill_indices_np = np.fromfunction(
+            lambda _batch, token, route: (token * top_k + route * 17) % 100,
+            (1, prefill_tokens, top_k),
+            dtype=int,
+        ).astype(np.int32)
+        prefill_indices = mx.array(prefill_indices_np)
+        prefill_scores = mx.full(
+            (1, prefill_tokens, top_k),
+            1.0 / top_k,
+            dtype=mx.float16,
+        )
+        prefill_input = mx.random.normal(
+            (1, prefill_tokens, hot_pool_sets[0][0].gate_proj.input_dims)
+        ).astype(mx.float16)
+
+        def prefill_stack(pool: StreamingSwitchGLU) -> mx.array:
+            value = prefill_input
+            for _ in range(4):
+                value = pool(
+                    value,
+                    prefill_indices,
+                    scores=prefill_scores,
+                    weighted_sum=True,
+                )
+            return value
+
+        mx.eval(prefill_stack(hot_pool_sets[0][0]))
+        mx.eval(prefill_stack(hot_pool_sets[1][0]))
+        prefill_32 = _timed(lambda: prefill_stack(hot_pool_sets[0][0]))
+        prefill_128 = _timed(lambda: prefill_stack(hot_pool_sets[1][0]))
+        prefill_exact = bool(mx.all(prefill_32[0] == prefill_128[0]).item())
+
+        full_gate = _decode_variant(gate_models[0], gate_executions[0], tokens=tokens)
+        working_set_gate = _decode_variant(
+            gate_models[1], gate_executions[1], tokens=tokens
+        )
+        gate_exact = all(
+            bool(mx.all(left == right).item())
+            for left, right in zip(full_gate[0], working_set_gate[0], strict=True)
+        )
+
+        expanding_sparse = _DecodeModel(gate_pool_sets[0], top_k, route_groups=12)
+        expanding_full = _DecodeModel(hot_pool_sets[1], top_k, route_groups=12)
+        expansion_tokens = 12
+        sparse_bytes_before = readers[2].file_cache_bytes_read
+        sparse_loads_before = sum(pool.stats.loads for pool in gate_pool_sets[0])
+        sparse_expansion = _timed(lambda: hot_run(expanding_sparse, expansion_tokens))
+        sparse_bytes = readers[2].file_cache_bytes_read - sparse_bytes_before
+        sparse_loads = (
+            sum(pool.stats.loads for pool in gate_pool_sets[0]) - sparse_loads_before
+        )
+        full_bytes_before = readers[1].file_cache_bytes_read
+        full_loads_before = sum(pool.stats.loads for pool in hot_pool_sets[1])
+        full_expansion = _timed(lambda: hot_run(expanding_full, expansion_tokens))
+        full_bytes = readers[1].file_cache_bytes_read - full_bytes_before
+        full_loads = (
+            sum(pool.stats.loads for pool in hot_pool_sets[1]) - full_loads_before
+        )
+        expansion_exact = all(
+            bool(mx.all(left == right).item())
+            for left, right in zip(sparse_expansion[0], full_expansion[0], strict=True)
+        )
+
+        return {
+            "exact": {
+                "hot_capacity_32_vs_128": hot_exact,
+                "prefill_capacity_32_vs_128": prefill_exact,
+                "full_vs_working_set_gate": gate_exact,
+                "sparse_vs_optimistic_fill": expansion_exact,
+            },
+            "tokens": tokens,
+            "hot_decode": {
+                "capacity_32_tokens_per_second": tokens / hot_32[1],
+                "capacity_128_tokens_per_second": tokens / hot_128[1],
+                "capacity_128_relative_throughput": hot_32[1] / hot_128[1],
+                "capacity_32_peak_delta_mib": (hot_32[3] - hot_32[2]) / 1024**2,
+                "capacity_128_peak_delta_mib": (hot_128[3] - hot_128[2]) / 1024**2,
+            },
+            "prefill": {
+                "tokens": prefill_tokens,
+                "capacity_32_tokens_per_second": prefill_tokens / prefill_32[1],
+                "capacity_128_tokens_per_second": prefill_tokens / prefill_128[1],
+                "capacity_128_relative_throughput": prefill_32[1] / prefill_128[1],
+                "capacity_32_peak_delta_mib": (prefill_32[3] - prefill_32[2]) / 1024**2,
+                "capacity_128_peak_delta_mib": (prefill_128[3] - prefill_128[2])
+                / 1024**2,
+            },
+            "speculation_readiness_at_128": {
+                "full_gate_tokens_per_second": tokens / full_gate[1],
+                "working_set_gate_tokens_per_second": tokens / working_set_gate[1],
+                "working_set_speedup": full_gate[1] / working_set_gate[1],
+                "full_gate_execution": full_gate[4],
+                "working_set_execution": working_set_gate[4],
+            },
+            "optimistic_fill_at_128": {
+                "tokens": expansion_tokens,
+                "sparse_tokens_per_second": expansion_tokens / sparse_expansion[1],
+                "full_tokens_per_second": expansion_tokens / full_expansion[1],
+                "speedup": sparse_expansion[1] / full_expansion[1],
+                "sparse_cold_loads": sparse_loads,
+                "full_cold_loads": full_loads,
+                "sparse_ssd_bytes": sparse_bytes,
+                "full_ssd_bytes": full_bytes,
+            },
+        }
+    finally:
+        for execution in gate_executions:
+            execution.close()
+        for reader in readers:
+            reader.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--experts", type=int, default=160)
@@ -445,6 +676,8 @@ def main() -> None:
     parser.add_argument("--prefill-layers", type=int, default=12)
     parser.add_argument("--prefill-repeats", type=int, default=2)
     parser.add_argument("--decode-tokens", type=int, default=12)
+    parser.add_argument("--capacity-decode-tokens", type=int, default=128)
+    parser.add_argument("--capacity-prefill-tokens", type=int, default=128)
     args = parser.parse_args()
     if args.experts < 160:
         parser.error("--experts must be at least 160")
@@ -490,6 +723,13 @@ def main() -> None:
                 experts=args.experts,
                 top_k=args.top_k,
                 tokens=args.decode_tokens,
+            ),
+            "capacity_scaling": _capacity_scaling_benchmark(
+                index,
+                experts=args.experts,
+                top_k=args.top_k,
+                tokens=args.capacity_decode_tokens,
+                prefill_tokens=args.capacity_prefill_tokens,
             ),
         }
         report["wall_seconds"] = time.perf_counter() - started
