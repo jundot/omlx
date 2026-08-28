@@ -37,25 +37,14 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
 
 
 def linear_forward(linear: nn.Module, x: mx.array) -> mx.array:
-    """Use oMLX's affine prefill tile when it is supported and profitable."""
-    if isinstance(linear, nn.QuantizedLinear):
-        if (
-            "bias" in linear
-            and getattr(linear, "mode", None) == "affine"
-            and getattr(linear, "biases", None) is not None
-        ):
-            out = fused_quantized_matmul(
-                x,
-                linear.weight,
-                linear.scales,
-                linear.biases,
-                bits=int(linear.bits),
-                group_size=int(linear.group_size),
-            )
-            return out + linear.bias
-        out = _native_qmm(linear, x)
-        if out is not None:
-            return out
+    """Route GLM-5.3 projections through standard mlx quantized matmul.
+
+    The oMLX native qwen35 affine-qmm tile (``qwen35_q{bits}_affine_qmm_t``)
+    returns incorrect results for glm5_next 8-bit affine projections once the
+    token count reaches its 1024-token threshold, corrupting long-context
+    attention and breaking head/middle retrieval (jundot/omlx#3248). Standard
+    mlx quantized matmul is correct at every length, so use it unconditionally.
+    """
     return linear(x)
 
 
