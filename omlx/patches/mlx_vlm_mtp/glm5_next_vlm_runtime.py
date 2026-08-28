@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
+# A depth-k chain verifies k+1 rows and PoolingCache only stashes an undo
+# log for updates of 8 rows or fewer.
+_MAX_CHAIN_DEPTH = 7
+
 # Source-side prefixes for the nextn MTP layer. glm5_next checkpoints use the
 # VLM-nested form; the other two are accepted so a text-only re-export or a
 # hand-rebased checkpoint still binds.
@@ -286,18 +290,22 @@ def _patch_linear_attention(g5_lang: Any) -> None:
         A_log = fg.A_log.reshape(self.num_heads, 1)
         dt_bias = fg.dt_bias.reshape(self.num_heads, self.head_dim)
         lower_bound = fg.safe_gate_lower_bound
+        # Resolved once and stashed: the rollback replay has to run the kernel
+        # with the same mask this forward used, or the state it rebuilds is not
+        # the state an n-token forward would have produced.
+        gate_mask = mask if mask is not None and mask.dtype == mx.bool_ else None
         if gdn_sink is not None:
             # Entry state + block inputs; rollback replays the accepted prefix.
             gdn_sink.append(
                 (
                     q, k, v, a, b_o, A_log, dt_bias, state,
-                    conv_input, self.conv_kernel_size, lower_bound,
+                    conv_input, self.conv_kernel_size, lower_bound, gate_mask,
                 )
             )
         out, state = gated_delta_update(
             q, k, v, a, b_o, A_log, dt_bias,
             state=state,
-            mask=mask if mask is not None and mask.dtype == mx.bool_ else None,
+            mask=gate_mask,
             lower_bound=lower_bound,
         )
         if cache is not None:
@@ -439,7 +447,18 @@ def _patch_language_model(g5_lang: Any) -> None:
             self.mtp = [g5_lang.Glm5NextMTPBlock(args) for _ in range(n_mtp)]
         if self._omlx_mtp_decode_enabled:
             self._omlx_mtp_chain = True
-            self._omlx_mtp_depth = get_mtp_depth()
+            # PoolingCache stashes its undo log only for updates of 8 rows or
+            # fewer, and a depth-k chain verifies k+1 rows, so at the admin
+            # setting's maximum of 8 the indexer pool holds no log at all and
+            # a full rejection cannot be undone. Cap the chain one below it.
+            requested_depth = get_mtp_depth()
+            self._omlx_mtp_depth = min(_MAX_CHAIN_DEPTH, requested_depth)
+            if requested_depth > _MAX_CHAIN_DEPTH:
+                logger.info(
+                    "glm5_next MTP chain depth capped at %d (requested %d): the "
+                    "indexer PoolingCache cannot undo a %d-row verify block",
+                    _MAX_CHAIN_DEPTH, requested_depth, requested_depth + 1,
+                )
             self._omlx_mtp_head_clone = False
             # Same 8-of-N routing economics as GLM-5.2: each extra verify row
             # pulls a nearly disjoint expert set, so the adaptive depth
@@ -503,20 +522,13 @@ def _patch_language_model(g5_lang: Any) -> None:
 
         KDA layers hold recurrent state with no trim semantics, so the
         accepted prefix is replayed through the same fused kernel from the
-        stashed entry state. Sparse layers just trim: oMLX's own PoolingCache
+        stashed entry state, and their position is rewound through the
+        inverse advance. Sparse layers just trim: oMLX's own PoolingCache
         carries a cross-boundary undo log, so unlike the upstream PR there is
-        no need to hand-roll the indexer pool rewind here.
+        no need to hand-roll the indexer pool rewind here. Every sparse layer
+        is checked before any layer is touched.
         """
         gated_delta_update = g5_lang.gated_delta_update
-
-        def _is_recurrent(cache) -> bool:
-            # Match the family, not one class. glm5_next's linear layers use
-            # ArraysCache or SizedArraysCache depending on the batch path, and
-            # a SizedArraysCache falling through to the trim branch leaves its
-            # recurrent state holding rejected tokens: the KV caches rewind,
-            # the KDA state does not, and the drift compounds every round.
-            # scheduler.py groups the same two names for this reason.
-            return type(cache).__name__ in ("ArraysCache", "SizedArraysCache")
 
         if isinstance(accepted, int):
             acc = [int(accepted)]
@@ -527,6 +539,24 @@ def _patch_language_model(g5_lang: Any) -> None:
         max_a = max(acc) if acc else 0
         n = max_a + 1
         trim = int(block_size) - n
+
+        # Check every sparse layer before mutating anything. A trim that
+        # fails on one layer after earlier layers already trimmed leaves the
+        # cache at mixed lengths; declining the whole rollback raises here,
+        # and the generator falls back to a standard step with every cache
+        # still intact. Same contract as mtp_partial_rollback on the mlx-lm
+        # path, which also refuses before it touches anything.
+        if trim > 0:
+            blocked = [
+                type(c).__name__
+                for c in caches
+                if c is not None and not _is_recurrent(c) and not _can_trim(c, trim)
+            ]
+            if blocked:
+                raise RuntimeError(
+                    f"glm5_next rollback: {len(blocked)} sparse cache(s) cannot "
+                    f"undo {trim} rejected rows (first: {blocked[0]})"
+                )
 
         gdn_idx = 0
         for c in caches:
@@ -539,30 +569,59 @@ def _patch_language_model(g5_lang: Any) -> None:
                         gdn_idx,
                     )
                     return 0
+                entry = gdn_states[gdn_idx]
+                # The gate mask joined the capture tuple later; older callers
+                # can still hand over the 11-element form.
                 (q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state,
-                 conv_input, K, lb) = gdn_states[gdn_idx]
+                 conv_input, K, lb) = entry[:11]
+                gate_mask = entry[11] if len(entry) > 11 else None
                 gdn_idx += 1
                 _, state_n = gated_delta_update(
                     q_[:, :n], k_[:, :n], v_[:, :n], a_[:, :n], b_[:, :n],
                     A_log_, dt_bias_, state=init_state, lower_bound=lb,
+                    mask=gate_mask[:, :n] if gate_mask is not None else None,
                 )
                 c[1] = state_n
                 c[0] = conv_input[:, n : n + K - 1]
-                # The verify forward advanced this cache by the whole block.
-                # Restoring the state does not undo that, and unlike the
-                # sparse caches there is no trim() here to do it, so rewind
-                # explicitly or the recurrent layers drift ahead of the KV
-                # layers by `trim` on every partial accept.
-                if trim > 0 and getattr(c, "offset", 0) >= trim:
-                    c.offset -= trim
+                # The verify forward ran cache.advance(S) over the whole
+                # block. Restoring the state does not undo that, and unlike
+                # the sparse caches there is no trim() here to do it. These
+                # caches carry no offset: their position is lengths and
+                # left_padding, which advance(N) decrements, so the inverse
+                # advance is the rewind. Without it the recurrent layers sit
+                # `trim` ahead of the KV layers on every partial accept.
+                if trim > 0 and (
+                    getattr(c, "lengths", None) is not None
+                    or getattr(c, "left_padding", None) is not None
+                ):
+                    c.advance(-trim)
             elif trim > 0:
-                if not c.is_trimmable():
+                trimmed = c.trim(trim)
+                if trimmed != trim:
                     logger.warning(
-                        "glm5_next rollback: %s not trimmable", type(c).__name__
+                        "glm5_next rollback: %s trimmed %s of %s rows",
+                        type(c).__name__, trimmed, trim,
                     )
-                    continue
-                c.trim(trim)
         return max_a
+
+    def mtp_clamp_accept(self, cache, accepted: int, num_drafts: int) -> int:
+        """Largest ``m <= accepted`` whose rollback every sparse layer supports.
+
+        Emitting fewer verified drafts than the acceptance test allowed is
+        always correct: the dropped ones are re-derived next cycle. Lowering
+        the accept count grows the rejected tail, which is what the pooling
+        cache needs, since it can only rebuild a confirmed prefix short
+        enough to stay inside its buffer. Called by the generator before
+        rollback_speculative_cache, so the refusal there stays unreachable
+        in normal operation.
+        """
+        for m in range(int(accepted), -1, -1):
+            n = int(num_drafts) - m
+            if n <= 0 or all(
+                c is None or _is_recurrent(c) or _can_trim(c, n) for c in cache
+            ):
+                return m
+        return 0
 
     def make_mtp_cache(self):
         """One ``[KVCache, PoolingCache]`` pair per MTP block.
@@ -705,9 +764,46 @@ def _patch_language_model(g5_lang: Any) -> None:
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_clamp_accept = mtp_clamp_accept
     cls.rollback_speculative_cache = rollback_speculative_cache
     cls.sanitize = sanitize
     cls._omlx_mtp_runtime_patched = True
+
+
+def _is_recurrent(cache: Any) -> bool:
+    """True for a KDA layer's recurrent cache.
+
+    Match the family, not one class. glm5_next's linear layers hold an
+    ArraysCache or a SizedArraysCache depending on the batch path, and a
+    SizedArraysCache falling through to the trim branch leaves its recurrent
+    state holding rejected tokens: the KV caches rewind, the recurrent state
+    does not, and the drift compounds every round. scheduler.py groups the
+    same two names for this reason.
+    """
+    return type(cache).__name__ in ("ArraysCache", "SizedArraysCache")
+
+
+def _can_trim(c: Any, n: int) -> bool:
+    """Non-mutating check that ``c.trim(n)`` will succeed.
+
+    Sparse layers hold ``CacheList(KVCache, PoolingCache)``. The KV half
+    always trims; the pooling half can only undo what its one-update log
+    holds, and its ``remainder`` is an int on the single-sequence cache and
+    a per-sequence list on the batched one. Mirrors the same check in
+    ``mlx_lm_mtp/deepseek_v4_model.py``.
+    """
+    subs = getattr(c, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        return all(_can_trim(sub, n) for sub in subs)
+    remainder = getattr(c, "remainder", None)
+    if remainder is not None:
+        rem_min = remainder if isinstance(remainder, int) else min(remainder)
+        if n <= rem_min:
+            return True
+        can_undo = getattr(c, "_can_undo", None)
+        return bool(can_undo and can_undo(n))
+    is_trimmable = getattr(c, "is_trimmable", None)
+    return bool(callable(is_trimmable) and is_trimmable())
 
 
 def _is_mtp_named(key: str) -> bool:
@@ -784,4 +880,14 @@ def _patch_vlm_model_adapter() -> None:
             )
 
         VLMModelAdapter.rollback_speculative_cache = rollback_speculative_cache
+
+    if not hasattr(VLMModelAdapter, "mtp_clamp_accept"):
+
+        def mtp_clamp_accept(self, cache, accepted, num_drafts):
+            fn = getattr(self._language_model, "mtp_clamp_accept", None)
+            if not callable(fn):
+                return accepted
+            return fn(cache, accepted, num_drafts)
+
+        VLMModelAdapter.mtp_clamp_accept = mtp_clamp_accept
     VLMModelAdapter._omlx_glm5_mtp_adapter_patched = True

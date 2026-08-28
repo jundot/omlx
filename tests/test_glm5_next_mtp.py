@@ -278,20 +278,168 @@ def test_rollback_matches_the_recurrent_cache_family(applied, config, monkeypatc
 
     _Recurrent.__name__ = "SizedArraysCache"
 
-    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None):
+    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None,
+                 mask=None):
         seen.append("replayed")
         return None, mx.zeros((1, 1, 1, 1))
 
     monkeypatch.setattr(applied, "gated_delta_update", fake_gdu, raising=False)
 
     c = _Recurrent(size=2)
-    c.offset = 4
-    K = 4
-    gdn = [(mx.zeros((1, 4, 1, 1)),) * 5 + (mx.zeros((1, 1)), mx.zeros((1, 1)),
-           None, mx.zeros((1, 4 + K - 1, 2)), K, 0.0)]
 
     host = _Host(config)
-    applied.LanguageModel.rollback_speculative_cache(host, [c], gdn, 0, 4)
+    applied.LanguageModel.rollback_speculative_cache(host, [c], _gdn_capture(), 0, 4)
 
     assert seen == ["replayed"], "SizedArraysCache must take the recurrent path"
-    assert c.offset == 1, f"offset must rewind by the rejected count, got {c.offset}"
+
+
+def test_rollback_replays_with_the_gate_mask(applied, config, monkeypatch):
+    """The replay must run the kernel under the mask the verify forward used.
+
+    Without it the rebuilt recurrent state is not the state an n-token
+    forward would have produced on a right-padded batch.
+    """
+    import mlx_lm.models.cache as cache_mod
+
+    seen_masks = []
+
+    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None,
+                 mask=None):
+        seen_masks.append(mask)
+        return None, mx.zeros((1, 1, 1, 1))
+
+    monkeypatch.setattr(applied, "gated_delta_update", fake_gdu, raising=False)
+
+    c = cache_mod.ArraysCache(size=2)
+    gate_mask = mx.ones((1, 4), dtype=mx.bool_)
+
+    host = _Host(config)
+    applied.LanguageModel.rollback_speculative_cache(
+        host, [c], _gdn_capture(gate_mask), 1, 4
+    )
+
+    assert len(seen_masks) == 1
+    assert seen_masks[0] is not None, "the gate mask must reach the replay"
+    assert seen_masks[0].shape == (1, 2), (
+        f"mask must be sliced to the accepted prefix, got {seen_masks[0].shape}"
+    )
+
+
+def test_rollback_rewinds_the_recurrent_position(applied, config, monkeypatch):
+    """These caches carry no offset: their position is lengths/left_padding,
+    which the verify forward decremented with cache.advance(S). The rewind is
+    the inverse advance, or the recurrent layers sit ahead of the KV layers by
+    the rejected count on every partial accept.
+    """
+    import mlx_lm.models.cache as cache_mod
+
+    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None,
+                 mask=None):
+        return None, mx.zeros((1, 1, 1, 1))
+
+    monkeypatch.setattr(applied, "gated_delta_update", fake_gdu, raising=False)
+
+    c = cache_mod.ArraysCache(size=2)
+    assert getattr(c, "offset", None) is None, (
+        "a production recurrent cache has no offset attribute"
+    )
+    c.lengths = mx.array([0])  # advance(4) over the verify block
+
+    host = _Host(config)
+    applied.LanguageModel.rollback_speculative_cache(host, [c], _gdn_capture(), 0, 4)
+
+    assert int(c.lengths[0]) == 3, (
+        f"position must rewind by the rejected count, got lengths={c.lengths}"
+    )
+
+
+def test_rollback_refuses_before_trimming_when_a_layer_cannot_undo(
+    applied, config, monkeypatch
+):
+    """A trim that fails after earlier layers trimmed leaves the layers at
+    mixed lengths, so the whole rollback is declined before anything moves.
+    """
+    def fake_gdu(q, k, v, a, b, A_log, dt_bias, state=None, lower_bound=None,
+                 mask=None):
+        return None, mx.zeros((1, 1, 1, 1))
+
+    monkeypatch.setattr(applied, "gated_delta_update", fake_gdu, raising=False)
+
+    ok, blocked = _FakeSparse(can_undo=True), _FakeSparse(can_undo=False)
+
+    host = _Host(config)
+    with pytest.raises(RuntimeError):
+        applied.LanguageModel.rollback_speculative_cache(
+            host, [ok, blocked], _gdn_capture(), 0, 4
+        )
+
+    assert ok.trimmed == [], "no layer may be trimmed once one of them refuses"
+
+
+def test_clamp_accept_lowers_the_accept_until_the_undo_fits(applied, config):
+    """PoolingCache can only rebuild a confirmed prefix that stays inside its
+    buffer, so accepting fewer drafts (a longer rejected tail) is what makes
+    the rollback possible. The generator calls this before the rollback.
+    """
+    host = _Host(config)
+    clamp = applied.LanguageModel.mtp_clamp_accept
+
+    # Undo works from 2 rejected rows up, so accepted=2 of 3 drafts (1 row)
+    # has to come down to 1 (2 rows).
+    cache = [_FakeSparse(can_undo=lambda n: n >= 2)]
+    assert clamp(host, cache, 2, 3) == 1
+
+    # Nothing to undo at a full accept.
+    assert clamp(host, cache, 3, 3) == 3
+
+
+def test_clamp_accept_ignores_recurrent_caches(applied, config):
+    """Recurrent layers are replayed, not trimmed, so they never constrain it."""
+    import mlx_lm.models.cache as cache_mod
+
+    host = _Host(config)
+    cache = [cache_mod.ArraysCache(size=2)]
+    assert applied.LanguageModel.mtp_clamp_accept(host, cache, 2, 3) == 2
+
+
+def test_chain_depth_stays_inside_the_pooling_undo_window(applied, config):
+    """PoolingCache stashes its undo log only for updates of 8 rows or fewer,
+    and a depth-k chain verifies k+1 rows.
+    """
+    from omlx.patches import mlx_lm_mtp
+
+    prev_depth, prev_active = mlx_lm_mtp.get_mtp_depth(), mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_depth(8)
+        mlx_lm_mtp.set_mtp_active(True)
+        model = applied.LanguageModel(config)
+    finally:
+        mlx_lm_mtp.set_mtp_depth(prev_depth)
+        mlx_lm_mtp.set_mtp_active(prev_active)
+
+    assert model._omlx_mtp_depth == 7
+
+
+def _gdn_capture(gate_mask=None, block=4, K=4):
+    """One layer's capture tuple, shaped as the verify forward records it."""
+    return [(mx.zeros((1, block, 1, 1)),) * 5 + (
+        mx.zeros((1, 1)), mx.zeros((1, 1)), None,
+        mx.zeros((1, block + K - 1, 2)), K, 0.0, gate_mask,
+    )]
+
+
+class _FakeSparse:
+    """Sparse-layer stand-in with PoolingCache's undo surface."""
+
+    def __init__(self, can_undo=True):
+        self._can_undo_fn = can_undo if callable(can_undo) else (lambda n: can_undo)
+        self.remainder = 0
+        self.trimmed = []
+
+    def _can_undo(self, n):
+        return self._can_undo_fn(n)
+
+    def trim(self, n):
+        self.trimmed.append(n)
+        return n
+
