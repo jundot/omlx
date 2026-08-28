@@ -443,3 +443,60 @@ class _FakeSparse:
         self.trimmed.append(n)
         return n
 
+
+_RUNTIME_MODULES = (
+    "qwen35_vlm_runtime",
+    "qwen35_moe_vlm_runtime",
+    "gemma4_vlm_runtime",
+    "inkling_vlm_runtime",
+    "glm5_next_vlm_runtime",
+)
+
+
+def _record_runtime_applies(monkeypatch):
+    import importlib
+
+    applied = []
+    for name in _RUNTIME_MODULES:
+        module = importlib.import_module(f"omlx.patches.mlx_vlm_mtp.{name}")
+        monkeypatch.setattr(
+            module, "apply", lambda n=name: (applied.append(n), True)[1]
+        )
+    return applied
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("glm5_next", ["glm5_next_vlm_runtime"]),
+        ("qwen3_5", ["qwen35_vlm_runtime"]),
+        ("qwen3_5_moe", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
+        # qwen4_exp runs its own MTP and subclasses the qwen3_5 classes these
+        # patches rebind, so the sweep must not reach it.
+        ("qwen4_exp", []),
+    ],
+)
+def test_runtime_sweep_applies_only_the_loaded_architecture(
+    monkeypatch, model_type, expected
+):
+    """Loading one MTP-capable model used to rewrite every other resident
+    model's trunk, because these patches rebind methods on shared parent
+    classes. A qwen4_exp model resident when a glm5_next model loaded then
+    failed on its next request until the server restarted.
+    """
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    applied = _record_runtime_applies(monkeypatch)
+    apply_mlx_vlm_mtp_runtime_patch(model_type)
+
+    assert applied == expected
+
+
+def test_runtime_sweep_applies_everything_for_an_unknown_model_type(monkeypatch):
+    """The historical behaviour is kept for architectures not in the table."""
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_runtime_patch
+
+    applied = _record_runtime_applies(monkeypatch)
+    apply_mlx_vlm_mtp_runtime_patch(None)
+
+    assert sorted(applied) == sorted(_RUNTIME_MODULES)

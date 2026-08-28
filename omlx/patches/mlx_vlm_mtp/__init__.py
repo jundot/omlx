@@ -77,7 +77,25 @@ def apply_mlx_vlm_mtp_patch() -> bool:
     return True
 
 
-def apply_mlx_vlm_mtp_runtime_patch() -> bool:
+# Which runtime sub-patch belongs to which ``model_type``. These patches
+# rebind methods on shared parent classes and other architectures subclass
+# them, so applying all of them reaches models this load has nothing to do
+# with. An empty tuple means the architecture manages its own MTP and must
+# never receive the sweep. A model_type that is not listed keeps the
+# historical apply-everything behaviour.
+_RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "qwen3_5": ("qwen35_vlm_runtime",),
+    "qwen3_5_moe": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
+    "gemma4": ("gemma4_vlm_runtime",),
+    "gemma4_unified": ("gemma4_vlm_runtime",),
+    "inkling": ("inkling_vlm_runtime",),
+    "inkling_mm_model": ("inkling_vlm_runtime",),
+    "glm5_next": ("glm5_next_vlm_runtime",),
+    "qwen4_exp": (),
+}
+
+
+def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
     """Apply the mlx-vlm runtime MTP patches (attach MTPModule, mtp_forward).
 
     Distinct from ``apply_mlx_vlm_mtp_patch``: that one only patches
@@ -94,7 +112,28 @@ def apply_mlx_vlm_mtp_runtime_patch() -> bool:
 
     Should be called *before* ``mlx_vlm.utils.load(...)`` so the
     instantiated LanguageModel picks up the patched ``__init__``.
+
+    ``model_type`` scopes the sweep to the architecture being loaded.
+    qwen4_exp's LanguageModel, gated delta net and attention all subclass
+    qwen3_5's, so applying the qwen3_5 runtime while a qwen4_exp model is
+    resident rewrites that live model's trunk ``__call__`` and its next
+    request fails with "Qwen4 Lightning MTP expects hidden shape
+    [batch, tokens, hc_count * hidden_size]" until the server restarts.
     """
+    import importlib
+
+    if model_type in _RUNTIME_PATCHES_BY_TYPE:
+        applied = False
+        for name in _RUNTIME_PATCHES_BY_TYPE[model_type]:
+            if importlib.import_module(f".{name}", __name__).apply():
+                applied = True
+            else:
+                logger.debug("%s MTP runtime patch did not apply", name)
+        logger.debug(
+            "mlx-vlm MTP runtime patch scoped to model_type=%s", model_type
+        )
+        return applied
+
     from . import (
         gemma4_vlm_runtime,
         glm5_next_vlm_runtime,

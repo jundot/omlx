@@ -327,7 +327,9 @@ class TestVlmMtpPreLoadDispatch:
         mocks."""
         calls: list[str] = []
         sanitize_mock = MagicMock(side_effect=lambda: calls.append("sanitize") or True)
-        runtime_mock = MagicMock(side_effect=lambda: calls.append("runtime") or True)
+        runtime_mock = MagicMock(
+            side_effect=lambda *_a: calls.append("runtime") or True
+        )
         attach_mock = MagicMock(
             side_effect=lambda enabled: calls.append(f"attach={enabled}")
         )
@@ -375,6 +377,25 @@ class TestVlmMtpPreLoadDispatch:
         # Ordering matters: the dense runtime patch assumes sanitize was
         # already installed by apply_mlx_vlm_mtp_patch.
         assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_runtime_patch_is_scoped_to_the_loaded_model_type(
+        self, tmp_path, monkeypatch
+    ):
+        # The runtime patches rebind methods on shared parent classes, so a
+        # sweep over every architecture rewrites models this load has nothing
+        # to do with. The dispatcher passes the model_type it resolved.
+        _, _, runtime_mock, _ = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "glm5_next", "vision_config": {}, '
+            '"text_config": {"num_nextn_predict_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        runtime_mock.assert_called_once_with("glm5_next")
 
     def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
         # Issue #1404: persisted ``mtp.*`` weights must still get a binding
