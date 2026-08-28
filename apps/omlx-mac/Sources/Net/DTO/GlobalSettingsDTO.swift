@@ -50,6 +50,11 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
     let mcp: MCPSettings?
+    let quantization: QuantizationSettings?
+
+    struct QuantizationSettings: Codable, Equatable, Sendable {
+        let defaultOqDtype: String?
+    }
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String

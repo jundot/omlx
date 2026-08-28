@@ -99,6 +99,9 @@
     "ui": {
         "language": "en"
     },
+    "quantization": {
+        "default_oq_dtype": "float16"
+    },
     "idle_timeout": {
         "idle_timeout_seconds": null
     }

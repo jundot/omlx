@@ -1481,15 +1481,15 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.dtype_help') }}</p>
                                             </div>
                                             <div class="flex gap-1.5 shrink-0">
-                                                <button type="button" @click="oqDtype='bfloat16'"
-                                                        :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
-                                                        class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
-                                                    bfloat16
-                                                </button>
                                                 <button type="button" @click="oqDtype='float16'"
                                                         :class="oqDtype==='float16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
+                                                </button>
+                                                <button type="button" @click="oqDtype='bfloat16'"
+                                                        :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                        class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
+                                                    bfloat16
                                                 </button>
                                             </div>
                                         </div>

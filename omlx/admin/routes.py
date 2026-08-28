@@ -1467,7 +1467,19 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
     Returns:
         HTML dashboard page with server status and model list.
     """
-    return templates.TemplateResponse(request, "dashboard.html", {})
+    default_oq_dtype = "float16"
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        default_oq_dtype = global_settings.quantization.default_oq_dtype
+    else:
+        from ..utils.hardware import default_oq_dtype as hardware_default_oq_dtype
+
+        default_oq_dtype = hardware_default_oq_dtype()
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"default_oq_dtype": default_oq_dtype},
+    )
 
 
 @router.get("/chat", response_class=HTMLResponse)

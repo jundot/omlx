@@ -9,7 +9,7 @@ final class QuantizationScreenVM {
     var oqLevel: Double = 4
     var textOnly: Bool = false
     var preserveMtp: Bool = false
-    var dtype: String = "bfloat16"
+    var dtype: String = "float16"
     var enhanced: Bool = false
     var imatrixReuseCache: Bool = true
     var imatrixCachePath: String = ""
@@ -113,6 +113,7 @@ final class QuantizationScreenVM {
         if let stored = Keychain.read(), !stored.isEmpty {
             self.uploadToken = stored
         }
+        await loadDefaultOqDtype()
         await loadModels()
         await loadUploadCandidates()
         await loadTasks()
@@ -127,6 +128,19 @@ final class QuantizationScreenVM {
     }
 
     // MARK: Loaders
+
+    private func loadDefaultOqDtype() async {
+        guard let client else { return }
+        do {
+            let settings = try await client.getGlobalSettings()
+            guard let dtype = settings.quantization?.defaultOqDtype else { return }
+            if dtype == "float16" || dtype == "bfloat16" {
+                self.dtype = dtype
+            }
+        } catch {
+            // Keep the float16 fallback when settings aren't reachable yet.
+        }
+    }
 
     private func loadModels() async {
         guard let client else { return }
