@@ -4294,6 +4294,165 @@ def _compile_bare_grammar(compiler, fmt: dict):
     return None
 
 
+def _xgrammar_supports_maxlength_completion_observer() -> bool:
+    """Return whether the installed xgrammar needs the narrow maxLength observer.
+
+    Use this exact allowlist for the known under-completing xgrammar releases.
+    Do not enable the observer for prereleases or later versions, including
+    versions whose primary grammar may reject a token differently.
+
+    Returns:
+        True only for xgrammar 0.2.3 through 0.2.5.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("xgrammar") in {"0.2.3", "0.2.4", "0.2.5"}
+    except PackageNotFoundError:
+        return False
+
+
+def _is_self_delimiting_maxlength_root_object(schema) -> bool:
+    """Return whether a schema is within the observer's safe root-object scope.
+
+    Use this strict predicate before compiling a completion observer. Do not
+    broaden it to scalar roots, open objects, or arbitrary schema composition:
+    the workaround relies on a closed root object ending at its final ``}``.
+
+    Args:
+        schema: The normalized JSON Schema candidate.
+
+    Returns:
+        True for a closed, explicit root object only.
+    """
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and schema.get("additionalProperties") is False
+    )
+
+
+def _copy_schema_without_maxlength(schema):
+    """Copy schema-bearing positions while removing only ``maxLength`` keywords.
+
+    Use this only for a private completion observer paired with unchanged
+    primary enforcement. Do not recurse through arbitrary JSON values, custom
+    keywords, property names, or schema examples, because those can legitimately
+    contain a key named ``maxLength`` as data.
+
+    Args:
+        schema: A JSON Schema object, boolean schema, or non-schema value.
+
+    Returns:
+        A tuple containing the copied value and whether a schema-keyword
+        ``maxLength`` was removed.
+    """
+    if isinstance(schema, bool) or not isinstance(schema, dict):
+        return schema, False
+
+    copied = dict(schema)
+    changed = "maxLength" in copied
+    if changed:
+        del copied["maxLength"]
+
+    single_schema_keys = (
+        "not",
+        "if",
+        "then",
+        "else",
+        "additionalItems",
+        "contains",
+        "propertyNames",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
+    )
+    for key in single_schema_keys:
+        if key not in schema:
+            continue
+        child, child_changed = _copy_schema_without_maxlength(schema[key])
+        if child_changed:
+            copied[key] = child
+            changed = True
+
+    if "items" in schema:
+        items = schema["items"]
+        if isinstance(items, list):
+            copied_items = []
+            items_changed = False
+            for item in items:
+                copied_item, item_changed = _copy_schema_without_maxlength(item)
+                copied_items.append(copied_item)
+                items_changed = items_changed or item_changed
+            if items_changed:
+                copied["items"] = copied_items
+                changed = True
+        else:
+            child, child_changed = _copy_schema_without_maxlength(items)
+            if child_changed:
+                copied["items"] = child
+                changed = True
+
+    for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = schema.get(key)
+        if not isinstance(children, list):
+            continue
+        copied_children = []
+        children_changed = False
+        for child in children:
+            copied_child, child_changed = _copy_schema_without_maxlength(child)
+            copied_children.append(copied_child)
+            children_changed = children_changed or child_changed
+        if children_changed:
+            copied[key] = copied_children
+            changed = True
+
+    for key in (
+        "$defs",
+        "definitions",
+        "properties",
+        "patternProperties",
+        "dependentSchemas",
+        "dependencies",
+    ):
+        children = schema.get(key)
+        if not isinstance(children, dict):
+            continue
+        copied_children = dict(children)
+        children_changed = False
+        for name, child in children.items():
+            copied_child, child_changed = _copy_schema_without_maxlength(child)
+            if child_changed:
+                copied_children[name] = copied_child
+                children_changed = True
+        if children_changed:
+            copied[key] = copied_children
+            changed = True
+
+    return copied, changed
+
+
+def _make_json_schema_validator(schema):
+    """Build an exact original-schema validator for a completion observer.
+
+    Use this before attaching the observer so an early logical stop cannot be
+    returned without host validation. Do not substitute the maxLength-free
+    observer schema for the original enforcement schema.
+
+    Args:
+        schema: The original normalized JSON Schema.
+
+    Returns:
+        A jsonschema validator constructed from the exact original schema.
+    """
+    from jsonschema.validators import validator_for
+
+    validator_type = validator_for(schema)
+    validator_type.check_schema(schema)
+    return validator_type(schema)
+
+
 def _response_format_requests_strict(response_format) -> bool:
     """True when an OpenAI ``response_format`` demands strict json_schema output.
 
@@ -4352,12 +4511,12 @@ def _compile_grammar_for_request(
     so that protocol tokens (thinking tags, channel markers) are handled
     automatically.  When not set, the grammar is compiled bare.
 
-    Returns a compiled grammar object or ``None``.  ``structured_outputs``
-    raises :class:`HTTPException` when grammar is unavailable or fails to
-    compile.  A ``response_format`` degrades to ``None`` so the caller can fall
-    back to prompt injection; the downgrade is logged (and named as an
-    unhonored strict request when ``strict: true`` was set) rather than being
-    silent (#1241).
+    Returns a compiled grammar object, a private completion-observer carrier,
+    or ``None``. ``structured_outputs`` raises :class:`HTTPException` when
+    primary grammar compilation fails. A ``response_format`` degrades to
+    ``None`` so the caller can fall back to prompt injection; the downgrade is
+    logged (and named as an unhonored strict request when ``strict: true`` was
+    set) rather than being silent (#1241).
     """
     compiler = getattr(engine, "grammar_compiler", None)
 
@@ -4396,13 +4555,14 @@ def _compile_grammar_for_request(
 
     try:
         if reasoning_parser:
-            return _compile_with_structural_tag(
+            primary = _compile_with_structural_tag(
                 compiler,
                 fmt,
                 reasoning_parser,
                 chat_template_kwargs,
             )
-        return _compile_bare_grammar(compiler, fmt)
+        else:
+            primary = _compile_bare_grammar(compiler, fmt)
     except Exception as e:
         if structured_outputs is not None:
             raise HTTPException(
@@ -4410,7 +4570,45 @@ def _compile_grammar_for_request(
                 detail=f"Grammar compilation error: {e}",
             )
         _warn_response_format_not_enforced(response_format, error=e)
-    return None
+        return None
+
+    schema = fmt.get("json_schema") if fmt["type"] == "json_schema" else None
+    if not (
+        _xgrammar_supports_maxlength_completion_observer()
+        and _is_self_delimiting_maxlength_root_object(schema)
+    ):
+        return primary
+
+    completion_schema, removed_maxlength = _copy_schema_without_maxlength(schema)
+    if not removed_maxlength:
+        return primary
+
+    try:
+        validator = _make_json_schema_validator(schema)
+        completion_fmt = {**fmt, "json_schema": completion_schema}
+        if reasoning_parser:
+            completion = _compile_with_structural_tag(
+                compiler,
+                completion_fmt,
+                reasoning_parser,
+                chat_template_kwargs,
+            )
+        else:
+            completion = _compile_bare_grammar(compiler, completion_fmt)
+    except Exception:
+        logger.warning(
+            "Could not build maxLength completion observer; "
+            "keeping primary enforcement"
+        )
+        return primary
+
+    from .api.grammar import _GrammarCompletionObserver
+
+    return _GrammarCompletionObserver(
+        primary=primary,
+        completion=completion,
+        validator=validator,
+    )
 
 
 def _warn_response_format_not_enforced(response_format, error=None):
