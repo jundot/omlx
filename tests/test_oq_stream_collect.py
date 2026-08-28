@@ -205,10 +205,8 @@ def _pinned_micro_batch(size: int):
     """
     original = oq._oqe_calibration_batch_plan
 
-    def pinned(config, *, requested_samples, seq_length):
-        plan = original(
-            config, requested_samples=requested_samples, seq_length=seq_length
-        )
+    def pinned(config, **kwargs):
+        plan = original(config, **kwargs)
         plan["micro_batch_size"] = int(size)
         return plan
 

@@ -8371,13 +8371,14 @@ def _iter_streamed_layer_blocks(
     next layer so at most one layer's weights are ever resident here.
     """
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
-    if is_qwen4_exp:
-        _qwen4_exp_configure_stream_runtime(source)
     args, layer_cls = _streamed_text_args(source, trust_remote_code=trust_remote_code)
+    lang_module = (
+        _qwen4_exp_stream_language_module(layer_cls, source) if is_qwen4_exp else None
+    )
     dp = _streamed_source_plan(source, config)
     for layer_idx in range(args.num_hidden_layers):
         items = _streamed_layer_items(dp, layer_idx)
-        if is_qwen4_exp and _qwen4_exp_ple_runtime_mode() == "mmap":
+        if lang_module is not None and lang_module.get_ple_runtime_mode() == "mmap":
             items = _qwen4_exp_drop_mmap_ple_shards(items, layer_idx)
         block = layer_cls(args, layer_idx)
         mode = _load_streamed_block_weights(block, items, layer_idx)
@@ -8415,30 +8416,39 @@ _QWEN4_EXP_PLE_SHARD_KEY_RE = re.compile(
 )
 
 
-def _qwen4_exp_configure_stream_runtime(source) -> None:
-    """Route the qwen4_exp N-gram PLE table to disk before block construction.
+def _qwen4_exp_apply_compat_patch() -> None:
+    """Expose mlx_vlm.models.qwen4_exp so the sanitize-plan build resolves."""
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+        apply_mlx_vlm_qwen4_exp_compat_patch,
+    )
+
+    apply_mlx_vlm_qwen4_exp_compat_patch()
+
+
+def _qwen4_exp_stream_language_module(layer_cls, source):
+    """Pin the PLE runtime to mmap on the module that DEFINES layer_cls.
 
     The vendored decoder layer reads the module-global PLE runtime mode at
     construction time; the default "resident" would materialize the full
-    N-gram table (tens of GB) inside every _iter_streamed_layer_blocks pass,
-    which is exactly the memory profile streaming exists to avoid. mmap mode
-    makes the PLE gather straight from the checkpoint shards instead.
-    Lightning MTP stays off: calibration forwards never target-verify.
+    N-gram table (~100 GB) inside every _iter_streamed_layer_blocks pass,
+    which is exactly the memory profile streaming exists to avoid. The
+    catch: maybe_apply_pre_load_patches (run by _streamed_text_args) can
+    re-install the vendored module, so a mode configured through the import
+    path BEFORE that call can land on a different module instance than the
+    one the layer class closes over. Resolving through
+    sys.modules[layer_cls.__module__] pins configure and every later mode
+    read to the exact globals the constructor consults.
     """
-    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+    import sys as _sys
 
-    resolved = configure_qwen4_exp_runtime(source, mode="mmap", mtp_enabled=False)
+    lang = _sys.modules[layer_cls.__module__]
+    resolved = lang.configure_ple_runtime(source, mode="mmap")
     if resolved != "mmap":
         raise RuntimeError(
             "qwen4_exp streaming requires the mmap PLE runtime, but "
-            f"configure_qwen4_exp_runtime resolved {resolved!r} for {source}"
+            f"configure_ple_runtime resolved {resolved!r} for {source}"
         )
-
-
-def _qwen4_exp_ple_runtime_mode() -> str:
-    from mlx_vlm.models.qwen4_exp.language import get_ple_runtime_mode
-
-    return get_ple_runtime_mode()
+    return lang
 
 
 def _qwen4_exp_drop_mmap_ple_shards(items: list, layer_idx: int) -> list:
@@ -8762,6 +8772,12 @@ def _collect_imatrix_streaming(
     # for its own sample slice instead of re-running stage 0.
     calib_data = calib_data[:max_samples]
     is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
+    if is_qwen4_exp:
+        # Must precede stage 0: the sanitize-plan discovery inside
+        # _streamed_embed_weight needs mlx_vlm.models.qwen4_exp resolvable.
+        # The mmap PLE configure happens inside _iter_streamed_layer_blocks,
+        # AFTER the pre-load patches that could re-install the module.
+        _qwen4_exp_apply_compat_patch()
     embed_weight = _streamed_embed_weight(source, config)
     embedded = embed_weight[calib_data]
     mx.eval(embedded)
@@ -9571,6 +9587,8 @@ def _measure_sensitivity_streaming(
     from mlx_lm.tokenizer_utils import load as load_tokenizer
 
     tokenizer = load_tokenizer(source)
+    if _stream_source_model_type(config) == "qwen4_exp":
+        _qwen4_exp_apply_compat_patch()
     embed_weight = _streamed_embed_weight(source, config)
     state = _streamed_sensitivity_state(
         tokenizer,
