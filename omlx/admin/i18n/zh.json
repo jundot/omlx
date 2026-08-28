@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "专家固定清单",
   "modal.model_settings.expert_cache": "每层热门专家数",
   "modal.model_settings.expert_cache_hint": "为常用的非固定专家提供额外内存。",
+  "modal.model_settings.expert_scratch": "冷专家执行区",
+  "modal.model_settings.expert_scratch_hint": "额外预分配的槽位，可批量执行冷专家而不逐出热门缓存。",
   "modal.model_settings.expert_substitution_threshold": "常驻专家替换阈值（%）",
   "modal.model_settings.expert_substitution_threshold_hint": "当路由权重差在此百分比内时，允许常驻专家替换冷专家。0 保持精确路由。",
   "modal.model_settings.expert_execution_policy": "执行模式",

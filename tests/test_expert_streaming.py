@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.switch_layers import SwiGLU
+from mlx_lm.models.switch_layers import SwiGLU, _gather_sort, _scatter_unsort
 
 from omlx.expert_streaming.adapters import discover_moe_layers
 from omlx.expert_streaming.execution import CacheSnapshot, SpeculativeExecution
@@ -52,8 +53,12 @@ def _checkpoint(path: Path, *, experts: int = 6, layers: int = 1):
     return full
 
 
-def _reference(full, x, indices):
+def _reference(full, x, indices, *, sort_routes=False):
     expanded = mx.expand_dims(x, (-2, -3))
+    routed_indices = indices
+    inv_order = None
+    if sort_routes:
+        expanded, routed_indices, inv_order = _gather_sort(expanded, indices)
 
     def projection(name, value):
         weight, scales, biases = full[(0, name)]
@@ -62,16 +67,20 @@ def _reference(full, x, indices):
             weight,
             scales,
             biases,
-            rhs_indices=indices,
+            rhs_indices=routed_indices,
             transpose=True,
             group_size=32,
             bits=4,
             mode="affine",
+            sorted_indices=sort_routes,
         )
 
     up = projection("up_proj", expanded)
     gate = projection("gate_proj", expanded)
-    return projection("down_proj", SwiGLU()(up, gate)).squeeze(-2)
+    output = projection("down_proj", SwiGLU()(up, gate))
+    if inv_order is not None:
+        output = _scatter_unsort(output, inv_order, indices.shape)
+    return output.squeeze(-2)
 
 
 def _quantized_projection(dense, *, group_size, bits, mode):
@@ -230,6 +239,57 @@ def test_cache_only_residency_requires_no_manifest(tmp_path):
     assert estimate.cache_slots_per_layer == 2
 
 
+def test_cold_reader_coalesces_small_gaps_without_affecting_direct_preload(tmp_path):
+    _checkpoint(tmp_path)
+    index = SafetensorExpertIndex(tmp_path)
+    cold = ExpertReader(index)
+    direct = ExpertReader(index)
+    try:
+        cold_rows = cold.read_many(index.layer(0), [0, 2], use_file_cache=True)
+        direct_rows = direct.read_many(index.layer(0), [0, 2], use_file_cache=False)
+        mx.eval(*cold_rows.values(), *direct_rows.values())
+        assert all(
+            bool(mx.all(cold_rows[key] == direct_rows[key]).item())
+            for key in cold_rows
+        )
+        assert cold.read_operations < direct.read_operations
+        assert cold.bytes_read > direct.bytes_read
+    finally:
+        cold.close()
+        direct.close()
+
+
+def test_async_reader_materializes_mlx_only_on_inference_thread(
+    tmp_path, monkeypatch
+):
+    _checkpoint(tmp_path)
+    index = SafetensorExpertIndex(tmp_path)
+    reader = ExpertReader(index)
+    inference_thread = threading.get_ident()
+    original_array = mx.array
+
+    def inference_thread_array(*args, **kwargs):
+        assert threading.get_ident() == inference_thread
+        return original_array(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "array", inference_thread_array)
+    try:
+        locations = index.layer(0)
+        cpu_components = reader.read_many_async(
+            locations, [0, 2], use_file_cache=True
+        ).result()
+        assert all(type(value).__module__ == "numpy" for value in cpu_components.values())
+
+        arrays = reader.materialize_many(locations, cpu_components)
+        expected = reader.read_many(locations, [0, 2], use_file_cache=True)
+        mx.eval(*arrays.values(), *expected.values())
+        assert all(
+            bool(mx.all(arrays[key] == expected[key]).item()) for key in arrays
+        )
+    finally:
+        reader.close()
+
+
 def test_cache_only_install_requires_no_manifest(tmp_path):
     _checkpoint(tmp_path)
     model = _streamable_test_model()
@@ -308,9 +368,11 @@ def test_learned_hotlist_warm_starts_evictable_cache(tmp_path):
         assert stats["ssd_decode_seconds"] >= 0
         assert stats["bank_bind_seconds"] >= 0
         assert stats["bank_materialize_seconds"] >= 0
-        assert stats["qmm_calls"] == 3
-        assert stats["execution_bank_slots"] == 2
+        assert stats["qmm_calls"] == 2
+        assert stats["fused_gate_up"] is True
+        assert stats["execution_bank_slots"] == 6
         assert stats["execution_banks_per_layer"] == 1
+        assert stats["scratch_slots_per_layer"] == 4
         assert stats["resident_experts"] == 2
         assert stats["resident_capacity"] == 2
     finally:
@@ -530,6 +592,41 @@ def test_streaming_switch_glu_is_bit_exact(tmp_path, expert_major):
         reader.close()
 
 
+def test_resident_prefill_sorts_physical_slots_and_remains_bit_exact(tmp_path):
+    full = _checkpoint(tmp_path)
+    index = SafetensorExpertIndex(tmp_path)
+    reader = ExpertReader(index)
+    try:
+        pool = StreamingSwitchGLU(
+            layer=0,
+            num_experts=6,
+            top_k=2,
+            pinned_experts=(5, 2, 0, 4, 1, 3),
+            cache_slots=0,
+            locations=index.layer(0),
+            projection_metadata={
+                name: {"group_size": 32, "bits": 4, "mode": "affine"}
+                for name in ("gate_proj", "up_proj", "down_proj")
+            },
+            activation=SwiGLU(),
+            reader=reader,
+        )
+        route = [value % 6 for value in range(64)]
+        indices = mx.array(route, dtype=mx.int32).reshape(1, 32, 2)
+        x = mx.random.normal((1, 32, 64)).astype(mx.float16)
+
+        output = pool(x, indices)
+        expected = _reference(full, x, indices, sort_routes=True)
+        mx.eval(output, expected)
+
+        assert bool(mx.all(output == expected).item())
+        assert pool.stats.sorted_prefill_groups == 1
+        assert pool.stats.sorted_prefill_routes == 64
+        assert pool.stats.sorted_qmm_calls == 2
+    finally:
+        reader.close()
+
+
 def test_cache_only_switch_glu_is_bit_exact(tmp_path):
     full = _checkpoint(tmp_path)
     index = SafetensorExpertIndex(tmp_path)
@@ -593,6 +690,44 @@ def test_route_larger_than_hot_cache_chunks_without_evicting_itself(tmp_path):
 
         assert bool(mx.all(output == expected).item())
         assert pool.stats.expert_major_calls == 1
+    finally:
+        reader.close()
+
+
+def test_scratch_bank_executes_cold_prefill_without_polluting_hot_cache(tmp_path):
+    full = _checkpoint(tmp_path)
+    index = SafetensorExpertIndex(tmp_path)
+    reader = ExpertReader(index)
+    try:
+        pool = StreamingSwitchGLU(
+            layer=0,
+            num_experts=6,
+            top_k=2,
+            pinned_experts=(),
+            cache_slots=2,
+            scratch_slots=2,
+            locations=index.layer(0),
+            projection_metadata={
+                name: {"group_size": 32, "bits": 4, "mode": "affine"}
+                for name in ("gate_proj", "up_proj", "down_proj")
+            },
+            activation=SwiGLU(),
+            reader=reader,
+        )
+        pool.preload_hotlist([(0, 2), (1, 1)])
+        before = tuple(pool._dynamic_lru)
+        indices = mx.array([[[0, 1], [2, 3], [4, 5]]], dtype=mx.int32)
+        x = mx.random.normal((1, 3, 64)).astype(mx.float16)
+        output = pool(x, indices)
+        expected = _reference(full, x, indices)
+        mx.eval(output, expected)
+        assert bool(mx.all(output == expected).item())
+        assert tuple(pool._dynamic_lru) == before
+        assert pool.stats.scratch_loads == 4
+        assert pool.stats.evictions == 0
+        assert pool.stats.cache_hits == 2
+        assert pool.stats.cache_misses == 4
+        assert pool.bank_size == 4
     finally:
         reader.close()
 

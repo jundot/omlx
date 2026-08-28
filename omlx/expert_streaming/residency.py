@@ -20,6 +20,7 @@ class ExpertStreamingEstimate:
     fixed_bytes: int
     pinned_bytes: int
     cache_bytes: int
+    scratch_bytes: int
     resident_bytes: int
     cache_slots_per_layer: int
 
@@ -54,6 +55,9 @@ def estimate_for_model_settings(
         path,
         manifest,
         cache_experts=int(getattr(settings, "expert_streaming_cache_experts", 32)),
+        scratch_experts=int(
+            getattr(settings, "expert_streaming_scratch_experts", 32)
+        ),
         num_layers=num_layers,
         num_experts=num_experts,
         top_k=top_k,
@@ -66,6 +70,7 @@ def estimate_expert_streaming_residency(
     manifest_path: str | Path | None,
     *,
     cache_experts: int,
+    scratch_experts: int = 32,
     num_layers: int,
     num_experts: int,
     top_k: int,
@@ -106,13 +111,28 @@ def estimate_expert_streaming_residency(
     )
     cache_slots = max(requested_slots, minimum_slots)
     cache_bytes = cache_slots * one_slot_all_layers
-    resident_bytes = int((fixed_bytes + pinned_bytes + cache_bytes) * _OVERHEAD_FACTOR)
+    available_scratch = max(
+        0,
+        min(
+            num_experts
+            - len(manifest.experts_for_layer(layer))
+            - cache_slots
+            for layer in layers
+        ),
+    )
+    scratch_slots = min(max(0, int(scratch_experts)), available_scratch)
+    scratch_bytes = scratch_slots * one_slot_all_layers
+    resident_bytes = int(
+        (fixed_bytes + pinned_bytes + cache_bytes + scratch_bytes)
+        * _OVERHEAD_FACTOR
+    )
     return ExpertStreamingEstimate(
         checkpoint_bytes=checkpoint_bytes,
         streamed_tensor_bytes=streamed_tensor_bytes,
         fixed_bytes=fixed_bytes,
         pinned_bytes=pinned_bytes,
         cache_bytes=cache_bytes,
+        scratch_bytes=scratch_bytes,
         resident_bytes=resident_bytes,
         cache_slots_per_layer=cache_slots,
     )

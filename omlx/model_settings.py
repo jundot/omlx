@@ -226,6 +226,7 @@ class ModelSettings:
     expert_streaming_mode: str = "soft_reap"
     expert_streaming_manifest: Optional[str] = None
     expert_streaming_cache_experts: int = 32
+    expert_streaming_scratch_experts: int = 32
     expert_streaming_substitution_threshold_percent: float = 0.0
     expert_streaming_execution_policy: str = "checked"
     preserve_thinking: Optional[bool] = (

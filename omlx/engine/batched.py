@@ -326,6 +326,13 @@ class BatchedEngine(BaseEngine):
                             32,
                         )
                     ),
+                    scratch_experts=int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_scratch_experts",
+                            32,
+                        )
+                    ),
                     substitution_threshold_percent=float(
                         getattr(
                             self._model_settings,

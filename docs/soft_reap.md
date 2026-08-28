@@ -6,9 +6,12 @@ expert bank. The bank is allocated once at model load, so its shape does not cha
 as experts are promoted or evicted. Dynamic slots use decayed route-frequency
 scoring rather than plain LRU.
 
-The setting **Hot experts per layer** is an expert count, not a byte budget. oMLX
-reserves at least the model's top-k working set. The model settings page shows the
-projected resident size before load.
+The settings **Hot experts per layer** and **Cold execution bank** are expert
+counts, not byte budgets. oMLX reserves at least the model's top-k hot working
+set. The cold execution bank is a separate fixed allocation used only by wide
+miss-heavy batches; it never reduces or evicts the configured hot cache. The
+model settings page includes both banks in the projected resident size before
+load.
 
 ## Residency modes
 
@@ -100,6 +103,23 @@ MTP hidden-state forwards use the same whole-pass cache transaction as ordinary
 decode. Runtime execution stats expose how many otherwise-speculative passes were
 held back by the cache-fill gate.
 
+When prefill selects more cold experts than the hot tier can hold, oMLX executes
+them in groups through the preallocated cold execution bank. The first cold group
+is requested while resident experts execute, and each following group is requested
+while the current group runs. Only one bounded group is in flight. Prefetch workers
+perform CPU-only `pread` and NumPy decoding; MLX array construction remains on the
+inference thread so thread-local Metal streams are never transferred between
+threads. Small nearby
+safetensor reads are coalesced with a 64 KiB maximum gap; pinned preload remains
+strictly component-at-a-time to cap transient memory. This keeps one-shot prefill
+experts from replacing analytically hot experts and avoids unbounded read-ahead.
+
+Resident prefill routes are sorted by their physical bank slot once a group reaches
+64 routed rows, restoring MLX's standard sorted gather-QMM path even when manifest
+order and cache placement differ from logical expert IDs. Gate and up projections
+share one preallocated quantized bank and one gather-QMM; decode therefore uses two
+expert QMM launches per layer instead of three, without increasing bank memory.
+
 ## Performance status
 
 On the 98.995 GiB Qwen3.8-Flash-Next oQ4e MTP baseline with the 288-expert REAP
@@ -140,6 +160,16 @@ MLX `export_function` can persist graph IR, but imported functions still need
 `mx.compile` in the new process. It does not persist a ready-to-run Metal executable,
 and host-side SSD decisions cannot be captured inside the compiled graph.
 
+Bounded synthetic measurements at 512×128 and 1024×256 expert geometry validated
+the current optimizations without loading the production checkpoint. The cold
+execution bank preserved exact output, reduced hot-cache evictions from 42 to 0,
+and made the miss-heavy prefill-to-decode fixture 2.12-2.19× faster. At 1024×256,
+physical-slot sorting improved 256-token prefill throughput by 26.6%; its output
+was bit-identical to MLX's standard sorted path. Gate/up fusion reduced decode-shape
+QMM calls from three to two and improved the isolated single-token fixture by 8.6%;
+it was neutral within noise for prefill. Peak MLX memory for that isolated run was
+391 MiB.
+
 ## DwarfStar-derived optimizations
 
 The cache now adopts DwarfStar's decayed route-hotness eviction and recency
@@ -149,13 +179,16 @@ parallel `pread` queue. It also applies Darwin read-ahead hints to cacheable col
 reads and uses a learned popularity hotlist to warm ordinary evictable slots on
 future loads. Runtime stats split SSD I/O, payload decode, bank binding, and bank
 materialization time and count QMM projection invocations. These are compatible
-with MLX's fixed-shape banks.
+with MLX's fixed-shape banks. The separate cold execution bank, bounded overlapped
+group loading, 64 KiB read coalescing, gate/up bank fusion, and physical-slot
+sorting are oMLX-specific extensions around that cache foundation.
 
 Local throughput benchmarks store per-trial streaming counter deltas alongside
 active and peak Metal memory. The benchmark log identifies the configured cache
 and execution-bank width, hotlist preload count, hit rate, misses, evictions,
 expert loads, SSD traffic, I/O and decode time, bank update time, expert-major
-calls, QMM calls, resident fill, and hotlist warm-start coverage. Analytical-cache
+calls, scratch prefetch wait, sorted groups and routes, QMM calls, resident fill,
+and hotlist warm-start coverage. Analytical-cache
 runs with incomplete warm-start coverage are marked and should only be compared
 with a run having the same learned coverage. Optimistic preload count and total
 startup-fill coverage are reported separately; total startup fill should equal the

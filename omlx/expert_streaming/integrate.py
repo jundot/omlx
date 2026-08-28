@@ -31,6 +31,8 @@ class ExpertStreamingRuntime:
     manifest: SoftReapManifest
     cache_budget_bytes: int
     cache_slots_per_layer: int
+    scratch_budget_bytes: int
+    scratch_slots_per_layer: int
     substitution_threshold_percent: float
     streaming_mode: str
     execution_policy: str
@@ -64,8 +66,13 @@ class ExpertStreamingRuntime:
                 "loads",
                 "pinned_loads",
                 "cold_loads",
+                "scratch_loads",
+                "scratch_prefetch_requests",
                 "expert_major_calls",
                 "qmm_calls",
+                "sorted_prefill_groups",
+                "sorted_prefill_routes",
+                "sorted_qmm_calls",
                 "speculative_routes",
                 "speculative_misses",
                 "hotness_decays",
@@ -74,7 +81,12 @@ class ExpertStreamingRuntime:
         }
         timing_totals = {
             key: sum(float(layer[key]) for layer in layers)
-            for key in ("bank_bind_seconds", "bank_materialize_seconds")
+            for key in (
+                "bank_bind_seconds",
+                "bank_materialize_seconds",
+                "scratch_prefetch_wait_seconds",
+                "scratch_mlx_materialize_seconds",
+            )
         }
         attempts = totals["pinned_hits"] + totals["cache_hits"] + totals["cache_misses"]
         totals["hit_rate"] = (
@@ -87,18 +99,21 @@ class ExpertStreamingRuntime:
             "manifest": str(self.manifest.source) if self.manifest.source else None,
             "cache_budget_bytes": self.cache_budget_bytes,
             "cache_slots_per_layer": self.cache_slots_per_layer,
+            "scratch_budget_bytes": self.scratch_budget_bytes,
+            "scratch_slots_per_layer": self.scratch_slots_per_layer,
             "layer_count": len(self.pools),
             "resident_experts": sum(
                 int(layer["resident_experts"]) for layer in layers
             ),
             "resident_capacity": sum(pool.pool_size for pool in self.pools),
-            # The current resident cache is also the QMM execution bank. Keep
-            # this explicit in benchmark telemetry so a future two-tier design
-            # can be compared without changing the result schema.
             "execution_bank_slots": (
-                max((pool.pool_size for pool in self.pools), default=0)
+                max((pool.bank_size for pool in self.pools), default=0)
             ),
             "execution_banks_per_layer": 1 if self.pools else 0,
+            "fused_gate_up": bool(self.pools)
+            and all(bool(layer["fused_gate_up"]) for layer in layers),
+            "sorted_prefill": bool(self.pools)
+            and all(bool(layer["sorted_prefill"]) for layer in layers),
             "substitution_threshold_percent": self.substitution_threshold_percent,
             "streaming_mode": self.streaming_mode,
             "cache_policy": "route_frequency",
@@ -231,6 +246,7 @@ def install_expert_streaming(
     manifest_path: str | Path | None,
     *,
     cache_experts: int = 32,
+    scratch_experts: int = 32,
     substitution_threshold_percent: float = 0.0,
     execution_policy: str = "checked",
     streaming_mode: str = "soft_reap",
@@ -299,6 +315,7 @@ def install_expert_streaming(
     )
     cache_slots = max(0, int(cache_experts), minimum_cache_slots)
     cache_budget_bytes = cache_slots * expert_bytes_all_layers
+    scratch_slots = max(0, int(scratch_experts))
     reader = ExpertReader(index)
     pools: list[StreamingSwitchGLU] = []
     try:
@@ -307,11 +324,13 @@ def install_expert_streaming(
             original = target.switch_mlp
             schema, locations = resolved[layer_idx]
             logger.info(
-                "Expert streaming loading layer %d/%d (%d pinned experts, %d hot slots)",
+                "Expert streaming loading layer %d/%d (%d pinned experts, "
+                "%d hot slots, %d scratch slots)",
                 ordinal + 1,
                 len(targets),
                 len(manifest.experts_for_layer(layer_idx)),
                 cache_slots,
+                scratch_slots,
             )
             pool = StreamingSwitchGLU(
                 layer=layer_idx,
@@ -319,6 +338,7 @@ def install_expert_streaming(
                 top_k=top_k,
                 pinned_experts=manifest.experts_for_layer(layer_idx),
                 cache_slots=cache_slots,
+                scratch_slots=scratch_slots,
                 locations=locations,
                 projection_metadata=schema,
                 activation=original.activation,
@@ -351,11 +371,19 @@ def install_expert_streaming(
         reader.close()
         raise
 
+    scratch_budget_bytes = sum(
+        pool.scratch_slots
+        * sum(location.row_bytes for location in pool.locations.values())
+        for pool in pools
+    )
+    actual_scratch_slots = max((pool.scratch_slots for pool in pools), default=0)
     runtime = ExpertStreamingRuntime(
         model_path=resolved_model_path,
         manifest=manifest,
         cache_budget_bytes=cache_budget_bytes,
         cache_slots_per_layer=int(cache_slots),
+        scratch_budget_bytes=scratch_budget_bytes,
+        scratch_slots_per_layer=actual_scratch_slots,
         substitution_threshold_percent=float(substitution_threshold_percent),
         streaming_mode=streaming_mode,
         execution_policy=execution_policy,
@@ -375,16 +403,18 @@ def install_expert_streaming(
         runtime.attach_model(language_model)
     logger.info(
         "Expert streaming ready: mode=%s, %d layers, pinned range %s, "
-        "%d hot slots/layer, learned preload=%d, optimistic preload=%d, "
+        "%d hot slots/layer, %d scratch slots/layer, learned preload=%d, "
+        "optimistic preload=%d, "
         "%.2f GiB bank",
         streaming_mode,
         len(targets),
         manifest.pinned_count_range,
         pools[0].cache_slots if pools else 0,
+        pools[0].scratch_slots if pools else 0,
         hotlist_preloaded,
         optimistic_preloaded,
         sum(
-            pool.pool_size
+            pool.bank_size
             * sum(location.row_bytes for location in pool.locations.values())
             for pool in pools
         )

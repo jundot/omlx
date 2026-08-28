@@ -268,6 +268,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingMode: String = "soft_reap"
     var expertStreamingManifest: String = ""
     var expertStreamingCacheExperts: String = "32"
+    var expertStreamingScratchExperts: String = "32"
     var expertStreamingSubstitutionThresholdPercent: String = "0"
     var expertStreamingExecutionPolicy: String = "checked"
     var expertManifestUploadInProgress: Bool = false
@@ -556,6 +557,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingMode = s?.expertStreamingMode ?? "soft_reap"
                 self.expertStreamingManifest = s?.expertStreamingManifest ?? ""
                 self.expertStreamingCacheExperts = s?.expertStreamingCacheExperts.map(String.init) ?? "32"
+                self.expertStreamingScratchExperts = s?.expertStreamingScratchExperts.map(String.init) ?? "32"
                 self.expertStreamingSubstitutionThresholdPercent = s?.expertStreamingSubstitutionThresholdPercent
                     .map { Self.formatPct($0) } ?? "0"
                 self.expertStreamingExecutionPolicy = s?.expertStreamingExecutionPolicy ?? "checked"
@@ -1246,6 +1248,7 @@ final class ModelSettingsScreenVM {
                     putString(ProfileSettingsKey.expertStreamingManifest, expertStreamingManifest)
                 }
                 putInt(ProfileSettingsKey.expertStreamingCacheExperts, expertStreamingCacheExperts)
+                putInt(ProfileSettingsKey.expertStreamingScratchExperts, expertStreamingScratchExperts)
                 putDouble(
                     ProfileSettingsKey.expertStreamingSubstitutionThresholdPercent,
                     expertStreamingSubstitutionThresholdPercent
@@ -1598,6 +1601,15 @@ final class ModelSettingsScreenVM {
             lastError = String(localized: "settings.expert_streaming.validation.cache",
                                defaultValue: "Hot cache size must be a whole number from 0 to 512 experts per layer.",
                                comment: "Validation error for SSD expert streaming hot cache size")
+            return false
+        }
+        guard let scratchExperts = Int(expertStreamingScratchExperts),
+              (0...512).contains(scratchExperts) else {
+            lastError = String(
+                localized: "settings.expert_streaming.validation.scratch",
+                defaultValue: "Cold execution size must be a whole number from 0 to 512 experts per layer.",
+                comment: "Validation error for SSD expert streaming scratch size"
+            )
             return false
         }
         guard let threshold = Double(expertStreamingSubstitutionThresholdPercent),

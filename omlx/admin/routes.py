@@ -143,6 +143,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_mode: str | None = None
     expert_streaming_manifest: str | None = None
     expert_streaming_cache_experts: int | None = None
+    expert_streaming_scratch_experts: int | None = None
     expert_streaming_substitution_threshold_percent: float | None = None
     expert_streaming_execution_policy: str | None = None
     thinking_budget_enabled: bool | None = None
@@ -2496,6 +2497,14 @@ async def update_model_settings(
                 detail="Expert cache size must be between 0 and 512 experts per layer.",
             )
         current_settings.expert_streaming_cache_experts = int(cache_experts)
+    if "expert_streaming_scratch_experts" in sent:
+        scratch_experts = request.expert_streaming_scratch_experts
+        if scratch_experts is None or not 0 <= scratch_experts <= 512:
+            raise HTTPException(
+                status_code=400,
+                detail="Expert scratch size must be between 0 and 512 experts per layer.",
+            )
+        current_settings.expert_streaming_scratch_experts = int(scratch_experts)
     if "expert_streaming_substitution_threshold_percent" in sent:
         threshold = request.expert_streaming_substitution_threshold_percent
         if threshold is None or not 0 <= threshold <= 100:

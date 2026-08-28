@@ -528,6 +528,13 @@
                                         <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_execution_policy_hint') }}</span>
                                     </label>
                                     <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_scratch') }}</span>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_scratch_experts"
+                                               min="0" max="512" step="1"
+                                               class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                        <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_scratch_hint') }}</span>
+                                    </label>
+                                    <label class="block">
                                         <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_substitution_threshold') }}</span>
                                         <input type="number" x-model.number="modelSettings.expert_streaming_substitution_threshold_percent"
                                                min="0" max="100" step="0.1"

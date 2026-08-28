@@ -7389,6 +7389,8 @@
                     expert_streaming_manifest_file: null,
                     expert_streaming_cache_experts:
                         s.expert_streaming_cache_experts ?? 32,
+                    expert_streaming_scratch_experts:
+                        s.expert_streaming_scratch_experts ?? 32,
                     expert_streaming_substitution_threshold_percent:
                         s.expert_streaming_substitution_threshold_percent ?? 0,
                     expert_streaming_execution_policy:
@@ -8349,6 +8351,8 @@
                                         : null,
                                 expert_streaming_cache_experts:
                                     Number(this.modelSettings.expert_streaming_cache_experts) || 0,
+                                expert_streaming_scratch_experts:
+                                    Number(this.modelSettings.expert_streaming_scratch_experts) || 0,
                                 expert_streaming_substitution_threshold_percent:
                                     Number(this.modelSettings.expert_streaming_substitution_threshold_percent) || 0,
                                 expert_streaming_execution_policy:

@@ -636,6 +636,10 @@ class EnginePool:
                 data.get("expert_streaming_cache_experts", 32),
             )
             add(
+                "expert_streaming_scratch_experts",
+                data.get("expert_streaming_scratch_experts", 32),
+            )
+            add(
                 "expert_streaming_substitution_threshold_percent",
                 data.get("expert_streaming_substitution_threshold_percent", 0.0),
             )

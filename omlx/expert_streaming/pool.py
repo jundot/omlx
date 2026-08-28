@@ -12,6 +12,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 
 from .safetensors import PROJECTIONS, ExpertReader, TensorLocation
 
@@ -35,6 +36,7 @@ class ExpertPoolStats:
     loads: int = 0
     pinned_loads: int = 0
     cold_loads: int = 0
+    scratch_loads: int = 0
     expert_major_calls: int = 0
     qmm_calls: int = 0
     speculative_routes: int = 0
@@ -43,6 +45,12 @@ class ExpertPoolStats:
     warm_start_loads: int = 0
     bank_bind_seconds: float = 0.0
     bank_materialize_seconds: float = 0.0
+    scratch_prefetch_wait_seconds: float = 0.0
+    scratch_prefetch_requests: int = 0
+    scratch_mlx_materialize_seconds: float = 0.0
+    sorted_prefill_groups: int = 0
+    sorted_prefill_routes: int = 0
+    sorted_qmm_calls: int = 0
 
     def as_dict(self) -> dict[str, int | float]:
         total = self.pinned_hits + self.cache_hits + self.cache_misses
@@ -55,6 +63,7 @@ class ExpertPoolStats:
             "loads": self.loads,
             "pinned_loads": self.pinned_loads,
             "cold_loads": self.cold_loads,
+            "scratch_loads": self.scratch_loads,
             "expert_major_calls": self.expert_major_calls,
             "qmm_calls": self.qmm_calls,
             "speculative_routes": self.speculative_routes,
@@ -63,6 +72,12 @@ class ExpertPoolStats:
             "warm_start_loads": self.warm_start_loads,
             "bank_bind_seconds": self.bank_bind_seconds,
             "bank_materialize_seconds": self.bank_materialize_seconds,
+            "scratch_prefetch_wait_seconds": self.scratch_prefetch_wait_seconds,
+            "scratch_prefetch_requests": self.scratch_prefetch_requests,
+            "scratch_mlx_materialize_seconds": self.scratch_mlx_materialize_seconds,
+            "sorted_prefill_groups": self.sorted_prefill_groups,
+            "sorted_prefill_routes": self.sorted_prefill_routes,
+            "sorted_qmm_calls": self.sorted_qmm_calls,
             "hit_rate": (self.pinned_hits + self.cache_hits) / total if total else 1.0,
         }
 
@@ -125,6 +140,9 @@ class StreamingSwitchGLU(nn.Module):
         activation: Any,
         reader: ExpertReader,
         cache_policy: str = "route_frequency",
+        fuse_gate_up: bool = True,
+        scratch_slots: int = 0,
+        sort_prefill: bool = True,
     ):
         super().__init__()
         self.layer = int(layer)
@@ -137,6 +155,10 @@ class StreamingSwitchGLU(nn.Module):
         minimum_working_set = min(self.top_k, cold_count)
         self.cache_slots = min(cold_count, max(int(cache_slots), minimum_working_set))
         self.pool_size = self.pinned_count + self.cache_slots
+        self.scratch_slots = min(
+            max(0, cold_count - self.cache_slots), max(0, int(scratch_slots))
+        )
+        self.bank_size = self.pool_size + self.scratch_slots
         self.locations = locations
         self.projection_metadata = projection_metadata
         for projection in PROJECTIONS:
@@ -149,6 +171,7 @@ class StreamingSwitchGLU(nn.Module):
         if cache_policy not in {"lru", "route_frequency"}:
             raise ValueError(f"Unknown expert cache policy: {cache_policy}")
         self.cache_policy = cache_policy
+        self._sort_prefill = bool(sort_prefill)
         self._lock = threading.RLock()
         self._expert_to_slot: dict[int, int] = {
             expert: slot for slot, expert in enumerate(self.pinned_experts)
@@ -177,20 +200,57 @@ class StreamingSwitchGLU(nn.Module):
         self._speculative_routes: list[tuple[mx.array, mx.array]] = []
         self.stats = ExpertPoolStats()
 
-        for projection in PROJECTIONS:
+        gate_metadata = self.projection_metadata["gate_proj"]
+        up_metadata = self.projection_metadata["up_proj"]
+        gate_parts = tuple(gate_metadata["parts"])
+        up_parts = tuple(up_metadata["parts"])
+        self._fused_gate_up = bool(fuse_gate_up) and (
+            gate_parts == up_parts
+            and (gate_metadata["group_size"], gate_metadata["bits"], gate_metadata["mode"])
+            == (up_metadata["group_size"], up_metadata["bits"], up_metadata["mode"])
+            and all(
+                locations[("gate_proj", part)].dtype
+                == locations[("up_proj", part)].dtype
+                and locations[("gate_proj", part)].shape[1:]
+                == locations[("up_proj", part)].shape[1:]
+                for part in gate_parts
+            )
+        )
+        if self._fused_gate_up:
+            self.projection_metadata["gate_up_proj"] = {
+                **gate_metadata,
+                "parts": gate_parts,
+            }
+
+        allocated_projections = (
+            ("gate_up_proj", "down_proj")
+            if self._fused_gate_up
+            else PROJECTIONS
+        )
+        for projection in allocated_projections:
             for part in self.projection_metadata[projection]["parts"]:
-                location = locations[(projection, part)]
+                source_projection = (
+                    "gate_proj" if projection == "gate_up_proj" else projection
+                )
+                location = locations[(source_projection, part)]
+                shape = location.shape[1:]
+                if projection == "gate_up_proj":
+                    shape = (shape[0] * 2, *shape[1:])
                 setattr(
                     self,
                     self._array_name(projection, part),
                     mx.zeros(
-                        (self.pool_size, *location.shape[1:]),
+                        (self.bank_size, *shape),
                         dtype=_MLX_DTYPES[location.dtype],
                     ),
                 )
 
         self.gate_proj = StreamingQuantizedSwitchLinear(self, "gate_proj")
         self.up_proj = StreamingQuantizedSwitchLinear(self, "up_proj")
+        if self._fused_gate_up:
+            self.gate_up_proj = StreamingQuantizedSwitchLinear(
+                self, "gate_up_proj"
+            )
         self.down_proj = StreamingQuantizedSwitchLinear(self, "down_proj")
         self._load_into_slots(
             self.pinned_experts,
@@ -203,6 +263,16 @@ class StreamingSwitchGLU(nn.Module):
         return f"_bank_{projection}_{part}"
 
     def _array(self, projection: str, part: str) -> mx.array | None:
+        if self._fused_gate_up and projection in {"gate_proj", "up_proj"}:
+            fused = getattr(self, self._array_name("gate_up_proj", part), None)
+            if fused is None:
+                return None
+            midpoint = fused.shape[1] // 2
+            return (
+                fused[:, :midpoint]
+                if projection == "gate_proj"
+                else fused[:, midpoint:]
+            )
         return getattr(self, self._array_name(projection, part), None)
 
     @property
@@ -240,21 +310,20 @@ class StreamingSwitchGLU(nn.Module):
         slots: list[int],
         *,
         load_kind: str = "cold",
+        preloaded_components: dict[tuple[str, str], mx.array] | None = None,
     ) -> None:
         if not experts:
             return
         preload = load_kind == "pinned"
         # Pinned preload stays component-at-a-time to cap transient memory.
         # Dynamic misses are small and benefit from one flat I/O queue.
-        components = (
-            None
-            if preload
-            else self._reader.read_many(
+        components = preloaded_components
+        if components is None and not preload:
+            components = self._reader.read_many(
                 self.locations,
                 experts,
                 use_file_cache=True,
             )
-        )
         for projection in PROJECTIONS:
             for part in self.projection_metadata[projection]["parts"]:
                 rows = (
@@ -266,9 +335,24 @@ class StreamingSwitchGLU(nn.Module):
                     if components is None
                     else components[(projection, part)]
                 )
-                target = self._array(projection, part)
+                target_projection = (
+                    "gate_up_proj"
+                    if self._fused_gate_up
+                    and projection in {"gate_proj", "up_proj"}
+                    else projection
+                )
+                target = self._array(target_projection, part)
                 bind_started = time.perf_counter()
-                target[slots] = rows
+                if target_projection == "gate_up_proj":
+                    midpoint = target.shape[1] // 2
+                    output_slice = (
+                        slice(0, midpoint)
+                        if projection == "gate_proj"
+                        else slice(midpoint, None)
+                    )
+                    target[slots, output_slice] = rows
+                else:
+                    target[slots] = rows
                 self.stats.bank_bind_seconds += time.perf_counter() - bind_started
                 if preload:
                     # Pinned construction can stage hundreds of rows, so commit
@@ -288,6 +372,8 @@ class StreamingSwitchGLU(nn.Module):
             self.stats.warm_start_loads += len(experts)
         else:
             self.stats.cold_loads += len(experts)
+            if load_kind == "scratch":
+                self.stats.scratch_loads += len(experts)
 
     @staticmethod
     def _flatten_indices(indices: mx.array) -> tuple[int, ...]:
@@ -534,9 +620,17 @@ class StreamingSwitchGLU(nn.Module):
         self._last_slots = mapped
         return mapped
 
-    def project(self, projection: str, x: mx.array, slot_indices: mx.array) -> mx.array:
+    def project(
+        self,
+        projection: str,
+        x: mx.array,
+        slot_indices: mx.array,
+        *,
+        sorted_indices: bool = False,
+    ) -> mx.array:
         metadata = self.projection_metadata[projection]
         self.stats.qmm_calls += 1
+        self.stats.sorted_qmm_calls += int(sorted_indices)
         output = mx.gather_qmm(
             x,
             self._array(projection, "weight"),
@@ -547,12 +641,44 @@ class StreamingSwitchGLU(nn.Module):
             group_size=metadata["group_size"],
             bits=metadata["bits"],
             mode=metadata["mode"],
-            sorted_indices=False,
+            sorted_indices=sorted_indices,
         )
         bias = self._array(projection, "bias")
         if bias is not None:
             output = output + mx.expand_dims(bias[slot_indices], -2)
         return output
+
+    def _project_gate_up(
+        self,
+        x: mx.array,
+        slot_indices: mx.array,
+        *,
+        sorted_indices: bool = False,
+    ) -> tuple[mx.array, mx.array]:
+        if not self._fused_gate_up:
+            return (
+                self.project(
+                    "gate_proj", x, slot_indices, sorted_indices=sorted_indices
+                ),
+                self.project(
+                    "up_proj", x, slot_indices, sorted_indices=sorted_indices
+                ),
+            )
+        gate_up = self.project(
+            "gate_up_proj", x, slot_indices, sorted_indices=sorted_indices
+        )
+        return tuple(mx.split(gate_up, 2, axis=-1))
+
+    def _sort_group_for_qmm(
+        self, selected: mx.array, slots: mx.array
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        """Sort route rows by physical bank slot for large gather QMMs."""
+        if not self._sort_prefill or slots.size < 64:
+            return selected, slots, None
+        order = mx.argsort(slots)
+        self.stats.sorted_prefill_groups += 1
+        self.stats.sorted_prefill_routes += int(slots.size)
+        return selected[order], slots[order], mx.argsort(order)
 
     def _forward_projection_expert_major(
         self,
@@ -584,7 +710,6 @@ class StreamingSwitchGLU(nn.Module):
         input_dims = x.shape[-1]
         vectors = x.reshape(-1, input_dims)
         flat_indices = np.asarray(values, dtype=np.int32)
-        metadata = self.projection_metadata[projection]
         output_dims = self._array(projection, "weight").shape[1]
         flat_output = mx.zeros((len(values), output_dims), dtype=x.dtype)
         route_specific_input = vectors.shape[0] == len(values)
@@ -603,21 +728,15 @@ class StreamingSwitchGLU(nn.Module):
                 positions_np if route_specific_input else positions_np // k
             )
             selected = vectors[mx.array(vector_positions, dtype=mx.int32)][:, None, :]
-            output = mx.gather_qmm(
+            selected, slots, inv_order = self._sort_group_for_qmm(selected, slots)
+            output = self.project(
+                projection,
                 selected,
-                self._array(projection, "weight"),
-                self._array(projection, "scales"),
-                self._array(projection, "biases"),
-                rhs_indices=slots,
-                transpose=True,
-                group_size=metadata["group_size"],
-                bits=metadata["bits"],
-                mode=metadata["mode"],
-                sorted_indices=False,
+                slots,
+                sorted_indices=inv_order is not None,
             ).squeeze(-2)
-            bias = self._array(projection, "bias")
-            if bias is not None:
-                output = output + bias[slots]
+            if inv_order is not None:
+                output = output[inv_order]
             # The next group can overwrite the same bank slots.
             mx.eval(output)
             flat_output[mx.array(positions_np, dtype=mx.int32)] = output
@@ -650,9 +769,23 @@ class StreamingSwitchGLU(nn.Module):
     ) -> mx.array:
         slots = self._map_known_values(indices, values)
         expanded = mx.expand_dims(x, (-2, -3))
-        up = self.project("up_proj", expanded, slots)
-        gate = self.project("gate_proj", expanded, slots)
-        output = self.project("down_proj", self.activation(up, gate), slots)
+        inv_order = None
+        if self._sort_prefill and slots.size >= 64:
+            expanded, slots, inv_order = _gather_sort(expanded, slots)
+            self.stats.sorted_prefill_groups += 1
+            self.stats.sorted_prefill_routes += int(slots.size)
+        sorted_indices = inv_order is not None
+        gate, up = self._project_gate_up(
+            expanded, slots, sorted_indices=sorted_indices
+        )
+        output = self.project(
+            "down_proj",
+            self.activation(up, gate),
+            slots,
+            sorted_indices=sorted_indices,
+        )
+        if inv_order is not None:
+            output = _scatter_unsort(output, inv_order, indices.shape)
         return output.squeeze(-2)
 
     def _forward_expert_major(
@@ -661,6 +794,8 @@ class StreamingSwitchGLU(nn.Module):
         indices: mx.array,
         values: tuple[int, ...],
     ) -> mx.array:
+        if self.scratch_slots:
+            return self._forward_expert_major_scratch(x, indices, values)
         self.stats.expert_major_calls += 1
         unique = list(dict.fromkeys(values))
         pinned = [
@@ -694,14 +829,136 @@ class StreamingSwitchGLU(nn.Module):
             )
             token_positions = mx.array(positions_np // k, dtype=mx.int32)
             selected = flat_x[token_positions][:, None, :]
-            up = self.project("up_proj", selected, slots)
-            gate = self.project("gate_proj", selected, slots)
+            selected, slots, inv_order = self._sort_group_for_qmm(selected, slots)
+            sorted_indices = inv_order is not None
+            gate, up = self._project_gate_up(
+                selected, slots, sorted_indices=sorted_indices
+            )
             output = self.project(
-                "down_proj", self.activation(up, gate), slots
+                "down_proj",
+                self.activation(up, gate),
+                slots,
+                sorted_indices=sorted_indices,
             ).squeeze(-2)
+            if inv_order is not None:
+                output = output[inv_order]
             # Evaluate before the next group mutates dynamic bank slots.
             mx.eval(output)
             flat_output[mx.array(positions_np, dtype=mx.int32)] = output
+        return flat_output.reshape((*indices.shape, hidden))
+
+    def _forward_expert_major_scratch(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        values: tuple[int, ...],
+    ) -> mx.array:
+        """Execute one-shot cold experts without replacing hot-cache rows."""
+
+        self.stats.expert_major_calls += 1
+        unique = list(dict.fromkeys(values))
+        resident = [expert for expert in unique if expert in self._expert_to_slot]
+        cold = [expert for expert in unique if expert not in self._expert_to_slot]
+
+        self._note_route(values)
+        self.stats.route_lookups += len(values)
+        self.stats.pinned_hits += sum(
+            1
+            for expert in values
+            if self._expert_to_slot.get(expert, self.pinned_count)
+            < self.pinned_count
+        )
+        self.stats.cache_hits += sum(
+            1 for expert in values if expert in self._dynamic_lru
+        )
+        cold_set = set(cold)
+        self.stats.cache_misses += sum(1 for expert in values if expert in cold_set)
+        for expert in dict.fromkeys(values):
+            if expert in self._dynamic_lru:
+                self._dynamic_lru.move_to_end(expert)
+
+        groups: list[tuple[list[int], bool]] = []
+        if resident:
+            groups.append((resident, False))
+        groups.extend(
+            (cold[offset : offset + self.scratch_slots], True)
+            for offset in range(0, len(cold), self.scratch_slots)
+        )
+
+        k = indices.shape[-1]
+        hidden = x.shape[-1]
+        flat_x = x.reshape(-1, hidden)
+        flat_indices = np.asarray(values, dtype=np.int32)
+        flat_output = mx.zeros((len(values), hidden), dtype=x.dtype)
+        scratch_base = self.pool_size
+        cold_groups = [group for group, is_scratch in groups if is_scratch]
+        prefetched = None
+        prefetched_index = 0
+        if cold_groups:
+            prefetched = self._reader.read_many_async(
+                self.locations,
+                cold_groups[0],
+                use_file_cache=True,
+            )
+            self.stats.scratch_prefetch_requests += 1
+
+        for group, is_scratch in groups:
+            mask = np.isin(flat_indices, np.asarray(group, dtype=np.int32))
+            positions_np = np.nonzero(mask)[0].astype(np.int32)
+            if positions_np.size == 0:
+                continue
+            logical_np = flat_indices[positions_np]
+            if is_scratch:
+                wait_started = time.perf_counter()
+                cpu_components = prefetched.result()
+                self.stats.scratch_prefetch_wait_seconds += (
+                    time.perf_counter() - wait_started
+                )
+                materialize_started = time.perf_counter()
+                components = self._reader.materialize_many(
+                    self.locations, cpu_components
+                )
+                self.stats.scratch_mlx_materialize_seconds += (
+                    time.perf_counter() - materialize_started
+                )
+                prefetched_index += 1
+                if prefetched_index < len(cold_groups):
+                    prefetched = self._reader.read_many_async(
+                        self.locations,
+                        cold_groups[prefetched_index],
+                        use_file_cache=True,
+                    )
+                    self.stats.scratch_prefetch_requests += 1
+                group_slots = list(range(scratch_base, scratch_base + len(group)))
+                self._load_into_slots(
+                    group,
+                    group_slots,
+                    load_kind="scratch",
+                    preloaded_components=components,
+                )
+                scratch_map = dict(zip(group, group_slots, strict=True))
+                slot_values = [scratch_map[int(expert)] for expert in logical_np]
+            else:
+                slot_values = [self._expert_to_slot[int(expert)] for expert in logical_np]
+            slots = mx.array(slot_values, dtype=mx.int32)
+            token_positions = mx.array(positions_np // k, dtype=mx.int32)
+            selected = flat_x[token_positions][:, None, :]
+            selected, slots, inv_order = self._sort_group_for_qmm(selected, slots)
+            sorted_indices = inv_order is not None
+            gate, up = self._project_gate_up(
+                selected, slots, sorted_indices=sorted_indices
+            )
+            output = self.project(
+                "down_proj",
+                self.activation(up, gate),
+                slots,
+                sorted_indices=sorted_indices,
+            ).squeeze(-2)
+            if inv_order is not None:
+                output = output[inv_order]
+            mx.eval(output)
+            flat_output[mx.array(positions_np, dtype=mx.int32)] = output
+
         return flat_output.reshape((*indices.shape, hidden))
 
     def __call__(
@@ -716,8 +973,7 @@ class StreamingSwitchGLU(nn.Module):
             if self._execution_mode == "speculative":
                 slots = self.ensure(indices)
                 expanded = mx.expand_dims(x, (-2, -3))
-                up = self.project("up_proj", expanded, slots)
-                gate = self.project("gate_proj", expanded, slots)
+                gate, up = self._project_gate_up(expanded, slots)
                 output = self.project("down_proj", self.activation(up, gate), slots)
                 output = output.squeeze(-2)
                 if weighted_sum and scores is not None:
@@ -744,7 +1000,11 @@ class StreamingSwitchGLU(nn.Module):
                 "cache_slots": self.cache_slots,
                 "cache_policy": self.cache_policy,
                 "resident_slots": self.pool_size,
+                "scratch_slots": self.scratch_slots,
+                "bank_slots": self.bank_size,
                 "resident_experts": len(self._expert_to_slot),
+                "fused_gate_up": self._fused_gate_up,
+                "sorted_prefill": self._sort_prefill,
                 "expert_bytes": sum(
                     location.row_bytes for location in self.locations.values()
                 ),

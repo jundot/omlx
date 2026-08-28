@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import tempfile
 import time
 from collections.abc import Callable
@@ -68,6 +69,9 @@ def _pool(
     experts: int,
     top_k: int,
     cache_slots: int,
+    fuse_gate_up: bool = True,
+    scratch_slots: int = 0,
+    sort_prefill: bool = True,
 ) -> StreamingSwitchGLU:
     return StreamingSwitchGLU(
         layer=0,
@@ -82,6 +86,9 @@ def _pool(
         },
         activation=SwiGLU(),
         reader=reader,
+        fuse_gate_up=fuse_gate_up,
+        scratch_slots=scratch_slots,
+        sort_prefill=sort_prefill,
     )
 
 
@@ -111,6 +118,227 @@ def _eager_promote(pool: StreamingSwitchGLU, values: tuple[int, ...]) -> None:
         for part in pool.projection_metadata[projection]["parts"]
     ]
     mx.eval(*arrays, pool._slot_map, pool._resident_mask)
+
+
+def _gate_up_fusion_benchmark(
+    index: SafetensorExpertIndex,
+    *,
+    experts: int,
+    hidden: int,
+    top_k: int,
+    tokens: int,
+    repeats: int,
+) -> dict[str, Any]:
+    readers = [ExpertReader(index), ExpertReader(index)]
+    separate = _pool(
+        index,
+        readers[0],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+        fuse_gate_up=False,
+    )
+    fused = _pool(
+        index,
+        readers[1],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+        fuse_gate_up=True,
+    )
+    try:
+        _preload(separate, 128)
+        _preload(fused, 128)
+        x = mx.random.normal((1, tokens, hidden)).astype(mx.float16)
+        route = np.arange(tokens * top_k, dtype=np.int32) % 128
+        indices = mx.array(route.reshape(1, tokens, top_k))
+        scores = mx.full(
+            (1, tokens, top_k), 1.0 / top_k, dtype=mx.float16
+        )
+
+        def run(pool: StreamingSwitchGLU) -> mx.array:
+            output = None
+            for _ in range(repeats):
+                output = pool(x, indices, scores=scores, weighted_sum=True)
+                mx.eval(output)
+            return output
+
+        mx.eval(run(separate), run(fused))
+        separate.stats.qmm_calls = 0
+        fused.stats.qmm_calls = 0
+        separate_output, separate_s, _, _ = _timed(lambda: run(separate))
+        fused_output, fused_s, _, _ = _timed(lambda: run(fused))
+        return {
+            "exact": bool(mx.all(separate_output == fused_output).item()),
+            "tokens": tokens,
+            "repeats": repeats,
+            "separate_tokens_per_second": tokens * repeats / separate_s,
+            "fused_tokens_per_second": tokens * repeats / fused_s,
+            "speedup": separate_s / fused_s,
+            "separate_qmm_calls": separate.stats.qmm_calls,
+            "fused_qmm_calls": fused.stats.qmm_calls,
+        }
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+def _scratch_preservation_benchmark(
+    index: SafetensorExpertIndex,
+    *,
+    experts: int,
+    hidden: int,
+    top_k: int,
+) -> dict[str, Any]:
+    readers = [ExpertReader(index), ExpertReader(index)]
+    polluting = _pool(
+        index,
+        readers[0],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+    )
+    scratch = _pool(
+        index,
+        readers[1],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+        scratch_slots=32,
+    )
+    try:
+        _preload(polluting, 128)
+        _preload(scratch, 128)
+        prefill_tokens = experts // top_k
+        x = mx.random.normal((1, prefill_tokens, hidden)).astype(mx.float16)
+        indices = mx.array(
+            np.arange(experts, dtype=np.int32).reshape(
+                1, prefill_tokens, top_k
+            )
+        )
+        scores = mx.full(
+            (1, prefill_tokens, top_k), 1.0 / top_k, dtype=mx.float16
+        )
+        decode_x = x[:, :1]
+        decode_indices = mx.array(
+            np.arange(96, 96 + top_k, dtype=np.int32).reshape(1, 1, top_k)
+        )
+        decode_scores = scores[:, :1]
+
+        def run(pool: StreamingSwitchGLU) -> tuple[mx.array, mx.array]:
+            prefill = pool(x, indices, scores=scores, weighted_sum=True)
+            mx.eval(prefill)
+            decode = pool(
+                decode_x,
+                decode_indices,
+                scores=decode_scores,
+                weighted_sum=True,
+            )
+            mx.eval(decode)
+            return prefill, decode
+
+        polluting_outputs, polluting_s, _, _ = _timed(lambda: run(polluting))
+        scratch_outputs, scratch_s, scratch_active, scratch_peak = _timed(
+            lambda: run(scratch)
+        )
+        exact = all(
+            bool(mx.all(left == right).item())
+            for left, right in zip(
+                polluting_outputs, scratch_outputs, strict=True
+            )
+        )
+        return {
+            "exact": exact,
+            "polluting_ms": polluting_s * 1000,
+            "scratch_ms": scratch_s * 1000,
+            "speedup": polluting_s / scratch_s,
+            "polluting_loads": polluting.stats.cold_loads,
+            "scratch_loads": scratch.stats.cold_loads,
+            "polluting_evictions": polluting.stats.evictions,
+            "scratch_evictions": scratch.stats.evictions,
+            "scratch_peak_delta_mib": (scratch_peak - scratch_active) / 1024**2,
+        }
+    finally:
+        for reader in readers:
+            reader.close()
+
+
+def _resident_slot_sort_benchmark(
+    index: SafetensorExpertIndex,
+    *,
+    experts: int,
+    hidden: int,
+    top_k: int,
+    tokens: int,
+    samples: int = 5,
+) -> dict[str, Any]:
+    readers = [ExpertReader(index), ExpertReader(index)]
+    unsorted = _pool(
+        index,
+        readers[0],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+        sort_prefill=False,
+    )
+    sorted_pool = _pool(
+        index,
+        readers[1],
+        experts=experts,
+        top_k=top_k,
+        cache_slots=128,
+        sort_prefill=True,
+    )
+    try:
+        _preload(unsorted, 128)
+        _preload(sorted_pool, 128)
+        x = mx.random.normal((1, tokens, hidden)).astype(mx.float16)
+        indices_np = np.fromfunction(
+            lambda _batch, token, route: (token * 37 + route * 17) % 128,
+            (1, tokens, top_k),
+            dtype=int,
+        ).astype(np.int32)
+        indices = mx.array(indices_np)
+        scores = mx.full(
+            (1, tokens, top_k), 1.0 / top_k, dtype=mx.float16
+        )
+
+        def run(pool: StreamingSwitchGLU) -> mx.array:
+            return pool(x, indices, scores=scores, weighted_sum=True)
+
+        mx.eval(run(unsorted), run(sorted_pool))
+        unsorted_samples: list[float] = []
+        sorted_samples: list[float] = []
+        unsorted_output = sorted_output = None
+        for _ in range(samples):
+            unsorted_output, elapsed, _, _ = _timed(lambda: run(unsorted))
+            unsorted_samples.append(elapsed)
+            sorted_output, elapsed, _, _ = _timed(lambda: run(sorted_pool))
+            sorted_samples.append(elapsed)
+
+        delta = mx.abs(
+            sorted_output.astype(mx.float32) - unsorted_output.astype(mx.float32)
+        )
+        baseline = mx.abs(unsorted_output.astype(mx.float32))
+        mx.eval(delta, baseline)
+        unsorted_median = statistics.median(unsorted_samples)
+        sorted_median = statistics.median(sorted_samples)
+        return {
+            "tokens": tokens,
+            "samples": samples,
+            "all_finite": bool(mx.all(mx.isfinite(sorted_output)).item()),
+            "max_abs_delta_from_unsorted": float(delta.max().item()),
+            "mean_abs_delta_from_unsorted": float(delta.mean().item()),
+            "mean_abs_output": float(baseline.mean().item()),
+            "unsorted_tokens_per_second": tokens / unsorted_median,
+            "sorted_tokens_per_second": tokens / sorted_median,
+            "speedup": unsorted_median / sorted_median,
+            "sorted_groups": sorted_pool.stats.sorted_prefill_groups,
+            "sorted_qmm_calls": sorted_pool.stats.sorted_qmm_calls,
+        }
+    finally:
+        for reader in readers:
+            reader.close()
 
 
 def _promotion_benchmark(
@@ -704,6 +932,27 @@ def main() -> None:
                 "top_k": args.top_k,
             },
             "lazy_promotion": _promotion_benchmark(
+                index,
+                experts=args.experts,
+                hidden=args.hidden,
+                top_k=args.top_k,
+            ),
+            "resident_gate_up_fusion": _gate_up_fusion_benchmark(
+                index,
+                experts=args.experts,
+                hidden=args.hidden,
+                top_k=args.top_k,
+                tokens=args.prefill_tokens,
+                repeats=max(2, args.prefill_repeats),
+            ),
+            "resident_physical_slot_sort": _resident_slot_sort_benchmark(
+                index,
+                experts=args.experts,
+                hidden=args.hidden,
+                top_k=args.top_k,
+                tokens=args.prefill_tokens,
+            ),
+            "scratch_cache_preservation": _scratch_preservation_benchmark(
                 index,
                 experts=args.experts,
                 hidden=args.hidden,

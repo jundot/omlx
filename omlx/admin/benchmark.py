@@ -656,9 +656,14 @@ _EXPERT_STREAMING_DELTA_FIELDS = (
     "loads",
     "pinned_loads",
     "cold_loads",
+    "scratch_loads",
+    "scratch_prefetch_requests",
     "warm_start_loads",
     "expert_major_calls",
     "qmm_calls",
+    "sorted_prefill_groups",
+    "sorted_prefill_routes",
+    "sorted_qmm_calls",
     "speculative_routes",
     "speculative_misses",
     "hotness_decays",
@@ -672,16 +677,22 @@ _EXPERT_STREAMING_DELTA_FIELDS = (
     "ssd_decode_seconds",
     "bank_bind_seconds",
     "bank_materialize_seconds",
+    "scratch_prefetch_wait_seconds",
+    "scratch_mlx_materialize_seconds",
 )
 
 _EXPERT_STREAMING_CONFIG_FIELDS = (
     "cache_budget_bytes",
     "cache_slots_per_layer",
+    "scratch_budget_bytes",
+    "scratch_slots_per_layer",
     "layer_count",
     "resident_experts",
     "resident_capacity",
     "execution_bank_slots",
     "execution_banks_per_layer",
+    "fused_gate_up",
+    "sorted_prefill",
     "substitution_threshold_percent",
     "streaming_mode",
     "cache_policy",
@@ -2123,18 +2134,24 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             if isinstance(streaming_metrics, dict):
                 logger.info(
                     "[benchmark-expert-streaming] pp=%d slots=%s "
-                    "execution_bank=%s banks=%s hit_rate=%.4f hits=%d "
+                    "scratch=%s execution_bank=%s banks=%s fused_gate_up=%s "
+                    "hit_rate=%.4f hits=%d "
                     "misses=%d evictions=%d loads=%d ssd_bytes=%d "
                     "ssd_io_ms=%.3f decode_ms=%.3f bind_ms=%.3f "
-                    "materialize_ms=%.3f expert_major=%d qmm_calls=%d "
+                    "materialize_ms=%.3f scratch_wait_ms=%.3f "
+                    "scratch_mlx_ms=%.3f "
+                    "expert_major=%d qmm_calls=%d sorted_groups=%d "
+                    "sorted_routes=%d sorted_qmm=%d "
                     "resident_fill=%.4f hotlist_preloaded=%s "
                     "optimistic_preloaded=%s hotlist_fill=%.4f "
                     "startup_fill=%.4f metal_start_gib=%.3f "
                     "metal_end_gib=%.3f metal_peak_gib=%.3f",
                     pp_len,
                     streaming_metrics.get("cache_slots_per_layer"),
+                    streaming_metrics.get("scratch_slots_per_layer"),
                     streaming_metrics.get("execution_bank_slots"),
                     streaming_metrics.get("execution_banks_per_layer"),
+                    streaming_metrics.get("fused_gate_up"),
                     float(streaming_metrics.get("hit_rate", 1.0) or 0.0),
                     int(streaming_metrics.get("pinned_hits", 0) or 0)
                     + int(streaming_metrics.get("cache_hits", 0) or 0),
@@ -2157,8 +2174,23 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                         or 0.0
                     )
                     * 1000.0,
+                    float(
+                        streaming_metrics.get("scratch_prefetch_wait_seconds", 0.0)
+                        or 0.0
+                    )
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get(
+                            "scratch_mlx_materialize_seconds", 0.0
+                        )
+                        or 0.0
+                    )
+                    * 1000.0,
                     int(streaming_metrics.get("expert_major_calls", 0) or 0),
                     int(streaming_metrics.get("qmm_calls", 0) or 0),
+                    int(streaming_metrics.get("sorted_prefill_groups", 0) or 0),
+                    int(streaming_metrics.get("sorted_prefill_routes", 0) or 0),
+                    int(streaming_metrics.get("sorted_qmm_calls", 0) or 0),
                     float(streaming_metrics.get("resident_fill_rate", 1.0) or 0.0),
                     streaming_metrics.get("hotlist_preloaded"),
                     streaming_metrics.get("optimistic_preloaded"),

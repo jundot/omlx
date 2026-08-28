@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "Manifeste des experts épinglés",
   "modal.model_settings.expert_cache": "Experts actifs par couche",
   "modal.model_settings.expert_cache_hint": "Mémoire supplémentaire pour les experts non épinglés fréquemment utilisés.",
+  "modal.model_settings.expert_scratch": "Banque d’exécution froide",
+  "modal.model_settings.expert_scratch_hint": "Emplacements préalloués supplémentaires pour regrouper les experts froids sans évincer le cache actif.",
   "modal.model_settings.expert_substitution_threshold": "Seuil de substitution résidente (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Autorise un expert résident à remplacer un expert froid si son poids de routage est dans ce pourcentage. 0 conserve le routage exact.",
   "modal.model_settings.expert_execution_policy": "Mode d’exécution",

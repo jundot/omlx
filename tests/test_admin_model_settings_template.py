@@ -167,6 +167,8 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_test",
         "modal.model_settings.qwen_ane_tune_throughput",
         "modal.model_settings.qwen_ane_tail_padding",
+        "modal.model_settings.expert_scratch",
+        "modal.model_settings.expert_scratch_hint",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -202,6 +204,17 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     assert 'placeholder="0.53"' in html
     assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
+
+
+def test_expert_streaming_cold_execution_bank_is_fully_wired():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    field = "expert_streaming_scratch_experts"
+
+    assert f'modelSettings.{field}' in html
+    assert script.count(f"{field}:") >= 2
+    assert f"s.{field} ?? 32" in script
+    assert f"Number(this.modelSettings.{field}) || 0" in script
 
 
 def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():

@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "Manifesto de especialistas fixados",
   "modal.model_settings.expert_cache": "Especialistas ativos por camada",
   "modal.model_settings.expert_cache_hint": "Memória extra para especialistas não fixados usados com frequência.",
+  "modal.model_settings.expert_scratch": "Banco de execução fria",
+  "modal.model_settings.expert_scratch_hint": "Slots pré-alocados adicionais para agrupar especialistas frios sem expulsar o cache ativo.",
   "modal.model_settings.expert_substitution_threshold": "Limite de substituição residente (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Permite substituir um especialista frio por um residente quando o peso do roteador estiver dentro desta porcentagem. 0 mantém o roteamento exato.",
   "modal.model_settings.expert_execution_policy": "Modo de execução",

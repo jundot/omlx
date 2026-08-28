@@ -994,6 +994,26 @@ private struct ExpertStreamingSection: View {
                 }
 
                 Row(
+                    label: String(localized: "settings.expert_streaming.scratch.label",
+                                  defaultValue: "Cold Execution Bank",
+                                  comment: "Row label for SSD expert streaming scratch size"),
+                    sublabel: String(localized: "settings.expert_streaming.scratch.sub",
+                                     defaultValue: "Extra preallocated slots that batch cold experts without evicting the hot cache.",
+                                     comment: "Sublabel for SSD expert streaming scratch size")
+                ) {
+                    TextInput(
+                        text: vm.bindProfile($vm.expertStreamingScratchExperts),
+                        isNumeric: true,
+                        range: 0...512,
+                        step: 1,
+                        suffix: String(localized: "settings.expert_streaming.cache.suffix",
+                                       defaultValue: "experts",
+                                       comment: "Unit suffix for SSD expert streaming scratch size"),
+                        width: 150
+                    )
+                }
+
+                Row(
                     label: String(localized: "settings.expert_streaming.threshold.label",
                                   defaultValue: "Substitution Threshold",
                                   comment: "Row label for SSD expert substitution threshold"),
@@ -1018,7 +1038,7 @@ private struct ExpertStreamingSection: View {
                                       defaultValue: "Projected Resident Memory",
                                       comment: "Row label for projected SSD expert streaming memory use"),
                         sublabel: String(localized: "settings.expert_streaming.resident.sub",
-                                         defaultValue: "Pinned experts, PLE, and configured hot-cache slots.",
+                                         defaultValue: "Pinned experts, PLE, hot-cache slots, and the cold execution bank.",
                                          comment: "Sublabel for projected SSD expert streaming memory use"),
                         isLast: true
                     ) {

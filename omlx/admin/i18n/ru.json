@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "Манифест закреплённых экспертов",
   "modal.model_settings.expert_cache": "Горячих экспертов на слой",
   "modal.model_settings.expert_cache_hint": "Дополнительная память для часто используемых незакреплённых экспертов.",
+  "modal.model_settings.expert_scratch": "Банк холодного выполнения",
+  "modal.model_settings.expert_scratch_hint": "Дополнительные заранее выделенные слоты для пакетной обработки холодных экспертов без вытеснения горячего кэша.",
   "modal.model_settings.expert_substitution_threshold": "Порог замены резидентным экспертом (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Разрешает замену холодного эксперта резидентным, если вес маршрутизации отличается не более чем на этот процент. 0 сохраняет точную маршрутизацию.",
   "modal.model_settings.expert_execution_policy": "Режим выполнения",

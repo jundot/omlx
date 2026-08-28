@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "전문가 고정 매니페스트",
   "modal.model_settings.expert_cache": "레이어당 핫 전문가 수",
   "modal.model_settings.expert_cache_hint": "자주 사용하는 비고정 전문가를 위한 추가 메모리입니다.",
+  "modal.model_settings.expert_scratch": "콜드 실행 뱅크",
+  "modal.model_settings.expert_scratch_hint": "핫 캐시를 축출하지 않고 콜드 전문가를 일괄 처리하는 추가 사전 할당 슬롯입니다.",
   "modal.model_settings.expert_substitution_threshold": "상주 전문가 대체 임계값(%)",
   "modal.model_settings.expert_substitution_threshold_hint": "라우터 가중치 차이가 이 비율 이내이면 콜드 전문가를 상주 전문가로 대체합니다. 0은 정확한 라우팅을 유지합니다.",
   "modal.model_settings.expert_execution_policy": "실행 모드",

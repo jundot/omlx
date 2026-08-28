@@ -9,7 +9,7 @@ import re
 import struct
 import time
 from collections.abc import Hashable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -436,11 +436,21 @@ class SafetensorExpertIndex:
 class ExpertReader:
     """Read selected expert rows with ``pread`` and bounded parallelism."""
 
-    def __init__(self, index: SafetensorExpertIndex, workers: int = 9):
+    def __init__(
+        self,
+        index: SafetensorExpertIndex,
+        workers: int = 9,
+        *,
+        cold_max_gap_bytes: int = 64 * 1024,
+    ):
         self.index = index
+        self.cold_max_gap_bytes = max(0, int(cold_max_gap_bytes))
         self._fds: dict[tuple[Path, bool], int] = {}
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, workers), thread_name_prefix="expert-ssd"
+        )
+        self._request_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="expert-prefetch"
         )
         self.bytes_read = 0
         self.direct_bytes_read = 0
@@ -501,7 +511,7 @@ class ExpertReader:
         location: TensorLocation,
         expert_ids: list[int] | tuple[int, ...],
         *,
-        max_gap_bytes: int = 0,
+        max_gap_bytes: int | None = None,
         use_file_cache: bool = False,
     ) -> mx.array:
         return self.read_many(
@@ -511,20 +521,22 @@ class ExpertReader:
             use_file_cache=use_file_cache,
         )["rows"]
 
-    def read_many(
+    def _read_many_numpy(
         self,
         locations: Mapping[Hashable, TensorLocation],
         expert_ids: list[int] | tuple[int, ...],
         *,
-        max_gap_bytes: int = 0,
+        max_gap_bytes: int | None = None,
         use_file_cache: bool = False,
-    ) -> dict[Hashable, mx.array]:
-        """Read several expert components through one flat parallel I/O queue."""
+    ) -> dict[Hashable, np.ndarray]:
+        """Read and decode components without creating thread-bound MLX arrays."""
 
         requested = [int(value) for value in expert_ids]
         if not requested:
             raise ValueError("At least one expert row must be requested")
         rows = sorted(set(requested))
+        if max_gap_bytes is None:
+            max_gap_bytes = self.cold_max_gap_bytes if use_file_cache else 0
         tasks: list[
             tuple[Hashable, TensorLocation, int, int, int, TensorRowSource | None]
         ] = []
@@ -579,7 +591,7 @@ class ExpertReader:
             grouped[key].append((first, payload))
 
         decode_started = time.perf_counter()
-        result: dict[Hashable, mx.array] = {}
+        result: dict[Hashable, np.ndarray] = {}
         for key, location in locations.items():
             row_shape = location.shape[1:]
             dtype = _NUMPY_DTYPES[location.dtype]
@@ -605,17 +617,66 @@ class ExpertReader:
                     if first <= row < first + count:
                         selected[row] = values[row - first]
             output = np.stack([selected[row] for row in requested])
-            array = mx.array(output)
-            if location.dtype == "BF16":
-                array = array.view(mx.bfloat16)
-            result[key] = array
+            result[key] = output
         self.decode_seconds += time.perf_counter() - decode_started
         return result
+
+    @staticmethod
+    def materialize_many(
+        locations: Mapping[Hashable, TensorLocation],
+        components: Mapping[Hashable, np.ndarray],
+    ) -> dict[Hashable, mx.array]:
+        """Create MLX arrays on the caller's inference thread."""
+
+        result: dict[Hashable, mx.array] = {}
+        for key, output in components.items():
+            array = mx.array(output)
+            if locations[key].dtype == "BF16":
+                array = array.view(mx.bfloat16)
+            result[key] = array
+        return result
+
+    def read_many(
+        self,
+        locations: Mapping[Hashable, TensorLocation],
+        expert_ids: list[int] | tuple[int, ...],
+        *,
+        max_gap_bytes: int | None = None,
+        use_file_cache: bool = False,
+    ) -> dict[Hashable, mx.array]:
+        """Read components and materialize them on the calling thread."""
+
+        components = self._read_many_numpy(
+            locations,
+            expert_ids,
+            max_gap_bytes=max_gap_bytes,
+            use_file_cache=use_file_cache,
+        )
+        return self.materialize_many(locations, components)
+
+    def read_many_async(
+        self,
+        locations: Mapping[Hashable, TensorLocation],
+        expert_ids: list[int] | tuple[int, ...],
+        *,
+        max_gap_bytes: int | None = None,
+        use_file_cache: bool = False,
+    ) -> Future[dict[Hashable, np.ndarray]]:
+        """Submit bounded CPU-only I/O and decoding for Metal overlap."""
+
+        return self._request_pool.submit(
+            self._read_many_numpy,
+            locations,
+            expert_ids,
+            max_gap_bytes=max_gap_bytes,
+            use_file_cache=use_file_cache,
+        )
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._request_pool.shutdown(wait=True, cancel_futures=True)
         self._pool.shutdown(wait=True, cancel_futures=True)
         for fd in self._fds.values():
             os.close(fd)

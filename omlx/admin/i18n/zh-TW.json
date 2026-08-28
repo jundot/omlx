@@ -1141,6 +1141,8 @@
   "modal.model_settings.expert_manifest": "專家固定清單",
   "modal.model_settings.expert_cache": "每層熱門專家數",
   "modal.model_settings.expert_cache_hint": "提供給常用非固定專家的額外記憶體。",
+  "modal.model_settings.expert_scratch": "冷專家執行區",
+  "modal.model_settings.expert_scratch_hint": "額外預先配置的插槽，可批次執行冷專家而不逐出熱門快取。",
   "modal.model_settings.expert_substitution_threshold": "常駐專家替換閾值（%）",
   "modal.model_settings.expert_substitution_threshold_hint": "當路由權重差在此百分比內時，允許常駐專家替換冷專家。0 會保留精確路由。",
   "modal.model_settings.expert_execution_policy": "執行模式",
