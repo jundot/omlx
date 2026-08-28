@@ -155,6 +155,7 @@
                     web_search_content_max_chars: 20000,
                 },
                 ui: { language: 'en' },
+                quantization: { default_oq_dtype: 'float16' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -673,7 +674,7 @@
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqTextOnly: false,
-            oqDtype: 'bfloat16',
+            oqDtype: 'float16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
             oqMtpAssistantPath: '',
@@ -6612,6 +6613,10 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+                        if (data.quantization?.default_oq_dtype) {
+                            this.globalSettings.quantization = data.quantization;
+                            this.oqDtype = data.quantization.default_oq_dtype;
+                        }
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'

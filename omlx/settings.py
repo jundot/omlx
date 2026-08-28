@@ -813,6 +813,31 @@ class UISettings:
         return cls(language=data.get("language", "en"))
 
 
+def _default_oq_dtype() -> str:
+    from .utils.hardware import default_oq_dtype
+
+    return default_oq_dtype()
+
+
+@dataclass
+class QuantizationSettings:
+    """oQ / quantization defaults."""
+
+    default_oq_dtype: str = field(default_factory=_default_oq_dtype)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"default_oq_dtype": self.default_oq_dtype}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QuantizationSettings:
+        """Create from dictionary."""
+        dtype = data.get("default_oq_dtype")
+        if dtype not in ("bfloat16", "float16"):
+            dtype = _default_oq_dtype()
+        return cls(default_oq_dtype=dtype)
+
+
 @dataclass
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
@@ -958,9 +983,11 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    quantization: QuantizationSettings = field(default_factory=QuantizationSettings)
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    _persist_quantization_default: bool = field(default=False, init=False, repr=False)
 
     @classmethod
     def load(
@@ -994,6 +1021,15 @@ class GlobalSettings:
         if settings_file.exists():
             settings._load_from_file(settings_file)
             logger.debug(f"Loaded settings from {settings_file}")
+            if settings._persist_quantization_default:
+                try:
+                    settings.save()
+                except OSError as exc:
+                    logger.warning(
+                        "Could not persist chip-aware oQ default to %s: %s",
+                        settings_file,
+                        exc,
+                    )
 
         # Apply environment variable overrides
         settings._apply_env_overrides()
@@ -1054,6 +1090,12 @@ class GlobalSettings:
                 self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "quantization" in data:
+                self.quantization = QuantizationSettings.from_dict(data["quantization"])
+                self._persist_quantization_default = False
+            else:
+                self.quantization = QuantizationSettings()
+                self._persist_quantization_default = True
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
@@ -1099,6 +1141,17 @@ class GlobalSettings:
             )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
+
+        if default_oq_dtype := os.getenv("OMLX_DEFAULT_OQ_DTYPE"):
+            normalized = default_oq_dtype.strip().lower()
+            if normalized in ("bfloat16", "float16"):
+                self.quantization.default_oq_dtype = normalized
+            else:
+                logger.warning(
+                    "Invalid OMLX_DEFAULT_OQ_DTYPE value: %s "
+                    "(must be bfloat16 or float16)",
+                    default_oq_dtype,
+                )
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
@@ -1396,6 +1449,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "quantization": self.quantization.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
@@ -1549,6 +1603,11 @@ class GlobalSettings:
             errors.append(
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
+            )
+
+        if self.quantization.default_oq_dtype not in ("bfloat16", "float16"):
+            errors.append(
+                "quantization.default_oq_dtype must be 'bfloat16' or 'float16'"
             )
 
         # Cache validation
@@ -1749,6 +1808,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "quantization": self.quantization.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 

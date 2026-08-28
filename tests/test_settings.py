@@ -25,6 +25,7 @@ from omlx.settings import (
     MemorySettings,
     ModelSettings,
     NetworkSettings,
+    QuantizationSettings,
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
@@ -795,6 +796,58 @@ class TestMCPSettings:
         backups = list(tmp_path.glob("settings.json.corrupt-*"))
         assert len(backups) == 1
         assert "garbage-tail" in backups[0].read_text()
+
+
+class TestQuantizationSettings:
+    """Tests for chip-aware oQ quantization defaults."""
+
+    def test_defaults_use_hardware_dtype(self):
+        with patch("omlx.utils.hardware.default_oq_dtype", return_value="float16"):
+            settings = QuantizationSettings()
+            assert settings.default_oq_dtype == "float16"
+
+    def test_to_dict(self):
+        settings = QuantizationSettings(default_oq_dtype="bfloat16")
+        assert settings.to_dict() == {"default_oq_dtype": "bfloat16"}
+
+    def test_from_dict(self):
+        settings = QuantizationSettings.from_dict({"default_oq_dtype": "float16"})
+        assert settings.default_oq_dtype == "float16"
+
+    def test_from_dict_missing_uses_hardware_default(self):
+        with patch("omlx.utils.hardware.default_oq_dtype", return_value="bfloat16"):
+            settings = QuantizationSettings.from_dict({})
+            assert settings.default_oq_dtype == "bfloat16"
+
+    def test_global_settings_load_without_quantization_persists_default(
+        self, tmp_path
+    ):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.save()
+
+        settings_file = tmp_path / "settings.json"
+        data = json.loads(settings_file.read_text())
+        del data["quantization"]
+        settings_file.write_text(json.dumps(data))
+
+        with patch("omlx.utils.hardware.default_oq_dtype", return_value="float16"):
+            restored = GlobalSettings.load(base_path=tmp_path)
+
+        assert restored.quantization.default_oq_dtype == "float16"
+        persisted = json.loads(settings_file.read_text())
+        assert persisted["quantization"]["default_oq_dtype"] == "float16"
+
+    def test_global_settings_validate_rejects_invalid_dtype(self, tmp_path):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.quantization.default_oq_dtype = "fp16"
+        errors = gs.validate()
+        assert any("quantization.default_oq_dtype" in err for err in errors)
+
+    def test_env_override_default_oq_dtype(self, tmp_path):
+        gs = GlobalSettings(base_path=tmp_path)
+        with patch.dict(os.environ, {"OMLX_DEFAULT_OQ_DTYPE": "bfloat16"}):
+            gs._apply_env_overrides()
+        assert gs.quantization.default_oq_dtype == "bfloat16"
 
 
 class TestHuggingFaceSettings:
