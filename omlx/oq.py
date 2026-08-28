@@ -8381,6 +8381,14 @@ def _iter_streamed_layer_blocks(
         if lang_module is not None and lang_module.get_ple_runtime_mode() == "mmap":
             items = _qwen4_exp_drop_mmap_ple_shards(items, layer_idx)
         block = layer_cls(args, layer_idx)
+        # Freshly constructed modules default to training mode; loaded models
+        # run in eval mode. Layer implementations may branch on the flag
+        # (Qwen3.5-family GDN picks its fused kernel with
+        # use_kernel=not self.training), so a bare block left in training
+        # mode computes the scan on a different code path than the resident
+        # collector and serving do — measured as one-ulp bf16 divergence
+        # that flips borderline MoE routing choices.
+        block.eval()
         mode = _load_streamed_block_weights(block, items, layer_idx)
         del items
         mx.eval(block.parameters())
