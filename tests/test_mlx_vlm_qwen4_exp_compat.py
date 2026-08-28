@@ -513,6 +513,84 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.index_position_ids.shape[-1] == 4
 
 
+def _assert_ple_state_matches(actual_cache, expected_cache):
+    mx.eval(
+        actual_cache[2],
+        actual_cache[3],
+        expected_cache[2],
+        expected_cache[3],
+    )
+    assert mx.array_equal(actual_cache[3], expected_cache[3]).item()
+    assert mx.allclose(actual_cache[2], expected_cache[2], rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_rollback_keeps_only_committed_verify_prefix():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    verify_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    confirmed = mx.array([[5]], dtype=mx.int32)
+    draft = mx.array([[6]], dtype=mx.int32)
+    next_token = mx.array([[7]], dtype=mx.int32)
+    model(prefix, cache=verify_cache)
+    model(prefix, cache=replay_cache)
+
+    verified = model(
+        mx.concatenate([confirmed, draft], axis=1),
+        cache=verify_cache,
+        return_hidden=True,
+    )
+    model(confirmed, cache=replay_cache)
+    model.rollback_speculative_cache(
+        verify_cache,
+        verified.gdn_states,
+        accepted=0,
+        block_size=2,
+    )
+
+    _assert_ple_state_matches(verify_cache[0], replay_cache[0])
+    rolled_back = model(next_token, cache=verify_cache)
+    replayed = model(next_token, cache=replay_cache)
+    mx.eval(rolled_back.logits, replayed.logits)
+    assert mx.allclose(rolled_back.logits, replayed.logits, rtol=1e-3, atol=1e-3).item()
+
+
+def test_qwen4_ple_partial_rollback_and_accept_match_sequential_replay():
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    verify_tokens = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+
+    accepted_cache = model.make_cache()
+    sequential_cache = model.make_cache()
+    model(prefix, cache=accepted_cache)
+    model(prefix, cache=sequential_cache)
+    model(verify_tokens, cache=accepted_cache, return_hidden=True)
+    for token in (5, 6, 7, 8):
+        model(mx.array([[token]], dtype=mx.int32), cache=sequential_cache)
+    _assert_ple_state_matches(accepted_cache[0], sequential_cache[0])
+
+    partial_cache = model.make_cache()
+    replay_cache = model.make_cache()
+    model(prefix, cache=partial_cache)
+    model(prefix, cache=replay_cache)
+    verified = model(verify_tokens, cache=partial_cache, return_hidden=True)
+    for token in (5, 6, 7):
+        model(mx.array([[token]], dtype=mx.int32), cache=replay_cache)
+    model.rollback_speculative_cache(
+        partial_cache,
+        verified.gdn_states,
+        accepted=2,
+        block_size=4,
+    )
+
+    _assert_ple_state_matches(partial_cache[0], replay_cache[0])
+
 def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
