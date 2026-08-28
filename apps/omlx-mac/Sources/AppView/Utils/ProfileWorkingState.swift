@@ -140,6 +140,12 @@ enum ProfileSettingsKey {
     // Model-specific
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"
+    static let expertStreamingEnabled = "expert_streaming_enabled"
+    static let expertStreamingMode = "expert_streaming_mode"
+    static let expertStreamingManifest = "expert_streaming_manifest"
+    static let expertStreamingCacheExperts = "expert_streaming_cache_experts"
+    static let expertStreamingSubstitutionThresholdPercent = "expert_streaming_substitution_threshold_percent"
+    static let expertStreamingExecutionPolicy = "expert_streaming_execution_policy"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
     static let turboquantKvBits = "turboquant_kv_bits"
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"

@@ -17,7 +17,9 @@
 // Save / Cancel / Load Defaults buttons live as a top-right toolbar that
 // only does navigation back to Models.
 
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ModelSettingsScreen: View {
     let modelID: String
@@ -826,6 +828,18 @@ private struct AdvancedTab: View {
             }
         }
 
+        if !vm.isDiffusionModel, vm.model?.expertStreamingSupported == true {
+            SectionHeader(
+                String(localized: "settings.expert_streaming.section",
+                       defaultValue: "SSD Expert Streaming",
+                       comment: "Section header above SSD expert streaming model settings"),
+                subtitle: String(localized: "settings.expert_streaming.subtitle",
+                                 defaultValue: "Keep selected MoE experts resident and stream cold experts from SSD on demand.",
+                                 comment: "Subtitle for SSD expert streaming model settings")
+            )
+            ExpertStreamingSection(vm: vm, client: client)
+        }
+
         SectionHeader(
             String(localized: "settings.advanced.chat_template.section",
                    defaultValue: "Chat Template Kwargs",
@@ -856,6 +870,181 @@ private struct AdvancedTab: View {
                                  comment: "Subtitle for the Experimental settings section")
             )
             ExperimentalSection(vm: vm, client: client)
+        }
+    }
+}
+
+// MARK: - SSD Expert Streaming
+
+private struct ExpertStreamingSection: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    private var modeHint: String {
+        if vm.expertStreamingMode == "cache_only" {
+            return String(localized: "settings.expert_streaming.mode.cache_only.hint",
+                          defaultValue: "Start with no pinned experts; the analytical hot cache learns which experts to retain.",
+                          comment: "Hint for SSD expert streaming analytical cache-only mode")
+        }
+        return String(localized: "settings.expert_streaming.mode.soft_reap.hint",
+                      defaultValue: "Pin manifest-selected experts in memory and cache other frequently routed experts.",
+                      comment: "Hint for Soft-REAP manifest pinning mode")
+    }
+
+    var body: some View {
+        ListGroup {
+            Row(
+                label: String(localized: "settings.expert_streaming.enabled.label",
+                              defaultValue: "SSD Expert Streaming",
+                              comment: "Row label for the SSD expert streaming toggle"),
+                sublabel: String(localized: "settings.expert_streaming.enabled.sub",
+                                 defaultValue: "Reduce MoE memory use by keeping cold expert weights on SSD.",
+                                 comment: "Sublabel for the SSD expert streaming toggle"),
+                isLast: !vm.expertStreamingEnabled
+            ) {
+                Toggle("", isOn: vm.bindProfile($vm.expertStreamingEnabled))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+
+            if vm.expertStreamingEnabled {
+                Row(
+                    label: String(localized: "settings.expert_streaming.mode.label",
+                                  defaultValue: "Mode",
+                                  comment: "Row label for SSD expert streaming mode"),
+                    sublabel: modeHint
+                ) {
+                    Popup(
+                        selection: vm.bindProfile($vm.expertStreamingMode),
+                        width: 190,
+                        options: ModelSettingsScreenVM.expertStreamingModeOptions
+                    )
+                }
+
+                if vm.expertStreamingMode == "soft_reap" {
+                    Row(
+                        label: String(localized: "settings.expert_streaming.manifest.label",
+                                      defaultValue: "Soft-REAP Manifest",
+                                      comment: "Row label for the Soft-REAP expert manifest picker"),
+                        sublabel: vm.expertManifestSummary ?? String(
+                            localized: "settings.expert_streaming.manifest.sub",
+                            defaultValue: "A JSON file selecting the experts pinned in memory for each layer.",
+                            comment: "Sublabel for the Soft-REAP expert manifest picker"
+                        )
+                    ) {
+                        HStack(spacing: 8) {
+                            if !vm.expertManifestFileName.isEmpty {
+                                Text(vm.expertManifestFileName)
+                                    .font(.omlxMono(11, weight: .medium))
+                                    .foregroundStyle(theme.textSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 150)
+                            }
+                            if vm.expertManifestUploadInProgress {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Button(String(localized: "settings.expert_streaming.manifest.choose",
+                                              defaultValue: "Choose JSON…",
+                                              comment: "Button that opens the Soft-REAP expert manifest picker")) {
+                                    chooseManifest()
+                                }
+                                .buttonStyle(.omlx(.normal, size: .small))
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    label: String(localized: "settings.expert_streaming.cache.label",
+                                  defaultValue: "Hot Expert Cache",
+                                  comment: "Row label for SSD expert streaming cache size"),
+                    sublabel: String(localized: "settings.expert_streaming.cache.sub",
+                                     defaultValue: "Preallocated cache slots per layer for frequently used non-pinned experts.",
+                                     comment: "Sublabel for SSD expert streaming cache size")
+                ) {
+                    TextInput(
+                        text: vm.bindProfile($vm.expertStreamingCacheExperts),
+                        isNumeric: true,
+                        range: 0...512,
+                        step: 1,
+                        suffix: String(localized: "settings.expert_streaming.cache.suffix",
+                                       defaultValue: "experts",
+                                       comment: "Unit suffix for SSD expert streaming cache size"),
+                        width: 150
+                    )
+                }
+
+                Row(
+                    label: String(localized: "settings.expert_streaming.policy.label",
+                                  defaultValue: "Execution Policy",
+                                  comment: "Row label for SSD expert streaming execution policy"),
+                    sublabel: String(localized: "settings.expert_streaming.policy.sub",
+                                     defaultValue: "Speculative mode overlaps loading with execution; Checked prioritizes predictable correctness.",
+                                     comment: "Sublabel for SSD expert streaming execution policy")
+                ) {
+                    Popup(
+                        selection: vm.bindProfile($vm.expertStreamingExecutionPolicy),
+                        width: 145,
+                        options: ModelSettingsScreenVM.expertStreamingExecutionPolicyOptions
+                    )
+                }
+
+                Row(
+                    label: String(localized: "settings.expert_streaming.threshold.label",
+                                  defaultValue: "Substitution Threshold",
+                                  comment: "Row label for SSD expert substitution threshold"),
+                    sublabel: String(localized: "settings.expert_streaming.threshold.sub",
+                                     defaultValue: "Use a resident expert when its router weight is within this percentage of an unloaded choice. 0% disables substitution.",
+                                     comment: "Sublabel for SSD expert substitution threshold"),
+                    isLast: (vm.model?.expertStreamingResidentBytes ?? 0) <= 0
+                ) {
+                    TextInput(
+                        text: vm.bindProfile($vm.expertStreamingSubstitutionThresholdPercent),
+                        isNumeric: true,
+                        range: 0...100,
+                        step: 0.1,
+                        suffix: "%",
+                        width: 120
+                    )
+                }
+
+                if let bytes = vm.model?.expertStreamingResidentBytes, bytes > 0 {
+                    Row(
+                        label: String(localized: "settings.expert_streaming.resident.label",
+                                      defaultValue: "Projected Resident Memory",
+                                      comment: "Row label for projected SSD expert streaming memory use"),
+                        sublabel: String(localized: "settings.expert_streaming.resident.sub",
+                                         defaultValue: "Pinned experts, PLE, and configured hot-cache slots.",
+                                         comment: "Sublabel for projected SSD expert streaming memory use"),
+                        isLast: true
+                    ) {
+                        Text(formatBytes(bytes))
+                            .font(.omlxMono(12, weight: .semibold))
+                            .foregroundStyle(theme.text)
+                    }
+                }
+            }
+        }
+    }
+
+    private func chooseManifest() {
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "settings.expert_streaming.manifest.panel_title",
+                             defaultValue: "Choose Soft-REAP Expert Manifest",
+                             comment: "Title of the Soft-REAP expert manifest file picker")
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                await vm.uploadExpertManifest(url: url, client: client)
+            }
         }
     }
 }

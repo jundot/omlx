@@ -25,6 +25,7 @@ enum AdminAPI {
     static func loadModel(_ id: String) -> String   { "\(models)/\(id)/load" }
     static func unloadModel(_ id: String) -> String { "\(models)/\(id)/unload" }
     static func modelSettings(_ id: String) -> String { "\(models)/\(id)/settings" }
+    static func expertManifest(_ id: String) -> String { "\(models)/\(id)/expert-manifest" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }

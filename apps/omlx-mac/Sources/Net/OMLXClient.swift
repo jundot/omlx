@@ -148,6 +148,32 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    func uploadExpertManifest(
+        id: String,
+        fileName: String,
+        data: Data
+    ) async throws -> ExpertManifestUploadResponse {
+        let boundary = "omlx-\(UUID().uuidString)"
+        let safeFileName = fileName
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\"", with: "_")
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"\(safeFileName)\"\r\n".utf8
+        ))
+        body.append(Data("Content-Type: application/json\r\n\r\n".utf8))
+        body.append(data)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        return try await request(
+            "POST",
+            path: AdminAPI.expertManifest(id),
+            body: body,
+            contentType: "multipart/form-data; boundary=\(boundary)"
+        )
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }
@@ -543,6 +569,7 @@ final class OMLXClient: ObservableObject {
         path: String,
         query: [URLQueryItem] = [],
         body: Data?,
+        contentType: String? = nil,
         isRetry: Bool = false
     ) async throws -> T {
         var components = URLComponents()
@@ -557,7 +584,7 @@ final class OMLXClient: ObservableObject {
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil {
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(contentType ?? "application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
         }
 
@@ -569,7 +596,14 @@ final class OMLXClient: ObservableObject {
                 throw OMLXClientError.unauthenticated
             }
             try await login(apiKey: key)
-            return try await request(method, path: path, query: query, body: body, isRetry: true)
+            return try await request(
+                method,
+                path: path,
+                query: query,
+                body: body,
+                contentType: contentType,
+                isRetry: true
+            )
         }
 
         guard 200..<300 ~= http.statusCode else {

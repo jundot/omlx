@@ -260,6 +260,95 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
+    func testExpertStreamingDefaultsAndOptions() {
+        let vm = ModelSettingsScreenVM()
+
+        XCTAssertFalse(vm.expertStreamingEnabled)
+        XCTAssertEqual(vm.expertStreamingMode, "soft_reap")
+        XCTAssertEqual(vm.expertStreamingCacheExperts, "32")
+        XCTAssertEqual(vm.expertStreamingSubstitutionThresholdPercent, "0")
+        XCTAssertEqual(vm.expertStreamingExecutionPolicy, "checked")
+        XCTAssertEqual(
+            ModelSettingsScreenVM.expertStreamingModeOptions.map(\.0),
+            ["soft_reap", "cache_only"]
+        )
+        XCTAssertEqual(
+            ModelSettingsScreenVM.expertStreamingExecutionPolicyOptions.map(\.0),
+            ["checked", "speculative"]
+        )
+    }
+
+    func testExpertStreamingWireKeysDecodeAndEncode() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"""
+            {
+              "expert_streaming_enabled": true,
+              "expert_streaming_mode": "soft_reap",
+              "expert_streaming_manifest": "/tmp/manifest.json",
+              "expert_streaming_cache_experts": 48,
+              "expert_streaming_substitution_threshold_percent": 2.5,
+              "expert_streaming_execution_policy": "speculative"
+            }
+            """#.utf8)
+        )
+        XCTAssertEqual(dto.expertStreamingEnabled, true)
+        XCTAssertEqual(dto.expertStreamingMode, "soft_reap")
+        XCTAssertEqual(dto.expertStreamingManifest, "/tmp/manifest.json")
+        XCTAssertEqual(dto.expertStreamingCacheExperts, 48)
+        XCTAssertEqual(dto.expertStreamingSubstitutionThresholdPercent, 2.5)
+        XCTAssertEqual(dto.expertStreamingExecutionPolicy, "speculative")
+
+        var patch = ModelSettingsPatch()
+        patch.expertStreamingEnabled = true
+        patch.expertStreamingMode = "cache_only"
+        patch.expertStreamingCacheExperts = 64
+        patch.expertStreamingSubstitutionThresholdPercent = 1.25
+        patch.expertStreamingExecutionPolicy = "checked"
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
+        XCTAssertEqual(object?["expert_streaming_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["expert_streaming_mode"] as? String, "cache_only")
+        XCTAssertEqual(object?["expert_streaming_cache_experts"] as? Int, 64)
+        XCTAssertEqual(object?["expert_streaming_substitution_threshold_percent"] as? Double, 1.25)
+        XCTAssertEqual(object?["expert_streaming_execution_policy"] as? String, "checked")
+    }
+
+    func testSoftReapSettingsAreIncludedInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.expertStreamingEnabled = true
+        vm.expertStreamingMode = "soft_reap"
+        vm.expertStreamingManifest = "/manifests/qwen.json"
+        vm.expertStreamingCacheExperts = "40"
+        vm.expertStreamingSubstitutionThresholdPercent = "3.5"
+        vm.expertStreamingExecutionPolicy = "speculative"
+
+        let settings = vm.currentSettingsDict()
+
+        XCTAssertEqual(settings["expert_streaming_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["expert_streaming_mode"]?.value as? String, "soft_reap")
+        XCTAssertEqual(settings["expert_streaming_manifest"]?.value as? String, "/manifests/qwen.json")
+        XCTAssertEqual(settings["expert_streaming_cache_experts"]?.value as? Int, 40)
+        XCTAssertEqual(settings["expert_streaming_substitution_threshold_percent"]?.value as? Double, 3.5)
+        XCTAssertEqual(settings["expert_streaming_execution_policy"]?.value as? String, "speculative")
+    }
+
+    func testCacheOnlyProfileDoesNotPersistManifest() {
+        let vm = ModelSettingsScreenVM()
+        vm.expertStreamingEnabled = true
+        vm.expertStreamingMode = "cache_only"
+        vm.expertStreamingManifest = "/manifests/old.json"
+
+        let settings = vm.currentSettingsDict()
+
+        XCTAssertEqual(settings["expert_streaming_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["expert_streaming_mode"]?.value as? String, "cache_only")
+        XCTAssertNil(settings["expert_streaming_manifest"])
+    }
+
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -367,6 +456,8 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
+            expertStreamingSupported: nil,
+            expertStreamingResidentBytes: nil,
             virtual: nil,
             settings: nil
         )
