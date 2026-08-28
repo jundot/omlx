@@ -10,6 +10,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.switch_layers import SwiGLU
 
+from omlx.expert_streaming.adapters import discover_moe_layers
 from omlx.expert_streaming.execution import CacheSnapshot, SpeculativeExecution
 from omlx.expert_streaming.integrate import install_expert_streaming
 from omlx.expert_streaming.manifest import (
@@ -71,6 +72,98 @@ def _reference(full, x, indices):
     up = projection("up_proj", expanded)
     gate = projection("gate_proj", expanded)
     return projection("down_proj", SwiGLU()(up, gate)).squeeze(-2)
+
+
+def _quantized_projection(dense, *, group_size, bits, mode):
+    weight, scales, *biases = mx.quantize(
+        dense, group_size=group_size, bits=bits, mode=mode
+    )
+    return SimpleNamespace(
+        weight=weight,
+        scales=scales,
+        biases=biases[0] if biases else None,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+
+
+def _family_checkpoint(
+    path: Path,
+    *,
+    container: str,
+    fragmented: bool = False,
+    fused_gate_up: bool = False,
+):
+    experts = 4
+    projections = {}
+    for name, output, inputs in (
+        ("gate_proj", 32, 64),
+        ("up_proj", 32, 64),
+        ("down_proj", 64, 32),
+    ):
+        dense = mx.random.normal((experts, output, inputs)).astype(mx.float16)
+        projections[name] = _quantized_projection(
+            dense, group_size=32, bits=4, mode="mxfp4"
+        )
+    tensors = {}
+    if fused_gate_up:
+        gate = projections["gate_proj"]
+        up = projections["up_proj"]
+        fused = SimpleNamespace(
+            weight=mx.concatenate([gate.weight, up.weight], axis=1),
+            scales=mx.concatenate([gate.scales, up.scales], axis=1),
+            biases=None,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        modules = {"gate_up_proj": fused, "down_proj": projections["down_proj"]}
+    else:
+        modules = projections
+    if fragmented:
+        aliases = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        for projection, module in projections.items():
+            for expert in range(experts):
+                prefix = (
+                    f"model.layers.1.{container}.experts.{expert}."
+                    f"{aliases[projection]}"
+                )
+                tensors[f"{prefix}.weight"] = module.weight[expert]
+                tensors[f"{prefix}.scale"] = module.scales[expert]
+    else:
+        for projection, module in modules.items():
+            prefix = f"model.layers.1.{container}.switch_mlp.{projection}"
+            tensors[f"{prefix}.weight"] = module.weight
+            tensors[f"{prefix}.scales"] = module.scales
+    shard = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(path / shard), tensors, metadata={"format": "mlx"})
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: shard for key in tensors}})
+    )
+    return projections, modules
+
+
+def _family_reference(projections, x, indices):
+    expanded = mx.expand_dims(x, (-2, -3))
+
+    def project(name, value):
+        module = projections[name]
+        return mx.gather_qmm(
+            value,
+            module.weight,
+            module.scales,
+            module.biases,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=module.group_size,
+            bits=module.bits,
+            mode=module.mode,
+        )
+
+    up = project("up_proj", expanded)
+    gate = project("gate_proj", expanded)
+    return project("down_proj", SwiGLU()(up, gate)).squeeze(-2)
 
 
 def test_official_reap_layer_mapping_shape(tmp_path):
@@ -144,6 +237,97 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
         assert runtime.pools[0].pinned_count == 0
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("fragmented", "fused_gate_up"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_cross_family_ffn_mxfp4_streaming_is_exact(
+    tmp_path, fragmented, fused_gate_up
+):
+    projections, modules = _family_checkpoint(
+        tmp_path,
+        container="ffn",
+        fragmented=fragmented,
+        fused_gate_up=fused_gate_up,
+    )
+    switch = SimpleNamespace(activation=SwiGLU(), **modules)
+    moe = SimpleNamespace(
+        switch_mlp=switch,
+        gate=SimpleNamespace(top_k=2, num_experts=4),
+        config=SimpleNamespace(n_routed_experts=4, num_experts_per_tok=2),
+    )
+
+    class Model:
+        def __init__(self):
+            self.layers = [SimpleNamespace(ffn=object()), SimpleNamespace(ffn=moe)]
+
+        def __call__(self, inputs, cache=None):
+            del cache
+            return inputs
+
+    model = Model()
+    runtime = install_expert_streaming(
+        model,
+        tmp_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+    )
+    try:
+        assert [pool.layer for pool in runtime.pools] == [1]
+        assert runtime.manifest.layers == {1: ()}
+        pool = runtime.pools[0]
+        assert all(
+            "arrays" not in metadata
+            for metadata in pool.projection_metadata.values()
+        )
+        indices = mx.array([[[0, 3]]], dtype=mx.int32)
+        x = mx.random.normal((1, 1, 64)).astype(mx.float16)
+        output = pool(x, indices)
+        expected = _family_reference(projections, x, indices)
+        mx.eval(output, expected)
+        assert bool(mx.all(output == expected).item())
+
+        scores = mx.array([[[0.25, 0.75]]], dtype=mx.float32)
+        combined = pool(x, indices, scores=scores, weighted_sum=True)
+        expected_combined = (
+            expected * scores[..., None].astype(expected.dtype)
+        ).sum(-2)
+        mx.eval(combined, expected_combined)
+        assert bool(mx.all(combined == expected_combined).item())
+    finally:
+        runtime.close()
+
+
+def test_adapter_discovers_common_moe_geometry_and_skips_dense_layers():
+    projection = SimpleNamespace(
+        weight=mx.zeros((8, 4, 2), dtype=mx.uint32),
+        scales=mx.zeros((8, 4, 1), dtype=mx.float16),
+        biases=mx.zeros((8, 4, 1), dtype=mx.float16),
+    )
+    switch = SimpleNamespace(
+        gate_proj=projection,
+        up_proj=projection,
+        down_proj=projection,
+    )
+    moe = SimpleNamespace(
+        switch_mlp=switch,
+        num_experts_per_tok=3,
+        router=SimpleNamespace(num_experts=8),
+    )
+    model = SimpleNamespace(
+        layers=[SimpleNamespace(mlp=object()), SimpleNamespace(mlp=moe)]
+    )
+
+    targets = discover_moe_layers(model)
+
+    assert len(targets) == 1
+    assert targets[0].layer_id == 1
+    assert targets[0].container_name == "mlp"
+    assert targets[0].num_experts == 8
+    assert targets[0].top_k == 3
 
 
 def test_resident_substitution_uses_relative_router_threshold():

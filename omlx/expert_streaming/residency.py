@@ -72,29 +72,33 @@ def estimate_expert_streaming_residency(
     streaming_mode: str = "soft_reap",
 ) -> ExpertStreamingEstimate:
     path = Path(model_path).expanduser().resolve()
+    index = SafetensorExpertIndex(path)
+    layers = index.expert_layer_ids()
+    if not layers:
+        raise ValueError("Checkpoint contains no indexed routed-expert tensors")
     if streaming_mode == "soft_reap":
         if not manifest_path:
             raise ValueError("Soft-REAP mode requires an expert pin manifest")
         manifest = load_soft_reap_manifest(
             manifest_path,
-            num_layers=num_layers,
+            layer_ids=layers,
             num_experts=num_experts,
         )
     elif streaming_mode == "cache_only":
-        manifest = SoftReapManifest.empty(num_layers)
+        manifest = SoftReapManifest.empty(layer_ids=layers)
     else:
         raise ValueError("Expert streaming mode must be soft_reap or cache_only")
-    index = SafetensorExpertIndex(path)
-    layers = list(range(num_layers))
     checkpoint_bytes = sum(file.stat().st_size for file in path.glob("*.safetensors"))
-    streamed_tensor_bytes = index.tensor_bytes(layers)
+    streamed_tensor_bytes = sum(index.streamed_storage_bytes(layer) for layer in layers)
     fixed_bytes = max(0, checkpoint_bytes - streamed_tensor_bytes)
-    per_layer_expert_bytes = [index.expert_bytes(layer) for layer in layers]
+    per_layer_expert_bytes = {
+        layer: index.expert_storage_bytes(layer) for layer in layers
+    }
     pinned_bytes = sum(
         len(manifest.experts_for_layer(layer)) * per_layer_expert_bytes[layer]
         for layer in layers
     )
-    one_slot_all_layers = sum(per_layer_expert_bytes)
+    one_slot_all_layers = sum(per_layer_expert_bytes.values())
     requested_slots = max(0, int(cache_experts))
     minimum_slots = max(
         min(top_k, num_experts - len(manifest.experts_for_layer(layer)))

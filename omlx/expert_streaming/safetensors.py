@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 from collections.abc import Hashable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -19,10 +20,22 @@ PARTS = ("weight", "scales", "biases")
 
 _NUMPY_DTYPES = {
     "U32": np.uint32,
+    "U8": np.uint8,
+    "I8": np.int8,
     "F32": np.float32,
     "F16": np.float16,
     "BF16": np.uint16,
 }
+
+
+@dataclass(frozen=True)
+class TensorRowSource:
+    name: str
+    path: Path
+    dtype: str
+    shape: tuple[int, ...]
+    data_start: int
+    data_bytes: int
 
 
 @dataclass(frozen=True)
@@ -33,6 +46,11 @@ class TensorLocation:
     shape: tuple[int, ...]
     data_start: int
     row_bytes: int
+    storage_dtype: str | None = None
+    storage_shape: tuple[int, ...] | None = None
+    storage_row_bytes: int | None = None
+    row_sources: tuple[TensorRowSource, ...] | None = None
+    output_slice: tuple[int, int] | None = None
 
     @property
     def tensor_bytes(self) -> int:
@@ -52,7 +70,9 @@ class SafetensorExpertIndex:
         except (OSError, KeyError, json.JSONDecodeError) as exc:
             raise ValueError(f"Invalid safetensors index: {exc}") from exc
         self._headers: dict[str, tuple[int, dict]] = {}
-        self._layer_locations: dict[int, dict[tuple[str, str], TensorLocation]] = {}
+        self._layer_locations: dict[
+            tuple[int, str], dict[tuple[str, str], TensorLocation]
+        ] = {}
 
     def _header(self, filename: str) -> tuple[int, dict]:
         cached = self._headers.get(filename)
@@ -69,11 +89,284 @@ class SafetensorExpertIndex:
         self._headers[filename] = cached
         return cached
 
-    def layer(self, layer: int) -> dict[tuple[str, str], TensorLocation]:
-        cached = self._layer_locations.get(layer)
+    @staticmethod
+    def _mlx_dtype_name(array) -> str:
+        if array.dtype == mx.uint32:
+            return "U32"
+        if array.dtype == mx.uint8:
+            return "U8"
+        if array.dtype == mx.int8:
+            return "I8"
+        if array.dtype == mx.float32:
+            return "F32"
+        if array.dtype == mx.float16:
+            return "F16"
+        if array.dtype == mx.bfloat16:
+            return "BF16"
+        raise ValueError(f"Unsupported streamed MLX dtype: {array.dtype}")
+
+    @staticmethod
+    def _projection_aliases(projection: str) -> tuple[str, ...]:
+        aliases = {
+            "gate_proj": ("gate_proj", "w1"),
+            "down_proj": ("down_proj", "w2"),
+            "up_proj": ("up_proj", "w3"),
+        }
+        return aliases[projection]
+
+    @staticmethod
+    def _part_aliases(part: str) -> tuple[str, ...]:
+        return ("scales", "scale") if part == "scales" else (part,)
+
+    def _source(self, name: str, filename: str) -> TensorRowSource:
+        data_base, header = self._header(filename)
+        meta = header.get(name)
+        if meta is None:
+            raise ValueError(f"Tensor {name} is absent from {filename}")
+        dtype = str(meta["dtype"])
+        if dtype not in _NUMPY_DTYPES:
+            raise ValueError(f"Unsupported streamed tensor dtype {dtype}: {name}")
+        shape = tuple(int(value) for value in meta["shape"])
+        start, end = (int(value) for value in meta["data_offsets"])
+        return TensorRowSource(
+            name=name,
+            path=self.model_path / filename,
+            dtype=dtype,
+            shape=shape,
+            data_start=data_base + start,
+            data_bytes=end - start,
+        )
+
+    @staticmethod
+    def _is_backbone_expert_name(name: str, layer: int) -> bool:
+        if name.startswith("mtp.") or ".mtp." in name:
+            return False
+        if f"layers.{layer}." not in name or ".shared_experts." in name:
+            return False
+        return ".switch_mlp." in name or ".experts." in name
+
+    def expert_layer_ids(self) -> list[int]:
+        result: set[int] = set()
+        for name in self.weight_map:
+            if name.startswith("mtp.") or ".mtp." in name or ".shared_experts." in name:
+                continue
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.(?:mlp|ffn)\.", name)
+            if match and (".switch_mlp." in name or ".experts." in name):
+                result.add(int(match.group(1)))
+        return sorted(result)
+
+    def _tensor_storage_bytes(self, name: str, filename: str) -> int:
+        return self._source(name, filename).data_bytes
+
+    def streamed_storage_bytes(self, layer: int) -> int:
+        """Checkpoint bytes occupied by all routed tensors in one layer."""
+        names = [
+            (name, filename)
+            for name, filename in self.weight_map.items()
+            if self._is_backbone_expert_name(name, layer)
+        ]
+        stacked = [item for item in names if ".switch_mlp." in item[0]]
+        selected = stacked or [item for item in names if ".experts." in item[0]]
+        return sum(self._tensor_storage_bytes(*item) for item in selected)
+
+    def expert_storage_bytes(self, layer: int) -> int:
+        """Resident bytes for one routed expert, without loading payloads."""
+        total = self.streamed_storage_bytes(layer)
+        stacked_experts = None
+        for name, filename in self.weight_map.items():
+            if self._is_backbone_expert_name(name, layer) and ".switch_mlp." in name:
+                source = self._source(name, filename)
+                if source.shape:
+                    stacked_experts = source.shape[0]
+                    break
+        if stacked_experts:
+            return total // stacked_experts
+        expert_ids: set[int] = set()
+        marker = re.compile(rf"layers\.{layer}\.(?:mlp|ffn)\.experts\.(\d+)\.")
+        for name in self.weight_map:
+            match = marker.search(name)
+            if match and self._is_backbone_expert_name(name, layer):
+                expert_ids.add(int(match.group(1)))
+        if not expert_ids:
+            raise ValueError(f"Layer {layer} has no indexed routed experts")
+        return total // len(expert_ids)
+
+    def _stacked_location(
+        self,
+        *,
+        layer: int,
+        container_name: str,
+        projection: str,
+        part: str,
+        metadata: dict,
+        num_experts: int,
+    ) -> TensorLocation | None:
+        source_projection = str(metadata.get("source_projection", projection))
+        projection_names = [source_projection]
+        if source_projection == "gate_up_proj":
+            projection_names.extend(self._projection_aliases(projection))
+        else:
+            projection_names.extend(self._projection_aliases(projection))
+        seen: set[str] = set()
+        projection_names = [
+            value for value in projection_names if not (value in seen or seen.add(value))
+        ]
+        for name, filename in self.weight_map.items():
+            if name.startswith("mtp.") or ".mtp." in name:
+                continue
+            if f"layers.{layer}.{container_name}.switch_mlp." not in name:
+                continue
+            matched_projection = next(
+                (
+                    candidate
+                    for candidate in projection_names
+                    if any(
+                        name.endswith(f".{candidate}.{alias}")
+                        for alias in self._part_aliases(part)
+                    )
+                ),
+                None,
+            )
+            if matched_projection is None:
+                continue
+            source = self._source(name, filename)
+            if len(source.shape) < 2 or source.shape[0] != num_experts:
+                raise ValueError(f"Expert tensor is not row-addressable: {name}")
+            output_slice = None
+            logical_shape = tuple(int(v) for v in metadata["arrays"][part].shape)
+            if metadata.get("fused_half"):
+                logical_shape = (
+                    logical_shape[0],
+                    logical_shape[1] // 2,
+                    *logical_shape[2:],
+                )
+            if matched_projection == "gate_up_proj":
+                midpoint = source.shape[1] // 2
+                output_slice = (
+                    (0, midpoint)
+                    if metadata.get("fused_half") == "gate"
+                    else (midpoint, source.shape[1])
+                )
+            logical_dtype = self._mlx_dtype_name(metadata["arrays"][part])
+            logical_bytes = (
+                int(np.prod(logical_shape[1:]))
+                * np.dtype(_NUMPY_DTYPES[logical_dtype]).itemsize
+            )
+            return TensorLocation(
+                name=name,
+                path=source.path,
+                dtype=logical_dtype,
+                shape=logical_shape,
+                data_start=source.data_start,
+                row_bytes=logical_bytes,
+                storage_dtype=source.dtype,
+                storage_shape=source.shape,
+                storage_row_bytes=source.data_bytes // num_experts,
+                output_slice=output_slice,
+            )
+        return None
+
+    def _fragmented_location(
+        self,
+        *,
+        layer: int,
+        container_name: str,
+        projection: str,
+        part: str,
+        metadata: dict,
+        num_experts: int,
+    ) -> TensorLocation | None:
+        sources: list[TensorRowSource] = []
+        aliases = self._projection_aliases(projection)
+        for expert in range(num_experts):
+            marker = f"layers.{layer}.{container_name}.experts.{expert}."
+            found = None
+            for name, filename in self.weight_map.items():
+                if name.startswith("mtp.") or ".mtp." in name or marker not in name:
+                    continue
+                if any(
+                    name.endswith(f".{candidate}.{part_alias}")
+                    for candidate in aliases
+                    for part_alias in self._part_aliases(part)
+                ):
+                    found = self._source(name, filename)
+                    break
+            if found is None:
+                return None
+            sources.append(found)
+        logical_array = metadata["arrays"][part]
+        logical_dtype = self._mlx_dtype_name(logical_array)
+        logical_shape = tuple(int(value) for value in logical_array.shape)
+        if metadata.get("fused_half"):
+            logical_shape = (
+                logical_shape[0],
+                logical_shape[1] // 2,
+                *logical_shape[2:],
+            )
+        row_bytes = (
+            int(np.prod(logical_shape[1:]))
+            * np.dtype(_NUMPY_DTYPES[logical_dtype]).itemsize
+        )
+        for source in sources:
+            if source.data_bytes != row_bytes:
+                raise ValueError(
+                    f"Expert tensor {source.name} has {source.data_bytes} bytes; "
+                    f"expected {row_bytes}"
+                )
+        return TensorLocation(
+            name=f"layers.{layer}.{container_name}.experts.*.{projection}.{part}",
+            path=sources[0].path,
+            dtype=logical_dtype,
+            shape=logical_shape,
+            data_start=0,
+            row_bytes=row_bytes,
+            row_sources=tuple(sources),
+        )
+
+    def layer(
+        self,
+        layer: int,
+        *,
+        container_name: str = "mlp",
+        schema: dict[str, dict] | None = None,
+        num_experts: int | None = None,
+    ) -> dict[tuple[str, str], TensorLocation]:
+        cache_key = (layer, container_name)
+        cached = self._layer_locations.get(cache_key)
         if cached is not None:
             return cached
-        marker = f"layers.{layer}.mlp.switch_mlp."
+        if schema is not None:
+            if num_experts is None:
+                raise ValueError("A projection schema requires the expert count")
+            locations: dict[tuple[str, str], TensorLocation] = {}
+            for projection in PROJECTIONS:
+                metadata = schema[projection]
+                for part in metadata["parts"]:
+                    location = self._stacked_location(
+                        layer=layer,
+                        container_name=container_name,
+                        projection=projection,
+                        part=part,
+                        metadata=metadata,
+                        num_experts=num_experts,
+                    ) or self._fragmented_location(
+                        layer=layer,
+                        container_name=container_name,
+                        projection=projection,
+                        part=part,
+                        metadata=metadata,
+                        num_experts=num_experts,
+                    )
+                    if location is None:
+                        raise ValueError(
+                            f"Layer {layer} lacks {container_name} expert tensor "
+                            f"{projection}.{part}"
+                        )
+                    locations[(projection, part)] = location
+            self._layer_locations[cache_key] = locations
+            return locations
+
+        marker = f"layers.{layer}.{container_name}.switch_mlp."
         locations: dict[tuple[str, str], TensorLocation] = {}
         for name, filename in self.weight_map.items():
             # MTP checkpoints can contain ``mtp.layers.0`` alongside the
@@ -111,14 +404,21 @@ class SafetensorExpertIndex:
                         shape=shape,
                         data_start=data_base + start,
                         row_bytes=total // shape[0],
+                        storage_dtype=dtype,
+                        storage_shape=shape,
+                        storage_row_bytes=total // shape[0],
                     )
-        required = {(projection, part) for projection in PROJECTIONS for part in PARTS}
+        required = {
+            (projection, part)
+            for projection in PROJECTIONS
+            for part in ("weight", "scales")
+        }
         missing = required - set(locations)
         if missing:
             raise ValueError(
                 f"Layer {layer} lacks stacked quantized expert tensors: {sorted(missing)}"
             )
-        self._layer_locations[layer] = locations
+        self._layer_locations[cache_key] = locations
         return locations
 
     def expert_bytes(self, layer: int) -> int:
@@ -209,22 +509,38 @@ class ExpertReader:
         if not requested:
             raise ValueError("At least one expert row must be requested")
         rows = sorted(set(requested))
-        tasks: list[tuple[Hashable, TensorLocation, int, int, int]] = []
+        tasks: list[
+            tuple[Hashable, TensorLocation, int, int, int, TensorRowSource | None]
+        ] = []
         for key, location in locations.items():
             if min(requested) < 0 or max(requested) >= location.shape[0]:
                 raise ValueError(f"Expert row outside tensor {location.name}")
-            fd = self._fd(location.path, use_file_cache=use_file_cache)
-            for first, stop in self._ranges(rows, location.row_bytes, max_gap_bytes):
-                tasks.append((key, location, fd, first, stop))
+            if location.row_sources is not None:
+                for row in rows:
+                    source = location.row_sources[row]
+                    fd = self._fd(source.path, use_file_cache=use_file_cache)
+                    tasks.append((key, location, fd, row, row + 1, source))
+            else:
+                fd = self._fd(location.path, use_file_cache=use_file_cache)
+                storage_row_bytes = location.storage_row_bytes or location.row_bytes
+                for first, stop in self._ranges(
+                    rows, storage_row_bytes, max_gap_bytes
+                ):
+                    tasks.append((key, location, fd, first, stop, None))
 
         def read_range(task) -> tuple[Hashable, int, bytes]:
-            key, location, fd, first, stop = task
-            size = (stop - first) * location.row_bytes
-            payload = os.pread(
-                fd, size, location.data_start + first * location.row_bytes
-            )
+            key, location, fd, first, stop, source = task
+            if source is not None:
+                size = source.data_bytes
+                offset = source.data_start
+            else:
+                storage_row_bytes = location.storage_row_bytes or location.row_bytes
+                size = (stop - first) * storage_row_bytes
+                offset = location.data_start + first * storage_row_bytes
+            payload = os.pread(fd, size, offset)
             if len(payload) != size:
-                raise OSError(f"Short expert read from {location.path.name}")
+                path = source.path if source is not None else location.path
+                raise OSError(f"Short expert read from {path.name}")
             return key, first, payload
 
         chunks = list(self._pool.map(read_range, tasks))
@@ -250,10 +566,22 @@ class ExpertReader:
             dtype = _NUMPY_DTYPES[location.dtype]
             selected: dict[int, np.ndarray] = {}
             for first, payload in grouped[key]:
-                count = len(payload) // location.row_bytes
-                values = np.frombuffer(payload, dtype=dtype).reshape(
-                    (count, *row_shape)
+                storage_row_bytes = location.storage_row_bytes or location.row_bytes
+                count = (
+                    1
+                    if location.row_sources is not None
+                    else len(payload) // storage_row_bytes
                 )
+                values = np.frombuffer(payload, dtype=dtype)
+                if location.output_slice is not None:
+                    storage_shape = location.storage_shape
+                    if storage_shape is None:
+                        raise ValueError(f"Missing storage shape for {location.name}")
+                    values = values.reshape((count, *storage_shape[1:]))
+                    start, stop = location.output_slice
+                    values = values[:, start:stop]
+                else:
+                    values = values.reshape((count, *row_shape))
                 for row in rows:
                     if first <= row < first + count:
                         selected[row] = values[row - first]

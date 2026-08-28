@@ -62,8 +62,12 @@ def main() -> None:
     if args.streaming_mode == "soft_reap" and args.manifest is None:
         parser.error("--manifest is required in soft_reap mode")
     layers, experts, top_k = _geometry(args.model)
+    index = SafetensorExpertIndex(args.model)
+    layer_ids = index.expert_layer_ids() or list(range(layers))
     manifest = (
-        load_soft_reap_manifest(args.manifest, num_layers=layers, num_experts=experts)
+        load_soft_reap_manifest(
+            args.manifest, layer_ids=layer_ids, num_experts=experts
+        )
         if args.manifest is not None
         else None
     )
@@ -93,11 +97,15 @@ def main() -> None:
     }
 
     # Always verify direct SSD row reads against MLX's checkpoint mapping.
-    index = SafetensorExpertIndex(args.model)
     reader = ExpertReader(index)
-    location = index.layer(0)[("gate_proj", "weight")]
+    sample_layer = layer_ids[0]
+    ffn_marker = f"layers.{sample_layer}.ffn."
+    container = "ffn" if any(ffn_marker in key for key in index.weight_map) else "mlp"
+    location = index.layer(sample_layer, container_name=container)[
+        ("gate_proj", "weight")
+    ]
     sample_ids = (
-        list(manifest.experts_for_layer(0)[:2]) + [experts - 1]
+        list(manifest.experts_for_layer(sample_layer)[:2]) + [experts - 1]
         if manifest
         else [0, experts - 1]
     )

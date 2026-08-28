@@ -12,10 +12,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .safetensors import PARTS, PROJECTIONS, ExpertReader, TensorLocation
+from .safetensors import PROJECTIONS, ExpertReader, TensorLocation
 
 _MLX_DTYPES = {
     "U32": mx.uint32,
+    "U8": mx.uint8,
+    "I8": mx.int8,
     "F32": mx.float32,
     "F16": mx.float16,
     "BF16": mx.bfloat16,
@@ -76,7 +78,7 @@ class StreamingQuantizedSwitchLinear:
         return self._owner._array(self._projection_name, "scales")
 
     @property
-    def biases(self) -> mx.array:
+    def biases(self) -> mx.array | None:
         return self._owner._array(self._projection_name, "biases")
 
     @property
@@ -128,6 +130,15 @@ class StreamingSwitchGLU(nn.Module):
         self.pool_size = self.pinned_count + self.cache_slots
         self.locations = locations
         self.projection_metadata = projection_metadata
+        for projection in PROJECTIONS:
+            self.projection_metadata[projection].setdefault(
+                "parts",
+                tuple(
+                    part
+                    for candidate, part in locations
+                    if candidate == projection
+                ),
+            )
         self.activation = activation
         self._reader = reader
         if cache_policy not in {"lru", "route_frequency"}:
@@ -161,7 +172,7 @@ class StreamingSwitchGLU(nn.Module):
         self.stats = ExpertPoolStats()
 
         for projection in PROJECTIONS:
-            for part in PARTS:
+            for part in self.projection_metadata[projection]["parts"]:
                 location = locations[(projection, part)]
                 setattr(
                     self,
@@ -181,8 +192,8 @@ class StreamingSwitchGLU(nn.Module):
     def _array_name(projection: str, part: str) -> str:
         return f"_bank_{projection}_{part}"
 
-    def _array(self, projection: str, part: str) -> mx.array:
-        return getattr(self, self._array_name(projection, part))
+    def _array(self, projection: str, part: str) -> mx.array | None:
+        return getattr(self, self._array_name(projection, part), None)
 
     @property
     def resident_mask(self) -> mx.array:
@@ -226,7 +237,7 @@ class StreamingSwitchGLU(nn.Module):
             )
         )
         for projection in PROJECTIONS:
-            for part in PARTS:
+            for part in self.projection_metadata[projection]["parts"]:
                 rows = (
                     self._reader.read_rows(
                         self.locations[(projection, part)],
@@ -410,7 +421,7 @@ class StreamingSwitchGLU(nn.Module):
                 arrays = [
                     self._array(projection, part)
                     for projection in PROJECTIONS
-                    for part in PARTS
+                    for part in self.projection_metadata[projection]["parts"]
                 ]
                 mx.eval(*arrays, self._slot_map, self._resident_mask)
             self._last_indices = None
@@ -425,7 +436,7 @@ class StreamingSwitchGLU(nn.Module):
 
     def project(self, projection: str, x: mx.array, slot_indices: mx.array) -> mx.array:
         metadata = self.projection_metadata[projection]
-        return mx.gather_qmm(
+        output = mx.gather_qmm(
             x,
             self._array(projection, "weight"),
             self._array(projection, "scales"),
@@ -437,6 +448,10 @@ class StreamingSwitchGLU(nn.Module):
             mode=metadata["mode"],
             sorted_indices=False,
         )
+        bias = self._array(projection, "bias")
+        if bias is not None:
+            output = output + mx.expand_dims(bias[slot_indices], -2)
+        return output
 
     def _forward_projection_expert_major(
         self,
@@ -499,6 +514,9 @@ class StreamingSwitchGLU(nn.Module):
                 mode=metadata["mode"],
                 sorted_indices=False,
             ).squeeze(-2)
+            bias = self._array(projection, "bias")
+            if bias is not None:
+                output = output + bias[slots]
             # The next group can overwrite the same bank slots.
             mx.eval(output)
             flat_output[mx.array(positions_np, dtype=mx.int32)] = output
@@ -585,7 +603,14 @@ class StreamingSwitchGLU(nn.Module):
             flat_output[mx.array(positions_np, dtype=mx.int32)] = output
         return flat_output.reshape((*indices.shape, hidden))
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        scores: mx.array | None = None,
+        weighted_sum: bool = False,
+        **_kwargs,
+    ) -> mx.array:
         with self._lock:
             if self._execution_mode == "speculative":
                 slots = self.ensure(indices)
@@ -593,14 +618,21 @@ class StreamingSwitchGLU(nn.Module):
                 up = self.project("up_proj", expanded, slots)
                 gate = self.project("gate_proj", expanded, slots)
                 output = self.project("down_proj", self.activation(up, gate), slots)
-                return output.squeeze(-2)
+                output = output.squeeze(-2)
+                if weighted_sum and scores is not None:
+                    output = (output * scores[..., None].astype(output.dtype)).sum(-2)
+                return output
             values = self._flatten_indices(indices)
             dynamic_working_set = {
                 expert for expert in values if expert not in self._pinned_set
             }
             if len(dynamic_working_set) > self.cache_slots:
-                return self._forward_expert_major(x, indices, values)
-            return self._forward_resident_set(x, indices, values)
+                output = self._forward_expert_major(x, indices, values)
+            else:
+                output = self._forward_resident_set(x, indices, values)
+            if weighted_sum and scores is not None:
+                output = (output * scores[..., None].astype(output.dtype)).sum(-2)
+            return output
 
     def snapshot(self) -> dict[str, Any]:
         result = self.stats.as_dict()

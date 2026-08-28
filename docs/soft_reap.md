@@ -35,6 +35,22 @@ Official REAP maps are accepted directly:
 
 The wrapped keys `layers`, `pinned_experts`, and `kept_experts` are also accepted.
 Every routed layer must be present, and IDs must be unique and valid for the model.
+Models with dense and sparse layers use their original model-layer IDs; dense layers
+must not appear in the manifest.
+
+## Supported MoE layouts
+
+SSD Expert Streaming discovers routed layers under both `mlp` and `ffn` and skips
+dense layers. It supports stacked and per-expert safetensor layouts, separate and
+fused gate/up projections, affine, MXFP4, and NVFP4 metadata, optional quantization
+biases, and routed layers that request an internal weighted sum. This covers the
+SwitchGLU implementations used by Qwen 3.5/3.8/4-Exp, DeepSeek V3.2/V4, GLM
+MoE/GLM5, MiMo-v2, Hy-v3, Laguna, Bailing Hybrid, and compatible MiniMax variants.
+
+Resident substitution remains Qwen-only because each family applies its router
+correction, normalization, and shared-expert path differently. Exact `0%` routing,
+Soft-REAP pinning, and analytical cache-only mode are shared across the supported
+families.
 
 ## Resident substitution
 

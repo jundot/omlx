@@ -35,10 +35,19 @@ class SoftReapManifest:
             ) from exc
 
     @classmethod
-    def empty(cls, num_layers: int) -> SoftReapManifest:
+    def empty(
+        cls,
+        num_layers: int | None = None,
+        *,
+        layer_ids: list[int] | tuple[int, ...] | None = None,
+    ) -> SoftReapManifest:
         """Build a manifest-free residency map for cache-only streaming."""
 
-        return cls(layers={layer: () for layer in range(num_layers)})
+        if layer_ids is None:
+            if num_layers is None:
+                raise ValueError("Empty manifest requires layer IDs or a layer count")
+            layer_ids = tuple(range(num_layers))
+        return cls(layers={int(layer): () for layer in layer_ids})
 
 
 def _unwrap_layers(data: Any) -> Any:
@@ -55,15 +64,17 @@ def _normalize_layers(
     data: Any,
     *,
     num_layers: int | None,
+    layer_ids: list[int] | tuple[int, ...] | None,
     num_experts: int | None,
 ) -> dict[int, tuple[int, ...]]:
     data = _unwrap_layers(data)
     if isinstance(data, list):
         if not data or not all(isinstance(value, int) for value in data):
             raise ValueError("Soft-REAP expert list must contain integer expert IDs")
-        if num_layers is None:
+        if num_layers is None and layer_ids is None:
             raise ValueError("A shared expert list requires the model layer count")
-        data = {str(layer): data for layer in range(num_layers)}
+        targets = layer_ids if layer_ids is not None else range(int(num_layers))
+        data = {str(layer): data for layer in targets}
     if not isinstance(data, Mapping) or not data:
         raise ValueError("Soft-REAP manifest must contain a non-empty layer mapping")
 
@@ -93,8 +104,12 @@ def _normalize_layers(
             )
         normalized[layer] = experts
 
-    if num_layers is not None:
-        expected = set(range(num_layers))
+    if layer_ids is not None or num_layers is not None:
+        expected = (
+            {int(layer) for layer in layer_ids}
+            if layer_ids is not None
+            else set(range(int(num_layers)))
+        )
         present = set(normalized)
         missing = sorted(expected - present)
         extra = sorted(present - expected)
@@ -112,6 +127,7 @@ def load_soft_reap_manifest(
     path: str | Path,
     *,
     num_layers: int | None = None,
+    layer_ids: list[int] | tuple[int, ...] | None = None,
     num_experts: int | None = None,
 ) -> SoftReapManifest:
     """Load official REAP maps and the wrapped Soft-REAP manifest form."""
@@ -126,6 +142,7 @@ def load_soft_reap_manifest(
     layers = _normalize_layers(
         data,
         num_layers=num_layers,
+        layer_ids=layer_ids,
         num_experts=num_experts,
     )
     return SoftReapManifest(layers=layers, source=manifest_path)
@@ -135,6 +152,7 @@ def validate_soft_reap_manifest_data(
     data: Any,
     *,
     num_layers: int | None = None,
+    layer_ids: list[int] | tuple[int, ...] | None = None,
     num_experts: int | None = None,
 ) -> SoftReapManifest:
     """Validate uploaded JSON before it is persisted by the admin API."""
@@ -143,6 +161,7 @@ def validate_soft_reap_manifest_data(
         layers=_normalize_layers(
             data,
             num_layers=num_layers,
+            layer_ids=layer_ids,
             num_experts=num_experts,
         )
     )

@@ -10,47 +10,14 @@ from typing import Any
 
 import mlx.core as mx
 
+from .adapters import discover_moe_layers, projection_schema
 from .execution import SpeculativeExecution
 from .manifest import SoftReapManifest, load_soft_reap_manifest
 from .pool import StreamingSwitchGLU
 from .routing import ResidentPreferredMoeBlock
-from .safetensors import PROJECTIONS, ExpertReader, SafetensorExpertIndex
+from .safetensors import ExpertReader, SafetensorExpertIndex
 
 logger = logging.getLogger(__name__)
-
-
-def _main_layers(model: Any) -> list[Any]:
-    candidates = (
-        getattr(
-            getattr(getattr(model, "language_model", None), "model", None),
-            "layers",
-            None,
-        ),
-        getattr(getattr(model, "model", None), "layers", None),
-        getattr(model, "layers", None),
-    )
-    for layers in candidates:
-        if isinstance(layers, (list, tuple)) and layers:
-            return list(layers)
-    raise ValueError("Could not locate the model's routed MoE layers")
-
-
-def _projection_metadata(switch_mlp: Any) -> dict[str, dict[str, Any]]:
-    metadata: dict[str, dict[str, Any]] = {}
-    for projection in PROJECTIONS:
-        module = getattr(switch_mlp, projection, None)
-        if module is None or not all(
-            hasattr(module, name) for name in ("weight", "scales", "biases")
-        ):
-            raise ValueError(
-                "Expert streaming currently requires stacked affine-quantized SwitchGLU weights"
-            )
-        metadata[projection] = {
-            "group_size": int(getattr(module, "group_size", 64)),
-            "bits": int(getattr(module, "bits", 4)),
-            "mode": str(getattr(module, "mode", "affine")),
-        }
-    return metadata
 
 
 @dataclass
@@ -148,46 +115,63 @@ def install_expert_streaming(
     streaming_mode = str(streaming_mode).strip().lower()
     if streaming_mode not in {"soft_reap", "cache_only"}:
         raise ValueError("Expert streaming mode must be soft_reap or cache_only")
-    layers = _main_layers(model)
-    first_mlp = getattr(layers[0], "mlp", None)
-    num_experts = int(getattr(first_mlp, "num_experts", 0) or 0)
-    top_k = int(getattr(first_mlp, "top_k", 0) or 0)
-    if not num_experts or not top_k:
-        raise ValueError(
-            "The selected model does not expose compatible routed MoE geometry"
-        )
+    targets = discover_moe_layers(model)
+    layer_ids = [target.layer_id for target in targets]
+    num_experts = targets[0].num_experts
+    top_k = targets[0].top_k
     if streaming_mode == "soft_reap":
         if not manifest_path:
             raise ValueError("Soft-REAP mode requires an expert pin manifest")
         manifest = load_soft_reap_manifest(
             manifest_path,
-            num_layers=len(layers),
+            layer_ids=layer_ids,
             num_experts=num_experts,
         )
     else:
-        manifest = SoftReapManifest.empty(len(layers))
+        manifest = SoftReapManifest.empty(layer_ids=layer_ids)
     index = SafetensorExpertIndex(model_path)
-    expert_bytes_all_layers = sum(
-        index.expert_bytes(layer) for layer in range(len(layers))
-    )
+    resolved: dict[int, tuple[dict[str, dict[str, Any]], dict]] = {}
+    expert_bytes_all_layers = 0
+    for target in targets:
+        schema = projection_schema(target.switch_mlp)
+        locations = index.layer(
+            target.layer_id,
+            container_name=target.container_name,
+            schema=schema,
+            num_experts=target.num_experts,
+        )
+        # ``arrays`` are only shape/dtype descriptors for checkpoint indexing.
+        # Never retain them in the runtime schema: they are the original full
+        # expert banks that streaming is meant to replace.
+        runtime_schema = {
+            projection: {
+                key: value
+                for key, value in metadata.items()
+                if key != "arrays"
+            }
+            for projection, metadata in schema.items()
+        }
+        resolved[target.layer_id] = (runtime_schema, locations)
+        expert_bytes_all_layers += sum(
+            location.row_bytes for location in locations.values()
+        )
     minimum_cache_slots = max(
         min(top_k, num_experts - len(manifest.experts_for_layer(layer)))
-        for layer in range(len(layers))
+        for layer in layer_ids
     )
     cache_slots = max(0, int(cache_experts), minimum_cache_slots)
     cache_budget_bytes = cache_slots * expert_bytes_all_layers
     reader = ExpertReader(index)
     pools: list[StreamingSwitchGLU] = []
     try:
-        for layer_idx, layer in enumerate(layers):
-            mlp = getattr(layer, "mlp", None)
-            original = getattr(mlp, "switch_mlp", None)
-            if original is None:
-                raise ValueError(f"Layer {layer_idx} has no switch_mlp")
+        for ordinal, target in enumerate(targets):
+            layer_idx = target.layer_id
+            original = target.switch_mlp
+            schema, locations = resolved[layer_idx]
             logger.info(
                 "Expert streaming loading layer %d/%d (%d pinned experts, %d hot slots)",
-                layer_idx + 1,
-                len(layers),
+                ordinal + 1,
+                len(targets),
                 len(manifest.experts_for_layer(layer_idx)),
                 cache_slots,
             )
@@ -197,18 +181,24 @@ def install_expert_streaming(
                 top_k=top_k,
                 pinned_experts=manifest.experts_for_layer(layer_idx),
                 cache_slots=cache_slots,
-                locations=index.layer(layer_idx),
-                projection_metadata=_projection_metadata(original),
+                locations=locations,
+                projection_metadata=schema,
                 activation=original.activation,
                 reader=reader,
                 cache_policy="route_frequency",
             )
-            mlp.switch_mlp = pool
+            target.replace_switch(pool)
             if substitution_threshold_percent > 0:
-                layer.mlp = ResidentPreferredMoeBlock(
-                    mlp,
+                module_name = type(target.moe).__module__.lower()
+                if "qwen" not in module_name:
+                    raise ValueError(
+                        "Resident substitution is currently available only for "
+                        "Qwen-family MoE routers"
+                    )
+                setattr(target.layer, target.container_name, ResidentPreferredMoeBlock(
+                    target.moe,
                     threshold_percent=substitution_threshold_percent,
-                )
+                ))
             pools.append(pool)
             mx.clear_cache()
     except Exception:
@@ -236,10 +226,14 @@ def install_expert_streaming(
         "Expert streaming ready: mode=%s, %d layers, pinned range %s, "
         "%d hot slots/layer, %.2f GiB bank",
         streaming_mode,
-        len(layers),
+        len(targets),
         manifest.pinned_count_range,
         pools[0].cache_slots if pools else 0,
-        sum(pool.pool_size * index.expert_bytes(pool.layer) for pool in pools)
+        sum(
+            pool.pool_size
+            * sum(location.row_bytes for location in pool.locations.values())
+            for pool in pools
+        )
         / 1024**3,
     )
     return runtime

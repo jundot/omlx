@@ -2292,14 +2292,16 @@ async def upload_expert_manifest(
         from ..expert_streaming.manifest import validate_soft_reap_manifest_data
         from ..expert_streaming.safetensors import SafetensorExpertIndex
 
+        index = SafetensorExpertIndex(entry.model_path)
+        layer_ids = index.expert_layer_ids()
         manifest = validate_soft_reap_manifest_data(
             data,
-            num_layers=num_layers,
+            num_layers=num_layers if not layer_ids else None,
+            layer_ids=layer_ids or None,
             num_experts=num_experts,
         )
-        index = SafetensorExpertIndex(entry.model_path)
         for layer in manifest.layers:
-            index.layer(layer)
+            index.expert_storage_bytes(layer)
     except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=400, detail=f"Invalid Soft-REAP manifest: {exc}"
