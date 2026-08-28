@@ -9,6 +9,7 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -138,6 +139,12 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    expert_streaming_enabled: bool | None = None
+    expert_streaming_mode: str | None = None
+    expert_streaming_manifest: str | None = None
+    expert_streaming_cache_experts: int | None = None
+    expert_streaming_substitution_threshold_percent: float | None = None
+    expert_streaming_execution_policy: str | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -1951,6 +1958,31 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
         qwen4_mmap_bytes = 0
+        expert_streaming_supported = False
+        expert_streaming_resident_bytes = 0
+        try:
+            model_path = Path(model_info.get("model_path", ""))
+            config = json.loads((model_path / "config.json").read_text())
+            text_config = config.get("text_config") or config
+            num_experts = int(
+                text_config.get(
+                    "num_experts", text_config.get("n_routed_experts", 0)
+                )
+                or 0
+            )
+            if num_experts > 0:
+                from ..expert_streaming.safetensors import SafetensorExpertIndex
+
+                SafetensorExpertIndex(model_path).layer(0)
+                expert_streaming_supported = True
+            if settings and settings.expert_streaming_enabled:
+                from ..expert_streaming.residency import estimate_for_model_settings
+
+                streaming_estimate = estimate_for_model_settings(model_path, settings)
+                if streaming_estimate is not None:
+                    expert_streaming_resident_bytes = streaming_estimate.resident_bytes
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
         if (model_info.get("config_model_type") or "").replace(
             "-", "_"
         ).lower() == "qwen4_exp":
@@ -1966,6 +1998,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
                 )
+                if (
+                    expert_streaming_resident_bytes
+                    and (
+                        residency_ceiling <= 0
+                        or expert_streaming_resident_bytes <= residency_ceiling
+                    )
+                ):
+                    qwen4_ple_ssd_offload_forced = False
                 qwen4_resident_bytes = estimate.resident_bytes
                 qwen4_mmap_bytes = estimate.mmap_bytes
             except (OSError, TypeError, ValueError):
@@ -2028,6 +2068,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "expert_streaming_supported": expert_streaming_supported,
+            "expert_streaming_resident_bytes": expert_streaming_resident_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2215,6 +2257,73 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+@router.post("/api/models/{model_id}/expert-manifest")
+async def upload_expert_manifest(
+    model_id: str,
+    file: UploadFile = File(...),
+    is_admin: bool = Depends(require_admin),
+):
+    """Validate and retain a small Soft-REAP expert-pinning manifest."""
+
+    del is_admin
+    engine_pool = _get_engine_pool()
+    settings_manager = _get_settings_manager()
+    if engine_pool is None or settings_manager is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    payload = await file.read(2 * 1024 * 1024 + 1)
+    if len(payload) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Expert manifest exceeds 2 MiB")
+    try:
+        data = json.loads(payload.decode("utf-8"))
+        config = json.loads(
+            (Path(entry.model_path) / "config.json").read_text(encoding="utf-8")
+        )
+        text_config = config.get("text_config") or config
+        num_layers = int(text_config.get("num_hidden_layers", 0) or 0)
+        num_experts = int(
+            text_config.get(
+                "num_experts", text_config.get("n_routed_experts", 0)
+            )
+            or 0
+        )
+        from ..expert_streaming.manifest import validate_soft_reap_manifest_data
+        from ..expert_streaming.safetensors import SafetensorExpertIndex
+
+        manifest = validate_soft_reap_manifest_data(
+            data,
+            num_layers=num_layers,
+            num_experts=num_experts,
+        )
+        index = SafetensorExpertIndex(entry.model_path)
+        for layer in manifest.layers:
+            index.layer(layer)
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid Soft-REAP manifest: {exc}"
+        ) from exc
+
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    directory = settings_manager.base_path / "expert_manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{digest}.json"
+    temporary = destination.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "success": True,
+        "manifest_path": str(destination),
+        "layers": manifest.layer_count,
+        "pinned_count_min": manifest.pinned_count_range[0],
+        "pinned_count_max": manifest.pinned_count_range[1],
+    }
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,
@@ -2359,6 +2468,67 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "expert_streaming_enabled" in sent:
+        current_settings.expert_streaming_enabled = bool(
+            request.expert_streaming_enabled
+        )
+    if "expert_streaming_mode" in sent:
+        streaming_mode = str(request.expert_streaming_mode or "")
+        if streaming_mode not in {"soft_reap", "cache_only"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Expert streaming mode must be soft_reap or cache_only.",
+            )
+        current_settings.expert_streaming_mode = streaming_mode
+    if "expert_streaming_manifest" in sent:
+        current_settings.expert_streaming_manifest = (
+            request.expert_streaming_manifest.strip()
+            if request.expert_streaming_manifest
+            else None
+        )
+    if "expert_streaming_cache_experts" in sent:
+        cache_experts = request.expert_streaming_cache_experts
+        if cache_experts is None or not 0 <= cache_experts <= 512:
+            raise HTTPException(
+                status_code=400,
+                detail="Expert cache size must be between 0 and 512 experts per layer.",
+            )
+        current_settings.expert_streaming_cache_experts = int(cache_experts)
+    if "expert_streaming_substitution_threshold_percent" in sent:
+        threshold = request.expert_streaming_substitution_threshold_percent
+        if threshold is None or not 0 <= threshold <= 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Expert substitution threshold must be between 0% and 100%.",
+            )
+        current_settings.expert_streaming_substitution_threshold_percent = float(
+            threshold
+        )
+    if "expert_streaming_execution_policy" in sent:
+        execution_policy = str(request.expert_streaming_execution_policy or "")
+        if execution_policy not in {"checked", "speculative"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Expert streaming execution policy must be checked or speculative.",
+            )
+        current_settings.expert_streaming_execution_policy = execution_policy
+    if current_settings.expert_streaming_enabled:
+        streaming_mode = current_settings.expert_streaming_mode
+        manifest_path = current_settings.expert_streaming_manifest
+        if streaming_mode == "soft_reap" and not manifest_path:
+            raise HTTPException(
+                status_code=400,
+                detail="Upload a Soft-REAP manifest before enabling expert streaming.",
+            )
+        try:
+            from ..expert_streaming.residency import estimate_for_model_settings
+
+            estimate_for_model_settings(entry.model_path, current_settings)
+        except (OSError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid Soft-REAP configuration: {exc}",
+            ) from exc
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

@@ -349,11 +349,15 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
-        )
-        if qwen4_offload and qwen4_estimate is not None:
-            base = min(base, qwen4_estimate.mmap_bytes)
+        streaming_estimate = self._expert_streaming_estimate(entry, runtime_settings)
+        if streaming_estimate is not None:
+            base = streaming_estimate.resident_bytes
+        else:
+            qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
+                entry, runtime_settings
+            )
+            if qwen4_offload and qwen4_estimate is not None:
+                base = min(base, qwen4_estimate.mmap_bytes)
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -372,6 +376,23 @@ class EnginePool:
                 entry.model_id,
             )
         return base + extra
+
+    @staticmethod
+    def _expert_streaming_estimate(entry: EngineEntry, settings: object | None):
+        try:
+            from .expert_streaming.residency import estimate_for_model_settings
+
+            return estimate_for_model_settings(entry.model_path, settings)
+        except (OSError, TypeError, ValueError):
+            if settings is not None and getattr(
+                settings, "expert_streaming_enabled", False
+            ):
+                logger.warning(
+                    "Could not estimate Soft-REAP residency for %s",
+                    entry.model_id,
+                    exc_info=True,
+                )
+            return None
 
     def _qwen4_ple_offload_status(
         self,
@@ -403,6 +424,12 @@ class EnginePool:
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
+        # A valid Soft-REAP layout can make the complete PLE-resident model fit.
+        # Only preserve a forced PLE mmap decision if that reduced layout still
+        # exceeds the configured ceiling; an explicit user request remains valid.
+        streaming = self._expert_streaming_estimate(entry, settings)
+        if streaming is not None and (ceiling <= 0 or streaming.resident_bytes <= ceiling):
+            forced = False
         return requested or forced, forced, estimate if estimate.supported else None
 
     def _effective_qwen4_model_settings(
@@ -594,6 +621,28 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+        expert_streaming = bool(data.get("expert_streaming_enabled", False))
+        add("expert_streaming_enabled", expert_streaming)
+        if expert_streaming:
+            streaming_mode = data.get("expert_streaming_mode", "soft_reap")
+            add("expert_streaming_mode", streaming_mode)
+            if streaming_mode == "soft_reap":
+                add(
+                    "expert_streaming_manifest",
+                    data.get("expert_streaming_manifest"),
+                )
+            add(
+                "expert_streaming_cache_experts",
+                data.get("expert_streaming_cache_experts", 32),
+            )
+            add(
+                "expert_streaming_substitution_threshold_percent",
+                data.get("expert_streaming_substitution_threshold_percent", 0.0),
+            )
+            add(
+                "expert_streaming_execution_policy",
+                data.get("expert_streaming_execution_policy", "checked"),
+            )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

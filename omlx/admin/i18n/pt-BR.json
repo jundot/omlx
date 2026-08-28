@@ -1130,5 +1130,22 @@
   "js.success.download_started": "Download iniciado: {repo_id}",
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
-  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP."
+  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP.",
+  "modal.model_settings.expert_streaming": "Streaming de especialistas via SSD",
+  "modal.model_settings.expert_streaming_hint": "Transmite especialistas do SSD usando fixação, cache analítico ou ambos.",
+  "modal.model_settings.expert_streaming_mode": "Modo de residência",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Fixação Soft-REAP",
+  "modal.model_settings.expert_streaming_mode_cache_only": "Somente cache analítico",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "Os especialistas do manifesto permanecem fixados; o cache extra aprende as outras rotas.",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "Nenhum especialista é fixado. Um cache de frequência com decaimento aprende a carga ativa.",
+  "modal.model_settings.expert_manifest": "Manifesto de especialistas fixados",
+  "modal.model_settings.expert_cache": "Especialistas ativos por camada",
+  "modal.model_settings.expert_cache_hint": "Memória extra para especialistas não fixados usados com frequência.",
+  "modal.model_settings.expert_substitution_threshold": "Limite de substituição residente (%)",
+  "modal.model_settings.expert_substitution_threshold_hint": "Permite substituir um especialista frio por um residente quando o peso do roteador estiver dentro desta porcentagem. 0 mantém o roteamento exato.",
+  "modal.model_settings.expert_execution_policy": "Modo de execução",
+  "modal.model_settings.expert_execution_speculative": "Especulativo (para acertos residentes)",
+  "modal.model_settings.expert_execution_checked": "Verificado (recomendado)",
+  "modal.model_settings.expert_execution_policy_hint": "O modo especulativo executa rotas residentes em um único grafo e repete exatamente após uma falha no SSD. O modo verificado carrega falhas camada por camada.",
+  "modal.model_settings.expert_projected_resident": "Modelo residente estimado:"
 }

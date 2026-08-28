@@ -62,6 +62,8 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
     switch_mlp = getattr(self, "switch_mlp", None)
     if switch_mlp is None or not hasattr(switch_mlp, "down_proj"):
         return False
+    if getattr(switch_mlp, "_omlx_expert_streaming", False):
+        return False
     # Either the stock split projections or the omlx gate+up fused layout
     # (qwen35_moe_gate_up patch, issue #2238).
     return hasattr(switch_mlp, "gate_up_proj") or (

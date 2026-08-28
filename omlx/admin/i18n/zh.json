@@ -1130,5 +1130,22 @@
   "js.success.download_started": "已开始下载：{repo_id}",
   "js.success.settings_saved": "设置已成功保存",
   "settings.mcp.expose_tools": "向客户端公开后端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。"
+  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。",
+  "modal.model_settings.expert_streaming": "SSD 专家流式加载",
+  "modal.model_settings.expert_streaming_hint": "使用固定、分析缓存或两者从 SSD 流式加载专家。",
+  "modal.model_settings.expert_streaming_mode": "常驻模式",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Soft-REAP 固定",
+  "modal.model_settings.expert_streaming_mode_cache_only": "仅分析缓存",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "清单专家保持固定；额外缓存会学习其他路由。",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "不固定任何专家。带衰减的路由频率缓存会学习当前工作负载。",
+  "modal.model_settings.expert_manifest": "专家固定清单",
+  "modal.model_settings.expert_cache": "每层热门专家数",
+  "modal.model_settings.expert_cache_hint": "为常用的非固定专家提供额外内存。",
+  "modal.model_settings.expert_substitution_threshold": "常驻专家替换阈值（%）",
+  "modal.model_settings.expert_substitution_threshold_hint": "当路由权重差在此百分比内时，允许常驻专家替换冷专家。0 保持精确路由。",
+  "modal.model_settings.expert_execution_policy": "执行模式",
+  "modal.model_settings.expert_execution_speculative": "推测执行（适用于常驻命中）",
+  "modal.model_settings.expert_execution_checked": "检查执行（推荐）",
+  "modal.model_settings.expert_execution_policy_hint": "推测模式将常驻路由作为单个计算图执行，并在 SSD 未命中后精确重试。检查模式逐层加载未命中专家。",
+  "modal.model_settings.expert_projected_resident": "预计常驻模型："
 }

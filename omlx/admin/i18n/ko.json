@@ -1130,5 +1130,22 @@
   "js.success.download_started": "다운로드 시작: {repo_id}",
   "js.success.settings_saved": "설정이 저장되었습니다",
   "settings.mcp.expose_tools": "백엔드 MCP 도구를 클라이언트에 노출",
-  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요."
+  "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요.",
+  "modal.model_settings.expert_streaming": "SSD 전문가 스트리밍",
+  "modal.model_settings.expert_streaming_hint": "고정, 분석 캐시 또는 둘 다를 사용해 SSD에서 전문가를 스트리밍합니다.",
+  "modal.model_settings.expert_streaming_mode": "상주 모드",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Soft-REAP 고정",
+  "modal.model_settings.expert_streaming_mode_cache_only": "분석 캐시 전용",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "매니페스트 전문가는 고정되고 추가 캐시는 나머지 경로를 학습합니다.",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "고정 전문가는 없습니다. 감쇠 경로 빈도 캐시가 활성 작업을 학습합니다.",
+  "modal.model_settings.expert_manifest": "전문가 고정 매니페스트",
+  "modal.model_settings.expert_cache": "레이어당 핫 전문가 수",
+  "modal.model_settings.expert_cache_hint": "자주 사용하는 비고정 전문가를 위한 추가 메모리입니다.",
+  "modal.model_settings.expert_substitution_threshold": "상주 전문가 대체 임계값(%)",
+  "modal.model_settings.expert_substitution_threshold_hint": "라우터 가중치 차이가 이 비율 이내이면 콜드 전문가를 상주 전문가로 대체합니다. 0은 정확한 라우팅을 유지합니다.",
+  "modal.model_settings.expert_execution_policy": "실행 모드",
+  "modal.model_settings.expert_execution_speculative": "추측 실행(상주 적중용)",
+  "modal.model_settings.expert_execution_checked": "확인 실행(권장)",
+  "modal.model_settings.expert_execution_policy_hint": "추측 모드는 상주 경로를 하나의 그래프로 실행하고 SSD 미스 후 정확히 재시도합니다. 확인 모드는 레이어별로 미스를 로드합니다.",
+  "modal.model_settings.expert_projected_resident": "예상 상주 모델:"
 }

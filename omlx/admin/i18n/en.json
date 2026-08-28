@@ -1130,5 +1130,22 @@
   "js.success.download_started": "Download started: {repo_id}",
   "js.success.settings_saved": "Settings saved successfully",
   "settings.mcp.expose_tools": "Expose backend MCP tools to clients",
-  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers."
+  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers.",
+  "modal.model_settings.expert_streaming": "SSD Expert Streaming",
+  "modal.model_settings.expert_streaming_hint": "Stream routed experts from SSD using fixed pins, an analytical cache, or both.",
+  "modal.model_settings.expert_streaming_mode": "Residency mode",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Soft-REAP pinning",
+  "modal.model_settings.expert_streaming_mode_cache_only": "Analytical cache only",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "Manifest experts remain pinned; the extra cache learns non-pinned routes.",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "No experts are pinned. A decayed route-frequency cache learns the active workload.",
+  "modal.model_settings.expert_manifest": "Expert pin manifest",
+  "modal.model_settings.expert_cache": "Hot experts per layer",
+  "modal.model_settings.expert_cache_hint": "Extra memory for frequently used non-pinned experts. A small working set is always reserved.",
+  "modal.model_settings.expert_substitution_threshold": "Resident substitution threshold (%)",
+  "modal.model_settings.expert_substitution_threshold_hint": "Allow a resident expert to replace a cold expert when its router weight is within this percentage. 0 keeps exact routing.",
+  "modal.model_settings.expert_execution_policy": "Execution mode",
+  "modal.model_settings.expert_execution_speculative": "Speculative (resident-hit optimized)",
+  "modal.model_settings.expert_execution_checked": "Checked (recommended)",
+  "modal.model_settings.expert_execution_policy_hint": "Checked mode is fastest when SSD misses are possible. Speculative mode is intended for measured near-perfect resident hit rates.",
+  "modal.model_settings.expert_projected_resident": "Projected resident model:"
 }

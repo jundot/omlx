@@ -1130,5 +1130,22 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
-  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP.",
+  "modal.model_settings.expert_streaming": "Streaming d’experts depuis le SSD",
+  "modal.model_settings.expert_streaming_hint": "Diffuse les experts depuis le SSD avec épinglage, cache analytique ou les deux.",
+  "modal.model_settings.expert_streaming_mode": "Mode de résidence",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Épinglage Soft-REAP",
+  "modal.model_settings.expert_streaming_mode_cache_only": "Cache analytique uniquement",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "Les experts du manifeste restent épinglés ; le cache apprend les autres routes.",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "Aucun expert n’est épinglé. Un cache de fréquence à décroissance apprend la charge active.",
+  "modal.model_settings.expert_manifest": "Manifeste des experts épinglés",
+  "modal.model_settings.expert_cache": "Experts actifs par couche",
+  "modal.model_settings.expert_cache_hint": "Mémoire supplémentaire pour les experts non épinglés fréquemment utilisés.",
+  "modal.model_settings.expert_substitution_threshold": "Seuil de substitution résidente (%)",
+  "modal.model_settings.expert_substitution_threshold_hint": "Autorise un expert résident à remplacer un expert froid si son poids de routage est dans ce pourcentage. 0 conserve le routage exact.",
+  "modal.model_settings.expert_execution_policy": "Mode d’exécution",
+  "modal.model_settings.expert_execution_speculative": "Spéculatif (pour les succès résidents)",
+  "modal.model_settings.expert_execution_checked": "Vérifié (recommandé)",
+  "modal.model_settings.expert_execution_policy_hint": "Le mode spéculatif exécute les routes résidentes dans un seul graphe et réessaie exactement après un défaut SSD. Le mode vérifié charge les défauts couche par couche.",
+  "modal.model_settings.expert_projected_resident": "Modèle résident estimé :"
 }

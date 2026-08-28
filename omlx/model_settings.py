@@ -220,6 +220,14 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Soft-REAP: keep manifest-selected routed experts resident and stream all
+    # remaining stacked quantized experts from their safetensor shards.
+    expert_streaming_enabled: bool = False
+    expert_streaming_mode: str = "soft_reap"
+    expert_streaming_manifest: Optional[str] = None
+    expert_streaming_cache_experts: int = 32
+    expert_streaming_substitution_threshold_percent: float = 0.0
+    expert_streaming_execution_policy: str = "checked"
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

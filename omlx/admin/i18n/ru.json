@@ -1130,5 +1130,22 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
-  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы.",
+  "modal.model_settings.expert_streaming": "Потоковая загрузка экспертов с SSD",
+  "modal.model_settings.expert_streaming_hint": "Загружает экспертов с SSD, используя закрепление, аналитический кэш или оба режима.",
+  "modal.model_settings.expert_streaming_mode": "Режим резидентности",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Закрепление Soft-REAP",
+  "modal.model_settings.expert_streaming_mode_cache_only": "Только аналитический кэш",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "Эксперты из манифеста закреплены; дополнительный кэш изучает остальные маршруты.",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "Закреплённых экспертов нет. Кэш частоты маршрутов с затуханием изучает активную нагрузку.",
+  "modal.model_settings.expert_manifest": "Манифест закреплённых экспертов",
+  "modal.model_settings.expert_cache": "Горячих экспертов на слой",
+  "modal.model_settings.expert_cache_hint": "Дополнительная память для часто используемых незакреплённых экспертов.",
+  "modal.model_settings.expert_substitution_threshold": "Порог замены резидентным экспертом (%)",
+  "modal.model_settings.expert_substitution_threshold_hint": "Разрешает замену холодного эксперта резидентным, если вес маршрутизации отличается не более чем на этот процент. 0 сохраняет точную маршрутизацию.",
+  "modal.model_settings.expert_execution_policy": "Режим выполнения",
+  "modal.model_settings.expert_execution_speculative": "Спекулятивный (для резидентных попаданий)",
+  "modal.model_settings.expert_execution_checked": "Проверяемый (рекомендуется)",
+  "modal.model_settings.expert_execution_policy_hint": "Спекулятивный режим выполняет резидентные маршруты одним графом и точно повторяет проход после промаха SSD. Проверяемый режим загружает промахи послойно.",
+  "modal.model_settings.expert_projected_resident": "Ожидаемый размер в памяти:"
 }

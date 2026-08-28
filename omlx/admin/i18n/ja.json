@@ -1130,5 +1130,22 @@
   "js.success.download_started": "ダウンロード開始: {repo_id}",
   "js.success.settings_saved": "設定が保存されました",
   "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
-  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。"
+  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。",
+  "modal.model_settings.expert_streaming": "SSD エキスパートストリーミング",
+  "modal.model_settings.expert_streaming_hint": "固定、分析キャッシュ、またはその両方を使ってSSDからエキスパートを読み込みます。",
+  "modal.model_settings.expert_streaming_mode": "常駐モード",
+  "modal.model_settings.expert_streaming_mode_soft_reap": "Soft-REAP 固定",
+  "modal.model_settings.expert_streaming_mode_cache_only": "分析キャッシュのみ",
+  "modal.model_settings.expert_streaming_mode_soft_reap_hint": "マニフェストのエキスパートを固定し、追加キャッシュが他のルートを学習します。",
+  "modal.model_settings.expert_streaming_mode_cache_only_hint": "固定エキスパートはありません。減衰付きルート頻度キャッシュが実行中の負荷を学習します。",
+  "modal.model_settings.expert_manifest": "エキスパート固定マニフェスト",
+  "modal.model_settings.expert_cache": "レイヤーごとのホットエキスパート数",
+  "modal.model_settings.expert_cache_hint": "頻繁に使う非固定エキスパート用の追加メモリです。",
+  "modal.model_settings.expert_substitution_threshold": "常駐置換しきい値（%）",
+  "modal.model_settings.expert_substitution_threshold_hint": "ルーター重みの差がこの割合以内なら、コールドエキスパートを常駐エキスパートで置換します。0は正確なルーティングを維持します。",
+  "modal.model_settings.expert_execution_policy": "実行モード",
+  "modal.model_settings.expert_execution_speculative": "投機的（常駐ヒット向け）",
+  "modal.model_settings.expert_execution_checked": "確認済み（推奨）",
+  "modal.model_settings.expert_execution_policy_hint": "投機モードは常駐ルートを単一グラフで実行し、SSDミス後に正確に再試行します。確認モードはレイヤーごとにミスを読み込みます。",
+  "modal.model_settings.expert_projected_resident": "推定常駐モデル:"
 }

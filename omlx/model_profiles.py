@@ -87,6 +87,12 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    "expert_streaming_enabled",
+    "expert_streaming_mode",
+    "expert_streaming_manifest",
+    "expert_streaming_cache_experts",
+    "expert_streaming_substitution_threshold_percent",
+    "expert_streaming_execution_policy",
 )
 
 # Excluded — never stored in a profile or template.

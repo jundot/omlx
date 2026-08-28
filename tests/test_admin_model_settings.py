@@ -122,6 +122,46 @@ async def test_sampling_setting_change_keeps_cached_failure():
 
 
 @pytest.mark.asyncio
+async def test_expert_streaming_execution_policy_is_persisted():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_execution_policy="speculative"
+        ),
+    )
+
+    assert settings.expert_streaming_execution_policy == "speculative"
+
+
+@pytest.mark.asyncio
+async def test_cache_only_streaming_does_not_require_manifest():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    with patch(
+        "omlx.expert_streaming.residency.estimate_for_model_settings"
+    ) as estimate:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                expert_streaming_enabled=True,
+                expert_streaming_mode="cache_only",
+                expert_streaming_manifest=None,
+            ),
+        )
+
+    assert settings.expert_streaming_enabled is True
+    assert settings.expert_streaming_mode == "cache_only"
+    assert settings.expert_streaming_manifest is None
+    estimate.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_settings_are_persisted():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -264,9 +304,7 @@ async def test_qwen_ane_prefill_rejects_invalid_block_size():
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(
-                qwen35_ane_prefill_sequence_length=2000
-            ),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_sequence_length=2000),
         )
 
 
@@ -298,9 +336,7 @@ async def test_qwen_ane_prefill_rejects_fused_down_above_half_fraction():
         await _update_settings(
             pool,
             settings,
-            admin_routes.ModelSettingsRequest(
-                qwen35_ane_prefill_fused_down=True
-            ),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_fused_down=True),
         )
 
 
