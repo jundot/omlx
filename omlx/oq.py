@@ -5756,6 +5756,7 @@ def quantize_oq_streaming(
     imatrix_seq_length: int = 512,
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
+    preserve_ngram_table: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -5814,11 +5815,19 @@ def quantize_oq_streaming(
             still wins over both. None (default) auto-enables streaming when
             the source exceeds the RAM budget; the OMLX_OQ_STREAM_CALIBRATION
             environment variable overrides the auto rule. The streamed sourcer
-            only supports the MiniMax-M3 (minimax_m3_vl) layout, so both the
-            auto rule and a truthy env var stay on the RAM-safe proxy for every
-            other model_type, and an explicit stream_calibration=True on an
-            unsupported layout raises a ValueError up front instead of failing
-            deep in the sourcer. Only consulted when enhanced is True.
+            supports the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp)
+            layouts, so both the auto rule and a truthy env var stay on the
+            RAM-safe proxy for every other model_type, and an explicit
+            stream_calibration=True on an unsupported layout raises a
+            ValueError up front instead of failing deep in the sourcer. Only
+            consulted when enhanced is True.
+        preserve_ngram_table: Write the qwen4_exp N-gram PLE table
+            (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
+            the checkpoint dtype, instead of at the selected oQ level. The
+            table can then be quantized separately (its measured
+            sensitivity is far below the core's), and a passthrough leaves
+            no per-layer quantization entry so loaders treat the shards as
+            plain weights. No effect on other model types.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6084,6 +6093,7 @@ def quantize_oq_streaming(
                 sensitivity_oq_level=oq_level,
                 sensitivity_num_samples=_SENS_NUM_SAMPLES,
                 sensitivity_seq_length=_SENS_SEQ_LENGTH,
+                require_mtp_entries=preserve_mtp,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -6399,8 +6409,15 @@ def quantize_oq_streaming(
             and not (not preserve_mtp and _is_mtp_tensor(tensor_name))
         ):
             src_info = all_weights.source_quant_info(tensor_name)
-            if src_info is not None and _should_quantize_tensor(
-                tensor_name, all_weights.plan_shape(tensor_name)
+            if (
+                src_info is not None
+                and _should_quantize_tensor(
+                    tensor_name, all_weights.plan_shape(tensor_name)
+                )
+                and not (
+                    preserve_ngram_table
+                    and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                )
             ):
                 bits, gs, qmode = _get_predicate_bits(
                     tensor_name, config, oq_level, group_size
@@ -6441,7 +6458,10 @@ def quantize_oq_streaming(
                 processed_bytes += tensor_bytes
                 continue
 
-            if _should_quantize_tensor(tensor_name, shape):
+            if _should_quantize_tensor(tensor_name, shape) and not (
+                preserve_ngram_table
+                and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+            ):
                 bits, gs, qmode = _get_predicate_bits(
                     tensor_name, config, oq_level, group_size
                 )
@@ -8212,12 +8232,15 @@ def _collect_imatrix_from_model(
 
 
 # --- Streamed per-layer weight sourcing (layer-streaming imatrix collector) ---
-# MiniMax-M3 focused for now: the layer prefix, the args location, and the
-# lazy-load path in _streamed_text_args assume the minimax_m3_vl layout.
-# When a second architecture needs streaming, a model-type dispatch table
-# replaces the hardcoded prefix and the args lookup, and its model_type joins
-# _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES below so the calibration decision
-# starts routing it through the streamed path.
+# Two layouts share this sourcer: minimax_m3_vl and qwen4_exp. Both keep
+# their text layers under the same checkpoint prefix and their token table
+# under the same embed key, so the constants below serve both; qwen4_exp
+# additionally routes its layer-2 N-gram PLE table to an mmap-backed store
+# and builds its own per-layer mask schedule (see the qwen4_exp helpers
+# below). A third architecture with a different tensor tree needs a
+# model-type dispatch for the prefix/embed constants, and its model_type
+# joins _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES so the calibration
+# decision starts routing it through the streamed path.
 
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
@@ -8226,7 +8249,7 @@ _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 # keeps the RAM-safe proxy calibration path: the auto rule never streams them,
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
-_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset({"minimax_m3_vl"})
+_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset({"minimax_m3_vl", "qwen4_exp"})
 
 
 def _stream_calibration_supported(model_type: str | None) -> bool:
@@ -8347,15 +8370,26 @@ def _iter_streamed_layer_blocks(
     the block; the generator drops its own reference before popping the
     next layer so at most one layer's weights are ever resident here.
     """
+    is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
+    if is_qwen4_exp:
+        _qwen4_exp_configure_stream_runtime(source)
     args, layer_cls = _streamed_text_args(source, trust_remote_code=trust_remote_code)
     dp = _streamed_source_plan(source, config)
     for layer_idx in range(args.num_hidden_layers):
         items = _streamed_layer_items(dp, layer_idx)
+        if is_qwen4_exp and _qwen4_exp_ple_runtime_mode() == "mmap":
+            items = _qwen4_exp_drop_mmap_ple_shards(items, layer_idx)
         block = layer_cls(args, layer_idx)
         mode = _load_streamed_block_weights(block, items, layer_idx)
         del items
         mx.eval(block.parameters())
-        is_moe = bool(block.is_moe_layer)
+        is_moe = bool(
+            getattr(
+                block,
+                "is_moe_layer",
+                "SparseMoeBlock" in type(getattr(block, "mlp", None)).__name__,
+            )
+        )
         logger.debug(
             "streamed layer %d sourced (%s load, moe=%s)", layer_idx, mode, is_moe
         )
@@ -8370,6 +8404,121 @@ def _streamed_embed_weight(source, config: dict):
     weight = dp.pop(_STREAM_EMBED_KEY)
     mx.eval(weight)
     return weight
+
+
+def _stream_source_model_type(config: dict) -> str:
+    return str(config.get("model_type", "")).lower()
+
+
+_QWEN4_EXP_PLE_SHARD_KEY_RE = re.compile(
+    r"^ple\.ple_embedding\.ngram_embedding\.shards\.\d+\.weight$"
+)
+
+
+def _qwen4_exp_configure_stream_runtime(source) -> None:
+    """Route the qwen4_exp N-gram PLE table to disk before block construction.
+
+    The vendored decoder layer reads the module-global PLE runtime mode at
+    construction time; the default "resident" would materialize the full
+    N-gram table (tens of GB) inside every _iter_streamed_layer_blocks pass,
+    which is exactly the memory profile streaming exists to avoid. mmap mode
+    makes the PLE gather straight from the checkpoint shards instead.
+    Lightning MTP stays off: calibration forwards never target-verify.
+    """
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+
+    resolved = configure_qwen4_exp_runtime(source, mode="mmap", mtp_enabled=False)
+    if resolved != "mmap":
+        raise RuntimeError(
+            "qwen4_exp streaming requires the mmap PLE runtime, but "
+            f"configure_qwen4_exp_runtime resolved {resolved!r} for {source}"
+        )
+
+
+def _qwen4_exp_ple_runtime_mode() -> str:
+    from mlx_vlm.models.qwen4_exp.language import get_ple_runtime_mode
+
+    return get_ple_runtime_mode()
+
+
+def _qwen4_exp_drop_mmap_ple_shards(items: list, layer_idx: int) -> list:
+    """Drop the N-gram shard tensors an mmap-mode PLE block self-sources.
+
+    The sanitize plan keeps the ``ple.ple_embedding.ngram_embedding.shards.*``
+    weights (the quantizer needs them), but an mmap-mode block exposes no
+    matching parameters — DiskBackedShardedEmbedding reads them straight from
+    the checkpoint and only registers its scale/offset metadata. Leaving the
+    shard tensors in the item list would make the strict block load raise on
+    ``extra``. Everything else (weight_scale, ngram_heads_*) matches real
+    block parameters and stays.
+    """
+    kept = [(k, v) for k, v in items if not _QWEN4_EXP_PLE_SHARD_KEY_RE.match(k)]
+    dropped = len(items) - len(kept)
+    if dropped:
+        logger.info(
+            "streamed layer %d: dropped %d N-gram shard tensors "
+            "(mmap-mode PLE reads them straight from the checkpoint)",
+            layer_idx,
+            dropped,
+        )
+    return kept
+
+
+def _streamed_qwen4_exp_state(config: dict, calib_data, embedded):
+    """Qwen4-Exp streaming boundary: hc-tiled inputs, mask schedule, state.
+
+    Mirrors _prepare_qwen4_exp_layer_inputs, which cannot dispatch here: its
+    _find_layer_model gate matches ``model.layers`` by object identity, and a
+    one-block-at-a-time generator never materializes that list. The mask
+    schedule comes from config.text_config.layer_types (None for
+    linear_attention, causal for full_attention) and MUST be indexed per
+    layer — reusing one mask for all layers would calibrate every QSA layer
+    non-causally, silently.
+
+    Returns (tiled_inputs, layer_masks, position_ids); the caller slices
+    calib_data/position_ids per micro-batch to build the per-slot forward
+    state, matching the resident collector's per-batch state construction.
+    """
+    text_config = config.get("text_config") or {}
+    hc_count = int(text_config.get("hc_count") or 0)
+    hidden_size = int(text_config.get("hidden_size") or 0)
+    layer_types = list(text_config.get("layer_types") or [])
+    if hc_count <= 0 or hidden_size <= 0 or not layer_types:
+        raise RuntimeError(
+            "qwen4_exp streaming requires text_config.hc_count, hidden_size "
+            "and layer_types"
+        )
+    expected_width = hc_count * hidden_size
+    if int(embedded.shape[-1]) == hidden_size:
+        inputs = mx.tile(embedded, (1, 1, hc_count))
+    elif int(embedded.shape[-1]) == expected_width:
+        inputs = embedded
+    else:
+        raise RuntimeError(
+            "qwen4_exp streaming received an invalid hidden width: "
+            f"{int(embedded.shape[-1])} (expected {hidden_size} or {expected_width})"
+        )
+    seq_len = int(calib_data.shape[1])
+    causal_mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+    causal_mask = causal_mask.astype(inputs.dtype)
+    layer_masks = [
+        None if layer_type == "linear_attention" else causal_mask
+        for layer_type in layer_types
+    ]
+    position_ids = mx.broadcast_to(
+        mx.arange(seq_len, dtype=mx.int32)[None],
+        (int(calib_data.shape[0]), seq_len),
+    )
+    return inputs, layer_masks, position_ids
+
+
+def _streamed_qwen4_exp_slot_state(calib_data, position_ids, lo: int, hi: int) -> dict:
+    """Per-micro-batch forward state, sliced exactly like the resident walk."""
+    return {
+        "kind": _QWEN4_EXP_LAYER_STATE_KIND,
+        "input_ids": calib_data[lo:hi],
+        "position_ids": position_ids[lo:hi],
+    }
 
 
 # Default seed for the streaming collector's calibration draw. The permutation
@@ -8413,6 +8562,7 @@ class _StreamingNoModel:
 def _streamed_sensitivity_state(
     tokenizer,
     embed_weight,
+    config: dict,
     *,
     calib_dataset: str,
     num_samples: int,
@@ -8424,9 +8574,12 @@ def _streamed_sensitivity_state(
     The sensitivity measurement keeps its own calibration boundary (own
     corpus, sample count, and sequence length), separate from the imatrix
     boundary, embedded through the caller's already-resident embedding
-    table. Mask and position ids come from the same generic
-    _prepare_layer_inputs branch _measure_sensitivity_from_model takes.
-    Returns None when the calibration draw fails.
+    table. For the generic layout, mask and position ids come from the same
+    _prepare_layer_inputs branch _measure_sensitivity_from_model takes; for
+    qwen4_exp the state carries the hc-tiled boundary, the per-layer mask
+    schedule, and the input-ids forward state instead (the auto-dispatch
+    cannot fire without a live model). Returns None when the calibration
+    draw fails.
     """
     mx.random.seed(int(calib_seed))
     calib_data = _load_calibration_data(
@@ -8438,6 +8591,20 @@ def _streamed_sensitivity_state(
     if calib_data is None:
         return None
     inputs = embed_weight[calib_data]
+    if _stream_source_model_type(config) == "qwen4_exp":
+        inputs, layer_masks, position_ids = _streamed_qwen4_exp_state(
+            config, calib_data, inputs
+        )
+        mx.eval(inputs)
+        return {
+            "inputs": inputs,
+            "mask": None,
+            "layer_masks": layer_masks,
+            "position_ids": _streamed_qwen4_exp_slot_state(
+                calib_data, position_ids, 0, int(calib_data.shape[0])
+            ),
+            "scores": {},
+        }
     inputs, masks, position_ids = _prepare_layer_inputs(
         _StreamingNoModel(), [None], calib_data, inputs
     )
@@ -8464,8 +8631,10 @@ def _streamed_sensitivity_layer(
     path skips the layer: with streamed sourcing it means a weight-load
     bug, and a silently missing score would skew the bit allocation.
     """
+    layer_masks = state.get("layer_masks")
+    layer_mask = layer_masks[layer_idx] if layer_masks is not None else state["mask"]
     out_float, _ = _forward_layer_result(
-        block, state["inputs"], state["mask"], state["position_ids"]
+        block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
     )
     if out_float is None:
         raise RuntimeError(
@@ -8475,7 +8644,7 @@ def _streamed_sensitivity_layer(
     saved = _temporary_quantize_block(block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE)
     try:
         out_quant, _ = _forward_layer_result(
-            block, state["inputs"], state["mask"], state["position_ids"]
+            block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
         )
         if out_quant is None:
             raise RuntimeError(
@@ -8592,6 +8761,7 @@ def _collect_imatrix_streaming(
     # 1024x512 ceiling) means an escalation round re-streams layers only
     # for its own sample slice instead of re-running stage 0.
     calib_data = calib_data[:max_samples]
+    is_qwen4_exp = _stream_source_model_type(config) == "qwen4_exp"
     embed_weight = _streamed_embed_weight(source, config)
     embedded = embed_weight[calib_data]
     mx.eval(embedded)
@@ -8602,6 +8772,7 @@ def _collect_imatrix_streaming(
         sens_state = _streamed_sensitivity_state(
             tokenizer,
             embed_weight,
+            config,
             calib_dataset=sensitivity_calib_dataset,
             num_samples=sensitivity_num_samples,
             seq_length=sensitivity_seq_length,
@@ -8615,12 +8786,25 @@ def _collect_imatrix_streaming(
     del embed_weight
     mx.clear_cache()
 
-    # One causal mask and one position-id row serve every layer and every
-    # micro-batch: both depend only on seq_length and the activation dtype.
-    _, layer_masks, position_ids = _prepare_layer_inputs(
-        _StreamingNoModel(), [None], calib_data[:1], embedded[:1]
-    )
-    mask = layer_masks[0]
+    if is_qwen4_exp:
+        # hc-tile once at stage 0 (slicing commutes with the tile, so the
+        # per-slot rows stay bitwise-equal to the resident per-batch tiling)
+        # and build the per-layer mask schedule from config.layer_types; the
+        # forward state is sliced per micro-batch below, exactly like the
+        # resident collector's per-batch _prepare_layer_inputs call.
+        embedded, q4_layer_masks, q4_position_ids = _streamed_qwen4_exp_state(
+            config, calib_data, embedded
+        )
+        mx.eval(embedded)
+        mask = None
+        position_ids = None
+    else:
+        # One causal mask and one position-id row serve every layer and every
+        # micro-batch: both depend only on seq_length and the activation dtype.
+        _, layer_masks, position_ids = _prepare_layer_inputs(
+            _StreamingNoModel(), [None], calib_data[:1], embedded[:1]
+        )
+        mask = layer_masks[0]
 
     text_config = config.get("text_config") or {}
     total_layers = int(
@@ -8655,6 +8839,14 @@ def _collect_imatrix_streaming(
         round_stop = min(round_start + step_samples, max_samples)
         ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
         working = [embedded[lo:hi] for lo, hi in ranges]
+        slot_states = (
+            [
+                _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
+                for lo, hi in ranges
+            ]
+            if is_qwen4_exp
+            else None
+        )
 
         # No MTP-head pass here: the checkpoints this path serves declare
         # MTP modules without shipping their weights (MiniMax-M3), so the
@@ -8684,10 +8876,15 @@ def _collect_imatrix_streaming(
                         "layout does not match the capture predicate. Refusing "
                         f"to sweep all {total_layers} layers for an empty imatrix"
                     )
+            layer_mask = q4_layer_masks[layer_idx] if is_qwen4_exp else mask
             try:
                 for slot in range(len(working)):
                     out, _ = _forward_layer_result(
-                        block, working[slot], mask, position_ids
+                        block,
+                        working[slot],
+                        layer_mask,
+                        slot_states[slot] if slot_states is not None else position_ids,
+                        layer_idx=layer_idx,
                     )
                     if out is None:
                         # The resident collector skips a dead layer forward;
@@ -8779,7 +8976,7 @@ def _collect_imatrix_streaming(
                 # boundary so escalation rounds do not carry it.
                 sens_state["inputs"] = None
 
-        del working
+        del working, slot_states
         mx.clear_cache()
 
         processed_samples = round_stop
@@ -8998,7 +9195,15 @@ def _load_or_collect_imatrix(
     sensitivity_oq_level=None,
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
+    require_mtp_entries: bool = True,
 ) -> OQImatrixData:
+    # ``require_mtp_entries=False`` skips the mtp.*-entries completeness
+    # check on a cache hit. A build that drops the MTP head
+    # (preserve_mtp=False) never quantizes mtp.* tensors, so a cache
+    # without head entries is complete for it — and the streaming
+    # collector never runs the MTP-head pass, so on a source that ships
+    # real mtp.* weights (e.g. qwen4_exp) the check would otherwise force
+    # a full recollect on every reuse.
     # ``measure_sensitivity`` asks the streaming collector to fuse the
     # per-layer qdq sensitivity measurement into the collection sweep; the
     # scores come back under metadata["collection"]["sensitivity_map"]. It
@@ -9030,7 +9235,9 @@ def _load_or_collect_imatrix(
                     path,
                     cache_load_kind or "an unknown load kind",
                 )
-            elif _oqe_cache_missing_mtp_entries(cache, config, model_path):
+            elif require_mtp_entries and _oqe_cache_missing_mtp_entries(
+                cache, config, model_path
+            ):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
@@ -9368,6 +9575,7 @@ def _measure_sensitivity_streaming(
     state = _streamed_sensitivity_state(
         tokenizer,
         embed_weight,
+        config,
         calib_dataset=calib_dataset,
         num_samples=num_samples,
         seq_length=seq_length,
