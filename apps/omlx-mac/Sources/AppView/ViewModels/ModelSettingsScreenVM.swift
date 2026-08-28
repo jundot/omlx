@@ -1013,18 +1013,14 @@ final class ModelSettingsScreenVM {
             || type.hasPrefix("qwen3_8")
     }
 
-    /// MTP can't co-exist with DFlash or TurboQuant KV. The toggle uses
-    /// this to disable itself and surface the conflict reason.
+    /// Native Lightning MTP can't co-exist with the other speculative
+    /// decoders. TurboQuant KV supports its decode-shaped multi-row verify
+    /// path, so it is intentionally not a conflict here.
     var mtpConflictReason: String? {
         if dflashEnabled {
             return String(localized: "settings.mtp.conflict.dflash",
                           defaultValue: "Disable DFlash before enabling MTP.",
                           comment: "Tooltip / sublabel shown when MTP can't be enabled because DFlash is on")
-        }
-        if turboquantKvEnabled {
-            return String(localized: "settings.mtp.conflict.turboquant",
-                          defaultValue: "Disable TurboQuant KV before enabling MTP.",
-                          comment: "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on")
         }
         if vlmMtpEnabled {
             return String(localized: "settings.mtp.conflict.vlm_mtp",

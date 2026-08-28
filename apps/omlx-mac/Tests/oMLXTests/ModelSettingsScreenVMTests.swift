@@ -23,6 +23,18 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         )
     }
 
+    func testLightningMtpAllowsTurboQuantInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        vm.turboquantKvEnabled = true
+
+        XCTAssertNil(vm.mtpConflictReason)
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"
