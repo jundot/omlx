@@ -126,6 +126,25 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
                     "sidecar_count": 84,
                     "sidecar_size_bytes": 4096,
                 },
+                "boundary_snapshots": {
+                    "capture_attempts": 5,
+                    "captures": 4,
+                    "override_misses": 1,
+                    "reasons": {"cache_offset_mismatch": 1},
+                    "last_event": {
+                        "event": "capture_skipped",
+                        "reason": "cache_offset_mismatch",
+                    },
+                },
+                "last_prefix_lookup": {
+                    "request_id": "lookup-a",
+                    "prompt_tokens": 20000,
+                    "reused_kv_tokens": 16384,
+                    "reprefill_tokens": 3616,
+                    "common_prefix_tokens": 18000,
+                    "unreused_common_prefix_tokens": 1616,
+                    "block_size": 2048,
+                },
                 "ssd_cache": {
                     "num_files": 84,
                     "total_size_bytes": 5000,
@@ -170,6 +189,12 @@ def test_scheduler_gdn_and_ssd_observability_is_mapped_to_model_row(tmp_path):
     assert row["loads"] == 6
     assert row["errors"] == 1
     assert row["hot_cache_hits"] == 4
+    assert row["boundary_snapshots"]["capture_attempts"] == 5
+    assert row["boundary_snapshots"]["reasons"] == {
+        "cache_offset_mismatch": 1
+    }
+    assert row["last_prefix_lookup"]["reused_kv_tokens"] == 16384
+    assert row["last_prefix_lookup"]["unreused_common_prefix_tokens"] == 1616
 
 
 def test_engine_returning_none_stats_is_skipped(tmp_path):

@@ -47,7 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
-from .cache.observability import CacheRateTracker
+from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
@@ -2061,12 +2061,14 @@ class Scheduler:
         self._boundary_snapshot_required: bool | None = None
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
         self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
+        self._boundary_snapshot_diagnostics = BoundarySnapshotDiagnostics()
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: PagedCacheManager | None = None
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
         self._cache_rate_tracker = CacheRateTracker()
+        self._last_prefix_cache_lookup: dict[str, Any] | None = None
         # Prefill-peak estimator used by ``_preflight_memory_check`` /
         # ``preflight_or_raise``. Only the estimator path is exercised
         # here (it reads head_dim / num_layers / num_kv_heads via
@@ -6211,14 +6213,45 @@ class Scheduler:
         ``BatchGenerator`` yet and the uid mapping does not exist —
         routing through it dropped every snapshot silently (#TBD).
         """
+        block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+        )
         if self.block_aware_cache is None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="prefix_cache_disabled",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
-        block_size = self.config.paged_cache_block_size
         if block_size <= 0 or token_count <= 0 or token_count % block_size != 0:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="unaligned_token_count",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if not self._cache_list_needs_boundary_snapshot(snapshot_cache):
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="no_stateful_cache",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         if request_id not in self._boundary_cache_snapshots:
@@ -6226,6 +6259,14 @@ class Scheduler:
 
         # Skip if we already have a snapshot at this token count
         if token_count in self._boundary_cache_snapshots[request_id]:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="duplicate_boundary",
+                request_id=request_id,
+                token_count=token_count,
+                block_size=block_size,
+                source="prefill",
+            )
             return
 
         # Offload snapshot to SSD if store is available, keeping only a
@@ -6247,7 +6288,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                    source="prefill",
+                    storage="memory",
+                )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
                         self._prefill_snapshot_value(snapshot_cache),
@@ -6256,6 +6307,7 @@ class Scheduler:
                         self._stream,
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request_id][token_count] = (
                 _compact_boundary_snapshot_value(
@@ -6265,13 +6317,23 @@ class Scheduler:
                     self._stream,
                 )
             )
+            storage = "memory"
 
         self._boundary_snapshot_required = True
         self._enable_mtp_boundary_alignment()
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request_id,
+            token_count=token_count,
+            block_size=block_size,
+            source="prefill",
+            storage=storage,
+        )
         logger.debug(
-            "Captured prefill boundary cache snapshot for %s at %s tokens",
+            "Captured prefill boundary cache snapshot for %s at %s tokens (%s)",
             request_id,
             token_count,
+            storage,
         )
 
     _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
@@ -6495,7 +6557,10 @@ class Scheduler:
             pass
 
     def _extract_boundary_snapshot(
-        self, uid: int, expected_tokens: int | None = None
+        self,
+        uid: int,
+        expected_tokens: int | None = None,
+        request_id: str | None = None,
     ) -> list[Any] | None:
         """Extract a per-request prompt cache snapshot via extract_cache().
 
@@ -6513,7 +6578,20 @@ class Scheduler:
         on hybrid models; skipping the capture merely costs a reuse
         opportunity.
         """
+        block_size = self.config.paged_cache_block_size
+
+        def record_skip(reason: str) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason=reason,
+                request_id=request_id,
+                token_count=expected_tokens,
+                block_size=block_size,
+                source="decode",
+            )
+
         if self.batch_generator is None:
+            record_skip("batch_generator_unavailable")
             return None
 
         try:
@@ -6525,6 +6603,7 @@ class Scheduler:
                 with mx.stream(self._stream):
                     result = self.batch_generator.extract_cache([uid])
                     if uid not in result:
+                        record_skip("uid_not_found")
                         return None
                     cache_list, _tokens = result[uid]
                     if expected_tokens is not None:
@@ -6545,11 +6624,12 @@ class Scheduler:
                                     offset,
                                     expected_tokens,
                                 )
+                                record_skip("cache_offset_mismatch")
                                 return None
                             break
                     # Only extract non-sliceable layers to avoid costly
                     # deep-copy accumulation (same rationale as prefill path).
-                    return [
+                    snapshot = [
                         (
                             c
                             if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
@@ -6557,10 +6637,15 @@ class Scheduler:
                         )
                         for c in cache_list
                     ]
+                    if not snapshot:
+                        record_skip("empty_snapshot")
+                        return None
+                    return snapshot
         except Exception as e:
             logger.debug(
                 f"Failed to extract boundary cache snapshot for uid={uid}: {e}"
             )
+            record_skip("extract_error")
             return None
 
     def _maybe_capture_boundary_snapshot(self, request: Request, uid: int) -> None:
@@ -6579,8 +6664,17 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_attempt",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+        )
         snapshot_cache = self._extract_boundary_snapshot(
-            uid, expected_tokens=total_tokens
+            uid,
+            expected_tokens=total_tokens,
+            request_id=request.request_id,
         )
         if not snapshot_cache:
             return
@@ -6600,7 +6694,17 @@ class Scheduler:
                 )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
+                storage = "ssd"
             else:
+                self._boundary_snapshot_diagnostics.record(
+                    "ssd_fallback",
+                    reason="ssd_save_failed",
+                    request_id=request.request_id,
+                    token_count=total_tokens,
+                    block_size=block_size,
+                    source="decode",
+                    storage="memory",
+                )
                 # In-memory fallback: the store-cache worker slices this snapshot
                 # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
                 # MLX streams are thread-local, so force the leaves concrete now on
@@ -6612,16 +6716,26 @@ class Scheduler:
                         snapshot_cache, total_tokens, block_size
                     )
                 )
+                storage = "memory"
         else:
             self._boundary_cache_snapshots[request.request_id][total_tokens] = (
                 self._decode_boundary_snapshot_value(
                     snapshot_cache, total_tokens, block_size
                 )
             )
+            storage = "memory"
 
+        self._boundary_snapshot_diagnostics.record(
+            "capture_success",
+            request_id=request.request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+            source="decode",
+            storage=storage,
+        )
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
-            f"{total_tokens} tokens"
+            f"{total_tokens} tokens ({storage})"
         )
 
     def _get_boundary_store_override(
@@ -6645,12 +6759,33 @@ class Scheduler:
             intermediate_snapshots) where intermediate_snapshots maps
             token_count -> extracted cache states for per-block storage.
         """
-        snapshots = self._boundary_cache_snapshots.get(request_id)
-        if not snapshots:
-            return None
-
         total_tokens = len(full_token_sequence)
         block_size = self.config.paged_cache_block_size
+        self._boundary_snapshot_diagnostics.record(
+            "override_attempt",
+            request_id=request_id,
+            token_count=total_tokens,
+            block_size=block_size,
+        )
+
+        def miss(reason: str, available_boundaries: int = 0) -> None:
+            self._boundary_snapshot_diagnostics.record(
+                "override_miss",
+                reason=reason,
+                request_id=request_id,
+                token_count=total_tokens,
+                block_size=block_size,
+                available_boundaries=available_boundaries,
+            )
+
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if not snapshots:
+            miss("no_snapshots")
+            return None
+
+        if block_size <= 0:
+            miss("invalid_block_size", len(snapshots))
+            return None
 
         # Find all valid boundary-aligned snapshot token counts
         valid_counts = sorted(
@@ -6659,6 +6794,7 @@ class Scheduler:
             if 0 < tc <= total_tokens and tc % block_size == 0
         )
         if not valid_counts:
+            miss("no_aligned_snapshots", len(snapshots))
             return None
 
         # Find the latest snapshot that leaves trailing partial tokens
@@ -6672,6 +6808,7 @@ class Scheduler:
             # provide intermediate snapshots for per-block storage.
             latest_tc = total_tokens
         else:
+            miss("latest_snapshot_not_usable", len(valid_counts))
             return None
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
@@ -6686,6 +6823,7 @@ class Scheduler:
             # Offloaded to SSD — load back.
             extracted_cache = self._boundary_snapshot_store.load(request_id, latest_tc)
             if not extracted_cache:
+                miss("ssd_load_failed", len(valid_counts))
                 return None
             # Build model_cache_config from the main request cache config
             # since the SSD snapshot doesn't carry it.
@@ -6709,8 +6847,10 @@ class Scheduler:
                     latest_snapshot
                 )
             if not extracted_cache:
+                miss("snapshot_extract_failed", len(valid_counts))
                 return None
         else:
+            miss("snapshot_value_unavailable", len(valid_counts))
             return None
 
         # Build provider for intermediate snapshots. SSD-backed snapshots remain
@@ -6754,6 +6894,13 @@ class Scheduler:
             else full_token_sequence
         )
 
+        self._boundary_snapshot_diagnostics.record(
+            "override_hit",
+            request_id=request_id,
+            token_count=latest_tc,
+            block_size=block_size,
+            available_boundaries=len(valid_counts),
+        )
         return (
             token_sequence,
             extracted_cache,
@@ -7651,7 +7798,35 @@ class Scheduler:
         logs.
         """
         prompt = request.prompt_token_ids or []
-        if not prompt or not self._cache_probe_seqs:
+        cached = request.cached_tokens or 0
+        block = max(1, self.config.paged_cache_block_size)
+        base_observation: dict[str, Any] = {
+            "request_id": request.request_id,
+            "prompt_tokens": len(prompt),
+            "reused_kv_tokens": cached,
+            "reprefill_tokens": max(0, len(prompt) - cached),
+            "block_size": block,
+            "matched_blocks": cached // block,
+        }
+        if not prompt:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "empty_prompt",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
+            return
+        if not self._cache_probe_seqs:
+            self._last_prefix_cache_lookup = {
+                **base_observation,
+                "reason": "no_recent_store_probe",
+                "closest_request_id": None,
+                "common_prefix_tokens": 0,
+                "comparable_tokens": 0,
+                "unreused_common_prefix_tokens": 0,
+            }
             return
         best_id, best_seq, best_p = None, None, -1
         for ref_id, seq in list(self._cache_probe_seqs):
@@ -7660,10 +7835,16 @@ class Scheduler:
                 best_id, best_seq, best_p = ref_id, seq, p
         if best_seq is None:
             return
-        cached = request.cached_tokens or 0
         reusable = min(len(prompt), len(best_seq))
-        block = max(1, self.config.paged_cache_block_size)
         reprefill = len(prompt) - cached
+        self._last_prefix_cache_lookup = {
+            **base_observation,
+            "reason": "closest_recent_store",
+            "closest_request_id": best_id,
+            "common_prefix_tokens": best_p,
+            "comparable_tokens": reusable,
+            "unreused_common_prefix_tokens": max(0, best_p - cached),
+        }
         if reprefill >= self._REPREFILL_INFO_MIN_TOKENS and best_p >= block:
             logger.info(
                 "prefix cache: request %s re-prefills %d of %d tokens "
@@ -11017,13 +11198,27 @@ class Scheduler:
                                 f"{len(request.output_token_ids)} output)"
                             )
                         except _BoundaryStoreUnavailable:
-                            logger.debug(
-                                "Skipping cache store for %s: no boundary-aligned "
-                                "snapshot for non-sliceable cache state (all "
-                                "captures skipped, e.g. by the speculative-decode "
-                                "skew guard); storing live state would corrupt "
+                            available_boundaries = len(
+                                self._boundary_cache_snapshots.get(request_id, {})
+                            )
+                            self._boundary_snapshot_diagnostics.record(
+                                "store_skip",
+                                reason="boundary_snapshot_unavailable",
+                                request_id=request_id,
+                                token_count=len(cacheable_sequence),
+                                block_size=self.config.paged_cache_block_size,
+                                available_boundaries=available_boundaries,
+                            )
+                            logger.info(
+                                "Skipping cache store for %s: reason=%s "
+                                "tokens=%d block_size=%d available_boundaries=%d; "
+                                "storing live non-sliceable state would corrupt "
                                 "later prefix hits",
                                 request_id,
+                                "boundary_snapshot_unavailable",
+                                len(cacheable_sequence),
+                                self.config.paged_cache_block_size,
+                                available_boundaries,
                             )
                             block_table = None
                             if self.paged_cache_manager:
@@ -12936,6 +13131,13 @@ class Scheduler:
         if self.block_aware_cache is not None:
             prefix_stats = self.block_aware_cache.get_stats_dict()
             stats["prefix_cache"] = prefix_stats
+            stats["boundary_snapshots"] = (
+                self._boundary_snapshot_diagnostics.snapshot()
+            )
+            if self._last_prefix_cache_lookup is not None:
+                stats["last_prefix_lookup"] = dict(
+                    self._last_prefix_cache_lookup
+                )
             specprefill_cache_stats = {
                 "target_static_hits": prefix_stats["exact_prefix_hits"],
                 "target_static_misses": prefix_stats["exact_prefix_misses"],

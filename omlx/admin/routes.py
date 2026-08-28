@@ -5053,6 +5053,12 @@ def _build_runtime_cache_observability(
         gdn_last_restore = prefix_stats.get("gdn_last_restore")
         if not isinstance(gdn_last_restore, dict):
             gdn_last_restore = None
+        boundary_snapshots = runtime_stats.get("boundary_snapshots")
+        if not isinstance(boundary_snapshots, dict):
+            boundary_snapshots = None
+        last_prefix_lookup = runtime_stats.get("last_prefix_lookup")
+        if not isinstance(last_prefix_lookup, dict):
+            last_prefix_lookup = None
 
         # Keep the cache fields at the model-row level so the dashboard and
         # external admin clients can inspect them without knowing scheduler's
@@ -5127,6 +5133,11 @@ def _build_runtime_cache_observability(
             "gdn_last_restore": gdn_last_restore,
             "gdn_staging": gdn_staging_payload,
         }
+
+        if boundary_snapshots is not None:
+            model_payload["boundary_snapshots"] = boundary_snapshots
+        if last_prefix_lookup is not None:
+            model_payload["last_prefix_lookup"] = last_prefix_lookup
 
         for field in ssd_counter_fields:
             if field in ssd_stats:
