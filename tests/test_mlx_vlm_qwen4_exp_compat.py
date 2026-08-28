@@ -1423,3 +1423,98 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def _disk_backed_bf16_fixture(tmp_path, num_shards=4, rows=4, dims=4):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    tensors = {}
+    for shard in range(num_shards):
+        start = shard * rows * dims
+        tensors[f"{prefix}.shard_{shard}.weight"] = (
+            mx.arange(start, start + rows * dims, dtype=mx.float32)
+            .reshape(rows, dims)
+            .astype(mx.bfloat16)
+        )
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: filename for key in tensors}}),
+        encoding="utf-8",
+    )
+    embedding = DiskBackedShardedEmbedding(
+        tmp_path,
+        prefix,
+        num_embeddings=num_shards * rows,
+        dims=dims,
+        num_shards=num_shards,
+    )
+    table = mx.concatenate(
+        [tensors[f"{prefix}.shard_{shard}.weight"] for shard in range(num_shards)]
+    )
+    return embedding, table
+
+
+def test_disk_backed_ple_gather_matches_a_plain_table_lookup(tmp_path):
+    """Shuffled, repeated indices across shards must gather row for row.
+
+    The gather buckets by shard, reads each shard's rows once and scatters the
+    result back, so duplicates and ordering are exactly where it can go wrong
+    while still returning something plausibly shaped.
+    """
+    embedding, table = _disk_backed_bf16_fixture(tmp_path)
+    indices = mx.array([[13, 2, 2, 7, 15], [0, 15, 6, 2, 13]], dtype=mx.int32)
+
+    values = embedding(indices)
+    mx.eval(values)
+
+    expected = table[indices.reshape(-1)].reshape(2, 5, 4)
+    assert values.shape == (2, 5, 4)
+    assert mx.array_equal(values, expected).item()
+    # Six distinct rows behind ten lookups: repeats are read once, not twice.
+    assert embedding.rows_read == 6
+    assert embedding.last_touched_shards == (0, 1, 3)
+    embedding.close()
+
+
+def test_disk_backed_ple_gather_handles_an_empty_batch(tmp_path):
+    embedding, _ = _disk_backed_bf16_fixture(tmp_path)
+    values = embedding(mx.zeros((1, 0), dtype=mx.int32))
+    mx.eval(values)
+    assert values.shape == (1, 0, 4)
+    assert embedding.rows_read == 0
+    assert embedding.last_touched_shards == ()
+    embedding.close()
+
+
+def test_disk_backed_ple_gather_rejects_out_of_range_rows(tmp_path):
+    embedding, _ = _disk_backed_bf16_fixture(tmp_path)
+    with pytest.raises(IndexError):
+        embedding(mx.array([[16]], dtype=mx.int32))
+    with pytest.raises(IndexError):
+        embedding(mx.array([[-1]], dtype=mx.int32))
+    embedding.close()
+
+
+def test_resident_sharded_embedding_gather_matches_a_plain_table_lookup():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(num_embeddings=16, dims=4, num_shards=4)
+    for shard, module in enumerate(embedding.shards):
+        start = shard * 16
+        module.weight = (
+            mx.arange(start, start + 16, dtype=mx.float32)
+            .reshape(4, 4)
+            .astype(mx.bfloat16)
+        )
+    table = mx.concatenate([module.weight for module in embedding.shards])
+
+    indices = mx.array([[13, 2, 2, 7, 15], [0, 15, 6, 2, 13]], dtype=mx.int32)
+    values = embedding(indices)
+    mx.eval(values)
+
+    expected = table[indices.reshape(-1)].reshape(2, 5, 4)
+    assert mx.array_equal(values, expected).item()

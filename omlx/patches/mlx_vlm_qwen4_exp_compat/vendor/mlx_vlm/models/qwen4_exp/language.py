@@ -5,8 +5,9 @@ import math
 import mmap
 import os
 import struct
+import threading
 import weakref
-from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1623,6 +1624,82 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+# Page-fault prefetch for the SSD-backed PLE gather.
+#
+# A gather is random over a table far larger than RAM, so each row costs a page
+# fault the process waits out one at a time. Measured on an M5 Max against
+# Qwen3.8-Flash-Next, 3000 verified-cold rows: 50 us/row as-is, 4.8 us/row when
+# the ranges are handed to the kernel up front from a small thread pool.
+#
+# It has to be libc's madvise through ctypes: ``mmap.madvise`` holds the GIL, so
+# threading it changes nothing (measured 16.9 us/row at 8 threads, 16.4 at 1).
+_MADV_WILLNEED = 3
+_PREFETCH_WORKERS = 8
+_prefetch_lock = threading.Lock()
+_prefetch_pool: Any = None
+_libc_madvise: Any = None
+_libc_resolved = False
+
+
+def _madvise_fn():
+    """libc madvise, or None when it cannot be reached on this platform."""
+    global _libc_madvise, _libc_resolved
+    if _libc_resolved:
+        return _libc_madvise
+    try:
+        import ctypes
+        import ctypes.util
+
+        name = ctypes.util.find_library("c") or "libc.dylib"
+        libc = ctypes.CDLL(name, use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        libc.madvise.restype = ctypes.c_int
+        _libc_madvise = libc.madvise
+    except Exception:  # noqa: BLE001 - advisory only, never correctness
+        _libc_madvise = None
+    _libc_resolved = True
+    return _libc_madvise
+
+
+def _prefetch_ranges(ranges: list[tuple[int, int, int]]) -> None:
+    """Advise every (address, offset, length) range, from a small pool.
+
+    Purely advisory: a failure here costs speed, never correctness.
+    """
+    madvise = _madvise_fn()
+    if madvise is None or not ranges:
+        return
+    import ctypes
+
+    global _prefetch_pool
+    if _prefetch_pool is None:
+        with _prefetch_lock:
+            if _prefetch_pool is None:
+                _prefetch_pool = ThreadPoolExecutor(
+                    max_workers=_PREFETCH_WORKERS,
+                    thread_name_prefix="omlx-ple-prefetch",
+                )
+
+    def advise(chunk):
+        for address, begin, length in chunk:
+            madvise(ctypes.c_void_p(address + begin), length, _MADV_WILLNEED)
+
+    slices = [ranges[i::_PREFETCH_WORKERS] for i in range(_PREFETCH_WORKERS)]
+    for done in as_completed(
+        [_prefetch_pool.submit(advise, part) for part in slices if part]
+    ):
+        done.result()
+
+
+_PLE_DTYPES = {
+    "BF16": (np.dtype("<u2"), 2),
+    "F16": (np.dtype("<f2"), 2),
+    "F32": (np.dtype("<f4"), 4),
+    "U32": (np.dtype("<u4"), 4),
+    "F8_E4M3": (np.dtype("u1"), 1),
+}
+
+
 class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
@@ -1633,6 +1710,11 @@ class _SafeTensorMMap:
         self._header = json.loads(self._file.read(header_size))
         self._data_start = 8 + header_size
         self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        self._geometry: dict[str, tuple] = {}
+        # Base address of the mapping, so ranges can be advised through libc.
+        self._address = np.ndarray(
+            (len(self._mapping),), dtype=np.uint8, buffer=self._mapping
+        ).__array_interface__["data"][0]
         try:
             self._mapping.madvise(mmap.MADV_RANDOM)
         except (AttributeError, OSError):
@@ -1644,28 +1726,67 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
-    def rows(self, key: str, rows: list[int]) -> mx.array:
+    def _tensor_geometry(self, key: str):
+        """(shape, np_dtype, dtype_name, byte offset, row stride), memoized."""
+        geometry = self._geometry.get(key)
+        if geometry is not None:
+            return geometry
         entry = self._header[key]
         shape = tuple(entry["shape"])
         start, end = entry["data_offsets"]
         dtype = entry["dtype"]
-        dtype_info = {
-            "BF16": (np.dtype("<u2"), 2),
-            "F16": (np.dtype("<f2"), 2),
-            "F32": (np.dtype("<f4"), 4),
-            "U32": (np.dtype("<u4"), 4),
-            "F8_E4M3": (np.dtype("u1"), 1),
-        }.get(dtype)
+        dtype_info = _PLE_DTYPES.get(dtype)
         if dtype_info is None:
             raise TypeError(f"SSD-backed Qwen4 PLE does not support {dtype}")
         np_dtype, item_size = dtype_info
         if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
+        geometry = (
+            shape,
+            np_dtype,
+            dtype,
+            self._data_start + start,
+            shape[1] * item_size,
+        )
+        self._geometry[key] = geometry
+        return geometry
+
+    def prefetch_ranges(self, key: str, rows) -> list[tuple[int, int, int]]:
+        """Page ranges these rows live on, as (address, offset, length).
+
+        Returned rather than advised here so the caller can hand the kernel
+        every shard's ranges at once; advising shard by shard would serialise
+        the reads again.
+        """
+        if self._mapping is None:
+            return []
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return []
+        _, _, _, offset, row_stride = self._tensor_geometry(key)
+        starts = offset + rows * row_stride
+        page = mmap.PAGESIZE
+        pages = np.unique(
+            np.concatenate([starts // page, (starts + row_stride - 1) // page])
+        )
+        # Coalesce consecutive pages so a run costs one call, not one each.
+        runs = np.split(pages, np.flatnonzero(np.diff(pages) != 1) + 1)
+        limit = len(self._mapping)
+        ranges = []
+        for run in runs:
+            begin = int(run[0]) * page
+            length = min((int(run[-1]) - int(run[0]) + 1) * page, limit - begin)
+            if length > 0:
+                ranges.append((self._address, begin, length))
+        return ranges
+
+    def rows(self, key: str, rows: list[int]) -> mx.array:
+        shape, np_dtype, dtype, offset, _ = self._tensor_geometry(key)
         view = np.ndarray(
             shape,
             dtype=np_dtype,
             buffer=self._mapping,
-            offset=self._data_start + start,
+            offset=offset,
         )
         copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
         if dtype == "BF16":
@@ -1704,6 +1825,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         for size in self.shard_sizes:
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
+        self._offsets = np.asarray(offsets, dtype=np.int64)
         self.dims = dims
         self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
@@ -1837,39 +1959,69 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
+    def _plan(self, host_indices: np.ndarray):
+        """Group a flat gather into (shard, positions, unique rows, inverse).
+
+        ``positions`` indexes back into the caller's flat gather; ``unique`` is
+        the ascending set of shard-local rows to read, and ``inverse`` maps each
+        position onto its row in that set. Bucketing this way is O(n log n) in
+        numpy rather than a Python scan of the whole gather per touched shard,
+        which on a 2048-token chunk is 128 passes over 32k entries.
+        """
+        offsets = self._offsets
+        shard_of = np.searchsorted(offsets, host_indices, side="right") - 1
+        order = np.argsort(shard_of, kind="stable")
+        if order.size == 0:
+            return []
+        sorted_shards = shard_of[order]
+        cuts = np.flatnonzero(sorted_shards[1:] != sorted_shards[:-1]) + 1
+        plan = []
+        for positions in np.split(order, cuts):
+            shard_index = int(shard_of[positions[0]])
+            local = host_indices[positions] - offsets[shard_index]
+            unique, inverse = np.unique(local, return_inverse=True)
+            plan.append((shard_index, positions, unique, inverse.reshape(-1)))
+        return plan
+
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
         flat = indices.reshape(-1)
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        host_indices = np.asarray(flat).astype(np.int64, copy=False).reshape(-1)
+        if host_indices.size and (
+            host_indices.min() < 0 or host_indices.max() >= self.shard_offsets[-1]
+        ):
             raise IndexError("embedding index is outside the sharded vocabulary")
-        shard_indices = [
-            bisect_right(self.shard_offsets, index) - 1 for index in host_indices
-        ]
-        touched = tuple(sorted(set(shard_indices)))
-        self.last_touched_shards = touched
-        self.rows_read = 0
-        result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
-        for shard_index in touched:
-            positions = [
-                i
-                for i, current_shard in enumerate(shard_indices)
-                if current_shard == shard_index
-            ]
-            local = [
-                host_indices[i] - self.shard_offsets[shard_index] for i in positions
-            ]
+
+        plan = self._plan(host_indices)
+        self.last_touched_shards = tuple(entry[0] for entry in plan)
+        # Rows actually read off disk: duplicates within a shard are read once.
+        self.rows_read = int(sum(entry[2].size for entry in plan))
+
+        # Queue every range before reading any of it. Reading shard by shard
+        # pays one page fault at a time; asking for the whole batch first lets
+        # the device serve them together.
+        ranges: list[tuple[int, int, int]] = []
+        for shard_index, _, unique, _ in plan:
+            for key in self._shard_specs[shard_index][:3]:
+                if key is not None:
+                    ranges.extend(
+                        self._tensor_readers[key].prefetch_ranges(key, unique)
+                    )
+        _prefetch_ranges(ranges)
+
+        result = mx.zeros((host_indices.size, self.dims), dtype=mx.bfloat16)
+        for shard_index, positions, unique, inverse in plan:
             weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
                 shard_index
             ]
-            values = self._tensor_readers[weight_key].rows(weight_key, local)
+            values = self._tensor_readers[weight_key].rows(weight_key, unique)
             if bits is not None:
                 assert scales_key is not None
                 assert biases_key is not None
                 assert group_size is not None
-                scales = self._tensor_readers[scales_key].rows(scales_key, local)
-                biases = self._tensor_readers[biases_key].rows(biases_key, local)
+                scales = self._tensor_readers[scales_key].rows(scales_key, unique)
+                biases = self._tensor_readers[biases_key].rows(biases_key, unique)
                 values = mx.dequantize(
                     values,
                     scales,
@@ -1879,7 +2031,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     mode="affine",
                 )
             values = values.astype(mx.bfloat16) * self.weight_scale
-            self.rows_read += len(local)
+            values = values[mx.array(inverse, dtype=mx.int32)]
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
 
@@ -1918,6 +2070,7 @@ class ShardedEmbedding(nn.Module):
         for size in self.shard_sizes:
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
+        self._offsets = np.asarray(offsets, dtype=np.int64)
         self.dims = dims
 
     def __call__(self, indices: mx.array) -> mx.array:
@@ -1929,33 +2082,36 @@ class ShardedEmbedding(nn.Module):
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
         mx.eval(flat)
-        host_indices = [int(index) for index in flat.tolist()]
-        if not host_indices:
+        host_indices = np.asarray(flat).astype(np.int64, copy=False).reshape(-1)
+        if host_indices.size == 0:
             return self.shards[0](flat).reshape(*indices.shape, self.dims)
-        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+        if (
+            host_indices.min() < 0
+            or host_indices.max() >= self.shard_offsets[-1]
+        ):
             raise IndexError("embedding index is outside the sharded vocabulary")
 
-        shard_indices = [
-            bisect_right(self.shard_offsets, index) - 1 for index in host_indices
-        ]
+        # Bucket by shard in numpy: the equivalent Python scan costs one pass
+        # over the whole gather per touched shard (128 of them here).
+        shard_of = np.searchsorted(self._offsets, host_indices, side="right") - 1
+        order = np.argsort(shard_of, kind="stable")
+        sorted_shards = shard_of[order]
+        cuts = np.flatnonzero(sorted_shards[1:] != sorted_shards[:-1]) + 1
         result = None
-        for shard_index in sorted(set(shard_indices)):
-            positions_list = [
-                position
-                for position, current_shard in enumerate(shard_indices)
-                if current_shard == shard_index
-            ]
-            local_indices = [
-                host_indices[position] - self.shard_offsets[shard_index]
-                for position in positions_list
-            ]
-            positions = mx.array(positions_list, dtype=mx.int32)
-            values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+        for positions_np in np.split(order, cuts):
+            shard_index = int(shard_of[positions_np[0]])
+            local_indices = host_indices[positions_np] - self._offsets[shard_index]
+            positions = mx.array(positions_np.astype(np.int32))
+            values = self.shards[shard_index](
+                mx.array(local_indices.astype(np.int32))
+            )
             if values.dtype == mx.uint8:
                 values = mx.from_fp8(values, dtype=mx.bfloat16)
             values = values * self.weight_scale
             if result is None:
-                result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
+                result = mx.zeros(
+                    (host_indices.size, self.dims), dtype=values.dtype
+                )
             result = result.at[positions].add(values)
         return result.reshape(*indices.shape, self.dims)
 
