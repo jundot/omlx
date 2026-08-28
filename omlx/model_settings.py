@@ -220,6 +220,11 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
+    # float16 after load, so the forward runs on the GPU's native float16 path
+    # instead of the emulated bfloat16 one. Quantized payloads are untouched.
+    # Measured on Qwen3.8-Flash-Next / M1 Ultra: -9% ms per decode cycle.
+    activation_fp16_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

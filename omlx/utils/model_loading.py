@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -1198,6 +1199,34 @@ def materialize_lazy_state(model: Any) -> None:
             mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
+def cast_bf16_params_to_fp16(model: Any) -> int:
+    """Recast every bfloat16 parameter of a loaded model to float16.
+
+    The M1/M2 GPU has no native bfloat16 ALU path — Metal emulates it — while
+    float16 is native. Activation dtype follows the dtype of the non-quantized
+    leaves (scales, biases, norms, embeddings), so recasting them moves the
+    whole forward onto the native path. Quantized U32 payloads are untouched.
+
+    Conversion runs in the same bounded chunks materialize_lazy_state uses, and
+    updates the tree per chunk so the bfloat16 originals are released as we go
+    instead of doubling peak memory.
+
+    Returns the number of tensors recast.
+    """
+    from mlx.utils import tree_unflatten
+
+    pending = [
+        (key, value)
+        for key, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and value.dtype == mx.bfloat16
+    ]
+    for start in range(0, len(pending), _MATERIALIZE_EVAL_CHUNK):
+        chunk = [(key, value.astype(mx.float16)) for key, value in pending[start : start + _MATERIALIZE_EVAL_CHUNK]]
+        mx.eval([value for _, value in chunk])
+        model.update(tree_unflatten(chunk))
+    return len(pending)
+
+
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     """Apply optional post-load model transforms based on settings.
 
@@ -1213,6 +1242,17 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    # Native-fp16 activations. Off by default; OMLX_ACT_FP16=1 forces it on for
+    # a one-off A/B without touching persisted settings.
+    if os.environ.get("OMLX_ACT_FP16") == "1" or getattr(
+        model_settings, "activation_fp16_enabled", False
+    ):
+        try:
+            recast = cast_bf16_params_to_fp16(model)
+            logger.info("activation dtype: bfloat16 -> float16 (%d tensors)", recast)
+        except Exception:
+            logger.warning("fp16 activation recast failed; staying on bfloat16", exc_info=True)
+
     # t5 bias recovery for text-engine loads (~420 MB on Bonsai-27B).
     # VLMBatchedEngine calls free_t5_biases explicitly; this covers the
     # BatchedEngine / LLM path, and is a no-op for non-t5 models.
