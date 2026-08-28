@@ -459,7 +459,7 @@
   "settings.generation.max_context_window": "フォールバックコンテキストウィンドウ",
   "settings.generation.max_context_window_hint": "モデルがネイティブのコンテキスト長を宣言していない場合にのみ使用されます。",
   "settings.generation.max_context_window_policy": "グローバルコンテキストウィンドウ上限",
-  "settings.generation.max_context_window_policy_hint": "検出されたモデルのコンテキストウィンドウに適用する任意の上限です。空欄の場合は上限なし。モデル別設定はこれを超えられます。",
+  "settings.generation.max_context_window_policy_hint": "モデル別、ネイティブ、フォールバックのコンテキスト解決後に適用される厳格な上限です。空欄の場合は上限なし。",
   "settings.generation.max_tokens": "最大トークン数",
   "settings.generation.temperature": "温度",
   "settings.generation.temperature_hint": "0.0 = 決定的、2.0 = 最大ランダム",

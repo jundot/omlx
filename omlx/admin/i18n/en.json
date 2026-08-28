@@ -459,7 +459,7 @@
   "settings.generation.max_context_window": "Fallback Context Window",
   "settings.generation.max_context_window_hint": "Used only when a model does not declare its native context length.",
   "settings.generation.max_context_window_policy": "Global Context Window Cap",
-  "settings.generation.max_context_window_policy_hint": "Optional cap for discovered model context windows. Leave empty for no cap; per-model overrides can exceed it.",
+  "settings.generation.max_context_window_policy_hint": "Hard cap applied after per-model, native, or fallback context resolution. Leave empty for no cap.",
   "settings.generation.max_tokens": "Max Tokens",
   "settings.generation.temperature": "Temperature",
   "settings.generation.temperature_hint": "0.0 = deterministic, 2.0 = max randomness",
