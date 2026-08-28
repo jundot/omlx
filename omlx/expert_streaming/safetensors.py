@@ -7,6 +7,7 @@ import json
 import os
 import re
 import struct
+import time
 from collections.abc import Hashable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -447,6 +448,10 @@ class ExpertReader:
         self.read_operations = 0
         self.direct_read_operations = 0
         self.file_cache_read_operations = 0
+        self.io_seconds = 0.0
+        self.decode_seconds = 0.0
+        self.readahead_descriptors = 0
+        self.no_cache_descriptors = 0
         self._closed = False
 
     def _fd(self, path: Path, *, use_file_cache: bool) -> int:
@@ -455,14 +460,25 @@ class ExpertReader:
         if fd is None:
             fd = os.open(path, os.O_RDONLY)
             self._fds[key] = fd
-            no_cache = getattr(os, "F_NOCACHE", None)
-            if not use_file_cache and no_cache is not None:
-                try:
-                    import fcntl
+            try:
+                import fcntl
 
-                    fcntl.fcntl(fd, no_cache, 1)
-                except OSError:
-                    pass
+                if use_file_cache:
+                    read_ahead = getattr(fcntl, "F_RDAHEAD", None)
+                    if read_ahead is not None:
+                        fcntl.fcntl(fd, read_ahead, 1)
+                        self.readahead_descriptors += 1
+                else:
+                    no_cache = getattr(
+                        fcntl, "F_NOCACHE", getattr(os, "F_NOCACHE", None)
+                    )
+                    if no_cache is not None:
+                        fcntl.fcntl(fd, no_cache, 1)
+                        self.no_cache_descriptors += 1
+            except OSError:
+                # These are advisory Darwin hints. Unsupported filesystems and
+                # non-Darwin platforms should retain ordinary pread semantics.
+                pass
         return fd
 
     @staticmethod
@@ -543,7 +559,9 @@ class ExpertReader:
                 raise OSError(f"Short expert read from {path.name}")
             return key, first, payload
 
+        io_started = time.perf_counter()
         chunks = list(self._pool.map(read_range, tasks))
+        self.io_seconds += time.perf_counter() - io_started
         bytes_read = sum(len(payload) for _, _, payload in chunks)
         operations = len(chunks)
         self.bytes_read += bytes_read
@@ -560,6 +578,7 @@ class ExpertReader:
         for key, first, payload in chunks:
             grouped[key].append((first, payload))
 
+        decode_started = time.perf_counter()
         result: dict[Hashable, mx.array] = {}
         for key, location in locations.items():
             row_shape = location.shape[1:]
@@ -590,6 +609,7 @@ class ExpertReader:
             if location.dtype == "BF16":
                 array = array.view(mx.bfloat16)
             result[key] = array
+        self.decode_seconds += time.perf_counter() - decode_started
         return result
 
     def close(self) -> None:

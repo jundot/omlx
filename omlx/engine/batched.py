@@ -9,6 +9,7 @@ for better throughput when serving multiple concurrent requests.
 import copy
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -304,6 +305,14 @@ class BatchedEngine(BaseEngine):
                 raise ValueError(
                     "Expert streaming is enabled without a Soft-REAP manifest"
                 )
+            hotlist_cache_root = getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            )
+            hotlist_profile_dir = (
+                Path(hotlist_cache_root) / "expert-hotlists"
+                if hotlist_cache_root
+                else None
+            )
             await loop.run_in_executor(
                 get_mlx_executor(),
                 lambda: install_expert_streaming(
@@ -332,6 +341,7 @@ class BatchedEngine(BaseEngine):
                         )
                     ),
                     streaming_mode=streaming_mode,
+                    hotlist_profile_dir=hotlist_profile_dir,
                 ),
             )
 

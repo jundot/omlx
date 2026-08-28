@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +36,10 @@ class ExpertStreamingRuntime:
     execution_policy: str
     reader: ExpertReader
     pools: list[StreamingSwitchGLU]
+    hotlist_profile_path: Path | None = None
+    hotlist_fingerprint: str | None = None
+    hotlist_preloaded: int = 0
+    hotlist_profile_error: str | None = None
     execution: SpeculativeExecution | None = None
 
     def attach_model(self, model: Any) -> None:
@@ -58,7 +67,12 @@ class ExpertStreamingRuntime:
                 "speculative_routes",
                 "speculative_misses",
                 "hotness_decays",
+                "warm_start_loads",
             )
+        }
+        timing_totals = {
+            key: sum(float(layer[key]) for layer in layers)
+            for key in ("bank_bind_seconds", "bank_materialize_seconds")
         }
         attempts = totals["pinned_hits"] + totals["cache_hits"] + totals["cache_misses"]
         totals["hit_rate"] = (
@@ -82,14 +96,107 @@ class ExpertStreamingRuntime:
             "ssd_preload_read_operations": self.reader.direct_read_operations,
             "ssd_cold_bytes_read": self.reader.file_cache_bytes_read,
             "ssd_cold_read_operations": self.reader.file_cache_read_operations,
+            "ssd_io_seconds": self.reader.io_seconds,
+            "ssd_decode_seconds": self.reader.decode_seconds,
+            "ssd_readahead_descriptors": self.reader.readahead_descriptors,
+            "ssd_no_cache_descriptors": self.reader.no_cache_descriptors,
+            "hotlist_profile": (
+                str(self.hotlist_profile_path) if self.hotlist_profile_path else None
+            ),
+            "hotlist_preloaded": self.hotlist_preloaded,
+            "hotlist_profile_error": self.hotlist_profile_error,
             **totals,
+            **timing_totals,
             "layers": layers,
         }
 
+    def _save_hotlist(self) -> None:
+        if self.hotlist_profile_path is None or self.hotlist_fingerprint is None:
+            return
+        payload = {
+            "version": 1,
+            "fingerprint": self.hotlist_fingerprint,
+            "num_experts": self.pools[0].num_experts if self.pools else 0,
+            "layers": {
+                str(pool.layer): [list(entry) for entry in pool.hotlist()]
+                for pool in self.pools
+            },
+        }
+        try:
+            self.hotlist_profile_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{self.hotlist_profile_path.name}.",
+                dir=self.hotlist_profile_path.parent,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.hotlist_profile_path)
+            except Exception:
+                with suppress(OSError):
+                    os.unlink(temporary)
+                raise
+        except (OSError, TypeError, ValueError) as exc:
+            self.hotlist_profile_error = f"save: {exc}"
+            logger.warning("Could not save expert hotlist profile: %s", exc)
+
     def close(self) -> None:
+        self._save_hotlist()
         if self.execution is not None:
             self.execution.close()
         self.reader.close()
+
+
+def _hotlist_identity(
+    model_path: Path, profile_dir: str | Path | None
+) -> tuple[Path | None, str | None]:
+    if profile_dir is None:
+        return None, None
+    index_path = model_path / "model.safetensors.index.json"
+    stat = index_path.stat()
+    identity = f"{model_path}\0{stat.st_size}\0{stat.st_mtime_ns}".encode()
+    fingerprint = hashlib.sha256(identity).hexdigest()
+    profile_path = Path(profile_dir).expanduser() / f"{fingerprint[:24]}.json"
+    return profile_path, fingerprint
+
+
+def _load_hotlist(
+    profile_path: Path | None,
+    fingerprint: str | None,
+    pools: list[StreamingSwitchGLU],
+) -> tuple[int, str | None]:
+    if profile_path is None or fingerprint is None or not profile_path.is_file():
+        return 0, None
+    try:
+        payload = json.loads(profile_path.read_text())
+        if payload.get("version") != 1 or payload.get("fingerprint") != fingerprint:
+            return 0, None
+        expected_experts = pools[0].num_experts if pools else 0
+        if int(payload.get("num_experts", -1)) != expected_experts:
+            return 0, None
+        layers = payload.get("layers")
+        if not isinstance(layers, dict):
+            raise ValueError("layers must be an object")
+        parsed: dict[int, list[tuple[int, int]]] = {}
+        for pool in pools:
+            raw_entries = layers.get(str(pool.layer), [])
+            if not isinstance(raw_entries, list):
+                raise ValueError(f"layer {pool.layer} must be a list")
+            entries: list[tuple[int, int]] = []
+            for entry in raw_entries:
+                if not isinstance(entry, list) or len(entry) != 2:
+                    raise ValueError(f"invalid layer {pool.layer} hotlist entry")
+                entries.append((int(entry[0]), int(entry[1])))
+            parsed[pool.layer] = entries
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Ignoring invalid expert hotlist profile %s: %s", profile_path, exc
+        )
+        return 0, f"load: {exc}"
+    preloaded = sum(pool.preload_hotlist(parsed[pool.layer]) for pool in pools)
+    return preloaded, None
 
 
 def install_expert_streaming(
@@ -101,6 +208,7 @@ def install_expert_streaming(
     substitution_threshold_percent: float = 0.0,
     execution_policy: str = "checked",
     streaming_mode: str = "soft_reap",
+    hotlist_profile_dir: str | Path | None = None,
 ) -> ExpertStreamingRuntime:
     """Replace main-layer SwitchGLUs before the lazy checkpoint is evaluated."""
 
@@ -130,6 +238,10 @@ def install_expert_streaming(
     else:
         manifest = SoftReapManifest.empty(layer_ids=layer_ids)
     index = SafetensorExpertIndex(model_path)
+    resolved_model_path = Path(model_path).expanduser().resolve()
+    hotlist_profile_path, hotlist_fingerprint = _hotlist_identity(
+        resolved_model_path, hotlist_profile_dir
+    )
     resolved: dict[int, tuple[dict[str, dict[str, Any]], dict]] = {}
     expert_bytes_all_layers = 0
     for target in targets:
@@ -205,8 +317,16 @@ def install_expert_streaming(
         reader.close()
         raise
 
+    try:
+        hotlist_preloaded, hotlist_profile_error = _load_hotlist(
+            hotlist_profile_path, hotlist_fingerprint, pools
+        )
+    except Exception:
+        reader.close()
+        raise
+
     runtime = ExpertStreamingRuntime(
-        model_path=Path(model_path).expanduser().resolve(),
+        model_path=resolved_model_path,
         manifest=manifest,
         cache_budget_bytes=cache_budget_bytes,
         cache_slots_per_layer=int(cache_slots),
@@ -215,6 +335,10 @@ def install_expert_streaming(
         execution_policy=execution_policy,
         reader=reader,
         pools=pools,
+        hotlist_profile_path=hotlist_profile_path,
+        hotlist_fingerprint=hotlist_fingerprint,
+        hotlist_preloaded=hotlist_preloaded,
+        hotlist_profile_error=hotlist_profile_error,
     )
     model._omlx_expert_streaming_runtime = runtime
     runtime.attach_model(model)

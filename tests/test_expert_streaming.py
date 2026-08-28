@@ -88,6 +88,40 @@ def _quantized_projection(dense, *, group_size, bits, mode):
     )
 
 
+def _streamable_test_model(*, experts: int = 6, top_k: int = 2):
+    projections = {}
+    for name, output, inputs in (
+        ("gate_proj", 32, 64),
+        ("up_proj", 32, 64),
+        ("down_proj", 64, 32),
+    ):
+        projections[name] = _quantized_projection(
+            mx.zeros((experts, output, inputs), dtype=mx.float16),
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+    switch = SimpleNamespace(
+        **projections,
+        activation=SwiGLU(),
+    )
+    mlp = SimpleNamespace(
+        num_experts=experts,
+        top_k=top_k,
+        switch_mlp=switch,
+    )
+
+    class Model:
+        def __init__(self):
+            self.layers = [SimpleNamespace(mlp=mlp)]
+
+        def __call__(self, inputs, cache=None):
+            del cache
+            return inputs
+
+    return Model()
+
+
 def _family_checkpoint(
     path: Path,
     *,
@@ -199,31 +233,7 @@ def test_cache_only_residency_requires_no_manifest(tmp_path):
 
 def test_cache_only_install_requires_no_manifest(tmp_path):
     _checkpoint(tmp_path)
-
-    class Model:
-        def __init__(self):
-            projection = SimpleNamespace(
-                weight=mx.zeros((1, 1)),
-                scales=mx.zeros((1, 1)),
-                biases=mx.zeros((1, 1)),
-                group_size=32,
-                bits=4,
-                mode="affine",
-            )
-            switch = SimpleNamespace(
-                gate_proj=projection,
-                up_proj=projection,
-                down_proj=projection,
-                activation=SwiGLU(),
-            )
-            mlp = SimpleNamespace(num_experts=6, top_k=2, switch_mlp=switch)
-            self.layers = [SimpleNamespace(mlp=mlp)]
-
-        def __call__(self, inputs, cache=None):
-            del cache
-            return inputs
-
-    model = Model()
+    model = _streamable_test_model()
     runtime = install_expert_streaming(
         model,
         tmp_path,
@@ -237,6 +247,99 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
         assert runtime.pools[0].pinned_count == 0
     finally:
         runtime.close()
+
+
+def test_learned_hotlist_warm_starts_evictable_cache(tmp_path):
+    model_path = tmp_path / "model"
+    profile_dir = tmp_path / "profiles"
+    model_path.mkdir()
+    full = _checkpoint(model_path)
+
+    first = install_expert_streaming(
+        _streamable_test_model(),
+        model_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        hotlist_profile_dir=profile_dir,
+    )
+    try:
+        for _ in range(5):
+            mx.eval(first.pools[0].ensure(mx.array([4], dtype=mx.int32)))
+        for _ in range(2):
+            mx.eval(first.pools[0].ensure(mx.array([1], dtype=mx.int32)))
+        mx.eval(first.pools[0].ensure(mx.array([3], dtype=mx.int32)))
+    finally:
+        first.close()
+
+    profiles = list(profile_dir.glob("*.json"))
+    assert len(profiles) == 1
+    second = install_expert_streaming(
+        _streamable_test_model(),
+        model_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        hotlist_profile_dir=profile_dir,
+    )
+    try:
+        resident = second.pools[0].resident_mask.tolist()
+        assert second.hotlist_preloaded == 2
+        assert second.pools[0].pinned_count == 0
+        assert resident[4] is True
+        assert resident[1] is True
+        assert second.pools[0].stats.warm_start_loads == 2
+        assert second.pools[0].stats.route_lookups == 0
+        bytes_after_preload = second.reader.bytes_read
+        indices = mx.array([[[4, 1]]], dtype=mx.int32)
+        x = mx.random.normal((1, 1, 64)).astype(mx.float16)
+        output = second.pools[0](x, indices)
+        expected = _reference(full, x, indices)
+        mx.eval(output, expected)
+        assert bool(mx.all(output == expected).item())
+        assert second.reader.bytes_read == bytes_after_preload
+        assert second.pools[0].stats.cache_hits == 2
+        stats = second.stats()
+        assert stats["ssd_io_seconds"] >= 0
+        assert stats["ssd_decode_seconds"] >= 0
+        assert stats["bank_bind_seconds"] >= 0
+        assert stats["bank_materialize_seconds"] >= 0
+    finally:
+        second.close()
+
+
+def test_invalid_hotlist_profile_is_ignored(tmp_path):
+    model_path = tmp_path / "model"
+    profile_dir = tmp_path / "profiles"
+    model_path.mkdir()
+    _checkpoint(model_path)
+    first = install_expert_streaming(
+        _streamable_test_model(),
+        model_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        hotlist_profile_dir=profile_dir,
+    )
+    profile_path = first.hotlist_profile_path
+    first.close()
+    assert profile_path is not None
+    profile_path.write_text("not json")
+
+    second = install_expert_streaming(
+        _streamable_test_model(),
+        model_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        hotlist_profile_dir=profile_dir,
+    )
+    try:
+        assert second.hotlist_preloaded == 0
+        assert second.hotlist_profile_error.startswith("load:")
+        assert not any(second.pools[0].resident_mask.tolist())
+    finally:
+        second.close()
 
 
 @pytest.mark.parametrize(

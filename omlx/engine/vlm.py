@@ -1709,6 +1709,14 @@ class VLMBatchedEngine(BaseEngine):
                 raise ValueError(
                     "Expert streaming is enabled without a Soft-REAP manifest"
                 )
+            hotlist_cache_root = getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            )
+            hotlist_profile_dir = (
+                Path(hotlist_cache_root) / "expert-hotlists"
+                if hotlist_cache_root
+                else None
+            )
             await loop.run_in_executor(
                 get_mlx_executor(),
                 lambda: install_expert_streaming(
@@ -1737,6 +1745,7 @@ class VLMBatchedEngine(BaseEngine):
                         )
                     ),
                     streaming_mode=streaming_mode,
+                    hotlist_profile_dir=hotlist_profile_dir,
                 ),
             )
 

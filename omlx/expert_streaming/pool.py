@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +39,9 @@ class ExpertPoolStats:
     speculative_routes: int = 0
     speculative_misses: int = 0
     hotness_decays: int = 0
+    warm_start_loads: int = 0
+    bank_bind_seconds: float = 0.0
+    bank_materialize_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, int | float]:
         total = self.pinned_hits + self.cache_hits + self.cache_misses
@@ -54,6 +58,9 @@ class ExpertPoolStats:
             "speculative_routes": self.speculative_routes,
             "speculative_misses": self.speculative_misses,
             "hotness_decays": self.hotness_decays,
+            "warm_start_loads": self.warm_start_loads,
+            "bank_bind_seconds": self.bank_bind_seconds,
+            "bank_materialize_seconds": self.bank_materialize_seconds,
             "hit_rate": (self.pinned_hits + self.cache_hits) / total if total else 1.0,
         }
 
@@ -159,6 +166,7 @@ class StreamingSwitchGLU(nn.Module):
         self._resident_mask = mx.array(mask)
         self._dynamic_lru: OrderedDict[int, int] = OrderedDict()
         self._route_hotness = np.zeros(self.num_experts, dtype=np.uint64)
+        self._route_counts = np.zeros(self.num_experts, dtype=np.uint64)
         self._last_used = np.zeros(self.num_experts, dtype=np.uint64)
         self._route_tokens = 0
         self._hotness_decay_interval = 16
@@ -186,7 +194,11 @@ class StreamingSwitchGLU(nn.Module):
         self.gate_proj = StreamingQuantizedSwitchLinear(self, "gate_proj")
         self.up_proj = StreamingQuantizedSwitchLinear(self, "up_proj")
         self.down_proj = StreamingQuantizedSwitchLinear(self, "down_proj")
-        self._load_into_slots(self.pinned_experts, list(range(self.pinned_count)))
+        self._load_into_slots(
+            self.pinned_experts,
+            list(range(self.pinned_count)),
+            load_kind="pinned",
+        )
 
     @staticmethod
     def _array_name(projection: str, part: str) -> str:
@@ -220,11 +232,15 @@ class StreamingSwitchGLU(nn.Module):
             return routes
 
     def _load_into_slots(
-        self, experts: tuple[int, ...] | list[int], slots: list[int]
+        self,
+        experts: tuple[int, ...] | list[int],
+        slots: list[int],
+        *,
+        load_kind: str = "cold",
     ) -> None:
         if not experts:
             return
-        preload = bool(slots) and max(slots) < self.pinned_count
+        preload = load_kind == "pinned"
         # Pinned preload stays component-at-a-time to cap transient memory.
         # Dynamic misses are small and benefit from one flat I/O queue.
         components = (
@@ -248,17 +264,25 @@ class StreamingSwitchGLU(nn.Module):
                     else components[(projection, part)]
                 )
                 target = self._array(projection, part)
+                bind_started = time.perf_counter()
                 target[slots] = rows
+                self.stats.bank_bind_seconds += time.perf_counter() - bind_started
                 if preload:
                     # Pinned construction can stage hundreds of rows, so commit
                     # one component at a time and release it immediately.
+                    materialize_started = time.perf_counter()
                     mx.eval(target)
+                    self.stats.bank_materialize_seconds += (
+                        time.perf_counter() - materialize_started
+                    )
                 # Dynamic updates deliberately remain lazy. The layer's QMM
                 # consumes the updated bank immediately, and the next layer's
                 # router evaluation provides the required synchronization.
         self.stats.loads += len(experts)
-        if preload:
+        if load_kind == "pinned":
             self.stats.pinned_loads += len(experts)
+        elif load_kind == "warm_start":
+            self.stats.warm_start_loads += len(experts)
         else:
             self.stats.cold_loads += len(experts)
 
@@ -276,8 +300,77 @@ class StreamingSwitchGLU(nn.Module):
         for expert in values:
             if self._route_hotness[expert] < np.iinfo(np.uint64).max:
                 self._route_hotness[expert] += 1
+            if self._route_counts[expert] < np.iinfo(np.uint64).max:
+                self._route_counts[expert] += 1
             self._access_clock += 1
             self._last_used[expert] = self._access_clock
+
+    def hotlist(self) -> list[tuple[int, int]]:
+        """Return non-pinned experts ranked by lifetime router selections."""
+        with self._lock:
+            experts = [
+                expert
+                for expert in range(self.num_experts)
+                if expert not in self._pinned_set and self._route_counts[expert] > 0
+            ]
+            experts.sort(
+                key=lambda expert: (
+                    int(self._route_counts[expert]),
+                    int(self._last_used[expert]),
+                ),
+                reverse=True,
+            )
+            return [
+                (expert, int(self._route_counts[expert])) for expert in experts
+            ]
+
+    def preload_hotlist(self, entries: list[tuple[int, int]]) -> int:
+        """Fill evictable slots from a prior run's learned route profile."""
+        with self._lock:
+            valid: list[tuple[int, int]] = []
+            seen: set[int] = set()
+            for expert, count in entries:
+                expert = int(expert)
+                count = int(count)
+                if (
+                    expert in seen
+                    or expert in self._pinned_set
+                    or not 0 <= expert < self.num_experts
+                    or count <= 0
+                ):
+                    continue
+                seen.add(expert)
+                valid.append((expert, count))
+            valid.sort(key=lambda entry: entry[1], reverse=True)
+            for expert, count in valid:
+                self._route_counts[expert] = min(
+                    count, int(np.iinfo(np.uint64).max)
+                )
+            selected = valid[: self.cache_slots]
+            missing = [
+                expert for expert, _ in selected if expert not in self._expert_to_slot
+            ]
+            if not missing:
+                return 0
+            slots = self._allocate_misses(missing)
+            self._load_into_slots(missing, slots, load_kind="warm_start")
+            counts = dict(selected)
+            for expert in missing:
+                score = min(counts[expert], int(np.iinfo(np.uint64).max))
+                self._route_hotness[expert] = score
+                self._access_clock += 1
+                self._last_used[expert] = self._access_clock
+            arrays = [
+                self._array(projection, part)
+                for projection in PROJECTIONS
+                for part in self.projection_metadata[projection]["parts"]
+            ]
+            materialize_started = time.perf_counter()
+            mx.eval(*arrays, self._slot_map, self._resident_mask)
+            self.stats.bank_materialize_seconds += (
+                time.perf_counter() - materialize_started
+            )
+            return len(missing)
 
     def _eviction_victim(self, protected: set[int]) -> tuple[int, int]:
         candidates = [

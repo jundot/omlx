@@ -22,6 +22,13 @@ recency as a tie-break. Experts used repeatedly by the current workload therefor
 survive one-off routes without becoming permanent. The minimum cache remains the
 model's top-k so one decode route can always execute exactly.
 
+When the scheduler has an SSD cache directory, both modes also maintain a compact
+learned hotlist there. On clean shutdown, oMLX stores per-layer router selection
+counts. A later load pre-fills the fixed hot tier with the most-used experts. These
+entries remain fully evictable and do not change the configured expert count,
+resident memory, or Soft-REAP manifest. Profiles are checkpoint-fingerprinted,
+written atomically, and ignored if stale or malformed.
+
 ## Manifest
 
 Official REAP maps are accepted directly:
@@ -126,15 +133,16 @@ and host-side SSD decisions cannot be captured inside the compiled graph.
 The cache now adopts DwarfStar's decayed route-hotness eviction and recency
 tie-break, protects experts in the current route from eviction, reuses fixed bank
 slots, and submits all dynamic weight/scale/bias reads through one persistent
-parallel `pread` queue. These are compatible with MLX's fixed-shape banks.
+parallel `pread` queue. It also applies Darwin read-ahead hints to cacheable cold
+reads and uses a learned popularity hotlist to warm ordinary evictable slots on
+future loads. Runtime stats split SSD I/O, payload decode, bank binding, and bank
+materialization time. These are compatible with MLX's fixed-shape banks.
 
 Further promising work, in priority order:
 
 1. An expert-major sidecar that stores all nine quantized components contiguously,
    reducing random reads and safetensor-header fragmentation.
-2. An optional learned hotlist profile that preloads experts as *evictable* cache
-   entries, unlike Soft-REAP pins.
-3. Per-layer read/bind/wait timings and adaptive cache sizing from real miss cost.
-4. Cross-layer predictive prefetch. Exact next-layer routing is data-dependent, so
+2. Adaptive per-layer cache sizing driven by measured miss and bank-update cost.
+3. Cross-layer predictive prefetch. Exact next-layer routing is data-dependent, so
    this requires either a predictor or deeper graph/runtime changes and carries a
    higher regression risk.
