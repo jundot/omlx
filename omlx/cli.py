@@ -432,6 +432,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     cli_opus_model = _optional_str(getattr(args, "opus_model", None))
     cli_sonnet_model = _optional_str(getattr(args, "sonnet_model", None))
     cli_haiku_model = _optional_str(getattr(args, "haiku_model", None))
+    cli_subagent_model = _optional_str(getattr(args, "subagent_model", None))
     settings_opus_model = _optional_str(getattr(claude_settings, "opus_model", None))
     settings_sonnet_model = _optional_str(
         getattr(claude_settings, "sonnet_model", None)
@@ -519,6 +520,7 @@ def launch_command(args, extra_args: list[str] | None = None):
             ("Opus tier ", opus_model),
             ("Sonnet tier ", sonnet_model),
             ("Haiku tier ", haiku_model),
+            ("Subagent ", cli_subagent_model),
         ]
         validated_models: set[str] = set()
         for role, model_id in models_to_validate:
@@ -550,6 +552,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,
+        subagent_model=cli_subagent_model if tool_name == "claude" else None,
         context_window=model_info.get("max_context_window"),
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
@@ -1289,6 +1292,15 @@ Example directory structure:
         type=str,
         default=None,
         help="Claude Code Haiku tier model (Claude integration only)",
+    )
+    launch_parser.add_argument(
+        "--subagent-model",
+        type=str,
+        default=None,
+        help=(
+            "Force every Claude Code subagent to one model; omitted preserves "
+            "each subagent's own model selection (Claude integration only)"
+        ),
     )
     launch_parser.add_argument(
         "--cross-session",

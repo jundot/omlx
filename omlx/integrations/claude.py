@@ -139,9 +139,12 @@ class ClaudeCodeIntegration(Integration):
         if haiku_model:
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku_model
 
-        subagent_model = haiku_model or sonnet_model or opus_model
-        if subagent_model:
-            env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
+        # This variable is a global override: Claude Code applies it to every
+        # subagent, including agents that explicitly select opus or sonnet.
+        # Leave it unset unless the operator asks for that override so the
+        # configured tier aliases and per-agent model choices remain useful.
+        if ctx.subagent_model:
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = ctx.subagent_model
 
         if ctx.context_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx.context_window)

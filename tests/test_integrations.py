@@ -1405,7 +1405,7 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "qwen3.5"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5"
-        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen3.5"
+        assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
         assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "131072"
         assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
         # Bundled-python vars must be stripped so claude code subprocess hooks
@@ -1413,6 +1413,31 @@ class TestClaudeCodeIntegration:
         assert "PYTHONHOME" not in env
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
+
+    def test_launch_sets_explicit_subagent_model_override(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(
+                    port=8000,
+                    model="qwen3.5",
+                    haiku_model="small-reader",
+                    subagent_model="small-reader",
+                    context_window=131072,
+                )
+            )
+
+        assert captured["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "small-reader"
 
     def test_model_disabled_reason_below_48k(self):
         cc = ClaudeCodeIntegration()
@@ -1749,7 +1774,7 @@ class TestClaudeCodeIntegration:
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "opus-local"
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "sonnet-local"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "haiku-local"
-        assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-local"
+        assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
 
     def test_launch_open_server_uses_omlx_token(self):
         cc = ClaudeCodeIntegration()
