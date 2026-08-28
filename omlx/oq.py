@@ -6471,6 +6471,18 @@ def quantize_oq_streaming(
                 processed_bytes += tensor_bytes
                 continue
 
+            if _stream_source_model_type(config) == "qwen4_exp" and tensor_name.endswith(
+                ".ple.ple_embedding.ngram_embedding.weight_scale"
+            ):
+                # Synthetic runtime placeholder, not checkpoint data: the
+                # sanitize plan discovers the model through the mmap-mode PLE,
+                # whose disk-backed embedding registers a weight_scale of ones.
+                # Emitting it makes strict loaders reject the artifact as
+                # carrying a parameter the model does not define.
+                del w_mx
+                processed_bytes += tensor_bytes
+                continue
+
             if _should_quantize_tensor(tensor_name, shape) and not (
                 preserve_ngram_table
                 and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
