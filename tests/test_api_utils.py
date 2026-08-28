@@ -54,6 +54,7 @@ from omlx.api.utils import (
     extract_text_content,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    reasoning_content_for_history,
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
@@ -633,6 +634,35 @@ class TestExtractTextContentNativeReasoningContent:
         assert len(result) == 1
         assert result[0]["content"] == "A"
         assert result[0]["reasoning_content"] == "R"
+
+
+class TestReasoningContentForHistory:
+    def test_preserves_no_thinking_marker_when_enabled(self):
+        assert reasoning_content_for_history(
+            "",
+            native_reasoning=True,
+            chat_template_kwargs={
+                "enable_thinking": False,
+                "preserve_thinking": True,
+            },
+        ) == "\n\n"
+
+    def test_drops_marker_when_preservation_is_disabled(self):
+        assert reasoning_content_for_history(
+            "",
+            native_reasoning=True,
+            chat_template_kwargs={
+                "enable_thinking": False,
+                "preserve_thinking": False,
+            },
+        ) is None
+
+    def test_keeps_nonempty_reasoning(self):
+        assert reasoning_content_for_history(
+            "reasoning",
+            native_reasoning=True,
+            chat_template_kwargs={},
+        ) == "reasoning"
 
 
 class TestUsesNativeReasoningContent:

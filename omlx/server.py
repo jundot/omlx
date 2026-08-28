@@ -173,6 +173,7 @@ from .api.utils import (
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    reasoning_content_for_history,
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
@@ -4026,8 +4027,10 @@ async def create_chat_completion(
                     ChatCompletionChoice(
                         message=AssistantMessage(
                             content=cleaned_text.strip() if cleaned_text else None,
-                            reasoning_content=(
-                                cleaned_thinking if cleaned_thinking else None
+                            reasoning_content=reasoning_content_for_history(
+                                cleaned_thinking,
+                                native_reasoning=native_reasoning,
+                                chat_template_kwargs=merged_ct_kwargs,
                             ),
                             tool_calls=tool_calls,
                         ),

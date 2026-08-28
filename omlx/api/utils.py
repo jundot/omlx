@@ -45,6 +45,24 @@ def uses_native_reasoning_content(
     return "minimax" in lowered and "m3" in lowered
 
 
+def reasoning_content_for_history(
+    content: str,
+    *,
+    native_reasoning: bool,
+    chat_template_kwargs: dict[str, Any],
+) -> str | None:
+    """Retain Qwen's empty no-thinking marker when history preservation is enabled."""
+    if content:
+        return content
+    if (
+        native_reasoning
+        and chat_template_kwargs.get("enable_thinking") is False
+        and chat_template_kwargs.get("preserve_thinking") is True
+    ):
+        return "\n\n"
+    return None
+
+
 def merge_reasoning_effort_chat_template_kwargs(
     chat_template_kwargs: dict[str, Any] | None,
     reasoning_effort: Any | None,
