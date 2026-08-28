@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import struct as _struct
@@ -413,7 +414,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
 
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
-) -> Union[bool, dict]:
+) -> bool | dict:
     """Per-tensor quantization decision based on GGUF/unsloth/llama.cpp rules.
 
     Protection levels vary by oQ level:
@@ -1293,8 +1294,7 @@ def _build_quant_plan(
             f"{name}×{count}" for name, count in sorted(route_dist.items())
         )
         logger.info(
-            f"  plan detail: {bits_summary} | routes: {route_summary} | "
-            f"top: {top_str}"
+            f"  plan detail: {bits_summary} | routes: {route_summary} | top: {top_str}"
         )
 
     return QuantPlan(
@@ -3204,7 +3204,7 @@ def _sensitivity_lm_config_override(config: dict) -> dict | None:
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     """Create a quant_predicate closure for mlx-lm's quantize_model."""
 
-    def predicate(path: str, module) -> Union[bool, dict]:
+    def predicate(path: str, module) -> bool | dict:
         return universal_quant_predicate(path, module, config, oq_level)
 
     return predicate
@@ -5245,6 +5245,22 @@ def _oqe_cache_matches(cache: OQImatrixData, expected: dict[str, Any]) -> bool:
     return all(cache.metadata.get(k) == v for k, v in expected.items())
 
 
+def _oqe_cache_load_kind(cache: OQImatrixData) -> str | None:
+    """How the cached imatrix was collected, or None for pre-field caches.
+
+    "streaming" marks a layer-streamed collection against the real source
+    weights; "resident" marks the whole-model walk (possibly against a
+    RAM-safe proxy). The source signature cannot tell these apart, so the
+    field is what keeps a proxy-collected cache from silently satisfying a
+    streaming request.
+    """
+    collection = cache.metadata.get("collection")
+    if isinstance(collection, dict) and collection.get("load_kind"):
+        return str(collection["load_kind"])
+    kind = cache.metadata.get("load_kind")
+    return str(kind) if kind else None
+
+
 def _oqe_cache_has_required_expert_coverage(
     cache: OQImatrixData,
 ) -> bool:
@@ -5672,12 +5688,58 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
 # --- end chunked-quantize helpers ---
 
 
+def _resolve_stream_calibration(
+    stream_calibration: bool | None,
+    *,
+    model_exceeds_ram: bool,
+    model_type: str | None,
+) -> bool:
+    """Decide whether oQe calibration streams layers from the checkpoint.
+
+    Explicit argument first, then the OMLX_OQ_STREAM_CALIBRATION env var,
+    then the auto rule: stream when the source does not fit in RAM, where
+    the resident collector would otherwise calibrate on a lossy quantized
+    proxy of the model.
+
+    Streaming only works for the layouts the sourcer understands
+    (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
+    the auto rule and a truthy env var stay on the proxy path, and an
+    explicit stream_calibration=True fails fast here with a clear message
+    rather than an AttributeError deep in the sourcer.
+    """
+    supported = _stream_calibration_supported(model_type)
+    if stream_calibration is not None:
+        if stream_calibration and not supported:
+            raise ValueError(
+                f"stream_calibration=True was requested for "
+                f"model_type={model_type!r}, but the streaming imatrix sourcer "
+                f"only supports {sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES)}. "
+                "Leave stream_calibration unset to calibrate through the RAM-safe "
+                "proxy, or extend the streamed sourcer for this layout."
+            )
+        return bool(stream_calibration)
+    env = os.environ.get("OMLX_OQ_STREAM_CALIBRATION", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        if not supported:
+            logger.warning(
+                "OMLX_OQ_STREAM_CALIBRATION asked for streaming calibration, but "
+                "model_type=%r has no streamed sourcer (supported: %s); using the "
+                "RAM-safe proxy instead.",
+                model_type,
+                sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES),
+            )
+        return supported
+    if env in ("0", "false", "no", "off"):
+        return False
+    return model_exceeds_ram and supported
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
     oq_level: int,
     group_size: int = 64,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     text_only: bool = False,
     target_bpw: float | None = None,
     hard_cap_bpw: float | None = None,
@@ -5693,6 +5755,7 @@ def quantize_oq_streaming(
     imatrix_num_samples: int = 128,
     imatrix_seq_length: int = 512,
     sensitivity_map_override: dict[int | str, float] | None = None,
+    stream_calibration: bool | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -5740,6 +5803,22 @@ def quantize_oq_streaming(
             scores. When supplied, skips cached/measured sensitivity and the
             sensitivity proxy path. Missing layers receive score zero. This
             does not skip oQe imatrix calibration when enhanced is True.
+        stream_calibration: Collect the oQe imatrix by streaming one decoder
+            layer at a time from the source checkpoint instead of loading a
+            whole model. Calibrates the real weights with a single layer
+            resident, so it needs no RAM-safe proxy. Sensitivity measurement
+            streams too: fused into the same sweep when the imatrix is
+            freshly collected (one weight load serves both passes), or as a
+            standalone streamed pass on an imatrix cache hit. An existing
+            oq_sensitivity_map.json or an explicit sensitivity_model_path
+            still wins over both. None (default) auto-enables streaming when
+            the source exceeds the RAM budget; the OMLX_OQ_STREAM_CALIBRATION
+            environment variable overrides the auto rule. The streamed sourcer
+            only supports the MiniMax-M3 (minimax_m3_vl) layout, so both the
+            auto rule and a truthy env var stay on the RAM-safe proxy for every
+            other model_type, and an explicit stream_calibration=True on an
+            unsupported layout raises a ValueError up front instead of failing
+            deep in the sourcer. Only consulted when enhanced is True.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -5929,8 +6008,7 @@ def quantize_oq_streaming(
         if _ram_safe_proxy_dir is not None and _ram_safe_proxy_dir.exists():
             shutil.rmtree(_ram_safe_proxy_dir, ignore_errors=True)
             logger.info(
-                f"oQ{oq_level:g}: cleaned up calibration proxy at "
-                f"{_ram_safe_proxy_dir}"
+                f"oQ{oq_level:g}: cleaned up calibration proxy at {_ram_safe_proxy_dir}"
             )
         _ram_safe_proxy_dir = None
 
@@ -5938,6 +6016,8 @@ def quantize_oq_streaming(
 
     imatrix_data: OQImatrixData | None = None
     imatrix_report: dict[str, Any] | None = None
+    stream_imatrix = False
+    streamed_sensitivity_map: dict | None = None
     if enhanced:
         if imatrix_num_samples < 1:
             raise ValueError("imatrix_num_samples must be >= 1")
@@ -5953,6 +6033,25 @@ def quantize_oq_streaming(
                 )
             )
         cb("imatrix", 13.0, "Preparing oQe imatrix calibration")
+
+        stream_imatrix = _resolve_stream_calibration(
+            stream_calibration,
+            model_exceeds_ram=_model_requires_proxy,
+            model_type=str(config.get("model_type", "")),
+        )
+        if stream_imatrix:
+            logger.info(
+                f"oQ{oq_level:g}: oQe imatrix will stream one layer at a "
+                "time from the source checkpoint (no calibration proxy)"
+            )
+        # When the streamed sweep is going to visit every layer anyway and
+        # this build still needs a measured sensitivity map, fuse the qdq
+        # measurement into that sweep: one weight load serves both passes.
+        fuse_sensitivity = (
+            stream_imatrix
+            and not sensitivity_map_path.exists()
+            and not sensitivity_model_path
+        )
 
         def _imatrix_load_path() -> str:
             cb(
@@ -5976,12 +6075,27 @@ def quantize_oq_streaming(
                 progress_start=13.0,
                 progress_end=18.0,
                 load_path_factory=(
-                    _imatrix_load_path if _model_requires_proxy else None
+                    _imatrix_load_path
+                    if (_model_requires_proxy and not stream_imatrix)
+                    else None
                 ),
+                stream_calibration=stream_imatrix,
+                measure_sensitivity=fuse_sensitivity,
+                sensitivity_oq_level=oq_level,
+                sensitivity_num_samples=_SENS_NUM_SAMPLES,
+                sensitivity_seq_length=_SENS_SEQ_LENGTH,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
             raise
+        if fuse_sensitivity and not imatrix_data.reused:
+            # Fresh fused collection; a cache hit skips the sweep and the
+            # sensitivity branches below fall back to a standalone streamed
+            # measurement instead (a cached map may predate this oq_level).
+            streamed_sensitivity_map = (
+                imatrix_data.metadata.get("collection", {}).get("sensitivity_map")
+                or None
+            )
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
         imatrix_report = {
             "enabled": True,
@@ -6024,6 +6138,28 @@ def quantize_oq_streaming(
                 oq_level,
                 num_samples=128,
                 seq_length=256,
+                trust_remote_code=trust_remote_code,
+            )
+        elif streamed_sensitivity_map:
+            logger.info(
+                f"oQ{oq_level:g}: sensitivity measured in the fused streaming "
+                f"calibration sweep ({len(streamed_sensitivity_map)} layers)"
+            )
+            sensitivity_map = streamed_sensitivity_map
+        elif stream_imatrix:
+            # Streaming calibration is active but the fused sweep never ran
+            # (imatrix cache hit). Measure with a standalone streamed pass:
+            # still the real weights, still no proxy, no whole-model load.
+            logger.info(
+                f"oQ{oq_level:g}: measuring sensitivity by streaming layers "
+                "from the source checkpoint (no calibration proxy)"
+            )
+            sensitivity_map = _measure_sensitivity_streaming(
+                model_path,
+                config,
+                oq_level,
+                num_samples=_SENS_NUM_SAMPLES,
+                seq_length=_SENS_SEQ_LENGTH,
                 trust_remote_code=trust_remote_code,
             )
         elif not _model_requires_proxy and _uses_quantized_source_sensitivity(config):
@@ -7435,7 +7571,16 @@ class OQImatrixCollector:
             return int(w.shape[-1] * 32 // int(bits))
         return int(w.shape[-1])
 
-    def install(self, model) -> int:
+    def install(self, model, name_prefix: str = "") -> int:
+        """Wrap capture modules; entry names get ``name_prefix`` prepended.
+
+        The streaming collector installs on bare decoder blocks whose
+        module paths are relative (``self_attn.q_proj``); the prefix
+        restores the full-model names the resident collector produces, so
+        ``_lookup_imatrix_importance`` resolves entries identically for
+        both collection paths. Restore keeps using the relative names,
+        which is what ``update_modules`` needs on the wrapped object.
+        """
         replacements = []
         for name, module in model.named_modules():
             if type(module).__name__ == "Glm5NextLinearAttention" and bool(
@@ -7456,7 +7601,9 @@ class OQImatrixCollector:
             if cls in _OQE_SWITCH_LINEAR_CLASSES:
                 self.switch_capture_modules += 1
             self._original_modules[name] = module
-            replacements.append((name, _ImatrixCaptureWrapper(module, name, self)))
+            replacements.append(
+                (name, _ImatrixCaptureWrapper(module, f"{name_prefix}{name}", self))
+            )
         if replacements:
             model.update_modules(tree_unflatten(replacements), strict=False)
         return len(replacements)
@@ -8064,6 +8211,643 @@ def _collect_imatrix_from_model(
     return collector.entries, metadata
 
 
+# --- Streamed per-layer weight sourcing (layer-streaming imatrix collector) ---
+# MiniMax-M3 focused for now: the layer prefix, the args location, and the
+# lazy-load path in _streamed_text_args assume the minimax_m3_vl layout.
+# When a second architecture needs streaming, a model-type dispatch table
+# replaces the hardcoded prefix and the args lookup, and its model_type joins
+# _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES below so the calibration decision
+# starts routing it through the streamed path.
+
+_STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
+_STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
+
+# Only these checkpoint model_types have a streamed sourcer. Every other layout
+# keeps the RAM-safe proxy calibration path: the auto rule never streams them,
+# and an explicit stream_calibration request for one fails fast (see
+# _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
+_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset({"minimax_m3_vl"})
+
+
+def _stream_calibration_supported(model_type: str | None) -> bool:
+    """True when the streamed sourcer handles this checkpoint's layout."""
+    return str(model_type or "").lower() in _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES
+
+
+def _streamed_text_args(model_path, *, trust_remote_code: bool = False):
+    """TextConfig plus the concrete decoder layer class for streamed sourcing.
+
+    Lazy-loads the VLM once through the same path _collect_imatrix uses (so
+    the M3 compat patches apply), reads language_model.model.args and the
+    layer class off the live model, then drops it. Lazy load never
+    materializes weights, so this costs seconds, not RAM.
+    """
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(model_path), for_vlm=True)
+
+    from mlx_vlm.utils import load_model as vlm_load_model
+
+    orig_load_weights = nn.Module.load_weights
+
+    def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
+        kwargs.pop("strict", None)
+        return orig_load_weights(self, file_or_weights, *args, strict=False, **kwargs)
+
+    nn.Module.load_weights = _lenient_load_weights
+    try:
+        model = vlm_load_model(
+            Path(model_path), lazy=True, trust_remote_code=trust_remote_code
+        )
+    finally:
+        nn.Module.load_weights = orig_load_weights
+
+    lm = model.language_model.model
+    args = lm.args
+    layer_cls = type(lm.layers[0])
+    del lm, model
+    mx.clear_cache()
+    return args, layer_cls
+
+
+def _streamed_source_plan(model_path, config: dict) -> "_DiscoveredPlan":
+    """Private lazy index plus discovered sanitize plan for one pass.
+
+    _DiscoveredPlan.pop is destructive, so every streaming pass builds its
+    own instance instead of sharing the quantize loop's. The rebuild is
+    header-only and costs seconds.
+    """
+    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    if not weight_files:
+        raise FileNotFoundError(f"no safetensors shards under {model_path}")
+    lazy_index = _LazyTensorIndex(weight_files)
+    sanitize_fn = _build_model_sanitizer(config)
+    if sanitize_fn is None:
+        raise RuntimeError(f"no sanitizer for model_type={config.get('model_type')!r}")
+    plan = _discover_sanitize_plan(sanitize_fn, lazy_index)
+    if plan is None:
+        raise RuntimeError("sanitize plan discovery failed for streamed sourcing")
+    return _DiscoveredPlan(plan, lazy_index)
+
+
+def _streamed_layer_items(dp: "_DiscoveredPlan", layer_idx: int) -> list:
+    """Pop every tensor of one text layer, keyed relative to the bare block."""
+    prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+    keys = sorted(k for k in dp if k.startswith(prefix))
+    if not keys:
+        raise KeyError(f"no checkpoint tensors for text layer {layer_idx}")
+    return [(k[len(prefix) :], dp.pop(k)) for k in keys]
+
+
+def _load_streamed_block_weights(block, items, layer_idx: int) -> str:
+    """Fill a bare decoder block from popped checkpoint tensors.
+
+    strict=True is the primary path. If mlx rejects the pairing (raw-array
+    attributes like e_score_correction_bias could plausibly trip it), fall
+    back to a lenient load guarded by an exact key-set and shape check so
+    nothing goes missing silently. Returns "strict" or "lenient".
+    """
+    try:
+        block.load_weights(items, strict=True)
+        return "strict"
+    except ValueError as exc:
+        expected = dict(tree_flatten(block.parameters()))
+        got = dict(items)
+        missing = sorted(set(expected) - set(got))
+        extra = sorted(set(got) - set(expected))
+        if missing or extra:
+            raise ValueError(
+                f"streamed layer {layer_idx}: checkpoint keys do not cover "
+                f"the block (missing={missing}, extra={extra})"
+            ) from exc
+        bad_shapes = sorted(
+            k for k, v in got.items() if tuple(v.shape) != tuple(expected[k].shape)
+        )
+        if bad_shapes:
+            raise
+        logger.info(
+            "streamed layer %d: strict load rejected a matching key set (%s); "
+            "using lenient load with key-set and shape guards",
+            layer_idx,
+            exc,
+        )
+        block.load_weights(items, strict=False)
+        return "lenient"
+
+
+def _iter_streamed_layer_blocks(
+    source, config: dict, *, trust_remote_code: bool = False
+):
+    """Yield (layer_idx, block, is_moe) with each text layer fully resident.
+
+    Each layer gets its own bare decoder block (attention wiring is
+    layer-index dependent, so one instance cannot be reused across the
+    dense/MoE boundary), filled straight from the checkpoint through a
+    private sanitize plan and evaluated before the yield. The caller owns
+    the block; the generator drops its own reference before popping the
+    next layer so at most one layer's weights are ever resident here.
+    """
+    args, layer_cls = _streamed_text_args(source, trust_remote_code=trust_remote_code)
+    dp = _streamed_source_plan(source, config)
+    for layer_idx in range(args.num_hidden_layers):
+        items = _streamed_layer_items(dp, layer_idx)
+        block = layer_cls(args, layer_idx)
+        mode = _load_streamed_block_weights(block, items, layer_idx)
+        del items
+        mx.eval(block.parameters())
+        is_moe = bool(block.is_moe_layer)
+        logger.debug(
+            "streamed layer %d sourced (%s load, moe=%s)", layer_idx, mode, is_moe
+        )
+        yield layer_idx, block, is_moe
+        del block  # delete-L before load-L+1: never two layers resident here
+        mx.clear_cache()
+
+
+def _streamed_embed_weight(source, config: dict):
+    """Source the token embedding table (bf16 on disk) for the stage-0 pass."""
+    dp = _streamed_source_plan(source, config)
+    weight = dp.pop(_STREAM_EMBED_KEY)
+    mx.eval(weight)
+    return weight
+
+
+# Default seed for the streaming collector's calibration draw. The permutation
+# inside _load_calibration_data is otherwise unseeded, which would make two
+# streaming runs incomparable.
+_OQE_STREAM_CALIB_SEED = 0
+
+# Hard per-layer ceiling on MLX active memory. One resident MoE layer plus
+# the boundary activations sits near 30 GB; anything past this limit means
+# the release idiom broke (a retained lazy graph keeps dead layers alive),
+# and it is far better to abort at layer 2 than to jetsam at layer 40.
+_OQE_STREAM_ACTIVE_LIMIT_BYTES = 50 * 1024**3
+
+
+def _stream_round_micro_ranges(
+    start: int, stop: int, micro_batch_size: int
+) -> list[tuple[int, int]]:
+    """Micro-batch boundaries for one round.
+
+    Clipped at the round end exactly like the resident collector's inner
+    loop clips at step boundaries, so the fp32 summation grouping matches.
+    """
+    ranges = []
+    lo = start
+    while lo < stop:
+        hi = min(lo + micro_batch_size, stop)
+        ranges.append((lo, hi))
+        lo = hi
+    return ranges
+
+
+class _StreamingNoModel:
+    """Model stand-in for _prepare_layer_inputs: streaming holds no model.
+
+    Carries no model_type, make_cache, or args, which routes the mask and
+    position-id construction through the same generic branch the resident
+    collector takes for this model family.
+    """
+
+
+def _streamed_sensitivity_state(
+    tokenizer,
+    embed_weight,
+    *,
+    calib_dataset: str,
+    num_samples: int,
+    seq_length: int,
+    calib_seed: int,
+) -> dict[str, Any] | None:
+    """Float boundary state for the streamed qdq sensitivity sweep.
+
+    The sensitivity measurement keeps its own calibration boundary (own
+    corpus, sample count, and sequence length), separate from the imatrix
+    boundary, embedded through the caller's already-resident embedding
+    table. Mask and position ids come from the same generic
+    _prepare_layer_inputs branch _measure_sensitivity_from_model takes.
+    Returns None when the calibration draw fails.
+    """
+    mx.random.seed(int(calib_seed))
+    calib_data = _load_calibration_data(
+        tokenizer,
+        dataset=calib_dataset,
+        num_samples=num_samples,
+        seq_length=seq_length,
+    )
+    if calib_data is None:
+        return None
+    inputs = embed_weight[calib_data]
+    inputs, masks, position_ids = _prepare_layer_inputs(
+        _StreamingNoModel(), [None], calib_data, inputs
+    )
+    mx.eval(inputs)
+    return {
+        "inputs": inputs,
+        "mask": masks[0],
+        "position_ids": position_ids,
+        "scores": {},
+    }
+
+
+def _streamed_sensitivity_layer(
+    state: dict[str, Any], layer_idx: int, block, config, oq_level
+) -> None:
+    """Measure one layer's qdq sensitivity while its block is resident.
+
+    Exactly _measure_sensitivity_from_model's per-layer walk: float
+    forward, temporary quantize-dequantize with the active predicate
+    configuration, quantized forward, relative MSE, weight restore, float
+    output propagated to the next layer. Runs on the pristine block after
+    the imatrix capture wrappers are off, so nothing leaks into the
+    imatrix statistic. A dead forward is fatal here where the resident
+    path skips the layer: with streamed sourcing it means a weight-load
+    bug, and a silently missing score would skew the bit allocation.
+    """
+    out_float, _ = _forward_layer_result(
+        block, state["inputs"], state["mask"], state["position_ids"]
+    )
+    if out_float is None:
+        raise RuntimeError(
+            f"streamed sensitivity: layer {layer_idx} float forward returned "
+            f"no output for {type(block).__name__}"
+        )
+    saved = _temporary_quantize_block(block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE)
+    try:
+        out_quant, _ = _forward_layer_result(
+            block, state["inputs"], state["mask"], state["position_ids"]
+        )
+        if out_quant is None:
+            raise RuntimeError(
+                f"streamed sensitivity: layer {layer_idx} quantized forward "
+                f"returned no output for {type(block).__name__}"
+            )
+        raw_mse = ((out_float - out_quant) ** 2).mean()
+        out_magnitude = (out_float**2).mean()
+        mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
+        mx.eval(mse_val)
+        state["scores"][layer_idx] = mse_val.item()
+    finally:
+        _restore_saved_weights(block, saved)
+    # Materialize the boundary before the caller releases the block: a lazy
+    # output would keep the whole layer's weights alive in its graph.
+    mx.eval(out_float)
+    state["inputs"] = out_float
+
+
+def _log_streamed_sensitivity(oq_level, scores: dict[int, float]) -> None:
+    if not scores:
+        return
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    logger.info(
+        f"oQ{oq_level:g} streamed: layer sensitivity (descending): "
+        + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+    )
+
+
+def _collect_imatrix_streaming(
+    source,
+    tokenizer,
+    config,
+    *,
+    calib_dataset: str = _OQE_CALIB_DATASET,
+    num_samples: int = 128,
+    seq_length: int = 512,
+    progress_callback=None,
+    progress_start: float = 13.0,
+    progress_end: float = 18.0,
+    trust_remote_code: bool = False,
+    calib_data=None,
+    calib_seed: int = _OQE_STREAM_CALIB_SEED,
+    measure_sensitivity: bool = False,
+    sensitivity_oq_level=None,
+    sensitivity_calib_dataset: str = "code_multilingual",
+    sensitivity_num_samples: int = 32,
+    sensitivity_seq_length: int = 256,
+    sensitivity_calib_seed: int = _OQE_STREAM_CALIB_SEED,
+) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    """Collect the oQe imatrix with one decoder layer resident at a time.
+
+    Same (entries, metadata) contract as _collect_imatrix_from_model, but
+    round-outer / layer-outer: round r pushes the next ``num_samples``
+    samples through every layer via _iter_streamed_layer_blocks before the
+    coverage predicate is evaluated. The imatrix statistic is an additive
+    token sum, so given the same calibration draw and the same micro-batch
+    partitioning this walk is bit-identical to the resident sample-outer
+    walk whenever coverage is reached at a round boundary (the expected
+    case at default settings). On escalation every layer is re-streamed
+    for the new samples, a full checkpoint re-read, and the run can
+    overshoot the resident stop point by up to one round minus one
+    micro-batch: layer-outer cannot stop mid-round because every layer
+    must see the same sample multiset.
+
+    ``calib_data`` injects a pre-drawn token array (tests); otherwise the
+    draw happens here, seeded with ``calib_seed``.
+
+    ``measure_sensitivity`` fuses the per-layer qdq sensitivity
+    measurement into the first round, so one weight load serves both
+    passes: each block is scored right after its imatrix forwards, once
+    the capture wrappers are off and the weights are pristine again. The
+    sensitivity boundary is completely separate from the imatrix boundary
+    (its own corpus, sample count, sequence length, and seed via the
+    ``sensitivity_*`` arguments), which keeps the imatrix accumulation
+    byte-identical to a sensitivity-free run. Scores land in
+    ``metadata["sensitivity_map"]`` as {layer_idx: relative_mse}, the
+    exact metric _measure_sensitivity_from_model produces; requires
+    ``sensitivity_oq_level`` for the qdq predicate.
+    """
+    if measure_sensitivity and sensitivity_oq_level is None:
+        raise ValueError("measure_sensitivity requires sensitivity_oq_level")
+    source = Path(source)
+    adaptive_max_samples = max(
+        int(num_samples),
+        min(
+            int(num_samples) * _OQE_MAX_SAMPLE_MULTIPLIER,
+            _OQE_MAX_ADAPTIVE_SAMPLES,
+        ),
+    )
+    if calib_data is None:
+        mx.random.seed(int(calib_seed))
+        calib_data = _load_calibration_data(
+            tokenizer,
+            dataset=calib_dataset,
+            num_samples=adaptive_max_samples,
+            seq_length=seq_length,
+        )
+    if calib_data is None:
+        return {}, {"dataset": calib_dataset, "processed_samples": 0}
+
+    available_samples = int(calib_data.shape[0])
+    max_samples = min(available_samples, adaptive_max_samples)
+    step_samples = max(1, int(num_samples))
+    batch_plan = _oqe_calibration_batch_plan(
+        config,
+        requested_samples=step_samples,
+        seq_length=seq_length,
+    )
+    micro_batch_size = int(batch_plan["micro_batch_size"])
+
+    # Stage 0: source the embedding table once, embed the full adaptive-max
+    # draw, drop the table. Embedding everything up front (6.4 GB at the
+    # 1024x512 ceiling) means an escalation round re-streams layers only
+    # for its own sample slice instead of re-running stage 0.
+    calib_data = calib_data[:max_samples]
+    embed_weight = _streamed_embed_weight(source, config)
+    embedded = embed_weight[calib_data]
+    mx.eval(embedded)
+    sens_state = None
+    if measure_sensitivity:
+        # Build the sensitivity boundary while the embedding table is still
+        # resident, so the fused sweep costs no extra stage-0 read.
+        sens_state = _streamed_sensitivity_state(
+            tokenizer,
+            embed_weight,
+            calib_dataset=sensitivity_calib_dataset,
+            num_samples=sensitivity_num_samples,
+            seq_length=sensitivity_seq_length,
+            calib_seed=sensitivity_calib_seed,
+        )
+        if sens_state is None:
+            logger.warning(
+                "oQe imatrix streaming: sensitivity calibration draw failed, "
+                "the sweep will return an empty sensitivity map"
+            )
+    del embed_weight
+    mx.clear_cache()
+
+    # One causal mask and one position-id row serve every layer and every
+    # micro-batch: both depend only on seq_length and the activation dtype.
+    _, layer_masks, position_ids = _prepare_layer_inputs(
+        _StreamingNoModel(), [None], calib_data[:1], embedded[:1]
+    )
+    mask = layer_masks[0]
+
+    text_config = config.get("text_config") or {}
+    total_layers = int(
+        text_config.get("num_hidden_layers") or config.get("num_hidden_layers") or 0
+    )
+
+    collector = OQImatrixCollector()
+    installed = 0
+    switch_capture_modules = 0
+    capture_module_classes: dict[str, int] = {}
+    micro_batches = 0
+    processed_samples = 0
+    round_index = 0
+    rounds: list[dict[str, Any]] = []
+    require_expert_counts = False
+    coverage = _imatrix_expert_coverage_stats(collector.entries)
+    coverage_sufficient = False
+    collection_sufficient = False
+
+    logger.info(
+        "oQe imatrix streaming: adaptive max=%d, step=%d, micro-batch=%d "
+        "(available=%s, capture budget=%s)",
+        max_samples,
+        step_samples,
+        micro_batch_size,
+        _format_size(int(batch_plan["live_available_bytes"])),
+        _format_size(int(batch_plan["capture_budget_bytes"])),
+    )
+
+    while processed_samples < max_samples:
+        round_start = processed_samples
+        round_stop = min(round_start + step_samples, max_samples)
+        ranges = _stream_round_micro_ranges(round_start, round_stop, micro_batch_size)
+        working = [embedded[lo:hi] for lo, hi in ranges]
+
+        # No MTP-head pass here: the checkpoints this path serves declare
+        # MTP modules without shipping their weights (MiniMax-M3), so the
+        # resident collector's head pass is a no-op for them too. A source
+        # with real mtp.* tensors needs the _collect_mtp_head_imatrix
+        # equivalent added after the last layer.
+        first_streamed_layer = round_index == 0
+        for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
+            source, config, trust_remote_code=trust_remote_code
+        ):
+            prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+            layer_installed = collector.install(block, name_prefix=prefix)
+            if round_index == 0:
+                installed += layer_installed
+            if first_streamed_layer:
+                # Fail on the first layer, not after a full sweep: if the
+                # capture predicate matches nothing on a real decoder block
+                # the source layout is wrong and every layer would install
+                # zero, so the imatrix would come back empty after streaming
+                # the whole model for nothing.
+                first_streamed_layer = False
+                if layer_installed == 0:
+                    collector.restore(block)
+                    raise RuntimeError(
+                        f"streamed layer {layer_idx}: collector installed 0 "
+                        f"capture modules on {type(block).__name__}; the source "
+                        "layout does not match the capture predicate. Refusing "
+                        f"to sweep all {total_layers} layers for an empty imatrix"
+                    )
+            try:
+                for slot in range(len(working)):
+                    out, _ = _forward_layer_result(
+                        block, working[slot], mask, position_ids
+                    )
+                    if out is None:
+                        # The resident collector skips a dead layer forward;
+                        # here it would mean a sourcing bug feeding silently
+                        # corrupt statistics downstream, so abort instead.
+                        raise RuntimeError(
+                            f"streamed layer {layer_idx} forward returned no "
+                            f"output for {type(block).__name__}: every "
+                            "signature in the (inputs, mask, None, "
+                            "position_ids) family failed; refusing to "
+                            "continue with a partial imatrix"
+                        )
+                    mx.eval(out)
+                    working[slot] = out
+            finally:
+                collector.restore(block)
+            if sens_state is not None and round_index == 0:
+                # One weight load serves both passes: with the capture
+                # wrappers off the block is pristine again, so the qdq
+                # sensitivity forwards ride the same residency. Sensitivity
+                # is a single pass; escalation rounds skip it.
+                _streamed_sensitivity_layer(
+                    sens_state, layer_idx, block, config, sensitivity_oq_level
+                )
+            # The generator owns the other reference and releases it when
+            # resumed, before sourcing the next layer.
+            del block
+            mx.synchronize()
+            mx.clear_cache()
+            active = mx.get_active_memory()
+            logger.info(
+                "oQe imatrix streaming: round %d layer %d/%d done "
+                "(active %.1f GB, peak %.1f GB, cache %.1f GB)",
+                round_index + 1,
+                layer_idx + 1,
+                total_layers,
+                active / 1e9,
+                mx.get_peak_memory() / 1e9,
+                mx.get_cache_memory() / 1e9,
+            )
+            if active > _OQE_STREAM_ACTIVE_LIMIT_BYTES:
+                raise RuntimeError(
+                    f"streamed layer {layer_idx}: active memory "
+                    f"{active / 1e9:.1f} GB exceeds the "
+                    f"{_OQE_STREAM_ACTIVE_LIMIT_BYTES / 1e9:.0f} GB "
+                    "streaming budget after release; aborting before the "
+                    "leak compounds across layers"
+                )
+            layer_frac = (layer_idx + 1) / total_layers if total_layers else 1.0
+            round_span = round_stop - round_start
+            frac = (round_start + round_span * layer_frac) / max(max_samples, 1)
+            pct = progress_start + min(max(frac, 0.0), 1.0) * (
+                progress_end - progress_start
+            )
+            _emit_progress(
+                progress_callback,
+                "imatrix",
+                pct,
+                f"oQe imatrix streaming round {round_index + 1}: "
+                f"layer {layer_idx + 1}/{total_layers or '?'}",
+                {
+                    "round": round_index + 1,
+                    "layer": layer_idx,
+                    "processed_samples": processed_samples,
+                    "round_samples": round_span,
+                    "max_samples": max_samples,
+                    "micro_batch_size": micro_batch_size,
+                    "active_memory_bytes": int(active),
+                },
+            )
+
+        if round_index == 0:
+            # Counter snapshot after the first full sweep. Later rounds
+            # re-install on freshly sourced blocks, which would double the
+            # collector's per-class tallies.
+            capture_module_classes = dict(collector.capture_module_classes)
+            switch_capture_modules = int(collector.switch_capture_modules)
+            require_expert_counts = _imatrix_requires_expert_counts(
+                config, switch_capture_modules
+            )
+            if installed == 0:
+                return {}, {
+                    "dataset": calib_dataset,
+                    "installed_modules": 0,
+                    "processed_samples": 0,
+                }
+            if sens_state is not None:
+                # Only the scores are needed past round 0; drop the float
+                # boundary so escalation rounds do not carry it.
+                sens_state["inputs"] = None
+
+        del working
+        mx.clear_cache()
+
+        processed_samples = round_stop
+        micro_batches += len(ranges)
+        round_index += 1
+        coverage = _imatrix_expert_coverage_stats(collector.entries)
+        coverage_sufficient = _imatrix_expert_coverage_sufficient(
+            coverage, require_expert_counts=require_expert_counts
+        )
+        collection_sufficient = (
+            processed_samples >= int(num_samples) and coverage_sufficient
+        )
+        rounds.append(
+            {
+                "processed_samples": processed_samples,
+                "coverage_sufficient": coverage_sufficient,
+                "collection_sufficient": collection_sufficient,
+                "coverage": coverage,
+            }
+        )
+        logger.info(
+            "oQe imatrix streaming: round %d done, %d/%d samples, "
+            "zero experts=%d, p05=%.1f, sufficient=%s",
+            round_index,
+            processed_samples,
+            max_samples,
+            int(coverage.get("zero_count_experts", 0)),
+            float(coverage.get("p05_count", 0.0)),
+            collection_sufficient,
+        )
+        if collection_sufficient:
+            break
+
+    if require_expert_counts and not coverage.get("has_expert_counts", False):
+        logger.warning(
+            "oQe imatrix streaming: model config expects routed experts, "
+            "but no expert activation counts were captured"
+        )
+
+    metadata = {
+        "dataset": calib_dataset,
+        "requested_samples": int(num_samples),
+        "seq_length": int(seq_length),
+        "adaptive": True,
+        "adaptive_step_samples": step_samples,
+        "adaptive_max_samples": max_samples,
+        "available_samples": available_samples,
+        "micro_batch_size": micro_batch_size,
+        "micro_batches": micro_batches,
+        "batch_plan": batch_plan,
+        "processed_samples": processed_samples,
+        "installed_modules": installed,
+        "capture_module_classes": dict(sorted(capture_module_classes.items())),
+        "switch_capture_modules": switch_capture_modules,
+        "requires_expert_counts": require_expert_counts,
+        "coverage_sufficient": coverage_sufficient,
+        "collection_sufficient": collection_sufficient,
+        "coverage": coverage,
+        "rounds": rounds,
+        "load_kind": "streaming",
+    }
+    if measure_sensitivity:
+        scores = sens_state["scores"] if sens_state is not None else {}
+        _log_streamed_sensitivity(sensitivity_oq_level, scores)
+        metadata["sensitivity_map"] = scores
+    return collector.entries, metadata
+
+
 def _collect_imatrix(
     model_path: str,
     config: dict,
@@ -8191,9 +8975,7 @@ def _oqe_cache_missing_mtp_entries(
             return False
     except Exception:
         return False
-    return not any(
-        ".mtp." in key or key.startswith("mtp.") for key in cache.entries
-    )
+    return not any(".mtp." in key or key.startswith("mtp.") for key in cache.entries)
 
 
 def _load_or_collect_imatrix(
@@ -8211,7 +8993,19 @@ def _load_or_collect_imatrix(
     progress_start: float = 13.0,
     progress_end: float = 18.0,
     load_path_factory: Callable[[], str] | None = None,
+    stream_calibration: bool = False,
+    measure_sensitivity: bool = False,
+    sensitivity_oq_level=None,
+    sensitivity_num_samples: int = 32,
+    sensitivity_seq_length: int = 256,
 ) -> OQImatrixData:
+    # ``measure_sensitivity`` asks the streaming collector to fuse the
+    # per-layer qdq sensitivity measurement into the collection sweep; the
+    # scores come back under metadata["collection"]["sensitivity_map"]. It
+    # only applies to a fresh streamed collection: a cache hit returns
+    # early (the cached map, if any, may have been measured at another
+    # oq_level, so callers must not consume it and should fall back to
+    # _measure_sensitivity_streaming instead).
     source = Path(model_path)
     path = Path(cache_path)
     expected = _source_imatrix_signature(
@@ -8224,7 +9018,19 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_missing_mtp_entries(cache, config, model_path):
+            cache_load_kind = _oqe_cache_load_kind(cache)
+            if stream_calibration and cache_load_kind != "streaming":
+                # The source signature cannot distinguish a cache collected
+                # on a lossy proxy from one streamed off the real weights,
+                # so a streaming request rejects anything not explicitly
+                # marked as stream-collected (legacy caches included).
+                logger.info(
+                    "oQe imatrix: streaming calibration requested but cache "
+                    "%s was collected as %s, recollecting",
+                    path,
+                    cache_load_kind or "an unknown load kind",
+                )
+            elif _oqe_cache_missing_mtp_entries(cache, config, model_path):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
@@ -8242,38 +9048,62 @@ def _load_or_collect_imatrix(
                 )
                 return cache
             logger.info(
-                "oQe imatrix: cache missing required expert coverage, "
-                "recollecting %s",
+                "oQe imatrix: cache missing required expert coverage, recollecting %s",
                 path,
             )
         else:
             logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
 
     logger.info(
-        "oQe imatrix: collecting %d samples x %d tokens from %s",
+        "oQe imatrix: collecting %d samples x %d tokens from %s%s",
         num_samples,
         seq_length,
         calib_dataset,
+        " (layer streaming)" if stream_calibration else "",
     )
-    # ``load_path_factory`` swaps in an alternate checkpoint for the
-    # calibration forwards (a memory-safe quantized proxy of the source when
-    # the source exceeds live calibration capacity). Resolved only on a cache
-    # miss so a reusable cache never pays the proxy build. The cache signature stays
-    # keyed to the source checkpoint either way.
-    load_path = model_path
-    if load_path_factory is not None:
-        load_path = load_path_factory()
-    entries, collection_metadata = _collect_imatrix(
-        load_path,
-        config,
-        calib_dataset=calib_dataset,
-        num_samples=num_samples,
-        seq_length=seq_length,
-        trust_remote_code=trust_remote_code,
-        progress_callback=progress_callback,
-        progress_start=progress_start,
-        progress_end=progress_end,
-    )
+    if stream_calibration:
+        # The streaming collector reads the source checkpoint directly with
+        # one decoder layer resident at a time, so the RAM-safe proxy
+        # indirection below does not apply: it calibrates the real weights.
+        from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+        tokenizer = load_tokenizer(Path(model_path))
+        entries, collection_metadata = _collect_imatrix_streaming(
+            model_path,
+            tokenizer,
+            config,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            trust_remote_code=trust_remote_code,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+            measure_sensitivity=measure_sensitivity,
+            sensitivity_oq_level=sensitivity_oq_level,
+            sensitivity_num_samples=sensitivity_num_samples,
+            sensitivity_seq_length=sensitivity_seq_length,
+        )
+    else:
+        # ``load_path_factory`` swaps in an alternate checkpoint for the
+        # calibration forwards (a memory-safe quantized proxy of the source when
+        # the source exceeds live calibration capacity). Resolved only on a cache
+        # miss so a reusable cache never pays the proxy build. The cache signature stays
+        # keyed to the source checkpoint either way.
+        load_path = model_path
+        if load_path_factory is not None:
+            load_path = load_path_factory()
+        entries, collection_metadata = _collect_imatrix(
+            load_path,
+            config,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            trust_remote_code=trust_remote_code,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+        )
     if not entries:
         stage = str(collection_metadata.get("failure_stage", "unknown"))
         reason = str(
@@ -8288,6 +9118,7 @@ def _load_or_collect_imatrix(
     metadata = {
         **expected,
         "entry_count": len(entries),
+        "load_kind": collection_metadata.get("load_kind", "resident"),
         "collection": collection_metadata,
         "expert_coverage": collection_metadata.get("coverage", {}),
         "requires_expert_counts": bool(
@@ -8505,6 +9336,66 @@ def _measure_sensitivity(
     mx.clear_cache()
 
     return sensitivity
+
+
+def _measure_sensitivity_streaming(
+    model_path,
+    config: dict,
+    oq_level,
+    *,
+    calib_dataset: str = "code_multilingual",
+    num_samples: int = 32,
+    seq_length: int = 256,
+    trust_remote_code: bool = False,
+    calib_seed: int = _OQE_STREAM_CALIB_SEED,
+) -> dict[int, float]:
+    """Measure per-layer qdq sensitivity with one decoder layer resident.
+
+    Standalone counterpart to the fused pass in _collect_imatrix_streaming,
+    for builds where the imatrix came out of the cache but the sensitivity
+    map still has to be measured. Sources each block straight from the
+    checkpoint, so it needs neither a whole-model load nor the RAM-safe
+    proxy, and it scores the real weights rather than a lossy 4-bit stand-in.
+
+    Returns {layer_idx: relative_mse}, the same metric and walk as
+    _measure_sensitivity_from_model.
+    """
+    source = Path(model_path)
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+    tokenizer = load_tokenizer(source)
+    embed_weight = _streamed_embed_weight(source, config)
+    state = _streamed_sensitivity_state(
+        tokenizer,
+        embed_weight,
+        calib_dataset=calib_dataset,
+        num_samples=num_samples,
+        seq_length=seq_length,
+        calib_seed=calib_seed,
+    )
+    del embed_weight
+    mx.clear_cache()
+    if state is None:
+        return {}
+
+    for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
+        source, config, trust_remote_code=trust_remote_code
+    ):
+        _streamed_sensitivity_layer(state, layer_idx, block, config, oq_level)
+        del block
+        mx.synchronize()
+        mx.clear_cache()
+        active = mx.get_active_memory()
+        if active > _OQE_STREAM_ACTIVE_LIMIT_BYTES:
+            raise RuntimeError(
+                f"streamed sensitivity: layer {layer_idx} left "
+                f"{active / 1e9:.1f} GB active, past the "
+                f"{_OQE_STREAM_ACTIVE_LIMIT_BYTES / 1e9:.0f} GB streaming "
+                "budget; aborting before the leak compounds across layers"
+            )
+
+    _log_streamed_sensitivity(oq_level, state["scores"])
+    return state["scores"]
 
 
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
@@ -8824,8 +9715,10 @@ def _measure_sensitivity_from_quantized_model(
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
-        lm_load_compat as lm_load,
         maybe_apply_pre_load_patches,
+    )
+    from omlx.utils.model_loading import (
+        lm_load_compat as lm_load,
     )
 
     # Reuse the centralised pre-load dispatch (DeepSeek V4 base patch,
@@ -8860,13 +9753,10 @@ def _measure_sensitivity_from_quantized_model(
                     apply_mlx_vlm_mtp_runtime_patch()
                     prev_active = is_mtp_active()
                     set_mtp_active(True)
-                    restore_mtp_active = lambda: set_mtp_active(
-                        prev_active
-                    )  # noqa: E731
+                    restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
                 except Exception as e:
                     logger.debug(
-                        "mlx-vlm MTP runtime patch skipped for proxy sensitivity: "
-                        f"{e}"
+                        f"mlx-vlm MTP runtime patch skipped for proxy sensitivity: {e}"
                     )
 
             from mlx_lm.tokenizer_utils import load as load_tokenizer
