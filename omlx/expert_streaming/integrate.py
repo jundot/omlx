@@ -64,6 +64,7 @@ class ExpertStreamingRuntime:
                 "pinned_loads",
                 "cold_loads",
                 "expert_major_calls",
+                "qmm_calls",
                 "speculative_routes",
                 "speculative_misses",
                 "hotness_decays",
@@ -85,6 +86,18 @@ class ExpertStreamingRuntime:
             "manifest": str(self.manifest.source) if self.manifest.source else None,
             "cache_budget_bytes": self.cache_budget_bytes,
             "cache_slots_per_layer": self.cache_slots_per_layer,
+            "layer_count": len(self.pools),
+            "resident_experts": sum(
+                int(layer["resident_experts"]) for layer in layers
+            ),
+            "resident_capacity": sum(pool.pool_size for pool in self.pools),
+            # The current resident cache is also the QMM execution bank. Keep
+            # this explicit in benchmark telemetry so a future two-tier design
+            # can be compared without changing the result schema.
+            "execution_bank_slots": (
+                max((pool.pool_size for pool in self.pools), default=0)
+            ),
+            "execution_banks_per_layer": 1 if self.pools else 0,
             "substitution_threshold_percent": self.substitution_threshold_percent,
             "streaming_mode": self.streaming_mode,
             "cache_policy": "route_frequency",

@@ -86,9 +86,15 @@ back to the checked path. Rejected passes are never returned, so routing remains
 exact at a `0%` substitution threshold.
 
 Prompt and multi-token prefill always use checked mode. This warms the hot cache
-and prevents a new request from cascading through many speculative misses. MTP
-hidden-state forwards use the same whole-pass cache transaction as ordinary
-decode.
+and prevents a new request from cascading through many speculative misses.
+Single-token decoding also remains checked until every layer's evictable cache
+has reached its configured capacity. Readiness is latched after the cache fills,
+so steady-state decoding does not scan every layer on each token. A speculative
+miss binds the promoted bank rows lazily; the retry's QMM materializes those writes
+with their first consumer instead of forcing a redundant full-bank evaluation.
+MTP hidden-state forwards use the same whole-pass cache transaction as ordinary
+decode. Runtime execution stats expose how many otherwise-speculative passes were
+held back by the cache-fill gate.
 
 ## Performance status
 
@@ -112,7 +118,9 @@ measured separately, and low hit rates increase SSD traffic substantially.
 Warm-SSD, two-token generation produced identical text in both modes. Checked
 mode completed in 14.709 s. Speculative mode completed in 166.965 s because both
 speculative calls still missed after two promotions and fell back; it is therefore
-not the default. In an isolated identical-forward replay with all 48 layers hot,
+not the default. That measurement predates the cache-fill gate; the current path
+keeps such a partially filled cache in checked mode and avoids those rejected
+whole-model passes. In an isolated identical-forward replay with all 48 layers hot,
 speculative output was bit-identical (`max_abs=0`) and took 0.579 s versus 0.556 s
 for checked mode. This baseline shows no current throughput benefit from the
 larger speculative graph, even at a 100% resident hit rate.
@@ -136,7 +144,16 @@ slots, and submits all dynamic weight/scale/bias reads through one persistent
 parallel `pread` queue. It also applies Darwin read-ahead hints to cacheable cold
 reads and uses a learned popularity hotlist to warm ordinary evictable slots on
 future loads. Runtime stats split SSD I/O, payload decode, bank binding, and bank
-materialization time. These are compatible with MLX's fixed-shape banks.
+materialization time and count QMM projection invocations. These are compatible
+with MLX's fixed-shape banks.
+
+Local throughput benchmarks store per-trial streaming counter deltas alongside
+active and peak Metal memory. The benchmark log identifies the configured cache
+and execution-bank width, hotlist preload count, hit rate, misses, evictions,
+expert loads, SSD traffic, I/O and decode time, bank update time, expert-major
+calls, QMM calls, resident fill, and hotlist warm-start coverage. Analytical-cache
+runs with incomplete warm-start coverage are marked and should only be compared
+with a run having the same coverage.
 
 Further promising work, in priority order:
 

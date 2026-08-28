@@ -18,6 +18,7 @@ import numpy as np
 @dataclass
 class ExpertExecutionStats:
     checked_passes: int = 0
+    fill_gated_passes: int = 0
     speculative_passes: int = 0
     speculative_hits: int = 0
     speculative_retries: int = 0
@@ -194,6 +195,7 @@ class SpeculativeExecution:
         self.max_retries = max(0, int(max_retries))
         self.stats = ExpertExecutionStats()
         self._has_checked_pass = False
+        self._cache_fill_ready = False
         self._executing = False
         self._lock = threading.RLock()
         self._targets: list[weakref.ReferenceType[Any]] = []
@@ -228,7 +230,18 @@ class SpeculativeExecution:
             return False
         if not args or not isinstance(args[0], mx.array):
             return False
-        return args[0].ndim >= 1 and args[0].shape[-1] == 1
+        if args[0].ndim < 1 or args[0].shape[-1] != 1:
+            return False
+        if not self._cache_ready_for_speculation():
+            self.stats.fill_gated_passes += 1
+            return False
+        return True
+
+    def _cache_ready_for_speculation(self) -> bool:
+        """Latch readiness once all dynamic caches have reached capacity."""
+        if not self._cache_fill_ready:
+            self._cache_fill_ready = all(pool.cache_full for pool in self.runtime.pools)
+        return self._cache_fill_ready
 
     def _checked(self, call: Callable[[], Any]) -> Any:
         self._set_mode("checked")

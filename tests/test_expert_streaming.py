@@ -160,8 +160,7 @@ def _family_checkpoint(
         for projection, module in projections.items():
             for expert in range(experts):
                 prefix = (
-                    f"model.layers.1.{container}.experts.{expert}."
-                    f"{aliases[projection]}"
+                    f"model.layers.1.{container}.experts.{expert}.{aliases[projection]}"
                 )
                 tensors[f"{prefix}.weight"] = module.weight[expert]
                 tensors[f"{prefix}.scale"] = module.scales[expert]
@@ -304,6 +303,11 @@ def test_learned_hotlist_warm_starts_evictable_cache(tmp_path):
         assert stats["ssd_decode_seconds"] >= 0
         assert stats["bank_bind_seconds"] >= 0
         assert stats["bank_materialize_seconds"] >= 0
+        assert stats["qmm_calls"] == 3
+        assert stats["execution_bank_slots"] == 2
+        assert stats["execution_banks_per_layer"] == 1
+        assert stats["resident_experts"] == 2
+        assert stats["resident_capacity"] == 2
     finally:
         second.close()
 
@@ -346,9 +350,7 @@ def test_invalid_hotlist_profile_is_ignored(tmp_path):
     ("fragmented", "fused_gate_up"),
     [(False, False), (True, False), (False, True)],
 )
-def test_cross_family_ffn_mxfp4_streaming_is_exact(
-    tmp_path, fragmented, fused_gate_up
-):
+def test_cross_family_ffn_mxfp4_streaming_is_exact(tmp_path, fragmented, fused_gate_up):
     projections, modules = _family_checkpoint(
         tmp_path,
         container="ffn",
@@ -383,8 +385,7 @@ def test_cross_family_ffn_mxfp4_streaming_is_exact(
         assert runtime.manifest.layers == {1: ()}
         pool = runtime.pools[0]
         assert all(
-            "arrays" not in metadata
-            for metadata in pool.projection_metadata.values()
+            "arrays" not in metadata for metadata in pool.projection_metadata.values()
         )
         indices = mx.array([[[0, 3]]], dtype=mx.int32)
         x = mx.random.normal((1, 1, 64)).astype(mx.float16)
@@ -395,9 +396,9 @@ def test_cross_family_ffn_mxfp4_streaming_is_exact(
 
         scores = mx.array([[[0.25, 0.75]]], dtype=mx.float32)
         combined = pool(x, indices, scores=scores, weighted_sum=True)
-        expected_combined = (
-            expected * scores[..., None].astype(expected.dtype)
-        ).sum(-2)
+        expected_combined = (expected * scores[..., None].astype(expected.dtype)).sum(
+            -2
+        )
         mx.eval(combined, expected_combined)
         assert bool(mx.all(combined == expected_combined).item())
     finally:
@@ -609,9 +610,13 @@ def test_direct_projection_helper_chunks_oversized_route(tmp_path):
 
         up = pool.up_proj(flat_x, flat_indices, sorted_indices=False)
         gate = pool.gate_proj(flat_x, flat_indices, sorted_indices=False)
-        output = pool.down_proj(
-            pool.activation(up, gate), flat_indices, sorted_indices=False
-        ).squeeze(-2).reshape(1, 2, 2, -1)
+        output = (
+            pool.down_proj(
+                pool.activation(up, gate), flat_indices, sorted_indices=False
+            )
+            .squeeze(-2)
+            .reshape(1, 2, 2, -1)
+        )
         expected = _reference(full, x, indices)
         mx.eval(output, expected)
 
@@ -716,23 +721,36 @@ def test_speculative_miss_rolls_back_promotes_and_retries_exactly(tmp_path):
     execution = SpeculativeExecution(Runtime(), policy="speculative")
     execution.attach(model)
     try:
-        # The first pass is intentionally checked so a one-token prompt cannot
-        # trigger a cascade of speculative cold misses.
+        # Speculation remains gated while the dynamic cache is only partially
+        # populated, even after the mandatory first checked pass.
+        model.indices = mx.array([[[0, 1]]], dtype=mx.int32)
         mx.eval(model(mx.array([[1]]), cache=cache))
         assert cache.offset == 1
 
+        model.indices = mx.array([[[0, 2]]], dtype=mx.int32)
+        mx.eval(model(mx.array([[2]]), cache=cache))
+        assert cache.offset == 2
+        assert pool.cache_full is True
+        assert execution.stats.checked_passes == 2
+        assert execution.stats.fill_gated_passes == 1
+
         model.indices = mx.array([[[0, 5]]], dtype=mx.int32)
-        result = model(mx.array([[2]]), cache=cache)
+        cold_loads = pool.stats.cold_loads
+        materialize_seconds = pool.stats.bank_materialize_seconds
+        result = model(mx.array([[3]]), cache=cache)
         expected = _reference(full, model.x, model.indices)
         mx.eval(result, expected)
 
         assert bool(mx.all(result == expected).item())
-        assert cache.offset == 2
+        assert cache.offset == 3
         assert execution.stats.speculative_passes == 2
         assert execution.stats.speculative_retries == 1
         assert execution.stats.speculative_hits == 1
         assert execution.stats.speculative_fallbacks == 0
-        assert pool.stats.cold_loads == 1
+        assert pool.stats.cold_loads == cold_loads + 1
+        # Promotion commits only routing maps. The retry consumes the lazy bank
+        # writes without a redundant explicit bank materialization.
+        assert pool.stats.bank_materialize_seconds == materialize_seconds
     finally:
         execution.close()
         reader.close()

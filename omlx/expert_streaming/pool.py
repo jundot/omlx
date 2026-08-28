@@ -36,6 +36,7 @@ class ExpertPoolStats:
     pinned_loads: int = 0
     cold_loads: int = 0
     expert_major_calls: int = 0
+    qmm_calls: int = 0
     speculative_routes: int = 0
     speculative_misses: int = 0
     hotness_decays: int = 0
@@ -55,6 +56,7 @@ class ExpertPoolStats:
             "pinned_loads": self.pinned_loads,
             "cold_loads": self.cold_loads,
             "expert_major_calls": self.expert_major_calls,
+            "qmm_calls": self.qmm_calls,
             "speculative_routes": self.speculative_routes,
             "speculative_misses": self.speculative_misses,
             "hotness_decays": self.hotness_decays,
@@ -140,11 +142,7 @@ class StreamingSwitchGLU(nn.Module):
         for projection in PROJECTIONS:
             self.projection_metadata[projection].setdefault(
                 "parts",
-                tuple(
-                    part
-                    for candidate, part in locations
-                    if candidate == projection
-                ),
+                tuple(part for candidate, part in locations if candidate == projection),
             )
         self.activation = activation
         self._reader = reader
@@ -214,6 +212,11 @@ class StreamingSwitchGLU(nn.Module):
     @property
     def execution_mode(self) -> str:
         return self._execution_mode
+
+    @property
+    def cache_full(self) -> bool:
+        """Whether every evictable expert slot has been populated."""
+        return len(self._dynamic_lru) >= self.cache_slots
 
     def set_execution_mode(self, mode: str) -> None:
         if mode not in {"checked", "speculative"}:
@@ -320,9 +323,7 @@ class StreamingSwitchGLU(nn.Module):
                 ),
                 reverse=True,
             )
-            return [
-                (expert, int(self._route_counts[expert])) for expert in experts
-            ]
+            return [(expert, int(self._route_counts[expert])) for expert in experts]
 
     def preload_hotlist(self, entries: list[tuple[int, int]]) -> int:
         """Fill evictable slots from a prior run's learned route profile."""
@@ -343,9 +344,7 @@ class StreamingSwitchGLU(nn.Module):
                 valid.append((expert, count))
             valid.sort(key=lambda entry: entry[1], reverse=True)
             for expert, count in valid:
-                self._route_counts[expert] = min(
-                    count, int(np.iinfo(np.uint64).max)
-                )
+                self._route_counts[expert] = min(count, int(np.iinfo(np.uint64).max))
             selected = valid[: self.cache_slots]
             missing = [
                 expert for expert, _ in selected if expert not in self._expert_to_slot
@@ -493,7 +492,7 @@ class StreamingSwitchGLU(nn.Module):
                     self._dynamic_lru.move_to_end(expert)
 
     def promote(self, values: tuple[int, ...]) -> None:
-        """Load every currently-cold expert in ``values`` into the hot tier."""
+        """Load cold experts while deferring bank materialization to the retry."""
         with self._lock:
             unique = list(dict.fromkeys(values))
             dynamic_working_set = [
@@ -511,12 +510,11 @@ class StreamingSwitchGLU(nn.Module):
             if missing:
                 slots = self._allocate_misses(missing, protected=set(unique))
                 self._load_into_slots(missing, slots)
-                arrays = [
-                    self._array(projection, part)
-                    for projection in PROJECTIONS
-                    for part in self.projection_metadata[projection]["parts"]
-                ]
-                mx.eval(*arrays, self._slot_map, self._resident_mask)
+                # The retried QMM immediately consumes the updated banks, so
+                # forcing every projection here only materializes the same
+                # writes twice. Commit the tiny routing maps now and let the
+                # retry evaluate each bank update with its first consumer.
+                mx.eval(self._slot_map, self._resident_mask)
             self._last_indices = None
             self._last_slots = None
 
@@ -529,6 +527,7 @@ class StreamingSwitchGLU(nn.Module):
 
     def project(self, projection: str, x: mx.array, slot_indices: mx.array) -> mx.array:
         metadata = self.projection_metadata[projection]
+        self.stats.qmm_calls += 1
         output = mx.gather_qmm(
             x,
             self._array(projection, "weight"),
@@ -736,6 +735,7 @@ class StreamingSwitchGLU(nn.Module):
                 "cache_slots": self.cache_slots,
                 "cache_policy": self.cache_policy,
                 "resident_slots": self.pool_size,
+                "resident_experts": len(self._expert_to_slot),
                 "expert_bytes": sum(
                     location.row_bytes for location in self.locations.values()
                 ),
