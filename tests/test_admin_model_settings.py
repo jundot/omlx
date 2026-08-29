@@ -334,3 +334,66 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_tokens_is_persisted_not_dropped():
+    """#2823: mtp_num_draft_tokens used to be silently discarded by PUT."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(mtp_num_draft_tokens=None)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+    )
+
+    assert settings.mtp_num_draft_tokens == 8
+    assert result["settings"]["mtp_num_draft_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
+    """Same silent-drop class as #2823 for the other two engine settings."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(
+        preserve_thinking=False,
+        turboquant_skip_last=True,
+    )
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            preserve_thinking=True,
+            turboquant_skip_last=False,
+        ),
+    )
+
+    assert settings.preserve_thinking is True
+    assert settings.turboquant_skip_last is False
+    assert result["settings"]["preserve_thinking"] is True
+    assert result["settings"]["turboquant_skip_last"] is False
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_tokens_rejects_non_positive_values():
+    pool, _ = _failed_pool()
+
+    with pytest.raises(
+        admin_routes.HTTPException, match="must be a positive integer"
+    ):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=0),
+        )
+
+
+def test_unknown_settings_fields_are_rejected_loudly():
+    """Unknown keys must 422 instead of silently returning success:true."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="bogus_field"):
+        # Simulate a client sending a field that has no admin-PUT support.
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8, bogus_field=1)
