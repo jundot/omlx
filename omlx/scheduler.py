@@ -1902,6 +1902,15 @@ class Scheduler:
         # One-shot marker for the guard-off fast-path INFO emitted by
         # _sdpa256_unfused_headroom.
         self._sdpa256_unguarded_logged: bool = False
+        # (kv_len, q_len) of the most recent _sdpa256_unfused_headroom call,
+        # so it can tell a genuine same-shape repeat (layers 2..N of one
+        # chunk, safe to credit pool reuse) from the first head-dim-256 call
+        # at a new, larger kv_len -- or a same-kv_len call at a different
+        # q_len (e.g. a different chunk of the same request landing on the
+        # same kv_len), neither of whose transient is safe to credit against
+        # what a differently-shaped predecessor left in the pool -- see
+        # _sdpa256_unfused_headroom's docstring.
+        self._sdpa256_last_call_shape: tuple[int, int] | None = None
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -3895,18 +3904,54 @@ class Scheduler:
         safety_cap = self._prefill_abort_cap()
         return base_cap, safety_cap, self._prefill_abort_margin
 
-    def _sdpa256_unfused_headroom(self) -> int:
-        """Live headroom (bytes) for one unfused SDPA transient, under the
-        same target the adaptive prefill throttle enforces (hard ceiling x
-        headroom safety, clamped by the abort cap). Negative when the
-        ceiling is unknown (enforcer not propagated yet), which tells the
-        sdpa256 route to keep its memory-safe tiled default. When the guard
-        is explicitly disabled there is no ceiling to respect: the user
-        opted out of memory management, so the route gets unbounded
-        headroom and keeps the unfused fast path instead of pinning
-        guard-off servers to the ~2x-slower tiled pass (#2283). Called from
-        the route gate on the MLX step thread mid-prefill, where refreshing
-        the active-memory sample is safe (issue #2204)."""
+    def _sdpa256_unfused_headroom(self, kv_len: int, q_len: int) -> int:
+        """Live headroom (bytes) for one unfused SDPA transient at ``kv_len``,
+        under the same target the adaptive prefill throttle enforces (hard
+        ceiling x headroom safety, clamped by ``_admission_limit_bytes`` --
+        the same hard-watermark line the reactive process-memory enforcer
+        actually kills requests at, not the separately-derived abort cap).
+        Negative when the ceiling is unknown (enforcer not propagated yet),
+        which tells the sdpa256 route to keep its memory-safe tiled default.
+        When the guard is explicitly disabled there is no ceiling to
+        respect: the user opted out of memory management, so the route gets
+        unbounded headroom and keeps the unfused fast path instead of
+        pinning guard-off servers to the ~2x-slower tiled pass (#2283).
+        Called from the route gate on the MLX step thread mid-prefill, where
+        refreshing the active-memory sample is safe (issue #2204).
+
+        Two corrections on top of the raw target-minus-usage number, both
+        found via the same live 258k-token run and confirmed by a second
+        run that the first correction alone didn't fix:
+
+        1. Credits the retained Metal buffer pool (``credit_cache_memory``)
+           only when ``(kv_len, q_len)`` matches the previous call's -- i.e.
+           this is a repeat of the same chunk's shape (layers 2..N of the
+           same forward pass), not the chunk's first head-dim-256 call, and
+           not a *different* chunk that happens to land on the same
+           kv_len (same kv_len, different q_len -- e.g. a q-split sub-tile
+           of a different width -- is not the same-size transient the pool
+           actually freed). Within a chunk every full-attention layer
+           shares one (kv_len, q_len) shape, so a same-shape call is
+           guaranteed a same-size transient just freed into the pool:
+           genuine reuse, safe to credit. The FIRST call at a new shape has
+           no such guarantee.
+
+        2. Charges 2x the candidate transient, not 1x (see the ``// 2`` at
+           the end). kv_len only grows within a request, so by the time
+           this chunk's transient goes cold, the pool can't reuse it for
+           the next (bigger) chunk -- it rides along as unreclaimed
+           physical footprint until a reclaim finally runs, which can't
+           happen mid-chunk (the MLX executor thread is busy inside this
+           very call). So a call at kv_len L doesn't just cost T(L); it
+           also carries roughly one dead, same-size predecessor from the
+           chunk before it. This alone (without the 2x charge) was proven
+           insufficient live: the router still rode the fast path to the
+           same abort point as the original bug, just one chunk later.
+
+        The q-split route (patches.sdpa256_attention) degrades gracefully
+        on a misestimate here (a smaller q_sub, not a wrong answer), so
+        being conservative costs a smaller q_sub for one call, not
+        correctness."""
         hard_cap = self._memory_hard_limit_bytes
         if hard_cap <= 0:
             if self._memory_limits_propagated and not self._prefill_memory_guard:
@@ -3924,11 +3969,32 @@ class Scheduler:
         headroom_safety = getattr(
             self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
         )
-        target = int(hard_cap * headroom_safety)
-        abort_cap = self._prefill_abort_cap()
-        if abort_cap > 0:
-            target = min(target, abort_cap)
-        return target - self._current_usage_bytes()
+        # Target the SAME line the reactive enforcer actually kills at (the
+        # hard watermark via _admission_limit_bytes), not the separately
+        # -derived abort cap -- the two can diverge, and a route decision
+        # computed against a looser number than what the killer polls is
+        # exactly how "fits on paper" and "dies anyway" coexisted before
+        # this fix (confirmed via a live 258k-token run).
+        base_cap = self._admission_limit_bytes() or hard_cap
+        target = int(base_cap * headroom_safety)
+        call_shape = (kv_len, q_len)
+        same_shape_as_last_call = call_shape == self._sdpa256_last_call_shape
+        self._sdpa256_last_call_shape = call_shape
+        headroom = target - self._current_usage_bytes(
+            credit_cache_memory=same_shape_as_last_call
+        )
+        # Charge k=2x the candidate transient against that headroom, not 1x.
+        # By the time this chunk's own transient goes cold, kv_len has
+        # already grown for the next chunk, so kv_len monotonicity means the
+        # pool can never actually reuse it -- it rides along as unreclaimed
+        # physical footprint until the process-wide reclaim finally runs
+        # (which can't happen mid-chunk, since the MLX executor thread is
+        # busy inside this very call). So a call landing at kv_len L doesn't
+        # just cost T(L); it also carries roughly one dead, same-size
+        # predecessor from the chunk before it. Halving the returned
+        # headroom (equivalently: requiring T(L) <= headroom / 2) prices
+        # that in without needing to track the predecessor's exact size.
+        return headroom // 2 if headroom > 0 else headroom
 
     # Two pauses, not one: a marginal pooled-buffer reclaim can satisfy the
     # first pass's target check while buying only a couple of minutes of KV
@@ -4365,13 +4431,27 @@ class Scheduler:
                 logger.debug("Failed to read local hot-cache byte counter")
                 return 0
 
-    def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
+    def _current_usage_bytes(
+        self, *, refresh_mlx_active: bool = True, credit_cache_memory: bool = False
+    ) -> int:
         """Current memory usage for scheduler-side guard checks.
 
         Scheduler steps run on the MLX executor thread, so they can refresh
         mx.get_active_memory() safely. Event-loop callers such as early
         preflight use the cached executor sample and phys_footprint instead.
-        """
+
+        ``credit_cache_memory``: subtract MLX's retained-but-reusable Metal
+        buffer pool (``mx.get_cache_memory()``) from the phys-footprint side
+        only, not from ``active`` (which never included pooled memory to
+        begin with). ``phys_footprint`` lags actual reclaim by a full chunk
+        boundary (see ``_reclaim_prefill_headroom``'s docstring — 42.8GB at
+        a mid-chunk check vs 24.6GB right after), so counting the whole pool
+        against a would-be allocation double-charges memory a new call could
+        largely satisfy by reusing pooled buffers instead of growing the
+        physical footprint. Default False: existing admission/throttle/OOM
+        checks keep their current (more conservative) accounting; opt in
+        per call site once a specific caller is verified to want the
+        looser, more accurate number."""
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
             active = max(0, int(mx.get_active_memory()))
@@ -4382,6 +4462,8 @@ class Scheduler:
         else:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
+        if credit_cache_memory:
+            phys = max(0, phys - max(0, int(mx.get_cache_memory())))
         return max(active, phys)
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
