@@ -4047,6 +4047,84 @@ class TestLayerSignatureSweep:
         ]
         assert mgr._signature_sweep_completed is True
 
+    # ---- ANE-prefill provenance (see docs/ane-prefill-moe-support.md) ----
+
+    def test_ane_prefill_change_triggers_sweep(self, tmp_path: Path):
+        """Toggling ANE prefill alone must re-arm the stale-signature sweep:
+        blocks written under the other numeric lineage (including the
+        poisoned-cache incident's ANE-corrupted blocks) must not survive
+        into the new session."""
+        mgr = self._make_manager(
+            tmp_path, expected_layer_cache_types=["ArraysCache", "KVCache"]
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(
+            ["ArraysCache", "KVCache"], ane_prefill=True
+        )
+
+        assert changed is True
+        assert mgr._expected_ane_prefill is True
+        assert mgr._signature_sweep_completed is False
+
+    def test_signature_stamps_ane_prefill_only_when_active(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, expected_layer_cache_types=["ArraysCache", "KVCache"]
+        )
+        plain = mgr.cache_signature_for(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        assert '"ane_prefill"' not in plain
+
+        mgr.set_expected_layer_signature(
+            ["ArraysCache", "KVCache"], ane_prefill=True
+        )
+        stamped = mgr.cache_signature_for(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        assert '"ane_prefill":true' in stamped
+
+    def test_ane_provenance_mismatch_is_rejected_both_ways(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, expected_layer_cache_types=["ArraysCache", "KVCache"]
+        )
+        gpu_sig = mgr.cache_signature_for(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        # GPU-expected manager accepts GPU-computed blocks.
+        assert mgr.is_signature_compatible(gpu_sig)
+
+        mgr.set_expected_layer_signature(
+            ["ArraysCache", "KVCache"], ane_prefill=True
+        )
+        ane_sig = mgr.cache_signature_for(
+            model_name="test-model",
+            num_layers=2,
+            block_size=2048,
+            layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        # ANE-expected manager: accepts ANE blocks, rejects GPU blocks.
+        assert mgr.is_signature_compatible(ane_sig)
+        assert not mgr.is_signature_compatible(gpu_sig)
+        assert "ANE prefill provenance" in mgr.signature_mismatch_reason(gpu_sig)
+
+        # Back to GPU-expected: the ANE block (the poisoning vector) is
+        # rejected.
+        mgr.set_expected_layer_signature(
+            ["ArraysCache", "KVCache"], ane_prefill=False
+        )
+        assert not mgr.is_signature_compatible(ane_sig)
+        assert mgr.is_signature_compatible(gpu_sig)
+
     def test_sweep_leaves_other_models_alone(self, tmp_path: Path):
         turbo = ["ArraysCache", "TurboQuantKVCache"]
         stock = ["ArraysCache", "KVCache"]

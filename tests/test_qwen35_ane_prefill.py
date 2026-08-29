@@ -677,6 +677,46 @@ def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
     )
 
 
+def test_enable_refuses_moe_models(monkeypatch):
+    """A MoE checkpoint's shared-expert MLPs still expose
+    gate_proj/up_proj/down_proj and would match the candidate scan, but the
+    fixed-shape ANE path cannot serve the routed experts and silently
+    corrupts their output (verified live on qwen3_5_moe: plausible-speed
+    "!!!" garbage). The structural guard must refuse before any module is
+    marked, regardless of what the config string claimed."""
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
+    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
+    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
+    monkeypatch.setattr(
+        ane_patch, "_compile_pair", lambda mlp, config: object()
+    )
+
+    class _MoeBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.switch_mlp = nn.Linear(8, 8, bias=False)  # marker attr
+            self.shared_expert = _MLP()
+
+    class _MoeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [_MoeBlock() for _ in range(2)]
+
+    model = _MoeModel()
+    count = ane_patch.enable_qwen35_ane_prefill(
+        model,
+        sequence_length=2048,
+        fraction=0.4,
+    )
+
+    assert count == 0
+    assert not any(
+        hasattr(layer.shared_expert, "_omlx_ane_prefill_config")
+        for layer in model.layers
+    )
+
+
 @pytest.mark.parametrize("available", [False, True])
 def test_cpu_shared_resource_scheduler_is_capability_guarded(
     monkeypatch, available
