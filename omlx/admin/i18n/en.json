@@ -625,6 +625,7 @@
   "modal.model_settings.limit_tool_placeholder": "e.g. 2000",
   "modal.model_settings.activation_fp16": "Convert activations to float16 on load (recommended on M1/M2)",
   "modal.model_settings.activation_fp16_hint": "Recasts the checkpoint's bfloat16 leaves to float16 after loading, so the forward runs on the GPU's native float16 path instead of the emulated one. Quantized weights are untouched. Takes effect on the next model load.",
+  "modal.model_settings.activation_fp16_unsupported": "This checkpoint is already stored in float16 — there is nothing to recast.",
   "modal.model_settings.turboquant_kv": "TurboQuant KV Cache",
   "modal.model_settings.turboquant_kv_hint": "Compress KV cache using vector quantization. Lower bits = more compression, higher bits = better quality. Supports 2 to 8 bits.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits per channel",

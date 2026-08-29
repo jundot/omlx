@@ -1199,6 +1199,33 @@ def materialize_lazy_state(model: Any) -> None:
             mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
+def checkpoint_has_bf16_leaves(model_path: str) -> bool:
+    """Whether the checkpoint on disk still carries bfloat16 tensors.
+
+    The fp16 activation recast only has work to do when it does: a checkpoint
+    already stored in float16 makes the toggle a no-op, so the admin UI uses
+    this to gate it out. Reads only the safetensors headers (a few KB each) and
+    stops at the first bfloat16 tensor.
+    """
+    if not model_path:
+        return False
+    try:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+    except OSError:
+        return False
+    for shard in shards:
+        try:
+            with open(shard, "rb") as handle:
+                header_len = int.from_bytes(handle.read(8), "little")
+                header = json.loads(handle.read(header_len))
+        except (OSError, ValueError):
+            continue
+        for name, spec in header.items():
+            if name != "__metadata__" and isinstance(spec, dict) and spec.get("dtype") == "BF16":
+                return True
+    return False
+
+
 def cast_bf16_params_to_fp16(model: Any) -> int:
     """Recast every bfloat16 parameter of a loaded model to float16.
 
@@ -1249,7 +1276,12 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     ):
         try:
             recast = cast_bf16_params_to_fp16(model)
-            logger.info("activation dtype: bfloat16 -> float16 (%d tensors)", recast)
+            if recast:
+                logger.info("activation dtype: bfloat16 -> float16 (%d tensors)", recast)
+            else:
+                logger.info(
+                    "activation dtype: already float16 or better; nothing to recast"
+                )
         except Exception:
             logger.warning("fp16 activation recast failed; staying on bfloat16", exc_info=True)
 

@@ -625,6 +625,7 @@
   "modal.model_settings.limit_tool_placeholder": "par ex. 2000",
   "modal.model_settings.activation_fp16": "Convertir les activations en float16 au chargement (recommandé sur M1/M2)",
   "modal.model_settings.activation_fp16_hint": "Reconvertit les tenseurs bfloat16 du checkpoint en float16 après le chargement, afin que la passe s'exécute sur le chemin float16 natif du GPU plutôt que sur celui émulé. Les poids quantifiés ne sont pas modifiés. Prend effet au prochain chargement du modèle.",
+  "modal.model_settings.activation_fp16_unsupported": "Ce checkpoint est déjà stocké en float16 — il n'y a rien à reconvertir.",
   "modal.model_settings.turboquant_kv": "Cache KV TurboQuant",
   "modal.model_settings.turboquant_kv_hint": "Compressez le cache KV en utilisant la quantification vectorielle. Bits inférieurs = plus de compression, bits supérieurs = meilleure qualité. Supporte 2 à 8 bits.",
   "modal.model_settings.turboquant_kv_bits_label": "Bits par canal",

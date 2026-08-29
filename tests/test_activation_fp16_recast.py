@@ -63,3 +63,28 @@ if __name__ == "__main__":
     test_recast_moves_bf16_leaves_to_fp16_and_keeps_u32_payloads()
     test_recast_is_a_noop_when_nothing_is_bf16()
     print("OK")
+
+
+def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
+    import json as _json
+    import struct
+
+    from omlx.utils.model_loading import checkpoint_has_bf16_leaves
+
+    def _write(path, dtype):
+        header = _json.dumps({"w": {"dtype": dtype, "shape": [2], "data_offsets": [0, 4]}}).encode()
+        path.write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 4)
+
+    bf16_dir = tmp_path / "bf16"
+    bf16_dir.mkdir()
+    _write(bf16_dir / "model-00001.safetensors", "F16")
+    _write(bf16_dir / "model-00002.safetensors", "BF16")
+    assert checkpoint_has_bf16_leaves(str(bf16_dir)) is True
+
+    fp16_dir = tmp_path / "fp16"
+    fp16_dir.mkdir()
+    _write(fp16_dir / "model-00001.safetensors", "F16")
+    assert checkpoint_has_bf16_leaves(str(fp16_dir)) is False
+
+    assert checkpoint_has_bf16_leaves("") is False
+    assert checkpoint_has_bf16_leaves(str(tmp_path / "nao-existe")) is False

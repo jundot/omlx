@@ -1764,9 +1764,14 @@ class VLMBatchedEngine(BaseEngine):
                 recast = await loop.run_in_executor(
                     get_mlx_executor(), cast_bf16_params_to_fp16, self._vlm_model
                 )
-                logger.info(
-                    "activation dtype: bfloat16 -> float16 (%d tensors)", recast
-                )
+                if recast:
+                    logger.info(
+                        "activation dtype: bfloat16 -> float16 (%d tensors)", recast
+                    )
+                else:
+                    logger.info(
+                        "activation dtype: already float16 or better; nothing to recast"
+                    )
             except Exception:
                 logger.warning(
                     "fp16 activation recast failed; staying on bfloat16",

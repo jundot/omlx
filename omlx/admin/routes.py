@@ -1949,6 +1949,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        try:
+            from ..utils.model_loading import checkpoint_has_bf16_leaves
+
+            activation_fp16_supported = checkpoint_has_bf16_leaves(
+                model_info.get("model_path", "") or ""
+            )
+        except (OSError, TypeError, ValueError):
+            activation_fp16_supported = False
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2032,6 +2040,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "activation_fp16_supported": activation_fp16_supported,
         }
 
         # Add settings if available

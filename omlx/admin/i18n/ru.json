@@ -625,6 +625,7 @@
   "modal.model_settings.limit_tool_placeholder": "например, 2000",
   "modal.model_settings.activation_fp16": "Преобразовывать активации в float16 при загрузке (рекомендуется на M1/M2)",
   "modal.model_settings.activation_fp16_hint": "Преобразует тензоры bfloat16 из чекпоинта в float16 после загрузки, чтобы прямой проход выполнялся по нативному пути float16 на GPU, а не по эмулируемому. Квантованные веса не затрагиваются. Вступает в силу при следующей загрузке модели.",
+  "modal.model_settings.activation_fp16_unsupported": "Этот чекпоинт уже хранится в float16 — преобразовывать нечего.",
   "modal.model_settings.turboquant_kv": "TurboQuant KV-кэш",
   "modal.model_settings.turboquant_kv_hint": "Сжимайте KV-кэш с помощью векторного квантования. Меньшее число бит = сильнее сжатие, большее = лучше качество. Поддерживает от 2 до 8 бит.",
   "modal.model_settings.turboquant_kv_bits_label": "Битов на канал",
