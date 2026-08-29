@@ -1382,6 +1382,8 @@ def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> 
     if lm is None or not hasattr(lm, "_rope_deltas"):
         return
     lm._rope_deltas = mx.zeros((1, 1), dtype=mx.int64)
+    # Keep the restore-only seed concrete before the engine-stream graph uses it.
+    mx.eval(lm._rope_deltas)
 
 
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:

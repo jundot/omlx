@@ -5751,17 +5751,101 @@ class TestVLMPositionStateClearing:
         request.num_prompt_tokens = 4
         request.cached_tokens = 2048
 
-        scheduler._do_external_prefill(
-            request,
-            tokens=[1, 2, 3, 4],
-            existing_cache=[],
-            vlm_embeds=None,
-        )
+        with patch.object(
+            scheduler_module,
+            "_seed_text_only_mrope_delta_for_cached_prefill",
+            wraps=scheduler_module._seed_text_only_mrope_delta_for_cached_prefill,
+        ) as seed_mrope:
+            scheduler._do_external_prefill(
+                request,
+                tokens=[1, 2, 3, 4],
+                existing_cache=[],
+                vlm_embeds=None,
+            )
 
         model.clear_vlm_position_state.assert_called_once()
+        seed_mrope.assert_called_once_with(model, request)
         seeded = model._language_model._rope_deltas
         assert seeded.shape == (1, 1)
+        assert seeded.dtype == mx.int64
         assert seeded.item() == 0
+
+    def test_cached_text_only_mrope_seed_is_materialized(self):
+        """The exact restore-only seed must be concrete before prefill starts."""
+        language_model = SimpleNamespace(_rope_deltas=mx.array([[123]]))
+        model = SimpleNamespace(_language_model=language_model)
+        request = SimpleNamespace(cached_tokens=2048)
+
+        with patch.object(scheduler_module.mx, "eval") as eval_mock:
+            scheduler_module._seed_text_only_mrope_delta_for_cached_prefill(
+                model, request
+            )
+
+        seeded = language_model._rope_deltas
+        assert seeded.shape == (1, 1)
+        assert seeded.dtype == mx.int64
+        assert eval_mock.call_count == 1
+        assert eval_mock.call_args.args[0] is seeded
+
+    def test_fresh_text_only_prefill_does_not_seed_or_evaluate_mrope(self):
+        previous = mx.array([[123]])
+        language_model = SimpleNamespace(_rope_deltas=previous)
+        model = SimpleNamespace(_language_model=language_model)
+        request = SimpleNamespace(cached_tokens=0)
+
+        with patch.object(scheduler_module.mx, "eval") as eval_mock:
+            scheduler_module._seed_text_only_mrope_delta_for_cached_prefill(
+                model, request
+            )
+
+        assert language_model._rope_deltas is previous
+        eval_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            SimpleNamespace(),
+            SimpleNamespace(_language_model=SimpleNamespace()),
+        ],
+    )
+    def test_text_only_mrope_seed_ignores_models_without_state(self, model):
+        before = vars(model).copy()
+        request = SimpleNamespace(cached_tokens=2048)
+
+        with patch.object(scheduler_module.mx, "eval") as eval_mock:
+            scheduler_module._seed_text_only_mrope_delta_for_cached_prefill(
+                model, request
+            )
+
+        assert vars(model) == before
+        eval_mock.assert_not_called()
+
+    def test_chunked_prefill_initialization_seeds_cached_text_mrope(
+        self, mock_tokenizer
+    ):
+        model = self._make_vlm_model()
+        model._language_model = SimpleNamespace(_rope_deltas=mx.array([[123]]))
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="text-cached-chunked-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.cached_tokens = 2048
+
+        with patch.object(
+            scheduler_module,
+            "_seed_text_only_mrope_delta_for_cached_prefill",
+            wraps=scheduler_module._seed_text_only_mrope_delta_for_cached_prefill,
+        ) as seed_mrope:
+            scheduler._begin_prefill(
+                request,
+                tokens=[1, 2, 3, 4],
+                existing_cache=[],
+            )
+
+        model.clear_vlm_position_state.assert_called_once()
+        seed_mrope.assert_called_once_with(model, request)
 
 
 class TestBuildStateMachineStopStrings:
