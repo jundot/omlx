@@ -242,6 +242,10 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 0,
       "stream"_a = nb::none());
+  // Capability marker for fast.py: older extensions expose the same affine
+  // bindings but accept only Q2/Q3.  New source must not route Q4/Q6/Q8 into
+  // one of those stale binaries.
+  m.attr("AFFINE_MOE_HAS_Q468") = true;
   m.def(
       "deepseek_mxfp4_gather_qmm_expert",
       &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_expert,

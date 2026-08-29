@@ -97,6 +97,12 @@ def _probe_mma_score(ext) -> bool:
 
 _EXT_MMA_SCORE = _probe_mma_score(_ext)
 
+# Extensions built before affine Q4/Q6/Q8 support expose the same block-list
+# symbols but reject those bit widths at call time.  Preserve their Q2/Q3 path
+# while failing closed for the newly added formats until the extension is
+# rebuilt.
+_EXT_HAS_AFFINE_Q468 = _ext is not None and hasattr(_ext, "AFFINE_MOE_HAS_Q468")
+
 
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
@@ -133,6 +139,11 @@ def import_error() -> Exception | None:
 
 def has_symbol(name: str) -> bool:
     return hasattr(_ext, name) or hasattr(mx.fast, name)
+
+
+def affine_moe_supports_bits(bits: int) -> bool:
+    """Whether the loaded affine MoE extension supports this bit width."""
+    return bits in (2, 3) or (_EXT_HAS_AFFINE_Q468 and bits in (4, 6, 8))
 
 
 def native_symbols() -> tuple[str, ...]:
