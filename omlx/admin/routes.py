@@ -142,6 +142,8 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
     mtp_num_draft_tokens: int | None = None
+    # Recast the checkpoint's bfloat16 leaves to float16 after load
+    activation_fp16_enabled: bool | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
@@ -2394,6 +2396,11 @@ async def update_model_settings(
             request.index_cache_freq
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
+        )
+    # Load-time activation dtype recast
+    if "activation_fp16_enabled" in sent:
+        current_settings.activation_fp16_enabled = (
+            request.activation_fp16_enabled or False
         )
     # TurboQuant KV cache settings
     if "turboquant_kv_enabled" in sent:

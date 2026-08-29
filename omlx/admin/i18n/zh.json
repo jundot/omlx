@@ -623,6 +623,8 @@
   "modal.model_settings.limit_tool_result": "限制工具结果 Token",
   "modal.model_settings.limit_tool_result_hint": "截断过长的工具结果（如文件读取）到 Token 限制",
   "modal.model_settings.limit_tool_placeholder": "例如 2000",
+  "modal.model_settings.activation_fp16": "加载时将激活值转换为 float16（建议在 M1/M2 上启用）",
+  "modal.model_settings.activation_fp16_hint": "加载后将检查点中的 bfloat16 张量转换为 float16，使前向计算走 GPU 原生的 float16 路径而非模拟路径。量化权重不受影响。下次加载模型时生效。",
   "modal.model_settings.turboquant_kv": "TurboQuant KV 缓存",
   "modal.model_settings.turboquant_kv_hint": "使用向量量化压缩 KV Cache。位数越低压缩越多，位数越高质量越好。支持 2 到 8 位。",
   "modal.model_settings.turboquant_kv_bits_label": "每通道位数",
