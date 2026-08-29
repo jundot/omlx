@@ -1030,7 +1030,7 @@
                                         <button type="button"
                                                 @click="if (modelSettings.activation_fp16_supported) modelSettings.activation_fp16_enabled = !modelSettings.activation_fp16_enabled"
                                                 :disabled="!modelSettings.activation_fp16_supported"
-                                                :title="modelSettings.activation_fp16_supported ? '' : '{{ t('modal.model_settings.activation_fp16_unsupported') }}'"
+                                                :title="modelSettings.activation_fp16_supported ? '' : '{{ t('modal.model_settings.activation_fp16_unsupported')|replace('\\', '\\\\')|replace("'", "\\'") }}'"
                                                 :class="[
                                                     modelSettings.activation_fp16_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     !modelSettings.activation_fp16_supported ? 'opacity-40 cursor-not-allowed' : ''
