@@ -586,6 +586,11 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        # Draft depth is read once at engine construction; it must be in the
+        # signature while Lightning MTP is active so a change reloads the
+        # engine, but a stale value must not force one when MTP is off.
+        if mtp_active:
+            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)

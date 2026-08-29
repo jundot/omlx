@@ -2395,7 +2395,12 @@ async def update_model_settings(
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
     if "turboquant_skip_last" in sent:
-        current_settings.turboquant_skip_last = bool(request.turboquant_skip_last)
+        # null = clear to the model default (True); bool(None) would flip it
+        # to False and silently disable the skip-last corruption guard.
+        current_settings.turboquant_skip_last = (
+            True if request.turboquant_skip_last is None
+            else bool(request.turboquant_skip_last)
+        )
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.
@@ -2930,8 +2935,6 @@ async def update_model_settings(
         or "dflash_in_memory_cache_max_bytes" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
-        # MTP draft token count is an engine-construction control.
-        or "mtp_num_draft_tokens" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent
