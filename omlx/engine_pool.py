@@ -2224,25 +2224,6 @@ class EnginePool:
                 return True
         return False
 
-    async def _run_deferred_mlx_cleanup_if_idle(self) -> None:
-        """Run cleanup deferred by an unload once all leased work has drained."""
-        if not self._deferred_mlx_cleanup:
-            return
-        if any(
-            entry.is_loading
-            or entry.in_use > 0
-            or self._entry_has_active_requests(entry)
-            for entry in self._entries.values()
-            if entry.engine is not None or entry.is_loading
-        ):
-            return
-
-        gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), _clear_mlx_cache_sync)
-        self._deferred_mlx_cleanup = False
-        self._wake_process_memory_enforcer()
-
     def _finish_engine_unload_task(
         self,
         model_id: str,
