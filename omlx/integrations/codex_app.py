@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Codex App (OpenAI Codex App Desktop) integration.
 
-This integration launches the Codex App Desktop GUI/TUI via the
-``codex app`` subcommand, while sharing the same config file as
-the CLI variant (``~/.codex/config.toml``).
+This integration launches the Codex App Desktop GUI/TUI via a standalone
+``omlx`` profile, leaving the user's base Codex configuration unchanged.
 
 OpenAI renamed the desktop app from Codex to ChatGPT. In-place
 upgrades keep the old ``/Applications/Codex.app`` folder name while
@@ -17,10 +16,11 @@ Usage:
     omlx launch codex_app --model qwen3.5
 
 Which launches:
-    codex app
+    codex --profile omlx app
 
-Both CLI and App use the same config file:
-    ~/.codex/config.toml
+The generated profile and model catalog live in the active Codex home:
+    ~/.codex/omlx.config.toml
+    ~/.codex/omlx-models.json
 """
 
 from __future__ import annotations
@@ -31,7 +31,13 @@ import shutil
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
-from omlx.integrations.codex import CODEX_CONFIG_PATH, write_codex_config
+from omlx.integrations.codex import (
+    CODEX_PROFILE_NAME,
+    codex_model_catalog_path,
+    codex_profile_path,
+    write_codex_config,
+    write_codex_model_catalog,
+)
 from omlx.utils.install import get_cli_command_prefix
 
 CODEX_APP_BUNDLE_ID = "com.openai.codex"
@@ -77,9 +83,7 @@ def resolve_codex_binary() -> str | None:
 
 
 class CodexAppIntegration(Integration):
-    """Codex App Desktop integration that configures ~/.codex/config.toml for oMLX."""
-
-    CONFIG_PATH = CODEX_CONFIG_PATH
+    """Codex App Desktop integration using a standalone oMLX profile."""
 
     def __init__(self):
         super().__init__(
@@ -105,7 +109,8 @@ class CodexAppIntegration(Integration):
         )
 
     def configure(self, ctx: IntegrationContext) -> None:
-        write_codex_config(self.CONFIG_PATH, ctx)
+        catalog_path = write_codex_model_catalog(codex_model_catalog_path(), ctx)
+        write_codex_config(codex_profile_path(), ctx, catalog_path)
 
     def launch(self, ctx: IntegrationContext) -> None:
         self.configure(ctx)
@@ -113,10 +118,10 @@ class CodexAppIntegration(Integration):
         env = self._scrubbed_env()
         env["OMLX_API_KEY"] = ctx.auth_token
 
-        # Launch codex app (desktop GUI/TUI) instead of codex CLI
-        # Note: codex app doesn't accept -m flag, model is set in config
+        # Launch Codex App with the standalone oMLX profile. The base user
+        # config remains untouched, so normal OpenAI sessions are unaffected.
         codex_bin = resolve_codex_binary() or "codex"
-        args = [codex_bin, "app"]
+        args = [codex_bin, "--profile", CODEX_PROFILE_NAME, "app"]
         args.extend(ctx.extra_args)
 
         os.execvpe(codex_bin, args, env)
