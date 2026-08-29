@@ -7,6 +7,7 @@ import base64
 import importlib
 import io
 import json
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -120,6 +121,145 @@ def _feed_pool(cache, token_count: int) -> None:
     ready, _, _ = cache.accumulate_windows(values, gates, 0)
     pooled = ready.reshape(1, -1, cache.ratio, width).mean(axis=2)
     cache.update_and_fetch(pooled)
+
+
+def test_glm5_decode_indexer_uses_single_row_exact_mma_contract(
+    monkeypatch,
+):
+    """The L=1 route must not pad one decode query into 64 prefill rows."""
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    mx.random.seed(5301)
+    indexer = SimpleNamespace(n_heads=32, head_dim=128)
+    q = mx.random.normal((1, 1, 32, 128), dtype=mx.bfloat16)
+    pool_keys = mx.random.normal((1, 4096, 128), dtype=mx.bfloat16)
+    weights = mx.random.normal((1, 1, 32), dtype=mx.bfloat16)
+    calls = []
+
+    def fake_indexer(qt, keys, w, **kwargs):
+        calls.append(qt.shape[2])
+        assert qt.shape == (1, 32, 1, 128)
+        assert keys.shape == (1, 1, 4096, 128)
+        assert w.shape == (1, 1, 32)
+        assert kwargs == {"causal": False}
+        scores = qt @ keys.swapaxes(-1, -2)
+        scores = mx.maximum(scores, mx.array(0, scores.dtype))
+        return (
+            (scores * w.transpose(0, 2, 1)[..., None])
+            .sum(axis=1, keepdims=True)
+            .astype(q.dtype)
+        )
+
+    monkeypatch.setattr(
+        fast,
+        "has_symbol",
+        lambda name: name == "dsa_indexer_scores",
+    )
+    monkeypatch.setattr(fast, "dsa_indexer_scores", fake_indexer)
+    direct = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    mx.eval(direct)
+
+    assert calls == [1]
+    assert direct.shape == (1, 1, 4096)
+
+
+def test_glm5_decode_indexer_m1_error_falls_back_to_padded_abi(monkeypatch):
+    """A stale M=1 implementation must retain the exact padded route."""
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    indexer = SimpleNamespace(n_heads=32, head_dim=128)
+    q = mx.zeros((1, 1, 32, 128), dtype=mx.bfloat16)
+    pool_keys = mx.zeros((1, 4096, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+    calls = []
+
+    monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
+
+    def m1_then_padded(qt, keys, w, **_kwargs):
+        calls.append(qt.shape[2])
+        if qt.shape[2] == 1:
+            raise RuntimeError("stale M=1 implementation")
+        assert qt.shape[2] == 64
+        return mx.zeros((1, 1, 64, keys.shape[2]), dtype=w.dtype)
+
+    monkeypatch.setattr(fast, "dsa_indexer_scores", m1_then_padded)
+    scores = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    mx.eval(scores)
+
+    assert calls == [1, 64]
+    assert scores.shape == (1, 1, 4096)
+
+
+def test_glm5_multirow_indexer_keeps_existing_padded_route(monkeypatch):
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    indexer = SimpleNamespace(n_heads=32, head_dim=128)
+    query_rows = 2
+    pool_length = 4096
+    q = mx.zeros((1, query_rows, 32, 128), dtype=mx.bfloat16)
+    pool_keys = mx.zeros((1, pool_length, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((1, query_rows, 32), dtype=mx.bfloat16)
+    calls = []
+
+    monkeypatch.setattr(fast, "has_symbol", lambda _name: True)
+
+    def fake_prefill(qt, keys, w, **_kwargs):
+        calls.append(qt.shape[2])
+        return mx.zeros((1, 1, qt.shape[2], keys.shape[2]), dtype=w.dtype)
+
+    monkeypatch.setattr(fast, "dsa_indexer_scores", fake_prefill)
+    scores = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    mx.eval(scores)
+
+    assert calls == [64]
+    assert scores.shape == (1, query_rows, pool_length)
+
+
+@pytest.mark.parametrize("pool_length", [513, 1024, 4095, 4096, 8191])
+def test_glm5_native_m1_mma_is_bit_exact_to_legacy_padded_row(pool_length):
+    """The BM8 decode specialization must preserve the deployed score sheet."""
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    required = ("dsa_indexer_scores", "dsa_topk_indices")
+    if not fast.is_native_available() or any(
+        not fast.has_symbol(name) for name in required
+    ):
+        pytest.skip("packaged GLM native decode/indexer kernels are unavailable")
+
+    mx.random.seed(530_000 + pool_length)
+    indexer = SimpleNamespace(n_heads=32, head_dim=128)
+    q = mx.random.normal((1, 1, 32, 128), dtype=mx.bfloat16)
+    pool_keys = mx.random.normal((1, pool_length, 128), dtype=mx.bfloat16)
+    weights = mx.random.normal((1, 1, 32), dtype=mx.bfloat16)
+
+    direct = Glm5NextIndexer._native_scores(indexer, q, pool_keys, weights)
+    qt = q.transpose(0, 2, 1, 3)
+    keys = pool_keys[:, None]
+    q_pad = mx.pad(qt, [(0, 0), (0, 0), (0, 63), (0, 0)])
+    w_pad = mx.pad(weights, [(0, 0), (0, 63), (0, 0)])
+    k_pad = (-pool_length) % 64
+    if k_pad:
+        keys = mx.pad(keys, [(0, 0), (0, 0), (0, k_pad), (0, 0)])
+    legacy = fast.dsa_indexer_scores(
+        q_pad,
+        keys,
+        w_pad,
+        causal=False,
+    )[:, 0, :1, :pool_length]
+    direct_topk = fast.dsa_topk_indices(direct[:, None], 512)[:, 0]
+    legacy_topk = fast.dsa_topk_indices(legacy[:, None], 512)[:, 0]
+    mx.eval(direct, legacy, direct_topk, legacy_topk)
+
+    assert mx.array_equal(direct, legacy).item()
+    assert mx.array_equal(direct_topk, legacy_topk).item()
 
 
 def test_glm5_next_registers_pinned_upstream_model():

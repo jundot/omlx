@@ -22,6 +22,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     exact_block_token_attention,
     q8_vup_flat,
     sparse_mla_attention,
+    sparse_mla_attention_nope,
 )
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
@@ -350,6 +351,31 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast
 
+            # Decode has exactly one query row.  Route it through the exact
+            # M=1 specialization of the same Steel MMA score kernel used by
+            # prefill.  This preserves the historical row-0 dot/reduction
+            # order bit-for-bit while avoiding both the 64-row input/output
+            # padding and 63 unused MMA rows.  Older extension builds safely
+            # accept M=1 with the historical BM64 implementation, so this is
+            # also an exact compatibility path rather than a new ABI.
+            if (
+                q.shape[1] == 1
+                and fast.has_symbol("dsa_indexer_scores")
+            ):
+                qt = q.transpose(0, 2, 1, 3)
+                try:
+                    scores = fast.dsa_indexer_scores(
+                        qt,
+                        pool_keys[:, None],
+                        weights,
+                        causal=False,
+                    )
+                    return scores[:, 0]
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    # Preserve availability through the historical padded
+                    # route below if a packaged extension rejects M=1.
+                    pass
+
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
             qt = q.transpose(0, 2, 1, 3)
@@ -613,18 +639,32 @@ class Glm5NextSparseAttention(nn.Module):
                 return self._gathered_attention(q, kv_latent, topk_indices)
             else:
                 q_latent = self.embed_q(q)
-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
                 output = None
                 if Kv >= 4096:
-                    output = sparse_mla_attention(
+                    output = sparse_mla_attention_nope(
                         q_latent,
-                        q_pe,
                         kv_latent,
-                        k_pe,
                         topk_indices,
                         self.scale,
                     )
+                    # Compatibility with an older packaged extension: retain
+                    # the exact historical path until the dedicated NoPE ABI
+                    # is present, rather than silently demoting to dense MLA.
+                    if output is None:
+                        q_pe = mx.zeros(
+                            q_latent.shape[:-1] + (64,), dtype=q_latent.dtype
+                        )
+                        k_pe = mx.zeros(
+                            kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype
+                        )
+                        output = sparse_mla_attention(
+                            q_latent,
+                            q_pe,
+                            kv_latent,
+                            k_pe,
+                            topk_indices,
+                            self.scale,
+                        )
                 if output is not None:
                     output_flat = q8_vup_flat(
                         output,

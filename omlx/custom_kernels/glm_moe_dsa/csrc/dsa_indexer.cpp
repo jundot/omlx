@@ -132,7 +132,6 @@ class DSAIndexerScoresPrimitive : public Primitive {
 
     out.set_data(allocator::malloc(out.nbytes()));
 
-    constexpr int bm = 64;
     constexpr int bk = 16;
 
     const int B = q.shape(0);
@@ -148,9 +147,11 @@ class DSAIndexerScoresPrimitive : public Primitive {
     // slower at P=125k and ~11% slower at P=2.5k — the kernel is
     // compute/barrier-bound (Q and pooled-K panels are largely
     // L2-resident), so the traffic reduction does not pay. bn=64/wm2/wn2
-    // is the fixed configuration.
+    // remains the prefill configuration; an M=1 decode row uses the exact
+    // BM8/wm1 specialization from the same Steel kernel.
+    const int bm = M == 1 ? 8 : 64;
     const int bn = 64;
-    const int wm = 2;
+    const int wm = M == 1 ? 1 : 2;
     const int wn = 2;
 
     const int tiles_m = (M + bm - 1) / bm;

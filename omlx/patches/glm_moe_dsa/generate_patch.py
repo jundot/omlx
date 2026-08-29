@@ -31,14 +31,90 @@ class _AdaptivePrefillConfig:
     min_remaining: int
 
 
+_GLM5_NATIVE_PREFILL_SYMBOLS = (
+    "dsa_indexer_scores",
+    "dsa_topk_indices",
+    "glm_dsa_sparse_mla_attention",
+    "glm_dsa_exact_block_attention",
+    "glm_dsa_q8_vup_flat",
+)
+
+
+def _glm5_native_prefill_geometry(model: Any) -> bool:
+    config = getattr(model, "config", None)
+    candidates = (
+        getattr(config, "text_config", None),
+        getattr(getattr(model, "language_model", None), "config", None),
+        getattr(getattr(model, "_language_model", None), "config", None),
+        config,
+        getattr(model, "args", None),
+    )
+    text_config = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate is not None
+            and hasattr(candidate, "num_attention_heads")
+        ),
+        None,
+    )
+    if text_config is None:
+        return False
+
+    expected = {
+        "num_attention_heads": 64,
+        "kv_lora_rank": 512,
+        "index_topk": 2048,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_kpool": 4,
+        "linear_num_heads": 64,
+        "linear_head_dim": 128,
+    }
+    try:
+        geometry_matches = all(
+            int(getattr(text_config, name, -1)) == value
+            for name, value in expected.items()
+        )
+    except (TypeError, ValueError):
+        return False
+    if not geometry_matches:
+        return False
+    return bool(
+        getattr(text_config, "mla_use_nope", False)
+        or int(getattr(text_config, "qk_rope_head_dim", -1)) == 0
+    )
+
+
+def _glm5_native_sparse_available(model: Any) -> bool:
+    if not _glm5_native_prefill_geometry(model):
+        return False
+    try:
+        from ...custom_kernels.glm_moe_dsa import fast
+
+        return bool(
+            fast.is_native_available()
+            and not fast.missing_symbols(_GLM5_NATIVE_PREFILL_SYMBOLS)
+        )
+    except Exception:
+        return False
+
+
 def _glm_dsa_adaptive_prefill_config(
     model: Any, prefill_step_size: int
 ) -> _AdaptivePrefillConfig | None:
     model_type = getattr(model, "model_type", None) or getattr(
         getattr(model, "args", None), "model_type", None
     )
+    adaptive_env = os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP")
+    glm5_wide_prefill = adaptive_env == "1"
+    supported_type = model_type == "glm_moe_dsa" or (
+        model_type in {"glm5_next", "glm5_next_text"}
+        and glm5_wide_prefill
+        and _glm5_native_sparse_available(model)
+    )
     if (
-        model_type != "glm_moe_dsa"
+        not supported_type
         or prefill_step_size != 2048
         or os.environ.get("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1") != "1"
     ):

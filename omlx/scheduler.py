@@ -1767,18 +1767,6 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
 
-        # For strict RotatingKVCache reuse, align paged cache block size to
-        # the model's rotating window size when paged cache is enabled.
-        self._align_block_size_with_rotating_window()
-        # For ArraysCache-only models (no RotatingKVCache), use a larger block
-        # size to reduce boundary snapshot overhead during prefill.
-        self._enlarge_block_size_for_arrays_cache()
-
-        # TurboQuant KV cache (set by engine if model_settings has it enabled)
-        self._turboquant_kv_bits: float | None = None
-        self._turboquant_skip_last: bool = True
-        # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
-        self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
         try:
             from .patches.glm_moe_dsa.generate_patch import (
@@ -1798,6 +1786,19 @@ class Scheduler:
                 self._glm_dsa_adaptive_prefill.after,
                 self._glm_dsa_adaptive_prefill.min_remaining,
             )
+
+        # For strict RotatingKVCache reuse, align paged cache block size to
+        # the model's rotating window size when paged cache is enabled.
+        self._align_block_size_with_rotating_window()
+        # For ArraysCache-only models (no RotatingKVCache), use a larger block
+        # size to reduce boundary snapshot overhead during prefill.
+        self._enlarge_block_size_for_arrays_cache()
+
+        # TurboQuant KV cache (set by engine if model_settings has it enabled)
+        self._turboquant_kv_bits: float | None = None
+        self._turboquant_skip_last: bool = True
+        # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
+        self._mla_model: bool | None = None
         self._minimax_m3_adaptive_prefill = None
         try:
             from .patches.minimax_m3.generate_patch import (
@@ -2756,6 +2757,14 @@ class Scheduler:
             self._ARRAYS_CACHE_BLOCK_SIZE,
             int(self.config.prefill_step_size or 0),
             self._qwen35_prefill_floor,
+            int(
+                getattr(
+                    getattr(self, "_glm_dsa_adaptive_prefill", None),
+                    "step_size",
+                    0,
+                )
+                or 0
+            ),
         )
         if self.config.paged_cache_block_size >= target:
             return

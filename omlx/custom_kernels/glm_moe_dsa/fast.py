@@ -105,6 +105,7 @@ NATIVE_SYMBOLS = (
     "dspark_fp32_topk_indices",
     "dspark_exact_mxfp8_qmv_pair",
     "glm_dsa_sparse_mla_attention",
+    "glm_dsa_nope_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "deepseek_v4_sparse_attention",
     "dspark_ring_gemm",
@@ -361,6 +362,40 @@ def glm_dsa_sparse_mla_attention(
         topk_length=topk_length,
         causal_prefix_rows=causal_prefix_rows,
         stream=stream or mx.gpu,
+    )
+
+
+def glm_dsa_nope_sparse_mla_attention(
+    q_latent: mx.array,
+    q_pe: mx.array,
+    kv_latent: mx.array,
+    k_pe: mx.array,
+    topk_indices: mx.array,
+    scale: float,
+    causal: bool = True,
+    topk_valid_prefix: bool = False,
+    causal_prefix_indices: bool = False,
+    topk_length: mx.array | None = None,
+    causal_prefix_rows: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Strict GLM-5.3 NoPE sparse-MLA ABI (D_PE must be zero)."""
+    if _ext is None or not hasattr(_ext, "glm_dsa_nope_sparse_mla_attention"):
+        raise RuntimeError("GLM-5.3 NoPE sparse-MLA kernel is unavailable")
+    return _ext.glm_dsa_nope_sparse_mla_attention(
+        q_latent,
+        q_pe,
+        kv_latent,
+        k_pe,
+        topk_indices,
+        scale,
+        causal=causal,
+        topk_valid_prefix=topk_valid_prefix,
+        causal_prefix_indices=causal_prefix_indices,
+        topk_length=topk_length,
+        causal_prefix_rows=causal_prefix_rows,
+        **_native_stream_kwargs(stream),
     )
 
 

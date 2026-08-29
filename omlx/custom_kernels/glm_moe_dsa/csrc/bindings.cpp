@@ -89,6 +89,23 @@ NB_MODULE(_ext, m) {
       "topk_length"_a = nb::none(),
       "causal_prefix_rows"_a = 0,
       "stream"_a = nb::none());
+  // Separate ABI name lets Python fail closed when code is paired with an
+  // older extension that only accepts the historical D_PE=64 geometry.
+  m.def(
+      "glm_dsa_nope_sparse_mla_attention",
+      &omlx::glm_kernels::glm_dsa_nope_sparse_mla_attention,
+      "q_latent"_a,
+      "q_pe"_a,
+      "kv_latent"_a,
+      "k_pe"_a,
+      "topk_indices"_a,
+      "scale"_a,
+      "causal"_a = true,
+      "topk_valid_prefix"_a = false,
+      "causal_prefix_indices"_a = false,
+      "topk_length"_a = nb::none(),
+      "causal_prefix_rows"_a = 0,
+      "stream"_a = nb::none());
   m.def(
       "glm_dsa_exact_block_attention",
       &omlx::glm_kernels::glm_dsa_exact_block_attention,

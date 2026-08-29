@@ -232,6 +232,51 @@ def test_glm_adaptive_prefill_config_defaults_and_gates(monkeypatch):
     assert _glm_dsa_adaptive_prefill_config(model, 2048) is None
 
 
+def test_glm5_adaptive_prefill_requires_complete_native_sparse_route(monkeypatch):
+    from omlx.patches.glm_moe_dsa import generate_patch
+
+    model = SimpleNamespace(model_type="glm5_next")
+    monkeypatch.setattr(
+        generate_patch, "_glm5_native_sparse_available", lambda _model: False
+    )
+    monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1")
+    assert generate_patch._glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+    monkeypatch.setattr(
+        generate_patch, "_glm5_native_sparse_available", lambda _model: True
+    )
+    cfg = generate_patch._glm_dsa_adaptive_prefill_config(model, 2048)
+    assert cfg is not None
+    assert cfg.step_size == 8192
+
+    monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP")
+    assert generate_patch._glm_dsa_adaptive_prefill_config(model, 2048) is None
+
+
+def test_glm5_wide_prefill_requires_published_native_geometry():
+    from omlx.patches.glm_moe_dsa.generate_patch import (
+        _glm5_native_prefill_geometry,
+    )
+
+    text_config = SimpleNamespace(
+        num_attention_heads=64,
+        kv_lora_rank=512,
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_kpool=4,
+        linear_num_heads=64,
+        linear_head_dim=128,
+        mla_use_nope=True,
+        qk_rope_head_dim=0,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(text_config=text_config))
+    assert _glm5_native_prefill_geometry(model)
+
+    text_config.num_attention_heads = 32
+    assert not _glm5_native_prefill_geometry(model)
+
+
 def test_glm_adaptive_prefill_config_env_overrides(monkeypatch):
     from omlx.patches.glm_moe_dsa.generate_patch import (
         _glm_dsa_adaptive_prefill_config,
@@ -332,6 +377,84 @@ def test_glm_direct_sparse_mla_uses_fork_default_threshold(monkeypatch):
     )
 
     assert glm_moe_dsa_model._native_sparse_mla_default_min_k() == "11264"
+
+
+def test_glm5_nope_sparse_mla_fails_closed_without_dedicated_abi(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.glm_moe_dsa import sparse_mla
+
+    monkeypatch.setattr(
+        sparse_mla,
+        "glm_fast",
+        SimpleNamespace(has=lambda _name: False),
+    )
+    q = mx.zeros((1, 64, 2, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 16, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 1, 2, 16), dtype=mx.uint32)
+
+    assert sparse_mla.sparse_mla_attention_nope(q, kv, topk, 512**-0.5) is None
+
+
+def test_glm5_nope_sparse_mla_dispatches_zero_width_pe(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.glm_moe_dsa import sparse_mla
+
+    sentinel = object()
+    captured = {}
+
+    class FakeFast:
+        @staticmethod
+        def has(name):
+            return name == "glm_dsa_nope_sparse_mla_attention"
+
+        @staticmethod
+        def glm_dsa_nope_sparse_mla_attention(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return sentinel
+
+    monkeypatch.setattr(sparse_mla, "glm_fast", FakeFast())
+    q = mx.zeros((1, 64, 2, 512), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 1, 16, 512), dtype=mx.bfloat16)
+    topk = mx.zeros((1, 1, 2, 16), dtype=mx.uint32)
+
+    assert sparse_mla.sparse_mla_attention_nope(q, kv, topk, 512**-0.5) is sentinel
+    assert captured["args"][1].shape == (1, 64, 2, 0)
+    assert captured["args"][3].shape == (1, 1, 16, 0)
+    assert captured["args"][1].dtype == q.dtype
+    assert captured["args"][3].dtype == q.dtype
+
+
+def test_glm5_nope_sparse_mla_is_bitwise_equal_to_zero_pe_native():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.patches.glm_moe_dsa.sparse_mla import sparse_mla_attention_nope
+
+    if not fast.has_symbol("glm_dsa_nope_sparse_mla_attention"):
+        pytest.skip("GLM-5.3 NoPE sparse-MLA kernel is unavailable")
+
+    mx.random.seed(29)
+    q = mx.random.normal((1, 64, 32, 512), dtype=mx.bfloat16)
+    kv = mx.random.normal((1, 1, 64, 512), dtype=mx.bfloat16)
+    topk = mx.broadcast_to(
+        mx.arange(16, dtype=mx.uint32).reshape(1, 1, 1, 16),
+        (1, 1, 32, 16),
+    )
+    q_pe = mx.zeros((1, 64, 32, 64), dtype=mx.bfloat16)
+    k_pe = mx.zeros((1, 1, 64, 64), dtype=mx.bfloat16)
+    scale = 512**-0.5
+
+    reference = fast.glm_dsa_sparse_mla_attention(
+        q, q_pe, kv, k_pe, topk, scale
+    )
+    with pytest.raises(ValueError, match="zero-width q_pe and k_pe"):
+        fast.glm_dsa_nope_sparse_mla_attention(
+            q, q_pe, kv, k_pe, topk, scale
+        )
+    nope = sparse_mla_attention_nope(q, kv, topk, scale)
+    assert nope is not None
+    mx.eval(reference, nope)
+    assert bool(mx.array_equal(reference, nope).item())
 
 
 def test_glm_native_fused_kernels_match_reference(monkeypatch):

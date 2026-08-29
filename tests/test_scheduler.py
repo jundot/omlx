@@ -3281,6 +3281,53 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_glm5_native_sparse_prefill_aligns_cache_boundary_to_8192(
+        self, mock_tokenizer, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1")
+        with patch(
+            "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
+            return_value=True,
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._glm_dsa_adaptive_prefill is not None
+            assert scheduler._prefill_step_size_for_progress(0, 20_000) == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
+        finally:
+            scheduler.shutdown()
+
+    def test_glm5_default_preserves_2048_cache_granularity(
+        self, mock_tokenizer, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)
+        with patch(
+            "omlx.patches.glm_moe_dsa.generate_patch._glm5_native_sparse_available",
+            return_value=True,
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler._glm_dsa_adaptive_prefill is None
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
     def test_custom_prefill_step_raises_arrays_block(self, mock_tokenizer, tmp_path):
         scheduler = Scheduler(
             model=self._hybrid_model(model_type="other_hybrid"),

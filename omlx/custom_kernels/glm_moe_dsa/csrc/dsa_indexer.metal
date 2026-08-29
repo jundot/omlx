@@ -45,6 +45,13 @@ struct OMLXDSATopKParams {
 instantiate_dsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 
+// Decode has one query row.  Keep the exact Steel MMA arithmetic used by the
+// historical BM64 score kernel, but reduce the minimum M tile to one 8-row
+// simdgroup fragment.  BK=16 and the simdgroup matmul sequence are unchanged,
+// so retained row 0 is bit-identical; the other seven fragment rows are safe
+// loaded as zero and never stored.
+instantiate_dsa_indexer_score(float16, half, 8, 64, 16, 1, 2);
+instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 8, 64, 16, 1, 2);
 instantiate_dsa_topk_indices(float16, half, 2048, 1024);
 instantiate_dsa_topk_indices(bfloat16, bfloat16_t, 2048, 1024);
 instantiate_dsa_topk_indices(float16, half, 512, 1024);
