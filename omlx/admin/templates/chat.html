@@ -6691,6 +6691,21 @@
             generationOverride = { temperature: temp };
         }
 
+        // "Regenerate with <model>" promotes the override to this chat's active
+        // model (fixes #2729): the header/picker must follow the model that
+        // actually generates the reply, and the per-model settings for that
+        // model must feed the call instead of the stale settings of the model
+        // that previously failed to load.
+        if (opts.model) {
+            const gatewayId = this.resolveGatewayModelId(opts.model);
+            this.currentModel = gatewayId;
+            session.model = gatewayId;
+            if (!this.loadModelSettingsForModel(session, gatewayId)) {
+                await this.ensureSessionModelSettings(session, gatewayId);
+                this.saveModelSettingsForModel(session, gatewayId);
+            }
+        }
+
         await this.streamResponse({
             chatId: this.currentChatId,
             model: this.currentModel,
