@@ -989,3 +989,54 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_glm5_head_dim_zero_installs_profile():
+    """GLM-5.x exposes head_dim=0 in the generic config field. The scheduler
+    must still install the model-specific prefill profile (which supplies an
+    effective head dim) instead of silently skipping admission pricing
+    (maintainer review #3291)."""
+    from omlx.memory_monitor import _Glm5PrefillMemoryProfile
+
+    class GlmConfig(_ModelConfig):
+        def __init__(self):
+            self.num_hidden_layers = 45
+            self.num_key_value_heads = 64
+            self.num_attention_heads = 64
+            self.head_dim = 0  # GLM generic field
+            self.model_type = "glm5_next_text"
+            self.layer_types = ["linear_attention"] * 34 + [
+                "deepseek_sparse_attention"
+            ] * 11
+            self.linear_attn_config = SimpleNamespace(
+                num_heads=64, head_dim=128, short_conv_kernel_size=4
+            )
+            self.qk_nope_head_dim = 256
+            self.v_head_dim = 256
+            self.kv_lora_rank = 512
+            self.index_n_heads = 32
+            self.index_head_dim = 128
+            self.index_topk = 2048
+            self.index_kpool = 4
+            self.hidden_size = 4096
+            self.hc_mult = 4
+
+    model = MagicMock()
+    model.layers = []
+    model.config = GlmConfig()
+    del model.make_cache
+
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    config = SchedulerConfig(
+        max_num_seqs=8,
+        prefill_step_size=2048,
+        paged_cache_block_size=0,
+    )
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+    # Profile installed despite generic head_dim=0.
+    assert isinstance(monitor._prefill_memory_profile, _Glm5PrefillMemoryProfile)
+    # Effective head dim came from the profile.
+    assert monitor._head_dim == 256

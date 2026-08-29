@@ -12621,13 +12621,30 @@ class Scheduler:
             def _pos_int(v: Any) -> bool:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
-            if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            # Hybrid configs may expose head_dim=0 in the generic field while
+            # the real attention head width lives elsewhere (e.g. GLM-5.x:
+            # qk_nope_head_dim / linear_head_dim). When a model-specific
+            # profile exists it supplies an effective head dim, so the gate
+            # can install the profile instead of silently skipping admission
+            # pricing for the whole model.
+            effective_head_dim = head_dim
+            if not _pos_int(effective_head_dim) and prefill_memory_profile is not None:
+                try:
+                    effective_head_dim = prefill_memory_profile.effective_head_dim
+                except Exception:
+                    effective_head_dim = None
+
+            if (
+                _pos_int(num_layers)
+                and _pos_int(num_kv_heads)
+                and _pos_int(effective_head_dim)
+            ):
                 from .memory_monitor import _ane_prefill_transient_bytes
 
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
+                    head_dim=effective_head_dim,
                     dtype_size=dtype_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
