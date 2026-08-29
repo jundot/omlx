@@ -1,8 +1,10 @@
-"""Opt-in ANE/GPU hybrid prefill for dense Qwen3.5/3.6/3.8 MLPs.
+"""Opt-in ANE/CPU/GPU hybrid prefill for Qwen3.5+ projection blocks.
 
 The private ANE runtime only accepts fixed shapes, so this backend is attached
 to a specific loaded model and sequence length. Unsupported layers, flattened
-token counts, dtypes, and decode/verify calls fall through unchanged.
+token counts, dtypes, and decode/verify calls fall through unchanged. Qwen4's
+routed experts stay on Metal; its fixed shared expert and Gated DeltaNet input
+projections reuse the same output-row partitioning backend.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ _PATCHED_CLASSES: set[type] = set()
 _VLM_HOOK_INSTALLED = False
 _VLM_GDN_HOOK_INSTALLED = False
 _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+_QWEN_ANE_MODEL_TYPE_PREFIXES = ("qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp")
 # Legacy extensions compile one program per slice, and the private runtime on
 # the reference M3 Ultra accepts 120 resident programs. Current extensions pack
 # all slices into one multi-procedure program per ANE instance and bypass this
@@ -58,6 +61,120 @@ _ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
 _ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
 
 
+def _ane_bank_max_memory_fraction() -> float:
+    """Return the process-footprint ceiling used by ANE bank compilation.
+
+    The conservative 70% default protects ordinary fully-resident loads from
+    the ANE driver's delayed program-release accounting. Qwen4 PLE mmap mode
+    can legitimately start above that line while still leaving substantial
+    absolute headroom, so an explicit per-process override lets the tuner use
+    that already-selected residency policy without weakening the default for
+    every model. Keep the override below 90% so a typo cannot erase the
+    emergency margin entirely.
+    """
+    raw = os.environ.get(
+        "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION", ""
+    ).strip()
+    if not raw:
+        return _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring non-numeric "
+            "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION=%r",
+            raw,
+        )
+        return _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    if not _ANE_BANK_RETRY_MAX_MEMORY_FRACTION <= value <= 0.90:
+        logger.warning(
+            "Ignoring out-of-range "
+            "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION=%r; expected %.2f..0.90",
+            raw,
+            _ANE_BANK_RETRY_MAX_MEMORY_FRACTION,
+        )
+        return _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    return value
+
+
+def qwen_ane_model_type_supported(model_type: str | None) -> bool:
+    """Return whether ``model_type`` has a validated fixed projection layout."""
+    normalized = str(model_type or "").strip().lower().replace("-", "_")
+    return normalized.startswith(_QWEN_ANE_MODEL_TYPE_PREFIXES)
+
+
+def _model_architecture(model: Any) -> str:
+    """Best-effort architecture name for loaded LM and VLM wrapper shapes."""
+    objects = [
+        model,
+        getattr(model, "config", None),
+        getattr(model, "args", None),
+        getattr(model, "language_model", None),
+    ]
+    language_model = objects[-1]
+    if language_model is not None:
+        objects.extend(
+            [
+                getattr(language_model, "config", None),
+                getattr(language_model, "args", None),
+            ]
+        )
+    config = getattr(model, "config", None)
+    if config is not None:
+        objects.append(getattr(config, "text_config", None))
+    for value in objects:
+        model_type = getattr(value, "model_type", None)
+        if model_type:
+            return str(model_type).strip().lower().replace("-", "_")
+    return ""
+
+
+def _qwen4_decoder_layers(model: Any) -> list[Any] | None:
+    """Return only Qwen4's serving decoder layers, excluding its MTP head."""
+    if not _model_architecture(model).startswith("qwen4_exp"):
+        return None
+    language_model = getattr(model, "language_model", None)
+    for owner in (language_model, model):
+        body = getattr(owner, "model", None) if owner is not None else None
+        layers = getattr(body, "layers", None)
+        if layers is not None:
+            return list(layers)
+    return None
+
+
+def _candidate_mlps(model: Any) -> list[Any]:
+    """Find fixed SwiGLU blocks that are safe to keep in resident ANE banks."""
+    layers = _qwen4_decoder_layers(model)
+    if layers is not None:
+        candidates = []
+        for layer in layers:
+            block = getattr(layer, "mlp", None)
+            shared = getattr(block, "shared_expert", None)
+            if shared is not None:
+                candidates.append(shared)
+        return candidates
+    return [
+        module
+        for module in (model.modules() if hasattr(model, "modules") else ())
+        if all(
+            hasattr(module, name)
+            for name in ("gate_proj", "up_proj", "down_proj")
+        )
+    ]
+
+
+def _candidate_gdns(model: Any) -> list[Any]:
+    """Find serving GDN blocks without walking Qwen4's speculative MTP head."""
+    layers = _qwen4_decoder_layers(model)
+    if layers is not None:
+        return [
+            module
+            for layer in layers
+            if (module := getattr(layer, "linear_attn", None)) is not None
+        ]
+    return list(model.modules()) if hasattr(model, "modules") else []
+
+
 def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
     """``(current phys_footprint, total system memory)`` in bytes for the
     headroom gate and its skip-warning log, so "why did ANE bank compile
@@ -79,7 +196,7 @@ def _ane_bank_memory_headroom_ok() -> bool:
     current, total = _ane_bank_memory_footprint_snapshot()
     if total <= 0:
         return True
-    return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    return current < total * _ane_bank_max_memory_fraction()
 
 
 @dataclass(frozen=True)
@@ -2116,6 +2233,19 @@ def _install_dispatch() -> bool:
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
 
+    # Qwen4-Exp reuses Qwen3.5's fixed shared-expert class and subclasses its
+    # GDN implementation. Importing the architecture here makes that contract
+    # explicit and keeps the shared expert wrapped across mlx-vlm revisions.
+    try:
+        importlib.import_module("mlx_vlm.models.qwen4_exp.language")
+        qwen4_moe = importlib.import_module("mlx_vlm.models.qwen3_5_moe.language")
+        shared_expert_cls = getattr(qwen4_moe, "Qwen3_5MoeMLP", None)
+        if shared_expert_cls is not None:
+            _wrap_class(shared_expert_cls)
+            installed = True
+    except Exception:
+        logger.debug("mlx-vlm Qwen4 ANE dispatch hook unavailable", exc_info=True)
+
     try:
         lm = importlib.import_module("mlx_lm.models.qwen3_5")
         cls = getattr(lm, "MLP", None)
@@ -2196,6 +2326,7 @@ def _bank_split_ladder(
     for attempt in range(4):
         if not _ane_bank_memory_headroom_ok():
             current, total = _ane_bank_memory_footprint_snapshot()
+            max_memory_fraction = _ane_bank_max_memory_fraction()
             logger.warning(
                 "Skipping ANE procedure bank compile attempt %d/4: phys "
                 "footprint %.2f GiB / %.2f GiB total already past the "
@@ -2204,7 +2335,7 @@ def _bank_split_ladder(
                 attempt + 1,
                 current / (1 << 30),
                 total / (1 << 30),
-                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+                max_memory_fraction * 100,
             )
             return None
         spans = (
@@ -2319,6 +2450,7 @@ def _compile_single_banks(
     for attempt in range(4):
         if not _ane_bank_memory_headroom_ok():
             current, total = _ane_bank_memory_footprint_snapshot()
+            max_memory_fraction = _ane_bank_max_memory_fraction()
             logger.warning(
                 "Skipping single-ANE procedure bank compile attempt %d/4: "
                 "phys footprint %.2f GiB / %.2f GiB total already past the "
@@ -2327,7 +2459,7 @@ def _compile_single_banks(
                 attempt + 1,
                 current / (1 << 30),
                 total / (1 << 30),
-                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+                max_memory_fraction * 100,
             )
             return None
         spans = (
@@ -2557,7 +2689,7 @@ def _enable_dual_procedure_banks(
                 prepared_mlps.append((module, state))
 
         if gdn and gdn_max_layers:
-            for module in model.modules() if hasattr(model, "modules") else ():
+            for module in _candidate_gdns(model):
                 if len(prepared_gdns) >= gdn_max_layers:
                     break
                 if not _eligible_gdn(module):
@@ -3060,7 +3192,7 @@ def _enable_fused_gdn_banks(
     )
     prepared: list[tuple[Any, _CombinedGDNState, mx.array, mx.array]] = []
     with _COMPILE_LOCK:
-        for module in model.modules() if hasattr(model, "modules") else ():
+        for module in _candidate_gdns(model):
             if len(prepared) >= max_layers:
                 break
             if not _eligible_gdn(module):
@@ -3200,6 +3332,7 @@ def enable_qwen35_ane_prefill(
         tail_padding_min_tokens=tail_padding_min_tokens,
     )
     model._omlx_ane_tail_padding_min_tokens = tail_padding_min_tokens
+    model._omlx_ane_architecture = _model_architecture(model)
     if ane_down_fraction > 0 and not dual_ane:
         logger.warning(
             "Experimental ANE down projection currently requires dual ANE; "
@@ -3207,12 +3340,7 @@ def enable_qwen35_ane_prefill(
         )
     candidates = []
     scanned_mlp = 0
-    modules = model.modules() if hasattr(model, "modules") else ()
-    for module in modules:
-        if not all(
-            hasattr(module, name) for name in ("gate_proj", "up_proj", "down_proj")
-        ):
-            continue
+    for module in _candidate_mlps(model):
         scanned_mlp += 1
         if not _eligible_pair(module):
             continue
@@ -3418,7 +3546,7 @@ def enable_qwen35_ane_prefill(
             cpu_shared_resource=config.cpu_shared_resource,
             tail_padding_min_tokens=config.tail_padding_min_tokens,
         )
-        for module in model.modules() if hasattr(model, "modules") else ():
+        for module in _candidate_gdns(model):
             if gdn_count >= gdn_max_layers:
                 break
             requested_programs = 2 if dual_ane else 1

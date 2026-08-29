@@ -130,6 +130,40 @@ class _Model(nn.Module):
         self.layers = [_MLP() for _ in range(count)]
 
 
+def test_qwen4_candidate_walk_uses_shared_experts_and_excludes_mtp_head():
+    shared = _MLP()
+    gdn = SimpleNamespace(in_proj_qkv=object())
+    mtp_shared = _MLP()
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen4_exp"),
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        mlp=SimpleNamespace(shared_expert=shared),
+                        linear_attn=gdn,
+                    )
+                ]
+            )
+        ),
+        mtp=SimpleNamespace(
+            layers=[SimpleNamespace(mlp=SimpleNamespace(shared_expert=mtp_shared))]
+        ),
+    )
+
+    assert ane_patch._candidate_mlps(model) == [shared]
+    assert ane_patch._candidate_gdns(model) == [gdn]
+    assert all(module is not mtp_shared for module in ane_patch._candidate_mlps(model))
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_5", "qwen3-6-moe", "qwen3_8", "qwen4_exp", "qwen4_exp_text"],
+)
+def test_qwen_ane_model_type_support_includes_qwen4(model_type):
+    assert ane_patch.qwen_ane_model_type_supported(model_type)
+
+
 class _GDN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -862,6 +896,9 @@ def test_ane_bank_memory_headroom_ok_math(monkeypatch):
     total system memory (the same ledger jetsam uses), not oMLX's own
     configured ceiling, since it has to work even before any ceiling has
     propagated."""
+    monkeypatch.delenv(
+        "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION", raising=False
+    )
     import omlx.utils.hardware as hardware
     import omlx.utils.proc_memory as proc_memory
 
@@ -877,6 +914,32 @@ def test_ane_bank_memory_headroom_ok_math(monkeypatch):
     # total==0 (measurement unavailable): default to allowing the attempt.
     monkeypatch.setattr(hardware, "get_total_memory_bytes", lambda: 0)
     assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_headroom_explicit_ple_override(monkeypatch):
+    monkeypatch.setattr(
+        ane_patch,
+        "_ane_bank_memory_footprint_snapshot",
+        lambda: (75, 100),
+    )
+    monkeypatch.setenv(
+        "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION", "0.80"
+    )
+
+    assert ane_patch._ane_bank_memory_headroom_ok() is True
+
+
+def test_ane_bank_memory_headroom_rejects_unsafe_override(monkeypatch):
+    monkeypatch.setattr(
+        ane_patch,
+        "_ane_bank_memory_footprint_snapshot",
+        lambda: (75, 100),
+    )
+    monkeypatch.setenv(
+        "OMLX_QWEN35_ANE_BANK_MAX_MEMORY_FRACTION", "0.95"
+    )
+
+    assert ane_patch._ane_bank_memory_headroom_ok() is False
 
 
 def test_ane_bank_memory_headroom_ok_defaults_true_on_error(monkeypatch):

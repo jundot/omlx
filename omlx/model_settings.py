@@ -110,8 +110,9 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
-            ANE/GPU prompt processing.
+        qwen35_ane_prefill_enabled: Enable private fixed-shape
+            Qwen3.5/3.6/3.8/Qwen4 ANE/CPU/GPU prompt processing. The legacy
+            setting name is retained for profile compatibility.
         qwen35_ane_prefill_sequence_length: Exact flattened token count routed
             through the eagerly compiled ANE programs.
         qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
@@ -234,7 +235,7 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
-    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Experimental private-API ANE/CPU/GPU prefill for Qwen3.5+ and Qwen4.
     # Off by default because the fixed-shape ANE models add load-time/runtime
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False

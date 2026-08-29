@@ -191,7 +191,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     }
 
     assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
-    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
+    assert "'qwen3_5', 'qwen3_6', 'qwen3_8', 'qwen4_exp'" in script
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
@@ -208,7 +208,7 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     html = _model_settings_template()
     section = _section(
         html,
-        "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
+        "<!-- Qwen 3.5+/Qwen4 private ANE/CPU/GPU prompt processing -->",
         "<!-- TurboQuant KV Cache -->",
     )
 

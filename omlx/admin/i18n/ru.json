@@ -627,7 +627,7 @@
   "modal.model_settings.turboquant_kv_hint": "Сжимайте KV-кэш с помощью векторного квантования. Меньшее число бит = сильнее сжатие, большее = лучше качество. Поддерживает от 2 до 8 бит.",
   "modal.model_settings.turboquant_kv_bits_label": "Битов на канал",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
-  "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
+  "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5+/Qwen4 prompt-processing work across ANE, CPU, and GPU. Qwen4 uses fixed shared-expert and GDN projections; routed experts stay on GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
   "modal.model_settings.qwen_ane_tail_padding": "Pad tails from",
   "modal.model_settings.qwen_ane_mlp_fraction": "MLP on ANE",

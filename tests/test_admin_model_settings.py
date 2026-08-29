@@ -334,3 +334,18 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_accepts_qwen4_exp():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert settings.qwen35_ane_prefill_enabled is True

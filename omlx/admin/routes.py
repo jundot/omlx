@@ -135,7 +135,7 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
+    # Private Qwen3.5+/Qwen4 ANE/CPU/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
     qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
@@ -2376,19 +2376,22 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
+    # Private Qwen3.5+ ANE/CPU/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.
     if "qwen35_ane_prefill_enabled" in sent:
         enabled = bool(request.qwen35_ane_prefill_enabled)
         config_type = str(getattr(entry, "config_model_type", "") or "")
         config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
+        from ..patches.qwen35_ane_prefill import qwen_ane_model_type_supported
+
+        if enabled and not qwen_ane_model_type_supported(config_type):
             raise HTTPException(
                 status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
+                detail=(
+                    "ANE prefill is available only for validated "
+                    "Qwen3.5/3.6/3.8/Qwen4 models."
+                ),
             )
         current_settings.qwen35_ane_prefill_enabled = enabled
     if "qwen35_ane_prefill_sequence_length" in sent:

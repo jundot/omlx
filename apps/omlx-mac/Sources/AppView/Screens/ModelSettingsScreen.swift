@@ -1160,7 +1160,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "Qwen ANE Prefill",
                                   comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
                     sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8/Qwen4 prompt processing across ANE, CPU, and GPU. Qwen4 accelerates fixed shared-expert and GDN projections; routed experts remain on GPU. Experimental private API; takes effect after the model reloads.",
                                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
                     Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
                         .labelsHidden().toggleStyle(.switch)

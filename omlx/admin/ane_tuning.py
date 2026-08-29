@@ -538,6 +538,20 @@ def _ane_is_active(engine: Any) -> bool:
     )
 
 
+def _force_lm_for_tuning(engine_pool: Any, model_id: str) -> bool:
+    """Keep Qwen4 on its VLM-only architecture instead of probing mlx-lm.
+
+    Qwen4-Exp owns PLE, QSA, hyper-connections, and its embedded MTP head in
+    the vendored mlx-vlm implementation. Asking the pool for ``force_lm``
+    first causes a doomed text-engine load before every fallback/reload and can
+    discard the architecture whose shared expert is being calibrated.
+    """
+    entry = getattr(engine_pool, "_entries", {}).get(model_id)
+    model_type = str(getattr(entry, "config_model_type", "") or "")
+    normalized = model_type.strip().lower().replace("-", "_")
+    return not normalized.startswith("qwen4_exp")
+
+
 async def _measure_candidate(
     run: ANETuningRun,
     engine_pool: Any,
@@ -547,7 +561,7 @@ async def _measure_candidate(
     settings = _settings_for_candidate(base_settings, run.request, candidate)
     engine = await engine_pool.get_engine(
         run.request.model_id,
-        force_lm=True,
+        force_lm=_force_lm_for_tuning(engine_pool, run.request.model_id),
         runtime_settings=settings,
     )
     if candidate.enabled and not _ane_is_active(engine):
@@ -1635,12 +1649,17 @@ def _calibrate_components_sync(
     dual_ane = bool(getattr(base_settings, "qwen35_ane_prefill_dual_ane", True))
 
     model = _loaded_model(engine)
-    modules = list(model.modules()) if hasattr(model, "modules") else []
-    mlp = next((module for module in modules if patch._eligible_pair(module)), None)
+    mlp = next(
+        (module for module in patch._candidate_mlps(model) if patch._eligible_pair(module)),
+        None,
+    )
     if mlp is None:
         raise RuntimeError("No eligible Qwen MLP layer is available for calibration")
     gdn = (
-        next((module for module in modules if patch._eligible_gdn(module)), None)
+        next(
+            (module for module in patch._candidate_gdns(model) if patch._eligible_gdn(module)),
+            None,
+        )
         if run.request.allow_ane_gdn
         else None
     )
@@ -2068,7 +2087,7 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         gpu_settings = _settings_for_candidate(base_settings, run.request, baseline)
         engine = await engine_pool.get_engine(
             run.request.model_id,
-            force_lm=True,
+            force_lm=_force_lm_for_tuning(engine_pool, run.request.model_id),
             runtime_settings=gpu_settings,
         )
         active_slot = _GATE_SLOT

@@ -42,6 +42,18 @@ def test_cpu_worker_search_space_is_independent_of_saved_settings():
     assert ane_tuning._FINALIST_SAMPLES == 9
 
 
+def test_qwen4_tuner_preserves_vlm_architecture():
+    qwen4_pool = SimpleNamespace(
+        _entries={"qwen4": SimpleNamespace(config_model_type="qwen4_exp")}
+    )
+    qwen35_pool = SimpleNamespace(
+        _entries={"qwen35": SimpleNamespace(config_model_type="qwen3_5")}
+    )
+
+    assert ane_tuning._force_lm_for_tuning(qwen4_pool, "qwen4") is False
+    assert ane_tuning._force_lm_for_tuning(qwen35_pool, "qwen35") is True
+
+
 def test_candidate_settings_are_transient_copy():
     base = ModelSettings(qwen35_ane_prefill_tail_padding_min_tokens=1500)
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)

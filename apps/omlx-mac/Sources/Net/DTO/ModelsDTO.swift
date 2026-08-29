@@ -108,7 +108,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
-    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    // Experimental: private Qwen3.5+/Qwen4 ANE/CPU/GPU prefill
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
     let qwen35AnePrefillTailPaddingMinTokens: Int?
@@ -191,7 +191,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
     var turboquantKvBits: Double? = nil
-    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    // Experimental: private Qwen3.5+/Qwen4 ANE/CPU/GPU prefill
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
     var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
