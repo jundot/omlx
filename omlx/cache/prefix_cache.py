@@ -39,10 +39,15 @@ from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
 # Non-sliceable CacheList member classes safe for per-member block storage.
-# PoolingCache (delta chains) and rotating families keep the legacy
-# cumulative path; ArraysCache state is small, positionless, and
-# self-contained at every boundary.
-_PM_SAFE_NON_SLICEABLE_SUBS = frozenset({"ArraysCache", "SizedArraysCache"})
+# ArraysCache state is small, positionless, and self-contained at every
+# boundary. PoolingCache is also safe: its ``pooled`` tensor is append-only
+# and the boundary snapshot carries the cumulative pool at that boundary,
+# while the small 3D remainder buffer is restored from the snapshot (GLM-5.x
+# CacheList(KVCache, PoolingCache); DeepSeek-V4's rotating member keeps that
+# layer on the legacy cumulative path). Rotating families stay legacy.
+_PM_SAFE_NON_SLICEABLE_SUBS = frozenset(
+    {"ArraysCache", "SizedArraysCache", "PoolingCache"}
+)
 
 
 def cachelist_pm_member_plan(
@@ -1880,6 +1885,8 @@ class BlockAwarePrefixCache(CacheManager):
         source_layer: dict[str, Any],
         source_state: Any,
         sub_class_names: list[str],
+        live_state: Any = None,
+        slice_range: tuple[int, int] | None = None,
     ) -> list[Any] | None:
         """Build ``__cache_list__`` sub-tensors from an extracted layer dict.
 
@@ -1887,12 +1894,85 @@ class BlockAwarePrefixCache(CacheManager):
         ``pooled`` must survive the round-trip) and wraps PoolingCache subs
         that carry a delta range as ``PoolingCacheDelta`` storage entries.
         Returns None when the state is not a usable list.
+
+        ``live_state`` (optional) refills blanked (``()``) members — the
+        sliceable KV sub of a member-filtered snapshot — from the live
+        cache's corresponding member, sliced to ``slice_range`` so the
+        stored block carries real, restorable KV instead of an incomplete
+        CacheList. Used by the non-pm (legacy cumulative) CacheList store
+        path, where boundary snapshots blank the sliceable KV member to
+        avoid quadratic in-memory retention but the persisted block must
+        still restore it (maintainer review, GLM CacheList(KVCache,
+        PoolingCache)).
         """
         if not isinstance(source_state, list):
             return None
         pooling_delta_ranges = source_layer.get("pooling_delta_ranges", {})
+        live_members = live_state if isinstance(live_state, list) else None
         sub_tensors: list[Any] = []
         for sub_idx, sub_state in enumerate(source_state):
+            if isinstance(sub_state, (list, tuple)) and len(sub_state) == 0:
+                # Blanked sliceable member (member-filtered snapshot).
+                # Refill from the live cache's member, sliced to this block.
+                if (
+                    live_members is not None
+                    and sub_idx < len(live_members)
+                    and isinstance(live_members[sub_idx], (list, tuple))
+                    and len(live_members[sub_idx]) >= 1
+                ):
+                    live_sub = live_members[sub_idx]
+                    cloned = [
+                        self._clone_tensor(elem)
+                        if hasattr(elem, "shape")
+                        else elem
+                        for elem in live_sub
+                    ]
+                    if slice_range is not None and cloned:
+                        start_idx, end_idx = slice_range
+                        seq_len = (
+                            cloned[0].shape[2]
+                            if hasattr(cloned[0], "shape")
+                            and len(cloned[0].shape) >= 3
+                            else -1
+                        )
+                        if seq_len > 0:
+                            actual_end = min(end_idx, seq_len)
+                            start_idx = min(start_idx, actual_end)
+                            sliced = []
+                            for elem in cloned:
+                                if (
+                                    hasattr(elem, "shape")
+                                    and len(elem.shape) == 4
+                                    and elem.shape[2] == seq_len
+                                ):
+                                    sliced.append(
+                                        self._clone_tensor(
+                                            elem[:, :, start_idx:actual_end, :]
+                                        )
+                                    )
+                                elif (
+                                    hasattr(elem, "shape")
+                                    and len(elem.shape) == 3
+                                    and elem.shape[1] == seq_len
+                                ):
+                                    sliced.append(
+                                        self._clone_tensor(
+                                            elem[:, start_idx:actual_end, :]
+                                        )
+                                    )
+                                else:
+                                    sliced.append(elem)
+                            cloned = sliced
+                    sub_tensors.append(
+                        _wrap_cachelist_sub_marker(
+                            sub_idx, cloned, sub_class_names
+                        )
+                    )
+                else:
+                    # No live member to refill from: skip (restore will
+                    # reject incomplete CacheList blocks rather than corrupt).
+                    continue
+                continue
             if not (isinstance(sub_state, (list, tuple)) and len(sub_state) >= 1):
                 continue
             cloned = [
@@ -2476,7 +2556,11 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             source_state = source_layer["state"]
                             sub_tensors = self._cachelist_snapshot_sub_tensors(
-                                source_layer, source_state, sub_class_names
+                                source_layer,
+                                source_state,
+                                sub_class_names,
+                                live_state=layer_state.get("state"),
+                                slice_range=(start_idx, end_idx),
                             )
                             if sub_tensors is not None:
                                 block_slices.append(("__cache_list__", sub_tensors))

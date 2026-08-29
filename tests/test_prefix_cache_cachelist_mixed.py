@@ -27,6 +27,7 @@ hot-cache-only PagedSSDCacheManager.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -417,6 +418,120 @@ def test_boundary_store_mixed_cachelist_roundtrip(tmp_path):
     assert info["has_state"] == "false"
 
     store.shutdown()
+
+
+def test_glm_pooling_cachelist_blanks_kv_member():
+    """GLM-5.x CacheList(KVCache, PoolingCache) boundary snapshot must blank
+    the sliceable KVCache member.
+
+    GLM is per-member-block eligible: PoolingCache is in
+    _PM_SAFE_NON_SLICEABLE_SUBS, so cachelist_pm_member_plan returns
+    ["slice", "boundary"] and the snapshot blanks the sliceable KVCache
+    member while keeping the PoolingCache member authoritative. Before the
+    fix, an unblanked KV member made in-memory snapshot retention quadratic
+    (~113GB RAM and a guard abort at ~30K tokens). The refill path (via
+    _refill_blanked_cachelist_members) restores the KV from the live cache.
+    """
+    from mlx_vlm.models.cache import PoolingCache
+
+    from omlx.scheduler import Scheduler
+
+    kv = KVCache()
+    keys, values = _position_kv(BLOCK_SIZE)
+    kv.update_and_fetch(keys, values)
+    pooled = PoolingCache(ratio=4)
+    cache_list = CacheList(kv, pooled)
+    mx.eval([keys, values])
+
+    stub = SimpleNamespace(_stream=mx.default_stream(mx.default_device()))
+    stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
+        stub, caches
+    )
+    extracted, _ = Scheduler._extract_snapshot_cache_states(stub, [cache_list])
+
+    assert extracted and len(extracted) == 1
+    state = extracted[0]["state"]
+    # KVCache member blanked, PoolingCache member kept.
+    assert state[0] == (), "GLM sliceable KVCache member must be blanked"
+    assert isinstance(state[1], (list, tuple)) and len(state[1]) > 0
+
+    # Refill from a live cache restores the KV member.
+    live_kv = KVCache()
+    live_kv.update_and_fetch(keys, values)
+    live_list = CacheList(live_kv, PoolingCache(ratio=4))
+    mx.eval([keys, values])
+    live_extracted, _ = Scheduler._extract_cache_states(stub, [live_list])
+
+    refilled = Scheduler._refill_blanked_cachelist_members(
+        extracted, live_extracted
+    )
+    assert refilled is not None
+    assert isinstance(refilled[0]["state"][0], (list, tuple))
+    assert len(refilled[0]["state"][0]) >= 2  # keys, values restored
+
+
+def test_glm_pooling_cachelist_blanked_kv_roundtrips(tmp_path):
+    """A GLM-5.x CacheList(KVCache, PoolingCache) whose boundary snapshots
+    blank the sliceable KV member must store and restore a complete
+    CacheList via the per-member path: the store slices the live KV per
+    block and the restore concatenates the slices back into the full
+    sequence, so prefix-cache reuse survives with correct KV positions
+    (maintainer review #3290)."""
+    from mlx_vlm.models.cache import PoolingCache
+
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+
+    apply_pooling_cache_support()
+    cache, _ = _make_cache(tmp_path)
+
+    def build(seq_len, blank_kv=False):
+        kv = KVCache()
+        keys, values = _position_kv(seq_len)
+        kv.update_and_fetch(keys, values)
+        pool = PoolingCache(ratio=4)
+        # pooled rows carry distinguishable data
+        pool.update_and_fetch(
+            mx.full((1, seq_len // 4, 8), 0.0, dtype=mx.float32)
+        )
+        cl = CacheList(kv, pool)
+        mx.eval([keys, values])
+        d = _layer_dict(cl)
+        if blank_kv:
+            d["state"][0] = ()
+        return d
+
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    full = build(len(tokens))
+    boundaries = {
+        BLOCK_SIZE * (i + 1): [build(BLOCK_SIZE * (i + 1), blank_kv=True)]
+        for i in range(num_blocks)
+    }
+    table = cache.store_cache("req-glm-refill", tokens, [full],
+                              boundary_snapshots=boundaries)
+    assert table is not None
+
+    result = cache.reconstruct_cache(table)
+    assert result is not None and len(result) == 1
+    restored = result[0]
+    assert type(restored).__name__ == "CacheList"
+    # KV member restored by concatenating the per-block slices: the FULL
+    # sequence (not last-block-only), position-encoded so content verifies.
+    kv = restored.caches[0]
+    assert kv.keys.shape[2] == num_blocks * BLOCK_SIZE
+    expected = mx.broadcast_to(
+        mx.arange(num_blocks * BLOCK_SIZE, dtype=mx.float32).reshape(
+            1, 1, num_blocks * BLOCK_SIZE, 1
+        ),
+        kv.keys.shape,
+    )
+    assert mx.max(mx.abs(kv.keys - expected)).item() == 0.0
+    # PoolingCache member restored: pooled is cumulative across the chain
+    # (append-only pooled rows) — the last matched block's boundary state.
+    pool = restored.caches[1]
+    assert type(pool).__name__ == "PoolingCache"
+    assert pool.pooled is not None
+    assert pool.pooled.shape[1] == (num_blocks * BLOCK_SIZE) // 4
 
 
 def test_arrays_cache_extract_none_guard():

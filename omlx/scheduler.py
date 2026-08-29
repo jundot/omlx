@@ -6442,11 +6442,30 @@ class Scheduler:
             ):
                 continue
             plan = cachelist_pm_member_plan([str(n) for n in meta[0]], state)
-            if plan is None:
+            if plan is not None:
+                layer["state"] = [
+                    () if mode == "slice" else sub_state
+                    for mode, sub_state in zip(plan, state)
+                ]
+                continue
+
+            # Not per-member-block eligible (e.g. DeepSeek-V4's
+            # CacheList(RotatingKVCache, PoolingCache) — the rotating member
+            # is not sliceable and keeps the legacy cumulative path). Blank
+            # any known-sliceable member so the boundary snapshot does not
+            # retain the full KV prefix — quadratic across a request (the
+            # #2551 class of bug, resurfacing as GLM prefill RAM creeping to
+            # ~113GB and a guard abort at ~30K tokens before GLM became
+            # pm-eligible). _merge_boundary_with_full_cache /
+            # _fill_boundary_placeholders_from_live_cache refill those
+            # members from the live cache at store time. Non-sliceable
+            # members (PoolingCache/ArraysCache/rotating) stay authoritative.
+            names = [str(n) for n in meta[0]]
+            if not any(n in _KNOWN_SLICEABLE_CACHE_TYPES for n in names):
                 continue
             layer["state"] = [
-                () if mode == "slice" else sub_state
-                for mode, sub_state in zip(plan, state)
+                () if n in _KNOWN_SLICEABLE_CACHE_TYPES else sub_state
+                for n, sub_state in zip(names, state)
             ]
         return extracted, tokens
 
