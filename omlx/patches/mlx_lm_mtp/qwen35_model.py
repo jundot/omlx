@@ -238,6 +238,23 @@ def _patch_gated_delta_net(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    # dflash coexistence (issue #2972): if the dflash batch-cache guard owns
+    # ``cls.__call__``, do not clobber it — that silently strips the resident
+    # DFlash engine's speculative hook and its generations degenerate into
+    # repetition loops. Instead install our body as the guard's fallback
+    # base: dflash traffic keeps its hook, MTP/batched traffic gets ours.
+    try:
+        from ..dflash_lifecycle import (
+            dflash_owns_call,
+            get_backup_base,
+            swap_backup_base,
+        )
+    except ImportError:
+        dflash_owns_call = None  # type: ignore[assignment]
+    if dflash_owns_call is not None and dflash_owns_call(cls):
+        if getattr(get_backup_base(cls), "_omlx_mtp_call_marker", False):
+            return  # our body already sits under the dflash guard
+
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
@@ -356,7 +373,13 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
     cls._process_chunk = _process_chunk
     __call__._omlx_mtp_call_marker = True
-    cls.__call__ = __call__
+    if dflash_owns_call is not None and dflash_owns_call(cls):
+        # Compose with the armed dflash guard instead of replacing it
+        # (issue #2972): our body becomes the guard's fallback base.
+        if not swap_backup_base(cls, __call__):
+            cls.__call__ = __call__
+    else:
+        cls.__call__ = __call__
 
 
 # ---------------------------------------------------------------------------
