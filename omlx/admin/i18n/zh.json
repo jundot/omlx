@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "为常用的非固定专家提供额外内存。",
   "modal.model_settings.expert_scratch": "冷专家执行区",
   "modal.model_settings.expert_scratch_hint": "额外预分配的槽位，可批量执行冷专家而不逐出热门缓存。",
+  "modal.model_settings.expert_fast_resource_loading": "快速资源加载",
+  "modal.model_settings.expert_fast_resource_loading_hint": "使用 Apple Metal I/O 加载一次性冷专家批次。在不改变热门缓存晋升的情况下加速预填充。",
   "modal.model_settings.expert_substitution_threshold": "常驻专家替换阈值（%）",
   "modal.model_settings.expert_substitution_threshold_hint": "当路由权重差在此百分比内时，允许常驻专家替换冷专家。0 保持精确路由。",
   "modal.model_settings.expert_execution_policy": "执行模式",

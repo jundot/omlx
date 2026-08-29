@@ -312,6 +312,39 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
         runtime.close()
 
 
+def test_fast_resource_loading_writes_exact_preallocated_bank_rows(tmp_path):
+    from omlx.custom_kernels.fast_resource_loading import available
+
+    if not available():
+        pytest.skip("Fast Resource Loading native extension is not built")
+    full = _checkpoint(tmp_path)
+    model = _streamable_test_model()
+    runtime = install_expert_streaming(
+        model,
+        tmp_path,
+        None,
+        cache_experts=2,
+        scratch_experts=2,
+        streaming_mode="cache_only",
+        fast_resource_loading=True,
+    )
+    try:
+        indices = mx.array([[[4, 5]]], dtype=mx.int32)
+        x = mx.random.normal((1, 1, 64)).astype(mx.float16)
+        output = runtime.pools[0](x, indices)
+        expected = _reference(full, x, indices)
+        mx.eval(output, expected)
+        assert bool(mx.all(output == expected).item())
+        stats = runtime.stats()
+        assert stats["fast_resource_loading"] is True
+        assert stats["frl_loads"] >= 2
+        assert stats["frl_bytes_read"] > 0
+        assert stats["frl_read_operations"] > 0
+        assert stats["frl_copy_seconds"] >= 0
+    finally:
+        runtime.close()
+
+
 def test_learned_hotlist_warm_starts_evictable_cache(tmp_path):
     model_path = tmp_path / "model"
     profile_dir = tmp_path / "profiles"
@@ -423,10 +456,24 @@ def test_invalid_hotlist_profile_is_ignored(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("fragmented", "fused_gate_up"),
-    [(False, False), (True, False), (False, True)],
+    ("fragmented", "fused_gate_up", "fast_resource_loading"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+    ],
 )
-def test_cross_family_ffn_mxfp4_streaming_is_exact(tmp_path, fragmented, fused_gate_up):
+def test_cross_family_ffn_mxfp4_streaming_is_exact(
+    tmp_path, fragmented, fused_gate_up, fast_resource_loading
+):
+    if fast_resource_loading:
+        from omlx.custom_kernels.fast_resource_loading import available
+
+        if not available():
+            pytest.skip("Fast Resource Loading native extension is not built")
     projections, modules = _family_checkpoint(
         tmp_path,
         container="ffn",
@@ -455,6 +502,7 @@ def test_cross_family_ffn_mxfp4_streaming_is_exact(tmp_path, fragmented, fused_g
         None,
         cache_experts=2,
         streaming_mode="cache_only",
+        fast_resource_loading=fast_resource_loading,
     )
     try:
         assert [pool.layer for pool in runtime.pools] == [1]

@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "Дополнительная память для часто используемых незакреплённых экспертов.",
   "modal.model_settings.expert_scratch": "Банк холодного выполнения",
   "modal.model_settings.expert_scratch_hint": "Дополнительные заранее выделенные слоты для пакетной обработки холодных экспертов без вытеснения горячего кэша.",
+  "modal.model_settings.expert_fast_resource_loading": "Быстрая загрузка ресурсов",
+  "modal.model_settings.expert_fast_resource_loading_hint": "Использует Apple Metal I/O для одноразовых пакетов холодных экспертов. Ускоряет префилл, не меняя продвижение в горячий кэш.",
   "modal.model_settings.expert_substitution_threshold": "Порог замены резидентным экспертом (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Разрешает замену холодного эксперта резидентным, если вес маршрутизации отличается не более чем на этот процент. 0 сохраняет точную маршрутизацию.",
   "modal.model_settings.expert_execution_policy": "Режим выполнения",

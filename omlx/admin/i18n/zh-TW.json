@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "提供給常用非固定專家的額外記憶體。",
   "modal.model_settings.expert_scratch": "冷專家執行區",
   "modal.model_settings.expert_scratch_hint": "額外預先配置的插槽，可批次執行冷專家而不逐出熱門快取。",
+  "modal.model_settings.expert_fast_resource_loading": "快速資源載入",
+  "modal.model_settings.expert_fast_resource_loading_hint": "使用 Apple Metal I/O 載入一次性冷專家批次。在不改變熱門快取晉升的情況下加速預填充。",
   "modal.model_settings.expert_substitution_threshold": "常駐專家替換閾值（%）",
   "modal.model_settings.expert_substitution_threshold_hint": "當路由權重差在此百分比內時，允許常駐專家替換冷專家。0 會保留精確路由。",
   "modal.model_settings.expert_execution_policy": "執行模式",

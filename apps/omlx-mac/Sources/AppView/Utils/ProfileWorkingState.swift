@@ -145,6 +145,7 @@ enum ProfileSettingsKey {
     static let expertStreamingManifest = "expert_streaming_manifest"
     static let expertStreamingCacheExperts = "expert_streaming_cache_experts"
     static let expertStreamingScratchExperts = "expert_streaming_scratch_experts"
+    static let expertStreamingFastResourceLoading = "expert_streaming_fast_resource_loading"
     static let expertStreamingSubstitutionThresholdPercent = "expert_streaming_substitution_threshold_percent"
     static let expertStreamingExecutionPolicy = "expert_streaming_execution_policy"
     static let turboquantKvEnabled = "turboquant_kv_enabled"

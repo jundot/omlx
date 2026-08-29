@@ -7391,6 +7391,8 @@
                         s.expert_streaming_cache_experts ?? 32,
                     expert_streaming_scratch_experts:
                         s.expert_streaming_scratch_experts ?? 32,
+                    expert_streaming_fast_resource_loading:
+                        s.expert_streaming_fast_resource_loading === true,
                     expert_streaming_substitution_threshold_percent:
                         s.expert_streaming_substitution_threshold_percent ?? 0,
                     expert_streaming_execution_policy:
@@ -8353,6 +8355,9 @@
                                     Number(this.modelSettings.expert_streaming_cache_experts) || 0,
                                 expert_streaming_scratch_experts:
                                     Number(this.modelSettings.expert_streaming_scratch_experts) || 0,
+                                expert_streaming_fast_resource_loading:
+                                    !!this.modelSettings.expert_streaming_enabled
+                                    && !!this.modelSettings.expert_streaming_fast_resource_loading,
                                 expert_streaming_substitution_threshold_percent:
                                     Number(this.modelSettings.expert_streaming_substitution_threshold_percent) || 0,
                                 expert_streaming_execution_policy:

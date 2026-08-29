@@ -36,6 +36,8 @@ class ExpertStreamingRuntime:
     substitution_threshold_percent: float
     streaming_mode: str
     execution_policy: str
+    fast_resource_loading: bool
+    fast_resource_loading_scope: str
     reader: ExpertReader
     pools: list[StreamingSwitchGLU]
     hotlist_profile_path: Path | None = None
@@ -118,6 +120,8 @@ class ExpertStreamingRuntime:
             "streaming_mode": self.streaming_mode,
             "cache_policy": "route_frequency",
             "execution_policy": self.execution_policy,
+            "fast_resource_loading": self.fast_resource_loading,
+            "fast_resource_loading_scope": self.fast_resource_loading_scope,
             "execution": self.execution.stats.as_dict() if self.execution else {},
             "ssd_bytes_read": self.reader.bytes_read,
             "ssd_read_operations": self.reader.read_operations,
@@ -129,6 +133,11 @@ class ExpertStreamingRuntime:
             "ssd_decode_seconds": self.reader.decode_seconds,
             "ssd_readahead_descriptors": self.reader.readahead_descriptors,
             "ssd_no_cache_descriptors": self.reader.no_cache_descriptors,
+            "frl_loads": self.reader.fast_loads,
+            "frl_bytes_read": self.reader.fast_bytes_read,
+            "frl_read_operations": self.reader.fast_read_operations,
+            "frl_io_wait_seconds": self.reader.fast_io_wait_seconds,
+            "frl_copy_seconds": self.reader.fast_copy_seconds,
             "hotlist_profile": (
                 str(self.hotlist_profile_path) if self.hotlist_profile_path else None
             ),
@@ -251,6 +260,7 @@ def install_expert_streaming(
     execution_policy: str = "checked",
     streaming_mode: str = "soft_reap",
     hotlist_profile_dir: str | Path | None = None,
+    fast_resource_loading: bool | str = False,
 ) -> ExpertStreamingRuntime:
     """Replace main-layer SwitchGLUs before the lazy checkpoint is evaluated."""
 
@@ -316,7 +326,7 @@ def install_expert_streaming(
     cache_slots = max(0, int(cache_experts), minimum_cache_slots)
     cache_budget_bytes = cache_slots * expert_bytes_all_layers
     scratch_slots = max(0, int(scratch_experts))
-    reader = ExpertReader(index)
+    reader = ExpertReader(index, fast_resource_loading=fast_resource_loading)
     pools: list[StreamingSwitchGLU] = []
     try:
         for ordinal, target in enumerate(targets):
@@ -387,6 +397,8 @@ def install_expert_streaming(
         substitution_threshold_percent=float(substitution_threshold_percent),
         streaming_mode=streaming_mode,
         execution_policy=execution_policy,
+        fast_resource_loading=reader.fast_resource_loading,
+        fast_resource_loading_scope=reader.fast_resource_loading_scope,
         reader=reader,
         pools=pools,
         hotlist_profile_path=hotlist_profile_path,

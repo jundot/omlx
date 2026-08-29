@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "Extra memory for frequently used non-pinned experts. A small working set is always reserved.",
   "modal.model_settings.expert_scratch": "Cold execution bank",
   "modal.model_settings.expert_scratch_hint": "Extra preallocated slots that batch cold experts without evicting the hot cache.",
+  "modal.model_settings.expert_fast_resource_loading": "Fast Resource Loading",
+  "modal.model_settings.expert_fast_resource_loading_hint": "Use Apple Metal I/O for one-shot cold expert batches. Improves prefill without changing hot-cache promotions.",
   "modal.model_settings.expert_substitution_threshold": "Resident substitution threshold (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Allow a resident expert to replace a cold expert when its router weight is within this percentage. 0 keeps exact routing.",
   "modal.model_settings.expert_execution_policy": "Execution mode",

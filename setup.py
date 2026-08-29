@@ -51,6 +51,10 @@ def _custom_kernel_build_kwargs() -> dict:
     return {
         "ext_modules": [
             extension.CMakeExtension(
+                "omlx.custom_kernels.fast_resource_loading._ext",
+                sourcedir="omlx/custom_kernels/fast_resource_loading/csrc",
+            ),
+            extension.CMakeExtension(
                 "omlx.custom_kernels.bonsai._ext",
                 sourcedir="omlx/custom_kernels/bonsai/csrc",
             ),

@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "Mémoire supplémentaire pour les experts non épinglés fréquemment utilisés.",
   "modal.model_settings.expert_scratch": "Banque d’exécution froide",
   "modal.model_settings.expert_scratch_hint": "Emplacements préalloués supplémentaires pour regrouper les experts froids sans évincer le cache actif.",
+  "modal.model_settings.expert_fast_resource_loading": "Chargement rapide des ressources",
+  "modal.model_settings.expert_fast_resource_loading_hint": "Utilise les E/S Apple Metal pour les lots ponctuels d’experts froids. Accélère le préremplissage sans modifier les promotions du cache actif.",
   "modal.model_settings.expert_substitution_threshold": "Seuil de substitution résidente (%)",
   "modal.model_settings.expert_substitution_threshold_hint": "Autorise un expert résident à remplacer un expert froid si son poids de routage est dans ce pourcentage. 0 conserve le routage exact.",
   "modal.model_settings.expert_execution_policy": "Mode d’exécution",

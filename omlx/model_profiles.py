@@ -92,6 +92,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "expert_streaming_manifest",
     "expert_streaming_cache_experts",
     "expert_streaming_scratch_experts",
+    "expert_streaming_fast_resource_loading",
     "expert_streaming_substitution_threshold_percent",
     "expert_streaming_execution_policy",
 )

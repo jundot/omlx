@@ -1753,6 +1753,17 @@ class VLMBatchedEngine(BaseEngine):
                     ),
                     streaming_mode=streaming_mode,
                     hotlist_profile_dir=hotlist_profile_dir,
+                    fast_resource_loading=(
+                        "scratch"
+                        if bool(
+                            getattr(
+                                self._model_settings,
+                                "expert_streaming_fast_resource_loading",
+                                False,
+                            )
+                        )
+                        else False
+                    ),
                 ),
             )
 

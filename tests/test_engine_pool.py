@@ -1378,6 +1378,27 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+    def test_fast_resource_loading_changes_expert_streaming_runtime_signature(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        baseline = ModelSettings(
+            expert_streaming_enabled=True,
+            expert_streaming_mode="cache_only",
+            expert_streaming_fast_resource_loading=False,
+        )
+        accelerated = ModelSettings(
+            expert_streaming_enabled=True,
+            expert_streaming_mode="cache_only",
+            expert_streaming_fast_resource_loading=True,
+        )
+
+        assert pool._engine_runtime_signature(
+            "model-a", baseline
+        ) != pool._engine_runtime_signature("model-a", accelerated)
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines

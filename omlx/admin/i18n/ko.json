@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "자주 사용하는 비고정 전문가를 위한 추가 메모리입니다.",
   "modal.model_settings.expert_scratch": "콜드 실행 뱅크",
   "modal.model_settings.expert_scratch_hint": "핫 캐시를 축출하지 않고 콜드 전문가를 일괄 처리하는 추가 사전 할당 슬롯입니다.",
+  "modal.model_settings.expert_fast_resource_loading": "빠른 리소스 로딩",
+  "modal.model_settings.expert_fast_resource_loading_hint": "일회성 콜드 전문가 배치에 Apple Metal I/O를 사용합니다. 핫 캐시 승격을 변경하지 않고 프리필을 가속합니다.",
   "modal.model_settings.expert_substitution_threshold": "상주 전문가 대체 임계값(%)",
   "modal.model_settings.expert_substitution_threshold_hint": "라우터 가중치 차이가 이 비율 이내이면 콜드 전문가를 상주 전문가로 대체합니다. 0은 정확한 라우팅을 유지합니다.",
   "modal.model_settings.expert_execution_policy": "실행 모드",

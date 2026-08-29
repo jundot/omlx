@@ -269,6 +269,7 @@ final class ModelSettingsScreenVM {
     var expertStreamingManifest: String = ""
     var expertStreamingCacheExperts: String = "32"
     var expertStreamingScratchExperts: String = "32"
+    var expertStreamingFastResourceLoading: Bool = false
     var expertStreamingSubstitutionThresholdPercent: String = "0"
     var expertStreamingExecutionPolicy: String = "checked"
     var expertManifestUploadInProgress: Bool = false
@@ -558,6 +559,7 @@ final class ModelSettingsScreenVM {
                 self.expertStreamingManifest = s?.expertStreamingManifest ?? ""
                 self.expertStreamingCacheExperts = s?.expertStreamingCacheExperts.map(String.init) ?? "32"
                 self.expertStreamingScratchExperts = s?.expertStreamingScratchExperts.map(String.init) ?? "32"
+                self.expertStreamingFastResourceLoading = s?.expertStreamingFastResourceLoading ?? false
                 self.expertStreamingSubstitutionThresholdPercent = s?.expertStreamingSubstitutionThresholdPercent
                     .map { Self.formatPct($0) } ?? "0"
                 self.expertStreamingExecutionPolicy = s?.expertStreamingExecutionPolicy ?? "checked"
@@ -1249,6 +1251,10 @@ final class ModelSettingsScreenVM {
                 }
                 putInt(ProfileSettingsKey.expertStreamingCacheExperts, expertStreamingCacheExperts)
                 putInt(ProfileSettingsKey.expertStreamingScratchExperts, expertStreamingScratchExperts)
+                putBool(
+                    ProfileSettingsKey.expertStreamingFastResourceLoading,
+                    expertStreamingFastResourceLoading
+                )
                 putDouble(
                     ProfileSettingsKey.expertStreamingSubstitutionThresholdPercent,
                     expertStreamingSubstitutionThresholdPercent

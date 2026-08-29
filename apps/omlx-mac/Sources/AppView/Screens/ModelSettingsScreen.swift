@@ -1014,6 +1014,22 @@ private struct ExpertStreamingSection: View {
                 }
 
                 Row(
+                    label: String(localized: "settings.expert_streaming.fast_resource_loading.label",
+                                  defaultValue: "Fast Resource Loading",
+                                  comment: "Row label for Metal Fast Resource Loading in SSD expert streaming"),
+                    sublabel: String(localized: "settings.expert_streaming.fast_resource_loading.sub",
+                                     defaultValue: "Use Apple Metal I/O for one-shot cold expert batches. Improves prefill without changing hot-cache promotions.",
+                                     comment: "Sublabel describing scratch-only Fast Resource Loading for SSD experts")
+                ) {
+                    Toggle(
+                        "",
+                        isOn: vm.bindProfile($vm.expertStreamingFastResourceLoading)
+                    )
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+
+                Row(
                     label: String(localized: "settings.expert_streaming.threshold.label",
                                   defaultValue: "Substitution Threshold",
                                   comment: "Row label for SSD expert substitution threshold"),

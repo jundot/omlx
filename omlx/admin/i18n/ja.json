@@ -1143,6 +1143,8 @@
   "modal.model_settings.expert_cache_hint": "頻繁に使う非固定エキスパート用の追加メモリです。",
   "modal.model_settings.expert_scratch": "コールド実行バンク",
   "modal.model_settings.expert_scratch_hint": "ホットキャッシュを追い出さずにコールドエキスパートをまとめて処理する追加の事前割り当てスロットです。",
+  "modal.model_settings.expert_fast_resource_loading": "高速リソース読み込み",
+  "modal.model_settings.expert_fast_resource_loading_hint": "一度だけ使うコールドエキスパートのバッチをApple Metal I/Oで読み込みます。ホットキャッシュの昇格を変えずにプリフィルを高速化します。",
   "modal.model_settings.expert_substitution_threshold": "常駐置換しきい値（%）",
   "modal.model_settings.expert_substitution_threshold_hint": "ルーター重みの差がこの割合以内なら、コールドエキスパートを常駐エキスパートで置換します。0は正確なルーティングを維持します。",
   "modal.model_settings.expert_execution_policy": "実行モード",

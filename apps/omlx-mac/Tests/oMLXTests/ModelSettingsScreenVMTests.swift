@@ -267,6 +267,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.expertStreamingMode, "soft_reap")
         XCTAssertEqual(vm.expertStreamingCacheExperts, "32")
         XCTAssertEqual(vm.expertStreamingScratchExperts, "32")
+        XCTAssertFalse(vm.expertStreamingFastResourceLoading)
         XCTAssertEqual(vm.expertStreamingSubstitutionThresholdPercent, "0")
         XCTAssertEqual(vm.expertStreamingExecutionPolicy, "checked")
         XCTAssertEqual(
@@ -291,6 +292,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
               "expert_streaming_manifest": "/tmp/manifest.json",
               "expert_streaming_cache_experts": 48,
               "expert_streaming_scratch_experts": 24,
+              "expert_streaming_fast_resource_loading": true,
               "expert_streaming_substitution_threshold_percent": 2.5,
               "expert_streaming_execution_policy": "speculative"
             }
@@ -301,6 +303,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(dto.expertStreamingManifest, "/tmp/manifest.json")
         XCTAssertEqual(dto.expertStreamingCacheExperts, 48)
         XCTAssertEqual(dto.expertStreamingScratchExperts, 24)
+        XCTAssertEqual(dto.expertStreamingFastResourceLoading, true)
         XCTAssertEqual(dto.expertStreamingSubstitutionThresholdPercent, 2.5)
         XCTAssertEqual(dto.expertStreamingExecutionPolicy, "speculative")
 
@@ -309,6 +312,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         patch.expertStreamingMode = "cache_only"
         patch.expertStreamingCacheExperts = 64
         patch.expertStreamingScratchExperts = 16
+        patch.expertStreamingFastResourceLoading = true
         patch.expertStreamingSubstitutionThresholdPercent = 1.25
         patch.expertStreamingExecutionPolicy = "checked"
         let encoder = JSONEncoder()
@@ -318,6 +322,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["expert_streaming_mode"] as? String, "cache_only")
         XCTAssertEqual(object?["expert_streaming_cache_experts"] as? Int, 64)
         XCTAssertEqual(object?["expert_streaming_scratch_experts"] as? Int, 16)
+        XCTAssertEqual(object?["expert_streaming_fast_resource_loading"] as? Bool, true)
         XCTAssertEqual(object?["expert_streaming_substitution_threshold_percent"] as? Double, 1.25)
         XCTAssertEqual(object?["expert_streaming_execution_policy"] as? String, "checked")
     }
@@ -329,6 +334,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.expertStreamingManifest = "/manifests/qwen.json"
         vm.expertStreamingCacheExperts = "40"
         vm.expertStreamingScratchExperts = "20"
+        vm.expertStreamingFastResourceLoading = true
         vm.expertStreamingSubstitutionThresholdPercent = "3.5"
         vm.expertStreamingExecutionPolicy = "speculative"
 
@@ -339,6 +345,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["expert_streaming_manifest"]?.value as? String, "/manifests/qwen.json")
         XCTAssertEqual(settings["expert_streaming_cache_experts"]?.value as? Int, 40)
         XCTAssertEqual(settings["expert_streaming_scratch_experts"]?.value as? Int, 20)
+        XCTAssertEqual(settings["expert_streaming_fast_resource_loading"]?.value as? Bool, true)
         XCTAssertEqual(settings["expert_streaming_substitution_threshold_percent"]?.value as? Double, 3.5)
         XCTAssertEqual(settings["expert_streaming_execution_policy"]?.value as? String, "speculative")
     }

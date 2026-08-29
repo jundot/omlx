@@ -12,9 +12,13 @@ from collections.abc import Hashable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
+
+if TYPE_CHECKING:
+    from .fast_resource import FastExpertLoad, FastExpertLoader, FastExpertLoadFuture
 
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 PARTS = ("weight", "scales", "biases")
@@ -442,6 +446,7 @@ class ExpertReader:
         workers: int = 9,
         *,
         cold_max_gap_bytes: int = 64 * 1024,
+        fast_resource_loading: bool | str = False,
     ):
         self.index = index
         self.cold_max_gap_bytes = max(0, int(cold_max_gap_bytes))
@@ -463,6 +468,60 @@ class ExpertReader:
         self.readahead_descriptors = 0
         self.no_cache_descriptors = 0
         self._closed = False
+        self.fast_resource_loading = False
+        self.fast_resource_loading_scope = "off"
+        self._fast_loader: FastExpertLoader | None = None
+        self.fast_loads = 0
+        self.fast_bytes_read = 0
+        self.fast_read_operations = 0
+        self.fast_io_wait_seconds = 0.0
+        self.fast_copy_seconds = 0.0
+        scope = (
+            "all"
+            if fast_resource_loading is True
+            else str(fast_resource_loading).lower()
+        )
+        if scope not in {"off", "false", "scratch", "all"}:
+            raise ValueError("Fast Resource Loading scope must be off, scratch, or all")
+        if scope in {"scratch", "all"}:
+            from .fast_resource import FastExpertLoader
+
+            self._fast_loader = FastExpertLoader()
+            self.fast_resource_loading = True
+            self.fast_resource_loading_scope = scope
+
+    def begin_fast_many(
+        self,
+        locations: Mapping[Hashable, TensorLocation],
+        expert_ids: list[int] | tuple[int, ...],
+    ) -> FastExpertLoad:
+        if self._fast_loader is None:
+            raise RuntimeError("Fast Resource Loading is not enabled")
+        return self._fast_loader.begin(
+            locations,
+            expert_ids,
+            max_gap_bytes=self.cold_max_gap_bytes,
+        )
+
+    def finish_fast_many(
+        self,
+        load: FastExpertLoad,
+        slots: list[int],
+        targets: Mapping[Hashable, tuple[mx.array, int]],
+    ) -> dict[str, int | float]:
+        if self._fast_loader is None:
+            raise RuntimeError("Fast Resource Loading is not enabled")
+        stats = self._fast_loader.finish_into(load, slots, targets)
+        self.fast_loads += 1
+        self.fast_bytes_read += int(stats["bytes"])
+        self.fast_read_operations += int(stats["commands"])
+        self.fast_io_wait_seconds += float(stats["io_wait_seconds"])
+        self.fast_copy_seconds += float(stats["copy_seconds"])
+        self.bytes_read += int(stats["bytes"])
+        self.read_operations += int(stats["commands"])
+        self.file_cache_bytes_read += int(stats["bytes"])
+        self.file_cache_read_operations += int(stats["commands"])
+        return stats
 
     def _fd(self, path: Path, *, use_file_cache: bool) -> int:
         key = (path, use_file_cache)
@@ -661,8 +720,13 @@ class ExpertReader:
         *,
         max_gap_bytes: int | None = None,
         use_file_cache: bool = False,
-    ) -> Future[dict[Hashable, np.ndarray]]:
+    ) -> Future[dict[Hashable, np.ndarray]] | FastExpertLoadFuture:
         """Submit bounded CPU-only I/O and decoding for Metal overlap."""
+
+        if self.fast_resource_loading:
+            from .fast_resource import FastExpertLoadFuture
+
+            return FastExpertLoadFuture(self.begin_fast_many(locations, expert_ids))
 
         return self._request_pool.submit(
             self._read_many_numpy,

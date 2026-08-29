@@ -152,6 +152,22 @@ async def test_expert_streaming_scratch_experts_is_persisted():
 
 
 @pytest.mark.asyncio
+async def test_expert_streaming_fast_resource_loading_is_persisted():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_fast_resource_loading=True
+        ),
+    )
+
+    assert settings.expert_streaming_fast_resource_loading is True
+
+
+@pytest.mark.asyncio
 async def test_cache_only_streaming_does_not_require_manifest():
     pool, _ = _failed_pool()
     settings = ModelSettings()

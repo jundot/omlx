@@ -14,6 +14,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 
+from .fast_resource import FastExpertLoad
 from .safetensors import PROJECTIONS, ExpertReader, TensorLocation
 
 _MLX_DTYPES = {
@@ -310,7 +311,9 @@ class StreamingSwitchGLU(nn.Module):
         slots: list[int],
         *,
         load_kind: str = "cold",
-        preloaded_components: dict[tuple[str, str], mx.array] | None = None,
+        preloaded_components: dict[tuple[str, str], mx.array]
+        | FastExpertLoad
+        | None = None,
     ) -> None:
         if not experts:
             return
@@ -318,6 +321,49 @@ class StreamingSwitchGLU(nn.Module):
         # Pinned preload stays component-at-a-time to cap transient memory.
         # Dynamic misses are small and benefit from one flat I/O queue.
         components = preloaded_components
+        use_fast_resource_loading = (
+            self._reader.fast_resource_loading
+            and not preload
+            and (
+                load_kind == "scratch"
+                or self._reader.fast_resource_loading_scope == "all"
+            )
+        )
+        if use_fast_resource_loading:
+            fast_load = (
+                components
+                if isinstance(components, FastExpertLoad)
+                else self._reader.begin_fast_many(self.locations, experts)
+            )
+            targets: dict[tuple[str, str], tuple[mx.array, int]] = {}
+            for projection in PROJECTIONS:
+                for part in self.projection_metadata[projection]["parts"]:
+                    target_projection = (
+                        "gate_up_proj"
+                        if self._fused_gate_up
+                        and projection in {"gate_proj", "up_proj"}
+                        else projection
+                    )
+                    target = self._array(target_projection, part)
+                    inner_offset = 0
+                    if target_projection == "gate_up_proj" and projection == "up_proj":
+                        target_row_bytes = int(target.nbytes) // int(target.shape[0])
+                        inner_offset = target_row_bytes // 2
+                    targets[(projection, part)] = (target, inner_offset)
+            fast_stats = self._reader.finish_fast_many(fast_load, slots, targets)
+            if load_kind == "scratch":
+                self.stats.scratch_prefetch_wait_seconds += float(
+                    fast_stats["io_wait_seconds"]
+                )
+            self.stats.bank_bind_seconds += float(fast_stats["copy_seconds"])
+            self.stats.loads += len(experts)
+            if load_kind == "warm_start":
+                self.stats.warm_start_loads += len(experts)
+            else:
+                self.stats.cold_loads += len(experts)
+                if load_kind == "scratch":
+                    self.stats.scratch_loads += len(experts)
+            return
         if components is None and not preload:
             components = self._reader.read_many(
                 self.locations,
@@ -914,13 +960,16 @@ class StreamingSwitchGLU(nn.Module):
                 self.stats.scratch_prefetch_wait_seconds += (
                     time.perf_counter() - wait_started
                 )
-                materialize_started = time.perf_counter()
-                components = self._reader.materialize_many(
-                    self.locations, cpu_components
-                )
-                self.stats.scratch_mlx_materialize_seconds += (
-                    time.perf_counter() - materialize_started
-                )
+                if isinstance(cpu_components, FastExpertLoad):
+                    components = cpu_components
+                else:
+                    materialize_started = time.perf_counter()
+                    components = self._reader.materialize_many(
+                        self.locations, cpu_components
+                    )
+                    self.stats.scratch_mlx_materialize_seconds += (
+                        time.perf_counter() - materialize_started
+                    )
                 prefetched_index += 1
                 if prefetched_index < len(cold_groups):
                     prefetched = self._reader.read_many_async(

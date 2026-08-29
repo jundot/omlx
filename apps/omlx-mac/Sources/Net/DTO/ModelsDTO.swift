@@ -99,6 +99,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let expertStreamingManifest: String?
     let expertStreamingCacheExperts: Int?
     let expertStreamingScratchExperts: Int?
+    let expertStreamingFastResourceLoading: Bool?
     let expertStreamingSubstitutionThresholdPercent: Double?
     let expertStreamingExecutionPolicy: String?
     let thinkingBudgetEnabled: Bool?
@@ -194,6 +195,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var expertStreamingManifest: String? = nil
     var expertStreamingCacheExperts: Int? = nil
     var expertStreamingScratchExperts: Int? = nil
+    var expertStreamingFastResourceLoading: Bool? = nil
     var expertStreamingSubstitutionThresholdPercent: Double? = nil
     var expertStreamingExecutionPolicy: String? = nil
     var thinkingBudgetEnabled: Bool? = nil
