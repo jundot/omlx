@@ -243,6 +243,23 @@ class EngineEntry:
     load_failure_at: float | None = None
 
 
+def _realtime_stt_capable(entry: EngineEntry) -> bool:
+    """Whether an entry advertises realtime STT to status consumers (#3231).
+
+    Unloaded models get the static config classification. Once the engine is
+    loaded, the engine-level probe wins, so the flag never promises a
+    capability the realtime WS handshake would reject (e.g. a bundled
+    mlx-audio whose voxtral Model predates ``create_streaming_session``).
+    """
+    if not is_realtime_stt_model(entry.model_type, entry.config_model_type):
+        return False
+    engine = entry.engine
+    if engine is not None:
+        probe = getattr(engine, "supports_realtime_stt", None)
+        return bool(probe()) if callable(probe) else False
+    return True
+
+
 class EnginePool:
     """
     Manages multiple model engines with LRU-based memory management.
@@ -3076,9 +3093,7 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
-                    "realtime_stt": is_realtime_stt_model(
-                        e.model_type, e.config_model_type
-                    ),
+                    "realtime_stt": _realtime_stt_capable(e),
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,

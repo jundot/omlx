@@ -14,6 +14,7 @@ from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
     _qwen35_cpu_share_estimated_bytes,
+    _realtime_stt_capable,
 )
 from omlx.exceptions import (
     InsufficientMemoryError,
@@ -468,6 +469,72 @@ class TestEnginePoolStatus:
         pool.discover_models(str(small_mock_model_dir))
 
         assert pool.get_loaded_model_ids() == []
+
+
+class TestRealtimeSttFlag:
+    """Tests for the realtime_stt status flag (#3231).
+
+    The flag must never promise a capability the realtime WS handshake
+    would reject: static config classification for unloaded models, the
+    engine's honest ``supports_realtime_stt`` probe once loaded.
+    """
+
+    @staticmethod
+    def _stt_entry(config_model_type: str, engine=None) -> EngineEntry:
+        return EngineEntry(
+            model_id="stt-model",
+            model_path="/path/to/stt-model",
+            model_type="audio_stt",
+            engine_type="simple",
+            estimated_size=1000,
+            config_model_type=config_model_type,
+            engine=engine,
+        )
+
+    def test_unloaded_voxtral_realtime_classified_realtime(self):
+        """Unloaded models fall back to static config classification."""
+        assert _realtime_stt_capable(self._stt_entry("voxtral_realtime")) is True
+        assert _realtime_stt_capable(self._stt_entry("whisper")) is True
+
+    def test_unloaded_non_realtime_config(self):
+        assert _realtime_stt_capable(self._stt_entry("qwen3_asr")) is False
+
+    def test_loaded_engine_probe_wins(self):
+        """A loaded engine whose backend lacks the streaming API reports False
+        even though config_model_type is realtime-classified (#3231)."""
+
+        class _Engine:
+            def __init__(self, capable: bool):
+                self._capable = capable
+
+            def supports_realtime_stt(self) -> bool:
+                return self._capable
+
+        assert (
+            _realtime_stt_capable(
+                self._stt_entry("voxtral_realtime", _Engine(capable=False))
+            )
+            is False
+        )
+        assert (
+            _realtime_stt_capable(
+                self._stt_entry("voxtral_realtime", _Engine(capable=True))
+            )
+            is True
+        )
+
+    def test_loaded_engine_without_probe_is_not_realtime(self):
+        """Defensive: an engine type without the probe never advertises it."""
+
+        class _Engine:
+            pass
+
+        assert (
+            _realtime_stt_capable(
+                self._stt_entry("voxtral_realtime", _Engine())
+            )
+            is False
+        )
 
 
 class TestEngineEntry:
