@@ -285,6 +285,7 @@ class EnginePool:
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server
         self._get_admission_soft_target: object | None = None  # Set by server
+        self._get_residency_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
@@ -396,10 +397,28 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        ceiling = self._fallback_admission_ceiling()
+        # Residency is a throughput decision, so it uses the ceiling that does
+        # not move with instantaneous pressure. Asking the admission ceiling
+        # here read vm_stat right after the previous model unloaded, before the
+        # OS had returned its pages: the ceiling dipped, a table that fits got
+        # forced to SSD, and the swapped-in model ran at 14.1 instead of 35.3
+        # tok/s for the rest of its life in the process.
+        ceiling = self._residency_ceiling()
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
         if ceiling <= 0:
             ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB residency ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -463,6 +482,22 @@ class EnginePool:
         pools admit unconditionally).
         """
         cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _residency_ceiling(self) -> int:
+        """Stable ceiling for the resident-vs-mmap call (#PLE residency).
+
+        Wired to `enforcer.get_residency_ceiling`, which drops the vm_stat
+        component so a model swap does not push a table that fits onto SSD.
+        Returns 0 when no callback is wired up; callers fall back to the
+        admission ceiling.
+        """
+        cb = self._get_residency_ceiling
         if cb is None:
             return 0
         try:
