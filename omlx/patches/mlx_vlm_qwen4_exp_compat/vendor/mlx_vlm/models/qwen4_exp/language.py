@@ -972,11 +972,25 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
-        query_ends = past_len + mx.arange(seq_len) + 1
+        # past_len is an int for QSAKVCache but an mx.array of per-row offsets
+        # for BatchQSAKVCache (whose `offset` is a property over
+        # kv_cache.offset). Treating it as a scalar gave query_ends and
+        # complete_counts shape [batch] rather than [seq_len], so
+        # complete_counts[None, :, None] put the batch axis where seq_len
+        # belongs and mx.where broadcast scores from (batch, seq_len, blocks)
+        # to (batch, batch, blocks). Downstream that met padding built from
+        # the literal seq_len and raised:
+        #
+        #   [concatenate] ... shapes are (2,2,55996), (2,1,1) ... axis is -1
+        #
+        # Invisible at batch == 1, where the two axes coincide. Build a
+        # [batch, seq_len] grid instead and index it on [..., None].
+        past = mx.array(past_len).reshape(-1)
+        query_ends = past[:, None] + mx.arange(seq_len)[None, :] + 1
         complete_counts = query_ends // self.compress_ratio
         valid_blocks = (
             mx.arange(max_complete_blocks)[None, None, :]
-            < complete_counts[None, :, None]
+            < complete_counts[..., None]
         )
         scores = mx.where(valid_blocks, scores, -mx.inf)
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
@@ -1005,16 +1019,17 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 axis=-1,
             )
 
+        # complete_counts and query_ends are [batch, seq_len] now, so these
+        # index on [..., None] rather than [None, :, None] -- the same axis
+        # confusion as above, and equally invisible at batch == 1.
         token_indices = mx.arange(key_len)
         tail_starts = complete_counts * self.compress_ratio
-        tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
-            token_indices[None, None, :] < query_ends[None, :, None]
+        tail = (token_indices[None, None, :] >= tail_starts[..., None]) & (
+            token_indices[None, None, :] < query_ends[..., None]
         )
-        causal = token_indices[None, None, :] < query_ends[None, :, None]
+        causal = token_indices[None, None, :] < query_ends[..., None]
         use_sparse = complete_counts > self.block_topk
-        selected_tokens = mx.where(
-            use_sparse[None, :, None], selected_tokens | tail, causal
-        )
+        selected_tokens = mx.where(use_sparse[..., None], selected_tokens | tail, causal)
         return selected_tokens[:, None]
 
 
