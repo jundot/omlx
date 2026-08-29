@@ -1599,7 +1599,9 @@ class EnginePool:
                     projected = current + admission_size
                     if projected <= evict_target:
                         break
-                    victim = self._find_lru_victim()
+                    victim = self._find_lru_victim(
+                        bytes_needed=projected - evict_target
+                    )
                     if victim is not None:
                         logger.info(
                             f"Evicting '{victim}' to fit '{model_id}' "
@@ -1793,7 +1795,41 @@ class EnginePool:
         finally:
             await self.release_engine(model_id)
 
-    def _find_lru_victim(self) -> str | None:
+    def _eviction_freeable_size(self, entry: EngineEntry) -> int:
+        """Bytes that unloading ``entry`` would actually reclaim."""
+        if entry.actual_size is not None:
+            return entry.actual_size
+        return self._entry_resident_size(entry)
+
+    def _pick_eviction_victim(
+        self,
+        candidates: list[tuple[float, int, str]],
+        bytes_needed: int,
+    ) -> str | None:
+        """Choose one victim from ``(last_access, freeable_bytes, model_id)``.
+
+        Plain LRU is size-blind. On a host serving models that differ by an
+        order of magnitude (a 1.7GB TTS model next to a 68GB LLM) it can
+        unload several small idle models -- each of which must be reloaded
+        later -- before the caller's loop frees enough for one request.
+
+        Prefer the coldest model that on its own covers ``bytes_needed`` so a
+        pressure event disturbs a single model. When nothing is big enough,
+        take the largest so the loop converges in fewer rounds. Passing
+        ``bytes_needed <= 0`` keeps the original pure-LRU behaviour.
+        """
+        if not candidates:
+            return None
+        if bytes_needed > 0:
+            sufficient = [c for c in candidates if c[1] >= bytes_needed]
+            if sufficient:
+                # Tuple order puts last_access first: coldest wins, and the
+                # remaining fields keep the choice deterministic on ties.
+                return min(sufficient)[2]
+            return max(candidates, key=lambda c: c[1])[2]
+        return min(candidates)[2]
+
+    def _find_lru_victim(self, bytes_needed: int = 0) -> str | None:
         """
         Find the least recently used non-pinned loaded model.
 
@@ -1812,11 +1848,8 @@ class EnginePool:
             if self._entry_has_active_requests(e):
                 logger.debug(f"Skipping victim '{mid}': has active requests")
                 continue
-            candidates.append((e.last_access, mid))
-        if not candidates:
-            return None
-        candidates.sort()  # Sort by last_access (oldest first)
-        return candidates[0][1]
+            candidates.append((e.last_access, self._eviction_freeable_size(e), mid))
+        return self._pick_eviction_victim(candidates, bytes_needed)
 
     async def _unload_other_dflash_engines(self, model_id: str) -> None:
         """Unload other idle DFlash engines before starting a new one.
@@ -1888,17 +1921,18 @@ class EnginePool:
                 return False
         return True
 
-    def _find_lru_prefill_eviction_victim(self, *, exclude_model_id: str) -> str | None:
+    def _find_lru_prefill_eviction_victim(
+        self, *, exclude_model_id: str, bytes_needed: int = 0
+    ) -> str | None:
         candidates = []
         for mid, entry in self._entries.items():
             if mid == exclude_model_id:
                 continue
             if self._is_idle_for_prefill_eviction(entry):
-                candidates.append((entry.last_access, mid))
-        if not candidates:
-            return None
-        candidates.sort()
-        return candidates[0][1]
+                candidates.append(
+                    (entry.last_access, self._eviction_freeable_size(entry), mid)
+                )
+        return self._pick_eviction_victim(candidates, bytes_needed)
 
     async def _evict_idle_lru_for_prefill(
         self,
@@ -1936,7 +1970,8 @@ class EnginePool:
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
-                    exclude_model_id=exclude_model_id
+                    exclude_model_id=exclude_model_id,
+                    bytes_needed=current + predicted - target,
                 )
                 if victim is None:
                     # No idle model left to evict -- the "No idle model

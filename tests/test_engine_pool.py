@@ -965,6 +965,55 @@ class TestEnginePoolLRU:
         victim = pool_with_entries._find_lru_victim()
         assert victim == "model-a"
 
+    def _loaded(self, pool, mid, *, last_access, size):
+        """Mark an entry loaded with a known age and freeable size."""
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        entry = pool._entries[mid]
+        entry.engine = engine
+        entry.last_access = last_access
+        entry.actual_size = size
+        return entry
+
+    def test_victim_prefers_coldest_that_alone_frees_enough(
+        self, pool_with_entries
+    ):
+        """A single sufficient model is evicted instead of several small ones.
+
+        Pure LRU would take model-a (coldest) and free only 100 bytes, leaving
+        the caller's loop to come back and unload model-b as well.
+        """
+        self._loaded(pool_with_entries, "model-a", last_access=100, size=100)
+        self._loaded(pool_with_entries, "model-b", last_access=200, size=5000)
+
+        victim = pool_with_entries._find_lru_victim(bytes_needed=1000)
+        assert victim == "model-b"
+
+    def test_victim_is_coldest_among_sufficient(self, pool_with_entries):
+        """When several models each suffice, age still decides."""
+        self._loaded(pool_with_entries, "model-a", last_access=100, size=4000)
+        self._loaded(pool_with_entries, "model-b", last_access=200, size=5000)
+
+        victim = pool_with_entries._find_lru_victim(bytes_needed=1000)
+        assert victim == "model-a"
+
+    def test_victim_falls_back_to_largest_when_none_suffices(
+        self, pool_with_entries
+    ):
+        """No single model covers the need, so free the most per eviction."""
+        self._loaded(pool_with_entries, "model-a", last_access=100, size=100)
+        self._loaded(pool_with_entries, "model-b", last_access=200, size=900)
+
+        victim = pool_with_entries._find_lru_victim(bytes_needed=5000)
+        assert victim == "model-b"
+
+    def test_victim_without_bytes_needed_is_plain_lru(self, pool_with_entries):
+        """Callers that pass nothing keep the original size-blind behaviour."""
+        self._loaded(pool_with_entries, "model-a", last_access=100, size=100)
+        self._loaded(pool_with_entries, "model-b", last_access=200, size=5000)
+
+        assert pool_with_entries._find_lru_victim() == "model-a"
+
     def test_pinned_model_skipped_for_eviction(self, pool_with_entries):
         """Test that pinned models are skipped during eviction."""
         # model-a is pinned and older
