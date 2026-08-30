@@ -58,6 +58,7 @@ _stats = {
     "cycles": 0, "bootstraps": 0, "drafts": 0, "accepts": 0,
     "reject_rollbacks": 0, "gdn_exact_rows": 0, "gdn_pollution_rows": 0,
     "fallbacks": 0, "head_ms": 0.0, "verify_ms": 0.0, "rollback_ms": 0.0,
+    "cycle_ms": 0.0, "emit_ms": 0.0,
 }
 
 
@@ -531,6 +532,8 @@ def _batched_next(gen_batch: Any) -> List[Any]:
         _finish_cycle(gen_batch, ctx, B, keep, finished)
         return responses
 
+    _t_cycle = time.perf_counter()
+
     # ---- steady cycle (sampler-exact-once), depth k >= 1 ----
     # Verify feeds [P', d1, ..., dk]; v_j is the oracle after position j.
     # Per row the sampler is called exactly as often as tokens are emitted:
@@ -548,6 +551,7 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     # speculative entries past the committed fold — trimmed below.
     t_head = time.perf_counter()
     drafts_all: List[List[int]] = []
+    d_rows_lazy: List[Any] = []
     samplers_l = list(getattr(gen_batch, "samplers", None) or [])
 
     def _row_sampler(i: int):
@@ -571,16 +575,20 @@ def _batched_next(gen_batch: Any) -> List[Any]:
                 return_hidden=True, logits_keep=1,
             )
             s_i = _row_sampler(i)
-            drafts: List[int] = [int(s_i(logits_h[:, -1, :])[0].item())]
+            # P1: drafts stay lazy — each feeds the next head call without a
+            # host sync, letting Metal pipeline the whole chain; ONE tolist
+            # after the chain materializes the row.
+            d = s_i(logits_h[:, -1, :])
+            chain: List[Any] = [d]
             h_c = head_hidden[:, -1:, :]
             for j in range(1, k):
-                dj = mx.array([[drafts[-1]]], dtype=emit_tokens.dtype)
                 logits_c, head_hidden_c = host.mtp_forward(
-                    h_c, dj, row.head_cache, return_hidden=True,
+                    h_c, d.reshape(1, 1), row.head_cache, return_hidden=True,
                 )
                 h_c = head_hidden_c[:, -1:, :]
-                drafts.append(int(s_i(logits_c[:, -1, :])[0].item()))
-            drafts_all.append(drafts)
+                d = s_i(logits_c[:, -1, :])
+                chain.append(d)
+            d_rows_lazy.append(mx.concatenate(chain))
         except Exception as exc:
             logger.warning("[batched-verify] head draft failed uid=%s: %s",
                            uid, exc)
@@ -589,18 +597,34 @@ def _batched_next(gen_batch: Any) -> List[Any]:
 
     # (B, k+1) verify forward
     t_v = time.perf_counter()
-    d_stack = mx.array(
-        [[drafts_all[i][j] for i in range(B)] for j in range(k)],
-        dtype=emit_tokens.dtype,
-    )
-    verify_inputs = mx.concatenate([p_next[:, None], d_stack.T], axis=1)
+    d_rows = mx.stack(d_rows_lazy)  # (B, k), still lazy
+    verify_inputs = mx.concatenate([p_next[:, None], d_rows], axis=1)
     v_logits, v_hidden = _model_forward(
         gen_batch.model, verify_inputs, gen_batch.prompt_cache, n_confirmed=1
     )
     _stats["verify_ms"] += time.perf_counter() - t_v
     v_lp = [_norm_lp(v_logits[:, j, :]) for j in range(k + 1)]
 
-    # sequential accept per row: sample v0, v1, ... until first reject or k
+    # P1-b: batched oracle sampling — all k+1 positions for all rows are
+    # sampled in ONE lazy dispatch burst, then ONE host sync materializes
+    # everything (drafts ride the same graph). Safe because eligibility is
+    # greedy-only and the suppression state is frozen for the whole cycle
+    # (it updates on emission, which happens strictly after this loop): the
+    # sequential per-row branching only decides WHICH samples are consumed,
+    # never their values.
+    _t_sync = time.perf_counter()
+    samples_lazy = [_sample_rows(gen_batch, v_logits[:, j, :])
+                    for j in range(k + 1)]
+    mx.async_eval(*samples_lazy)
+    s_list = [s.tolist() for s in samples_lazy]       # the ONE sync burst
+    drafts_all = d_rows.tolist()                       # (B, k) ints
+    _stats["sync_ms"] = (
+        _stats.get("sync_ms", 0.0) + (time.perf_counter() - _t_sync) * 1000.0
+    )
+    _stats["sampler_dispatch_ms"] = _stats.get("sampler_dispatch_ms", 0.0)
+
+    # sequential accept per row (pure Python on materialized ints)
+    _t_lp = time.perf_counter()
     acc_counts: List[int] = []
     next_toks: List[int] = []
     next_lps: List[float] = []
@@ -608,7 +632,7 @@ def _batched_next(gen_batch: Any) -> List[Any]:
         a = 0
         tok = -1
         for j in range(k):
-            s_int = int(_row_sampler(i)(v_logits[i : i + 1, j, :])[0].item())
+            s_int = int(s_list[j][i])
             if s_int == drafts_all[i][j]:
                 a += 1
             else:
@@ -616,10 +640,13 @@ def _batched_next(gen_batch: Any) -> List[Any]:
                 break
         if tok < 0:
             # accepted all k drafts: sample v_k for the next primary
-            tok = int(_row_sampler(i)(v_logits[i : i + 1, k, :])[0].item())
+            tok = int(s_list[k][i])
         acc_counts.append(a)
         next_toks.append(tok)
         next_lps.append(float(v_lp[a][i, tok].item()))
+    _stats["lp_ms"] = (
+        _stats.get("lp_ms", 0.0) + (time.perf_counter() - _t_lp) * 1000.0
+    ) - 0.0
 
     # rollback rows whose chain broke early (a < k): replay the confirmed
     # prefix into the GDN state and trim the speculative KV tail.
@@ -665,6 +692,7 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     ctx.skip_logits = None  # no longer sampled from
 
     # primary emission (P') + per-row fold-pair bookkeeping
+    _t_emit = time.perf_counter()
     for i, uid in enumerate(uids):
         row = ctx.rows.get(uid)
         _emit_one(gen_batch, i, uid, tokens_list[i], emit_lps[i],
@@ -694,6 +722,10 @@ def _batched_next(gen_batch: Any) -> List[Any]:
     gen_batch._next_logprobs = next_lps
     mx.async_eval(gen_batch._next_tokens)
 
+    _stats["emit_ms"] += (time.perf_counter() - _t_emit) * 1000.0
+    _stats.setdefault("cycle_ms", 0.0)
+    _stats["cycle_ms"] += (time.perf_counter() - _t_cycle) * 1000.0
+    _stats.setdefault("emit_ms", 0.0)
     _stats["cycles"] += 1
     _stats["drafts"] += B * k
     _stats["accepts"] += sum(acc_counts)
@@ -719,6 +751,19 @@ def _batched_next(gen_batch: Any) -> List[Any]:
             _stats["gdn_exact_rows"], _stats["gdn_pollution_rows"],
             _stats["fallbacks"], _stats["head_ms"] * 1000,
             _stats["verify_ms"] * 1000, _stats["rollback_ms"] * 1000,
+        )
+        n = max(_stats["cycles"], 1)
+        logger.info(
+            "[batched-verify] per-cycle: cycle=%.1f head=%.1f verify=%.1f "
+            "roll=%.1f sync=%.1f lp=%.1f emit=%.1f glue=%.1f",
+            _stats["cycle_ms"] / n, _stats["head_ms"] * 1000 / n,
+            _stats["verify_ms"] * 1000 / n, _stats["rollback_ms"] * 1000 / n,
+            _stats.get("sync_ms", 0.0) / n, _stats.get("lp_ms", 0.0) / n,
+            _stats.get("emit_ms", 0.0) / n,
+            _stats["cycle_ms"] / n - (_stats["head_ms"] * 1000
+            + _stats["verify_ms"] * 1000 + _stats["rollback_ms"] * 1000
+            + _stats.get("emit_ms", 0.0) + _stats.get("sync_ms", 0.0)
+            + _stats.get("lp_ms", 0.0)) / n,
         )
         pp = _stats.get("per_pos", {})
         parts = []
