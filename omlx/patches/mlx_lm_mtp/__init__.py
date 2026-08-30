@@ -147,4 +147,14 @@ def apply_mlx_lm_mtp_patch() -> bool:
 
     apply_ds_consistency()
 
+    # Batched depth-1 MTP for multi-row decode steps. Opt-in via
+    # OMLX_MTP_BATCHED_VERIFY; wraps GenerationBatch.next AFTER batch_generator
+    # installed its own dispatch, so ineligible batches fall straight through.
+    try:
+        from . import batched_verify
+
+        batched_verify.install()
+    except Exception:
+        logger.warning("batched_verify install failed", exc_info=True)
+
     return True
