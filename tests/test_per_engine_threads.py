@@ -1,6 +1,7 @@
 """Tests for per-engine thread isolation (issue #1248)."""
 
 import concurrent.futures
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -249,6 +250,94 @@ class TestPerEngineExecutor:
             assert engine.scheduler._stream is engine._mlx_stream
 
             engine.close()
+
+    def test_engine_stream_created_on_executor_thread(self):
+        """The per-engine MLX stream must be owned by the worker thread."""
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+        main_thread_id = threading.get_ident()
+        stream = object()
+        created_on = []
+
+        def create_stream():
+            created_on.append((threading.get_ident(), threading.current_thread().name))
+            return stream
+
+        with patch("omlx.engine_core.get_registry") as mock_registry, patch(
+            "omlx.engine_core._create_mlx_thread_stream", side_effect=create_stream
+        ):
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(mock_model, mock_tokenizer)
+            try:
+                assert engine._mlx_stream is stream
+                assert engine.scheduler._stream is stream
+                assert created_on
+                thread_id, thread_name = created_on[0]
+                assert thread_id != main_thread_id
+                assert thread_name.startswith("mlx-engine-")
+            finally:
+                engine.close()
+
+    def test_generate_batch_sync_runs_on_engine_thread(self):
+        """Synchronous generation must retain the engine stream's affinity."""
+        mock_model = MagicMock()
+        mock_model.model_type = "test"
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.eos_token_id = 0
+        caller_thread_id = threading.get_ident()
+
+        class SyncScheduler:
+            def __init__(self):
+                self.pending = []
+                self.thread_ids = []
+
+            def add_request(self, request):
+                self.thread_ids.append(threading.get_ident())
+                self.pending.append(request)
+
+            def has_requests(self):
+                return bool(self.pending)
+
+            def step(self):
+                self.thread_ids.append(threading.get_ident())
+                request = self.pending.pop(0)
+                return SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            request_id=request.request_id,
+                            finished=True,
+                        )
+                    ]
+                )
+
+            def remove_finished_request(self, request_id):
+                self.thread_ids.append(threading.get_ident())
+
+            def shutdown(self):
+                pass
+
+            def deep_reset(self):
+                pass
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(mock_model, mock_tokenizer)
+            scheduler = SyncScheduler()
+            engine.scheduler = scheduler
+            worker_thread_id = engine._mlx_executor.submit(threading.get_ident).result()
+
+            try:
+                results = engine.generate_batch_sync(["one", "two"])
+
+                assert len(results) == 2
+                assert scheduler.thread_ids
+                assert all(thread_id == worker_thread_id for thread_id in scheduler.thread_ids)
+                assert worker_thread_id != caller_thread_id
+            finally:
+                engine.close()
 
     def test_close_clears_compile_cache_then_shuts_down(self):
         """Normal path (compile-cache clear available): close() clears the
