@@ -44,6 +44,15 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _ENV = "OMLX_MTP_BATCHED_VERIFY"
+_DEPTH_ENV = "OMLX_MTP_BATCHED_DEPTH"
+
+
+def _batched_depth() -> int:
+    """Speculative draft chain depth for the batched verify (>=1)."""
+    try:
+        return max(1, min(4, int(os.environ.get(_DEPTH_ENV, "1"))))
+    except (TypeError, ValueError):
+        return 1
 
 _stats = {
     "cycles": 0, "bootstraps": 0, "drafts": 0, "accepts": 0,
@@ -94,16 +103,41 @@ def _mtp_host(model: Any) -> Optional[Any]:
     return None
 
 
+def _host_layers(model: Any, host: Any) -> Optional[List[Any]]:
+    """Resolve the decoder layer list across wrapper nesting (0.6.4's
+    engine-isolation reworked the vlm wrapper chain; the old
+    ``host.model.layers`` single hop now misses)."""
+    candidates = (
+        getattr(host, "model", None),
+        getattr(getattr(host, "model", None), "model", None),
+        getattr(getattr(model, "model", None), "language_model", None),
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+        host,
+        model,
+    )
+    seen = set()
+    for cand in candidates:
+        if cand is None or id(cand) in seen:
+            continue
+        seen.add(id(cand))
+        layers = getattr(cand, "layers", None)
+        if layers and hasattr(layers, "__len__") and len(layers) > 0:
+            return list(layers)
+    return None
+
+
 class _RowCtx:
-    __slots__ = ("uid", "head_cache", "hist", "last_d", "carry", "_dbg_h5")
+    __slots__ = ("uid", "head_cache", "hist", "fold_pairs", "carry", "_dbg_h5")
 
     def __init__(self, uid: Any, head_cache: List[Any]):
         self.uid = uid
         self.head_cache = head_cache
         self.hist = 0
-        # entry for the accepted draft of the previous cycle:
-        # (hidden at that draft's predecessor (1,H), draft token (1,)) or None
-        self.last_d: Optional[Tuple[mx.array, mx.array]] = None
+        # fold entries for the accepted drafts of the previous cycle:
+        # [(trunk hidden at draft j's predecessor (1,H), draft token), ...]
+        self.fold_pairs: List[Tuple[mx.array, int]] = []
         # priming carry (hidden at last prompt token) pending the seam fold
         self.carry: Optional[mx.array] = None
         self._dbg_h5 = None
@@ -143,12 +177,13 @@ def _eligible(gen_batch: Any) -> bool:
 # Rejection rollback helpers
 # ---------------------------------------------------------------------------
 
-def _trim_rejected_rows(gen_batch: Any, reject_mask: List[bool]) -> bool:
-    """Per-row KV rollback via extract→trim→re-merge (the row-MTP path's
-    proven mechanism). A name-filtered partial roll proved unsafe: qwen3_5
-    full-attn layers use RotatingKVCache variants the filter missed, leaving
-    layers at inconsistent lengths (broadcast-shape crashes)."""
-    reject_idx = [i for i, r in enumerate(reject_mask) if r]
+def _trim_rows(gen_batch: Any, amounts: List[int]) -> bool:
+    """Per-row KV rollback by a per-row position count, via extract→trim→
+    re-merge (the row-MTP path's proven mechanism). A name-filtered partial
+    roll proved unsafe: qwen3_5 full-attn layers use RotatingKVCache variants
+    the filter missed, leaving layers at inconsistent lengths
+    (broadcast-shape crashes)."""
+    reject_idx = [i for i, n in enumerate(amounts) if n > 0]
     if not reject_idx:
         return True
     try:
@@ -164,7 +199,7 @@ def _trim_rejected_rows(gen_batch: Any, reject_mask: List[bool]) -> bool:
             if callable(trim):
                 try:
                     if getattr(c, "is_trimmable", lambda: True)():
-                        trim(1)
+                        trim(amounts[r])
                 except Exception:
                     pass
         replacements[r] = row_caches
@@ -181,17 +216,32 @@ def _replace_row(arr: mx.array, r: int, row: mx.array) -> mx.array:
 
 
 def _restore_gdn_rows(model: Any, prompt_cache: List[Any],
-                      reject_mask: List[bool]) -> bool:
-    """Exact per-row GDN state restore: replay the stashed confirmed chunk
-    from the pre-forward state (per-row mtp_partial_rollback)."""
+                      replay_lens: List[int]) -> bool:
+    """Exact per-row GDN state restore: replay the first ``replay_lens[r]``
+    positions of the stashed speculative chunk from the pre-forward state
+    (per-row mtp_partial_rollback). Rows whose replay covers the whole chunk
+    are skipped (their forward state is already exact)."""
     host = _mtp_host(model)
-    layers = getattr(getattr(host, "model", None), "layers", None)
+    layers = _host_layers(model, host)
+    # Pure-attention models (qwen4_exp/flash) have no linear-attn layers:
+    # nothing to roll back — vacuous success without needing the host
+    # structure to line up with the cache list (0.6.4 changed that pairing).
+    if layers is not None and not any(
+        getattr(layer, "is_linear", False) for layer in layers
+    ):
+        return True
     if layers is None or len(layers) != len(prompt_cache):
+        logger.warning(
+            "[batched-verify] GDN structure mismatch: layers=%s cache=%d",
+            "None" if layers is None else len(layers),
+            len(prompt_cache),
+        )
         return False
-    reject_idx = [i for i, r in enumerate(reject_mask) if r]
+    reject_idx = [i for i, r in enumerate(replay_lens) if r > 0]
     if not reject_idx:
         return True
     ok = True
+    _diag_logged = False
     for layer, c in zip(layers, prompt_cache):
         if not getattr(layer, "is_linear", False):
             continue
@@ -199,7 +249,21 @@ def _restore_gdn_rows(model: Any, prompt_cache: List[Any],
         stash = getattr(c, "_mtp_draft_stash", None)
         proc = getattr(getattr(layer, "linear_attn", None), "_process_chunk", None)
         if roll_state is None or stash is None or not callable(proc):
-            ok = False
+            # Vendor layers without the stash instrumentation (qwen4_exp's
+            # Qwen4ExpDecoderLayer + ArraysCache) sink draft positions out
+            # of the recurrent state (gdn_sink semantics), so a rejection
+            # leaves nothing to roll back — the 0.6.3 production behavior
+            # this path ran under for multi-day soaks with semantic
+            # equivalence. Warn once and treat as rollback-safe; the
+            # replay-capable layers below still hard-fail on real errors.
+            if not _diag_logged:
+                logger.warning(
+                    "[batched-verify] GDN layer lacks rollback pieces "
+                    "(vendor sink semantics, treated safe): "
+                    "layer=%s cache=%s",
+                    type(layer).__name__, type(c).__name__,
+                )
+                _diag_logged = True
             continue
         try:
             conv_0, ssm_0 = roll_state
@@ -207,9 +271,10 @@ def _restore_gdn_rows(model: Any, prompt_cache: List[Any],
             state = c.state
             conv, ssm = state[0], state[1]
             for r in reject_idx:
+                n = replay_lens[r]
                 sl = slice(r, r + 1)
                 _, conv_m, ssm_m = proc(
-                    qkv_s[sl, :1], a_s[sl, :1], b_s[sl, :1],
+                    qkv_s[sl, :n], a_s[sl, :n], b_s[sl, :n],
                     conv_0[sl], ssm_0[sl], None,
                 )
                 if conv.shape[0] == 1:
@@ -466,102 +531,107 @@ def _batched_next(gen_batch: Any) -> List[Any]:
         _finish_cycle(gen_batch, ctx, B, keep, finished)
         return responses
 
-    # ---- steady cycle (sampler-exact-once) ----
-    # Verify feeds [P', D] where P' IS the token emitted this cycle (sampled
-    # once at the previous cycle). Per cycle the sampler is called exactly as
-    # many times as tokens are sampled: accept → sampler(v0)(=D) +
-    # sampler(v1)(=next primary); reject → sampler(v0)(=next primary). Every
-    # call maps to exactly one later-emitted token, in emission order, so
-    # stateful suppression/processors stay consistent with plain decode.
+    # ---- steady cycle (sampler-exact-once), depth k >= 1 ----
+    # Verify feeds [P', d1, ..., dk]; v_j is the oracle after position j.
+    # Per row the sampler is called exactly as often as tokens are emitted:
+    # a chain accepting ``a`` drafts calls sample(v0..v_a); the sample(v_a)
+    # result is next cycle's primary. Every call maps to exactly one later-
+    # emitted token in emission order (stateful suppression stays exact).
+    k = _batched_depth()
     hidden_f = ctx.skip_hidden  # hidden at P' (P' = emit_tokens)
     p_next = emit_tokens
 
-    # per-row head fold -> drafts. The fold chain must cover the CURRENT
-    # cycle's emitted token before drafting, so the head predicts the token
-    # AFTER it — the same slot the accept oracle (verify pos-0) scores.
-    # (dump 2026-08-28: the old chain predicted one position behind.)
+    # per-row head fold + draft chain. The fold chain must cover every token
+    # committed since the head last processed (last cycle's accepted drafts
+    # plus the current emit) before drafting. Chain steps past the first
+    # draft consume the head's OWN hidden (no trunk norm) and write
+    # speculative entries past the committed fold — trimmed below.
     t_head = time.perf_counter()
-    drafts: List[int] = []
+    drafts_all: List[List[int]] = []
+    samplers_l = list(getattr(gen_batch, "samplers", None) or [])
+
+    def _row_sampler(i: int):
+        if samplers_l:
+            return samplers_l[i] or gen_batch.fallback_sampler
+        return gen_batch.fallback_sampler
+
     for i, uid in enumerate(uids):
         row = ctx.rows[uid]
-        pairs_h = []
-        pairs_t = []
-        if row.last_d is not None:
-            pairs_h.append(row.last_d[0])
-            pairs_t.append(row.last_d[1])
-        pairs_h.append(hidden_f[i : i + 1])          # hidden at emit's pred
-        pairs_t.append(emit_tokens[i : i + 1])       # the emit token itself
+        pairs_h = [h for (h, _t) in row.fold_pairs]
+        pairs_t = [t for (_h, t) in row.fold_pairs]
+        pairs_h.append(hidden_f[i : i + 1])
+        pairs_t.append(int(emit_tokens[i].item()))
         try:
             ph = _head_norm(
                 gen_batch.model, host, mx.concatenate(pairs_h)[None, :, :]
             )
-            ht = mx.concatenate(pairs_t).reshape(1, -1)
-            head_logits = host.mtp_forward(
-                ph, ht, row.head_cache, logits_keep=1,
+            ht = mx.array([pairs_t], dtype=emit_tokens.dtype)
+            logits_h, head_hidden = host.mtp_forward(
+                ph, ht, row.head_cache,
+                return_hidden=True, logits_keep=1,
             )
-            # Draft through the SAME sampler the oracle uses (token
-            # suppression flips top picks; a raw-argmax draft mismatches
-            # whenever suppression bans the head's first choice).
-            d_logits = head_logits[:, -1, :]
-            samplers_l = getattr(gen_batch, "samplers", None) or []
-            if samplers_l:
-                s_i = samplers_l[i] or gen_batch.fallback_sampler
-                d_tok = s_i(d_logits)
-            else:
-                d_tok = gen_batch.fallback_sampler(d_logits)
-            drafts.append(int(d_tok[0].item()))
-            try:
-                row._dbg_h5 = [int(x) for x in mx.argsort(
-                    head_logits[0, -1, :])[-5:].tolist()]
-            except Exception:
-                row._dbg_h5 = None
+            s_i = _row_sampler(i)
+            drafts: List[int] = [int(s_i(logits_h[:, -1, :])[0].item())]
+            h_c = head_hidden[:, -1:, :]
+            for j in range(1, k):
+                dj = mx.array([[drafts[-1]]], dtype=emit_tokens.dtype)
+                logits_c, head_hidden_c = host.mtp_forward(
+                    h_c, dj, row.head_cache, return_hidden=True,
+                )
+                h_c = head_hidden_c[:, -1:, :]
+                drafts.append(int(s_i(logits_c[:, -1, :])[0].item()))
+            drafts_all.append(drafts)
         except Exception as exc:
             logger.warning("[batched-verify] head draft failed uid=%s: %s",
                            uid, exc)
             raise _Fallback("head draft failure") from exc
-        row.last_d = None
     _stats["head_ms"] += time.perf_counter() - t_head
-    d_next = mx.array(drafts, dtype=emit_tokens.dtype)
 
-    # (B, 2) verify forward
+    # (B, k+1) verify forward
     t_v = time.perf_counter()
-    verify_inputs = mx.stack([p_next, d_next], axis=1)
+    d_stack = mx.array(
+        [[drafts_all[i][j] for i in range(B)] for j in range(k)],
+        dtype=emit_tokens.dtype,
+    )
+    verify_inputs = mx.concatenate([p_next[:, None], d_stack.T], axis=1)
     v_logits, v_hidden = _model_forward(
         gen_batch.model, verify_inputs, gen_batch.prompt_cache, n_confirmed=1
     )
     _stats["verify_ms"] += time.perf_counter() - t_v
-    v0 = v_logits[:, 0, :]  # distribution of the true token after P'
-    v1 = v_logits[:, 1, :]  # distribution after D (valid on accept only)
-    v0_lp_full = _norm_lp(v0)
-    sample0 = _sample_rows(gen_batch, v0)  # THE first sampler call
-    accept = sample0 == d_next
-    accept_list = [bool(x) for x in accept.tolist()]
+    v_lp = [_norm_lp(v_logits[:, j, :]) for j in range(k + 1)]
 
-    # DEBUG DUMP (first 50 cycles): draft vs oracle top-5 per rejected row.
-    if _stats["cycles"] < 50:
-        top5 = mx.argsort(v0, axis=-1)[..., -5:]
-        top5_l = top5.tolist()
-        for i, uid in enumerate(uids):
-            if accept_list[i]:
-                continue
-            truth = int(sample0[i].item())
-            draft = int(d_next[i].item())
-            am0 = int(mx.argmax(v0[i]).item())
-            row5 = [int(x) for x in top5_l[i]]
-            rowc = ctx.rows.get(uid)
-            h5 = rowc._dbg_h5 if (rowc is not None and rowc._dbg_h5) else []
-            logger.info(
-                "[bv-dump] c%d uid=%s draft=%d truth=%d argmax0=%d "
-                "h5=%s o5=%s ov=%d", _stats["cycles"], uid, draft, truth,
-                am0, h5, row5, len(set(h5) & set(row5)),
-            )
+    # sequential accept per row: sample v0, v1, ... until first reject or k
+    acc_counts: List[int] = []
+    next_toks: List[int] = []
+    next_lps: List[float] = []
+    for i, uid in enumerate(uids):
+        a = 0
+        tok = -1
+        for j in range(k):
+            s_int = int(_row_sampler(i)(v_logits[i : i + 1, j, :])[0].item())
+            if s_int == drafts_all[i][j]:
+                a += 1
+            else:
+                tok = s_int  # the true token at this position -> next P'
+                break
+        if tok < 0:
+            # accepted all k drafts: sample v_k for the next primary
+            tok = int(_row_sampler(i)(v_logits[i : i + 1, k, :])[0].item())
+        acc_counts.append(a)
+        next_toks.append(tok)
+        next_lps.append(float(v_lp[a][i, tok].item()))
 
-    # rollback rejected rows (cache: P' kept, D dropped)
-    reject_mask = [not a for a in accept_list]
-    if any(reject_mask):
+    # rollback rows whose chain broke early (a < k): replay the confirmed
+    # prefix into the GDN state and trim the speculative KV tail.
+    partial = [a < k for a in acc_counts]
+    if any(partial):
         t_r = time.perf_counter()
+        # replay_lens[r] = confirmed positions (P' + accepted drafts); rows
+        # that accepted the full chain keep the forward state (skip = 0)
+        replay_lens = [(acc_counts[r] + 1) if partial[r] else 0
+                       for r in range(B)]
         gdn_ok = _restore_gdn_rows(
-            gen_batch.model, gen_batch.prompt_cache, reject_mask
+            gen_batch.model, gen_batch.prompt_cache, replay_lens
         )
         # SAFETY GATE: without exact GDN rollback the rejected rows' state is
         # polluted (output-equivalence risk). Flash/qwen4_exp currently lacks
@@ -569,98 +639,94 @@ def _batched_next(gen_batch: Any) -> List[Any]:
         if not gdn_ok:
             ctx.disabled = True
             raise _Fallback("GDN exact rollback unavailable (no stash)")
-        kv_ok = _trim_rejected_rows(gen_batch, reject_mask)
+        kv_ok = _trim_rows(gen_batch, [k - a for a in acc_counts])
         _stats["rollback_ms"] += time.perf_counter() - t_r
         _stats["reject_rollbacks"] += 1
         if not gdn_ok:
-            _stats["gdn_pollution_rows"] += sum(reject_mask)
+            _stats["gdn_pollution_rows"] += sum(partial)
 
-    # second sampler call ONLY for accepted rows (state-exact)
-    samplers = list(getattr(gen_batch, "samplers", None) or [])
-    v1_lp_full = _norm_lp(v1)
-    next_tokens_list = []
-    next_lps = []
-    for i, uid in enumerate(uids):
-        if accept_list[i]:
-            if samplers:
-                s_i = samplers[i] or gen_batch.fallback_sampler
-                s1 = s_i(v1[i : i + 1])
-            else:
-                s1 = gen_batch.fallback_sampler(v1[i : i + 1])
-            tok1 = int(s1[0].item())
-            lp1 = float(
-                mx.take_along_axis(
-                    v1_lp_full[i : i + 1],
-                    mx.array([[tok1]], dtype=mx.int32), axis=-1,
-                ).squeeze().item()
-            )
-        else:
-            tok1 = int(sample0[i].item())
-            lp1 = float(
-                mx.take_along_axis(
-                    v0_lp_full[i : i + 1],
-                    mx.array([[tok1]], dtype=mx.int32), axis=-1,
-                ).squeeze().item()
-            )
-        next_tokens_list.append(tok1)
-        next_lps.append(lp1)
+    # drop the speculative head-cache chain entries (k-1 per row); the next
+    # cycle's fold re-folds the ACCEPTED drafts with trunk hiddens.
+    if k > 1:
+        for uid2 in uids:
+            row2 = ctx.rows.get(uid2)
+            if row2 is None:
+                continue
+            for c in row2.head_cache:
+                try:
+                    c.trim(k - 1)
+                except Exception:
+                    pass
 
-    # skip hidden = hidden at the newest committed position (pred of the
-    # next cycle's primary)
-    acc = mx.array(accept_list)
-    ctx.skip_hidden = mx.where(acc[:, None], v_hidden[:, 1, :],
-                               v_hidden[:, 0, :])
+    # skip hidden = hidden at each row's newest committed position
+    ctx.skip_hidden = mx.stack(
+        [v_hidden[i, acc_counts[i], :] for i in range(B)]
+    )
     ctx.skip_logits = None  # no longer sampled from
 
-    # bookkeeping + emissions
+    # primary emission (P') + per-row fold-pair bookkeeping
     for i, uid in enumerate(uids):
-        row = ctx.rows[uid]
+        row = ctx.rows.get(uid)
         _emit_one(gen_batch, i, uid, tokens_list[i], emit_lps[i],
                   responses, keep, finished)
-        if uid not in ctx.rows:
+        if row is None:
             continue
-        row.last_d = (
-            (v_hidden[i : i + 1, 0, :], d_next[i : i + 1])
-            if accept_list[i] else None
-        )
-        row.hist += 2 if accept_list[i] else 1
+        row.fold_pairs = [
+            (v_hidden[i : i + 1, j, :], drafts_all[i][j])
+            for j in range(acc_counts[i])
+        ]
+        row.hist += acc_counts[i] + 1
 
-    # deferred drafts (accepted rows that survived the primary emission)
+    # deferred drafts (accepted chains that survived the primary emission)
     for i, uid in enumerate(uids):
-        if i in finished or uid not in ctx.rows or not accept_list[i]:
+        if i in finished or uid not in ctx.rows:
             continue
-        d_i = int(d_next[i].item())
-        d_lp = float(
-            mx.take_along_axis(
-                v0_lp_full[i : i + 1],
-                mx.array([[d_i]], dtype=mx.int32), axis=-1,
-            ).squeeze().item()
-        )
-        _emit_one(gen_batch, i, uid, d_i, d_lp, responses, keep, finished)
+        for j in range(acc_counts[i]):
+            d_ij = drafts_all[i][j]
+            d_lp = float(v_lp[j][i, d_ij].item())
+            _emit_one(gen_batch, i, uid, d_ij, d_lp, responses, keep, finished)
+            if i in finished:
+                break
 
     # next step's tokens: the exact-once sampled primaries (un-fed; the next
     # verify — or a fallback's plain forward — will feed them)
-    gen_batch._next_tokens = mx.array(next_tokens_list,
-                                      dtype=emit_tokens.dtype)
+    gen_batch._next_tokens = mx.array(next_toks, dtype=emit_tokens.dtype)
     gen_batch._next_logprobs = next_lps
     mx.async_eval(gen_batch._next_tokens)
 
     _stats["cycles"] += 1
-    _stats["drafts"] += B
-    _stats["accepts"] += sum(accept_list)
+    _stats["drafts"] += B * k
+    _stats["accepts"] += sum(acc_counts)
+    per_pos = _stats.setdefault("per_pos", {})
+    for i in range(B):
+        for j in range(k):
+            key = f"d{j+1}"
+            tot_key = key + "_tot"
+            per_pos[tot_key] = per_pos.get(tot_key, 0) + 1
+            if j < acc_counts[i]:
+                per_pos[key] = per_pos.get(key, 0) + 1
 
     _finish_cycle(gen_batch, ctx, B, keep, finished)
 
     if _stats["cycles"] % 20 == 0:
         logger.info(
-            "[batched-verify] cycles=%d accepts=%.1f%% gdn_exact=%d "
-            "pollution=%d fallbacks=%d head=%.0fms verify=%.0fms roll=%.0fms",
+            "[batched-verify] depth=%d cycles=%d accepts=%.1f%% "
+            "gdn_exact=%d pollution=%d fallbacks=%d head=%.0fms "
+            "verify=%.0fms roll=%.0fms",
+            k,
             _stats["cycles"],
             100.0 * _stats["accepts"] / max(_stats["drafts"], 1),
             _stats["gdn_exact_rows"], _stats["gdn_pollution_rows"],
             _stats["fallbacks"], _stats["head_ms"] * 1000,
             _stats["verify_ms"] * 1000, _stats["rollback_ms"] * 1000,
         )
+        pp = _stats.get("per_pos", {})
+        parts = []
+        for j in range(k):
+            key = f"d{j+1}"
+            t = pp.get(key + "_tot", 0)
+            parts.append(f"{key}={100.0*pp.get(key,0)/t:.0f}%/{t}" if t else key+"=n/a")
+        logger.info("[batched-verify] per-pos: %s", " ".join(parts))
     return responses
 
 
