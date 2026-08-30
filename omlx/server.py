@@ -4277,6 +4277,9 @@ def _compile_with_structural_tag(
     return compiler.compile_structural_tag(tag_dict)
 
 
+_JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
+
+
 def _compile_bare_grammar(compiler, fmt: dict):
     """Compile a grammar without any structural tag wrapping."""
     if fmt["type"] == "json_schema":
@@ -4286,7 +4289,15 @@ def _compile_bare_grammar(compiler, fmt: dict):
         if not schema:
             return compiler.compile_builtin_json_grammar()
         schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
-        return compiler.compile_json_schema(schema_str)
+        # An unlimited whitespace run can trap a grammar-constrained decoder
+        # after an early string termination: whitespace remains valid while
+        # every useful token is masked.  Keep the bound local to the compiler
+        # call so ordinary JSON and user-supplied EBNF/regex grammars retain
+        # their existing behavior.
+        return compiler.compile_json_schema(
+            schema_str,
+            max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+        )
     elif fmt["type"] == "grammar":
         return compiler.compile_grammar(fmt["grammar"])
     elif fmt["type"] == "regex":
