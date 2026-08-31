@@ -14,11 +14,27 @@ struct AppView: View {
     @State private var selection: AppSection? = .status
     @State private var presentedUpdate: AvailableUpdate?
 
+    @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
+
     @Environment(\.colorScheme) private var scheme
     @Environment(AppServices.self) private var services
 
+    /// The resolved theme. Enhanced Readability lifts secondary/tertiary text
+    /// to the primary color and uses the web's higher-contrast red.
+    private var resolvedTheme: OMLXTheme {
+        var theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        if enhancedReadability {
+            theme.textSecondary = theme.text
+            theme.textTertiary = theme.text
+            let danger = Color(hex: scheme == .dark ? 0xef5b54 : 0xd92d20)
+            theme.redDot = danger
+            theme.warningText = danger
+        }
+        return theme
+    }
+
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        let theme = resolvedTheme
         let section = selectedSection
 
         NavigationSplitView {

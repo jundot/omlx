@@ -7,6 +7,24 @@
 
 import SwiftUI
 
+extension Color {
+    /// Initialize from a 0xRRGGBB hex value.
+    init(hex: UInt32) {
+        let r = Double((hex >> 16) & 0xFF) / 255.0
+        let g = Double((hex >> 8) & 0xFF) / 255.0
+        let b = Double(hex & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
+}
+
+// MARK: - Enhanced Readability (global)
+
+/// Persisted preference key for the Enhanced Readability toggle.
+enum EnhancedReadability {
+    static let enabledKey = "OMLXEnhancedReadability"
+}
+
+
 // MARK: - Token table
 
 struct OMLXTheme: Sendable {
@@ -26,8 +44,8 @@ struct OMLXTheme: Sendable {
 
     // Text
     let text: Color
-    let textSecondary: Color
-    let textTertiary: Color
+    var textSecondary: Color
+    var textTertiary: Color
 
     // Accent + selection
     let accent: Color
@@ -48,13 +66,13 @@ struct OMLXTheme: Sendable {
     // Status
     let greenDot: Color
     let amberDot: Color
-    let redDot: Color
+    var redDot: Color
     let blueDot: Color
 
     // Code + status backgrounds
     let codeBg: Color
     let warningBg: Color
-    let warningText: Color
+    var warningText: Color
     let successBg: Color
     let successText: Color
 

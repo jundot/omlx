@@ -659,6 +659,78 @@
         }
       }
     },
+    "appearance.row.enhanced_readability" : {
+      "comment" : "Appearance row label for the enhanced readability toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enhanced Readability"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повышенная читаемость"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "增强可读性"
+          }
+        }
+      }
+    },
+    "appearance.row.enhanced_readability.sub" : {
+      "comment" : "Appearance row sublabel for the enhanced readability toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Raise low-contrast text to the primary color for higher readability."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повышает малоконтрастный текст до основного цвета для лучшей читаемости."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将低对比度文本提升为主色以获得更高的可读性。"
+          }
+        }
+      }
+    },
+    "appearance.section.readability" : {
+      "comment" : "Appearance screen section header for readability settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Readability"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Читаемость"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可读性"
+          }
+        }
+      }
+    },
     "bench.accuracy.upload.already" : {
       "comment" : "Accuracy result card status when the leaderboard already has this result",
       "extractionState" : "manual",
