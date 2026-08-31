@@ -3562,8 +3562,9 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     prefill needs back once the KV cache has grown into the guard's sizing
     target. Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
-    and never lazily recompile), then drops the state references; the native
-    models free their programs and mapped blobs when the last reference dies.
+    and never lazily recompile), then drops the state references and clears the
+    per-module state caches that hold the same objects; the native models free
+    their programs and mapped blobs when the last reference dies.
     Idempotent, and scoped to this engine instance: the next load of the
     model rebuilds the banks from its settings.
 
@@ -3587,6 +3588,17 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
+        # _compile_pair and _compile_gdn cache their state per module, so
+        # dropping the attributes above frees nothing while those stay
+        # populated. Cleared unconditionally rather than alongside a live
+        # state: an entry left over from an earlier slice is exactly the
+        # mapped bank this call exists to hand back. No _COMPILE_LOCK needed
+        # -- compiles and this release both run on the engine's single-worker
+        # MLX executor, so they are already serialized.
+        for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
+            cache = getattr(module, cache_attr, None)
+            if cache:
+                cache.clear()
     if modules_released:
         # Zero (not delete) the status counters and set the shed marker:
         # attempted=True/configured=False alone is indistinguishable from a
