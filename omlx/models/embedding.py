@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
-from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import validate_image_data_uri
 from .base_model import last_token_pool, mean_pooling, normalize_embeddings
 from .mlx_embeddings_compat import (
@@ -741,7 +740,6 @@ class MLXEmbeddingModel:
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
-        clear_thread_compile_cache()
         gc.collect()
 
     def embed(

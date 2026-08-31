@@ -1563,7 +1563,10 @@ class TestEnginePoolAsync:
             engine_idx[0] += 1
             return engine
 
-        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+        with (
+            patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine),
+            patch("omlx.engine_pool.shutdown_mlx_executor") as shutdown_executor,
+        ):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
@@ -1571,7 +1574,22 @@ class TestEnginePoolAsync:
 
         mock_engine_a.stop.assert_called_once()
         mock_engine_b.stop.assert_called_once()
+        shutdown_executor.assert_called_once_with()
         assert pool.loaded_model_count == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_failed_load_reclaim_before_global_worker(self):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._schedule_failed_load_reclaim("failed-model", pre_load_memory=0)
+        reclaim_task = pool._failed_load_reclaim_task
+        assert reclaim_task is not None
+
+        with patch("omlx.engine_pool.shutdown_mlx_executor") as shutdown_executor:
+            await pool.shutdown()
+
+        assert reclaim_task.cancelled()
+        assert not pool._failed_load_reclaim_tasks
+        shutdown_executor.assert_called_once_with()
 
 
 class TestEnginePoolEviction:

@@ -505,7 +505,7 @@ class TestEstimatePrefillPeakBytes:
 
     def test_sdpa_dispatch_constants_match_mlx_use_fallback(self):
         assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
-        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 72, 80, 96, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
         assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
 
     def test_vector_path_head_dim_256_is_output_only_for_short_query(self):
@@ -520,16 +520,24 @@ class TestEstimatePrefillPeakBytes:
             self._expected_fallback_sdpa(8, 4, 10_000, 80)
         )
 
+    def test_vector_path_head_dim_192_stays_conservative_without_force(self):
+        # MLX 0.32.2 instantiates this kernel, but its default dispatcher does
+        # not select it; only force_fused=True can make it memory-bounded.
+        m = self._make_monitor(head_dim=192, n_attn=8, n_kv=4, n_layers=48)
+        assert m.estimate_chunk_transient_bytes(4, 10_000) == (
+            self._expected_fallback_sdpa(8, 4, 10_000, 192)
+        )
+
     def test_full_prefill_head_dim_80_is_output_only(self):
         m = self._make_monitor(head_dim=80, n_attn=8, n_kv=4, n_layers=48)
         assert m.estimate_chunk_transient_bytes(512, 10_000) == (
             self._expected_output_sdpa(8, 512, 80)
         )
 
-    def test_full_prefill_head_dim_96_falls_back(self):
+    def test_full_prefill_head_dim_96_is_output_only(self):
         m = self._make_monitor(head_dim=96, n_attn=8, n_kv=4, n_layers=48)
         assert m.estimate_chunk_transient_bytes(512, 10_000) == (
-            self._expected_fallback_sdpa(8, 512, 10_000, 96)
+            self._expected_output_sdpa(8, 512, 96)
         )
 
     def test_vector_path_gqa_limit_falls_back(self):

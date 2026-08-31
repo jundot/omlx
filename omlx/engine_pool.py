@@ -39,7 +39,7 @@ from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
-from .engine_core import get_mlx_executor
+from .engine_core import get_mlx_executor, shutdown_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
     InsufficientMemoryError,
@@ -299,6 +299,8 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
+        self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
         self.configure_hot_cache_budget()
 
@@ -2431,6 +2433,15 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    def _finish_failed_load_reclaim_task(self, task: asyncio.Task[None]) -> None:
+        self._failed_load_reclaim_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Post-failed-load reclaim task failed")
+
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int
     ) -> None:
@@ -2474,11 +2485,15 @@ class EnginePool:
             )
             self._wake_process_memory_enforcer()
 
-        # Keep a reference so the task isn't garbage-collected mid-flight;
-        # one slot suffices -- a newer failure supersedes the previous task.
-        self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
-            _reclaim()
+        # Keep every task reachable until it finishes. Concurrent load failures
+        # can overlap, and shutdown must cancel/drain all of them before the
+        # process-wide MLX executor is reclaimed.
+        task = asyncio.get_running_loop().create_task(
+            _reclaim(), name=f"engine-failed-load-reclaim:{model_id}"
         )
+        self._failed_load_reclaim_task = task
+        self._failed_load_reclaim_tasks.add(task)
+        task.add_done_callback(self._finish_failed_load_reclaim_task)
 
     async def _load_engine(
         self,
@@ -3028,6 +3043,13 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
+        for task in reclaim_tasks:
+            task.cancel()
+        if reclaim_tasks:
+            await asyncio.gather(*reclaim_tasks, return_exceptions=True)
+        self._failed_load_reclaim_tasks.clear()
+        self._failed_load_reclaim_task = None
         pending_tasks = tuple(self._pending_unload_tasks.values())
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
@@ -3041,6 +3063,7 @@ class EnginePool:
                     except Exception as e:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
+        shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
     def get_status(self) -> dict:

@@ -1957,6 +1957,9 @@ class TestSchedulerReset:
             "executor_shutdown",
             "drain",
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        fake_executor.submit.assert_called_once_with(
+            scheduler_module.clear_thread_streams
+        )
         fake_executor.shutdown.assert_called_once_with(wait=False)
 
     def test_shutdown_closes_boundary_snapshot_store(

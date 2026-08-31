@@ -149,6 +149,7 @@ def test_int8_async_staging_file_roundtrip(tmp_path):
         staged = store.take_staged_file("durable", 2048, timeout_s=5.0)
         assert staged is not None
         arrays, metadata = mx.load(str(staged), return_metadata=True)
+        mx.eval(*arrays.values())
         assert arrays["layer_0_state_1"].dtype == mx.int8
         assert arrays["layer_0_state_1__scale"].dtype == mx.float32
         assert metadata["gdn_sidecar_format_version"] == "2"
@@ -287,6 +288,7 @@ def test_rht_int8_async_staging_file_roundtrip(tmp_path):
         staged = store.take_staged_file("rht-durable", 2048, timeout_s=5.0)
         assert staged is not None
         arrays, metadata = mx.load(str(staged), return_metadata=True)
+        mx.eval(*arrays.values())
         assert arrays["layer_0_state_1"].dtype == mx.int8
         assert arrays["layer_0_state_1__scale"].dtype == mx.float32
         info = json.loads(metadata["layer_info"])
@@ -846,6 +848,9 @@ def test_rejected_sidecar_degrades_to_a_cache_miss(tmp_path):
         assert store.gdn_decode_failures == 0
 
         arrays, metadata = mx.load(str(staged), return_metadata=True)
+        # Materialize before overwriting the same backing file. MLX 0.32.2
+        # otherwise retains read primitives that fail after the truncate.
+        mx.eval(*arrays.values())
         info = json.loads(metadata["layer_info"])
         info[0]["state_1_original_dtype"] = "bfloat16"
         metadata["layer_info"] = json.dumps(info)
@@ -1016,6 +1021,9 @@ def test_pending_raw_and_durable_file_restore_identically(tmp_path, mode):
         assert staged is not None
         durable = store.load_file(staged)
         assert durable is not None
+        # load_file must detach mx.load's lazy arrays from the ephemeral
+        # promotion file before ownership returns to the caller.
+        staged.unlink()
 
         pending_state = pending[0]["state"][1]
         durable_state = durable[0]["state"][1]

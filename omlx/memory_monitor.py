@@ -43,7 +43,7 @@ except ImportError:
 # different head dimensions; unsupported cases fall back to an unfused
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
-_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
+_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # Default bytes/elem for the materialized unfused score matrix when the model's
 # compute dtype is unknown. MLX softmax accumulates in fp32, but the dominant
@@ -58,22 +58,43 @@ _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 # kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
 # runtime by the kernel patch that installs the route (see
 # omlx/patches/sdpa256_attention.py); empty otherwise, so the estimate stays
-# O(L^2) when no such kernel is active. Maps head_dim -> kv_tile (the kernel's
-# KV block width, which bounds the per-chunk score transient).
-_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, int] = {}
-_SDPA_TILED_MIN_KV_LEN = 8192
+# O(L^2) when no such kernel is active. Each entry records the query/KV shape
+# floor actually covered by the installed route plus a conservative score-tile
+# width for admission accounting.
+
+
+@dataclass(frozen=True)
+class _BoundedSDPAPrefillRoute:
+    min_query_len: int
+    min_kv_len: int
+    kv_tile: int
+
+
+_SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, tuple[_BoundedSDPAPrefillRoute, ...]] = {}
 
 
 def register_tiled_prefill_head_dim(
-    head_dim: int, *, min_kv_len: int = 8192, kv_tile: int = 1024
+    head_dim: int,
+    *,
+    min_query_len: int = 2,
+    min_kv_len: int = 8192,
+    kv_tile: int = 1024,
 ) -> None:
-    """Register a head_dim whose long-context prefill now uses an O(L) tiled
-    kernel, so the prefill memory estimate stops charging the O(L^2) score
-    matrix for it. Must be called in lockstep with installing the kernel route,
-    or the guard keeps rejecting valid long-context requests."""
-    global _SDPA_TILED_MIN_KV_LEN
-    _SDPA_TILED_PREFILL_HEAD_DIMS[int(head_dim)] = int(kv_tile)
-    _SDPA_TILED_MIN_KV_LEN = int(min_kv_len)
+    """Register a bounded long-context route installed for one head dim.
+
+    Multiple native routes may cover the same head dimension at different
+    thresholds. Store them independently so combining two registrations can
+    never invent shape coverage that neither route actually guarantees.
+    """
+    head_dim = int(head_dim)
+    route = _BoundedSDPAPrefillRoute(
+        min_query_len=max(2, int(min_query_len)),
+        min_kv_len=max(1, int(min_kv_len)),
+        kv_tile=max(1, int(kv_tile)),
+    )
+    routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(head_dim, ())
+    if route not in routes:
+        _SDPA_TILED_PREFILL_HEAD_DIMS[head_dim] = (*routes, route)
 
 
 # Bytes/elem of a model-built additive attention bias materialized as a
@@ -729,12 +750,14 @@ class MemoryMonitor:
         # [n_q, query_tokens, kv_len] matrix. This matches the kernel's route
         # gate (query_len > 1, kv_len >= threshold); any query_len <= 1 already
         # returned above via the fused vector path.
-        kv_tile = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd)
-        if (
-            kv_tile is not None
-            and query_tokens > 1
-            and kv_len >= _SDPA_TILED_MIN_KV_LEN
-        ):
+        bounded_routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(hd, ())
+        matching_routes = [
+            route
+            for route in bounded_routes
+            if query_tokens >= route.min_query_len and kv_len >= route.min_kv_len
+        ]
+        if matching_routes:
+            kv_tile = max(route.kv_tile for route in matching_routes)
             tile_scores = (
                 n_q * query_tokens * min(kv_tile, kv_len) * self._score_dtype_size
             )
@@ -760,9 +783,9 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA only uses fused full-attention kernels for the head dimensions
-        supported by ``ScaledDotProductAttention::use_fallback``. Unsupported
-        prefill chunks fall back to an unfused fp32 score matrix whose K
+        MLX SDPA uses its fused full-attention kernels only for shapes accepted
+        by ``ScaledDotProductAttention::use_fallback``. Other prefill chunks
+        fall back to an unfused score matrix whose K
         dimension spans the full key/value context. With prefix-cache hits,
         that context is ``new_tokens + cached_tokens``, not just the new suffix.
         Passing only ``new_tokens`` here silently under-counts long-context

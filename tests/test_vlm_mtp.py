@@ -18,6 +18,17 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_mtp_rounds_share_the_wrapper_generation_stream():
+    """The wrapper must drain the same stream used inside both round loops."""
+    from mlx_vlm.speculative import common, mtp
+
+    stream = vlm_mtp._vlm_generation_stream
+    assert stream is common.generation_stream
+    assert stream is mtp.generation_stream
+    assert stream is vlm_mtp._mtp_rounds.__globals__["generation_stream"]
+    assert stream is vlm_mtp._mtp_rounds_batch.__globals__["generation_stream"]
+
+
 def test_qwen38_block_fp8_dequantization():
     from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
 

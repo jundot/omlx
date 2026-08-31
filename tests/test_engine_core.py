@@ -674,41 +674,6 @@ class TestEngineCoreClose:
             future.result.assert_called_once_with(timeout=60.0)
             assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
 
-    def test_close_fatal_exits_when_compile_cache_clear_times_out(
-        self, mock_model, mock_tokenizer
-    ):
-        """A stuck MLX compile-cache clear is also fatal."""
-        with patch("omlx.engine_core.get_registry") as mock_registry:
-            mock_registry.return_value.acquire.return_value = True
-
-            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
-            engine._mlx_executor.shutdown(wait=False)
-
-            ok_future = MagicMock()
-            ok_future.result.return_value = None
-            timeout_future = MagicMock()
-            timeout_future.result.side_effect = concurrent.futures.TimeoutError
-            executor = MagicMock()
-            executor.submit.side_effect = [
-                ok_future,
-                ok_future,
-                ok_future,
-                timeout_future,
-            ]
-            engine._mlx_executor = executor
-
-            with (
-                patch(
-                    "omlx.engine_core.compile_cache_clear_available", return_value=True
-                ),
-                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
-                pytest.raises(SystemExit),
-            ):
-                engine.close()
-
-            timeout_future.result.assert_called_once_with(timeout=60.0)
-            assert "MLX compile cache" in fatal.call_args.args[0]
-
 
 class TestEngineCoreGetCacheStats:
     """Tests for EngineCore.get_cache_stats()."""
@@ -1382,6 +1347,23 @@ class TestEngineCoreAbortAllRequests:
 
 class TestGlobalMLXExecutor:
     """Tests for the global MLX executor singleton (issue #85)."""
+
+    def test_shutdown_reclaims_on_worker_before_executor_exit(self):
+        import omlx.engine_core as engine_core
+
+        executor = MagicMock()
+        future = MagicMock()
+        executor.submit.return_value = future
+
+        with patch.object(engine_core, "_global_mlx_executor", executor):
+            engine_core.shutdown_mlx_executor()
+            assert engine_core._global_mlx_executor is None
+
+        executor.submit.assert_called_once_with(
+            engine_core._final_global_mlx_thread_reclaim
+        )
+        future.result.assert_called_once_with(timeout=60.0)
+        executor.shutdown.assert_called_once_with(wait=False)
 
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""

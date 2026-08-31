@@ -849,11 +849,9 @@ class TestEmbeddingCompileFallback:
         model._compiled_embed = MagicMock()
         model._remap_input_ids_to_inputs = True
 
-        with patch("omlx.models.embedding.gc.collect") as collect, \
-             patch("omlx.models.embedding.mx") as mock_mx, \
-             patch(
-                 "omlx.models.embedding.clear_thread_compile_cache"
-             ) as clear_compile_cache:
+        with patch("omlx.models.embedding.gc.collect") as collect, patch(
+            "omlx.models.embedding.mx"
+        ) as mock_mx:
             model.close()
 
         assert model.model is None
@@ -866,7 +864,6 @@ class TestEmbeddingCompileFallback:
         assert model._remap_input_ids_to_inputs is False
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
-        clear_compile_cache.assert_called_once()
         assert collect.call_count == 2
 
 
