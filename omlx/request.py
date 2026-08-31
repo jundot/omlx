@@ -292,7 +292,8 @@ class RequestOutput:
     # New tokens generated in this step
     new_token_ids: List[int] = field(default_factory=list)
     new_text: str = ""
-    # Cumulative output
+    # Cumulative output token ids. Only populated on the finished output;
+    # mid-stream outputs leave this empty to avoid an O(n^2) per-token copy.
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     # Status

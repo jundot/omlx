@@ -6324,6 +6324,79 @@ class TestStopStringOutputBuffer:
         assert "�" not in streamed_text
 
 
+class TestOutputTokenIdsCopy:
+    """Regression: only the finished output carries the cumulative id list.
+
+    _process_batch_responses used to attach list(request.output_token_ids)
+    to every emitted RequestOutput — an O(n^2) copy over a single response.
+    Mid-stream outputs must stay empty; the finished output must carry the
+    complete cumulative list, matching the request state at finish.
+    """
+
+    @staticmethod
+    def _response(token, finish_reason=None):
+        return SimpleNamespace(
+            uid=99,
+            token=token,
+            finish_reason=finish_reason,
+            logprobs=None,
+            prompt_cache=None,
+        )
+
+    def _setup(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._get_detokenizer = lambda request_id: None
+        request = Request(
+            request_id="outcopy",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=[1, 2],
+            num_prompt_tokens=2,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+        return scheduler, request
+
+    def test_intermediate_outputs_do_not_copy_cumulative_ids(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler, request = self._setup(mock_model, mock_tokenizer)
+        responses = [
+            self._response(10),
+            self._response(11),
+            self._response(12),
+            self._response(13, finish_reason="length"),
+        ]
+
+        outputs = []
+        for response in responses:
+            step_outputs, _ = scheduler._process_batch_responses([response])
+            outputs.extend(step_outputs)
+
+        assert len(outputs) == 4
+        # Mid-stream outputs carry only the per-step delta, not the history.
+        assert all(output.output_token_ids == [] for output in outputs[:-1])
+        assert [output.new_token_ids for output in outputs] == [
+            [10],
+            [11],
+            [12],
+            [13],
+        ]
+        # The finished output carries the complete cumulative list as an
+        # owned copy (not an alias of the request's list).
+        assert outputs[-1].finished is True
+        assert (
+            outputs[-1].output_token_ids
+            == request.output_token_ids
+            == [10, 11, 12, 13]
+        )
+        assert outputs[-1].output_token_ids is not request.output_token_ids
+
+
 class TestTurboQuantMLAGuard:
     """Regression tests for #1613: MLA models must not be TurboQuant-converted.
 

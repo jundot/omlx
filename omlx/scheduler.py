@@ -10865,7 +10865,10 @@ class Scheduler:
             ):
                 response.logprobs = None
 
-            # Create output
+            # Create output. output_token_ids stays empty here on purpose:
+            # copying the growing cumulative list for every emitted token is
+            # O(n^2) over a response. The full list is attached once below
+            # when the request finishes.
             output_generated_at = (
                 generated_at
                 if request.num_output_tokens > completion_tokens_before
@@ -10875,7 +10878,6 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
@@ -10909,6 +10911,8 @@ class Scheduler:
                 elif is_length:
                     request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED)
 
+                # Attach the complete cumulative ids only on the final output.
+                output.output_token_ids = list(request.output_token_ids)
                 output.finished = True
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
