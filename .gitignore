@@ -104,6 +104,11 @@ packaging/_export/
 packaging/_build/
 *.dmg
 
+# Out-of-tree custom-kernel dev build dirs (CMakeCache.txt, CMakeFiles/,
+# Makefile, libnanobind-static.a, .o -- never committed). Distinct name from
+# the already-ignored build/, so it needs its own rule.
+build_dev/
+
 # Generated engine commit metadata (build-time artifact)
 omlx/_engine_commits.json
 
