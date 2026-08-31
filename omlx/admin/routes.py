@@ -5101,6 +5101,29 @@ def _build_runtime_cache_observability(
         boundary_snapshots = runtime_stats.get("boundary_snapshots")
         if not isinstance(boundary_snapshots, dict):
             boundary_snapshots = None
+        # The embedded layout reports the same codec counters the sidecar
+        # layout publishes under gdn_staging; map them through with the same
+        # typing so an admin client sees one shape for both storage paths.
+        gdn_embedded = runtime_stats.get("gdn_embedded_state")
+        if not isinstance(gdn_embedded, dict):
+            gdn_embedded = None
+        else:
+            gdn_embedded = {
+                "state_dtype": str(gdn_embedded.get("state_dtype", "fp32") or "fp32"),
+                "state_encodes": int(gdn_embedded.get("state_encodes", 0) or 0),
+                "state_dequantizations": int(
+                    gdn_embedded.get("state_dequantizations", 0) or 0
+                ),
+                "encode_failures": int(
+                    gdn_embedded.get("encode_failures", 0) or 0
+                ),
+                "decode_failures": int(
+                    gdn_embedded.get("decode_failures", 0) or 0
+                ),
+                "capability_fallbacks": int(
+                    gdn_embedded.get("capability_fallbacks", 0) or 0
+                ),
+            }
         last_prefix_lookup = runtime_stats.get("last_prefix_lookup")
         if not isinstance(last_prefix_lookup, dict):
             last_prefix_lookup = None
@@ -5181,6 +5204,8 @@ def _build_runtime_cache_observability(
 
         if boundary_snapshots is not None:
             model_payload["boundary_snapshots"] = boundary_snapshots
+        if gdn_embedded is not None:
+            model_payload["gdn_embedded_state"] = gdn_embedded
         if last_prefix_lookup is not None:
             model_payload["last_prefix_lookup"] = last_prefix_lookup
 
