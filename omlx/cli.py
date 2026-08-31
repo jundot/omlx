@@ -42,6 +42,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _port_number(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not (1 <= parsed <= 65535):
+        raise argparse.ArgumentTypeError("must be a TCP port between 1 and 65535")
+    return parsed
+
+
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
 
@@ -970,9 +980,198 @@ def cluster_command(args) -> int:
                 print(f"Measured:    {holder.node} (the node holding the model)")
         return 0
 
+    if action == "discover":
+        from .cluster.sweep import (
+            _DEFAULT_PROBE_TIMEOUT,
+            default_sweep_ports,
+            detect_local_subnet,
+            sweep_subnet,
+        )
+        from omlx.settings import ServerSettings
+
+        cidr = args.cidr
+        if cidr is None:
+            cidr = detect_local_subnet()
+            if not cidr:
+                print(
+                    "Could not detect this host's subnet; pass --cidr explicitly",
+                    file=sys.stderr,
+                )
+                return 2
+
+        try:
+            found = sweep_subnet(
+                cidr,
+                ports=args.ports,
+                timeout=(
+                    args.timeout
+                    if args.timeout is not None
+                    else _DEFAULT_PROBE_TIMEOUT
+                ),
+            )
+        except ValueError as exc:
+            print(f"Cluster discovery failed: {exc}", file=sys.stderr)
+            return 2
+
+        if args.json:
+            print(json.dumps({"cidr": cidr, "hosts": found}, indent=2, sort_keys=True))
+        else:
+            probed_ports = tuple(args.ports) if args.ports else default_sweep_ports()
+            port_label = "/".join(str(port) for port in probed_ports)
+            print(f"Swept {cidr}")
+            if not found:
+                print(f"No hosts answered on ports {port_label}")
+                return 0
+            for entry in found:
+                ports = ",".join(str(p) for p in entry["open_ports"])
+                print(f"  {entry['address']:<16} open ports: {ports}")
+        return 0
+
+    if action == "inventory":
+        from .cluster.inventory import (
+            add_host,
+            load_inventory,
+            remove_host,
+            save_inventory,
+        )
+
+        inventory_action = getattr(args, "inventory_action", None)
+        if inventory_action == "list":
+            inventory = load_inventory()
+            if args.json:
+                print(json.dumps(inventory.to_dict(), indent=2, sort_keys=True))
+                return 0
+            if not inventory.hosts:
+                print("Inventory is empty")
+                return 0
+            for host in inventory.hosts:
+                state = "provisioned" if host.provisioned else "pending"
+                print(
+                    f"  {host.name:<24} {host.user}@{host.name} "
+                    f"group={host.group} {state}"
+                )
+            return 0
+
+        if inventory_action == "add":
+            try:
+                inventory = add_host(
+                    load_inventory(),
+                    args.host,
+                    user=args.user,
+                    port=args.port,
+                    group=args.group,
+                    discovered_from="manual",
+                )
+            except ValueError as exc:
+                print(f"Inventory add failed: {exc}", file=sys.stderr)
+                return 2
+            save_inventory(inventory)
+            print(f"Added {args.host} to the cluster inventory")
+            return 0
+
+        if inventory_action == "remove":
+            inventory = load_inventory()
+            if not remove_host(inventory, args.host):
+                print(f"Host not found in inventory: {args.host}", file=sys.stderr)
+                return 1
+            save_inventory(inventory)
+            print(f"Removed {args.host} from the cluster inventory")
+            return 0
+
+        print("Unknown inventory action. Available: list, add, remove",
+              file=sys.stderr)
+        return 2
+
+    if action == "provision":
+        import getpass
+
+        from .cluster.inventory import load_inventory
+        from .cluster.provisioning import (
+            ProvisioningError,
+            provision_hosts,
+        )
+
+        if args.ask_pass and args.key:
+            print(
+                "Use either --key or --ask-pass, not both",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.ask_pass and not args.key:
+            print(
+                "provision needs --key <existing SSH private key> or --ask-pass",
+                file=sys.stderr,
+            )
+            return 2
+
+        inventory = load_inventory()
+        if args.hosts:
+            unknown = [host for host in args.hosts if inventory.get(host) is None]
+            if unknown:
+                print(
+                    f"Hosts not in inventory (add them first): {', '.join(unknown)}",
+                    file=sys.stderr,
+                )
+                return 2
+            selected = [
+                (host, inventory.get(host).user if inventory.get(host) else "")
+                for host in args.hosts
+            ]
+        else:
+            if not inventory.hosts:
+                print(
+                    "Inventory is empty; run 'omlx cluster inventory add' first",
+                    file=sys.stderr,
+                )
+                return 2
+            selected = [(host.name, host.user) for host in inventory.hosts]
+
+        password = None
+        if args.ask_pass:
+            password = getpass.getpass("SSH password for provisioning: ")
+
+        try:
+            results = provision_hosts(
+                selected,
+                admin_key_path=args.key,
+                password=password,
+            )
+        except (ProvisioningError, ValueError) as exc:
+            print(f"Provisioning failed: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            password = None
+
+        if results["failed"] == 0 and not args.json:
+            from .cluster.inventory import add_host, load_inventory, save_inventory
+
+            inventory = load_inventory()
+            for host, _user in selected:
+                existing = inventory.get(host)
+                if existing is not None:
+                    inventory = add_host(
+                        inventory,
+                        host,
+                        user=existing.user,
+                        port=existing.port,
+                        group=existing.group,
+                        discovered_from=existing.discovered_from,
+                        provisioned=True,
+                    )
+            save_inventory(inventory)
+
+        if args.json:
+            print(json.dumps(results, indent=2, sort_keys=True))
+        else:
+            for host, message in results["errors"].items():
+                print(f"  {host:<24} FAILED: {message}")
+            print(f"Provisioned {results['ok']} host(s), "
+                  f"{results['failed']} failed")
+        return 0 if results["failed"] == 0 else 1
+
     print(
         "Unknown cluster action. Available: status, worker-smoke, "
-        "collective-smoke, pipeline-smoke, plan",
+        "collective-smoke, pipeline-smoke, plan, discover, inventory, provision",
         file=sys.stderr,
     )
     return 2
@@ -1438,6 +1637,125 @@ Example directory structure:
         ),
     )
     cluster_plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_discover_parser = cluster_subparsers.add_parser(
+        "discover",
+        help="Sweep a subnet for SSH/oMLX nodes and merge Bonjour results",
+    )
+    from .cluster.sweep import (
+        _DEFAULT_PROBE_TIMEOUT,
+        default_sweep_ports,
+    )
+    from omlx.settings import ServerSettings
+
+    cluster_discover_parser.add_argument(
+        "--cidr",
+        metavar="CIDR",
+        default=None,
+        help="IPv4 subnet to sweep (for example 192.168.1.0/24); "
+        "defaults to this host's private subnet",
+    )
+    cluster_discover_parser.add_argument(
+        "--ports",
+        nargs="+",
+        type=_port_number,
+        metavar="PORT",
+        default=None,
+        help=(
+            "TCP ports to probe (default: SSH 22 and the oMLX admin port "
+            f"{ServerSettings.port})"
+        ),
+    )
+    cluster_discover_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=None,
+        help="Per-port probe timeout in seconds "
+        f"(default: {_DEFAULT_PROBE_TIMEOUT})",
+    )
+    cluster_discover_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_inventory_parser = cluster_subparsers.add_parser(
+        "inventory",
+        help="Manage the cluster host inventory file",
+    )
+    cluster_inventory_subparsers = cluster_inventory_parser.add_subparsers(
+        dest="inventory_action",
+        required=True,
+        help="Inventory command",
+    )
+    cluster_inventory_list_parser = cluster_inventory_subparsers.add_parser(
+        "list",
+        help="Show inventory hosts and their provision state",
+    )
+    cluster_inventory_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_inventory_add_parser = cluster_inventory_subparsers.add_parser(
+        "add",
+        help="Add or update a host in the inventory",
+    )
+    from .cluster.ssh_identity import _SSH_PORT, default_ssh_user
+
+    cluster_inventory_add_parser.add_argument("host", metavar="HOST")
+    cluster_inventory_add_parser.add_argument(
+        "--user",
+        default=default_ssh_user(),
+        help=f"SSH user for this host (default: {default_ssh_user()})",
+    )
+    cluster_inventory_add_parser.add_argument(
+        "--port",
+        type=_positive_int,
+        default=_SSH_PORT,
+        help=f"SSH port (default: {_SSH_PORT})",
+    )
+    cluster_inventory_add_parser.add_argument(
+        "--group",
+        default="all",
+        help="Inventory group (default: all)",
+    )
+    cluster_inventory_remove_parser = cluster_inventory_subparsers.add_parser(
+        "remove",
+        help="Remove a host from the inventory",
+    )
+    cluster_inventory_remove_parser.add_argument("host", metavar="HOST")
+    cluster_provision_parser = cluster_subparsers.add_parser(
+        "provision",
+        help="Push the managed cluster key to inventory hosts",
+    )
+    cluster_provision_parser.add_argument(
+        "--hosts",
+        nargs="+",
+        metavar="HOST",
+        default=None,
+        help="Provision only these hosts (default: all inventory hosts)",
+    )
+    cluster_provision_parser.add_argument(
+        "--key",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Existing SSH private key used to authenticate to the host while "
+            "the managed cluster key is installed"
+        ),
+    )
+    cluster_provision_parser.add_argument(
+        "--ask-pass",
+        action="store_true",
+        help=(
+            "Prompt once for a password used to bootstrap each host "
+            "(one-shot sshpass transport; the password is never stored)"
+        ),
+    )
+    cluster_provision_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",
