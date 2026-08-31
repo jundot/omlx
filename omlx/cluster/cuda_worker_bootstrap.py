@@ -433,11 +433,25 @@ def _host_public_key() -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Join this CUDA machine to oMLX")
     parser.add_argument("--controller", required=True)
-    parser.add_argument("--join-key", required=True)
+    parser.add_argument("--join-key")
+    parser.add_argument(
+        "--join-key-stdin",
+        action="store_true",
+        help="Read the join key from stdin instead of --join-key",
+    )
     parser.add_argument("--controller-key-fingerprint", required=True)
     parser.add_argument("--source-digest", required=True)
     parser.add_argument("--ssh-user")
     args = parser.parse_args(argv)
+
+    if args.join_key_stdin:
+        join_key = sys.stdin.read().strip()
+    elif args.join_key:
+        join_key = args.join_key
+    else:
+        raise BootstrapError(
+            "a join key is required, via --join-key or --join-key-stdin"
+        )
 
     if os.geteuid() != 0:
         raise BootstrapError("the worker bootstrap must run through sudo")
@@ -458,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             "accelerator": "cuda",
             "platform": platform.platform()[:255],
         },
-        bearer=args.join_key,
+        bearer=join_key,
     )
     session_token = str(claim.get("session_token") or "")
     source_digest = str(claim.get("source_digest") or "")

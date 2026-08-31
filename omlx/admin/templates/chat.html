@@ -2520,7 +2520,6 @@
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
     const MAX_CHAT_HISTORY_SIZE = 100;
     const CHAT_HISTORY_STORAGE_KEY = 'omlx_chat_history';
-    const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
@@ -2541,9 +2540,10 @@
 
     function chatApp() {
         return {
-            // API Key
+            // API Key (kept in memory only — never persisted to localStorage)
             apiKeySet: false,
             apiKeyInput: '',
+            apiKeyValue: '',
 
             // UI State
             // Touch/coarse-pointer devices (phones, tablets) — NOT just narrow windows.
@@ -3925,11 +3925,10 @@
                 const serverApiKey = {{ api_key | tojson }};
 
         if (serverApiKey) {
-            localStorage.setItem(API_KEY_STORAGE_KEY, serverApiKey);
+            this.apiKeyValue = serverApiKey;
         }
 
-        const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
-        if (storedKey) {
+        if (this.apiKeyValue) {
             this.apiKeySet = true;
             await this.loadModels();
             if (this.currentModel) {
@@ -4668,7 +4667,7 @@
 
     async saveApiKey() {
         if (!this.apiKeyInput.trim()) return;
-        localStorage.setItem(API_KEY_STORAGE_KEY, this.apiKeyInput.trim());
+        this.apiKeyValue = this.apiKeyInput.trim();
         this.apiKeySet = true;
         this.apiKeyInput = '';
         try {
@@ -4683,7 +4682,7 @@
     },
 
     getApiKey() {
-        return localStorage.getItem(API_KEY_STORAGE_KEY) || '';
+        return this.apiKeyValue || '';
     },
 
     combineAbortSignals(signals) {
@@ -4748,7 +4747,7 @@
             if (!modelsResponse.ok) {
                 if (modelsResponse.status === 401) {
                     alert(window.t('chat.error.incorrect_api_key'));
-                    localStorage.removeItem(API_KEY_STORAGE_KEY);
+                    this.apiKeyValue = '';
                     this.apiKeySet = false;
                     this.messages = [];
                     this.currentChatId = null;

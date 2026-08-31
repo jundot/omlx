@@ -1007,8 +1007,48 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
-        NSWorkspace.shared.open(url)
+        let apiKey = config.apiKey
+
+        // Exchange the main API key for a short-lived auto-login token so
+        // the permanent key is never placed in the browser URL. On any
+        // failure (no key, server down, reject) open without a token — the
+        // server gracefully redirects to the login page.
+        if let apiKey, !apiKey.isEmpty {
+            Task {
+                let token = await fetchAutoLoginToken(host: host, port: port, apiKey: apiKey)
+                guard let url = MenubarController.webAdminURL(host: host, port: port, token: token)
+                else { return }
+                NSWorkspace.shared.open(url)
+            }
+        } else {
+            guard let url = MenubarController.webAdminURL(host: host, port: port, token: nil)
+            else { return }
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// POSTs the main API key to `/admin/api/auto-login-token` and returns
+    /// the short-lived auto-login token, or nil if the exchange fails. The
+    /// key travels in the request body only — never in the URL.
+    private func fetchAutoLoginToken(host: String, port: Int, apiKey: String) async -> String? {
+        guard let baseURL = AppConfig.httpURL(host: host, port: port) else { return nil }
+        var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/admin/api/auto-login-token"
+        guard let url = comps?.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["key": apiKey])
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode,
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let token = json["token"] as? String, !token.isEmpty else {
+            return nil
+        }
+        return token
     }
 
     @objc private func openChat() {
@@ -1398,37 +1438,32 @@ extension MenubarController {
 
     /// Builds the browser URL for the web admin dashboard. Uses the
     /// `/admin/auto-login` endpoint so the dashboard opens without the
-    /// manual login form: the server validates the main API key, sets the
-    /// session cookie, then redirects to `redirect`. A missing/stale key
-    /// makes the endpoint redirect to the login page instead — a graceful
-    /// fallback, so we still emit the URL.
-    ///
-    /// `URLComponents.queryItems` percent-encodes the key, so a key
-    /// containing `&`, `=`, `/`, spaces etc. is transmitted intact. The one
-    /// exception is `+`: URLComponents leaves it unescaped and servers
-    /// decode `+` as a space (form-urlencoded semantics), which would
-    /// corrupt a key containing `+`. We escape it explicitly below.
+    /// manual login form: the caller first exchanges the main API key for
+    /// a short-lived token (POST to `/admin/api/auto-login-token`), then
+    /// passes that token here. The server validates it, sets the session
+    /// cookie, and redirects to `redirect`. The permanent key never
+    /// appears in a URL. A missing/stale token makes the endpoint redirect
+    /// to the login page instead — a graceful fallback, so we still emit
+    /// the URL.
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
-    static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
+    static func webAdminURL(host: String, port: Int, token: String?) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
             port: port
-        ),
-              var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
-        else {
+        ) else {
             return nil
         }
-        comps.path = "/admin/auto-login"
-        var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
-        if let key = apiKey, !key.isEmpty {
-            items.append(URLQueryItem(name: "key", value: key))
+        var urlString = baseURL.absoluteString + "/admin/auto-login?redirect=/admin/dashboard"
+        if let token = token, !token.isEmpty {
+            // Percent-encode so '+' and '&' in the token survive query parsing
+            // intact; '/' is kept literal (URLComponents leaves it as-is too).
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~/"))
+            let encoded = token.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            urlString += "&token=" + encoded
         }
-        comps.queryItems = items
-        comps.percentEncodedQuery = comps.percentEncodedQuery?
-            .replacingOccurrences(of: "+", with: "%2B")
-        return comps.url
+        return URL(string: urlString)
     }
 
     static func shouldShowGenericFailureAlert(message: String) -> Bool {

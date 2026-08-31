@@ -51,10 +51,12 @@ from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
     compare_keys,
+    create_auto_login_token,
     create_session_token,
     require_admin,
     validate_api_key,
     verify_api_key,
+    verify_auto_login_token,
     verify_session,
 )
 
@@ -73,6 +75,12 @@ class LoginRequest(BaseModel):
 
     api_key: str
     remember: bool = False
+
+
+class AutoLoginTokenRequest(BaseModel):
+    """Request model for the /admin/api/auto-login-token exchange."""
+
+    key: str
 
 
 class SetupApiKeyRequest(BaseModel):
@@ -1522,9 +1530,44 @@ async def admin_static(path: str):
 # Authentication API Routes
 # =============================================================================
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+
+
+def _is_loopback_request(http_request: Request) -> bool:
+    """Return True when the request originates from a loopback client.
+
+    A missing or unresolvable client host is treated as loopback so the
+    local (default) case keeps working over plain HTTP.
+    """
+    if http_request is None:
+        return True
+    client = getattr(http_request, "client", None)
+    host = getattr(client, "host", None)
+    return host is None or host in _LOOPBACK_HOSTS
+
+
+def _set_session_cookie(
+    response: Response, token: str, max_age: int, http_request: Request
+) -> None:
+    """Set the admin session cookie.
+
+    The cookie is marked ``Secure`` whenever the session was established
+    from a non-loopback client, so it is never transmitted over cleartext
+    HTTP on LAN/exposed setups. Loopback (the default) keeps Secure off so
+    the local http://127.0.0.1 session keeps working.
+    """
+    response.set_cookie(
+        key="omlx_admin_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=max_age,
+        secure=not _is_loopback_request(http_request),
+    )
+
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     """
     Authenticate with API key and create session.
 
@@ -1534,6 +1577,7 @@ async def login(request: LoginRequest, response: Response):
     Args:
         request: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
+        http_request: The underlying FastAPI request (for Secure-cookie decision).
 
     Returns:
         JSON response with success status.
@@ -1561,19 +1605,15 @@ async def login(request: LoginRequest, response: Response):
     # Create session token and set cookie
     token = create_session_token(remember=request.remember)
     cookie_max_age = REMEMBER_ME_MAX_AGE if request.remember else SESSION_MAX_AGE
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=cookie_max_age,
-    )
+    _set_session_cookie(response, token, cookie_max_age, http_request)
 
     return {"success": True}
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest, response: Response, http_request: Request
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1626,13 +1666,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
 
     # Create session token and set cookie (auto-login after setup)
     token = create_session_token()
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,  # 24 hours
-    )
+    _set_session_cookie(response, token, 86400, http_request)
 
     return {"success": True, "message": "API key configured successfully"}
 
@@ -1652,16 +1686,49 @@ async def logout(response: Response):
     return {"success": True}
 
 
-@router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+@router.post("/api/auto-login-token")
+async def create_auto_login_token_route(request: AutoLoginTokenRequest):
+    """Exchange the main API key for a short-lived browser auto-login token.
+
+    The macOS menubar app POSTs the main API key here (in the request body,
+    never in a URL) and opens the returned token in the browser. The token
+    is signed, single-purpose, and expires within ``AUTO_LOGIN_MAX_AGE``
+    seconds, so the permanent key never appears in browser history, server
+    logs, or the OS-level URL.
+
+    Only the main key is accepted — sub keys must not grant admin login.
     """
-    Auto-login using API key and redirect to the target admin page.
+    global_settings = _get_global_settings()
+    server_api_key = global_settings.auth.api_key if global_settings else None
+    if (
+        not request.key
+        or not server_api_key
+        or not verify_api_key(request.key, server_api_key)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return {"token": create_auto_login_token()}
+
+
+@router.get("/auto-login")
+async def auto_login(
+    http_request: Request,
+    auth_token: str = "",
+    redirect: str = "/admin/dashboard",
+):
+    """
+    Auto-login using a short-lived auto-login token and redirect to the
+    target admin page.
 
     Used by the macOS menubar app to open admin pages with automatic
-    authentication, bypassing the manual login form.
+    authentication, bypassing the manual login form. The app first POSTs
+    the main API key to ``/admin/api/auto-login-token`` and receives a
+    short-lived token; this endpoint consumes it. Keeping the permanent
+    key out of this URL prevents it leaking through browser history,
+    server access logs, and process listings.
 
     Args:
-        key: The API key for authentication.
+        http_request: The underlying FastAPI request (for Secure-cookie decision).
+        auth_token: Short-lived signed auto-login token.
         redirect: The path to redirect to after login. Must start with /admin.
 
     Returns:
@@ -1670,22 +1737,12 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    if not auth_token or not verify_auto_login_token(auth_token):
         return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()
     response = RedirectResponse(url=redirect, status_code=302)
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,
-    )
+    _set_session_cookie(response, token, 86400, http_request)
     return response
 
 
