@@ -4757,7 +4757,13 @@ async def stream_chat_completion(
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        # Grammar-constrained responses may skip the (template-opened)
+        # thinking phase entirely — classify a schema-opening first char
+        # as content instead of streaming the whole answer as reasoning.
+        content_on_schema_start=bool(kwargs.get("compiled_grammar")),
+    )
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -5202,7 +5208,13 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        # Grammar-constrained responses may skip the (template-opened)
+        # thinking phase entirely — classify a schema-opening first char
+        # as content instead of streaming the whole answer as reasoning.
+        content_on_schema_start=bool(kwargs.get("compiled_grammar")),
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -6577,7 +6589,13 @@ async def stream_responses_api(
                 )
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        # Grammar-constrained responses may skip the (template-opened)
+        # thinking phase entirely — classify a schema-opening first char
+        # as content instead of streaming the whole answer as reasoning.
+        content_on_schema_start=bool(kwargs.get("compiled_grammar")),
+    )
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)

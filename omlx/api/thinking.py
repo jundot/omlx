@@ -9,9 +9,12 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import logging
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
@@ -234,7 +237,11 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self, start_in_thinking: bool = False):
+    def __init__(
+        self,
+        start_in_thinking: bool = False,
+        content_on_schema_start: bool = False,
+    ):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
         # Recovery state for malformed thinking: when the prompt prepends
@@ -246,6 +253,22 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Grammar-aware fallback for structured-output requests: the server
+        # forces the thinking template open (prompt ends on ``<think>``) so
+        # the structural-tag grammar can span the reasoning phase, but a
+        # model told not to think (``/no_think``, empty think block styles)
+        # jumps straight into the schema without ever emitting ``</think>``.
+        # The triggered grammar allows that — and everything would stream as
+        # reasoning_content until the finish() recovery. When this flag is
+        # set, the FIRST non-whitespace character decides: a schema opener
+        # (``{`` / ``[``) means the model skipped thinking, so flip to
+        # content immediately; anything else locks normal thinking handling.
+        self._content_on_schema_start: bool = content_on_schema_start
+        self._schema_probe_done: bool = False
+        # Sticky once the probe decided "schema": open tags seen after the
+        # decision (e.g. a synthetic ``<think>\n`` sharing the chunk with the
+        # schema text) are consumed silently instead of re-entering thinking.
+        self._schema_forced_content: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -263,6 +286,31 @@ class ThinkingParser:
         text = self._buffer + text
         self._buffer = ""
 
+        # Structured-output probe (see __init__): decide once, on the first
+        # non-whitespace character, whether the model skipped its thinking
+        # phase and went straight into the schema.
+        if (
+            self._content_on_schema_start
+            and self._in_thinking
+            and not self._schema_probe_done
+            and not self._close_seen
+        ):
+            probe = text.lstrip()
+            for tag in (_OPEN_TAG, _HY3_OPEN_TAG):
+                if probe.startswith(tag):
+                    probe = probe[len(tag):].lstrip()
+            if probe and not self._could_be_tag(probe):
+                self._schema_probe_done = True
+                if probe[0] in "{[":
+                    self._in_thinking = False
+                    self._schema_forced_content = True
+                    logger.info(
+                        "ThinkingParser: structured-output response opened "
+                        "with %r — model skipped thinking, streaming as "
+                        "content",
+                        probe[0],
+                    )
+
         thinking_out = []
         content_out = []
 
@@ -274,12 +322,14 @@ class ThinkingParser:
 
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
-                    self._in_thinking = True
+                    if not self._schema_forced_content:
+                        self._in_thinking = True
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
-                    self._in_thinking = True
+                    if not self._schema_forced_content:
+                        self._in_thinking = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
@@ -355,6 +405,15 @@ class ThinkingParser:
         ):
             recovered = "".join(self._thinking_accumulated) + partial
             self._content_emitted = True
+            # This recovery should be rare.  When it fires for every long
+            # request the close tag is being lost upstream (e.g. the
+            # grammar matcher desync fixed in api/grammar.py) — make that
+            # visible instead of silently double-emitting.
+            logger.warning(
+                "ThinkingParser.finish recovery: </think> never arrived, "
+                "re-emitting %d thinking chars as content",
+                len(recovered),
+            )
             return ("", recovered)
 
         if not partial:
