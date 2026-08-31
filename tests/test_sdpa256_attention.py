@@ -368,10 +368,14 @@ class _HeadroomOwner:
 
 @pytest.fixture
 def _sdpa256_provider_reset(monkeypatch):
-    """Isolate the module-level provider/override state and restore it."""
+    """Isolate the thread-local provider/override state and restore it."""
+    import threading
+
     from omlx.patches import sdpa256_attention as sdpa256
 
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
+    )
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
     return sdpa256
@@ -412,6 +416,60 @@ def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_rese
     assert sdpa256._should_route(q, k, None, "causal", None) is True
 
 
+def test_provider_binding_is_idempotent_and_replaceable(_sdpa256_provider_reset):
+    sdpa256 = _sdpa256_provider_reset
+    first = _HeadroomOwner(1)
+    second = _HeadroomOwner(2)
+
+    sdpa256.set_unfused_headroom_provider(first.headroom)
+    first_ref = sdpa256._HEADROOM_PROVIDER_LOCAL.ref
+    sdpa256.set_unfused_headroom_provider(first.headroom)
+    assert sdpa256._HEADROOM_PROVIDER_LOCAL.ref is first_ref
+
+    sdpa256.set_unfused_headroom_provider(second.headroom)
+    provider = sdpa256._get_unfused_headroom_provider()
+    assert provider is not None
+    assert provider.__self__ is second
+
+
+def test_worker_provider_survives_other_scheduler_teardown(
+    _sdpa256_provider_reset,
+):
+    """A later engine must not replace or clear a surviving engine's provider."""
+    import concurrent.futures
+    import gc
+
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    surviving = _HeadroomOwner(1 << 40)
+    later = _HeadroomOwner(1)
+
+    def route(worker):
+        return worker.submit(
+            sdpa256._should_route, q, k, None, "causal", None
+        ).result()
+
+    with (
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) as first_worker,
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) as second_worker,
+    ):
+        first_worker.submit(
+            sdpa256.set_unfused_headroom_provider, surviving.headroom
+        ).result()
+        second_worker.submit(
+            sdpa256.set_unfused_headroom_provider, later.headroom
+        ).result()
+
+        assert route(first_worker) is False
+        assert route(second_worker) is True
+
+        del later
+        gc.collect()
+
+        assert route(first_worker) is False
+        assert route(second_worker) is True
+
+
 def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):
     sdpa256 = _sdpa256_provider_reset
 
@@ -426,6 +484,8 @@ def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):
 
 
 def test_force_tiled_override(_sdpa256_provider_reset, monkeypatch):
+    import threading
+
     sdpa256 = _sdpa256_provider_reset
     q, k, _ = _qkv(2048, 16384)
     owner = _HeadroomOwner(1 << 40)
@@ -435,7 +495,9 @@ def test_force_tiled_override(_sdpa256_provider_reset, monkeypatch):
     assert sdpa256._should_route(q, k, None, "causal", None) is True
     # 0: never tiled even without headroom info.
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", False, raising=False)
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
+    )
     assert sdpa256._should_route(q, k, None, "causal", None) is False
 
 
@@ -610,10 +672,8 @@ def test_unguarded_fast_path_logs_once(caplog):
     assert "OMLX_SDPA256_TILED=1" in msg
 
 
-def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
-    """Constructing a Scheduler must wire the provider (the production seam:
-    a rename that silently skips registration would revert #2204 to an
-    unbounded default)."""
+def test_scheduler_step_registers_headroom_provider(_sdpa256_provider_reset):
+    """Scheduler.step must bind its provider on the model execution thread."""
     from unittest.mock import MagicMock
 
     from omlx.scheduler import Scheduler, SchedulerConfig
@@ -628,9 +688,9 @@ def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
         tokenizer=tokenizer,
         config=SchedulerConfig(paged_cache_block_size=0),
     )
-    ref = sdpa256._HEADROOM_PROVIDER
-    assert ref is not None
-    bound = ref()
+    assert sdpa256._get_unfused_headroom_provider() is None
+    scheduler.step()
+    bound = sdpa256._get_unfused_headroom_provider()
     assert bound is not None
     assert bound.__self__ is scheduler
     # Ceiling not propagated yet -> negative sentinel keeps the bounded default.

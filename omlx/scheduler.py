@@ -51,13 +51,13 @@ from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .decode_activity import get_decode_activity
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
 from .patches.sdpa256_attention import set_unfused_headroom_provider
-from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -1984,12 +1984,6 @@ class Scheduler:
         # and taken after the first prefill chunk's eval.
         self._fixed_state_measure_armed: bool = False
         self._fixed_state_recorded: bool = False
-        # Let the sdpa256 head_dim-256 prefill route ask for live guard
-        # headroom so it only forces bounded native SDPA when the faster
-        # unfused default would not fit (issue #2204). Weakly held; harmless
-        # when the patch is never applied.
-        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
-
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
         self._draft_paged_ssd_cache_manager: Any | None = None
@@ -11883,6 +11877,11 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
+        # Bind on the thread that runs model forwards. Scheduler construction
+        # can happen on a shared event-loop thread, while every engine executes
+        # steps on its own worker. The setter is idempotent for repeated steps.
+        set_unfused_headroom_provider(self._sdpa256_unfused_headroom)
+
         output = SchedulerOutput()
 
         # Publish decode activity for cross-engine prefill fairness (a
