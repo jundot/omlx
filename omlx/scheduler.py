@@ -1547,6 +1547,11 @@ class SchedulerConfig:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk. Inert while nothing is decoding.
     decode_fairness: bool = True
+    # Cap on concurrently resident model engines. When a new model load
+    # would exceed the cap, the least recently used loaded (non-pinned,
+    # idle) model is evicted first. None = unlimited (only the memory
+    # guard drives eviction).
+    max_loaded_models: int | None = None
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block

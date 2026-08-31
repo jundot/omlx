@@ -339,6 +339,7 @@ class TestSchedulerSettings:
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
         assert settings.embedding_batch_size == 32
+        assert settings.max_loaded_models is None
 
     def test_custom_values(self):
         """Test custom values."""
@@ -358,7 +359,22 @@ class TestSchedulerSettings:
             "chunked_prefill": False,
             "prefill_priority": "context",
             "decode_fairness": True,
+            "max_loaded_models": None,
         }
+
+    def test_max_loaded_models_from_dict(self):
+        """Defaults to None; explicit values round-trip; 0 normalizes to None."""
+        assert SchedulerSettings.from_dict({}).max_loaded_models is None
+        assert SchedulerSettings.from_dict({"max_loaded_models": 3}).max_loaded_models == 3
+        # Round-trip through to_dict/from_dict
+        settings = SchedulerSettings(max_loaded_models=3)
+        assert SchedulerSettings.from_dict(settings.to_dict()).max_loaded_models == 3
+        # 0 has no meaning now that None is the unlimited sentinel
+        assert SchedulerSettings.from_dict({"max_loaded_models": 0}).max_loaded_models is None
+        assert (
+            SchedulerSettings.from_dict({"max_loaded_models": None}).max_loaded_models
+            is None
+        )
 
     def test_decode_fairness_from_dict(self):
         """Defaults on; explicit false round-trips."""
@@ -1411,6 +1427,20 @@ class TestGlobalSettings:
         settings.sampling.max_context_window_policy = 0
         errors = settings.validate()
         assert any("max_context_window_policy" in e for e in errors)
+
+    def test_validate_max_loaded_models(self):
+        """max_loaded_models must be null/unlimited or an integer >= 1."""
+        settings = GlobalSettings()
+        settings.scheduler.max_loaded_models = None
+        assert settings.validate() == []
+
+        settings.scheduler.max_loaded_models = 2
+        assert settings.validate() == []
+
+        for bad in (0, -1):
+            settings.scheduler.max_loaded_models = bad
+            errors = settings.validate()
+            assert any("max_loaded_models" in e for e in errors), bad
 
     def test_validate_invalid_port_low(self):
         """Test validation catches port below 1."""

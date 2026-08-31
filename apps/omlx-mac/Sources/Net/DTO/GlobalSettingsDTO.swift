@@ -74,6 +74,10 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// "context" (default) | "speed" — what the prefill memory guard
         /// optimizes under pressure.
         let prefillPriority: String?
+        /// Cap on concurrently resident model engines; loading another
+        /// model evicts the LRU idle one first. `nil` = unlimited
+        /// (older servers omit the key; new servers report null).
+        let maxLoadedModels: Int?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -300,6 +304,11 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
     var prefillPriority: String? = nil
+
+    /// Cap on concurrently resident model engines. `nil` (default) leaves
+    /// it unchanged, `.null` resets to unlimited, `.value(n)` sets the cap
+    /// (server enforces `>= 1`).
+    var maxLoadedModels: PatchOptionalInt? = nil
 
     var cacheEnabled: Bool? = nil
     var hotCacheOnly: Bool? = nil
