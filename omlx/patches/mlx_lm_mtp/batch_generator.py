@@ -120,6 +120,93 @@ def _set_dspark_target_verify(model: Any, flag: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+_LANE_DECODE_ENV = "OMLX_QWEN4_COMPILED_DECODE"
+_LANE_PREWARM_ENV = "OMLX_QWEN4_LANE_PREWARM"
+
+
+def _lane_decode_enabled() -> bool:
+    return os.environ.get(_LANE_DECODE_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _lane_shim_for(model: Any) -> Any:
+    """The Qwen4Exp compiled-decode shim for this model, or None.
+
+    Returns the already-attached shim so a re-init (each prefill completion
+    constructs a fresh GenerationBatch) reuses one lane across the serving
+    lifetime instead of re-snapshotting per batch.
+    """
+    existing = getattr(model, "_omlx_lane_shim", None)
+    if existing is not None:
+        return existing
+    if not _lane_decode_enabled():
+        return None
+    language_model = getattr(model, "_language_model", None)
+    if getattr(language_model, "model_type", "") != "qwen4_exp_text":
+        return None
+    from mlx_vlm.models.qwen4_exp.compiled_decode import Qwen4ExpLaneShim
+
+    shim = Qwen4ExpLaneShim(model)
+    try:
+        model._omlx_lane_shim = shim
+    except Exception:
+        return None
+    logger.info(
+        "Qwen4Exp compiled decode lane attached (env %s=1)",
+        _LANE_DECODE_ENV,
+    )
+    prewarm_spec = os.environ.get(_LANE_PREWARM_ENV, "").strip()
+    if prewarm_spec and not getattr(model, "_omlx_lane_prewarm_started", False):
+        try:
+            model._omlx_lane_prewarm_started = True
+            import threading
+
+            def _run_prewarm():
+                try:
+                    from mlx_vlm.models.qwen4_exp.compiled_decode import (
+                        prewarm_lane,
+                    )
+
+                    prewarm_lane(
+                        model,
+                        _prewarm_shapes(
+                            prewarm_spec if prewarm_spec not in ("1", "on")
+                            else None
+                        )
+                        if prewarm_spec not in ("1", "on")
+                        else None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("lane prewarm failed: %s", exc)
+
+            threading.Thread(target=_run_prewarm, daemon=True).start()
+        except Exception:
+            pass
+    return shim
+
+
+def _prewarm_shapes(spec):
+    from mlx_vlm.models.qwen4_exp.compiled_decode import _prewarm_shapes as _ps
+
+    return _ps(spec)
+
+
+def _lane_before_reshape(batch: Any) -> None:
+    shim = getattr(getattr(batch, "model", None), "_omlx_lane_shim", None)
+    if shim is not None:
+        shim.before_reshape(batch.prompt_cache)
+
+
+def _lane_after_reshape(batch: Any) -> None:
+    shim = getattr(getattr(batch, "model", None), "_omlx_lane_shim", None)
+    if shim is not None:
+        shim.after_reshape(batch.prompt_cache)
+
+
 def apply() -> bool:
     """Wrap ``GenerationBatch`` and ``BatchGenerator`` MTP hooks.
 
@@ -141,6 +228,15 @@ def apply() -> bool:
         original_extend = GenerationBatch.extend
 
         def patched_init(self, *args, **kwargs):
+            args = list(args)
+            if args:
+                shim = _lane_shim_for(args[0])
+                if shim is not None:
+                    args[0] = shim
+            elif "model" in kwargs:
+                shim = _lane_shim_for(kwargs["model"])
+                if shim is not None:
+                    kwargs["model"] = shim
             original_init(self, *args, **kwargs)
             # Do not activate MTP here. Fresh singleton batches created by
             # PromptProcessingBatch.generate() may still be merged into a larger
@@ -234,7 +330,9 @@ def apply() -> bool:
                         park_state.defer_probe()
                 _reconcile_mtp_to_standard(self, host_state)
                 _drop_mtp_state(self, "extend-reconciled")
+            _lane_before_reshape(self)
             result = original_extend(self, batch, *args, **kwargs)
+            _lane_after_reshape(self)
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
             _drop_invalid_mtp_batch_state(self, "extend")
@@ -248,7 +346,9 @@ def apply() -> bool:
 
         def patched_filter(self, keep, *args, **kwargs):
             old_uids = list(getattr(self, "uids", []) or [])
+            _lane_before_reshape(self)
             result = original_filter(self, keep, *args, **kwargs)
+            _lane_after_reshape(self)
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
             _drop_invalid_mtp_batch_state(
                 self,
