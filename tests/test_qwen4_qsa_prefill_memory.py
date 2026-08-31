@@ -50,9 +50,11 @@ def test_qsa_cache_is_not_retained_in_boundary_snapshots(cache_cls):
 
 
 def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
+    import threading
+
     from omlx.patches import sdpa256_attention as sdpa256
 
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None)
+    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local())
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None)
     monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 64)
     monkeypatch.setattr(sdpa256, "_Q_TILE", 16)
