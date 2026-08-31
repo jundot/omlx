@@ -393,3 +393,6 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
+---
+
+> 💡 **文档维护说明**：本中文文档由社区志愿者（@JasonYeYuhe）翻译维护，最后同步更新于 2026年8月31日。如发现内容与官方英文原版存在差异或新特性滞后，欢迎提交 PR 共同完善！
