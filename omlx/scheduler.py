@@ -535,6 +535,11 @@ class _RegisteredRow(NamedTuple):
 
     sampler: Any
     logits_processors: list
+    # Whether the request asked for API logprobs; drives the full-vocab
+    # logprobs skip in _patched_generation_batch_step.  Defaults to True so
+    # registrations that predate the gate keep mlx-lm's always-compute
+    # behaviour — the skip is opt-out only once the row's intent is known.
+    wants_logprobs: bool = True
 
 
 _UID_ROW_REGISTRY_MAX = 4096
@@ -559,16 +564,24 @@ _uid_row_drift_last_warning = float("-inf")
 _SDPA256_UNBOUNDED_HEADROOM = 1 << 62
 
 
-def _register_uid_rows(model, uids, samplers, lps_rows) -> None:
+def _register_uid_rows(model, uids, samplers, lps_rows, wants_logprobs_rows=None) -> None:
     """Record the sampler and logits processors each freshly-inserted uid must run.
 
     Each (model, uid) key is inserted exactly once per request, so plain
     insertion order is enough for the oldest-first backstop eviction.
+
+    ``wants_logprobs_rows`` carries each uid's ``sampling_params.logprobs``
+    flag; callers that omit it keep the always-compute default (see
+    ``_RegisteredRow.wants_logprobs``).
     """
+    if wants_logprobs_rows is None:
+        wants_logprobs_rows = [True] * len(list(uids))
     with _uid_row_registry_lock:
-        for uid, sampler, lps in zip(uids, samplers, lps_rows):
+        for uid, sampler, lps, wants_logprobs in zip(
+            uids, samplers, lps_rows, wants_logprobs_rows
+        ):
             _uid_row_registry[(id(model), uid)] = _RegisteredRow(
-                sampler, list(lps or ())
+                sampler, list(lps or ()), bool(wants_logprobs)
             )
         while len(_uid_row_registry) > _UID_ROW_REGISTRY_MAX:
             _uid_row_registry.popitem(last=False)
@@ -727,6 +740,172 @@ def _omlx_advance_grammar_rows(self) -> None:
         proc.accept_token(sampled[e])
 
 
+# ---------------------------------------------------------------------------
+# Full-vocab logprobs skip.
+#
+# mlx-lm's GenerationBatch._step ends every decode step with
+#
+#     self._next_logprobs = list(logprobs)                    # B x vocab fp32
+#     mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+#     ...
+#     mx.eval(inputs, self._current_logprobs)
+#
+# i.e. it materialises and retains one [vocab] fp32 array per row per step
+# (~800KB at 200k vocab).  omlx discards those arrays host-side whenever the
+# request did not ask for logprobs (see _process_batch_responses), so nearly
+# every step pays a full B x vocab materialisation whose only consumer is
+# the sampler that already ran.  When NO row in the batch wants logprobs —
+# and no speculative-decode path reads them internally — the patched step
+# below runs a variant with the materialisation elided.  Consumer audit:
+#
+#   * API responses: per-row via the ``wants_logprobs`` registry flag
+#     recorded at insert (``sampling_params.logprobs``).  Any row wanting
+#     them runs the original step for the whole batch, so requested values
+#     are bit-identical to before.
+#   * Samplers (omlx.utils.sampling): consume the NORMALISED logprobs —
+#     top-p's cumulative mass and min_p's ``max + log(min_p)`` threshold
+#     assume true log-probabilities — so the variant keeps the
+#     ``logits - logsumexp`` normalisation for sampler input and sampling
+#     stays bit-identical; only the per-row materialisation/retention is
+#     skipped.
+#   * Grammar constraints: ``_omlx_advance_grammar_rows`` reads
+#     ``_next_tokens`` only; processors see raw logits rows in both
+#     variants.  Unaffected.
+#   * Native MTP / dspark (omlx.patches.mlx_lm_mtp): reads
+#     ``gen_batch._next_logprobs`` for acceptance math — including the
+#     PREVIOUS standard step's arrays when it lazily activates inside
+#     ``GenerationBatch.next`` (``_post_init_mtp``,
+#     ``_prepare_mtp_batch_state_for_next``).  Gated below on the same
+#     per-load model markers that patch's own eligibility checks consult,
+#     plus any live MTP state on the batch.
+#   * VLM MTP (omlx.speculative.processing_sampler): its sampler receives
+#     logprobs from mlx-vlm's verify walk, never from GenerationBatch, and
+#     vlm_mtp requests are routed away before BatchGenerator.insert.
+#     Unaffected.
+#   * dflash / specprefill / gemma4_verify patches and the glm_moe_dsa
+#     ``GenerationBatch.next`` call site: none read ``_next_logprobs`` or
+#     ``Response.logprobs`` (grep-verified).
+# ---------------------------------------------------------------------------
+
+
+def _omlx_batch_wants_logprobs(self) -> bool:
+    """True when any row in the generation batch asked for API logprobs.
+
+    Reads the same per-uid registry the row realignment uses.  Uids without
+    a registered row — a fresh singleton mid-insert (``GenerationBatch``
+    steps once in ``__init__``, before ``_register_uid_rows`` runs) or a
+    batch omlx did not insert — keep mlx-lm's always-compute behaviour.
+    """
+    uids = getattr(self, "uids", None) or []
+    if not uids:
+        return True
+    model_id = id(getattr(self, "model", None))
+    with _uid_row_registry_lock:
+        rows = [_uid_row_registry.get((model_id, uid)) for uid in uids]
+    return any(row is None or row.wants_logprobs for row in rows)
+
+
+def _omlx_spec_decode_reads_logprobs(self) -> bool:
+    """True while speculative decoding may consume ``_next_logprobs``.
+
+    Native MTP activation is lazy (see the header above), so a live
+    ``_omlx_mtp_state`` is not the only hazard: any MTP/dspark-enabled load
+    must keep materialising logprobs because the next ``next()`` call may
+    bridge a row into speculative decode using THIS step's arrays.  The
+    model markers mirror ``_model_mtp_decode_enabled`` in
+    omlx.patches.mlx_lm_mtp.batch_generator.
+    """
+    if (
+        getattr(self, "_omlx_mtp_state", None) is not None
+        or getattr(self, "_omlx_mtp_batch_state", None) is not None
+    ):
+        return True
+    model = getattr(self, "model", None)
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    return any(
+        bool(
+            getattr(candidate, "_omlx_mtp_decode_enabled", False)
+            or getattr(candidate, "_omlx_dspark_decode_enabled", False)
+        )
+        for candidate in candidates
+    )
+
+
+def _omlx_generation_batch_step_no_logprobs(self):
+    """``GenerationBatch._step`` with the per-row logprobs materialisation elided.
+
+    Mirrors mlx-lm 0.31.x ``GenerationBatch._step`` line for line — keep in
+    sync with upstream on mlx-lm upgrades — except:
+
+    * ``_next_logprobs``/``_current_logprobs`` hold per-row ``None`` slots
+      (length-preserving, so ``extend()``/``filter()`` reindexing is
+      unaffected) and are dropped from the ``async_eval``/``eval`` calls;
+      ``next()`` therefore builds Responses with ``logprobs=None``, exactly
+      the state omlx's host-side discard produces today.
+    * the ``logits - logsumexp`` normalisation stays: omlx's samplers take
+      true log-probabilities (see the audit header above), so the sampled
+      tokens are bit-identical to the original step.
+    """
+    self._current_tokens = self._next_tokens
+    # Drop any arrays a previous logprobs-computing step left behind: nothing
+    # reads them in this mode, and releasing the batch's reference here lets
+    # the allocator reclaim the full-vocab buffers.
+    self._current_logprobs = [None] * len(self.uids)
+    inputs = self._current_tokens
+
+    # Forward pass
+    logits = self.model(inputs[:, None], cache=self.prompt_cache)
+    logits = logits[:, -1, :]
+
+    # Logits processors
+    token_context = []
+    if any(self.logits_processors):
+        # Update the token context that will be used by the logits processors
+        token_context = [
+            tc.update_and_fetch(inputs[i : i + 1])
+            for i, tc in enumerate(self._token_context)
+        ]
+        processed_logits = []
+        for e in range(len(self.uids)):
+            sample_logits = logits[e : e + 1]
+            for processor in self.logits_processors[e]:
+                sample_logits = processor(token_context[e], sample_logits)
+            processed_logits.append(sample_logits)
+        logits = mx.concatenate(processed_logits, axis=0)
+
+    # Normalize the logits — required for sampler correctness, see header.
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    # Sample
+    if any(self.samplers):
+        all_samples = []
+        for e in range(len(self.uids)):
+            sample_sampler = self.samplers[e] or self.fallback_sampler
+            sampled = sample_sampler(logprobs[e : e + 1])
+            all_samples.append(sampled)
+        sampled = mx.concatenate(all_samples, axis=0)
+    else:
+        sampled = self.fallback_sampler(logprobs)
+
+    # Assign the next step to member variables and start computing it
+    # asynchronously — without the per-row full-vocab logprobs arrays.
+    self._next_tokens = sampled
+    self._next_logprobs = [None] * len(self.uids)
+    mx.async_eval(self._next_tokens, token_context)
+
+    # Eval the current tokens. After that also add them to self.tokens so
+    # that it always represents the tokens contained in the KV Cache.
+    mx.eval(inputs)
+    inputs = inputs.tolist()
+    for sti, ti in zip(self.tokens, inputs):
+        sti.append(ti)
+    return inputs, self._current_logprobs
+
+
 _original_generation_batch_step = GenerationBatch._step
 
 
@@ -765,7 +944,13 @@ def _patched_generation_batch_step(self):
     # is there to guarantee.
     _omlx_advance_grammar_rows(self)
 
-    return _original_generation_batch_step(self)
+    # Skip the full-vocab logprobs materialisation when no row asked for
+    # logprobs and no speculative-decode path reads them (see the audit
+    # header above _omlx_batch_wants_logprobs).  Any consumer at all runs
+    # the upstream step unchanged, keeping requested logprobs bit-identical.
+    if _omlx_batch_wants_logprobs(self) or _omlx_spec_decode_reads_logprobs(self):
+        return _original_generation_batch_step(self)
+    return _omlx_generation_batch_step_no_logprobs(self)
 
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
@@ -5424,7 +5609,12 @@ class Scheduler:
                 state_machines=[state.sm],
             )
         if uids:
-            _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
+            _register_uid_rows(
+                self.model, uids, [state.sampler], [per_row_lps],
+                wants_logprobs_rows=[
+                    bool(getattr(request.sampling_params, "logprobs", False))
+                ],
+            )
             uid = uids[0]
             self.request_id_to_uid[request.request_id] = uid
             self.uid_to_request_id[uid] = request.request_id
@@ -10704,7 +10894,12 @@ class Scheduler:
                     state_machines=[sm],
                 )
             if uids:
-                _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
+                _register_uid_rows(
+                    self.model, uids, [sampler], [per_row_lps],
+                    wants_logprobs_rows=[
+                        bool(getattr(request.sampling_params, "logprobs", False))
+                    ],
+                )
                 uid = uids[0]
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
