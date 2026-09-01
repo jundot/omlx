@@ -420,6 +420,11 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     if _has_grammar_processors(gen_batch):
         return False
+    # See the assignment in Scheduler._create_batch_generator: XTC sampling
+    # is absent from MTP's rejection-sampling acceptance math, so a request
+    # sampling with xtc_probability > 0 must not speculate.
+    if getattr(gen_batch, "_omlx_mtp_disabled_xtc", False):
+        return False
     return True
 
 

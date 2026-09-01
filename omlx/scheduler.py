@@ -3091,6 +3091,11 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+        # MTP's draft-acceptance math (_accept_lp_for) reconstructs temp/
+        # top_p/min_p/top_k but has no XTC term, so the emitted distribution
+        # would diverge from the target under XTC. Gate MTP off at
+        # eligibility time rather than model XTC in the acceptance math.
+        bg._omlx_mtp_disabled_xtc = sampling_params.xtc_probability > 0
 
         return bg
 
