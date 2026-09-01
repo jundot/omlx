@@ -230,6 +230,15 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Structured cluster event emitters (#2770), exposed ahead of the
+        # deployment/collective/scheduler call sites landing in the PRs
+        # built on top of this logging foundation.
+        ("structured_events.py", "log_cluster_deployment_started"),
+        ("structured_events.py", "log_cluster_deployment_completed"),
+        ("structured_events.py", "log_worker_joined"),
+        ("structured_events.py", "log_worker_left"),
+        ("structured_events.py", "log_collective_operation"),
+        ("structured_events.py", "log_inference_routed"),
     }
 
     sources = {
