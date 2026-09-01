@@ -122,6 +122,9 @@ from .worker_bundle import (
     worker_source_bundle,
     worker_source_digest,
 )
+from .deployment_gate import DeploymentGate
+from .error_budget import ErrorBudgetTracker
+from .slo_tracker import SLOTracker
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
@@ -1806,6 +1809,51 @@ async def cluster_status(route_to: str | None = None):
     return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
 
 
+_slo_tracker: SLOTracker | None = None
+_error_budget_tracker: ErrorBudgetTracker | None = None
+_deployment_gate: DeploymentGate | None = None
+
+
+def get_slo_tracker() -> SLOTracker:
+    """Return the singleton SLO tracker, creating it on first call."""
+    global _slo_tracker
+    if _slo_tracker is None:
+        _slo_tracker = SLOTracker()
+    return _slo_tracker
+
+
+def get_error_budget_tracker() -> ErrorBudgetTracker:
+    """Return the singleton error budget tracker."""
+    global _error_budget_tracker
+    if _error_budget_tracker is None:
+        _error_budget_tracker = ErrorBudgetTracker(get_slo_tracker())
+    return _error_budget_tracker
+
+
+def get_deployment_gate() -> DeploymentGate:
+    """Return the singleton deployment gate."""
+    global _deployment_gate
+    if _deployment_gate is None:
+        _deployment_gate = DeploymentGate(get_error_budget_tracker())
+    return _deployment_gate
+
+
+@router.get("/slos")
+async def cluster_slos():
+    """Return current SLO compliance status for all defined objectives."""
+
+    tracker = await asyncio.to_thread(get_slo_tracker)
+    return tracker.status_dict()
+
+
+@router.get("/error-budget")
+async def cluster_error_budget():
+    """Return per-SLO error budget status and deployment readiness."""
+
+    tracker = await asyncio.to_thread(get_error_budget_tracker)
+    return tracker.budget_status()
+
+
 @router.get("/runtime")
 async def cluster_runtime():
     """Return lightweight local rank markers for dashboard polling."""
@@ -3139,6 +3187,13 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     "again and approve what it shows. As posted, this request "
                     f"would place: {_describe_placement(plan)}."
                 ),
+            )
+        gate = get_deployment_gate()
+        gate_result = await asyncio.to_thread(gate.check)
+        if not gate_result.allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=gate_result.message,
             )
         memory_plan = plan
         # Refuse to start against a Mac that is not answering. Launching into a
