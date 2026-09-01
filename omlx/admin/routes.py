@@ -6305,33 +6305,80 @@ async def delete_hf_model(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+    # Search the same directories discovery uses -- get_effective_model_dirs
+    # includes the HF hub cache when huggingface.hf_cache_enabled is set,
+    # while model.get_model_dirs() returns only the configured dirs. Models
+    # discovered from the cache were otherwise listable but undeletable.
+    model_dirs = global_settings.get_effective_model_dirs()
 
-    # Search for model across all directories in both flat and org-folder layouts
-    model_path = None
-    parent_model_dir = None
-    for model_dir in model_dirs:
-        if not model_dir.exists():
-            continue
-        candidate = model_dir / model_name
-        if candidate.is_dir() and (candidate / "config.json").exists():
-            model_path = candidate
-            parent_model_dir = model_dir
-            break
-        # Try two-level: search inside organization folders
-        for subdir in model_dir.iterdir():
-            if not subdir.is_dir() or subdir.name.startswith("."):
+    from ..model_discovery import _resolve_hf_cache_entry
+
+    # Search for model across all directories in flat, org-folder, and
+    # HF-cache layouts. The list endpoint surfaces HF Hub cache entries
+    # (models--Org--Name/snapshots/<hash>/) via _resolve_hf_cache_entry, so
+    # delete must resolve them the same way or cache-resident models 404.
+    def _find_model_matches() -> list[tuple[Path, Path]]:
+        """Collect every (model_path, owning_root) the id maps to.
+
+        All configured roots and all layouts are scanned to completion so
+        that duplicates anywhere -- not just within one root -- surface as
+        an ambiguity instead of deleting whichever copy is found first.
+        """
+        matches: list[tuple[Path, Path]] = []
+        seen: set[Path] = set()
+
+        def _add(candidate: Path, root: Path) -> None:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                matches.append((candidate, root))
+
+        for model_dir in model_dirs:
+            if not model_dir.is_dir():
                 continue
-            candidate = subdir / model_name
+            candidate = model_dir / model_name
             if candidate.is_dir() and (candidate / "config.json").exists():
-                model_path = candidate
-                parent_model_dir = model_dir
-                break
-        if model_path is not None:
-            break
+                _add(candidate, model_dir)
+            # Two-level: search inside organization folders
+            for subdir in model_dir.iterdir():
+                if not subdir.is_dir() or subdir.name.startswith("."):
+                    continue
+                candidate = subdir / model_name
+                if candidate.is_dir() and (candidate / "config.json").exists():
+                    _add(candidate, model_dir)
+            # HF Hub cache entry: the route-safe id inverts directly to the
+            # cache directory name (org--repo -> models--org--repo), so
+            # resolve that one candidate instead of scanning the directory.
+            # The deletion root is the whole models--Org--Name directory --
+            # removing only the snapshot would leave refs and blobs behind.
+            candidate = model_dir / f"models--{model_name}"
+            hf_resolved = _resolve_hf_cache_entry(candidate)
+            if hf_resolved is not None and hf_resolved.model_id == model_name:
+                _add(candidate, model_dir)
+        return matches
 
-    if model_path is None:
+    # Filesystem-bound lookup runs off the event loop.
+    try:
+        matches = await asyncio.to_thread(_find_model_matches)
+    except OSError as e:
+        logger.warning(f"Model lookup failed for '{model_name}': {e}")
+        raise HTTPException(status_code=503, detail="Model storage unavailable")
+
+    if not matches:
         raise HTTPException(status_code=404, detail="Model not found")
+    if len(matches) > 1:
+        # More than one on-disk location maps to this route-safe id (e.g. a
+        # flat org--repo folder next to a models--org--repo cache entry, or
+        # the same model in two roots). Deleting any one would be a guess;
+        # refuse rather than remove the wrong one.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model id '{model_name}' matches multiple on-disk locations; "
+                "remove the duplicate on disk to disambiguate"
+            ),
+        )
+    model_path, parent_model_dir = matches[0]
 
     # Validate path traversal against parent model directory
     try:
@@ -6369,11 +6416,20 @@ async def delete_hf_model(
             return
         raise exc_info[1].with_traceback(exc_info[2])
 
-    try:
+    def _delete_model_dir() -> None:
         if sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
+        # Deliberately leave <root>/.locks/<entry> alone: another process may
+        # hold one of those lock files mid-download, and unlinking a held
+        # lock lets a second writer acquire a fresh inode and race the first.
+        # The stale zero-byte residue is cosmetic; sweep it offline if needed.
+
+    # rmtree of a large model (tens of GB, thousands of blobs) must not
+    # block the event loop; run it off-thread like the lookup above.
+    try:
+        await asyncio.to_thread(_delete_model_dir)
         logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
         logger.error(f"Failed to delete model directory {model_path}: {e}")
