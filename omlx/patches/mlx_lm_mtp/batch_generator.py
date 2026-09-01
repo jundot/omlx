@@ -1801,6 +1801,21 @@ def _effective_loop_tax(model: Any) -> Optional[float]:
     return prior + (float(tax) - prior) * math.exp(-age / _STD_TAX_DECAY_S)
 
 
+_FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
+
+
+def _fixed_mtp_depth() -> Optional[int]:
+    """Experimental: pin the draft depth (None = adaptive controller)."""
+    raw = os.environ.get(_FIXED_DEPTH_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        d = int(raw)
+    except ValueError:
+        return None
+    return d if d > 0 else None
+
+
 class _DepthController:
     """Adaptive draft-depth selection.
 
@@ -1907,6 +1922,9 @@ class _DepthController:
             )
         self.max_depth = max(1, int(max_depth))
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
+        _fixed = _fixed_mtp_depth()
+        if _fixed is not None:
+            self.cur = min(_fixed, self.max_depth)
         self.p = [0.6] * self.max_depth
         self.t: Dict[int, float] = {}
         self.t_age: Dict[int, float] = {}  # ms since each depth was measured
@@ -1935,6 +1953,11 @@ class _DepthController:
     ) -> None:
         self.cycles += 1
         used = max(0, min(int(used), self.max_depth))
+        _fixed = _fixed_mtp_depth()
+        if _fixed is not None:
+            # Pin: keep measuring (t/p EMAs stay fresh, park logic stays
+            # armed) but the draft depth is forced every cycle.
+            self.cur = min(_fixed, self.max_depth)
         accepted = max(0, min(int(accepted), used))
         # Acceptance: token-domain EMA (a property of model/content, not load).
         a = self.ALPHA
