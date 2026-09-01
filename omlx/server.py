@@ -4757,7 +4757,10 @@ async def stream_chat_completion(
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        guard_second_reasoning=bool(has_tools),
+    )
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4851,7 +4854,10 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            finish_reason=(last_output.finish_reason if last_output else None),
+            has_tools=has_tools,
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5202,14 +5208,17 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    # Filter tool-call markup from streamed content when tools are present.
+    has_tools = bool(kwargs.get("tools"))
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        guard_second_reasoning=bool(has_tools),
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
     last_output = None  # Track last output for tool_calls and token counts
 
-    # Filter tool-call markup from streamed content when tools are present.
-    has_tools = bool(kwargs.get("tools"))
     tool_filter = None
     thinking_filter = None
     if has_tools:
@@ -5347,7 +5356,10 @@ async def stream_anthropic_messages(
         return
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        finish_reason=(last_output.finish_reason if last_output else None),
+        has_tools=has_tools,
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6577,7 +6589,10 @@ async def stream_responses_api(
                 )
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking,
+        guard_second_reasoning=bool(has_tools),
+    )
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
@@ -6882,7 +6897,10 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            finish_reason=(last_output.finish_reason if last_output else None),
+            has_tools=has_tools,
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
