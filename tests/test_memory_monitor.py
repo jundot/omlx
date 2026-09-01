@@ -1044,6 +1044,164 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
 
 
+class TestGlm5PrefillMemoryProfile:
+    """GLM-5.x hybrid prefill estimator.
+
+    GLM-5.3 prices its sparse-MLA layers as bounded top-k attention, not dense
+    full-context SDPA — the generic estimator over-counts the prefill
+    transient by ~15x at 40K context.
+    """
+
+    @staticmethod
+    def _config():
+        return SimpleNamespace(
+            model_type="glm5_next_text",
+            num_hidden_layers=45,
+            layer_types=["linear_attention", "deepseek_sparse_attention"] * 22
+            + ["linear_attention"],
+            linear_attn_config=SimpleNamespace(
+                num_heads=64,
+                head_dim=128,
+                short_conv_kernel_size=4,
+            ),
+            num_attention_heads=64,
+            qk_nope_head_dim=256,
+            v_head_dim=256,
+            kv_lora_rank=512,
+            index_n_heads=32,
+            index_head_dim=128,
+            index_topk=2048,
+            index_kpool=4,
+            hidden_size=4096,
+            hc_mult=4,
+        )
+
+    def _monitor(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = self._config()
+        profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+        assert profile is not None
+        monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
+        monitor.set_model_info(
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=64,
+            head_dim=256,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=11,
+            compute_dtype_size=2,
+            prefill_memory_profile=profile,
+        )
+        return monitor
+
+    def test_glm5_profile_built(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        assert make_prefill_memory_profile(self._config(), compute_dtype_size=2) is not None
+
+    def test_non_glm5_config_keeps_generic_estimator(self):
+        from omlx.memory_monitor import make_prefill_memory_profile
+
+        config = self._config()
+        config.model_type = "llama"
+        assert make_prefill_memory_profile(config, compute_dtype_size=2) is None
+
+    def test_glm5_transient_is_bounded_not_dense(self, monkeypatch):
+        import omlx.memory_monitor as memory_monitor
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        monkeypatch.setattr(
+            memory_monitor, "native_indexer_eligible", lambda **kwargs: True
+        )
+        monkeypatch.setattr(
+            memory_monitor, "_glm5_sparse_mla_kernel_available", lambda: True
+        )
+        monitor = self._monitor()
+        chunk, kv = 2048, 40_000
+        profiled = monitor.estimate_chunk_transient_bytes(chunk, kv)
+        dense = estimate_unfused_sdpa_call_bytes(64, chunk, kv, 256, 2)
+        # The real sparse workload is bounded and far below the dense charge.
+        assert 0 < profiled < dense / 4
+        assert profiled < 2 * 1024**3
+
+    def test_glm5_dense_fallback_prices_kept_small_with_native_kernel(
+        self, monkeypatch
+    ):
+        import omlx.memory_monitor as memory_monitor
+        from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+
+        monkeypatch.setattr(
+            memory_monitor, "native_indexer_eligible", lambda **kwargs: True
+        )
+        # Native kernel present -> no dense O(L x K) mask; transient bounded.
+        monkeypatch.setattr(
+            memory_monitor, "_glm5_sparse_mla_kernel_available", lambda: True
+        )
+        monitor = self._monitor()
+        chunk, kv = 2048, 200_000
+        profiled = monitor.estimate_chunk_transient_bytes(chunk, kv)
+        dense = estimate_unfused_sdpa_call_bytes(64, chunk, kv, 256, 2)
+        assert profiled < dense / 8
+        assert profiled < 3 * 1024**3
+
+    def test_glm5_transient_scales_gently_with_context(self, monkeypatch):
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(
+            memory_monitor, "native_indexer_eligible", lambda **kwargs: True
+        )
+        monkeypatch.setattr(
+            memory_monitor, "_glm5_sparse_mla_kernel_available", lambda: True
+        )
+        monitor = self._monitor()
+        # Growing context increases pooled indexer keys, but the bounded sparse
+        # attention keeps the transient far below linear growth.
+        short = monitor.estimate_chunk_transient_bytes(2048, 20_000)
+        long_ = monitor.estimate_chunk_transient_bytes(2048, 200_000)
+        assert 0 < short < long_ < short * 3
+
+    def test_glm5_three_tiers_priced_separately(self, monkeypatch):
+        """Native sparse-MLA, exact-block, and dense fallback must price
+        differently: each tier's transient grows with kv_len at its own
+        rate, and the estimate must never under-price a tier."""
+        import omlx.memory_monitor as memory_monitor
+
+        monkeypatch.setattr(
+            memory_monitor, "native_indexer_eligible", lambda **kwargs: True
+        )
+
+        def estimate(sparse_mla, exact_block, kv):
+            monkeypatch.setattr(
+                memory_monitor, "_glm5_sparse_mla_kernel_available", lambda: sparse_mla
+            )
+            monkeypatch.setattr(
+                memory_monitor, "_glm5_exact_block_kernel_available", lambda: exact_block
+            )
+            return self._monitor().estimate_chunk_transient_bytes(2048, kv)
+
+        # Tier ordering at the same context: sparse-MLA << exact-block << dense.
+        sparse = estimate(True, True, 40_000)
+        exact = estimate(False, True, 40_000)
+        dense = estimate(False, False, 40_000)
+        assert 0 < sparse < exact < dense
+
+        # Exact-block grows with kv_len (expanded K/V); dense grows faster.
+        exact_long = estimate(False, True, 80_000)
+        dense_long = estimate(False, False, 80_000)
+        assert exact_long > exact
+        assert dense_long > dense
+        # Dense tier is O(kv): doubling context at least doubles it.
+        assert dense_long >= dense * 1.5
+
+    def test_glm5_effective_head_dim_from_profile(self):
+        """GLM exposes head_dim=0 generically; the profile must supply a real
+        head dim so schedulers can install it (maintainer review #3291)."""
+        profile = self._monitor()._prefill_memory_profile
+        assert profile is not None
+        assert profile.effective_head_dim == 256
+
+
 class TestAnePrefillTransientReserve:
     def test_ane_prefill_transient_is_added_to_the_peak(self):
         # issue #2841: the ANE I/O surfaces are dirtied by the first long

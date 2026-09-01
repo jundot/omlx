@@ -167,6 +167,19 @@ class PrefillMemoryProfile(Protocol):
         self, query_tokens: int, kv_len: int
     ) -> int: ...
 
+    @property
+    def effective_head_dim(self) -> int | None:
+        """A positive head-dimension for schedulers that require one.
+
+        Some hybrid configs expose ``head_dim=0`` in the generic field (e.g.
+        GLM-5.x where the real attention dims live in ``qk_nope_head_dim`` /
+        ``linear_head_dim``). Schedulers gate ``set_model_info()`` on a
+        positive generic ``head_dim``; a profile that can supply a real one
+        lets those models install the profile instead of silently skipping
+        admission pricing.
+        """
+        ...
+
 
 class MemoryMonitor:
     """
@@ -969,6 +982,10 @@ class _DeepSeekV4PrefillMemoryProfile:
     dtype_size: float
     wsdpa_dtype_supported: bool = False
 
+    @property
+    def effective_head_dim(self) -> int | None:
+        return self.head_dim
+
     def _wsdpa_route_active(self, *, topk: bool = False) -> bool:
         """Match the live WSDPA route without a process-wide head-dim flag."""
         if (
@@ -1221,14 +1238,375 @@ class _DeepSeekV4PrefillMemoryProfile:
         return max(candidates, default=0)
 
 
+def _glm5_sparse_mla_kernel_available() -> bool:
+    """True iff the native sparse-MLA kernel is loadable in this process.
+
+    When it is, GLM-5.x sparse prefill attends over only the top-k selected
+    latent keys (no dense O(query x kv_len) score matrix). The dense
+    bool-mask SDPA fallback runs only when BOTH ``sparse_mla_attention`` and
+    ``exact_block_token_attention`` are unavailable, so this gates the
+    worst-case dense term in ``_Glm5PrefillMemoryProfile``.
+    """
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as _glm_fast
+
+        return _glm_fast.has_symbol("glm_dsa_sparse_mla_attention")
+    except Exception:
+        return False
+
+
+def _glm5_exact_block_kernel_available() -> bool:
+    """True iff the native exact-block attention kernel is loadable.
+
+    ``exact_block_token_attention`` is the second fallback tier (used when
+    ``sparse_mla_attention`` is unavailable). It expands the latent KV to
+    per-head K/V before attending over the selected keys, so its transient
+    is larger than the sparse-MLA path and must be priced separately.
+    """
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as _glm_fast
+
+        return _glm_fast.has_symbol("glm_dsa_exact_block_attention")
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class _Glm5PrefillMemoryProfile:
+    """Exact-shape prefill transient estimator for GLM-5.x's hybrid attention.
+
+    GLM-5.x stacks two distinct attention families over the same hidden
+    stream:
+
+    * ``linear_attention`` (GDN / Kimi Delta / KDA) layers: 64 heads x
+      head_dim 128 with a ``short_conv_kernel``-wide local convolution and a
+      fixed fp32 recursive state ``[num_heads, head_dim, head_dim]``
+      (~4MB/layer) that does NOT grow with context. Attention is strictly
+      local — the SDPA K dimension is bounded by ``short_conv_kernel``, never
+      the full context.
+    * ``deepseek_sparse_attention`` (NoPE-MLA) layers: latent KV
+      (``kv_lora_rank``), 64 heads x ``qk_nope_head_dim``, plus an indexer
+      that top-k selects ``index_topk`` of ``kv_len/index_kpool`` pooled
+      keys. Prefill attends over the *selected* keys only — never a dense
+      O(query x kv_len) score matrix.
+
+    Treating either family as ordinary full-context dense SDPA (the uniform
+    estimator) over-prices the prefill transient ~15x: 64 heads x 2048-query
+    x 40K-KV x fp16 ≈ 9.9 GB/chunk, versus the ~0.66 GB the real bounded
+    sparse/local workload needs. This profile prices the real kernels.
+
+    The indexer is the only member whose transient grows with ``kv_len``
+    (the pooled-key count is ``kv_len / index_kpool``). When the fused native
+    indexer path is eligible it materializes ``query x pooled`` fp16 scores;
+    the unfused fallback allocates a larger fp32 ``query x pooled`` volume
+    plus top-k workspaces (mirroring ``_DeepSeekV4PrefillMemoryProfile``).
+
+    The sparse attention has three runtime tiers with very different
+    transients, priced separately:
+
+    1. Native sparse-MLA (``sparse_mla_attention``): streams over the top-k
+       selected latent keys — bounded by ``index_topk``, never by ``kv_len``.
+    2. Native exact-block (``exact_block_token_attention``): expands the
+       latent KV to per-head K/V over the full context before attending,
+       so it is O(kv_len) per layer.
+    3. Dense bool-mask fallback (both kernels unavailable): materializes a
+       ``query x kv_len`` mask and an unfused O(heads x query x kv_len)
+       score matrix — the largest tier.
+    """
+
+    linear_layers: int
+    sparse_layers: int
+    linear_num_heads: int
+    linear_head_dim: int
+    short_conv_kernel: int
+    num_attention_heads: int
+    qk_nope_head_dim: int
+    v_head_dim: int
+    kv_lora_rank: int
+    index_n_heads: int
+    index_head_dim: int
+    index_topk: int
+    index_kpool: int
+    hidden_size: int
+    hc_mult: int
+    dtype_size: float
+
+    @property
+    def effective_head_dim(self) -> int | None:
+        """GLM exposes ``head_dim=0`` generically; the real sparse-attention
+        head width is ``qk_nope_head_dim``."""
+        return self.qk_nope_head_dim
+
+    def _linear_attention_bytes(self, query_tokens: int) -> int:
+        """GDN layer prefill transient: projections + conv + local state.
+
+        The recursive state (fp32 ``[num_heads, head_dim, head_dim]`` per
+        layer) is carried for the whole chunk graph and counted separately in
+        ``estimate_prefill_transient_bytes``. Here is one layer's per-chunk
+        working set: q/k/v + forget-gate projections at the chunk width, plus
+        the short-conv window. ``qkv_dim = linear_num_heads * linear_head_dim``
+        and the projections feed q/k/v/g/a (5 buffers) + o.
+        """
+        qkv_dim = self.linear_num_heads * self.linear_head_dim
+        conv_width = qkv_dim * (self.short_conv_kernel + query_tokens) * self.dtype_size
+        # q, k, v, g_a->g_b, a projections + the gated-delta kernel scratch.
+        proj = 5 * qkv_dim * query_tokens * self.dtype_size
+        output = qkv_dim * query_tokens * self.dtype_size
+        return int(conv_width + proj + output)
+
+    def _sparse_attention_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        pooled_tokens: int,
+        *,
+        native_indexer: bool,
+    ) -> int:
+        """Sparse-MLA layer prefill transient (indexer + one attention tier).
+
+        The indexer scores materialize ``query x pooled`` (native fp16) or the
+        larger fp32 ``query x pooled`` volume + top-k workspaces (fallback).
+
+        The attention tier follows the model's runtime dispatch
+        (``glm5_next/language.py``):
+
+        * sparse-MLA kernel present: streams over the top-k selected latent
+          keys — bounded, no K/V expansion.
+        * only exact-block kernel present: expands latent KV to per-head
+          K/V across the full context (``kv_len x heads x dim``) before
+          attending over the selected keys.
+        * neither kernel present: dense bool-mask + unfused SDPA —
+          O(heads x query x kv_len) score matrix, the largest tier.
+        """
+        indexer_q = self.index_n_heads * query_tokens * self.index_head_dim
+        indexer_scores = query_tokens * max(pooled_tokens, 1)
+        if native_indexer:
+            # Fused native path: fp16 scores + a compact top-k index.
+            indexer = (
+                indexer_q
+                + self.index_n_heads * query_tokens
+                + indexer_scores * self.dtype_size
+                + query_tokens * self.index_topk * 4
+            )
+        else:
+            # Unfused MLX fallback: fp32 score volume + top-k workspaces.
+            indexer = (
+                indexer_q * 4
+                + pooled_tokens * self.index_head_dim * 4
+                + indexer_scores * 4
+                + 6 * indexer_scores * 4
+            )
+
+        if _glm5_sparse_mla_kernel_available():
+            # sparse_mla_attention streams over the selected keys; the live
+            # volume is the latent query, the top-k index, and the MLA
+            # output projection — bounded by index_topk, not kv_len.
+            q_latent = self.num_attention_heads * query_tokens * self.kv_lora_rank
+            topk_idx = query_tokens * self.index_topk * 4
+            output = (
+                self.num_attention_heads * query_tokens * self.qk_nope_head_dim * 4
+            )
+            attention = int(q_latent * self.dtype_size + topk_idx + output)
+        elif _glm5_exact_block_kernel_available():
+            # exact_block_token_attention takes the FULLY EXPANDED per-head
+            # K/V (embed_q / unembed_out over the whole context) plus the
+            # expanded query. The kernel consumes them in blocks, so the
+            # dominant transient is the expanded K/V pair, which grows with
+            # kv_len (per layer).
+            expanded_k = (
+                max(kv_len, 1) * self.num_attention_heads * self.qk_nope_head_dim
+            )
+            expanded_v = (
+                max(kv_len, 1) * self.num_attention_heads * self.v_head_dim
+            )
+            q_expanded = (
+                query_tokens * self.num_attention_heads * self.qk_nope_head_dim
+            )
+            attention = int(
+                (expanded_k + expanded_v + q_expanded) * self.dtype_size
+            )
+        else:
+            # Dense bool-mask fallback: materializes a query x kv_len bool
+            # mask plus an unfused O(heads x query x kv_len) score matrix.
+            mask = query_tokens * max(kv_len, 1) * 1
+            scores = (
+                self.num_attention_heads
+                * query_tokens
+                * max(kv_len, 1)
+                * self.dtype_size
+            )
+            attention = mask + scores
+        return int(indexer + attention)
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        """Resident KV a GLM-5.x prefill of ``num_tokens`` adds.
+
+        Sparse layers hold a latent key (``kv_lora_rank`` wide, one KV head)
+        per token plus pooled indexer keys (``index_head_dim`` wide,
+        ``index_kpool`` tokens per pooled entry). Linear (GDN) layers hold a
+        fixed fp32 recursive state that does NOT grow with context — a
+        per-sequence constant, charged once regardless of length.
+        """
+        if num_tokens <= 0:
+            return 0
+        num_tokens = int(num_tokens)
+        # Latent KV per sparse layer per token (NoPE MLA: latent + zero rope).
+        latent = self.sparse_layers * self.kv_lora_rank * num_tokens * self.dtype_size
+        # Pooled indexer keys: kv_len / index_kpool entries, index_head_dim wide.
+        pooled = (
+            self.sparse_layers
+            * (num_tokens // self.index_kpool)
+            * self.index_head_dim
+            * self.dtype_size
+        )
+        # GDN recursive state is a per-sequence constant (fp32 per layer).
+        gdn = self.linear_layers * self.linear_num_heads * self.linear_head_dim**2 * 4
+        return int(latent + pooled + gdn)
+
+    def estimate_prefill_transient_bytes(self, query_tokens: int, kv_len: int) -> int:
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+
+        query_tokens = int(query_tokens)
+        kv_len = int(kv_len)
+        pooled_tokens = kv_len // self.index_kpool
+        native_indexer = native_indexer_eligible(
+            query_tokens=query_tokens,
+            pooled_tokens=pooled_tokens,
+            n_heads=self.index_n_heads,
+            head_dim=self.index_head_dim,
+            index_topk=self.index_topk,
+            dtype_supported=self.dtype_size == 2,
+        )
+
+        # One representative layer per attention family, plus the fixed GDN
+        # recursive-state carry (old + new slots) that lives for the chunk.
+        linear = self._linear_attention_bytes(query_tokens)
+        sparse = self._sparse_attention_bytes(
+            query_tokens,
+            kv_len,
+            pooled_tokens,
+            native_indexer=native_indexer,
+        )
+
+        # The GDN recursive state is genuinely held across all linear layers
+        # for the whole chunk graph (fp32 [64,128,128] per layer, old+new).
+        gdn_state = (
+            2 * self.linear_layers * self.linear_num_heads * self.linear_head_dim**2 * 4
+        )
+
+        # HyperConnection widens the carried hidden stream to hidden_size *
+        # hc_mult and materializes a broadcast copy per layer. It is the
+        # dominant fixed per-chunk carry.
+        hc_stream = self.hidden_size * self.hc_mult * query_tokens * self.dtype_size
+
+        # Lazy MLX evaluates the 45 layers sequentially, so the peak is one
+        # layer's working set plus the carried stream (HC + GDN state), not
+        # every layer summed. Take the larger attention family as the layer
+        # peak; the dense-fallback path is already folded into ``sparse``.
+        return int(max(linear, sparse) + hc_stream + gdn_state)
+
+
+def _make_glm5_prefill_memory_profile(
+    config: Any,
+    *,
+    compute_dtype_size: float,
+) -> PrefillMemoryProfile | None:
+    """Build the GLM-5.x hybrid prefill transient estimator, or None.
+
+    GLM-5.3 layer counts come from ``layer_types`` (a per-layer
+    ``"linear_attention"`` / ``"deepseek_sparse_attention"`` list). The GDN
+    dimensions nest under ``linear_attn_config``; the sparse/indexer dims live
+    at the top level. Any missing or malformed dimension falls back to the
+    generic estimator (None), never a half-built profile that underprices.
+    """
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    layer_types = _cfg_get(config, "layer_types")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(layer_types, Sequence)
+        or isinstance(layer_types, (str, bytes))
+        or len(layer_types) != num_layers
+    ):
+        return None
+
+    linear_layers = sum(1 for t in layer_types if t == "linear_attention")
+    sparse_layers = sum(1 for t in layer_types if t == "deepseek_sparse_attention")
+    if linear_layers + sparse_layers != num_layers:
+        return None
+    if not isinstance(compute_dtype_size, (int, float)) or compute_dtype_size <= 0:
+        return None
+
+    linear_cfg = _cfg_get(config, "linear_attn_config")
+    linear_num_heads = _cfg_get(linear_cfg, "num_heads")
+    linear_head_dim = _cfg_get(linear_cfg, "head_dim")
+    short_conv = _cfg_get(linear_cfg, "short_conv_kernel_size")
+    num_attention_heads = _cfg_get(config, "num_attention_heads")
+    qk_nope_head_dim = _cfg_get(config, "qk_nope_head_dim")
+    v_head_dim = _cfg_get(config, "v_head_dim")
+    kv_lora_rank = _cfg_get(config, "kv_lora_rank")
+    index_n_heads = _cfg_get(config, "index_n_heads")
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    index_topk = _cfg_get(config, "index_topk")
+    index_kpool = _cfg_get(config, "index_kpool")
+    hidden_size = _cfg_get(config, "hidden_size")
+    hc_mult = _cfg_get(config, "hc_mult")
+
+    required = (
+        num_attention_heads,
+        qk_nope_head_dim,
+        v_head_dim,
+        kv_lora_rank,
+        index_n_heads,
+        index_head_dim,
+        index_topk,
+        index_kpool,
+        hidden_size,
+        hc_mult,
+        linear_num_heads,
+        linear_head_dim,
+        short_conv,
+    )
+    if not all(_pos_int(value) for value in required):
+        return None
+
+    return _Glm5PrefillMemoryProfile(
+        linear_layers=linear_layers,
+        sparse_layers=sparse_layers,
+        linear_num_heads=int(linear_num_heads),
+        linear_head_dim=int(linear_head_dim),
+        short_conv_kernel=int(short_conv),
+        num_attention_heads=int(num_attention_heads),
+        qk_nope_head_dim=int(qk_nope_head_dim),
+        v_head_dim=int(v_head_dim),
+        kv_lora_rank=int(kv_lora_rank),
+        index_n_heads=int(index_n_heads),
+        index_head_dim=int(index_head_dim),
+        index_topk=int(index_topk),
+        index_kpool=int(index_kpool),
+        hidden_size=int(hidden_size),
+        hc_mult=int(hc_mult),
+        dtype_size=float(compute_dtype_size),
+    )
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
 ) -> PrefillMemoryProfile | None:
-    """Build the one model-specific prefill strategy currently required."""
+    """Build the model-specific prefill strategy when one is required."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+
+    if model_type.startswith("glm5"):
+        return _make_glm5_prefill_memory_profile(
+            config,
+            compute_dtype_size=compute_dtype_size,
+        )
+
     if not model_type.startswith("deepseek_v4"):
         return None
 
