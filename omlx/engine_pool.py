@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import gc
 import json
 import logging
@@ -178,6 +179,58 @@ def _qwen35_cpu_share_estimated_bytes(
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
 
 
+MTP_INACTIVE_NO_EMBEDDED_TENSORS = "no_embedded_mtp_tensors"
+
+
+def _checkpoint_mtp_fingerprint(model_path: str) -> tuple | None:
+    """Cheap change-detector for the files ``_checkpoint_has_mtp_weights`` reads.
+
+    The detector answers from ``model.safetensors.index.json`` when it exists
+    (a shard edited without an index update is invisible to it too), so the
+    fingerprint is that file's ``(size, mtime_ns)``. Without an index it scans
+    every shard header, so the fingerprint covers every ``*.safetensors``.
+    ``None`` when neither exists -- the detector returns False there.
+    """
+    root = Path(model_path)
+    index_path = root / "model.safetensors.index.json"
+    try:
+        st = index_path.stat()
+    except OSError:
+        st = None
+    if st is not None:
+        return ("index", st.st_size, st.st_mtime_ns)
+    shards: list[tuple[str, int, int]] = []
+    try:
+        for shard in sorted(root.glob("*.safetensors")):
+            shard_st = shard.stat()
+            shards.append((shard.name, shard_st.st_size, shard_st.st_mtime_ns))
+    except OSError:
+        return None
+    return tuple(shards) or None
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_checkpoint_has_mtp_weights(
+    model_path: str, fingerprint: tuple | None
+) -> bool:
+    from .utils.model_loading import _checkpoint_has_mtp_weights
+
+    return _checkpoint_has_mtp_weights(model_path)
+
+
+def _checkpoint_has_mtp_weights_cached(model_path: str) -> bool:
+    """``_checkpoint_has_mtp_weights`` with one index parse per checkpoint state.
+
+    ``_engine_runtime_signature`` runs on every ``get_engine``; the Flash-Next
+    index alone is ~400 KB, so the parse is cached on the checkpoint
+    fingerprint (one ``stat`` per call) the same way
+    ``qwen4_exp_residency_estimate`` caches its estimate.
+    """
+    return _cached_checkpoint_has_mtp_weights(
+        model_path, _checkpoint_mtp_fingerprint(model_path)
+    )
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -240,6 +293,16 @@ class EngineEntry:
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
+    # Load-time MTP resolution (issue #3342). ``mtp_active`` is what the
+    # pool could verify for the loaded engine, not what settings asked for:
+    # True/False only for families whose activation the pool resolves
+    # (qwen4_exp), None for everything else and whenever no engine is
+    # loaded — so a client can never read None as "disabled".
+    # ``mtp_inactive_reason`` is set iff MTP was requested and could not
+    # activate.
+    mtp_requested: bool | None = None
+    mtp_active: bool | None = None
+    mtp_inactive_reason: str | None = None
     load_failure_at: float | None = None
 
 
@@ -412,14 +475,50 @@ class EnginePool:
         entry: EngineEntry,
         settings: object | None,
     ) -> object | None:
-        """Apply a forced mmap decision without mutating persisted settings."""
+        """Apply forced mmap / resolved MTP decisions without mutating persisted settings."""
 
         enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
-        if not enabled or not forced or settings is None:
-            return settings
-        effective = copy.copy(settings)
-        setattr(effective, "qwen4_ple_ssd_offload", True)
+        effective = settings
+        if enabled and forced and settings is not None:
+            effective = copy.copy(settings)
+            setattr(effective, "qwen4_ple_ssd_offload", True)
+        # Same shape for Lightning MTP (issue #3342): a persisted
+        # ``mtp_enabled`` on a checkpoint that lost its embedded ``mtp.*``
+        # tensors must not reach the engine as a request the runtime will
+        # silently ignore. Hand the engine the resolved value on a copy; the
+        # persisted setting stays as the operator wrote it.
+        requested, active, _ = self._resolve_mtp_state(entry, settings)
+        if requested and active is False and settings is not None:
+            if effective is settings:
+                effective = copy.copy(settings)
+            effective.mtp_enabled = False
         return effective
+
+    def _resolve_mtp_state(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> tuple[bool, bool | None, str | None]:
+        """Resolve ``(requested, active, inactive_reason)`` for a load.
+
+        ``active`` is only ever True/False for families whose activation the
+        pool can verify from the checkpoint -- today qwen4_exp, using the same
+        ``_checkpoint_has_mtp_weights`` detector the loader and the admin
+        write gate use, so the three surfaces cannot disagree. Every other
+        family resolves to ``None`` ("not verified"), never to a guess.
+        ``inactive_reason`` is set iff MTP was requested and cannot activate.
+        """
+        requested = bool(
+            settings is not None and getattr(settings, "mtp_enabled", False)
+        )
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "qwen4_exp":
+            return requested, None, None
+        if not requested:
+            return False, False, None
+        if _checkpoint_has_mtp_weights_cached(entry.model_path):
+            return True, True, None
+        return True, False, MTP_INACTIVE_NO_EMBEDDED_TENSORS
 
     @property
     def current_model_memory(self) -> int:
@@ -586,7 +685,16 @@ class EnginePool:
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
         # force a reload when the corresponding feature is disabled.
+        # Resolved, not requested: the expected signature (get_engine) is
+        # computed from the caller's settings and the recorded one (load
+        # completion) from the effective copy. Reading the raw setting here
+        # would make them disagree whenever the pool resolved mtp_enabled
+        # off, and every request would unload/reload the engine (#2406).
         mtp_active = bool(data.get("mtp_enabled", False))
+        if entry is not None:
+            _, resolved, _ = self._resolve_mtp_state(entry, settings)
+            if resolved is not None:
+                mtp_active = resolved
         add("mtp_enabled", mtp_active)
         # Draft depth is read once at engine construction; it must be in the
         # signature while Lightning MTP is active so a change reloads the
@@ -2305,6 +2413,9 @@ class EnginePool:
         entry.pending_unload_allow_pinned = False
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
+        entry.mtp_requested = None
+        entry.mtp_active = None
+        entry.mtp_inactive_reason = None
 
         if distributed:
             # Cluster weights live in supervised rank processes, not this
@@ -2536,6 +2647,15 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            mtp_resolution = self._resolve_mtp_state(entry, model_settings)
+            if mtp_resolution[2] is not None:
+                logger.warning(
+                    "Lightning MTP is enabled in settings for %s but cannot "
+                    "activate (%s); the engine will serve target-only "
+                    "completions. Status reports mtp_active=false.",
+                    model_id,
+                    mtp_resolution[2],
+                )
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
@@ -2864,6 +2984,11 @@ class EnginePool:
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True
+            (
+                entry.mtp_requested,
+                entry.mtp_active,
+                entry.mtp_inactive_reason,
+            ) = mtp_resolution
             self._clear_load_failure(entry)
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
@@ -3021,6 +3146,12 @@ class EnginePool:
             entry.abort_loading = False
             if not load_completed:
                 entry.runtime_estimated_size = None
+                # Constructor failure and post-construction abort both land
+                # here; neither leaves an engine, so neither leaves a
+                # resolution to report.
+                entry.mtp_requested = None
+                entry.mtp_active = None
+                entry.mtp_inactive_reason = None
             self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
@@ -3109,6 +3240,11 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    # Load-time MTP resolution; None = not resolved (engine
+                    # not loaded, or a family the pool does not verify).
+                    "mtp_requested": e.mtp_requested,
+                    "mtp_active": e.mtp_active,
+                    "mtp_inactive_reason": e.mtp_inactive_reason,
                 }
                 for mid, e in sorted(self._entries.items())
             ],
