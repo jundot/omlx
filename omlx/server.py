@@ -3671,6 +3671,19 @@ async def create_chat_completion(
             request_guided_grammar=request.guided_grammar,
             settings_guided_grammar=settings_guided_grammar,
         )
+        # A model-settings guided grammar is a whole-sequence contract: it is
+        # written against the full generation (typically opening inside the
+        # <think> block to structure reasoning).  Wrapping it in the
+        # reasoning_parser structural tag would instead patch it into the
+        # post-</think> output slot, constraining the visible response with a
+        # grammar meant for thinking — corrupting the response channel — and
+        # silently auto-setting a thinking budget.  Compile settings grammars
+        # bare; the structural-tag wrap remains for request-level structured
+        # outputs / response_format, which only describe the output.
+        grammar_is_whole_sequence = (
+            settings_guided_grammar is not None
+            and guided_grammar == settings_guided_grammar
+        )
         structured_outputs = _normalize_structured_outputs(
             request.structured_outputs,
             guided_grammar,
@@ -3688,7 +3701,7 @@ async def create_chat_completion(
             structured_outputs=structured_outputs,
             response_format=response_format,
             chat_template_kwargs=merged_ct_kwargs or None,
-            reasoning_parser=reasoning_parser,
+            reasoning_parser=None if grammar_is_whole_sequence else reasoning_parser,
         )
         # Fall back to prompt injection when grammar is not compiled. The degrade
         # is also surfaced to the caller as a Warning response header (#1241).
@@ -3846,10 +3859,16 @@ async def create_chat_completion(
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
         # a thinking phase — auto-set a thinking_budget so the model exits
-        # the reasoning phase and the grammar can activate.
+        # the reasoning phase and the grammar can activate.  Whole-sequence
+        # settings grammars are compiled bare and govern the thinking phase
+        # themselves, so no budget is forced for them.
         if compiled_grammar is not None:
             chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            if (
+                reasoning_parser
+                and not grammar_is_whole_sequence
+                and "thinking_budget" not in chat_kwargs
+            ):
                 default_budget = min(max_tokens // 2, 4096)
                 chat_kwargs["thinking_budget"] = default_budget
                 logger.debug(
