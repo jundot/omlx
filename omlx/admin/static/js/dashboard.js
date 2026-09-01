@@ -375,6 +375,7 @@
             _clusterIncidentSeq: 0,
             _clusterIncidentsById: null,
             _clusterIncidentEpoch: '',
+            clusterSlos: null,
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -1510,6 +1511,7 @@
             async refreshClusterExperience() {
                 await this.loadClusterRuntime();
                 await this.loadClusterIncidents();
+                await this.loadClusterSlos();
                 this._clusterDiscoveryRefreshCounter += 1;
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;
@@ -1589,6 +1591,21 @@
                     }
                 } catch (error) {
                     // Leave the row visible; dismissal is retryable.
+                }
+            },
+
+            async loadClusterSlos() {
+                try {
+                    const response = await fetch('/admin/api/cluster/slos');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (response.ok) {
+                        this.clusterSlos = await response.json();
+                    }
+                } catch (error) {
+                    // SLO fetch failure is non-critical; leave existing state.
                 }
             },
 

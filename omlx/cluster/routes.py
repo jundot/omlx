@@ -122,6 +122,7 @@ from .worker_bundle import (
     worker_source_bundle,
     worker_source_digest,
 )
+from .slo_tracker import SLOTracker
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
@@ -1804,6 +1805,25 @@ async def cluster_status(route_to: str | None = None):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
+
+
+_slo_tracker: SLOTracker | None = None
+
+
+def get_slo_tracker() -> SLOTracker:
+    """Return the singleton SLO tracker, creating it on first call."""
+    global _slo_tracker
+    if _slo_tracker is None:
+        _slo_tracker = SLOTracker()
+    return _slo_tracker
+
+
+@router.get("/slos")
+async def cluster_slos():
+    """Return current SLO compliance status for all defined objectives."""
+
+    tracker = await asyncio.to_thread(get_slo_tracker)
+    return tracker.status_dict()
 
 
 @router.get("/runtime")
