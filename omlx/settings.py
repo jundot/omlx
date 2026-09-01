@@ -1674,19 +1674,22 @@ class GlobalSettings:
                 )
 
         # Network proxy validation
+        # Schemes both client stacks can actually dial: httpx (via socksio)
+        # and requests (via PySocks). socks4/socks4a are httpx-unsupported.
+        _PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
         if self.network.http_proxy:
             proxy = self.network.http_proxy.strip()
-            if proxy and not proxy.startswith(("http://", "https://")):
+            if proxy and not proxy.startswith(_PROXY_SCHEMES):
                 errors.append(
                     f"Invalid http_proxy: '{proxy}' "
-                    "(must start with http:// or https://)"
+                    f"(must start with one of: {', '.join(_PROXY_SCHEMES)})"
                 )
         if self.network.https_proxy:
             proxy = self.network.https_proxy.strip()
-            if proxy and not proxy.startswith(("http://", "https://")):
+            if proxy and not proxy.startswith(_PROXY_SCHEMES):
                 errors.append(
                     f"Invalid https_proxy: '{proxy}' "
-                    "(must start with http:// or https://)"
+                    f"(must start with one of: {', '.join(_PROXY_SCHEMES)})"
                 )
 
         return errors
