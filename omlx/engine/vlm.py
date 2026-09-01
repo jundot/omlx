@@ -45,7 +45,11 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..models.vlm import VLMModelAdapter
+from ..models.vlm import (
+    VLMModelAdapter,
+    reset_lm_mrope_state,
+    rope_deltas_as_float,
+)
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
@@ -3236,6 +3240,10 @@ class VLMBatchedEngine(BaseEngine):
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
             # expect it as a positional/keyword arg named 'mask'.
+            # Drop leftover MTP / prior-request mRoPE fields first so
+            # get_input_embeddings recomputes deltas for *this* prompt
+            # instead of tiling a stale (batch, 1) vector.
+            reset_lm_mrope_state(getattr(self._vlm_model, "language_model", None))
             try:
                 embed_features = self._vlm_model.get_input_embeddings(
                     input_ids, pixel_values, mask=attention_mask, **call_kwargs
@@ -3279,7 +3287,7 @@ class VLMBatchedEngine(BaseEngine):
                     extra_kwargs["position_ids"] = pid
                 rd = getattr(lm, "_rope_deltas", None)
                 if rd is not None:
-                    extra_kwargs["_captured_rope_deltas"] = rd
+                    extra_kwargs["_captured_rope_deltas"] = rope_deltas_as_float(rd)
 
             # Extract token IDs as list
             token_ids = (

@@ -60,6 +60,7 @@ from .patches.sdpa256_attention import set_unfused_headroom_provider
 from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
+from .models.vlm import claim_request_rope_deltas
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
@@ -8324,6 +8325,10 @@ class Scheduler:
                 self._release_paged_cache_for_request(request.request_id)
                 raise
 
+        # Own the mRoPE scalar on the request before it enters the
+        # queue. Prefill must not see ``_captured_rope_deltas`` in extras.
+        claim_request_rope_deltas(request)
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
@@ -10090,6 +10095,7 @@ class Scheduler:
                 break
 
             request = self.waiting.popleft()
+            claim_request_rope_deltas(request)
             self._cache_freshness_waits.pop(request.request_id, None)
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
@@ -10616,20 +10622,17 @@ class Scheduler:
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
-            # Capture per-request mRoPE rope_deltas for decode.
-            # Prefer _captured_rope_deltas from per-request extra_kwargs
-            # (set during get_input_embeddings), since the global
-            # _rope_deltas may be stale when explicit position_ids are used.
-            if request.vlm_inputs_embeds is not None:
-                extra = request.vlm_extra_kwargs or {}
-                captured = extra.get("_captured_rope_deltas")
-                if captured is not None:
-                    if hasattr(captured, "item"):
-                        request.rope_deltas = float(captured.item())
-                    else:
-                        request.rope_deltas = float(captured)
-                elif hasattr(self.model, "get_last_rope_deltas"):
-                    request.rope_deltas = self.model.get_last_rope_deltas()
+            # Decode uses request.rope_deltas, claimed at admit time.
+            # Only fall back to the live LM field when no embed snapshot
+            # was available. Never re-read extras here: prefill may have
+            # already mutated that dict.
+            if (
+                request.vlm_inputs_embeds is not None
+                and not request._rope_deltas_bound
+                and hasattr(self.model, "get_last_rope_deltas")
+            ):
+                request.rope_deltas = self.model.get_last_rope_deltas()
+                request._rope_deltas_bound = True
 
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)

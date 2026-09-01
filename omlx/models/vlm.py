@@ -28,6 +28,53 @@ import mlx.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def rope_deltas_as_float(rd: Any) -> float:
+    """Coerce language-model ``_rope_deltas`` to the per-request scalar.
+
+    ``Request.rope_deltas`` is a single float. Qwen mRoPE writes
+    ``(batch_size, 1)``, and Lightning MTP can leave that vector on the
+    shared language model. ``mx.array.item()`` only accepts size 1.
+    """
+    if rd is None:
+        return 0.0
+    if hasattr(rd, "reshape"):
+        flat = rd.reshape((-1,))
+        size = int(getattr(flat, "size", 0) or 0)
+        if size == 0:
+            return 0.0
+        first = flat[0]
+        return float(first.item()) if hasattr(first, "item") else float(first)
+    if hasattr(rd, "item"):
+        return float(rd.item())
+    return float(rd)
+
+
+def reset_lm_mrope_state(lm: Any) -> None:
+    """Drop leftover mRoPE fields so the next embed pass recomputes them."""
+    if lm is None:
+        return
+    lm._position_ids = None
+    lm._rope_deltas = None
+
+
+def claim_request_rope_deltas(request: Any) -> bool:
+    """Move ``_captured_rope_deltas`` onto ``request.rope_deltas``.
+
+    The snapshot used to live in ``vlm_extra_kwargs``, the same dict
+    prefill slices and the adapter forwards into the language model.
+    That bag is the wrong home for a per-request scalar: the key got
+    popped or seq-sliced, and the scheduler then re-read leftover
+    ``language_model._rope_deltas``. Lift the value once, as a float,
+    and take it out of the extras dict.
+    """
+    extra = getattr(request, "vlm_extra_kwargs", None)
+    if extra and "_captured_rope_deltas" in extra:
+        request.rope_deltas = rope_deltas_as_float(extra.pop("_captured_rope_deltas"))
+        request._rope_deltas_bound = True
+        return True
+    return bool(getattr(request, "_rope_deltas_bound", False))
+
+
 class VLMModelAdapter(nn.Module):
     """
     Adapter wrapping a VLM's language_model for BatchGenerator compatibility.
@@ -327,12 +374,7 @@ class VLMModelAdapter(nn.Module):
         Should be called after get_input_embeddings() which sets
         ``_rope_deltas`` on the language model.
         """
-        rd = getattr(self._language_model, "_rope_deltas", None)
-        if rd is None:
-            return 0.0
-        if hasattr(rd, "item"):
-            return float(rd.item())
-        return float(rd)
+        return rope_deltas_as_float(getattr(self._language_model, "_rope_deltas", None))
 
     @property
     def has_pending_embeddings(self) -> bool:
@@ -372,7 +414,10 @@ class VLMModelAdapter(nn.Module):
             if self.model_type == "qwen4_exp":
                 kwargs["skip_logits"] = True
         inputs_embeds = kwargs.pop("inputs_embeds", None)
-        vlm_extra = kwargs.pop("vlm_extra_kwargs", None) or {}
+        # Copy: the scheduler packs request.vlm_extra_kwargs into the
+        # forward. Popping the snapshot off that shared dict used to
+        # force the next schedule step to re-read leftover LM state.
+        vlm_extra = dict(kwargs.pop("vlm_extra_kwargs", None) or {})
         vlm_extra.pop("_captured_rope_deltas", None)
 
         if inputs_embeds is not None:

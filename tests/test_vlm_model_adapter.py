@@ -268,12 +268,17 @@ class TestVLMModelAdapter:
         embeds = MockMXArray(shape=(2, 10, 128))
         extra = {"position_ids": MockMXArray(shape=(2, 10))}
 
+        extra["_captured_rope_deltas"] = 12.0
         adapter(input_ids, cache=cache, inputs_embeds=embeds, vlm_extra_kwargs=extra)
 
         # Should call language_model with inputs_embeds and extra kwargs
         call_args = vlm.language_model.call_args
         assert call_args.kwargs.get("inputs_embeds") is embeds
         assert call_args.kwargs.get("position_ids") is extra["position_ids"]
+        assert "_captured_rope_deltas" not in call_args.kwargs
+        # Shared extras dict must keep the snapshot; popping it forced
+        # the scheduler to re-read leftover language-model state.
+        assert extra["_captured_rope_deltas"] == 12.0
         # _pending_embeds should NOT be set (batched path doesn't use it)
         assert adapter._pending_embeds is None
 
@@ -585,6 +590,52 @@ class TestPerRequestMRoPEDecode:
 
         vlm.language_model._rope_deltas = None
         assert adapter.get_last_rope_deltas() == 0.0
+
+    def test_get_last_rope_deltas_multi_element_array(self):
+        """Qwen MTP leaves (batch, 1) deltas; .item() used to kill the engine."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter, rope_deltas_as_float
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        vlm.language_model._rope_deltas = mx.array([10.0, 20.0])
+        assert adapter.get_last_rope_deltas() == 10.0
+
+        vlm.language_model._rope_deltas = mx.zeros((3, 1))
+        assert adapter.get_last_rope_deltas() == 0.0
+
+        vlm.language_model._rope_deltas = mx.array([[123]])
+        assert adapter.get_last_rope_deltas() == 123.0
+
+        assert rope_deltas_as_float(None) == 0.0
+        assert rope_deltas_as_float(-7.5) == -7.5
+        assert rope_deltas_as_float(mx.array(-42.0)) == -42.0
+
+    def test_claim_request_rope_deltas_leaves_extras_bag(self):
+        """The embed snapshot belongs on the request, not in vlm_extra_kwargs."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import claim_request_rope_deltas
+        from omlx.request import Request, SamplingParams
+
+        request = Request(
+            request_id="claim-3345",
+            prompt="hi",
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.vlm_extra_kwargs = {
+            "position_ids": mx.zeros((1, 4)),
+            "_captured_rope_deltas": mx.array([12.0, 24.0]),
+        }
+
+        assert claim_request_rope_deltas(request) is True
+        assert request.rope_deltas == 12.0
+        assert request._rope_deltas_bound is True
+        assert "_captured_rope_deltas" not in request.vlm_extra_kwargs
+        assert "position_ids" in request.vlm_extra_kwargs
+        assert claim_request_rope_deltas(request) is True
 
     def test_mrope_scalar_offset_fallback_initializes_position_state(self):
         """Regression #2387: MiniCPM-o text-only prefill with scalar cache offsets.

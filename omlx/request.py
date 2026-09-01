@@ -174,7 +174,8 @@ class Request:
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = (
         None  # [(token_start, cumulative_image_hash)]
     )
-    rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
+    rope_deltas: float = 0.0  # Per-request mRoPE position delta
+    _rope_deltas_bound: bool = False  # True once the embed snapshot is claimed
 
     @property
     def vlm_extra_keys_for_cache(self) -> Optional[Tuple[str, ...]]:
