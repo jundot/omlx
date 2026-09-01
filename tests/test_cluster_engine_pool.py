@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -173,6 +174,37 @@ def test_cluster_model_path_rejects_non_text_model(tmp_path):
 
     with pytest.raises(ValueError, match="text LLM models only"):
         pool.resolve_cluster_model_id(str(model_path))
+
+
+def test_cluster_model_path_accepts_gated_deepseek_v4_vision(tmp_path):
+    model_path = tmp_path / "deepseek-v4-vision"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "vision_n_layers": 32,
+                "vision_dim": 1024,
+                "vision_n_heads": 16,
+                "vision_inter_dim": 2816,
+                "vision_patch_size": 14,
+                "vision_rope_theta": 10000.0,
+                "vision_downsample_ratio": 3,
+                "vision_max_n_token": 384,
+                "vision_min_pixels": 147456,
+                "vision_max_wh_ratio": 8,
+            }
+        )
+    )
+    pool = EnginePool()
+    entry = _entry(str(model_path))
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    pool._entries["deepseek-v4-vision"] = entry
+
+    assert (
+        pool.resolve_cluster_model_id(str(model_path)) == "deepseek-v4-vision"
+    )
 
 
 def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):

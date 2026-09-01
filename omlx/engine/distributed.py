@@ -227,6 +227,20 @@ class DistributedBatchedEngine(BatchedEngine):
             ],
         )
         config = await asyncio.to_thread(load_config, metadata_path)
+        from ..deepseek_v4_vision import (
+            is_deepseek_v4_vision_config,
+            require_supported_distributed_vlm,
+        )
+        from ..model_discovery import _has_vision_subconfig
+
+        if _has_vision_subconfig(config):
+            require_supported_distributed_vlm(config)
+            logger.info(
+                "DeepSeek-V4 Vision distributed capability recognized: "
+                "rank 0 owns vision preprocessing/encoder; language uses pipeline"
+            )
+        elif is_deepseek_v4_vision_config(config):  # defensive if heuristics change
+            require_supported_distributed_vlm(config)
         self._model_type = config.get("model_type")
         self._tokenizer = await asyncio.to_thread(
             load_tokenizer,

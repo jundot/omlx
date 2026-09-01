@@ -174,6 +174,19 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
     use_native_ratio128_attention: bool = True
+    # DeepSeek-V4-Flash-Vision-Exp uses flat top-level vision fields rather
+    # than a nested vision_config. Zero keeps ordinary DeepSeek-V4 text models
+    # byte-for-byte on their existing path.
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 384
+    vision_min_pixels: int = 147456
+    vision_max_wh_ratio: int = 8
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -841,32 +854,63 @@ class MoEGate(nn.Module):
         self.scoring_func = config.scoring_func
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
+        self.vocab_size = config.vocab_size
+        self.vision = config.vision_n_layers > 0
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
-        else:
+        if not self.hash or self.vision:
             self.e_score_correction_bias = mx.zeros(
+                (self.num_experts,), dtype=mx.float32
+            )
+        if self.vision:
+            self.e_score_correction_bias_vl = mx.zeros(
                 (self.num_experts,), dtype=mx.float32
             )
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         logits = decode_matmul(x, self.weight.T)
 
+        image_mask = None
+        if self.vision:
+            if input_ids is None:
+                raise ValueError("DeepSeek-V4 Vision routing requires input_ids.")
+            image_mask = input_ids >= self.vocab_size
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
-            inds, weights = _hash_expert_select(
-                input_ids,
-                logits,
-                self.tid2eid,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
-            )
+            if image_mask is None:
+                inds, weights = _hash_expert_select(
+                    input_ids,
+                    logits,
+                    self.tid2eid,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                safe_ids = mx.where(image_mask, 0, input_ids)
+                scores = _score_func(logits.astype(mx.float32), self.scoring_func)
+                inds = self.tid2eid[safe_ids]
+                vision_inds = mx.argpartition(
+                    -(scores + self.e_score_correction_bias_vl),
+                    kth=self.top_k - 1,
+                    axis=-1,
+                )[..., : self.top_k]
+                inds = mx.where(image_mask[..., None], vision_inds, inds)
+                weights = mx.take_along_axis(scores, inds, axis=-1)
+                if self.scoring_func != "softmax" and self.norm_topk_prob:
+                    weights /= weights.sum(axis=-1, keepdims=True) + 1e-20
+                weights *= self.routed_scaling_factor
         else:
+            bias = self.e_score_correction_bias
+            if image_mask is not None:
+                bias = mx.where(
+                    image_mask[..., None], self.e_score_correction_bias_vl, bias
+                )
             inds, weights = _expert_select(
                 logits,
-                self.e_score_correction_bias,
+                bias,
                 self.top_k,
                 self.routed_scaling_factor,
                 self.norm_topk_prob,
@@ -2193,8 +2237,15 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        h = self.embed_tokens(inputs)
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        *,
+        inputs_embeds: Optional[mx.array] = None,
+    ) -> mx.array:
+        safe_inputs = mx.where(inputs >= self.vocab_size, 0, inputs)
+        h = self.embed_tokens(safe_inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
             h[:, :, None, :],
             (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
@@ -2217,6 +2268,25 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             window_size=self.args.sliding_window,
             return_array=True,
         )
+        if inputs.shape[1] > 1 and bool(mx.any(inputs >= self.vocab_size).item()):
+            # The checkpoint's sparse local attention extends visibility across
+            # each complete image sentinel block. It otherwise uses ordinary
+            # one-dimensional token positions.
+            visible = mx.zeros(
+                (inputs.shape[1], inputs.shape[1]), dtype=mx.bool_
+            )
+            for row in inputs.tolist():
+                start = None
+                for index, token in enumerate(row):
+                    kind = int(token) - self.vocab_size
+                    if kind == 0:
+                        start = index
+                    elif kind == 4 and start is not None:
+                        visible = visible.at[start : index + 1, start : index + 1].add(
+                            True
+                        )
+                        start = None
+            mask = visible if mask is None else (mask | visible)
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
@@ -2248,9 +2318,131 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self._vision_group = mx.distributed.init()
+        self._vision_rank = int(self._vision_group.rank())
+        self._vision_inputs = None
+        if config.vision_n_layers > 0 and self._vision_rank == 0:
+            from omlx.patches.deepseek_v4.vision_model import Aligner, ViT
+
+            self.vision = ViT(config)
+            self.aligner = Aligner(config)
+            self.image_start = mx.zeros((config.hidden_size,))
+            self.image_end = mx.zeros((config.hidden_size,))
+            self.image_newline = mx.zeros((config.hidden_size,))
+            self.image_pad = mx.zeros((config.hidden_size,))
+
+    @property
+    def is_vision_model(self) -> bool:
+        return self.args.vision_n_layers > 0
+
+    def set_vision_inputs(self, images) -> None:
+        """Install one request's preprocessed images on coordinator only."""
+
+        self._vision_inputs = images if self._vision_rank == 0 else None
+
+    def _vision_embeddings(self, inputs: mx.array) -> mx.array:
+        import time
+
+        logger = logging.getLogger(__name__)
+        dtype = self.model.embed_tokens.weight.dtype
+        shape = (inputs.shape[0], inputs.shape[1], self.args.hidden_size)
+        encode_error = None
+        if self._vision_rank == 0:
+            try:
+                if not self._vision_inputs:
+                    raise RuntimeError(
+                        "image sentinel tokens reached the model without "
+                        "rank-zero vision inputs"
+                    )
+                safe = mx.where(inputs >= self.args.vocab_size, 0, inputs)
+                embeddings = self.model.embed_tokens(safe)
+                params = mx.stack(
+                    [
+                        self.image_start,
+                        self.image_pad,
+                        self.image_pad,
+                        self.image_newline,
+                        self.image_end,
+                    ]
+                )
+                started = time.perf_counter()
+                logger.info(
+                    "deepseek_v4_vision stage=vision_encode_begin images=%d",
+                    len(self._vision_inputs),
+                )
+                for image in self._vision_inputs:
+                    patches = mx.array(image.patches, dtype=mx.bfloat16)
+                    features = self.aligner(
+                        self.vision(patches, image.n_vit_h, image.n_vit_w),
+                        image.n_vit_h,
+                        image.n_vit_w,
+                    )
+                    features = features[
+                        mx.array(image.permutation, dtype=mx.uint32)
+                    ]
+                    types = mx.array(image.types, dtype=mx.uint32)
+                    block = params[types]
+                    positions = mx.array(
+                        [i for i, kind in enumerate(image.types) if kind == 2],
+                        dtype=mx.uint32,
+                    )
+                    block = block.at[positions].add(features - block[positions])
+                    current = embeddings[
+                        0, image.start : image.start + block.shape[0]
+                    ]
+                    embeddings = embeddings.at[
+                        0, image.start : image.start + block.shape[0]
+                    ].add(block - current)
+                mx.eval(embeddings)
+                logger.info(
+                    "deepseek_v4_vision stage=vision_encode_complete images=%d "
+                    "elapsed_ms=%.1f",
+                    len(self._vision_inputs),
+                    (time.perf_counter() - started) * 1000,
+                )
+            except Exception as exc:
+                encode_error = exc
+                embeddings = mx.zeros(shape, dtype=dtype)
+                logger.exception(
+                    "deepseek_v4_vision stage=vision_encode_failed rank=0"
+                )
+        else:
+            embeddings = mx.zeros(shape, dtype=dtype)
+        self._vision_inputs = None
+        if self._vision_group.size() > 1:
+            # Synchronize success before the large embedding collective so a
+            # coordinator-side decode/encode failure cannot strand peers.
+            local_status = mx.array(
+                int(self._vision_rank == 0 and encode_error is None),
+                dtype=mx.int32,
+            )
+            status = mx.distributed.all_sum(local_status, group=self._vision_group)
+            mx.eval(status)
+            if int(status.item()) != 1:
+                message = "DeepSeek-V4 vision encoding failed on rank zero"
+                if encode_error is not None:
+                    raise RuntimeError(message) from encode_error
+                raise RuntimeError(message)
+            embeddings = mx.distributed.all_sum(
+                embeddings, group=self._vision_group
+            )
+        elif encode_error is not None:
+            raise RuntimeError("DeepSeek-V4 vision encoding failed") from encode_error
+        logger.info(
+            "deepseek_v4_vision stage=multimodal_embeddings shape=%s dtype=%s "
+            "sequence_length=%d",
+            tuple(embeddings.shape),
+            embeddings.dtype,
+            int(embeddings.shape[1]),
+        )
+        return embeddings
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+        multimodal = self.is_vision_model and bool(
+            mx.any(inputs >= self.args.vocab_size).item()
+        )
+        embeddings = self._vision_embeddings(inputs) if multimodal else None
+        return self.lm_head(self.model(inputs, cache, inputs_embeds=embeddings))
 
     @property
     def layers(self):
