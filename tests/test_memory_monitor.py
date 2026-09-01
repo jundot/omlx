@@ -1097,3 +1097,30 @@ class TestAnePrefillTransientReserve:
         )
         monitor.clear_ane_prefill_transient()
         assert monitor._ane_prefill_transient_bytes == 0
+
+    def test_setter_refreshes_after_compile_and_clears_after_release(self):
+        # The banks compile after the scheduler snapshots model info, so the
+        # load-time reserve reads 0; engines refresh it post-compile, and the
+        # release rung clears it while the model stays resident.
+        from omlx.memory_monitor import MemoryMonitor
+
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        monitor.set_model_info(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            dtype_size=2,
+        )
+        assert monitor._ane_prefill_transient_bytes == 0
+        reserve = 12 * 1024**3
+        base_peak = monitor.estimate_prefill_peak_bytes(32768, 2048)
+        monitor.set_ane_prefill_transient_bytes(reserve)
+        assert monitor._ane_prefill_transient_bytes == reserve
+        assert (
+            monitor.estimate_prefill_peak_bytes(32768, 2048) == base_peak + reserve
+        )
+        monitor.clear_ane_prefill_transient()
+        assert monitor._ane_prefill_transient_bytes == 0
+        # Negative input clamps to zero instead of widening headroom.
+        monitor.set_ane_prefill_transient_bytes(-5)
+        assert monitor._ane_prefill_transient_bytes == 0

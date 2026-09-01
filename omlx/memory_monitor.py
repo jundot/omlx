@@ -427,6 +427,18 @@ class MemoryMonitor:
         """
         self._ane_prefill_transient_bytes = 0
 
+    def set_ane_prefill_transient_bytes(self, value: int) -> None:
+        """Refresh the ANE prefill I/O-surface reservation.
+
+        ANE banks compile after the scheduler snapshots model info (the
+        engine builds them once the scheduler exists), so the load-time
+        value can read 0 while banks are being created. Engines call this
+        right after compilation so admission prices the real reservation
+        while banks exist; bank release clears it via
+        clear_ane_prefill_transient.
+        """
+        self._ane_prefill_transient_bytes = max(int(value), 0)
+
     def set_model_info(
         self,
         num_layers: int,

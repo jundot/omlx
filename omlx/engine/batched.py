@@ -579,6 +579,7 @@ class BatchedEngine(BaseEngine):
         scheduler = self._engine.engine.scheduler
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
+                ane_prefill_transient_bytes,
                 configure_qwen35_ane_prefill_scheduler,
             )
 
@@ -586,6 +587,15 @@ class BatchedEngine(BaseEngine):
                 scheduler,
                 ane_prefill_sequence_length,
             )
+            # Price the compiled ANE I/O surfaces explicitly: a later
+            # _set_model_info_for_monitor() defaults the term to zero
+            # unless re-derived, and the monitor must hold the real
+            # reservation while the banks exist.
+            monitor = getattr(scheduler, "memory_monitor", None)
+            if monitor is not None:
+                monitor.set_ane_prefill_transient_bytes(
+                    ane_prefill_transient_bytes(self._model)
+                )
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:

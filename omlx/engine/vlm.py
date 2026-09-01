@@ -2105,6 +2105,18 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
+                    # The scheduler snapshotted model info before these
+                    # banks existed; price the compiled I/O surfaces now so
+                    # admission charges them while the banks are resident.
+                    from ..patches.qwen35_ane_prefill import (
+                        ane_prefill_transient_bytes,
+                    )
+
+                    monitor = getattr(scheduler, "memory_monitor", None)
+                    if monitor is not None:
+                        monitor.set_ane_prefill_transient_bytes(
+                            ane_prefill_transient_bytes(self._vlm_model)
+                        )
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
