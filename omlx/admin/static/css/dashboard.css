@@ -240,6 +240,198 @@
     .model-card-content img { max-width: 100%; border-radius: 0.5rem; margin: 0.5rem 0; }
     .model-card-content h1:first-child { margin-top: 0; }
 
+    /* ===================================================================
+       Cluster
+       Component styles for the cluster dashboard. These build on the CSS
+       custom property system defined above (--bg-primary, --text-primary,
+       --border-faint, etc.) and support dark mode via data-theme="dark".
+       =================================================================== */
+
+    /* === Cluster: card shell === */
+    .cluster-card {
+        background-color: var(--bg-primary);
+        border: 1px solid var(--border-faint);
+        border-radius: 1rem;
+        overflow: hidden;
+    }
+    .cluster-card__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 1rem 1.5rem;
+        background-color: var(--bg-tertiary);
+        border-bottom: 1px solid var(--border-faint);
+    }
+    .cluster-card__body {
+        padding: 1.5rem;
+    }
+
+    /* === Cluster: capacity bar === */
+    .cluster-capacity-bar {
+        display: flex;
+        width: 100%;
+        height: 0.34rem;
+        border-radius: 999px;
+        overflow: hidden;
+        background-color: var(--border-faint);
+    }
+    .cluster-capacity-bar__weights {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #6366f1, #818cf8);
+        transition: width 220ms ease;
+    }
+    .cluster-capacity-bar__kv {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #0891b2, #22d3ee);
+        box-shadow: 0 0 9px rgba(34, 211, 238, 0.32);
+        transition: width 220ms ease;
+    }
+
+    /* === Cluster: health score ring === */
+    .cluster-health-ring {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 999px;
+        border: 2px solid var(--border-faint);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 700;
+    }
+    .cluster-health-ring--ok {
+        border-color: #22c55e;
+        color: #16a34a;
+    }
+    .cluster-health-ring--warn {
+        border-color: #f59e0b;
+        color: #d97706;
+    }
+    .cluster-health-ring--error {
+        border-color: #ef4444;
+        color: #dc2626;
+    }
+
+    /* === Cluster: node row === */
+    .cluster-node-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-secondary);
+    }
+    .cluster-node-row__identity {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        min-width: 0;
+    }
+    .cluster-node-row__icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 0.5rem;
+        flex-shrink: 0;
+    }
+    .cluster-node-row__icon--local {
+        background-color: var(--bg-tertiary);
+        color: var(--text-secondary);
+    }
+    .cluster-node-row__icon--worker {
+        background-color: rgba(34, 197, 94, 0.1);
+        color: #16a34a;
+    }
+    .cluster-node-row__name {
+        overflow: hidden;
+        font-size: 0.875rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .cluster-node-row__detail {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+    }
+
+    /* === Cluster: model row === */
+    .cluster-model-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-primary);
+        text-align: left;
+        transition: border-color 150ms ease, background-color 150ms ease;
+        width: 100%;
+    }
+    .cluster-model-row:hover {
+        border-color: var(--text-muted);
+    }
+    .cluster-model-row--selected {
+        border-color: var(--text-primary);
+        background-color: var(--text-primary);
+        color: var(--bg-primary);
+    }
+    .cluster-model-row__icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 0.5rem;
+        flex-shrink: 0;
+    }
+    .cluster-model-row__icon--default {
+        background-color: rgba(59, 130, 246, 0.1);
+        color: #2563eb;
+    }
+    .cluster-model-row__info {
+        display: flex;
+        min-width: 0;
+        flex: 1;
+        flex-direction: column;
+        gap: 0.125rem;
+    }
+
+    /* === Cluster: expand/collapse toggle === */
+    .cluster-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-primary);
+        text-align: left;
+        transition: background-color 150ms ease;
+    }
+    .cluster-toggle:hover {
+        background-color: var(--bg-secondary);
+    }
+    .cluster-toggle__chevron {
+        width: 1rem;
+        height: 1rem;
+        color: var(--text-muted);
+        transition: transform 150ms ease;
+    }
+    .cluster-toggle[aria-expanded="true"] .cluster-toggle__chevron {
+        transform: rotate(180deg);
+    }
+
     /* === Cluster neural fabric === */
     .cluster-fabric {
         position: relative;
@@ -1063,6 +1255,111 @@
         }
         .cluster-fabric-metric:last-child {
             grid-column: 1 / -1;
+        }
+    }
+
+    /* === Prefix Cache Topology === */
+    .prefix-cache-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+        gap: 0.75rem;
+    }
+    .prefix-cache-node {
+        display: grid;
+        gap: 0.5rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        padding: 0.85rem;
+        background-color: var(--bg-secondary);
+    }
+    .prefix-cache-node__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+    }
+    .prefix-cache-node__name {
+        overflow: hidden;
+        font-size: 0.8rem;
+        font-weight: 650;
+        color: var(--text-primary);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .prefix-cache-node__hit-rate {
+        flex-shrink: 0;
+        font-size: 0.7rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+    }
+    .prefix-cache-node__hit-rate--high { color: #16a34a; }
+    .prefix-cache-node__hit-rate--mid  { color: #d97706; }
+    .prefix-cache-node__hit-rate--low  { color: #dc2626; }
+    .prefix-cache-util {
+        display: flex;
+        width: 100%;
+        height: 0.28rem;
+        border-radius: 999px;
+        overflow: hidden;
+        background-color: var(--border-faint);
+    }
+    .prefix-cache-util__used {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #6366f1, #818cf8);
+        transition: width 220ms ease;
+    }
+    .prefix-cache-util__free {
+        display: block;
+        height: 100%;
+        background: rgba(100, 116, 139, 0.15);
+        flex: 1;
+    }
+    .prefix-cache-node__meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.3rem;
+        color: var(--text-secondary);
+        font-size: 0.68rem;
+    }
+    .prefix-cache-events {
+        display: grid;
+        gap: 0.4rem;
+        max-height: 12rem;
+        overflow-y: auto;
+    }
+    .prefix-cache-event {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.4rem 0.6rem;
+        border-radius: 0.5rem;
+        font-size: 0.68rem;
+        color: var(--text-secondary);
+    }
+    .prefix-cache-event--hit    { background: rgba(34, 197, 94, 0.08); }
+    .prefix-cache-event--miss   { background: rgba(239, 68, 68, 0.08); }
+    .prefix-cache-event--evict  { background: rgba(245, 158, 11, 0.08); }
+    .prefix-cache-event__dot {
+        width: 0.38rem;
+        height: 0.38rem;
+        border-radius: 999px;
+        flex-shrink: 0;
+    }
+    .prefix-cache-event__dot--hit   { background: #22c55e; }
+    .prefix-cache-event__dot--miss  { background: #ef4444; }
+    .prefix-cache-event__dot--evict { background: #f59e0b; }
+
+    [data-theme="dark"] .prefix-cache-node { background: var(--bg-tertiary); }
+    [data-theme="dark"] .prefix-cache-util { background: rgba(71, 85, 105, 0.28); }
+    [data-theme="dark"] .prefix-cache-event--hit  { background: rgba(34, 197, 94, 0.12); }
+    [data-theme="dark"] .prefix-cache-event--miss { background: rgba(239, 68, 68, 0.12); }
+    [data-theme="dark"] .prefix-cache-event--evict { background: rgba(245, 158, 11, 0.12); }
+
+    @media (max-width: 720px) {
+        .prefix-cache-grid {
+            grid-template-columns: 1fr;
         }
     }
 

@@ -338,6 +338,9 @@
             serverAliases: [],
             selectedAlias: '',
 
+            // Prefix-cache topology visualization
+            prefixCacheTopology: null,
+
             // Distributed cluster prototype
             clusterStatus: null,
             clusterLoading: false,
@@ -958,6 +961,7 @@
                         this.clusterStatus ? Promise.resolve() : this.loadClusterStatus(),
                         this.loadClusterDeployments(),
                         this.loadClusterJoinStatus(),
+                        this.loadPrefixCacheTopology(),
                         this.clusterDiscoveredPeers === null
                             ? this.discoverClusterPeers()
                             : Promise.resolve(),
@@ -1374,6 +1378,32 @@
                 }
             },
 
+            async loadPrefixCacheTopology() {
+                try {
+                    const response = await fetch('/admin/api/cluster/prefix-cache');
+                    if (response.status === 401) return;
+                    if (response.ok) {
+                        this.prefixCacheTopology = await response.json();
+                    }
+                } catch (_) {
+                    // Non-critical: topology is supplementary diagnostic data.
+                }
+            },
+
+            prefixCacheHitRateTone() {
+                const rate = this.prefixCacheTopology?.totals?.hit_rate ?? 0;
+                if (rate >= 0.7) return 'bg-green-50 text-green-700';
+                if (rate >= 0.3) return 'bg-amber-50 text-amber-700';
+                return 'bg-red-50 text-red-700';
+            },
+
+            prefixCacheHitRateLabel() {
+                const rate = this.prefixCacheTopology?.totals?.hit_rate ?? 0;
+                if (rate >= 0.7) return 'High';
+                if (rate >= 0.3) return 'Moderate';
+                return 'Low';
+            },
+
             async downloadClusterDiagnostics() {
                 if (this.clusterDiagnosticsLoading) return;
                 this.clusterDiagnosticsLoading = true;
@@ -1510,6 +1540,7 @@
             async refreshClusterExperience() {
                 await this.loadClusterRuntime();
                 await this.loadClusterIncidents();
+                await this.loadPrefixCacheTopology();
                 this._clusterDiscoveryRefreshCounter += 1;
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;

@@ -34,11 +34,20 @@ _CLUSTER_URL = re.compile(
 
 
 def _registered_routes() -> set[str]:
-    from omlx.cluster import routes
+    """Every cluster path the server actually mounts.
+
+    ``routes.router`` is not the whole surface: ``_register_cluster_routes`` in
+    ``omlx/server.py`` mounts sibling routers under the same prefix, and a route
+    that only lives in one of those is still a real route. Collecting just the
+    one router made the dashboard's ``/prefix-cache`` call look like a 404.
+    """
+
+    from omlx.cluster import prefix_cache_api, routes
 
     return {
         re.sub(r"\{[^{}]+\}", "{parameter}", route.path)
-        for route in routes.router.routes
+        for router in (routes.router, prefix_cache_api.router)
+        for route in router.routes
         if getattr(route, "path", None)
     }
 

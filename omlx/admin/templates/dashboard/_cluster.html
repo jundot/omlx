@@ -845,15 +845,14 @@
                 <button type="button"
                         @click="clusterShowSetupDetails = !clusterShowSetupDetails"
                         :aria-expanded="clusterShowSetupDetails"
-                        class="w-full mb-6 flex items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-left hover:bg-neutral-50"
+                        class="cluster-toggle w-full mb-6"
                         data-cluster-advanced-toggle>
                     <span>
                         <span class="block text-sm font-medium text-neutral-700">Diagnostics</span>
                         <span class="block text-xs text-neutral-400 mt-0.5">Connection, runtime, and recovery details</span>
                     </span>
                     <i data-lucide="chevron-down"
-                       class="w-4 h-4 text-neutral-400 transition-transform"
-                       :class="{ 'rotate-180': clusterShowSetupDetails }"></i>
+                       class="cluster-toggle__chevron"></i>
                 </button>
 
                 <div x-show="clusterShowSetupDetails" x-cloak
@@ -876,59 +875,178 @@
                 <!-- Capability summary -->
                 <div x-show="clusterShowSetupDetails" x-cloak
                      class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
-                    <div class="bg-white border border-neutral-200 rounded-2xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">This Mac</span>
-                            <span class="w-8 h-8 rounded-xl bg-green-50 text-green-600 flex items-center justify-center">
-                                <i data-lucide="monitor" class="w-4 h-4"></i>
-                            </span>
-                        </div>
-                        <div class="text-base font-semibold text-neutral-900 truncate" x-text="clusterStatus.node.hostname"></div>
-                        <div class="text-sm text-neutral-500 mt-1 truncate" x-text="clusterStatus.node.chip_name"></div>
-                    </div>
-
-                    <div class="bg-white border border-neutral-200 rounded-2xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Memory budget</span>
-                            <span class="w-8 h-8 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center">
-                                <i data-lucide="memory-stick" class="w-4 h-4"></i>
-                            </span>
-                        </div>
-                        <div class="text-base font-semibold text-neutral-900"
-                             x-text="formatClusterGiB(clusterStatus.node.recommended_working_set_bytes)"></div>
-                        <div class="text-sm text-neutral-500 mt-1">
-                            <span x-text="formatClusterGiB(clusterStatus.node.physical_memory_bytes)"></span>
-                            <span> physical</span>
+                    <div class="cluster-card">
+                        <div class="cluster-card__body">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">This Mac</span>
+                                <span class="w-8 h-8 rounded-xl bg-green-50 text-green-600 flex items-center justify-center">
+                                    <i data-lucide="monitor" class="w-4 h-4"></i>
+                                </span>
+                            </div>
+                            <div class="text-base font-semibold text-neutral-900 truncate" x-text="clusterStatus.node.hostname"></div>
+                            <div class="text-sm text-neutral-500 mt-1 truncate" x-text="clusterStatus.node.chip_name"></div>
                         </div>
                     </div>
 
-                    <div class="bg-white border border-neutral-200 rounded-2xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Transport</span>
-                            <span class="w-8 h-8 rounded-xl flex items-center justify-center"
-                                  :class="clusterTransportIconTone(clusterEffectiveTransportState())">
-                                <i data-lucide="cable" class="w-4 h-4"></i>
-                            </span>
+                    <div class="cluster-card">
+                        <div class="cluster-card__body">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Memory budget</span>
+                                <span class="w-8 h-8 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center">
+                                    <i data-lucide="memory-stick" class="w-4 h-4"></i>
+                                </span>
+                            </div>
+                            <div class="text-base font-semibold text-neutral-900"
+                                 x-text="formatClusterGiB(clusterStatus.node.recommended_working_set_bytes)"></div>
+                            <div class="text-sm text-neutral-500 mt-1">
+                                <span x-text="formatClusterGiB(clusterStatus.node.physical_memory_bytes)"></span>
+                                <span> physical</span>
+                            </div>
                         </div>
-                        <div class="text-base font-semibold text-neutral-900"
-                             x-text="clusterStateLabel(clusterEffectiveTransportState())"></div>
-                        <div class="text-sm text-neutral-500 mt-1"
-                             x-text="clusterStatus.transport.rdma.enabled
-                                ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
-                                : 'RDMA not enabled'"></div>
                     </div>
 
-                    <div class="bg-white border border-neutral-200 rounded-2xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Runtime</span>
-                            <span class="w-8 h-8 rounded-xl bg-purple-50 text-purple-700 flex items-center justify-center">
-                                <i data-lucide="blocks" class="w-4 h-4"></i>
-                            </span>
+                    <div class="cluster-card">
+                        <div class="cluster-card__body">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Transport</span>
+                                <span class="w-8 h-8 rounded-xl flex items-center justify-center"
+                                      :class="clusterTransportIconTone(clusterEffectiveTransportState())">
+                                    <i data-lucide="cable" class="w-4 h-4"></i>
+                                </span>
+                            </div>
+                            <div class="text-base font-semibold text-neutral-900"
+                                 x-text="clusterStateLabel(clusterEffectiveTransportState())"></div>
+                            <div class="text-sm text-neutral-500 mt-1"
+                                 x-text="clusterStatus.transport.rdma.enabled
+                                    ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
+                                    : 'RDMA not enabled'"></div>
                         </div>
-                        <div class="text-base font-semibold text-neutral-900"
-                             x-text="'MLX ' + clusterStatus.runtime.mlx_version"></div>
-                        <div class="text-sm text-neutral-500 mt-1"
-                             x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · protocol ' + clusterStatus.protocol_version"></div>
+                    </div>
+
+                    <div class="cluster-card">
+                        <div class="cluster-card__body">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">Runtime</span>
+                                <span class="w-8 h-8 rounded-xl bg-purple-50 text-purple-700 flex items-center justify-center">
+                                    <i data-lucide="blocks" class="w-4 h-4"></i>
+                                </span>
+                            </div>
+                            <div class="text-base font-semibold text-neutral-900"
+                                 x-text="'MLX ' + clusterStatus.runtime.mlx_version"></div>
+                            <div class="text-sm text-neutral-500 mt-1"
+                                 x-text="'oMLX ' + clusterStatus.runtime.omlx_version + ' · protocol ' + clusterStatus.protocol_version"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Prefix Cache Topology -->
+                <div x-show="clusterShowSetupDetails && prefixCacheTopology" x-cloak
+                     class="cluster-card mb-6"
+                     data-cluster-prefix-cache>
+                    <div class="cluster-card__header">
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Prefix cache topology</span>
+                            </div>
+                            <p class="text-xs text-neutral-400 mt-1">Shared KV cache blocks across requests — hits reduce TTFT</p>
+                        </div>
+                        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium"
+                              :class="prefixCacheHitRateTone()">
+                            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+                            <span x-text="prefixCacheHitRateLabel()"></span>
+                        </span>
+                    </div>
+
+                    <div class="p-6">
+                        <!-- Summary cards -->
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+                            <div class="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                                <div class="text-[10px] uppercase tracking-wider text-neutral-400">Total blocks</div>
+                                <div class="text-lg font-semibold text-neutral-900 mt-1"
+                                     x-text="prefixCacheTopology?.totals?.total_blocks ?? 0"></div>
+                            </div>
+                            <div class="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                                <div class="text-[10px] uppercase tracking-wider text-neutral-400">Used blocks</div>
+                                <div class="text-lg font-semibold text-neutral-900 mt-1"
+                                     x-text="prefixCacheTopology?.totals?.used_blocks ?? 0"></div>
+                            </div>
+                            <div class="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                                <div class="text-[10px] uppercase tracking-wider text-neutral-400">Tokens saved</div>
+                                <div class="text-lg font-semibold text-blue-600 mt-1"
+                                     x-text="formatClusterCount(prefixCacheTopology?.totals?.tokens_saved ?? 0)"></div>
+                            </div>
+                            <div class="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                                <div class="text-[10px] uppercase tracking-wider text-neutral-400">Evictions</div>
+                                <div class="text-lg font-semibold text-neutral-900 mt-1"
+                                     x-text="prefixCacheTopology?.totals?.evictions ?? 0"></div>
+                            </div>
+                        </div>
+
+                        <!-- Per-node cache state -->
+                        <div class="prefix-cache-grid" x-show="prefixCacheTopology?.nodes?.length">
+                            <template x-for="node in prefixCacheTopology?.nodes ?? []" :key="node.node_id">
+                                <div class="prefix-cache-node">
+                                    <div class="prefix-cache-node__header">
+                                        <span class="prefix-cache-node__name" x-text="node.hostname"></span>
+                                        <span class="prefix-cache-node__hit-rate"
+                                              :class="{
+                                                  'prefix-cache-node__hit-rate--high': node.hit_rate >= 0.7,
+                                                  'prefix-cache-node__hit-rate--mid': node.hit_rate >= 0.3 && node.hit_rate < 0.7,
+                                                  'prefix-cache-node__hit-rate--low': node.hit_rate < 0.3
+                                              }"
+                                              x-text="(node.hit_rate * 100).toFixed(1) + '%'"></span>
+                                    </div>
+                                    <div class="prefix-cache-util"
+                                         role="meter"
+                                         :aria-label="node.hostname + ' cache utilization'"
+                                         :aria-valuenow="Math.round(node.total_blocks > 0 ? (node.used_blocks / node.total_blocks) * 100 : 0)"
+                                         aria-valuemin="0"
+                                         aria-valuemax="100">
+                                        <span class="prefix-cache-util__used"
+                                              :style="'width:' + (node.total_blocks > 0 ? Math.max(2, (node.used_blocks / node.total_blocks) * 100) : 0) + '%'"></span>
+                                        <span class="prefix-cache-util__free"></span>
+                                    </div>
+                                    <div class="prefix-cache-node__meta">
+                                        <span x-text="node.used_blocks + ' / ' + node.total_blocks + ' blocks'"></span>
+                                        <span x-text="formatClusterCount(node.tokens_saved) + ' tokens saved'"></span>
+                                    </div>
+                                    <div class="prefix-cache-node__meta">
+                                        <span x-text="node.prefix_hashes.length + ' prefix hashes'"></span>
+                                        <span x-text="node.total_queries + ' queries'"></span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+
+                        <!-- Recent cache events -->
+                        <div x-show="(prefixCacheTopology?.events ?? []).length" class="mt-5">
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Recent events</div>
+                            <div class="prefix-cache-events">
+                                <template x-for="(event, idx) in (prefixCacheTopology?.events ?? []).slice(0, 20)" :key="idx">
+                                    <div class="prefix-cache-event"
+                                         :class="{
+                                             'prefix-cache-event--hit': event.kind === 'hit',
+                                             'prefix-cache-event--miss': event.kind === 'miss',
+                                             'prefix-cache-event--evict': event.kind === 'eviction'
+                                         }">
+                                        <span class="prefix-cache-event__dot"
+                                              :class="{
+                                                  'prefix-cache-event__dot--hit': event.kind === 'hit',
+                                                  'prefix-cache-event__dot--miss': event.kind === 'miss',
+                                                  'prefix-cache-event__dot--evict': event.kind === 'eviction'
+                                              }"></span>
+                                        <span class="uppercase font-semibold text-[9px] tracking-wider"
+                                              x-text="event.kind"></span>
+                                        <span x-show="event.tokens_saved > 0"
+                                              class="text-blue-600 font-medium"
+                                              x-text="'+' + formatClusterCount(event.tokens_saved) + ' tokens'"></span>
+                                        <span class="ml-auto text-neutral-400"
+                                              x-text="clusterIncidentAge(event.ts)"></span>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1225,9 +1343,9 @@
 
                 <!-- Nodes and direct link -->
                 <div x-show="clusterShowSetupDetails" x-cloak
-                     class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                     class="cluster-card mb-6"
                      data-cluster-node-card>
-                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="cluster-card__header">
                         <div>
                             <div class="flex items-center gap-2">
                                 <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
@@ -1510,9 +1628,9 @@
 
                 <!-- Trusted peer -->
                 <div x-show="clusterShowSetupDetails" x-cloak
-                     class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                     class="cluster-card mb-6"
                      data-cluster-peer>
-                    <div class="px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="cluster-card__header">
                         <div class="flex items-center gap-2">
                             <i data-lucide="shield-check" class="w-4 h-4 text-neutral-500"></i>
                             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">1 · Verify the worker</span>
@@ -1868,9 +1986,9 @@
 
                 <!-- Unequal-memory planner -->
                 <div x-show="clusterShowSetupDetails" x-cloak
-                     class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                     class="cluster-card mb-6"
                      data-cluster-planner>
-                    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                    <div class="cluster-card__header flex-col lg:flex-row">
                         <div>
                             <div class="flex items-center gap-2">
                                 <i data-lucide="split-square-vertical" class="w-4 h-4 text-neutral-500"></i>
@@ -2380,9 +2498,9 @@
                      Mac someone is working on must not be planned like a shelf
                      appliance. Both are set here rather than assumed. -->
                 <div x-show="clusterShowSetupDetails" x-cloak
-                     class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mt-4"
+                     class="cluster-card mt-4"
                      x-init="loadClusterNodeRoles()">
-                    <div class="px-6 py-4 border-b border-neutral-200 flex items-center justify-between gap-3">
+                    <div class="cluster-card__header">
                         <div>
                             <div class="text-xs font-bold uppercase tracking-wider text-neutral-900">Memory each accelerator gives</div>
                             <p class="text-xs text-neutral-500 mt-1">
