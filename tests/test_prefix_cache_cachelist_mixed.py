@@ -462,9 +462,7 @@ def test_glm_pooling_cachelist_blanks_kv_member():
     mx.eval([keys, values])
     live_extracted, _ = Scheduler._extract_cache_states(stub, [live_list])
 
-    refilled = Scheduler._refill_blanked_cachelist_members(
-        extracted, live_extracted
-    )
+    refilled = Scheduler._refill_blanked_cachelist_members(extracted, live_extracted)
     assert refilled is not None
     assert isinstance(refilled[0]["state"][0], (list, tuple))
     assert len(refilled[0]["state"][0]) >= 2  # keys, values restored
@@ -628,3 +626,258 @@ def test_none_conv_slots_roundtrip(tmp_path):
     assert slots[0] is not None and slots[2] is not None
     kv_state = restored.caches[0].state
     assert kv_state[0].shape[2] == BLOCK_SIZE
+
+
+def test_kv_batch_pooling_cachelist_pm_roundtrip(tmp_path):
+    """CacheList(KVCache, BatchPoolingCache) round-trips through the pm
+    path with the FULL KV sequence (maintainer review #3290).
+
+    BatchPoolingCache is boundary-eligible (self-contained at its boundary,
+    not compacted), so the scheduler blanks the KV member and the store
+    persists per-block KV slices plus the cumulative BatchPoolingCache
+    boundary state as a PLAIN marker (no PoolingCacheDelta — compaction only
+    covers PoolingCache). The restore concatenates the KV slices back to the
+    full sequence and takes the last block's pooling state. Before the fix,
+    the scheduler's non-pm fallback blanked the KV member of this layer
+    while the legacy restore last-blocked the refilled per-block slices —
+    silently truncating the KV sequence to one block."""
+    from mlx_vlm.models.cache import BatchPoolingCache
+
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+    from omlx.scheduler import Scheduler
+
+    apply_pooling_cache_support()
+    cache, ssd = _make_cache(tmp_path)
+
+    stub = SimpleNamespace(_stream=mx.default_stream(mx.default_device()))
+    stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
+        stub, caches
+    )
+
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    kv = KVCache()
+    bpc = BatchPoolingCache(ratio=4, left_padding=[0])
+    boundaries = {}
+    for i in range(num_blocks):
+        start, end = i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE
+        pos = mx.arange(start, end, dtype=mx.float32).reshape(1, 1, BLOCK_SIZE, 1)
+        keys = mx.contiguous(mx.broadcast_to(pos, (1, 2, BLOCK_SIZE, 8)))
+        kv.update_and_fetch(keys, keys + 1000.0)
+        # Cumulative pooled rows at this boundary; value encodes the row
+        # count so the restored state pins the LAST block's snapshot.
+        rows = end // 4
+        bpc.buf_kv = mx.full((1, 4, 8), float(i + 1), dtype=mx.float32)
+        bpc.buf_gate = mx.full((1, 4, 4), float(i + 1), dtype=mx.float32)
+        bpc.pooled = mx.full((1, rows, 8), float(rows), dtype=mx.float32)
+        bpc._pool_lengths = [rows]
+        bpc.remainder = [0]
+        mx.eval([keys])
+        extracted, _ = Scheduler._extract_snapshot_cache_states(
+            stub, [CacheList(kv, bpc)]
+        )
+        assert extracted[0]["state"][0] == (), "KV member must be blanked (pm)"
+        boundaries[end] = extracted
+
+    full = _layer_dict(CacheList(kv, bpc))
+    table = cache.store_cache(
+        "req-bpc-pm", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+
+    for i, bid in enumerate(table.block_ids):
+        block = cache.paged_cache.allocated_blocks[bid]
+        payload, _meta = ssd.load_block_with_metadata(block.block_hash)
+        layer = payload[0]
+        assert isinstance(layer, tuple) and layer[0] == "__cache_list_pm__"
+        sub = layer[1][1]
+        assert (
+            isinstance(sub, tuple)
+            and sub[0] == "__nstate__"
+            and sub[1] == "BatchPoolingCache"
+        ), f"block {i}: expected plain BatchPoolingCache marker, got {sub[:2]}"
+
+    result = cache.reconstruct_cache(table)
+    assert result is not None
+    kv_r = result[0].caches[0]
+    assert kv_r.keys.shape[2] == num_blocks * BLOCK_SIZE
+    expected = mx.broadcast_to(
+        mx.arange(num_blocks * BLOCK_SIZE, dtype=mx.float32).reshape(
+            1, 1, num_blocks * BLOCK_SIZE, 1
+        ),
+        kv_r.keys.shape,
+    )
+    assert mx.max(mx.abs(kv_r.keys - expected)).item() == 0.0
+    bpc_r = result[0].caches[1]
+    assert type(bpc_r).__name__ == "BatchPoolingCache"
+    assert bpc_r.pooled is not None
+    assert bpc_r.pooled.shape[1] == num_blocks * BLOCK_SIZE // 4
+    assert mx.max(bpc_r.pooled).item() == float(num_blocks)
+
+
+def _advance_glm_pooling_boundaries(stub, kv, pool, num_blocks, compact_from=0):
+    """Advance kv/pool block by block, extracting scheduler-shaped boundary
+    snapshots; compact PoolingCache from block ``compact_from`` (earlier
+    blocks keep their cumulative pooled — the plain-snapshot shape)."""
+    from omlx.cache.pooling_delta import compact_pooling_cache_snapshot
+    from omlx.scheduler import Scheduler
+
+    boundaries = {}
+    for i in range(num_blocks):
+        start, end = i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE
+        pos = mx.arange(start, end, dtype=mx.float32).reshape(1, 1, BLOCK_SIZE, 1)
+        keys = mx.contiguous(mx.broadcast_to(pos, (1, 2, BLOCK_SIZE, 8)))
+        kv.update_and_fetch(keys, keys + 1000.0)
+        pool.update_and_fetch(
+            mx.full((1, BLOCK_SIZE // 4, 8), float(i + 1), dtype=mx.float32)
+        )
+        mx.eval([keys])
+        extracted, _ = Scheduler._extract_snapshot_cache_states(
+            stub, [CacheList(kv, pool)]
+        )
+        if i >= compact_from:
+            compact_pooling_cache_snapshot(extracted, end, BLOCK_SIZE)
+        boundaries[end] = extracted
+    return boundaries
+
+
+def _glm_pooling_fixture(tmp_path):
+    from mlx_vlm.models.cache import PoolingCache
+
+    from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+    from omlx.scheduler import Scheduler
+
+    apply_pooling_cache_support()
+    cache, ssd = _make_cache(tmp_path)
+    stub = SimpleNamespace(_stream=mx.default_stream(mx.default_device()))
+    stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
+        stub, caches
+    )
+    kv = KVCache()
+    pool = PoolingCache(ratio=4)
+    return cache, ssd, stub, kv, pool
+
+
+def test_glm_pm_partial_match_restores_truncated_pooling_chain(tmp_path):
+    """A partial prefix match (first 2 of 3 blocks) must rebuild the pooled
+    chain truncated at the match point — 2 rows in block order — and the KV
+    at 8 tokens (maintainer review #3290 edge case)."""
+    from omlx.cache.paged_cache import BlockTable
+
+    cache, _ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    boundaries = _advance_glm_pooling_boundaries(stub, kv, pool, num_blocks)
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-partial", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+
+    partial = BlockTable(
+        request_id="req-glm-partial-restore",
+        block_ids=list(table.block_ids[:2]),
+        num_tokens=2 * BLOCK_SIZE,
+    )
+    result = cache.reconstruct_cache(partial)
+    assert result is not None
+    kv_r = result[0].caches[0]
+    assert kv_r.keys.shape[2] == 2 * BLOCK_SIZE
+    pool_r = result[0].caches[1]
+    assert pool_r.pooled.shape[1] == 2
+    assert mx.max(pool_r.pooled[0, 0, :]).item() == 1.0
+    assert mx.max(pool_r.pooled[0, 1, :]).item() == 2.0
+
+
+def test_glm_pm_pooled_delta_chain_gap_rejects(tmp_path):
+    """A block chain with a skipped middle block cannot rebuild the pooled
+    delta chain (absolute ranges stop being contiguous): the cache must be
+    REJECTED (safe miss -> re-prefill), never silently shortened."""
+    from omlx.cache.paged_cache import BlockTable
+
+    cache, _ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    boundaries = _advance_glm_pooling_boundaries(stub, kv, pool, num_blocks)
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-gap", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+
+    gapped = BlockTable(
+        request_id="req-glm-gap-restore",
+        block_ids=[table.block_ids[0], table.block_ids[2]],
+        num_tokens=2 * BLOCK_SIZE,
+    )
+    assert cache.reconstruct_cache(gapped) is None
+
+
+def test_glm_pm_uncompacted_and_mixed_pooling_chains(tmp_path):
+    """Snapshots that never went through compaction persist as plain
+    PoolingCache members and restore last-block-wins (cumulative). Mixed
+    chains are contiguous-safe in both orders: a plain cumulative snapshot
+    before the deltas becomes the base; a plain snapshot AFTER the deltas
+    resets the base to its own cumulative pool (the authoritative state at
+    that boundary)."""
+    from omlx.scheduler import Scheduler
+
+    cache, ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+
+    # (a) fully uncompacted
+    boundaries = _advance_glm_pooling_boundaries(
+        stub, kv, pool, num_blocks, compact_from=num_blocks
+    )
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-uncompacted", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+    for bid in table.block_ids:
+        block = cache.paged_cache.allocated_blocks[bid]
+        payload, _meta = ssd.load_block_with_metadata(block.block_hash)
+        sub = payload[0][1][1]
+        assert sub[0] == "__nstate__" and sub[1] == "PoolingCache"
+    result = cache.reconstruct_cache(table)
+    assert result is not None
+    assert result[0].caches[0].keys.shape[2] == num_blocks * BLOCK_SIZE
+    assert result[0].caches[1].pooled.shape[1] == num_blocks * BLOCK_SIZE // 4
+
+    # (b) plain first block, then deltas
+    cache, ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    boundaries = _advance_glm_pooling_boundaries(
+        stub, kv, pool, num_blocks, compact_from=1
+    )
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-mixed-base", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+    result = cache.reconstruct_cache(table)
+    assert result is not None
+    pool_r = result[0].caches[1]
+    assert pool_r.pooled.shape[1] == num_blocks
+    for i in range(num_blocks):
+        assert mx.max(pool_r.pooled[0, i, :]).item() == float(i + 1)
+
+    # (c) deltas first, plain cumulative last block
+    cache, ssd, stub, kv, pool = _glm_pooling_fixture(tmp_path)
+    boundaries = _advance_glm_pooling_boundaries(stub, kv, pool, num_blocks)
+    # replace the last boundary with its uncompacted (cumulative) shape:
+    # the chain's plain snapshot resets the base to its own cumulative pool
+    final_extracted, _ = Scheduler._extract_snapshot_cache_states(
+        stub, [CacheList(kv, pool)]
+    )
+    boundaries[num_blocks * BLOCK_SIZE] = final_extracted
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-mixed-last", tokens, [full], boundary_snapshots=boundaries
+    )
+    assert table is not None
+    result = cache.reconstruct_cache(table)
+    assert result is not None
+    pool_r = result[0].caches[1]
+    assert pool_r.pooled.shape[1] == num_blocks
+    assert mx.max(pool_r.pooled[0, num_blocks - 1, :]).item() == float(num_blocks)

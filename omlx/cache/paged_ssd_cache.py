@@ -385,13 +385,14 @@ _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 # addition to ArraysCache (see ``cachelist_pm_member_plan``). Kept separate
 # from ``_ARRAYS_SUB_CLASSES`` so signature descriptors
 # (``_block_cachelist_subtypes`` / ``cachelist_subtypes_from_cache_list``)
-# still route PoolingCache through the pooling branch (``PoolingCache:N``)
-# instead of mis-stamping it as an ArraysCache slot count. Must stay in
-# sync with ``prefix_cache._PM_SAFE_NON_SLICEABLE_SUBS``: BatchPoolingCache
-# is NOT boundary-eligible — compact_pooling_cache_snapshot only compacts
-# PoolingCache, so BatchPoolingCache boundary snapshots stay cumulative and
-# its layers keep the legacy path.
-_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | frozenset({"PoolingCache"})
+# still route pooling members through the pooling branch
+# (``PoolingCache:N`` / ``BatchPoolingCache:N``) instead of mis-stamping
+# them as an ArraysCache slot count. Must stay in sync with
+# ``prefix_cache._PM_SAFE_NON_SLICEABLE_SUBS``: boundary members are
+# self-contained at their boundary and restore last-block-wins; pooling
+# members that compact_pooling_cache_snapshot does NOT cover
+# (BatchPoolingCache) simply persist their cumulative boundary state.
+_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | _POOLING_SUB_CLASSES
 # Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
 # Shared with prefix_cache.cachelist_pm_member_plan (single source so the
 # class-level expectation and the shape-level store plan cannot drift).

@@ -168,11 +168,12 @@ def test_plan_helper_classification():
         # persisted as PoolingCacheDelta and the chain is rebuilt on restore
         # (PR #3290).
         "pooling member": (["KVCache", "PoolingCache"], True),
-        # BatchPoolingCache stays legacy: compact_pooling_cache_snapshot
-        # only compacts PoolingCache, so its boundary snapshots would remain
-        # cumulative — the class-level eligibility in paged_ssd_cache must
-        # not accept it either (maintainer review #3290).
-        "batch pooling member": (["KVCache", "BatchPoolingCache"], False),
+        # BatchPoolingCache is boundary-eligible too: its state is
+        # self-contained at the boundary and it is not compacted to deltas,
+        # so it persists/restores last-block-wins like ArraysCache — the
+        # plan helper and the class-level eligibility must agree
+        # (maintainer review #3290).
+        "batch pooling member": (["KVCache", "BatchPoolingCache"], True),
         "no names": ([], False),
     }
     live = _build_mixed_cachelist(BLOCK_SIZE)

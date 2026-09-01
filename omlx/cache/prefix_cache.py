@@ -44,9 +44,15 @@ from .type_registry import CacheTypeRegistry
 # and the boundary snapshot carries the cumulative pool at that boundary,
 # while the small 3D remainder buffer is restored from the snapshot (GLM-5.x
 # CacheList(KVCache, PoolingCache); DeepSeek-V4's rotating member keeps that
-# layer on the legacy cumulative path). Rotating families stay legacy.
+# layer on the legacy cumulative path). BatchPoolingCache is the batched
+# pooling shape: its boundary state (buf_kv, buf_gate, pooled) is likewise
+# self-contained and it is NOT compacted to per-block deltas
+# (compact_pooling_cache_snapshot only covers PoolingCache), so it restores
+# last-block-wins like ArraysCache. Must stay in sync with
+# ``paged_ssd_cache._PM_BOUNDARY_SUB_CLASSES``. Rotating families stay
+# legacy.
 _PM_SAFE_NON_SLICEABLE_SUBS = frozenset(
-    {"ArraysCache", "SizedArraysCache", "PoolingCache"}
+    {"ArraysCache", "SizedArraysCache", "PoolingCache", "BatchPoolingCache"}
 )
 
 
