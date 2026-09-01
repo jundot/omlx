@@ -4721,8 +4721,19 @@ class Scheduler:
                 requested_step,
             )
             return
+        static_per_token = 0.0
+        monitor = getattr(self, "memory_monitor", None)
+        if monitor is not None:
+            static = monitor.estimate_chunk_transient_bytes(
+                n_tokens, kv_len + n_tokens
+            )
+            static += monitor.estimate_prompt_kv_bytes(n_tokens)
+            static_per_token = float(static) / n_tokens
         self._prefill_transient_tracker.update(
-            n_tokens, delta, floor_sample=n_tokens <= min_chunk
+            n_tokens,
+            delta,
+            floor_sample=n_tokens <= min_chunk,
+            static_per_token=static_per_token,
         )
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",

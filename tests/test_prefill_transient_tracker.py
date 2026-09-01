@@ -187,3 +187,53 @@ class TestReset:
         assert t.last_delta_bytes == 0
         assert t.predict(2048) == 0
         assert t.observed_max_bytes == 0
+
+
+class TestShortSeedRejection:
+    """A short chunk's fixed overhead must not seed the per-token rate.
+
+    Qwen3.8 Flash Next with SSD expert streaming measured 571 MB for a
+    54-token prompt; seeded as 10.8 MB/token it predicted 24.6 GB for the
+    next 2048-token chunk (real transient 3.2 GB) and refused every long
+    prompt.
+    """
+
+    def test_implausible_short_seed_is_rejected(self):
+        t = PrefillTransientTracker("m")
+        # 54 tokens, 571 MB, static estimate ~20 KB/token.
+        t.update(54, 571 * 1024**2, static_per_token=20 * 1024)
+        assert t.samples == 1, "sample is still counted"
+        assert t.bytes_per_token == 0.0, "must not seed the rate"
+        assert t.last_n_tokens == 0 and t.last_delta_bytes == 0
+        assert t.predict(2048) == 0, "caller falls back to the static estimate"
+
+    def test_plausible_short_seed_still_seeds(self):
+        t = PrefillTransientTracker("m")
+        t.update(54, 54 * 100_000, static_per_token=50_000)  # 2x static
+        assert t.bytes_per_token == 100_000.0
+
+    def test_seed_without_static_hint_is_unchanged(self):
+        t = PrefillTransientTracker("m")
+        t.update(54, 571 * 1024**2)
+        assert t.bytes_per_token == 571 * 1024**2 / 54
+
+    def test_rate_sized_seed_ignores_the_ratio(self):
+        t = PrefillTransientTracker("m")
+        t.update(2048, 2048 * 1_000_000, static_per_token=1_000)  # 1000x static
+        assert t.bytes_per_token == 1_000_000.0
+
+    def test_later_plausible_sample_seeds_after_rejection(self):
+        t = PrefillTransientTracker("m")
+        t.update(54, 571 * 1024**2, static_per_token=20 * 1024)
+        t.update(2048, 2048 * 1_500_000, static_per_token=1_000_000)
+        assert t.samples == 2
+        assert t.bytes_per_token == 1_500_000.0
+        assert t.last_n_tokens == 2048
+
+    def test_rejected_seed_still_feeds_floor_max(self):
+        t = PrefillTransientTracker("m")
+        t.update(1000, 100_000)  # first sample never feeds the max
+        t.reset()
+        t.update(2048, 2048 * 100)  # seeds the rate
+        t.update(32, 300 * 1024**2, floor_sample=True, static_per_token=1_000)
+        assert t.observed_max_bytes == 300 * 1024**2

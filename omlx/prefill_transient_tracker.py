@@ -44,6 +44,22 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    # A chunk's footprint delta is a fixed overhead plus a per-token cost:
+    # MoE gather buffers, expert-streaming scratch banks, MTP verify buffers
+    # and the MLX pool's first-touch allocations are paid once per chunk
+    # regardless of its length. Dividing a short chunk's delta by its token
+    # count attributes that overhead to every token and, when the sample
+    # seeds the EWMA, extrapolates it to full-size chunks with nothing to
+    # compare against. Measured on Qwen3.8 Flash Next with SSD expert
+    # streaming (2026-09-01): a 54-token prompt cost 571 MB, the seeded
+    # 10.8 MB/token predicted 24.6 GB for the next 2048-token chunk, and
+    # every prompt over ~2k tokens was refused; the chunk's real transient
+    # was 3.2 GB. A seed sample shorter than this whose per-token rate is
+    # more than ``_EWMA_OUTLIER_RATIO`` times the caller's static estimate
+    # is therefore treated like any other outlier: counted, kept out of the
+    # rate, and the scheduler stays on its static estimate until a plausible
+    # sample arrives, exactly as it does before the first chunk.
+    _SEED_RATE_MIN_TOKENS = 256
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -78,7 +94,12 @@ class PrefillTransientTracker:
         self._recent_reclaim_bytes = 0
 
     def update(
-        self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
+        self,
+        n_tokens: int,
+        transient_bytes: int,
+        *,
+        floor_sample: bool = False,
+        static_per_token: float = 0.0,
     ) -> None:
         """Record one chunk observation.
 
@@ -100,6 +121,14 @@ class PrefillTransientTracker:
         still updates ``last_delta_bytes``/``last_n_tokens`` raw, so a
         genuine regime change remains visible via those fields even while
         the accumulated EWMA is protected from a single noisy reading.
+
+        ``static_per_token`` is the scheduler's formula estimate for this
+        chunk (bytes per token). While no rate has been seeded yet, a chunk
+        shorter than ``_SEED_RATE_MIN_TOKENS`` whose measured rate exceeds
+        that estimate by ``_EWMA_OUTLIER_RATIO`` is rejected from the seed
+        (see the constant's docstring); it is still counted and still feeds
+        the floor-size running max, but does not become the last-delta
+        anchor either.
         """
         if n_tokens <= 0:
             return
@@ -125,7 +154,24 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
-        if self._samples == 0:
+        if self._ewma_per_token <= 0.0:
+            if (
+                n_tokens < self._SEED_RATE_MIN_TOKENS
+                and static_per_token > 0.0
+                and per_token > static_per_token * self._EWMA_OUTLIER_RATIO
+            ):
+                logger.debug(
+                    "PrefillTransientTracker(%s): rejected %d-token seed at "
+                    "%.1f bytes/token (static %.1f, ratio limit %.1fx): a "
+                    "short chunk's fixed overhead is not a per-token rate",
+                    self._model_id,
+                    n_tokens,
+                    per_token,
+                    static_per_token,
+                    self._EWMA_OUTLIER_RATIO,
+                )
+                self._samples += 1
+                return
             self._ewma_per_token = per_token
         elif per_token > self._ewma_per_token * self._EWMA_OUTLIER_RATIO:
             # Reject from the EWMA blend: a single sample this far above
