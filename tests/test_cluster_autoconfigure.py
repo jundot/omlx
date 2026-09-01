@@ -709,12 +709,83 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    # Automatic must refuse rather than plan a pipeline this architecture
+    # cannot run. The refusal must also name the reason it actually hit: the
+    # link gate dropped the only candidate degree. It must not blame the head
+    # counts, which are 8 and 8 here and divide two nodes exactly.
+    with pytest.raises(PlanningError) as excinfo:
         choose_parallelism(
             unsupported,
             _nodes(2),
             transports=[_link("ethernet", speed=10, tb_version=None)],
         )
+
+    message = str(excinfo.value)
+    assert "link" in message.lower(), message
+    assert "no tensor-parallel degree" not in message, message
+
+
+def test_slow_link_refusal_names_the_link_not_the_head_counts():
+    """The reported cause must be the link, not architecture dimensions.
+
+    With ``supports_pipeline=False`` the candidate list narrows to the
+    tensor-parallel degree alone, so a link the gate rejects leaves no candidate
+    and no recorded error. The fall-through message then blamed
+    ``tensor_parallel_divisors`` -- printing (16, 8), both of which divide two
+    nodes exactly, sending the user to inspect a model that was never at fault.
+    """
+
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=1024**3,
+        layer_weight_bytes=(1024**3,) * 8,
+        tensor_parallel_heads=16,
+        tensor_parallel_kv_heads=8,
+        supports_tensor_parallel=True,
+        supports_pipeline=False,
+    )
+
+    with pytest.raises(PlanningError) as excinfo:
+        choose_parallelism(
+            model,
+            _nodes(2),
+            transports=[_link("ethernet", speed=10, tb_version=None)],
+            strategy="auto",
+        )
+
+    message = str(excinfo.value)
+    assert "link" in message.lower(), (
+        f"the refusal must name the link that caused it; got: {message}"
+    )
+    assert "divide" not in message.lower(), (
+        "the refusal must not blame head divisibility when the heads divide "
+        f"cleanly; got: {message}"
+    )
+
+
+def test_genuine_divisor_failure_still_names_the_architecture():
+    """A real divisibility failure must keep its accurate message."""
+
+    model = ModelLayout(
+        source="test",
+        fixed_weight_bytes=1024**3,
+        layer_weight_bytes=(1024**3,) * 8,
+        tensor_parallel_heads=7,
+        tensor_parallel_kv_heads=7,
+        supports_tensor_parallel=True,
+        supports_pipeline=False,
+    )
+
+    with pytest.raises(PlanningError) as excinfo:
+        choose_parallelism(
+            model,
+            _nodes(2),
+            transports=[_link("thunderbolt", speed=40)],
+            strategy="auto",
+        )
+
+    message = str(excinfo.value)
+    assert "one Mac" in message or "divide" in message.lower(), message
 
 
 def test_grouped_query_attention_bounds_the_split():
