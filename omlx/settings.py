@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from .config import parse_size
+from .utils.legacy_kwargs import deprecated_init_kwargs
 
 if TYPE_CHECKING:
     from .scheduler import SchedulerConfig
@@ -324,6 +325,7 @@ class SchedulerSettings:
         )
 
 
+@deprecated_init_kwargs(gdn_sidecar_state_dtype="gdn_snapshot_state_dtype")
 @dataclass
 class CacheSettings:
     """Cache configuration settings."""

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .utils.legacy_kwargs import deprecated_init_kwargs
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ class CacheConfig:
     pass
 
 
+@deprecated_init_kwargs(gdn_sidecar_state_dtype="gdn_snapshot_state_dtype")
 @dataclass
 class PagedSSDCacheConfig:
     """Paged SSD cache configuration. oMLX only supports paged SSD-based caching."""

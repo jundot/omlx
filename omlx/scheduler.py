@@ -61,6 +61,7 @@ from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .utils.legacy_kwargs import deprecated_init_kwargs
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     supports_vlm_mtp_processing,
@@ -1519,6 +1520,7 @@ class SchedulingPolicy(Enum):
     PRIORITY = "priority"  # Priority-based
 
 
+@deprecated_init_kwargs(gdn_sidecar_state_dtype="gdn_snapshot_state_dtype")
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
