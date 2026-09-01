@@ -1157,6 +1157,12 @@ from omlx._version import __version__ as _omlx_version
 
 templates.env.globals["version"] = _omlx_version
 
+# Which branch/tag this node is running. None on a release install, where the
+# badge is omitted entirely.
+from omlx.build_ref import build_ref as _build_ref
+
+templates.env.globals["build_ref"] = _build_ref()
+
 # i18n defaults (English) — overridden once set_admin_getters is called
 _i18n_dir = Path(__file__).parent / "i18n"
 _en_locale: dict = {}
