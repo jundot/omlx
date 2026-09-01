@@ -293,8 +293,9 @@ class EnginePool:
         # rung can "succeed" marginally on every pass of a long prompt while
         # the durable rung behind it (ANE bank release) is never reached; a
         # request coming back for more headroom escalates instead of
-        # reclaiming again first. Bounded FIFO — request ids are transient.
-        self._prefill_headroom_recurring: OrderedDict[str, None] = OrderedDict()
+        # reclaiming again first. Values count callback attempts per request
+        # (>1 = recurring). Bounded FIFO — request ids are transient.
+        self._prefill_headroom_recurring: OrderedDict[str, int] = OrderedDict()
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
@@ -1915,12 +1916,39 @@ class EnginePool:
             return False
 
         evicted_any = False
+        evicted_count = 0
         reclaim_attempted = False
         ane_release_attempted = False
-        # Snapshot once per call: "a PREVIOUS pass for this request already
-        # got a reclaim". Marking inside this call must not flip it.
-        recurring = request_id in self._prefill_headroom_recurring
+        reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
+            attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
+            self._prefill_headroom_recurring[request_id] = attempt
+            while len(self._prefill_headroom_recurring) > 512:
+                self._prefill_headroom_recurring.popitem(last=False)
+            # Snapshot once per call: "a PREVIOUS pass for this request
+            # already ran". Marking at entry must not flip it for THIS call.
+            recurring = attempt > 1
+
+            def _log_decision(action: str, outcome: str) -> None:
+                logger.info(
+                    "[prefill-eviction] request=%s retry=%d reason=%s "
+                    "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
+                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "predicted=%.2fGB target=%.2fGB evicted=%d",
+                    request_id,
+                    attempt,
+                    reason,
+                    action,
+                    outcome,
+                    recurring,
+                    mx.get_active_memory() / 1024**3,
+                    get_phys_footprint() / 1024**3,
+                    self._current_model_memory / 1024**3,
+                    predicted / 1024**3,
+                    target / 1024**3,
+                    evicted_count,
+                )
+
             while True:
                 current = max(
                     mx.get_active_memory(),
@@ -1935,6 +1963,22 @@ class EnginePool:
                     # process-wide and can be masked by concurrent
                     # allocation, but reaching this check with headroom
                     # after an attempt means admission will now succeed.
+                    if ane_release_attempted:
+                        action = "release_ane"
+                    elif reclaim_attempted:
+                        action = "reclaim_pool"
+                    elif evicted_any:
+                        action = "evict_model"
+                    else:
+                        # No rung ran: the pool's own reading already sees
+                        # headroom. The entry mark above keeps this request
+                        # recurring, so when the scheduler's tighter usage
+                        # reading disagrees and sends it back, the ladder
+                        # escalates straight to the ANE-bank release instead
+                        # of spending the remaining retry on the reclaim rung
+                        # a no-op first pass already proved useless.
+                        action = "already_fit"
+                    _log_decision(action, "retry")
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
@@ -1968,9 +2012,6 @@ class EnginePool:
                         # requesting engine's own MLX thread, then let the
                         # loop re-measure.
                         reclaim_attempted = True
-                        self._prefill_headroom_recurring[request_id] = None
-                        while len(self._prefill_headroom_recurring) > 512:
-                            self._prefill_headroom_recurring.popitem(last=False)
                         await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
                         )
@@ -2008,6 +2049,9 @@ class EnginePool:
                             format_size(predicted),
                             format_size(target),
                         )
+                        _log_decision("evict_model", "retry")
+                    else:
+                        _log_decision("reject", "exhausted")
                     return evicted_any
 
                 logger.info(
@@ -2021,6 +2065,7 @@ class EnginePool:
                 )
                 await self._unload_engine(victim)
                 evicted_any = True
+                evicted_count += 1
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:
