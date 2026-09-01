@@ -386,8 +386,12 @@ _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 # from ``_ARRAYS_SUB_CLASSES`` so signature descriptors
 # (``_block_cachelist_subtypes`` / ``cachelist_subtypes_from_cache_list``)
 # still route PoolingCache through the pooling branch (``PoolingCache:N``)
-# instead of mis-stamping it as an ArraysCache slot count.
-_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | _POOLING_SUB_CLASSES
+# instead of mis-stamping it as an ArraysCache slot count. Must stay in
+# sync with ``prefix_cache._PM_SAFE_NON_SLICEABLE_SUBS``: BatchPoolingCache
+# is NOT boundary-eligible — compact_pooling_cache_snapshot only compacts
+# PoolingCache, so BatchPoolingCache boundary snapshots stay cumulative and
+# its layers keep the legacy path.
+_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | frozenset({"PoolingCache"})
 # Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
 # Shared with prefix_cache.cachelist_pm_member_plan (single source so the
 # class-level expectation and the shape-level store plan cannot drift).
@@ -419,8 +423,7 @@ def cachelist_pm_class_eligible(sub_class_names: list[str]) -> bool:
     has_slice = any(n in _PM_SLICEABLE_SUB_CLASSES for n in names)
     has_boundary = any(n in _PM_BOUNDARY_SUB_CLASSES for n in names)
     all_known = all(
-        n in _PM_SLICEABLE_SUB_CLASSES or n in _PM_BOUNDARY_SUB_CLASSES
-        for n in names
+        n in _PM_SLICEABLE_SUB_CLASSES or n in _PM_BOUNDARY_SUB_CLASSES for n in names
     )
     return has_slice and has_boundary and all_known
 

@@ -476,40 +476,89 @@ def test_glm_pooling_cachelist_blanked_kv_roundtrips(tmp_path):
     CacheList via the per-member path: the store slices the live KV per
     block and the restore concatenates the slices back into the full
     sequence, so prefix-cache reuse survives with correct KV positions
-    (maintainer review #3290)."""
+    (maintainer review #3290).
+
+    Boundary snapshots are produced the way the scheduler produces them —
+    ``Scheduler._extract_snapshot_cache_states`` followed by
+    ``compact_pooling_cache_snapshot`` — so the PoolingCache member reaches
+    the store as a per-block pooled DELTA with an absolute row range. The
+    persisted block payload must carry PoolingCacheDelta markers, and the
+    restore must rebuild the cumulative pooled tensor from the delta chain
+    in block order (last-blocking would restore one block's rows instead of
+    the chain)."""
     from mlx_vlm.models.cache import PoolingCache
 
+    from omlx.cache.pooling_delta import compact_pooling_cache_snapshot
     from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+    from omlx.scheduler import Scheduler
 
     apply_pooling_cache_support()
-    cache, _ = _make_cache(tmp_path)
+    cache, ssd = _make_cache(tmp_path)
 
-    def build(seq_len, blank_kv=False):
-        kv = KVCache()
-        keys, values = _position_kv(seq_len)
-        kv.update_and_fetch(keys, values)
-        pool = PoolingCache(ratio=4)
-        # pooled rows carry distinguishable data
-        pool.update_and_fetch(
-            mx.full((1, seq_len // 4, 8), 0.0, dtype=mx.float32)
-        )
-        cl = CacheList(kv, pool)
-        mx.eval([keys, values])
-        d = _layer_dict(cl)
-        if blank_kv:
-            d["state"][0] = ()
-        return d
+    stub = SimpleNamespace(_stream=mx.default_stream(mx.default_device()))
+    stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
+        stub, caches
+    )
 
     num_blocks = 3
+    rows_per_block = BLOCK_SIZE // 4
     tokens = list(range(num_blocks * BLOCK_SIZE))
-    full = build(len(tokens))
-    boundaries = {
-        BLOCK_SIZE * (i + 1): [build(BLOCK_SIZE * (i + 1), blank_kv=True)]
-        for i in range(num_blocks)
-    }
-    table = cache.store_cache("req-glm-refill", tokens, [full],
-                              boundary_snapshots=boundaries)
+
+    # Advance one live cache block by block; each boundary snapshot is the
+    # scheduler-shaped extract (KV member blanked) compacted to the block's
+    # pooled delta. Pooled row values encode the block index so the
+    # reconstructed chain order is verifiable, not just its length.
+    kv = KVCache()
+    pool = PoolingCache(ratio=4)
+    boundaries = {}
+    for i in range(num_blocks):
+        start, end = i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE
+        pos = mx.arange(start, end, dtype=mx.float32).reshape(1, 1, BLOCK_SIZE, 1)
+        keys = mx.contiguous(mx.broadcast_to(pos, (1, 2, BLOCK_SIZE, 8)))
+        values = keys + 1000.0
+        kv.update_and_fetch(keys, values)
+        pool.update_and_fetch(
+            mx.full((1, rows_per_block, 8), float(i + 1), dtype=mx.float32)
+        )
+        mx.eval([keys, values])
+        extracted, _ = Scheduler._extract_snapshot_cache_states(
+            stub, [CacheList(kv, pool)]
+        )
+        compact_pooling_cache_snapshot(extracted, end, BLOCK_SIZE)
+        snapshot_layer = extracted[0]
+        assert snapshot_layer["state"][0] == (), "KV member must be blanked"
+        assert (
+            "pooling_delta_ranges" in snapshot_layer
+        ), f"boundary @{end}: compaction did not tag pooled delta ranges"
+        assert snapshot_layer["state"][1][2].shape[1] == rows_per_block
+        boundaries[end] = extracted
+
+    full = _layer_dict(CacheList(kv, pool))
+    table = cache.store_cache(
+        "req-glm-refill", tokens, [full], boundary_snapshots=boundaries
+    )
     assert table is not None
+
+    # Persisted blocks: per-member layout with PoolingCacheDelta markers
+    # carrying the absolute pooled row range of each block.
+    for i, bid in enumerate(table.block_ids):
+        block = cache.paged_cache.allocated_blocks[bid]
+        payload, _meta = ssd.load_block_with_metadata(block.block_hash)
+        assert payload is not None
+        layer = payload[0]
+        assert isinstance(layer, tuple) and layer[0] == "__cache_list_pm__"
+        sub = layer[1][1]
+        assert (
+            isinstance(sub, tuple)
+            and len(sub) >= 3
+            and sub[0] == "__nstate__"
+            and sub[1] == "PoolingCacheDelta"
+        ), f"block {i}: boundary member not a PoolingCacheDelta: {type(sub)}"
+        elements = sub[2]
+        assert elements[-1].tolist() == [
+            i * rows_per_block,
+            (i + 1) * rows_per_block,
+        ], f"block {i}: wrong pooled delta range"
 
     result = cache.reconstruct_cache(table)
     assert result is not None and len(result) == 1
@@ -526,12 +575,15 @@ def test_glm_pooling_cachelist_blanked_kv_roundtrips(tmp_path):
         kv.keys.shape,
     )
     assert mx.max(mx.abs(kv.keys - expected)).item() == 0.0
-    # PoolingCache member restored: pooled is cumulative across the chain
-    # (append-only pooled rows) — the last matched block's boundary state.
+    # PoolingCache member restored: the delta chain rebuilt into the FULL
+    # cumulative pooled tensor, in block order (row i carries block i+1).
     pool = restored.caches[1]
     assert type(pool).__name__ == "PoolingCache"
     assert pool.pooled is not None
-    assert pool.pooled.shape[1] == (num_blocks * BLOCK_SIZE) // 4
+    assert pool.pooled.shape[1] == num_blocks * rows_per_block
+    for i in range(num_blocks):
+        row = pool.pooled[0, i * rows_per_block, :]
+        assert mx.max(row).item() == float(i + 1), f"pooled row {i} misplaced"
 
 
 def test_arrays_cache_extract_none_guard():
