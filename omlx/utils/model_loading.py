@@ -23,6 +23,48 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 _MATERIALIZE_EVAL_CHUNK = 8
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
+_VLM_VISION_CONFIG_MT_PATCHED = False
+
+
+def _needs_vision_suffix_strip(model_type: str) -> bool:
+    """Return True for Qwen vision model types that need ``_vision`` stripped."""
+    return model_type.startswith("qwen") and model_type.endswith("_vision")
+
+
+def _patch_vlm_vision_config_model_type() -> None:
+    """Strip ``_vision`` suffix from Qwen ``VisionConfig.model_type``.
+
+    HuggingFace transformers auto-generates ``vision_config.model_type`` by
+    appending ``_vision`` to the base model type (e.g. ``qwen3_5_moe_vision``).
+    mlx-vlm's Qwen ``VisionModel.__init__`` has a hardcoded allowlist that only
+    accepts the base name.  Other families (gemma3n, minicpmv4_6) *require* the
+    ``_vision`` suffix, so we only strip for Qwen types.
+    """
+    global _VLM_VISION_CONFIG_MT_PATCHED
+    if _VLM_VISION_CONFIG_MT_PATCHED:
+        return
+
+    try:
+        from mlx_vlm.models.base import BaseModelConfig
+    except ImportError:
+        return
+
+    if getattr(BaseModelConfig, "_omlx_vision_mt_patched", False):
+        _VLM_VISION_CONFIG_MT_PATCHED = True
+        return
+
+    original = BaseModelConfig.from_dict.__func__
+
+    def patched(cls, params):
+        if params and isinstance(params, dict):
+            mt = params.get("model_type", "")
+            if isinstance(mt, str) and _needs_vision_suffix_strip(mt):
+                params = {**params, "model_type": mt.removesuffix("_vision")}
+        return original(cls, params)
+
+    BaseModelConfig.from_dict = classmethod(patched)
+    BaseModelConfig._omlx_vision_mt_patched = True
+    _VLM_VISION_CONFIG_MT_PATCHED = True
 
 _REMOTE_CODE_METADATA_PATTERNS = [
     "*.json",
@@ -435,6 +477,7 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+    _patch_vlm_vision_config_model_type()
 
     if for_vlm:
         from ..patches.mlx_vlm_mlx0322_compat import (
