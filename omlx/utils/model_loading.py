@@ -391,6 +391,11 @@ def maybe_apply_pre_load_patches(
     - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
       ``model_type == "mimo_v2"``. The vendored model intentionally ignores
       the base checkpoint's vision, audio, speech, and MTP weights.
+    - Intern-S2-Mobius hybrid Gated Delta Net / full-attention MoE backbone
+      when ``config.json`` declares ``model_type == "interns2_mobius"``. The
+      vendored module is registered as ``mlx_lm.models.interns2_mobius`` and
+      intentionally drops the base checkpoint's vision and MTP weights; text
+      generation only (no speculative/MTP draft head yet).
     - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
       ``model_type == "bailing_hybrid"``. The vendored module is registered
       as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
@@ -526,6 +531,14 @@ def maybe_apply_pre_load_patches(
 
         if apply_mimo_v2_patch():
             logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+
+    if model_type == "interns2_mobius":
+        from ..patches.interns2_mobius import apply_interns2_mobius_patch
+
+        if apply_interns2_mobius_patch():
+            logger.info(
+                "Intern-S2-Mobius text pre-load patch applied for %s", model_name
+            )
 
     if model_type == "bailing_hybrid":
         from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
@@ -1110,6 +1123,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     return (
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
+        or model_type.startswith("interns2_mobius")
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"

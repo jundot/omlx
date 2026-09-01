@@ -104,6 +104,7 @@ def apply_mlx_lm_mtp_patch() -> bool:
         deepseek_v4_model,
         gemma4_text_model,
         glm_moe_dsa_model,
+        interns2_mobius_model,
         nemotron_h_chain,
         nemotron_h_model,
         qwen35_model,
@@ -118,6 +119,8 @@ def apply_mlx_lm_mtp_patch() -> bool:
         # Qwen models are the main target; if the qwen patch refuses we
         # still continue so DeepSeek-V4 users aren't blocked.
         logger.debug("Qwen3.5/3.6 MTP patch did not apply (likely import error)")
+    if not interns2_mobius_model.apply():
+        logger.debug("Intern-S2-Mobius MTP patch did not apply (module not registered)")
     if not deepseek_v4_model.apply():
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
     if not glm_moe_dsa_model.apply():
