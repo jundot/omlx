@@ -677,7 +677,11 @@ async def test_engine_core_add_request_cleans_up_on_scheduler_raise(
     raising_scheduler = MagicMock()
     raising_scheduler._specprefill_draft_model = None
 
+    seen_request = None
+
     def _raise(req):
+        nonlocal seen_request
+        seen_request = req
         raise PrefillMemoryExceededError(
             message="rejected for test",
             request_id=req.request_id,
@@ -687,6 +691,7 @@ async def test_engine_core_add_request_cleans_up_on_scheduler_raise(
 
     raising_scheduler.add_request = _raise
     core.scheduler = raising_scheduler
+    semantic_hint_candidate = object()
 
     # Drive add_request enough that we can observe collectors before/after.
     with pytest.raises(PrefillMemoryExceededError):
@@ -694,12 +699,15 @@ async def test_engine_core_add_request_cleans_up_on_scheduler_raise(
             prompt=[1, 2, 3],
             sampling_params=MagicMock(),
             request_id="leak-check-1",
+            semantic_hint_candidate=semantic_hint_candidate,
         )
 
     # All per-request engine_core entries must be cleaned up.
     assert "leak-check-1" not in core._output_collectors
     assert "leak-check-1" not in core._stream_states
     assert "leak-check-1" not in core._finished_events
+    assert seen_request is not None
+    assert seen_request.semantic_hint_candidate is None
 
     core._mlx_executor.shutdown(wait=True)
 

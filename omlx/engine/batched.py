@@ -14,6 +14,10 @@ from typing import Any
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..speculative.semantic_hints import (
+    SemanticHintCandidate,
+    prepare_semantic_hint_candidate,
+)
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -205,6 +209,54 @@ class BatchedEngine(BaseEngine):
             return self._engine.engine.scheduler.block_aware_cache is not None
         except AttributeError:
             return False
+
+    @property
+    def supports_semantic_hint_verification(self) -> bool:
+        """Whether this exact loaded engine exposes the bounded live lane."""
+        # Exclude VLMBatchedEngine and any future BatchedEngine subclasses.
+        if type(self) is not BatchedEngine or self._engine is None:
+            return False
+        try:
+            scheduler = self._engine.engine.scheduler
+            return bool(scheduler.supports_semantic_hint_verification)
+        except AttributeError:
+            return False
+
+    def _prepare_semantic_hint_candidate(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        is_partial: bool,
+        parallel_tool_calls: bool | None,
+        tool_choice: Any,
+    ) -> SemanticHintCandidate | None:
+        """Freeze a call-free candidate for an explicit single-call chat."""
+        if (
+            not self.supports_semantic_hint_verification
+            or not tools
+            or is_partial
+            or parallel_tool_calls is not False
+            or tool_choice not in (None, "auto")
+        ):
+            return None
+        template_options: dict[str, Any] = {}
+        if self._enable_thinking is not None:
+            template_options["enable_thinking"] = self._enable_thinking
+        if chat_template_kwargs:
+            template_options.update(chat_template_kwargs)
+        try:
+            return prepare_semantic_hint_candidate(
+                messages,
+                tools,
+                template_tools,
+                template_options,
+            )
+        except Exception:
+            logger.info("OoO-Spec candidate preparation failed; using target baseline")
+            return None
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
@@ -894,11 +946,13 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        semantic_hint_candidate = kwargs.pop("semantic_hint_candidate", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            semantic_hint_candidate=semantic_hint_candidate,
             **specprefill_kwargs,
         )
 
@@ -971,12 +1025,14 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        semantic_hint_candidate = kwargs.pop("semantic_hint_candidate", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            semantic_hint_candidate=semantic_hint_candidate,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
@@ -1085,11 +1141,24 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        if partial is None:
+            partial = detect_and_strip_partial(messages)
+        parallel_tool_calls = kwargs.pop("parallel_tool_calls", None)
+        tool_choice = kwargs.pop("tool_choice", None)
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+        )
+        semantic_hint_candidate = self._prepare_semantic_hint_candidate(
+            messages=messages,
+            tools=tools,
+            template_tools=template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=bool(partial),
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
@@ -1107,6 +1176,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             tools=tools,
+            semantic_hint_candidate=semantic_hint_candidate,
             **kwargs,
         )
 
@@ -1242,11 +1312,24 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        if partial is None:
+            partial = detect_and_strip_partial(messages)
+        parallel_tool_calls = kwargs.pop("parallel_tool_calls", None)
+        tool_choice = kwargs.pop("tool_choice", None)
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+        )
+        semantic_hint_candidate = self._prepare_semantic_hint_candidate(
+            messages=messages,
+            tools=tools,
+            template_tools=template_tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=bool(partial),
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
@@ -1264,6 +1347,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             tools=tools,
+            semantic_hint_candidate=semantic_hint_candidate,
             **kwargs,
         ):
             yield output
