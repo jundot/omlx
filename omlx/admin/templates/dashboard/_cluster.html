@@ -130,6 +130,263 @@
             </ul>
         </details>
 
+        <!-- SLO Status Cards -->
+        <div x-show="clusterSlos && clusterSlos.slos && clusterSlos.slos.length" x-cloak class="mb-6">
+            <div class="flex items-center gap-2 mb-3">
+                <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                <h3 class="text-sm font-semibold text-neutral-900">Service Level Objectives</h3>
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+                      :class="{
+                          'bg-green-100 text-green-800': clusterSlos.overall_status === 'healthy',
+                          'bg-amber-100 text-amber-800': clusterSlos.overall_status === 'degraded',
+                          'bg-red-100 text-red-800': clusterSlos.overall_status === 'breached'
+                      }"
+                      x-text="clusterSlos.overall_status"></span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <template x-for="slo in (clusterSlos.slos || [])" :key="slo.name">
+                    <div class="rounded-xl border p-3 transition-colors"
+                         :class="{
+                             'border-green-200 bg-green-50': slo.status === 'healthy',
+                             'border-amber-200 bg-amber-50': slo.status === 'degraded',
+                             'border-red-200 bg-red-50': slo.status === 'breached'
+                         }">
+                        <div class="flex items-center justify-between mb-1.5">
+                            <span class="text-[10px] font-semibold uppercase tracking-wider"
+                                  :class="{
+                                      'text-green-700': slo.status === 'healthy',
+                                      'text-amber-700': slo.status === 'degraded',
+                                      'text-red-700': slo.status === 'breached'
+                                  }"
+                                  x-text="slo.status"></span>
+                            <span class="text-[10px] font-mono text-neutral-400" x-text="slo.metric_kind"></span>
+                        </div>
+                        <div class="text-xs font-semibold text-neutral-900 mb-0.5" x-text="slo.description || slo.name"></div>
+                        <div class="flex items-baseline gap-1.5 mt-1.5">
+                            <span class="text-lg font-bold tabular-nums"
+                                  :class="{
+                                      'text-green-700': slo.status === 'healthy',
+                                      'text-amber-700': slo.status === 'degraded',
+                                      'text-red-700': slo.status === 'breached'
+                                  }"
+                                  x-text="slo.compliance_pct + '%'"></span>
+                            <span class="text-[10px] text-neutral-400">compliance</span>
+                        </div>
+                        <div class="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-500">
+                            <span>Burn rate: <span class="font-semibold tabular-nums" x-text="slo.burn_rate.toFixed(2) + 'x'"></span></span>
+                            <span x-show="slo.time_to_breach_seconds != null">
+                                Breach in: <span class="font-semibold" x-text="slo.time_to_breach_seconds < 3600 ? Math.round(slo.time_to_breach_seconds / 60) + 'm' : Math.round(slo.time_to_breach_seconds / 3600) + 'h'"></span>
+                            </span>
+                        </div>
+                        <div class="mt-1 text-[10px] text-neutral-400 font-mono" x-show="slo.current_value != null">
+                            Current: <span x-text="slo.current_value"></span> / Target: <span x-text="slo.target"></span>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Error Budget -->
+        <div x-show="clusterErrorBudget && clusterErrorBudget.slos && clusterErrorBudget.slos.length" x-cloak class="mb-6">
+            <div class="flex items-center gap-2 mb-3">
+                <i data-lucide="battery-medium" class="w-4 h-4 text-neutral-500"></i>
+                <h3 class="text-sm font-semibold text-neutral-900">Error Budget</h3>
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+                      :class="clusterErrorBudget.can_deploy
+                          ? 'bg-green-100 text-green-800'
+                          : 'bg-red-100 text-red-800'"
+                      x-text="clusterErrorBudget.can_deploy ? 'deploy allowed' : 'deploy blocked'"></span>
+            </div>
+            <div x-show="(clusterErrorBudget.blocking_slos || []).length"
+                 class="mb-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-xs text-red-800">
+                Blocked by:
+                <span class="font-semibold" x-text="(clusterErrorBudget.blocking_slos || []).join(', ')"></span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <template x-for="budget in (clusterErrorBudget.slos || [])" :key="budget.slo_name">
+                    <div class="rounded-xl border p-3 transition-colors"
+                         :class="{
+                             'border-green-200 bg-green-50': budget.budget_remaining_pct >= 50,
+                             'border-amber-200 bg-amber-50': budget.budget_remaining_pct >= 10 && budget.budget_remaining_pct < 50,
+                             'border-red-200 bg-red-50': budget.budget_remaining_pct < 10
+                         }">
+                        <div class="text-xs font-semibold text-neutral-900 mb-1.5" x-text="budget.slo_name"></div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span class="text-lg font-bold tabular-nums"
+                                  :class="{
+                                      'text-green-700': budget.budget_remaining_pct >= 50,
+                                      'text-amber-700': budget.budget_remaining_pct >= 10 && budget.budget_remaining_pct < 50,
+                                      'text-red-700': budget.budget_remaining_pct < 10
+                                  }"
+                                  x-text="budget.budget_remaining_pct.toFixed(1) + '%'"></span>
+                            <span class="text-[10px] text-neutral-500">budget left</span>
+                        </div>
+                        <div class="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-600">
+                            <span>Burn: <span class="font-semibold tabular-nums" x-text="budget.consumption_rate.toFixed(2) + 'x'"></span></span>
+                            <span x-show="budget.time_to_exhaustion_hours != null">
+                                Empty in:
+                                <span class="font-semibold"
+                                      x-text="budget.time_to_exhaustion_hours < 1
+                                          ? Math.round(budget.time_to_exhaustion_hours * 60) + 'm'
+                                          : Math.round(budget.time_to_exhaustion_hours) + 'h'"></span>
+                            </span>
+                        </div>
+                        <div class="mt-1 text-[10px] text-neutral-500 font-mono"
+                             x-text="budget.sample_count + ' samples / ' + Math.round(budget.window_seconds / 3600) + 'h window'"></div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+
+
+        <!-- Capacity Planning -->
+        <div x-show="clusterCapacity && clusterCapacity.nodes && clusterCapacity.nodes.length" x-cloak class="mb-6">
+            <div class="flex items-center gap-2 mb-3">
+                <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
+                <h3 class="text-sm font-semibold text-neutral-900">Cluster Capacity</h3>
+            </div>
+
+            <!-- Overview cards -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                <div class="rounded-xl border border-neutral-200 bg-white p-3">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Total Nodes</div>
+                    <div class="text-xl font-bold text-neutral-900 mt-1" x-text="clusterCapacity.aggregate.total_nodes"></div>
+                </div>
+                <div class="rounded-xl border border-neutral-200 bg-white p-3">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Avg CPU</div>
+                    <div class="text-xl font-bold mt-1"
+                         :class="clusterCapacity.aggregate.avg_cpu_pct > 85 ? 'text-red-700' : clusterCapacity.aggregate.avg_cpu_pct > 75 ? 'text-amber-700' : 'text-green-700'"
+                         x-text="clusterCapacity.aggregate.avg_cpu_pct + '%'"></div>
+                </div>
+                <div class="rounded-xl border border-neutral-200 bg-white p-3">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Avg Memory</div>
+                    <div class="text-xl font-bold mt-1"
+                         :class="clusterCapacity.aggregate.avg_memory_pct > 90 ? 'text-red-700' : clusterCapacity.aggregate.avg_memory_pct > 80 ? 'text-amber-700' : 'text-green-700'"
+                         x-text="clusterCapacity.aggregate.avg_memory_pct + '%'"></div>
+                </div>
+                <div class="rounded-xl border border-neutral-200 bg-white p-3">
+                    <div class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Headroom</div>
+                    <div class="text-xl font-bold text-neutral-900 mt-1" x-text="clusterCapacity.aggregate.total_headroom_pct + '%'"></div>
+                </div>
+            </div>
+
+            <!-- Per-node capacity bars -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+                <template x-for="node in clusterCapacity.nodes" :key="node.node_id">
+                    <div class="rounded-xl border border-neutral-200 bg-white p-3">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xs font-semibold text-neutral-900" x-text="node.hostname"></span>
+                            <span x-show="node.accelerator"
+                                  class="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase"
+                                  :class="node.accelerator === 'cuda' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'"
+                                  x-text="node.accelerator"></span>
+                        </div>
+                        <div class="space-y-2">
+                            <div>
+                                <div class="flex items-center justify-between text-[10px] text-neutral-500 mb-0.5">
+                                    <span>CPU</span>
+                                    <span x-text="node.cpu_usage_pct + '%'"></span>
+                                </div>
+                                <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                    <div class="h-full rounded-full transition-all"
+                                         :class="node.cpu_usage_pct > 85 ? 'bg-red-500' : node.cpu_usage_pct > 75 ? 'bg-amber-500' : 'bg-green-500'"
+                                         :style="'width:' + Math.min(100, node.cpu_usage_pct) + '%'"></div>
+                                </div>
+                            </div>
+                            <div>
+                                <div class="flex items-center justify-between text-[10px] text-neutral-500 mb-0.5">
+                                    <span>Memory</span>
+                                    <span x-text="node.memory_usage_pct + '%'"></span>
+                                </div>
+                                <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                    <div class="h-full rounded-full transition-all"
+                                         :class="node.memory_usage_pct > 90 ? 'bg-red-500' : node.memory_usage_pct > 80 ? 'bg-amber-500' : 'bg-green-500'"
+                                         :style="'width:' + Math.min(100, node.memory_usage_pct) + '%'"></div>
+                                </div>
+                            </div>
+                            <div x-show="node.gpu_utilization_pct != null">
+                                <div class="flex items-center justify-between text-[10px] text-neutral-500 mb-0.5">
+                                    <span>GPU</span>
+                                    <span x-text="node.gpu_utilization_pct + '%'"></span>
+                                </div>
+                                <div class="h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                    <div class="h-full rounded-full transition-all"
+                                         :class="node.gpu_utilization_pct > 90 ? 'bg-red-500' : node.gpu_utilization_pct > 75 ? 'bg-amber-500' : 'bg-green-500'"
+                                         :style="'width:' + Math.min(100, node.gpu_utilization_pct) + '%'"></div>
+                                </div>
+                            </div>
+                            <div class="flex items-center justify-between text-[10px] text-neutral-500 pt-1 border-t border-neutral-100">
+                                <span>Connections</span>
+                                <span class="font-semibold" x-text="node.active_connections"></span>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Utilization trend chart (24h) -->
+            <div x-show="clusterCapacity.trend && clusterCapacity.trend.length > 1" class="rounded-xl border border-neutral-200 bg-white p-4 mb-4">
+                <div class="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 mb-3">24h Utilization Trend</div>
+                <div class="relative h-32" data-cluster-capacity-trend>
+                    <svg class="w-full h-full" viewBox="0 0 960 128" preserveAspectRatio="none">
+                        <!-- CPU line -->
+                        <polyline
+                            fill="none"
+                            stroke="#2563EB"
+                            stroke-width="1.5"
+                            :points="clusterCapacityTrendPoints('avg_cpu_pct')"
+                        ></polyline>
+                        <!-- Memory line -->
+                        <polyline
+                            fill="none"
+                            stroke="#7C3AED"
+                            stroke-width="1.5"
+                            :points="clusterCapacityTrendPoints('avg_memory_pct')"
+                        ></polyline>
+                    </svg>
+                    <div class="absolute top-0 right-0 flex items-center gap-3 text-[10px]">
+                        <span class="flex items-center gap-1"><span class="w-2 h-0.5 bg-blue-600 inline-block"></span> CPU</span>
+                        <span class="flex items-center gap-1"><span class="w-2 h-0.5 bg-purple-600 inline-block"></span> Memory</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Scaling recommendation -->
+            <div class="rounded-xl border p-4"
+                 :class="{
+                     'border-red-200 bg-red-50': clusterCapacity.recommendation.action === 'scale_up',
+                     'border-green-200 bg-green-50': clusterCapacity.recommendation.action === 'scale_down',
+                     'border-neutral-200 bg-white': clusterCapacity.recommendation.action === 'stable'
+                 }">
+                <div class="flex items-center gap-2 mb-2">
+                    <i data-lucide="trending-up" class="w-4 h-4"
+                       :class="{
+                           'text-red-600': clusterCapacity.recommendation.action === 'scale_up',
+                           'text-green-600': clusterCapacity.recommendation.action === 'scale_down',
+                           'text-neutral-600': clusterCapacity.recommendation.action === 'stable'
+                       }"></i>
+                    <span class="text-xs font-bold uppercase tracking-wider"
+                          :class="{
+                              'text-red-700': clusterCapacity.recommendation.action === 'scale_up',
+                              'text-green-700': clusterCapacity.recommendation.action === 'scale_down',
+                              'text-neutral-700': clusterCapacity.recommendation.action === 'stable'
+                          }"
+                          x-text="'Scale ' + clusterCapacity.recommendation.action.replace('_', ' ')"></span>
+                    <span class="text-[10px] text-neutral-400"
+                          x-text="'Confidence: ' + Math.round(clusterCapacity.recommendation.confidence * 100) + '%'"></span>
+                </div>
+                <ul class="space-y-1">
+                    <template x-for="(reason, index) in clusterCapacity.recommendation.reasons" :key="index">
+                        <li class="text-xs text-neutral-600 flex items-start gap-1.5">
+                            <span class="text-neutral-300 mt-0.5">-</span>
+                            <span x-text="reason"></span>
+                        </li>
+                    </template>
+                </ul>
+            </div>
+        </div>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">

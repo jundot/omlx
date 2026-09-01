@@ -230,6 +230,10 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Injection seam for the module-level planner. Production reaches the
+        # planner through get_capacity_planner, which lazily builds one; only
+        # tests need to substitute it.
+        ("capacity_api.py", "set_capacity_planner"),
     }
 
     sources = {
