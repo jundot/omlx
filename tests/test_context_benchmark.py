@@ -223,11 +223,13 @@ class _FakePool:
         self.native = native
         self.loaded = list(loaded or [])
         self.unloaded = []
+        self.get_engine_calls = []
 
     def get_loaded_model_ids(self):
         return list(self.loaded)
 
     async def get_engine(self, model_id, force_lm=False):
+        self.get_engine_calls.append((model_id, force_lm))
         return self._engine
 
     async def _unload_engine(self, model_id):
@@ -237,11 +239,11 @@ class _FakePool:
         return SimpleNamespace(model_context_length=self.native, model_type="llm")
 
 
-def _make_run(target_tokens=131072):
+def _make_run(target_tokens=131072, **request_kwargs):
     return ContextBenchmarkRun(
         bench_id="ctx-test",
         request=ContextBenchmarkRequest(
-            model_id="test-model", target_tokens=target_tokens
+            model_id="test-model", target_tokens=target_tokens, **request_kwargs
         ),
     )
 
@@ -599,3 +601,44 @@ class TestRunContextBenchmark:
         assert run.phase == "apply"
         assert run.progress > 90
         assert run.message
+
+    @pytest.mark.asyncio
+    async def test_force_lm_engine_reaches_pool_and_reports_mode(self):
+        scheduler = _FakeScheduler(boundary=50000)
+        engine = _FakeEngine(scheduler)
+        pool = _FakePool(engine)
+        run = _make_run(force_lm_engine=True)
+
+        await _run_bench(run, pool)
+
+        assert run.status == "completed"
+        assert pool.get_engine_calls == [("test-model", True)]
+        assert run.result["engine_mode"] == "lm"
+
+    @pytest.mark.asyncio
+    async def test_default_run_loads_default_engine_mode(self):
+        scheduler = _FakeScheduler(boundary=50000)
+        engine = _FakeEngine(scheduler)
+        pool = _FakePool(engine)
+        run = _make_run()
+
+        await _run_bench(run, pool)
+
+        assert pool.get_engine_calls == [("test-model", False)]
+        assert run.result["engine_mode"] == "default"
+        assert run.result["apply_result"] is True
+
+    @pytest.mark.asyncio
+    async def test_apply_result_false_never_writes_settings(self):
+        scheduler = _FakeScheduler(boundary=50000)
+        engine = _FakeEngine(scheduler)
+        pool = _FakePool(engine)
+        run = _make_run(apply_result=False)
+
+        await _run_bench(run, pool)
+
+        assert run.status == "completed"
+        assert run.result["applied"] is False
+        assert run.result["apply_result"] is False
+        assert pool._settings_manager.applied == []
+        assert pool._settings_manager.settings.max_context_window is None

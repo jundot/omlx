@@ -318,3 +318,175 @@ def test_boundary_snapshot_diagnostics_clear_resets_state():
     assert snapshot["capture_attempts"] == 0
     assert snapshot["reasons"] == {}
     assert snapshot["last_event"] is None
+
+
+def test_boundary_snapshot_diagnostics_count_gdn_commit_failures_by_reason():
+    diagnostics = BoundarySnapshotDiagnostics()
+    for reason in ("in_memory_only", "staged_missing", "promotion_failed"):
+        diagnostics.record(
+            "gdn_commit_attempt",
+            request_id="req-a",
+            token_count=4096,
+            block_size=2048,
+        )
+        diagnostics.record(
+            "gdn_commit_failure",
+            reason=reason,
+            request_id="req-a",
+            token_count=4096,
+            block_size=2048,
+        )
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["gdn_commit_attempts"] == 3
+    assert snapshot["gdn_commit_failures"] == 3
+    assert snapshot["gdn_commit_successes"] == 0
+    assert snapshot["reasons"] == {
+        "in_memory_only": 1,
+        "staged_missing": 1,
+        "promotion_failed": 1,
+    }
+    assert snapshot["last_event"]["reason"] == "promotion_failed"
+
+
+def test_boundary_snapshot_diagnostics_count_successful_promotion_once():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "gdn_commit_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+    )
+    diagnostics.record(
+        "gdn_commit_success",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+    )
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["gdn_commit_attempts"] == 1
+    assert snapshot["gdn_commit_successes"] == 1
+    assert snapshot["gdn_commit_failures"] == 0
+
+
+def test_boundary_provider_commit_records_each_failure_reason():
+    from omlx.scheduler import _BoundarySnapshotProvider
+
+    diagnostics = BoundarySnapshotDiagnostics()
+
+    # No SSD store at all: the snapshot existed in memory only.
+    provider = _BoundarySnapshotProvider(
+        store=None,
+        request_id="req-a",
+        valid_tcs=[2048],
+        in_memory_snapshots={},
+        paged_ssd_manager=None,
+        diagnostics=diagnostics,
+    )
+    assert provider.commit_gdn_checkpoint(
+        2048,
+        b"h1",
+        layer_cache_types=None,
+        layer_meta_states=None,
+        model_name="m",
+        block_size=2048,
+    ) is False
+
+    # Store exists but the staged sidecar file is gone.
+    class _Store:
+        def take_staged_file(self, request_id, token_count):
+            return None
+
+    provider = _BoundarySnapshotProvider(
+        store=_Store(),
+        request_id="req-a",
+        valid_tcs=[2048],
+        in_memory_snapshots={},
+        paged_ssd_manager=object(),
+        diagnostics=diagnostics,
+    )
+    assert provider.commit_gdn_checkpoint(
+        2048,
+        b"h2",
+        layer_cache_types=None,
+        layer_meta_states=None,
+        model_name="m",
+        block_size=2048,
+    ) is False
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["gdn_commit_attempts"] == 2
+    assert snapshot["gdn_commit_failures"] == 2
+    assert snapshot["reasons"] == {"in_memory_only": 1, "staged_missing": 1}
+
+
+def test_boundary_provider_commit_records_promotion_failure_and_success(tmp_path):
+    from pathlib import Path
+
+    from omlx.scheduler import _BoundarySnapshotProvider
+
+    diagnostics = BoundarySnapshotDiagnostics()
+    staged = tmp_path / "staged.bin"
+    staged.write_bytes(b"x")
+
+    class _Store:
+        def take_staged_file(self, request_id, token_count):
+            return Path(staged)
+
+    class _FailingManager:
+        def gdn_cache_signature_for(self, **kwargs):
+            return b"sig"
+
+        def commit_gdn_checkpoint_file(self, *args, **kwargs):
+            return None
+
+    provider = _BoundarySnapshotProvider(
+        store=_Store(),
+        request_id="req-a",
+        valid_tcs=[2048],
+        in_memory_snapshots={},
+        paged_ssd_manager=_FailingManager(),
+        diagnostics=diagnostics,
+    )
+    assert provider.commit_gdn_checkpoint(
+        2048,
+        b"h3",
+        layer_cache_types=["kv"],
+        layer_meta_states=None,
+        model_name="m",
+        block_size=2048,
+    ) is False
+    assert not staged.exists()  # fail-closed staged-file deletion preserved
+
+    staged.write_bytes(b"x")
+
+    class _OkManager:
+        def gdn_cache_signature_for(self, **kwargs):
+            return b"sig"
+
+        def commit_gdn_checkpoint_file(self, *args, **kwargs):
+            return Path(staged)
+
+    provider = _BoundarySnapshotProvider(
+        store=_Store(),
+        request_id="req-a",
+        valid_tcs=[2048],
+        in_memory_snapshots={},
+        paged_ssd_manager=_OkManager(),
+        diagnostics=diagnostics,
+    )
+    assert provider.commit_gdn_checkpoint(
+        2048,
+        b"h4",
+        layer_cache_types=["kv"],
+        layer_meta_states=None,
+        model_name="m",
+        block_size=2048,
+    ) is True
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["gdn_commit_attempts"] == 2
+    assert snapshot["gdn_commit_failures"] == 1
+    assert snapshot["gdn_commit_successes"] == 1
+    assert snapshot["reasons"] == {"promotion_failed": 1}

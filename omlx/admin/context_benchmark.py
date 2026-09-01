@@ -90,6 +90,12 @@ class ContextBenchmarkRequest(BaseModel):
 
     model_id: str
     target_tokens: int = 131072
+    # API-only A/B controls (defaults keep the admin UI behavior).
+    # Load the text-only LM engine even for VLM models to measure the
+    # vision-weight residency difference.
+    force_lm_engine: bool = False
+    # False runs the measurement without writing max_context_window.
+    apply_result: bool = True
 
     @field_validator("target_tokens")
     @classmethod
@@ -296,6 +302,9 @@ async def _run_probe_prefill(engine: Any, prompt: str) -> tuple[Any, float]:
     memory guard refuses or aborts the probe. With max_tokens=1 the wall
     clock is dominated by the prefill, so callers can derive a prefill
     tok/s from it when the engine does not report prompt_tps.
+
+    Probes carry benchmark_trace so every prefill chunk emits the
+    content-free memory diagnostic lines the A/B matrix is built from.
     """
     started = time.perf_counter()
     last_output = None
@@ -305,6 +314,7 @@ async def _run_probe_prefill(engine: Any, prompt: str) -> tuple[Any, float]:
         temperature=0.0,
         top_p=1.0,
         skip_cache_store=True,
+        benchmark_trace=True,
     ):
         last_output = output
     return last_output, time.perf_counter() - started
@@ -425,8 +435,14 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
                     )
 
         await _progress(run, "prepare", 0.4, f"Loading {request.model_id}...")
-        engine = await engine_pool.get_engine(request.model_id)
-        logger.info("Context bench: loaded %s", request.model_id)
+        engine = await engine_pool.get_engine(
+            request.model_id, force_lm=request.force_lm_engine
+        )
+        logger.info(
+            "Context bench: loaded %s (engine_mode=%s)",
+            request.model_id,
+            "lm" if request.force_lm_engine else "default",
+        )
 
         scheduler = _resolve_scheduler(engine)
         if scheduler is None:
@@ -699,7 +715,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
 
         applied = False
         sm = getattr(engine_pool, "_settings_manager", None)
-        if sm is not None:
+        if request.apply_result and sm is not None:
             try:
                 settings = sm.get_settings(request.model_id)
                 settings.max_context_window = final
@@ -743,6 +759,10 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
                 if getattr(scheduler, "_prefill_speed_priority", False)
                 else "context"
             ),
+            # A/B mode metadata: which engine served the measurement and
+            # whether it mutated the stored max_context_window.
+            "engine_mode": "lm" if request.force_lm_engine else "default",
+            "apply_result": request.apply_result,
         }
         run.result = result
         await _send_event(run, {"type": "result", "data": result})

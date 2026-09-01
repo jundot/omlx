@@ -96,6 +96,9 @@ class BoundarySnapshotDiagnostics:
         "override_hits",
         "override_misses",
         "store_skips",
+        "gdn_commit_attempts",
+        "gdn_commit_successes",
+        "gdn_commit_failures",
     )
 
     def __init__(self) -> None:
@@ -124,6 +127,9 @@ class BoundarySnapshotDiagnostics:
             "override_hit": "override_hits",
             "override_miss": "override_misses",
             "store_skip": "store_skips",
+            "gdn_commit_attempt": "gdn_commit_attempts",
+            "gdn_commit_success": "gdn_commit_successes",
+            "gdn_commit_failure": "gdn_commit_failures",
         }.get(event)
 
         with self._lock:

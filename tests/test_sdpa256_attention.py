@@ -791,3 +791,46 @@ def test_production_install_order_covers_vlm_language(
         from omlx import memory_monitor as mm
 
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
+# --- opt-in route counters (benchmark correlation) -----------------------
+
+
+def test_route_stats_off_by_default_and_count_nothing(monkeypatch):
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    monkeypatch.setenv("OMLX_SDPA256_ROUTE_STATS", "")
+    monkeypatch.setattr(sdpa256, "_ROUTE_STATS_ENABLED", False, raising=False)
+    sdpa256._reset_route_stats()
+
+    # A bounded and a stock note with stats disabled leave the counters at 0,
+    # so the decode hot path adds no bookkeeping unless explicitly enabled.
+    sdpa256._note_route_call(True, kv_len=16384)
+    sdpa256._note_route_call(False)
+    snap = sdpa256.get_route_snapshot()
+    assert snap == {"stock_calls": 0, "bounded_calls": 0, "first_bounded_kv_len": 0}
+
+
+def test_route_stats_count_and_record_first_switch_when_enabled(monkeypatch):
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    monkeypatch.setattr(sdpa256, "_ROUTE_STATS_ENABLED", True, raising=False)
+    sdpa256._reset_route_stats()
+
+    sdpa256._note_route_call(False)
+    sdpa256._note_route_call(False)
+    sdpa256._note_route_call(True, kv_len=65535)
+    sdpa256._note_route_call(True, kv_len=70000)
+
+    snap = sdpa256.get_route_snapshot()
+    assert snap["stock_calls"] == 2
+    assert snap["bounded_calls"] == 2
+    # Only the FIRST bounded switch is recorded.
+    assert snap["first_bounded_kv_len"] == 65535
+
+    sdpa256._reset_route_stats()
+    assert sdpa256.get_route_snapshot() == {
+        "stock_calls": 0,
+        "bounded_calls": 0,
+        "first_bounded_kv_len": 0,
+    }
