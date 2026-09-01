@@ -6132,6 +6132,42 @@ async def get_recommended_models(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/api/hf/browse")
+async def browse_hf_models(
+    sort: str = "trending",
+    limit: int = 50,
+    mlx_only: bool = True,
+    base_only: bool = False,
+    inference_available: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Browse Hugging Face models with native Hub sorting and filters."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    memory_info = get_system_memory_info()
+    max_memory = memory_info["total_bytes"] or 16 * 1024**3
+
+    from .hf_downloader import HFDownloader
+
+    try:
+        return await HFDownloader.browse_models(
+            max_memory_bytes=max_memory,
+            sort=sort,
+            limit=min(max(limit, 1), 100),
+            mlx_only=mlx_only,
+            base_only=base_only,
+            inference_available=inference_available,
+        )
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
 @router.get("/api/hf/search")
 async def search_hf_models(
     q: str = "",
@@ -6528,6 +6564,68 @@ async def get_ms_recommended_models(
             max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/browse")
+async def browse_ms_models(
+    sort: str = "trending",
+    limit: int = 50,
+    mlx_only: bool = True,
+    experience: str = "",
+    task: str = "",
+    is_admin: bool = Depends(require_admin),
+):
+    """Browse ModelScope models with native sorting and filters."""
+    if _ms_downloader is None:
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
+
+    memory_info = get_system_memory_info()
+    max_memory = memory_info["total_bytes"] or 16 * 1024**3
+
+    from .ms_downloader import MSDownloader
+
+    experiences = tuple(
+        value.strip() for value in experience.split(",") if value.strip()
+    )
+    try:
+        return await MSDownloader.browse_models(
+            max_memory_bytes=max_memory,
+            sort=sort,
+            limit=min(max(limit, 1), 50),
+            mlx_only=mlx_only,
+            experiences=experiences,
+            task=task.strip(),
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="ModelScope API request timed out. The service may be temporarily unavailable.",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/api/ms/filter-options")
+async def get_ms_filter_options(is_admin: bool = Depends(require_admin)):
+    """Get ModelScope task groups for the suggested-model filters."""
+    if _ms_downloader is None:
+        raise HTTPException(
+            status_code=503, detail="ModelScope downloader not initialized"
+        )
+
+    from .ms_downloader import MSDownloader
+
+    try:
+        return await MSDownloader.get_filter_options()
     except TimeoutError:
         raise HTTPException(
             status_code=504,

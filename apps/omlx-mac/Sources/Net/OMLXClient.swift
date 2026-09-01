@@ -225,6 +225,24 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// Browse RAM-compatible Hub models using the same sort and quick-filter
+    /// semantics as huggingface.co/models.
+    func browseHFModels(
+        sort: String = "trending",
+        limit: Int = 50,
+        mlxOnly: Bool = true,
+        baseOnly: Bool = false,
+        inferenceAvailable: Bool = false
+    ) async throws -> HFSearchResponse {
+        try await get(AdminAPI.hfBrowse, query: [
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "base_only", value: baseOnly ? "true" : "false"),
+            URLQueryItem(name: "inference_available", value: inferenceAvailable ? "true" : "false"),
+        ])
+    }
+
     /// Search HF Hub for repos matching a free-text query. Same endpoint the
     /// browser admin panel uses for its model picker (dashboard.js:3879).
     /// Defaults match the JS caller: trending sort, MLX-only filter, cap 20
@@ -299,6 +317,31 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.msRecommended, query: [
             URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
         ])
+    }
+
+    func browseMSModels(
+        sort: String = "trending",
+        limit: Int = 50,
+        mlxOnly: Bool = true,
+        experiences: [String] = [],
+        task: String? = nil
+    ) async throws -> MSSearchResponse {
+        var query = [
+            URLQueryItem(name: "sort", value: sort),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+        ]
+        if !experiences.isEmpty {
+            query.append(URLQueryItem(name: "experience", value: experiences.joined(separator: ",")))
+        }
+        if let task, !task.isEmpty {
+            query.append(URLQueryItem(name: "task", value: task))
+        }
+        return try await get(AdminAPI.msBrowse, query: query)
+    }
+
+    func getMSFilterOptions() async throws -> MSFilterOptionsResponse {
+        try await get(AdminAPI.msFilterOptions)
     }
 
     func searchMSModels(

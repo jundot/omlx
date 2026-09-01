@@ -3,15 +3,15 @@
 
 import asyncio
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from omlx.admin.hf_downloader import DownloadStatus, DownloadTask
 from omlx.admin.ms_downloader import (
-    MSDownloader,
     _ENRICH_CACHE,
+    MSDownloader,
+    _build_ms_web_browse_payload,
     _enrich_cache_get,
     _enrich_cache_put,
     _enrich_ms_entry,
@@ -19,8 +19,10 @@ from omlx.admin.ms_downloader import (
     _extract_model_size_from_files,
     _fetch_model_config,
     _fetch_model_detail_size,
+    _fetch_ms_task_groups,
     _get_ms_endpoint,
     _parse_ms_model_entry,
+    _parse_ms_openapi_entry,
 )
 
 
@@ -111,6 +113,128 @@ class TestParseMsModelEntry:
         entry = {"Path": "owner/my-model"}
         result = _parse_ms_model_entry(entry)
         assert result["name"] == "my-model"
+
+
+class TestParseMsOpenAPIEntry:
+    def test_normalizes_native_size_and_params(self):
+        result = _parse_ms_openapi_entry(
+            {
+                "id": "mlx-community/model",
+                "display_name": "Model",
+                "downloads": 1200,
+                "likes": 45,
+                "file_size": 4_000_000_000,
+                "params": 7_000_000_000,
+            }
+        )
+
+        assert result["repo_id"] == "mlx-community/model"
+        assert result["downloads"] == 1200
+        assert result["likes"] == 45
+        assert result["size"] == 4_000_000_000
+        assert result["size_formatted"]
+        assert result["params"] == 7_000_000_000
+        assert result["params_formatted"] == "7.0B"
+
+
+class TestBuildMsWebBrowsePayload:
+    @pytest.mark.parametrize(
+        ("sort", "expected"),
+        [
+            ("trending", "Default"),
+            ("downloads", "DownloadsCount"),
+            ("likes", "StarsCount"),
+        ],
+    )
+    def test_maps_native_sort(self, sort, expected):
+        payload = _build_ms_web_browse_payload(sort, 100, False)
+        assert payload["SortBy"] == expected
+        assert payload["PageSize"] == 50
+
+    def test_maps_owner_task_and_experience_filters(self):
+        payload = _build_ms_web_browse_payload(
+            "likes",
+            30,
+            True,
+            experiences=(
+                "api_inference",
+                "model_demo",
+                "restful_inference",
+            ),
+            task="vision-classification:image-classification",
+        )
+
+        assert {
+            "category": "organizations",
+            "predicate": "contains",
+            "values": ["mlx-community"],
+        } in payload["Criterion"]
+        assert {
+            "category": "tasks",
+            "predicate": "contains",
+            "values": ["vision-classification"],
+            "sub_values": ["image-classification"],
+        } in payload["Criterion"]
+        assert {
+            "category": "demo_service",
+            "predicate": "contains",
+            "values": ['{"enabled":true}'],
+        } in payload["Criterion"]
+        assert {item["category"] for item in payload["SingleCriterion"]} == {
+            "inference_type",
+            "support_experience",
+            "support_api_inference",
+        }
+
+    @pytest.mark.asyncio
+    async def test_task_groups_use_display_order_and_popular_tasks(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "Data": {
+                "Domains": [
+                    {
+                        "DomainName": "multi-modal",
+                        "Tasks": [
+                            {"Name": "text-to-image-synthesis", "IsRetrieval": True}
+                        ],
+                    },
+                    {
+                        "DomainName": "audio",
+                        "Tasks": [
+                            {"Name": "text-to-speech", "IsRetrieval": True}
+                        ],
+                    },
+                    {
+                        "DomainName": "nlp",
+                        "Tasks": [
+                            {"Name": "text-generation", "IsRetrieval": True}
+                        ],
+                    },
+                    {
+                        "DomainName": "cv",
+                        "Tasks": [{"Name": "ocr", "IsRetrieval": True}],
+                    },
+                ]
+            }
+        }
+
+        with patch("omlx.admin.ms_downloader.requests.get", return_value=response):
+            groups = await _fetch_ms_task_groups()
+
+        assert [group["id"] for group in groups] == [
+            "popular",
+            "cv",
+            "nlp",
+            "audio",
+            "multi-modal",
+        ]
+        assert [task["value"] for task in groups[0]["tasks"]] == [
+            "text-generation",
+            "text-to-image-synthesis",
+            "text-to-speech",
+        ]
+        assert groups[1]["tasks"][0]["label"] == "OCR"
 
 
 # =============================================================================
@@ -428,6 +552,127 @@ class TestMSDownloader:
 
 class TestMSDownloaderStaticMethods:
     """Test MSDownloader static methods for API interaction."""
+
+    @pytest.mark.asyncio
+    async def test_browse_models_uses_openapi_order_and_filters_by_memory(self):
+        raw_models = [
+            {
+                "id": "mlx-community/too-large",
+                "downloads": 5000,
+                "likes": 100,
+                "file_size": 40 * 1024**3,
+                "params": 20_000_000_000,
+            },
+            {
+                "id": "mlx-community/second",
+                "downloads": 4000,
+                "likes": 90,
+                "file_size": 4 * 1024**3,
+                "params": 7_000_000_000,
+            },
+            {
+                "id": "mlx-community/third",
+                "downloads": 3000,
+                "likes": 80,
+                "file_size": 2 * 1024**3,
+                "params": 3_000_000_000,
+            },
+        ]
+
+        with patch(
+            "omlx.admin.ms_downloader._fetch_ms_models_openapi",
+            new=AsyncMock(return_value=(raw_models, 3)),
+        ) as fetch:
+            result = await MSDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="likes",
+                limit=10,
+                mlx_only=True,
+                task="text-generation",
+            )
+
+        fetch.assert_awaited_once_with(
+            sort="likes",
+            page_size=50,
+            mlx_only=True,
+            task="text-generation",
+        )
+        assert [model["repo_id"] for model in result["models"]] == [
+            "mlx-community/second",
+            "mlx-community/third",
+        ]
+        assert result["total"] == 3
+
+    @pytest.mark.asyncio
+    async def test_browse_models_uses_web_endpoint_for_experience_filters(self):
+        raw_models = [
+            {
+                "Path": "owner",
+                "Name": "demo",
+                "Downloads": 500,
+                "Stars": 12,
+                "StorageSize": 1024,
+            }
+        ]
+        with patch(
+            "omlx.admin.ms_downloader._fetch_ms_models_web",
+            new=AsyncMock(return_value=(raw_models, 1)),
+        ) as fetch, patch(
+            "omlx.admin.ms_downloader._enrich_ms_entry",
+            new=AsyncMock(side_effect=lambda model, sem: model),
+        ):
+            result = await MSDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="trending",
+                mlx_only=False,
+                experiences=("model_demo",),
+            )
+
+        payload = fetch.await_args.args[0]
+        assert payload["SortBy"] == "Default"
+        assert any(
+            item["category"] == "demo_service"
+            for item in payload["Criterion"]
+        )
+        assert result["models"][0]["repo_id"] == "owner/demo"
+
+    @pytest.mark.asyncio
+    async def test_browse_route_forwards_sort_filters_and_memory(self):
+        import omlx.admin.routes as routes
+
+        previous_downloader = routes._ms_downloader
+        routes._ms_downloader = object()
+        response = {"models": [], "total": 0}
+        try:
+            with patch.object(
+                routes,
+                "get_system_memory_info",
+                return_value={"total_bytes": 24 * 1024**3},
+            ), patch.object(
+                MSDownloader,
+                "browse_models",
+                new=AsyncMock(return_value=response),
+            ) as browse:
+                result = await routes.browse_ms_models(
+                    sort="likes",
+                    limit=25,
+                    mlx_only=False,
+                    experience="api_inference,model_demo",
+                    task="text-generation",
+                    is_admin=True,
+                )
+        finally:
+            routes._ms_downloader = previous_downloader
+
+        assert result == response
+        browse.assert_awaited_once_with(
+            max_memory_bytes=24 * 1024**3,
+            sort="likes",
+            limit=25,
+            mlx_only=False,
+            experiences=("api_inference", "model_demo"),
+            task="text-generation",
+        )
 
     @pytest.mark.asyncio
     async def test_search_models(self):

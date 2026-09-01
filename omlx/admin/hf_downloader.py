@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, ModelInfo, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
     GatedRepoError,
     HfHubHTTPError,
     RepositoryNotFoundError,
+    build_hf_headers,
+    get_session,
+    hf_raise_for_status,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
@@ -261,6 +264,47 @@ def _list_models_stale_token_fallback(api: HfApi, kwargs: dict) -> tuple[list, b
         return list(api.list_models(token=False, **kwargs)), True
 
 
+def _list_models_raw(api: HfApi, params: dict, token: bool | None = None) -> list:
+    """List Hub models with query fields not yet exposed by ``HfApi``.
+
+    Hugging Face's public models page uses ``base_model_relation`` and
+    ``direction`` query parameters, but huggingface-hub 1.19 does not expose
+    either argument on ``HfApi.list_models``. Keep the raw request isolated to
+    this helper so the rest of the downloader still consumes ``ModelInfo``.
+    """
+    response = get_session().get(
+        f"{api.endpoint.rstrip('/')}/api/models",
+        params=params,
+        headers=build_hf_headers(token=token),
+        timeout=_HF_API_TIMEOUT,
+    )
+    hf_raise_for_status(response)
+
+    models = []
+    for item in response.json():
+        if "siblings" not in item:
+            item["siblings"] = None
+        models.append(ModelInfo(**item))
+    return models
+
+
+def _list_models_raw_stale_token_fallback(
+    api: HfApi, params: dict
+) -> tuple[list, bool]:
+    """Raw-list equivalent of ``_list_models_stale_token_fallback``."""
+    try:
+        return _list_models_raw(api, params), False
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 401:
+            raise
+        logger.warning(
+            "HF model listing rejected the stored token (401): %s. "
+            "Retrying anonymously.",
+            e,
+        )
+        return _list_models_raw(api, params, token=False), True
+
+
 class DownloadStatus(str, enum.Enum):
     """Status of a download task."""
 
@@ -359,6 +403,7 @@ def _get_param_count(safetensors: dict) -> int:
 # HF API sort field mapping for search.
 _SORT_MAP = {
     "trending": "trendingScore",
+    "likes": "likes",
     "downloads": "downloads",
     "created": "createdAt",
     "updated": "lastModified",
@@ -458,6 +503,111 @@ class HFDownloader:
             "trending": trending[:result_limit],
             "popular": popular[:result_limit],
             "hf_token_invalid": trending_rejected or popular_rejected,
+        }
+
+    @staticmethod
+    async def browse_models(
+        max_memory_bytes: int,
+        sort: str = "trending",
+        limit: int = 50,
+        mlx_only: bool = True,
+        base_only: bool = False,
+        inference_available: bool = False,
+    ) -> dict:
+        """Browse runnable-size Hub models with Hugging Face's native controls.
+
+        Unlike ``get_recommended_models``, this returns one ordered list and
+        mirrors the Hub model browser's sort and quick-filter semantics. The
+        raw API request is necessary for ``base_model_relation`` and ascending
+        parameter sorting, which are not exposed by the pinned HfApi client.
+        """
+        api, _endpoint = _get_hf_api()
+
+        api_sort = _SORT_MAP.get(sort, "trendingScore")
+        python_size_sort = sort in ("largest", "smallest")
+        if sort in ("most_params", "least_params"):
+            api_sort = "num_parameters"
+        elif python_size_sort:
+            # The Hub has no safetensors-byte-size sort. Start with popular
+            # models, then preserve oMLX's existing local size ordering.
+            api_sort = "downloads"
+
+        # Fetch a wider candidate pool because the RAM, safetensors, and
+        # minimum-download filters are applied after the Hub ranking.
+        fetch_limit = min(max(limit * 4, 100), 500)
+        params: dict[str, object] = {
+            "sort": api_sort,
+            "direction": 1 if sort in ("least_params", "smallest") else -1,
+            "limit": fetch_limit,
+            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+        }
+        if mlx_only:
+            params["filter"] = "mlx"
+        if sort in ("most_params", "least_params"):
+            # Exclude missing metadata so "least" starts with a real count.
+            params["num_parameters"] = "min:1"
+        if base_only:
+            # Exact query used by huggingface.co/models?base_model_relation=base.
+            params["base_model_relation"] = "base"
+        if inference_available:
+            # Exact query used by the Hub's "Inference Available" control.
+            params["inference_provider"] = "all"
+
+        models, token_rejected = await asyncio.wait_for(
+            asyncio.to_thread(_list_models_raw_stale_token_fallback, api, params),
+            timeout=_HF_API_TIMEOUT,
+        )
+
+        results = []
+        for model in models:
+            safetensors = model.safetensors or {}
+            if not safetensors.get("parameters"):
+                continue
+
+            downloads = model.downloads or 0
+            if downloads < _MIN_DOWNLOADS:
+                continue
+
+            size = _calc_safetensors_disk_size(safetensors)
+            if size <= 0 or size > max_memory_bytes:
+                continue
+
+            params_count = _get_param_count(safetensors)
+            results.append(
+                {
+                    "repo_id": model.id,
+                    "name": model.id.split("/")[-1],
+                    "downloads": downloads,
+                    "likes": model.likes or 0,
+                    "trending_score": model.trending_score or 0,
+                    "size": size,
+                    "size_formatted": _format_model_size(size),
+                    "params": params_count if params_count > 0 else None,
+                    "params_formatted": (
+                        _format_param_count(params_count)
+                        if params_count > 0
+                        else None
+                    ),
+                }
+            )
+
+        if sort == "most_params":
+            # Some Hub entries expose a stale safetensors.total value even
+            # when their per-dtype parameter counts are complete. Keep the
+            # native Hub candidate set, then order the visible rows by the
+            # parameter count oMLX displays.
+            results.sort(key=lambda item: item["params"] or 0, reverse=True)
+        elif sort == "least_params":
+            results.sort(key=lambda item: item["params"] or 0)
+        elif sort == "largest":
+            results.sort(key=lambda item: item["size"], reverse=True)
+        elif sort == "smallest":
+            results.sort(key=lambda item: item["size"])
+
+        return {
+            "models": results[:limit],
+            "total": len(results),
+            "hf_token_invalid": token_rejected,
         }
 
     @staticmethod

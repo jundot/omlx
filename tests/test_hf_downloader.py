@@ -21,6 +21,7 @@ from omlx.admin.hf_downloader import (
     _DownloadActivity,
     _DownloadCancelled,
     _is_xet_transport_error,
+    _list_models_raw_stale_token_fallback,
     _make_cancellable_tqdm,
 )
 
@@ -1585,6 +1586,217 @@ class TestGetRecommendedModels:
         item = result["trending"][0]
         assert item["params"] == 7_000_000_000
         assert item["params_formatted"] == "7.0B"
+
+
+# =============================================================================
+# Browse Models Tests
+# =============================================================================
+
+
+class TestBrowseModels:
+    """Test the native Hugging Face browse sort and quick-filter surface."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sort", "api_sort", "direction"),
+        [
+            ("trending", "trendingScore", -1),
+            ("likes", "likes", -1),
+            ("downloads", "downloads", -1),
+            ("created", "createdAt", -1),
+            ("updated", "lastModified", -1),
+            ("most_params", "num_parameters", -1),
+            ("least_params", "num_parameters", 1),
+        ],
+    )
+    async def test_native_sort_query_mapping(self, sort, api_sort, direction):
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=([], False),
+        ) as list_models:
+            await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort=sort,
+            )
+
+        query = list_models.call_args.args[1]
+        assert query["sort"] == api_sort
+        assert query["direction"] == direction
+        if sort in ("most_params", "least_params"):
+            assert query["num_parameters"] == "min:1"
+        else:
+            assert "num_parameters" not in query
+
+    @pytest.mark.asyncio
+    async def test_quick_filters_use_exact_hub_query_fields(self):
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=([], False),
+        ) as list_models:
+            await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                base_only=True,
+                inference_available=True,
+            )
+
+        query = list_models.call_args.args[1]
+        assert query["filter"] == "mlx"
+        assert query["base_model_relation"] == "base"
+        assert query["inference_provider"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_filters_candidates_by_downloads_safetensors_and_memory(self):
+        good = _make_mock_model(
+            "mlx-community/good", disk_size_bytes=4 * 1024**3, downloads=200
+        )
+        too_large = _make_mock_model(
+            "mlx-community/too-large",
+            disk_size_bytes=32 * 1024**3,
+            downloads=200,
+        )
+        unpopular = _make_mock_model(
+            "mlx-community/unpopular", disk_size_bytes=2 * 1024**3, downloads=99
+        )
+        missing_metadata = _make_mock_model(
+            "mlx-community/missing", disk_size_bytes=None, downloads=200
+        )
+
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=(
+                [good, too_large, unpopular, missing_metadata],
+                False,
+            ),
+        ):
+            result = await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+            )
+
+        assert [model["repo_id"] for model in result["models"]] == [
+            "mlx-community/good"
+        ]
+        assert result["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_size_sort_preserves_existing_local_order(self):
+        small = _make_mock_model(
+            "mlx-community/small", disk_size_bytes=2 * 1024**3, downloads=200
+        )
+        large = _make_mock_model(
+            "mlx-community/large", disk_size_bytes=8 * 1024**3, downloads=200
+        )
+
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=([small, large], False),
+        ):
+            largest = await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="largest",
+            )
+            smallest = await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="smallest",
+            )
+
+        assert [model["repo_id"] for model in largest["models"]] == [
+            "mlx-community/large",
+            "mlx-community/small",
+        ]
+        assert [model["repo_id"] for model in smallest["models"]] == [
+            "mlx-community/small",
+            "mlx-community/large",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parameter_sort_uses_displayed_per_dtype_count(self):
+        small = _make_mock_model(
+            "mlx-community/small", disk_size_bytes=2 * 1024**3, downloads=200
+        )
+        large = _make_mock_model(
+            "mlx-community/large", disk_size_bytes=8 * 1024**3, downloads=200
+        )
+
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=([large, small], False),
+        ):
+            least = await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="least_params",
+            )
+
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw_stale_token_fallback",
+            return_value=([small, large], False),
+        ):
+            most = await HFDownloader.browse_models(
+                max_memory_bytes=16 * 1024**3,
+                sort="most_params",
+            )
+
+        assert [model["repo_id"] for model in least["models"]] == [
+            "mlx-community/small",
+            "mlx-community/large",
+        ]
+        assert [model["repo_id"] for model in most["models"]] == [
+            "mlx-community/large",
+            "mlx-community/small",
+        ]
+
+    def test_raw_listing_retries_anonymously_on_401(self):
+        api = MagicMock()
+        params = {"sort": "likes"}
+
+        with patch(
+            "omlx.admin.hf_downloader._list_models_raw",
+            side_effect=[_make_401_error(), []],
+        ) as raw_list:
+            models, token_rejected = _list_models_raw_stale_token_fallback(
+                api, params
+            )
+
+        assert models == []
+        assert token_rejected is True
+        assert raw_list.call_args_list[1].kwargs["token"] is False
+
+    @pytest.mark.asyncio
+    async def test_browse_route_forwards_sort_filters_and_memory(self):
+        import omlx.admin.routes as routes
+
+        previous_downloader = routes._hf_downloader
+        routes._hf_downloader = object()
+        response = {"models": [], "total": 0, "hf_token_invalid": False}
+        try:
+            with patch.object(
+                routes,
+                "get_system_memory_info",
+                return_value={"total_bytes": 24 * 1024**3},
+            ), patch.object(
+                HFDownloader,
+                "browse_models",
+                new=AsyncMock(return_value=response),
+            ) as browse:
+                result = await routes.browse_hf_models(
+                    sort="likes",
+                    limit=25,
+                    mlx_only=True,
+                    base_only=True,
+                    inference_available=True,
+                    is_admin=True,
+                )
+        finally:
+            routes._hf_downloader = previous_downloader
+
+        assert result == response
+        browse.assert_awaited_once_with(
+            max_memory_bytes=24 * 1024**3,
+            sort="likes",
+            limit=25,
+            mlx_only=True,
+            base_only=True,
+            inference_available=True,
+        )
 
 
 # =============================================================================
