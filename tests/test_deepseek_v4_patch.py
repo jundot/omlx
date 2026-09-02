@@ -2370,3 +2370,48 @@ class TestIndexerFallbackTiling:
         _, dm = self._reduce_and_ref()
         assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
         assert dm._INDEXER_MAX_ELEMS < 2**31
+
+
+class TestAffineBlockRouteThreshold:
+    """The affine block kernels must not engage below the measured crossover:
+    at 64 routes they cost 2-2.7x the plain gather (M1 Ultra, GLM-5.3-Flash
+    2-bit experts). The decision is testable without the Metal kernel."""
+
+    def _linear(self):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        import mlx.core as mx
+
+        linear = sl.QuantizedSwitchLinear(
+            64, 64, num_experts=2, bias=False, group_size=64, bits=2
+        )
+        # affine metadata in the activation dtype, as a loaded oQ checkpoint has
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        if linear.get("biases") is None:
+            linear.biases = mx.zeros_like(linear.scales)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+        return linear
+
+    def test_affine_blocks_engage_only_from_the_route_threshold(self, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        linear = self._linear()
+        below = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES - 1, 1, 64), dtype=mx.bfloat16)
+        at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)
+        assert linear._can_use_affine_blocks(below, sorted_indices=True) is False
+        assert linear._can_use_affine_blocks(at, sorted_indices=True) is True
+        # unsorted routes never take the block path, whatever the count
+        assert linear._can_use_affine_blocks(at, sorted_indices=False) is False
+
+    def test_thresholds_default_to_the_measured_crossovers(self):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        assert sl._SORT_MIN_ROUTES == 32
+        assert sl._AFFINE_NATIVE_MIN_ROUTES == 1024
+        # both are environment-overridable, like the mxfp4 neighbour
+        src = open(sl.__file__, encoding="utf-8").read()
+        assert "OMLX_DEEPSEEK_SORT_MIN_ROUTES" in src
+        assert "OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES" in src
