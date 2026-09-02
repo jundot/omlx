@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from ..model_discovery import (
     CAUSAL_LM_RERANKER_ARCHITECTURES,
@@ -30,6 +31,10 @@ from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
+)
+from .sentence_transformers import (
+    ModernBertCrossEncoderPipeline,
+    parse_modernbert_cross_encoder_pipeline,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,13 +58,144 @@ class RerankOutput:
     """Output from rerank operation."""
 
     scores: list[float]
-    """Relevance scores for each document (0 to 1)."""
+    """Model-native relevance scores for each document."""
 
     indices: list[int]
     """Document indices sorted by score (descending)."""
 
     total_tokens: int
     """Total number of tokens processed."""
+
+
+class SentenceTransformersCrossEncoderHead(nn.Module):
+    """GELU Dense -> LayerNorm -> scalar Dense with raw output scores."""
+
+    def __init__(self, hidden_size: int, layer_norm_eps: float):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.activation = nn.GELU(approx="precise")
+        self.norm = nn.LayerNorm(
+            hidden_size,
+            eps=layer_norm_eps,
+            bias=True,
+        )
+        self.output = nn.Linear(hidden_size, 1, bias=True)
+
+    def __call__(self, pooled: mx.array) -> mx.array:
+        hidden = self.activation(self.dense(pooled))
+        return self.output(self.norm(hidden))
+
+
+def _sanitize_sentence_transformers_modernbert_weights(
+    weights: dict[str, Any],
+    pipeline: ModernBertCrossEncoderPipeline,
+) -> dict[str, Any]:
+    """Map root backbone and nested SentenceTransformers tensors into MLX."""
+
+    head_keys = {
+        f"{pipeline.dense_path}.linear.weight": (
+            "head.dense.weight",
+            (pipeline.hidden_size, pipeline.hidden_size),
+        ),
+        f"{pipeline.layer_norm_path}.norm.weight": (
+            "head.norm.weight",
+            (pipeline.hidden_size,),
+        ),
+        f"{pipeline.layer_norm_path}.norm.bias": (
+            "head.norm.bias",
+            (pipeline.hidden_size,),
+        ),
+        f"{pipeline.output_path}.linear.weight": (
+            "head.output.weight",
+            (1, pipeline.hidden_size),
+        ),
+        f"{pipeline.output_path}.linear.bias": ("head.output.bias", (1,)),
+    }
+    module_prefixes = tuple(
+        f"{path}."
+        for path in (
+            pipeline.dense_path,
+            pipeline.layer_norm_path,
+            pipeline.output_path,
+        )
+    )
+    present_head_keys = {
+        key for key in weights if key.startswith(module_prefixes)
+    }
+    missing = sorted(set(head_keys) - present_head_keys)
+    if missing:
+        raise ValueError(
+            f"SentenceTransformers CrossEncoder is missing head tensor(s): {missing}"
+        )
+    unexpected = sorted(present_head_keys - set(head_keys))
+    if unexpected:
+        raise ValueError(
+            f"SentenceTransformers CrossEncoder has unexpected head tensor(s): {unexpected}"
+        )
+
+    mapped: dict[str, Any] = {}
+    for key, value in weights.items():
+        if key in head_keys:
+            target, expected_shape = head_keys[key]
+            actual_shape = tuple(int(dimension) for dimension in value.shape)
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"{key} has shape {actual_shape}; expected {expected_shape}"
+                )
+        else:
+            target = key if key.startswith("model.") else f"model.{key}"
+        if target in mapped:
+            raise ValueError(f"Duplicate mapped model tensor: {target}")
+        mapped[target] = value
+    return mapped
+
+
+class ModernBertSentenceTransformersCrossEncoder(nn.Module):
+    """Bare ModernBERT plus a validated modular CrossEncoder scoring head."""
+
+    def __init__(self, config: Any, pipeline: ModernBertCrossEncoderPipeline):
+        super().__init__()
+        from mlx_embeddings.models.modernbert import ModernBertModel
+
+        self.config = config
+        self.pipeline = pipeline
+        self.model = ModernBertModel(config)
+        self.head = SentenceTransformersCrossEncoderHead(
+            pipeline.hidden_size,
+            pipeline.layer_norm_eps,
+        )
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        attention_mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+    ) -> Any:
+        from mlx_embeddings.models.base import BaseModelOutput
+
+        if attention_mask is None:
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+        encoder_outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        last_hidden_state = encoder_outputs["last_hidden_state"]
+        pooled = last_hidden_state[:, 0, :]
+        raw_scores = self.head(pooled)
+        return BaseModelOutput(
+            last_hidden_state=last_hidden_state,
+            pooler_output=raw_scores,
+            hidden_states=encoder_outputs.get("hidden_states"),
+        )
+
+    def sanitize(self, weights: dict[str, Any]) -> dict[str, Any]:
+        return _sanitize_sentence_transformers_modernbert_weights(
+            weights,
+            self.pipeline,
+        )
 
 
 class MLXRerankerModel:
@@ -105,6 +241,7 @@ class MLXRerankerModel:
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
 
+        self._resolved_model_path: Path | None = None
         self.model = None
         self.processor = None
         self._loaded = False
@@ -112,6 +249,7 @@ class MLXRerankerModel:
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._is_sentence_transformers_cross_encoder = False
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
         self._doc_embed_token_id: int | None = None
@@ -123,9 +261,22 @@ class MLXRerankerModel:
         self._is_compiled = False
         self._compiled_seq_logits = None
 
-    def _get_architecture(self) -> str | None:
+    def _resolve_model_path(self) -> Path:
+        """Resolve a local directory for architecture and modular-file reads."""
+
+        if self._resolved_model_path is not None:
+            return self._resolved_model_path
+        model_path = Path(self.model_name)
+        if not model_path.exists():
+            from mlx_embeddings.utils import get_model_path
+
+            model_path = get_model_path(self.model_name)
+        self._resolved_model_path = model_path
+        return model_path
+
+    def _get_architecture(self, model_path: Path | None = None) -> str | None:
         """Get the model architecture from config.json."""
-        config_path = Path(self.model_name) / "config.json"
+        config_path = (model_path or Path(self.model_name)) / "config.json"
         if not config_path.exists():
             return None
 
@@ -229,6 +380,41 @@ class MLXRerankerModel:
             str(model_path), trust_remote_code=self.trust_remote_code
         )
 
+        return model, tokenizer
+
+    def _load_modernbert_sentence_transformers(
+        self, model_path: Path
+    ) -> Tuple[Any, Any]:
+        """Load a validated modular ModernBERT CrossEncoder pipeline."""
+
+        from mlx_embeddings.models.modernbert import ModelArgs
+        from mlx_embeddings.tokenizer_utils import load_tokenizer
+        from mlx_embeddings.utils import load_model
+
+        pipeline = parse_modernbert_cross_encoder_pipeline(model_path)
+
+        class _ConfiguredModernBertCrossEncoder(
+            ModernBertSentenceTransformersCrossEncoder
+        ):
+            def __init__(self, config: Any):
+                super().__init__(config, pipeline)
+
+        def _get_model_classes(config: dict[str, Any]) -> tuple[Any, Any, None, None]:
+            return _ConfiguredModernBertCrossEncoder, ModelArgs, None, None
+
+        model = load_model(
+            model_path,
+            model_config={
+                "global_rope_theta": pipeline.global_rope_theta,
+                "local_rope_theta": pipeline.local_rope_theta,
+            },
+            get_model_classes=_get_model_classes,
+            path_to_repo=self.model_name,
+        )
+        tokenizer = load_tokenizer(
+            model_path,
+            {"trust_remote_code": self.trust_remote_code},
+        )
         return model, tokenizer
 
     def _load_vl_reranker(self) -> Tuple[Any, Any]:
@@ -796,10 +982,12 @@ class MLXRerankerModel:
         if self._loaded:
             return
 
-        # Check architecture before loading
-        self._validate_architecture()
+        # Resolve Hub IDs before architecture dispatch so modular checkpoints
+        # cannot fall through to a generic embedding loader.
+        model_path = self._resolve_model_path()
+        self._validate_architecture(model_path)
 
-        arch = self._get_architecture()
+        arch = self._get_architecture(model_path)
         logger.info(f"Loading reranker model: {self.model_name} (arch={arch})")
 
         try:
@@ -822,6 +1010,12 @@ class MLXRerankerModel:
                 # Use omlx native implementation
                 self.model, self.processor = self._load_xlm_roberta()
                 self._num_labels = getattr(self.model.config, "num_labels", None)
+            elif arch == "ModernBertModel":
+                self.model, self.processor = (
+                    self._load_modernbert_sentence_transformers(model_path)
+                )
+                self._is_sentence_transformers_cross_encoder = True
+                self._num_labels = 1
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 patch_qwen3_vl_processor_for_torch_free_image_loading()
@@ -845,6 +1039,7 @@ class MLXRerankerModel:
                 f"Reranker model loaded successfully: {self.model_name} "
                 f"(arch={arch}, num_labels={self._num_labels}, "
                 f"causal_lm={self._is_causal_lm}, vl={self._is_vl_reranker}, "
+                f"sentence_transformers={self._is_sentence_transformers_cross_encoder}, "
                 f"compiled={self._is_compiled})"
             )
 
@@ -923,6 +1118,7 @@ class MLXRerankerModel:
         self._compiled_seq_logits = None
         self._is_compiled = False
 
+        self._resolved_model_path = None
         self.model = None
         self.processor = None
         self._loaded = False
@@ -930,6 +1126,7 @@ class MLXRerankerModel:
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._is_sentence_transformers_cross_encoder = False
         self._token_true_id = None
         self._token_false_id = None
         self._doc_embed_token_id = None
@@ -1385,11 +1582,10 @@ class MLXRerankerModel:
         # Ensure computation is done
         mx.eval(logits)
 
-        # Extract relevance scores
-        # For binary classification (num_labels=1), score is already sigmoid applied
-        # For multi-class, take the positive class probability
+        # Extract model-native relevance scores. Sequence-classification loaders
+        # may return probabilities, while modular CrossEncoders intentionally
+        # return signed raw regression scores.
         if logits.shape[-1] == 1:
-            # Binary classification: sigmoid already applied by model
             scores = logits.squeeze(-1).tolist()
         else:
             # Multi-class: take last column (typically "relevant" class)
@@ -1450,14 +1646,15 @@ class MLXRerankerModel:
         """Get the number of classification labels."""
         return self._num_labels
 
-    def _validate_architecture(self) -> None:
+    def _validate_architecture(self, model_path: Path | None = None) -> None:
         """
         Validate that the model architecture is supported.
 
         Raises:
             ValueError: If the architecture is not supported
         """
-        config_path = Path(self.model_name) / "config.json"
+        resolved_path = model_path or Path(self.model_name)
+        config_path = resolved_path / "config.json"
         if not config_path.exists():
             # If no config.json, let mlx-embeddings handle validation
             return
@@ -1499,6 +1696,10 @@ class MLXRerankerModel:
                     f"'reranker' or 'rerank'. Please rename the directory or "
                     f"use the correct model."
                 )
+            return
+
+        if arch == "ModernBertModel":
+            parse_modernbert_cross_encoder_pipeline(resolved_path)
             return
 
         if arch not in SUPPORTED_RERANKER_ARCHITECTURES:
