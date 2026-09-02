@@ -1234,17 +1234,14 @@ def make_prefill_memory_profile(
     wsdpa_dtype_supported: bool = False,
     layer_ratios: Sequence[int] | None = None,
 ) -> PrefillMemoryProfile | None:
-    """Build the one model-specific prefill strategy currently required.
-
-    ``layer_ratios`` narrows a pipeline model to the layers resident in the
-    current process.  The model config continues to describe the full network
-    after mlx-lm applies pipeline sharding, so using its unsliced ratios in a
-    rank-local admission guard would charge every rank for every layer.
-    """
+    """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
     if not model_type.startswith("deepseek_v4"):
         return None
 
+    # ``layer_ratios`` narrows a pipeline model to the layers resident in the
+    # current process. The config still describes the full network after
+    # pipeline sharding, so unsliced ratios would charge each rank for all layers.
     ratios = (
         layer_ratios
         if layer_ratios is not None
