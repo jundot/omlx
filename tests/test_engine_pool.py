@@ -1378,6 +1378,22 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+    def test_runtime_signature_tracks_prefill_step_size(self, pool_with_mock_engines):
+        """Changing the prefill chunk width must reload an already-loaded engine."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+
+        automatic = ModelSettings()
+        override = ModelSettings(prefill_step_size=1024)
+
+        automatic_signature = pool._engine_runtime_signature("model-a", automatic)
+        override_signature = pool._engine_runtime_signature("model-a", override)
+        repeat_signature = pool._engine_runtime_signature("model-a", ModelSettings())
+
+        assert override_signature != automatic_signature
+        assert repeat_signature == automatic_signature
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines
