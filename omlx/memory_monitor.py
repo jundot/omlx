@@ -828,7 +828,13 @@ class MemoryMonitor:
         # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        attn = (
+            self._prefill_memory_profile.estimate_prefill_transient_bytes(
+                eff_chunk, full_kv_len
+            )
+            if self._prefill_memory_profile is not None
+            else self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        )
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
@@ -1226,14 +1232,29 @@ def make_prefill_memory_profile(
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
+    layer_ratios: Sequence[int] | None = None,
 ) -> PrefillMemoryProfile | None:
-    """Build the one model-specific prefill strategy currently required."""
+    """Build the one model-specific prefill strategy currently required.
+
+    ``layer_ratios`` narrows a pipeline model to the layers resident in the
+    current process.  The model config continues to describe the full network
+    after mlx-lm applies pipeline sharding, so using its unsliced ratios in a
+    rank-local admission guard would charge every rank for every layer.
+    """
     model_type = str(_cfg_get(config, "model_type", "") or "")
     if not model_type.startswith("deepseek_v4"):
         return None
 
-    num_layers = _cfg_get(config, "num_hidden_layers")
-    ratios = _cfg_get(config, "compress_ratios")
+    ratios = (
+        layer_ratios
+        if layer_ratios is not None
+        else _cfg_get(config, "compress_ratios")
+    )
+    num_layers = (
+        len(layer_ratios)
+        if layer_ratios is not None
+        else _cfg_get(config, "num_hidden_layers")
+    )
     if (
         not _pos_int(num_layers)
         or not isinstance(ratios, Sequence)
@@ -1528,13 +1549,25 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
             head_dim = hidden_size // num_heads
 
-        # Determine dtype size
-        dtype_size = 2  # Default float16
-        if hasattr(model, "dtype"):
-            if model.dtype == mx.float32:
-                dtype_size = 4
-            elif model.dtype == mx.bfloat16:
-                dtype_size = 2
+        # Determine the activation dtype from an explicit model property or,
+        # for mlx-lm text models, the embedding weight that produces the
+        # hidden-state stream.  The latter is how DeepSeek V4 exposes it.
+        model_dtype = getattr(model, "dtype", None)
+        if model_dtype is None:
+            model_body = getattr(model, "model", None)
+            embed_tokens = getattr(model_body, "embed_tokens", None)
+            embed_weight = getattr(embed_tokens, "weight", None)
+            model_dtype = getattr(embed_weight, "dtype", None)
+
+        def _dtype_matches(dtype: Any, expected: Any) -> bool:
+            if dtype is None:
+                return False
+            try:
+                return bool(dtype == expected)
+            except (TypeError, ValueError):
+                return False
+
+        dtype_size = 4 if _dtype_matches(model_dtype, mx.float32) else 2
 
         # Extract num_attention_heads (query heads) for SDPA peak estimation
         num_attention_heads = (
@@ -1569,6 +1602,33 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
             config, cache_list, dtype_size
         ) or estimate_mla_kv_bytes_per_token(config, cache_list, dtype_size)
 
+        # mlx-lm leaves the full config attached after pipeline sharding.  Its
+        # PipelineMixin records the resident half-open layer range on the
+        # language-model body; slice the DeepSeek V4 ratio schedule so the
+        # specialized cache/transient profile remains rank-local.
+        layer_ratios = None
+        ratios = _cfg_get(config, "compress_ratios")
+        pipeline_model = getattr(model, "model", None)
+        start_idx = getattr(pipeline_model, "start_idx", None)
+        end_idx = getattr(pipeline_model, "end_idx", None)
+        if (
+            isinstance(ratios, Sequence)
+            and not isinstance(ratios, (str, bytes))
+            and isinstance(start_idx, int)
+            and not isinstance(start_idx, bool)
+            and isinstance(end_idx, int)
+            and not isinstance(end_idx, bool)
+            and 0 <= start_idx < end_idx <= len(ratios)
+        ):
+            layer_ratios = tuple(ratios[start_idx:end_idx])
+
+        prefill_memory_profile = make_prefill_memory_profile(
+            config,
+            compute_dtype_size=dtype_size,
+            wsdpa_dtype_supported=_dtype_matches(model_dtype, mx.bfloat16),
+            layer_ratios=layer_ratios,
+        )
+
         # Truthiness alone isn't enough — MagicMock proxies leaking through the
         # descent (test scaffolds that don't fully spec ``model.config``) are
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
@@ -1586,6 +1646,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                prefill_memory_profile=prefill_memory_profile,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(

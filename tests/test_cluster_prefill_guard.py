@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import mlx.core as mx
 import pytest
 
 from omlx.cluster.prefill_guard import RankPrefillGuard, build_guard, rank_monitor
 from omlx.exceptions import PrefillMemoryExceededError
+from omlx.memory_monitor import MemoryMonitor
 
 GiB = 1024**3
 
@@ -116,6 +120,70 @@ def test_request_prefill_step_override_sizes_peak_without_mutating_guard():
         )
 
     assert guard._step == 2048
+
+
+def test_deepseek_v4_pipeline_guard_uses_rank_local_hybrid_profile(monkeypatch):
+    """A long tool prompt plus one image must not be priced as dense 64-head SDPA.
+
+    The vision bridge intentionally prefills the image-bearing suffix in one
+    call.  At 18k tokens the generic head_dim=512 fallback is about 40 GiB,
+    which falsely rejects the OpenCode request before the model can use its
+    compressed/sparse DeepSeek V4 kernels.
+    """
+
+    from omlx.patches.deepseek_v4 import wsdpa_attention
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.native_indexer_eligible", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        wsdpa_attention,
+        "wsdpa_prefill_route_active",
+        lambda **_kwargs: True,
+    )
+
+    ratios = [0] + [4 if i % 2 else 128 for i in range(41)] + [0]
+    config = SimpleNamespace(
+        model_type="deepseek_v4",
+        num_hidden_layers=43,
+        num_key_value_heads=1,
+        num_attention_heads=64,
+        head_dim=512,
+        hidden_size=4096,
+        sliding_window=128,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=512,
+        compress_ratios=ratios,
+    )
+    embedding = SimpleNamespace(weight=SimpleNamespace(dtype=mx.bfloat16))
+    language = SimpleNamespace(start_idx=21, end_idx=43, embed_tokens=embedding)
+    model = SimpleNamespace(args=config, model=language)
+
+    rank_local = rank_monitor(model, layer_count=22)
+    assert rank_local is not None
+    profile = rank_local._prefill_memory_profile
+    assert profile is not None
+    assert profile.local_layers == 22
+    assert profile.ratio4_layers == ratios[21:43].count(4)
+    assert profile.ratio128_layers == ratios[21:43].count(128)
+
+    tokens = 18_000
+    hybrid_peak = rank_local.estimate_prefill_peak_bytes(tokens, tokens)
+    generic = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    generic.set_model_info(
+        num_layers=22,
+        num_kv_heads=1,
+        head_dim=512,
+        dtype_size=2,
+        num_attention_heads=64,
+        num_kv_cache_layers=22,
+        compute_dtype_size=2,
+    )
+    dense_peak = generic.estimate_prefill_peak_bytes(tokens, tokens)
+
+    assert dense_peak > 40 * GiB
+    assert hybrid_peak < 8 * GiB
 
 
 # --- The desync rule: all ranks vote and leave the request together. ---------

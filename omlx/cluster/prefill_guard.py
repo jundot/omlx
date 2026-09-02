@@ -64,11 +64,25 @@ def rank_monitor(
 
     heads = int(getattr(monitor, "_num_attention_heads", 0) or kv_heads)
     dtype_size = float(getattr(monitor, "_dtype_size", 2) or 2)
+    compute_dtype_size = float(
+        getattr(monitor, "_score_dtype_size", dtype_size) or dtype_size
+    )
     kv_override = getattr(monitor, "_kv_bytes_per_token_override", None)
+    rotating_layer_specs = getattr(monitor, "_rotating_layer_specs", ())
+    prefill_memory_profile = getattr(monitor, "_prefill_memory_profile", None)
+    ane_prefill_transient_bytes = int(
+        getattr(monitor, "_ane_prefill_transient_bytes", 0) or 0
+    )
+    detected_kv_layers = getattr(monitor, "_num_kv_cache_layers", None)
 
     # Pipeline: this rank stores KV for its own layers only.
     stage_layers = int(layer_count) if layer_count else num_layers
     stage_layers = max(1, min(stage_layers, num_layers or stage_layers))
+    stage_kv_layers = (
+        stage_layers
+        if detected_kv_layers is None
+        else max(0, min(int(detected_kv_layers), stage_layers))
+    )
 
     # Tensor parallel: heads are split across ranks, so both the KV this rank
     # stores and the attention transient it computes shrink with the shard.
@@ -85,8 +99,12 @@ def rank_monitor(
         head_dim=head_dim,
         dtype_size=dtype_size,
         num_attention_heads=heads,
-        num_kv_cache_layers=stage_layers,
+        num_kv_cache_layers=stage_kv_layers,
+        compute_dtype_size=compute_dtype_size,
         kv_bytes_per_token=kv_override,
+        rotating_layer_specs=rotating_layer_specs,
+        prefill_memory_profile=prefill_memory_profile,
+        ane_prefill_transient_bytes=ane_prefill_transient_bytes,
     )
     return monitor
 
@@ -141,7 +159,9 @@ class RankPrefillGuard:
             if current_usage_bytes is None
             else max(0, int(current_usage_bytes))
         )
-        step = self._step if prefill_step_size is None else max(1, int(prefill_step_size))
+        step = (
+            self._step if prefill_step_size is None else max(1, int(prefill_step_size))
+        )
         try:
             raise_if_prefill_exceeds(
                 self._monitor,
