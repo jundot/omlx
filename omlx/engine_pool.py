@@ -3131,6 +3131,20 @@ class EnginePool:
         shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
+    @staticmethod
+    def _entry_cache_block_size(entry: "EngineEntry") -> int | None:
+        """Effective prefix-cache block size for a loaded entry, else None.
+
+        The scheduler adjusts the configured block size at load time
+        (RotatingKVCache window alignment, ArraysCache enlargement, pooling
+        models), so the live value is only known once the engine exists.
+        Exposing it lets clients that resend a stable prefix pad it to a
+        block multiple and avoid the trailing-partial-block re-prefill.
+        """
+        scheduler = getattr(getattr(entry.engine, "engine", None), "scheduler", None)
+        config = getattr(scheduler, "config", None)
+        return getattr(config, "paged_cache_block_size", None)
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
@@ -3162,6 +3176,7 @@ class EnginePool:
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
+                    "cache_block_size": self._entry_cache_block_size(e),
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
                     "realtime_stt": is_realtime_stt_model(
