@@ -227,12 +227,23 @@ def apply_load_patch() -> bool:
             )
         if wrapper._tool_parser is None:
             wrapper._tool_parser = _tp.parse_tool_call
+        if wrapper._tool_parser is _tp.parse_tool_call:
+            # Normalize marker metadata even when tokenizer_config_extra (or a
+            # future published config) selected our parser before this wrapper
+            # ran.  mlx-lm otherwise keeps the context-free token cache that
+            # cannot match canonical DeepSeek V4 output.
             wrapper._tool_call_start = _tp.tool_call_start
             wrapper._tool_call_end = _tp.tool_call_end
             try:
                 wrapper._tool_call_start_tokens = tuple(
                     wrapper._tokenizer.encode(
-                        _tp.tool_call_start, add_special_tokens=False
+                        # The canonical DSML form puts the first invoke on the
+                        # next line.  Encode that context as well: DeepSeek's
+                        # tokenizer merges the closing ``>`` and newline into
+                        # one token, so encoding the bare marker produces a
+                        # sequence that can never match generated tool calls.
+                        _tp.tool_call_start + "\n",
+                        add_special_tokens=False,
                     )
                 )
                 wrapper._tool_call_end_tokens = tuple(
