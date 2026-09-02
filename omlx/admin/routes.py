@@ -2024,6 +2024,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            # Load-time resolution from the pool (issue #3342): what the
+            # loaded engine is actually doing, as opposed to the disk
+            # compatibility verdict above. None = not resolved.
+            "mtp_requested": model_info.get("mtp_requested"),
+            "mtp_active": model_info.get("mtp_active"),
+            "mtp_inactive_reason": model_info.get("mtp_inactive_reason"),
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
@@ -2073,6 +2079,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_ssd_cache_available": False,
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
+                "mtp_requested": None,
+                "mtp_active": None,
+                "mtp_inactive_reason": None,
                 "is_paroquant": False,
                 "paroquant_reason": "",
                 "virtual": True,

@@ -3989,3 +3989,395 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "dynamic memory ceiling" in message
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
+
+
+class TestMTPEffectiveState:
+    """Load-time MTP resolution (issue #3342).
+
+    A persisted ``mtp_enabled`` on a Qwen4-Exp checkpoint without embedded
+    ``mtp.*`` tensors used to reach the engine unchanged and serve target-only
+    completions with nothing observable. The pool now resolves the effective
+    state before construction, records it on the entry, and exposes it on
+    status -- without touching the persisted setting.
+    """
+
+    @staticmethod
+    def _qwen4_checkpoint(tmp_path, *, with_mtp: bool, name: str = "qwen4"):
+        model = tmp_path / name
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+        weight_map = {
+            "language_model.model.embed_tokens.weight": "model-00001.safetensors"
+        }
+        if with_mtp:
+            weight_map["mtp.layers.0.mlp.gate.weight"] = "model-00002.safetensors"
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+        return model
+
+    @staticmethod
+    def _entry(model, *, config_model_type="qwen4_exp", engine_type="vlm"):
+        return EngineEntry(
+            model_id=model.name,
+            model_path=str(model),
+            model_type="vlm" if engine_type == "vlm" else "llm",
+            engine_type=engine_type,
+            config_model_type=config_model_type,
+            estimated_size=1000,
+        )
+
+    @staticmethod
+    def _pool_with(entry):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries[entry.model_id] = entry
+        return pool
+
+    # -- resolution (AC1) ---------------------------------------------------
+
+    def test_missing_tensors_resolve_off_on_a_copy(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=False))
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True)
+
+        effective = pool._effective_qwen4_model_settings(entry, requested)
+
+        assert effective is not requested
+        assert effective.mtp_enabled is False
+        assert requested.mtp_enabled is True
+        assert pool._resolve_mtp_state(entry, requested) == (
+            True,
+            False,
+            "no_embedded_mtp_tensors",
+        )
+
+    def test_present_tensors_pass_settings_through(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=True))
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True)
+
+        effective = pool._effective_qwen4_model_settings(entry, requested)
+
+        assert effective is requested
+        assert effective.mtp_enabled is True
+        assert pool._resolve_mtp_state(entry, requested) == (True, True, None)
+
+    def test_not_requested_has_no_reason(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=False))
+        pool = self._pool_with(entry)
+
+        assert pool._resolve_mtp_state(entry, ModelSettings(mtp_enabled=False)) == (
+            False,
+            False,
+            None,
+        )
+        assert pool._resolve_mtp_state(entry, None) == (False, False, None)
+
+    # -- non-qwen4 untouched (AC6) -------------------------------------------
+
+    def test_generic_family_is_not_resolved(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen35"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        entry = self._entry(model, config_model_type="qwen3_5", engine_type="batched")
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True)
+
+        assert pool._effective_qwen4_model_settings(entry, requested) is requested
+        assert pool._resolve_mtp_state(entry, requested) == (True, None, None)
+
+    # -- record + status + reason invariant (AC2, AC2b, AC3) -----------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("with_mtp", "mtp_enabled", "expected"),
+        [
+            (False, True, (True, False, "no_embedded_mtp_tensors")),
+            (True, True, (True, True, None)),
+            (False, False, (False, False, None)),
+        ],
+    )
+    async def test_load_records_resolution_and_status_exposes_it(
+        self, tmp_path, with_mtp, mtp_enabled, expected
+    ):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=with_mtp))
+        pool = self._pool_with(entry)
+        before = pool.get_status()["models"][0]
+        assert (
+            before["mtp_requested"],
+            before["mtp_active"],
+            before["mtp_inactive_reason"],
+        ) == (
+            None,
+            None,
+            None,
+        )
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+        ):
+            await pool._load_engine(
+                entry.model_id, runtime_settings=ModelSettings(mtp_enabled=mtp_enabled)
+            )
+
+        assert (
+            entry.mtp_requested,
+            entry.mtp_active,
+            entry.mtp_inactive_reason,
+        ) == expected
+        assert (entry.mtp_inactive_reason is not None) == (
+            entry.mtp_requested is True and entry.mtp_active is False
+        )
+        after = pool.get_status()["models"][0]
+        assert (
+            after["mtp_requested"],
+            after["mtp_active"],
+            after["mtp_inactive_reason"],
+        ) == expected
+        assert set(before) <= set(after)
+
+        await pool._unload_engine(entry.model_id)
+        assert (entry.mtp_requested, entry.mtp_active, entry.mtp_inactive_reason) == (
+            None,
+            None,
+            None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_family_records_unverified_active(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = tmp_path / "qwen35"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        entry = self._entry(model, config_model_type="qwen3_5", engine_type="batched")
+        pool = self._pool_with(entry)
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool._load_engine(
+                entry.model_id, runtime_settings=ModelSettings(mtp_enabled=True)
+            )
+
+        assert (entry.mtp_requested, entry.mtp_active, entry.mtp_inactive_reason) == (
+            True,
+            None,
+            None,
+        )
+
+    # -- failed / aborted loads reset (AC2) ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_constructor_failure_leaves_fields_unset(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=False))
+        pool = self._pool_with(entry)
+        with (
+            patch(
+                "omlx.engine_pool.VLMBatchedEngine", side_effect=RuntimeError("boom")
+            ),
+            patch("omlx.engine_pool.BatchedEngine", side_effect=RuntimeError("boom")),
+            pytest.raises(ModelUnavailableError, match="failed to load"),
+        ):
+            await pool._load_engine(
+                entry.model_id, runtime_settings=ModelSettings(mtp_enabled=True)
+            )
+
+        assert (entry.mtp_requested, entry.mtp_active, entry.mtp_inactive_reason) == (
+            None,
+            None,
+            None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_aborted_load_leaves_fields_unset(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=False))
+        pool = self._pool_with(entry)
+        mock_engine = MagicMock()
+
+        async def _start_then_abort():
+            entry.abort_loading = True
+
+        mock_engine.start = AsyncMock(side_effect=_start_then_abort)
+        mock_engine.stop = AsyncMock()
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            pytest.raises(ModelLoadingError, match="aborted"),
+        ):
+            await pool._load_engine(
+                entry.model_id, runtime_settings=ModelSettings(mtp_enabled=True)
+            )
+
+        assert entry.engine is None
+        assert (entry.mtp_requested, entry.mtp_active, entry.mtp_inactive_reason) == (
+            None,
+            None,
+            None,
+        )
+
+    # -- warning (AC5) --------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("with_mtp", "mtp_enabled", "expect_warning"),
+        [(False, True, True), (True, True, False), (False, False, False)],
+    )
+    async def test_inactive_for_cause_warns_once(
+        self, tmp_path, caplog, with_mtp, mtp_enabled, expect_warning
+    ):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=with_mtp))
+        pool = self._pool_with(entry)
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        with (
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+        ):
+            await pool._load_engine(
+                entry.model_id, runtime_settings=ModelSettings(mtp_enabled=mtp_enabled)
+            )
+
+        hits = [
+            r
+            for r in caplog.records
+            if r.name == "omlx.engine_pool"
+            and r.levelno == logging.WARNING
+            and "no_embedded_mtp_tensors" in r.getMessage()
+        ]
+        if expect_warning:
+            assert len(hits) == 1
+            message = hits[0].getMessage()
+            assert entry.model_id in message
+            assert "target-only" in message
+        else:
+            assert hits == []
+
+    # -- reuse-key invariant (AC7) --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_signature_agrees_and_reuse_does_not_reload(self, tmp_path, caplog):
+        from omlx.model_settings import ModelSettings
+
+        entry = self._entry(self._qwen4_checkpoint(tmp_path, with_mtp=False))
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        mock_engine.has_active_requests = MagicMock(return_value=False)
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_engine),
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+        ):
+            await pool._load_engine(entry.model_id, runtime_settings=requested)
+            expected = pool._engine_runtime_signature(entry.model_id, requested)
+            assert expected == entry.runtime_settings_signature
+            assert dict(expected)["mtp_enabled"] == "False"
+            assert "mtp_num_draft_tokens" not in dict(expected)
+
+            with caplog.at_level(logging.INFO, logger="omlx.engine_pool"):
+                engine = await pool.get_engine(
+                    entry.model_id, runtime_settings=requested
+                )
+        assert engine is mock_engine
+        assert entry.engine is mock_engine
+        assert not any(
+            "Runtime settings variant changed" in r.getMessage() for r in caplog.records
+        )
+
+    def test_signature_flips_when_tensors_appear(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = self._qwen4_checkpoint(tmp_path, with_mtp=False)
+        entry = self._entry(model)
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True)
+
+        before = dict(pool._engine_runtime_signature(entry.model_id, requested))
+        assert before["mtp_enabled"] == "False"
+
+        index = model / "model.safetensors.index.json"
+        data = json.loads(index.read_text())
+        data["weight_map"]["mtp.layers.0.mlp.gate.weight"] = "model-00002.safetensors"
+        index.write_text(json.dumps(data))
+        after = dict(pool._engine_runtime_signature(entry.model_id, requested))
+        assert after["mtp_enabled"] == "True"
+
+    # -- no per-request index parse (AC6b, AC2c) ------------------------------
+
+    def test_index_is_parsed_once_per_fingerprint(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        model = self._qwen4_checkpoint(tmp_path, with_mtp=False)
+        entry = self._entry(model)
+        pool = self._pool_with(entry)
+        requested = ModelSettings(mtp_enabled=True)
+
+        with patch(
+            "omlx.utils.model_loading._checkpoint_has_mtp_weights", return_value=False
+        ) as detector:
+            for _ in range(25):
+                pool._engine_runtime_signature(entry.model_id, requested)
+            assert detector.call_count == 1
+
+            # A touched index is a new fingerprint: exactly one more parse.
+            index = model / "model.safetensors.index.json"
+            import os
+
+            st = index.stat()
+            os.utime(index, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+            pool._engine_runtime_signature(entry.model_id, requested)
+            pool._engine_runtime_signature(entry.model_id, requested)
+            assert detector.call_count == 2
+
+    def test_fingerprint_without_index_covers_every_shard(self, tmp_path):
+        from omlx.engine_pool import _checkpoint_mtp_fingerprint
+
+        model = tmp_path / "single"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+        (model / "model-00001.safetensors").write_bytes(b"a")
+        (model / "model-00002.safetensors").write_bytes(b"b")
+
+        first = _checkpoint_mtp_fingerprint(str(model))
+        assert first is not None and len(first) == 2
+
+        # Changing the SECOND shard changes the fingerprint (the detector
+        # scans every shard header when there is no index).
+        (model / "model-00002.safetensors").write_bytes(b"bb")
+        second = _checkpoint_mtp_fingerprint(str(model))
+        assert second != first
+
+        # With an index present, the fingerprint tracks the index alone.
+        (model / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {}})
+        )
+        indexed = _checkpoint_mtp_fingerprint(str(model))
+        assert indexed[0] == "index"
+        (model / "model-00002.safetensors").write_bytes(b"bbb")
+        assert _checkpoint_mtp_fingerprint(str(model)) == indexed
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert _checkpoint_mtp_fingerprint(str(empty)) is None

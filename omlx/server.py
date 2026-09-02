@@ -2988,6 +2988,15 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     List all available models with detailed status.
 
     Extended endpoint that provides more information than /v1/models.
+
+    Speculative decoding fields per model: ``mtp_requested`` is the
+    ``mtp_enabled`` value the engine was loaded under (the persisted setting,
+    or a runtime override such as ANE tuning's); ``mtp_active`` is the server's
+    load-time resolution of whether Lightning MTP actually engaged;
+    ``mtp_inactive_reason`` names why a requested MTP could not (e.g.
+    ``no_embedded_mtp_tensors``). ``null`` means not resolved -- the model is
+    not loaded, or its family's activation is not verified by the server --
+    never "disabled".
     """
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
