@@ -585,6 +585,26 @@ class DistributedBatchedEngine(BatchedEngine):
             prepared.append(copied)
         return prepared
 
+    def count_chat_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        """Count coordinator text without rendering media parts as strings."""
+
+        if self._supports_multimodal_fallback:
+            from ..utils.image import extract_images_from_messages
+
+            messages, _, _ = extract_images_from_messages(messages)
+        return super().count_chat_tokens(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
     @staticmethod
     def _normalize_backend_tool_calls(
         tool_calls: Any,

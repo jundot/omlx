@@ -40,6 +40,10 @@ class _Tokenizer:
     def encode(text):
         return list(text.encode())
 
+    @staticmethod
+    def apply_chat_template(messages, **_kwargs):
+        return "\n".join(str(message["content"]) for message in messages)
+
 
 def _ready_engine(handler) -> DistributedBatchedEngine:
     engine = DistributedBatchedEngine(_deployment())
@@ -133,6 +137,33 @@ def test_backend_chat_messages_serialize_native_tool_history_once():
     )
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
     assert prepared[1] == messages[1]
+
+
+def test_distributed_vision_counts_only_text_message_parts(monkeypatch):
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64"}},
+                {"type": "text", "text": "describe this image"},
+            ],
+        }
+    ]
+    cleaned = [{"role": "user", "content": "describe this image"}]
+
+    def extract(received):
+        assert received is messages
+        return cleaned, [object()], []
+
+    monkeypatch.setattr("omlx.utils.image.extract_images_from_messages", extract)
+    engine = DistributedBatchedEngine(_deployment())
+    engine._tokenizer = _Tokenizer()
+    engine._supports_multimodal_fallback = True
+
+    count = engine.count_chat_tokens(messages)
+
+    assert count == len("describe this image")
+    assert isinstance(messages[0]["content"], list)
 
 
 @pytest.mark.asyncio
