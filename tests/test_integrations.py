@@ -38,7 +38,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 8
+        assert len(integrations) == 9
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -49,6 +49,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "swival",
         }
 
     def test_get_integration(self):
@@ -2062,3 +2063,77 @@ class TestIntegrationSettings:
 
         settings = IntegrationSettings.from_dict({})
         assert settings.codex_model is None
+
+
+class TestVerboseCommandEcho:
+    """`omlx launch -v` prints the tool command line with secrets masked."""
+
+    def test_echo_prints_masked_command(self, capsys):
+        integration = get_integration("swival")
+        launch_ctx = ctx(api_key="sk-secret", model="qwen3-coder", verbose=True)
+
+        integration._echo_command(
+            launch_ctx,
+            ["swival", "--api-key", launch_ctx.api_key, "--model", launch_ctx.model],
+        )
+
+        out = capsys.readouterr().out
+        assert out == "$ swival --api-key REDACTED --model qwen3-coder\n"
+        assert "sk-secret" not in out
+
+    def test_echo_silent_without_verbose(self, capsys):
+        integration = get_integration("swival")
+        launch_ctx = ctx(api_key="sk-secret")
+
+        integration._echo_command(
+            launch_ctx, ["swival", "--api-key", launch_ctx.api_key]
+        )
+
+        assert capsys.readouterr().out == ""
+
+    def test_echo_quotes_arguments_with_spaces(self, capsys):
+        integration = get_integration("codex")
+        launch_ctx = ctx(verbose=True)
+
+        integration._echo_command(launch_ctx, ["codex", "--resume", "session id"])
+
+        assert capsys.readouterr().out == "$ codex --resume 'session id'\n"
+
+    def test_context_defaults_to_non_verbose(self):
+        assert ctx().verbose is False
+
+
+class TestMaskSecrets:
+    def test_masks_separate_flag_value(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--api-key", "k"], "k") == [
+            "t",
+            "--api-key",
+            "REDACTED",
+        ]
+
+    def test_masks_equals_form(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--api-key=k"], "k") == ["t", "--api-key=REDACTED"]
+
+    def test_masks_key_embedded_in_other_argument(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--base-url", "http://u:k@h/v1"], "k") == [
+            "t",
+            "--base-url",
+            "http://u:REDACTED@h/v1",
+        ]
+
+    def test_leaves_non_secret_arguments_untouched(self):
+        from omlx.integrations.base import _mask_secrets
+
+        args = ["t", "--model", "m", "--max-context-tokens", "32768"]
+        assert _mask_secrets(args, "") == args
+
+    def test_empty_key_does_not_mask_everything(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--model", "m"], "") == ["t", "--model", "m"]

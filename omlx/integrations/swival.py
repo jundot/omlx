@@ -32,25 +32,26 @@ class SwivalIntegration(Integration):
     def launch(self, ctx: IntegrationContext) -> None:
         # Set up environment for swival
         env = self._scrubbed_env()
-        
+
         # Build the command arguments
         args = ["swival"]
         args.extend(["--provider", "generic"])
         args.extend(["--base-url", ctx.base_url])
-        
+
         # Add API key if provided
         if ctx.api_key:
             args.extend(["--api-key", ctx.api_key])
-        
+
         # Add model name (this is the required injection)
         if ctx.model:
             args.extend(["--model", ctx.model])
-        
+
         # Add max context tokens
         if ctx.context_window:
             args.extend(["--max-context-tokens", str(ctx.context_window)])
-            
+
         # Add any extra arguments
         args.extend(ctx.extra_args)
-        
+
+        self._echo_command(ctx, args)
         os.execvpe("swival", args, env)

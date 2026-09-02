@@ -208,4 +208,6 @@ class OpenClawIntegration(Integration):
         print("OpenClaw is running")
 
         # Launch TUI (replaces this process)
-        os.execvpe(bin_name, [bin_name, "tui", *ctx.extra_args], env)
+        args = [bin_name, "tui", *ctx.extra_args]
+        self._echo_command(ctx, args)
+        os.execvpe(bin_name, args, env)

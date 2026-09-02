@@ -119,4 +119,5 @@ class CodexAppIntegration(Integration):
         args = [codex_bin, "app"]
         args.extend(ctx.extra_args)
 
+        self._echo_command(ctx, args)
         os.execvpe(codex_bin, args, env)
