@@ -70,6 +70,12 @@ def test_deepseek_v4_vision_layout_charges_sidecar_only_to_rank_zero(tmp_path):
                 "vision_max_n_token": 16,
                 "vision_min_pixels": 16,
                 "vision_max_wh_ratio": 8,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 1,
+                "head_dim": 512,
+                "sliding_window": 128,
+                "index_head_dim": 128,
+                "compress_ratios": [0, 4, 128, 4],
             }
         )
     )
@@ -89,6 +95,15 @@ def test_deepseek_v4_vision_layout_charges_sidecar_only_to_rank_zero(tmp_path):
     assert layout.fixed_weight_bytes == 20
     assert layout.coordinator_weight_bytes == 160
     assert layout.layer_weight_bytes == (100, 100, 100, 100)
+    assert layout.kv_bytes_per_token_by_layer == (0, 320, 8, 320)
+    assert layout.kv_fixed_bytes_by_layer == (
+        131_072,
+        172_032,
+        393_216,
+        172_032,
+    )
+    assert layout.supports_chunked_multimodal_prefill is True
+    assert ModelLayout.from_dict(layout.to_dict()) == layout
 
     plan = plan_unequal_pipeline(
         layout,
@@ -103,6 +118,48 @@ def test_deepseek_v4_vision_layout_charges_sidecar_only_to_rank_zero(tmp_path):
     assert worker.coordinator_weight_bytes == 0
     assert coordinator.layer_count < worker.layer_count
     assert plan.cluster_resident_weight_bytes == 600
+
+
+def test_deepseek_v4_hybrid_kv_layout_supports_one_million_tokens():
+    from omlx.cluster.planner import _deepseek_v4_kv_layout
+
+    ratios = [0] + [ratio for _ in range(20) for ratio in (128, 4)] + [128, 0]
+    per_token, fixed = _deepseek_v4_kv_layout(
+        {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 43,
+            "head_dim": 512,
+            "sliding_window": 128,
+            "index_head_dim": 128,
+            "compress_ratios": ratios,
+        }
+    )
+
+    assert len(per_token) == len(fixed) == 43
+    assert per_token.count(320) == 20
+    assert per_token.count(8) == 21
+    assert per_token.count(0) == 2
+    assert sum(per_token) == 6_568
+
+    model = ModelLayout(
+        source="deepseek-v4",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(GIB,) * 43,
+        kv_bytes_per_token_by_layer=per_token,
+        kv_fixed_bytes_by_layer=fixed,
+        supports_pipeline=True,
+        supports_chunked_multimodal_prefill=True,
+    )
+    plan = plan_unequal_pipeline(
+        model,
+        [NodeBudget(node_id="mac", capacity_bytes=50 * GIB, rank=0)],
+        context_tokens=1_000_000,
+    )
+
+    assignment = plan.assignments[0]
+    assert assignment.kv_bytes_per_token == 6_568
+    assert assignment.kv_cache_bytes == sum(fixed) + 6_568_000_000
+    assert assignment.headroom_bytes > 0
 
 
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):

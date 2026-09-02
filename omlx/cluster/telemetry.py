@@ -943,13 +943,31 @@ def install_server_telemetry(
                     "mx_module": mx,
                 }
                 if getattr(self, "_omlx_prefill_step_size_override", False):
-                    # The vision runtime prefills the uncached image-bearing
-                    # suffix in one call. Size admission for that actual call,
-                    # without changing the server's configured chunk size.
-                    guard_kwargs["prefill_step_size"] = max(
-                        snapshot_step,
-                        len(rest),
+                    # The vision runtime uses variable chunks so no boundary
+                    # crosses an image block. Price the largest actual call,
+                    # not the whole prompt and not merely the configured step.
+                    from .deepseek_v4_vision_runtime import vision_prefill_chunks
+
+                    vocab_size = int(
+                        getattr(self, "_omlx_vision_vocab_size", 0) or 0
                     )
+                    if vocab_size > 0:
+                        chunks = vision_prefill_chunks(
+                            rest,
+                            vocab_size=vocab_size,
+                            max_chunk_tokens=snapshot_step,
+                        )
+                        guard_kwargs["prefill_step_size"] = max(
+                            (end - start for start, end in chunks),
+                            default=snapshot_step,
+                        )
+                    else:
+                        # Fail safe for tests/third-party providers without
+                        # exposed model args. Real DeepSeek V4 configs always
+                        # provide vocab_size.
+                        guard_kwargs["prefill_step_size"] = max(
+                            snapshot_step, len(rest)
+                        )
                 prefill_guard.check_collective(
                     len(prompt),
                     **guard_kwargs,

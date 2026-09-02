@@ -390,7 +390,10 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
     monkeypatch.setattr(
         deepseek_v4_vision_runtime,
         "prepare_token_ids",
-        lambda *_args, **_kwargs: (list(range(10)), (prepared,)),
+        lambda *_args, **_kwargs: (
+            [1, 2, 100, 101, 102, 103, 104, 3, 4, 5],
+            (prepared,),
+        ),
     )
 
     class Model:
@@ -460,16 +463,27 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
     args = SimpleNamespace(prefill_step_size=4)
 
     with (
-        install_deepseek_v4_vision_runtime(mlx_server, provider, config={}, rank=0),
+        install_deepseek_v4_vision_runtime(
+            mlx_server, provider, config={"vocab_size": 100}, rank=0
+        ),
         install_server_telemetry(_Marker(), prefill_guard=guard, prefill_step_size=4),
     ):
         generator = mlx_server.ResponseGenerator()
         _queue, shared_request, shared_args = generator._share_request(
             (object(), request, args)
         )
-        assert generator._tokenize(tokenizer, shared_request, shared_args)[0] == list(
-            range(10)
-        )
+        assert generator._tokenize(tokenizer, shared_request, shared_args)[0] == [
+            1,
+            2,
+            100,
+            101,
+            102,
+            103,
+            104,
+            3,
+            4,
+            5,
+        ]
         assert len(provider.model_key) == 5
 
     assert events == [
@@ -480,7 +494,7 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
     ]
     assert guard.call[0] == (10,)
     assert guard.call[1]["cached_tokens"] == 3
-    assert guard.call[1]["prefill_step_size"] == 7
+    assert guard.call[1]["prefill_step_size"] == 4
     assert args.prefill_step_size == 4
     assert provider.model_key == ("model", None, None)
     assert provider.model.images is None

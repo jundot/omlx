@@ -113,6 +113,17 @@ class ModelLayout:
     # proportion to the layers it holds, so a plan that fits the weights
     # still fits once a long prompt fills the cache.
     kv_bytes_per_token_per_layer: int = 0
+    # Architectures with heterogeneous caches cannot be represented by the
+    # uniform field above.  These two optional arrays describe an affine
+    # resident-cache bound for each transformer layer:
+    #
+    #   fixed[layer] + context_tokens * per_token[layer]
+    #
+    # DeepSeek V4 uses this for its 128-token rotating local cache plus its
+    # ratio-4 / ratio-128 compressed pools.  Empty tuples preserve the legacy
+    # uniform layout for every other architecture.
+    kv_bytes_per_token_by_layer: tuple[int, ...] = ()
+    kv_fixed_bytes_by_layer: tuple[int, ...] = ()
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
@@ -120,6 +131,11 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    # Whether the distributed runtime can prefill long multimodal prompts in
+    # bounded chunks without splitting an image-sentinel block. This is kept
+    # separate from the resident context estimate so the catalogue never
+    # implies that a text-only limit is automatically safe for images.
+    supports_chunked_multimodal_prefill: bool = False
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -144,6 +160,20 @@ class ModelLayout:
             raise ValueError("tensor_parallel_kv_heads must be non-negative")
         if self.kv_bytes_per_token_per_layer < 0:
             raise ValueError("kv_bytes_per_token_per_layer must be non-negative")
+        for name, values in (
+            ("kv_bytes_per_token_by_layer", self.kv_bytes_per_token_by_layer),
+            ("kv_fixed_bytes_by_layer", self.kv_fixed_bytes_by_layer),
+        ):
+            if values and len(values) != len(self.layer_weight_bytes):
+                raise ValueError(f"{name} must have one entry per model layer")
+            if any(value < 0 for value in values):
+                raise ValueError(f"{name} values must be non-negative")
+        if bool(self.kv_bytes_per_token_by_layer) != bool(
+            self.kv_fixed_bytes_by_layer
+        ):
+            raise ValueError(
+                "per-layer KV token and fixed byte arrays must be set together"
+            )
         if self.tensor_parallel_kv_heads == 0:
             object.__setattr__(
                 self, "tensor_parallel_kv_heads", self.tensor_parallel_heads
@@ -176,6 +206,13 @@ class ModelLayout:
             + sum(self.layer_weight_bytes)
         )
 
+    @property
+    def has_kv_cache_estimate(self) -> bool:
+        return bool(
+            self.kv_bytes_per_token_per_layer > 0
+            or self.kv_bytes_per_token_by_layer
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source": self.source,
@@ -191,7 +228,14 @@ class ModelLayout:
             "tensor_parallel_divisors": list(self.tensor_parallel_divisors),
             "supports_tensor_parallel": self.supports_tensor_parallel,
             "supports_pipeline": self.supports_pipeline,
+            "supports_chunked_multimodal_prefill": (
+                self.supports_chunked_multimodal_prefill
+            ),
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
+            "kv_bytes_per_token_by_layer": list(
+                self.kv_bytes_per_token_by_layer
+            ),
+            "kv_fixed_bytes_by_layer": list(self.kv_fixed_bytes_by_layer),
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
 
@@ -234,6 +278,14 @@ class ModelLayout:
                 kv_bytes_per_token_per_layer=int(
                     payload.get("kv_bytes_per_token_per_layer", 0)
                 ),
+                kv_bytes_per_token_by_layer=tuple(
+                    int(value)
+                    for value in payload.get("kv_bytes_per_token_by_layer", ())
+                ),
+                kv_fixed_bytes_by_layer=tuple(
+                    int(value)
+                    for value in payload.get("kv_fixed_bytes_by_layer", ())
+                ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
                 ),
@@ -241,6 +293,9 @@ class ModelLayout:
                     payload.get("supports_tensor_parallel", False)
                 ),
                 supports_pipeline=bool(payload.get("supports_pipeline", False)),
+                supports_chunked_multimodal_prefill=bool(
+                    payload.get("supports_chunked_multimodal_prefill", False)
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -909,6 +964,76 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     return kv_heads * head_dim * 2 * dtype_size
 
 
+def _deepseek_v4_kv_layout(
+    config: dict[str, Any],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return a conservative affine resident-cache layout for DeepSeek V4.
+
+    The runtime stores one 128-token local K-only rotating cache in every
+    layer. Ratio-4 layers additionally retain main and index pools; ratio-128
+    layers retain only the main pool. Pool remainder/carry buffers are fixed,
+    while completed rows grow linearly with context. This mirrors
+    ``_DeepSeekV4PrefillMemoryProfile.estimate_resident_kv_bytes`` with a
+    one-token resident chunk, rounded upward where a ratio does not divide a
+    dimension exactly.
+    """
+
+    model_type = str(config.get("model_type", "") or "")
+    ratios = config.get("compress_ratios")
+    num_layers = _config_int(config, "num_hidden_layers", 0)
+    if (
+        not model_type.startswith("deepseek_v4")
+        or not isinstance(ratios, list)
+        or num_layers <= 0
+        or len(ratios) < num_layers
+    ):
+        return (), ()
+    ratios = ratios[:num_layers]
+    if any(
+        not isinstance(ratio, int)
+        or isinstance(ratio, bool)
+        or ratio not in (0, 4, 128)
+        for ratio in ratios
+    ):
+        return (), ()
+
+    head_dim = _config_int(config, "head_dim", 0)
+    sliding_window = _config_int(config, "sliding_window", 0)
+    index_head_dim = _config_int(config, "index_head_dim", 0)
+    if head_dim <= 0 or sliding_window <= 0 or index_head_dim <= 0:
+        return (), ()
+
+    dtype_size = 2
+    local_fixed = sliding_window * head_dim * dtype_size
+    per_token: list[int] = []
+    fixed: list[int] = []
+
+    def pooled_linear_bytes(dim: int, ratio: int) -> int:
+        return (dim * dtype_size + ratio - 1) // ratio
+
+    def pooled_fixed_bytes(dim: int, ratio: int, *, overlap: bool) -> int:
+        projection_dim = dim * (2 if overlap else 1)
+        elements = 2 * ratio * projection_dim
+        if overlap:
+            elements += 2 * ratio * projection_dim
+        return elements * dtype_size
+
+    for ratio in ratios:
+        linear = 0
+        constant = local_fixed
+        if ratio == 4:
+            linear += pooled_linear_bytes(head_dim, ratio)
+            linear += pooled_linear_bytes(index_head_dim, ratio)
+            constant += pooled_fixed_bytes(head_dim, ratio, overlap=True)
+            constant += pooled_fixed_bytes(index_head_dim, ratio, overlap=True)
+        elif ratio == 128:
+            linear += pooled_linear_bytes(head_dim, ratio)
+            constant += pooled_fixed_bytes(head_dim, ratio, overlap=False)
+        per_token.append(linear)
+        fixed.append(constant)
+    return tuple(per_token), tuple(fixed)
+
+
 def _attention_head_count(model_path: Path) -> int:
     """Attention heads per layer, which bounds the tensor-parallel degree.
 
@@ -1114,6 +1239,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
+    kv_by_layer, kv_fixed_by_layer = _deepseek_v4_kv_layout(config)
     layout = ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
@@ -1133,9 +1259,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             False if coordinator_vision else _supports_tensor_parallel(config)
         ),
         supports_pipeline=_supports_pipeline(config),
+        supports_chunked_multimodal_prefill=coordinator_vision,
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
             config
         ),
+        kv_bytes_per_token_by_layer=kv_by_layer,
+        kv_fixed_bytes_by_layer=kv_fixed_by_layer,
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             config
         ),
@@ -1552,7 +1681,10 @@ def plan_unequal_pipeline(
     # rank zero (late layers / HTTP coordinator), so partition in reverse rank.
     pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
-    kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
+    layer_kv_bytes = tuple(
+        _kv_bytes_for_stage(model, index, index + 1, context_tokens)
+        for index in range(model.layer_count)
+    )
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,
@@ -1560,15 +1692,17 @@ def plan_unequal_pipeline(
             fixed_weight_bytes=model.fixed_weight_bytes,
             coordinator_weight_bytes=model.coordinator_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + kv_bytes
+                for weight_bytes, kv_bytes in zip(
+                    model.layer_weight_bytes, layer_kv_bytes
+                )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
         )
     except PlanningError as exc:
-        if kv_bytes_per_layer:
+        if any(layer_kv_bytes):
             raise PlanningError(
                 f"model weights and KV cache for {context_tokens} tokens do not "
                 f"fit the supplied per-node budgets: {exc}"
@@ -1577,7 +1711,7 @@ def plan_unequal_pipeline(
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
-        kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        kv_bytes = _kv_bytes_for_stage(model, start, end, context_tokens)
         coordinator_bytes = (
             model.coordinator_weight_bytes if node.rank == 0 else 0
         )
@@ -1616,11 +1750,14 @@ def plan_unequal_pipeline(
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
                 kv_cache_bytes=kv_bytes,
-                kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
+                kv_bytes_per_token=_kv_bytes_per_token_for_stage(
+                    model, start, end
+                ),
                 max_context_tokens=_max_context_for_stage(
                     model,
                     node,
-                    layer_count=end - start,
+                    start_layer=start,
+                    end_layer=end,
                     weight_bytes=(
                         model.fixed_weight_bytes
                         + coordinator_bytes
@@ -1783,7 +1920,8 @@ def format_shard_plan(plan: ShardPlan) -> str:
 
 def _kv_bytes_for_stage(
     model: ModelLayout,
-    layer_count: int,
+    start_layer: int,
+    end_layer: int,
     context_tokens: int,
     tensor_parallel_size: int = 1,
 ) -> int:
@@ -1795,9 +1933,20 @@ def _kv_bytes_for_stage(
     is not per-head and stays whole on every member.
     """
 
-    if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
+    if context_tokens <= 0 or not model.has_kv_cache_estimate:
         return 0
-    total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
+    if not (0 <= start_layer <= end_layer <= model.layer_count):
+        raise ValueError("KV layer range is outside the model")
+    if model.kv_bytes_per_token_by_layer:
+        linear = sum(model.kv_bytes_per_token_by_layer[start_layer:end_layer])
+        fixed = sum(model.kv_fixed_bytes_by_layer[start_layer:end_layer])
+        total = fixed + linear * context_tokens
+    else:
+        total = (
+            model.kv_bytes_per_token_per_layer
+            * (end_layer - start_layer)
+            * context_tokens
+        )
     if model.kv_replicated_across_tp:
         return total
     return total // max(1, tensor_parallel_size)
@@ -1805,14 +1954,22 @@ def _kv_bytes_for_stage(
 
 def _kv_bytes_per_token_for_stage(
     model: ModelLayout,
-    layer_count: int,
+    start_layer: int,
+    end_layer: int,
     tensor_parallel_size: int = 1,
 ) -> int:
     """What one more token of context costs this node."""
 
-    if model.kv_bytes_per_token_per_layer <= 0:
+    if not model.has_kv_cache_estimate:
         return 0
-    per_token = model.kv_bytes_per_token_per_layer * layer_count
+    if model.kv_bytes_per_token_by_layer:
+        per_token = sum(
+            model.kv_bytes_per_token_by_layer[start_layer:end_layer]
+        )
+    else:
+        per_token = (
+            model.kv_bytes_per_token_per_layer * (end_layer - start_layer)
+        )
     if model.kv_replicated_across_tp:
         return per_token
     return per_token // max(1, tensor_parallel_size)
@@ -1822,7 +1979,8 @@ def _max_context_for_stage(
     model: ModelLayout,
     node: NodeBudget,
     *,
-    layer_count: int,
+    start_layer: int,
+    end_layer: int,
     weight_bytes: int,
     tensor_parallel_size: int = 1,
 ) -> int:
@@ -1837,11 +1995,16 @@ def _max_context_for_stage(
     """
 
     per_token = _kv_bytes_per_token_for_stage(
-        model, layer_count, tensor_parallel_size
+        model, start_layer, end_layer, tensor_parallel_size
     )
     if per_token <= 0:
         return 0
-    spare = node.usable_bytes - weight_bytes
+    fixed = 0
+    if model.kv_fixed_bytes_by_layer:
+        fixed = sum(model.kv_fixed_bytes_by_layer[start_layer:end_layer])
+        if not model.kv_replicated_across_tp:
+            fixed //= max(1, tensor_parallel_size)
+    spare = node.usable_bytes - weight_bytes - fixed
     return max(0, spare // per_token)
 
 
@@ -2020,24 +2183,28 @@ def plan_hybrid(
     # the same degree when assignments are materialised below. A replicated
     # MLA cache is the exception: every member pays it whole, so at the
     # aggregate level one layer costs the group N caches.
-    kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
-    if model.kv_replicated_across_tp:
-        kv_bytes_per_layer *= tensor_parallel_size
+    layer_kv_bytes = tuple(
+        _kv_bytes_for_stage(model, index, index + 1, context_tokens)
+        * (tensor_parallel_size if model.kv_replicated_across_tp else 1)
+        for index in range(model.layer_count)
+    )
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,
             stage_budgets,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + kv_bytes
+                for weight_bytes, kv_bytes in zip(
+                    model.layer_weight_bytes, layer_kv_bytes
+                )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
         )
     except PlanningError as exc:
-        if kv_bytes_per_layer:
+        if any(layer_kv_bytes):
             raise PlanningError(
                 f"model weights and KV cache for {context_tokens} tokens do not "
                 f"fit the supplied per-node budgets: {exc}"
@@ -2054,7 +2221,7 @@ def plan_hybrid(
         per_member = stage_layer_bytes // tensor_parallel_size
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
-            model, end - start, context_tokens, tensor_parallel_size
+            model, start, end, context_tokens, tensor_parallel_size
         )
         for tp_rank, node in enumerate(group):
             held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)
@@ -2088,12 +2255,13 @@ def plan_hybrid(
                     tensor_parallel_size=tensor_parallel_size,
                     kv_cache_bytes=kv_bytes,
                     kv_bytes_per_token=_kv_bytes_per_token_for_stage(
-                        model, end - start, tensor_parallel_size
+                        model, start, end, tensor_parallel_size
                     ),
                     max_context_tokens=_max_context_for_stage(
                         model,
                         node,
-                        layer_count=end - start,
+                        start_layer=start,
+                        end_layer=end,
                         weight_bytes=model.fixed_weight_bytes + held_layer_bytes,
                         tensor_parallel_size=tensor_parallel_size,
                     ),

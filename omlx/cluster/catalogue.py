@@ -70,6 +70,7 @@ class ModelFit:
     pipeline_stages: int = 1
     nodes_required: int = 0
     max_context_tokens: int = 0
+    max_multimodal_context_tokens: int = 0
     declared_context_tokens: int | None = None
     splittable: bool = True
     headroom_bytes: int = 0
@@ -153,6 +154,7 @@ class ModelFit:
             "pipeline_stages": self.pipeline_stages,
             "nodes_required": self.nodes_required,
             "max_context_tokens": self.max_context_tokens,
+            "max_multimodal_context_tokens": self.max_multimodal_context_tokens,
             "declared_context_tokens": self.declared_context_tokens,
             "context_is_limited": self.context_is_limited,
             "splittable": self.splittable,
@@ -287,7 +289,7 @@ def largest_context_that_fits(
     stages and per-node reserves, and would disagree with any shortcut here.
     """
 
-    if not layout.kv_bytes_per_token_per_layer:
+    if not layout.has_kv_cache_estimate:
         # Nothing is known about this model's KV growth — a synthetic layout
         # built from a download size, typically. Bisecting would return the
         # top of the ladder for every model, which is not an answer, it is a
@@ -391,10 +393,10 @@ def assess_model(
             workload_profile=workload_profile,
         )
         warnings: list[str] = []
-        if not context and layout.kv_bytes_per_token_per_layer:
+        if not context and layout.has_kv_cache_estimate:
             # Weights fit at the smallest context but nothing above it.
             context = _MIN_CONTEXT_TOKENS
-        if not layout.kv_bytes_per_token_per_layer:
+        if not layout.has_kv_cache_estimate:
             warnings.append(
                 "Context length is unknown: this model was planned from its "
                 "size, not its config. Download it for an exact answer."
@@ -414,6 +416,9 @@ def assess_model(
             pipeline_stages=stages,
             nodes_required=used,
             max_context_tokens=context,
+            max_multimodal_context_tokens=(
+                context if layout.supports_chunked_multimodal_prefill else 0
+            ),
             declared_context_tokens=declared_context_tokens,
             headroom_bytes=max(0, headroom),
             model_path=layout.source,
@@ -459,7 +464,7 @@ def assess_model(
                 ceiling_tokens=declared_context_tokens,
                 workload_profile=workload_profile,
             )
-            if not standalone_context and layout.kv_bytes_per_token_per_layer:
+            if not standalone_context and layout.has_kv_cache_estimate:
                 standalone_context = _MIN_CONTEXT_TOKENS
             break
 

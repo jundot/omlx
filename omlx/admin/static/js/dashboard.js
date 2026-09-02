@@ -3112,9 +3112,12 @@
 
             clusterModelContextLabel(model) {
                 const fit = this.clusterCatalogueFit(model?.model_path);
-                const tokens = Number(fit?.max_context_tokens || 0);
+                const multimodal = Number(
+                    fit?.max_multimodal_context_tokens || 0
+                );
+                const tokens = multimodal || Number(fit?.max_context_tokens || 0);
                 return fit?.fits === true && tokens > 0
-                    ? `Up to ${this.clusterTokens(tokens)} context`
+                    ? `Up to ${this.clusterTokens(tokens)}${multimodal > 0 ? ' multimodal' : ''} context`
                     : '';
             },
 
@@ -3122,7 +3125,11 @@
                 const declared = Number(model?.model_context_length || 8192);
                 const target = Number(requested || declared || 8192);
                 const fit = this.clusterCatalogueFit(model?.model_path);
-                const maximum = Number(fit?.max_context_tokens || 0);
+                const maximum = Number(
+                    fit?.max_multimodal_context_tokens
+                    || fit?.max_context_tokens
+                    || 0
+                );
                 return fit?.fits === true && maximum > 0
                     ? Math.min(target, maximum)
                     : target;
@@ -3137,7 +3144,11 @@
                     || model.model_context_length
                     || 0
                 );
-                const maximum = Number(fit?.max_context_tokens || 0);
+                const maximum = Number(
+                    fit?.max_multimodal_context_tokens
+                    || fit?.max_context_tokens
+                    || 0
+                );
                 if (fit?.fits !== true || maximum <= 0) {
                     // Catalogue assessment is asynchronous. Until it arrives,
                     // retain the last known-safe choice (8k on first use)

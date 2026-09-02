@@ -111,11 +111,14 @@ use Ring first, then JACCL only after the baseline succeeds.
    `vision_encode_begin` and a different content-keyed prompt-cache identity;
    the first image's KV state must not be reused.
 
-8. Send a longer text prompt plus one image. Success is a single unchunked
-   image-bearing prefill, then ordinary decode. The vision tower must not run
-   again after prefill. Include a tool-heavy OpenCode request of roughly 18k
-   prompt tokens: rank admission must use the local DeepSeek-V4 hybrid-attention
-   profile, not report the generic dense-SDPA false positive of roughly 40 GiB.
+8. Send a longer text prompt plus one image. Success is bounded, incremental
+   prefill with no chunk boundary inside an image-sentinel block, then ordinary
+   decode. The vision tower must run once for each image, not once per chunk.
+   Include a tool-heavy OpenCode request of roughly 18k prompt tokens: rank
+   admission must use the local DeepSeek-V4 hybrid-attention profile, not report
+   the generic dense-SDPA false positive of roughly 40 GiB. Also verify that the
+   catalogue offers the memory-supported multimodal context instead of stopping
+   at the old dense-KV estimate (commonly 128k).
 
 9. During steps 5–8 capture the Cluster dashboard and:
 

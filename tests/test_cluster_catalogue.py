@@ -100,6 +100,31 @@ def test_context_is_reported_not_just_whether_the_weights_load():
     assert fit.max_context_tokens >= 2048
 
 
+def test_hybrid_vision_cache_reports_memory_supported_multimodal_context():
+    ratios = [0] + [ratio for _ in range(20) for ratio in (128, 4)] + [128, 0]
+    per_token = tuple(0 if ratio == 0 else 320 if ratio == 4 else 8 for ratio in ratios)
+    fixed = tuple(
+        131_072 if ratio == 0 else 172_032 if ratio == 4 else 393_216
+        for ratio in ratios
+    )
+    layout = ModelLayout(
+        source="deepseek-v4-vision",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(GiB,) * 43,
+        kv_bytes_per_token_by_layer=per_token,
+        kv_fixed_bytes_by_layer=fixed,
+        supports_pipeline=True,
+        supports_chunked_multimodal_prefill=True,
+    )
+
+    fit = assess_model(layout, _nodes(54), model_id="deepseek-v4-vision")
+
+    assert fit.fits
+    assert fit.max_context_tokens == 1_048_576
+    assert fit.max_multimodal_context_tokens == 1_048_576
+    assert fit.to_dict()["max_multimodal_context_tokens"] == 1_048_576
+
+
 def test_a_tighter_cluster_supports_less_context():
     """The same model on less memory must not claim the same context."""
 

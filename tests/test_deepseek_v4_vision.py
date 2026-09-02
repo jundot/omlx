@@ -13,6 +13,7 @@ from PIL import Image
 
 from omlx.cluster.deepseek_v4_vision_runtime import (
     install_deepseek_v4_vision_runtime,
+    vision_prefill_chunks,
 )
 from omlx.deepseek_v4_vision import (
     IMAGE,
@@ -94,6 +95,55 @@ def test_one_and_multiple_images_expand_in_prompt_order():
     assert len(tokens) == 3 + sum(len(image.types) for image in images)
     assert all(token >= 100 for token in tokens if token not in {1, 2, 3})
     assert IMAGE_PLACEHOLDER.startswith("<")
+
+
+def test_vision_prefill_chunks_never_split_an_image_block():
+    prompt = [1, 100, 101, 102, 103, 104, 2, 3, 4]
+
+    chunks = vision_prefill_chunks(
+        prompt,
+        vocab_size=100,
+        max_chunk_tokens=4,
+    )
+
+    assert chunks == ((0, 1), (1, 6), (6, 8), (8, 9))
+    assert [prompt[start:end] for start, end in chunks] == [
+        [1],
+        [100, 101, 102, 103, 104],
+        [2, 3],
+        [4],
+    ]
+
+
+def test_vision_prefill_chunks_accept_a_cache_suffix_inside_an_image():
+    chunks = vision_prefill_chunks(
+        [101, 102, 103, 104, 7, 8],
+        vocab_size=100,
+        max_chunk_tokens=2,
+    )
+
+    assert chunks == ((0, 4), (4, 6))
+
+
+def test_vision_prefill_chunks_accept_an_image_at_prompt_start():
+    assert vision_prefill_chunks(
+        [100, 101, 102, 103, 104, 7],
+        vocab_size=100,
+        max_chunk_tokens=3,
+    ) == ((0, 5), (5, 6))
+
+
+@pytest.mark.parametrize(
+    ("prompt", "message"),
+    [
+        ([1, 104], "has no start"),
+        ([1, 100, 101], "incomplete"),
+        ([1, 100, 100, 104], "nested"),
+    ],
+)
+def test_vision_prefill_chunks_reject_malformed_sentinels(prompt, message):
+    with pytest.raises(ValueError, match=message):
+        vision_prefill_chunks(prompt, vocab_size=100, max_chunk_tokens=4)
 
 
 def test_tiny_vision_encoder_and_aligner_produce_language_embeddings():
@@ -220,7 +270,70 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
     assert segments == [prompt]
     assert state == "normal"
     assert streamed == ["first", "second"]
-    assert seen["prefill_step_size"] == len(prompt)
+    assert seen["prefill_step_size"] == 2048
+
+
+def test_runtime_prefills_variable_image_safe_chunks(monkeypatch):
+    from omlx.cluster import deepseek_v4_vision_runtime
+
+    prefills = []
+    progress = []
+    seen = {}
+
+    class Model:
+        def set_vision_inputs(self, images):
+            self.images = images
+
+    class ResponseGenerator:
+        def _tokenize(self, *_args):
+            return [], [], [], "normal"
+
+    def stream_generate(*_args, **kwargs):
+        seen.update(kwargs)
+        callback = kwargs["prompt_progress_callback"]
+        callback(0, len(kwargs["prompt"]))
+        callback(len(kwargs["prompt"]), len(kwargs["prompt"]))
+        yield "token"
+
+    monkeypatch.setattr(
+        deepseek_v4_vision_runtime,
+        "_prefill_prompt_chunk",
+        lambda _model, _cache, tokens, _kwargs: prefills.append(list(tokens)),
+    )
+    server = SimpleNamespace(
+        ResponseGenerator=ResponseGenerator,
+        stream_generate=stream_generate,
+    )
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("model", None, None),
+        is_batchable=True,
+    )
+    prompt = [1, 100, 101, 102, 103, 104, 2, 3, 4]
+    cache = [object()]
+
+    with install_deepseek_v4_vision_runtime(
+        server, provider, config=_config(), rank=0
+    ):
+        provider.model_key = (*provider.model_key, "vision", "digest")
+        output = list(
+            server.stream_generate(
+                model=provider.model,
+                tokenizer=object(),
+                prompt=prompt,
+                prompt_cache=cache,
+                prefill_step_size=4,
+                prompt_progress_callback=lambda done, total: progress.append(
+                    (done, total)
+                ),
+            )
+        )
+
+    assert output == ["token"]
+    assert prefills == [[1], [100, 101, 102, 103, 104], [2, 3]]
+    assert seen["prompt"] == [4]
+    assert seen["prompt_cache"] is cache
+    assert progress[-1] == (len(prompt), len(prompt))
 
 
 @pytest.mark.parametrize("preprocessing_error", [False, True])

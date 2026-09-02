@@ -7,15 +7,96 @@ import copy
 import hashlib
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from typing import Any
 
-from omlx.deepseek_v4_vision import IMAGE_PLACEHOLDER
+from omlx.deepseek_v4_vision import (
+    IMAGE_END,
+    IMAGE_PLACEHOLDER,
+    IMAGE_START,
+)
 from omlx.patches.deepseek_v4.vision_inputs import prepare_token_ids
 
 logger = logging.getLogger(__name__)
 _IMAGE_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def vision_prefill_chunks(
+    tokens,
+    *,
+    vocab_size: int,
+    max_chunk_tokens: int,
+) -> tuple[tuple[int, int], ...]:
+    """Partition a prompt without ever splitting an image sentinel block.
+
+    All ranks receive the same expanded token IDs, so this pure function also
+    gives them an identical sequence of model calls without another control
+    collective. Chunks stay at or below the configured prefill size unless an
+    image block itself is larger, in which case exactly that block sets the
+    minimum safe size.
+    """
+
+    values = [int(token) for token in tokens]
+    if not values:
+        return ()
+    configured = max(1, int(max_chunk_tokens))
+
+    spans: list[tuple[int, int]] = []
+    # A prompt-cache hit may leave this suffix part-way through an image
+    # block.  The model uses the same rule: any image sentinel in position
+    # zero means the current suffix starts inside a block.
+    first_kind = values[0] - int(vocab_size)
+    start = 0 if values[0] >= int(vocab_size) and first_kind != IMAGE_START else None
+    for index, token in enumerate(values):
+        kind = token - int(vocab_size)
+        if kind == IMAGE_START:
+            if start is not None:
+                raise ValueError("nested DeepSeek image sentinel blocks are invalid")
+            start = index
+        elif kind == IMAGE_END:
+            if start is None:
+                raise ValueError("DeepSeek image end sentinel has no start")
+            spans.append((start, index + 1))
+            start = None
+    if start is not None:
+        raise ValueError("DeepSeek image sentinel block is incomplete")
+
+    chunks: list[tuple[int, int]] = []
+    position = 0
+    total = len(values)
+    while position < total:
+        # Return to the configured cadence after an image forced an early or
+        # oversized chunk. This preserves ordinary prompt-snapshot boundaries
+        # for the text suffix instead of shifting every later chunk.
+        boundary = min(((position // configured) + 1) * configured, total)
+        for begin, end in spans:
+            if begin < boundary < end:
+                boundary = begin if begin > position else end
+                break
+        if boundary <= position:  # pragma: no cover - defensive invariant
+            raise RuntimeError("could not construct an image-safe prefill chunk")
+        chunks.append((position, boundary))
+        position = boundary
+    return tuple(chunks)
+
+
+def _prefill_prompt_chunk(model, prompt_cache, tokens, kwargs) -> None:
+    """Run one non-final prefill chunk exactly like mlx-lm ``generate_step``."""
+
+    import mlx.core as mx
+    from mlx_lm.generate import generation_stream, maybe_quantize_kv_cache
+
+    with mx.stream(generation_stream):
+        model(mx.array(tokens)[None], cache=prompt_cache)
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            kwargs.get("quantized_kv_start", 0),
+            kwargs.get("kv_group_size", 64),
+            kwargs.get("kv_bits"),
+        )
+        mx.eval([cache.state for cache in prompt_cache])
+        mx.clear_cache()
 
 
 def _request_has_images(request: Any) -> bool:
@@ -82,6 +163,7 @@ def install_deepseek_v4_vision_runtime(
         prepared_images_by_digest.clear()
         if instance is not None:
             instance._omlx_prefill_step_size_override = False
+            instance._omlx_vision_vocab_size = None
 
     def prepare_shared_request(self, request, args):
         try:
@@ -147,6 +229,7 @@ def install_deepseek_v4_vision_runtime(
 
     def tokenize(self, tokenizer, request, args):
         self._omlx_prefill_step_size_override = False
+        self._omlx_vision_vocab_size = None
         metadata = getattr(request, "_omlx_vision_metadata", None)
         if metadata is None:
             clear_request_state(self)
@@ -167,6 +250,12 @@ def install_deepseek_v4_vision_runtime(
         self.model_provider.model.set_vision_inputs(prepared_images)
         self.model_provider.model_key = (*base_model_key, "vision", digest)
         self._omlx_prefill_step_size_override = True
+        model_args = getattr(self.model_provider.model, "args", None)
+        self._omlx_vision_vocab_size = int(
+            config.get("vocab_size")
+            or getattr(model_args, "vocab_size", 0)
+            or 0
+        )
         logger.info(
             "deepseek_v4_vision stage=multimodal_prompt_ready rank=%d "
             "images=%d sequence_length=%d",
@@ -192,27 +281,100 @@ def install_deepseek_v4_vision_runtime(
         if prompt is None and len(args) >= 3:
             prompt = args[2]
         if provider.model_key != base_model_key and prompt is not None:
-            kwargs["prefill_step_size"] = max(
-                int(kwargs.get("prefill_step_size", 0) or 0), len(prompt)
+            configured_step = max(
+                1, int(kwargs.get("prefill_step_size", 0) or 2048)
+            )
+            model = kwargs.get("model") or (args[0] if args else None)
+            model_args = getattr(model, "args", None)
+            vocab_size = int(
+                config.get("vocab_size")
+                or getattr(model_args, "vocab_size", 0)
+                or 0
+            )
+            chunks = (
+                vision_prefill_chunks(
+                    prompt,
+                    vocab_size=vocab_size,
+                    max_chunk_tokens=configured_step,
+                )
+                if vocab_size > 0
+                else ((0, len(prompt)),)
             )
             started = time.perf_counter()
             logger.info(
                 "deepseek_v4_vision stage=distributed_prefill_begin rank=%d "
-                "sequence_length=%d",
+                "sequence_length=%d chunks=%d max_chunk=%d",
                 rank,
                 len(prompt),
+                len(chunks),
+                max((end - start for start, end in chunks), default=0),
             )
+
+            # mlx-lm accepts one fixed prefill size. Process every variable
+            # image-safe prefix chunk here, then give its generator the final
+            # chunk and the already-advanced cache. This retains its sampling,
+            # logits-processor, cancellation, and cache-insertion behavior.
+            prompt_cache = kwargs.get("prompt_cache")
+            draft_model = kwargs.get("draft_model")
+            manual_chunks = bool(
+                len(chunks) > 1
+                and model is not None
+                and prompt_cache is not None
+                and draft_model is None
+            )
+            original_prompt_tokens = len(prompt)
+            processed = 0
+            progress = kwargs.get("prompt_progress_callback")
+            call_args = list(args)
+            call_kwargs = dict(kwargs)
+            if manual_chunks:
+                if progress is not None:
+                    progress(0, original_prompt_tokens)
+                for begin, end in chunks[:-1]:
+                    _prefill_prompt_chunk(
+                        model,
+                        prompt_cache,
+                        prompt[begin:end],
+                        kwargs,
+                    )
+                    processed = end
+                    if progress is not None:
+                        progress(processed, original_prompt_tokens)
+                tail_start, tail_end = chunks[-1]
+                tail = prompt[tail_start:tail_end]
+                if "prompt" in call_kwargs:
+                    call_kwargs["prompt"] = tail
+                elif len(call_args) >= 3:
+                    call_args[2] = tail
+                call_kwargs["prefill_step_size"] = max(
+                    configured_step, len(tail)
+                )
+                if progress is not None:
+                    call_kwargs["prompt_progress_callback"] = (
+                        lambda done, _total: progress(
+                            processed + int(done), original_prompt_tokens
+                        )
+                    )
+            else:
+                call_kwargs["prefill_step_size"] = max(
+                    configured_step,
+                    max((end - start for start, end in chunks), default=0),
+                )
+
             first = True
             steady = False
+            prompt_tps = None
             try:
-                for result in original_stream_generate(*args, **kwargs):
+                for result in original_stream_generate(*call_args, **call_kwargs):
                     if first:
                         first = False
+                        elapsed = time.perf_counter() - started
+                        prompt_tps = original_prompt_tokens / max(elapsed, 1e-9)
                         logger.info(
                             "deepseek_v4_vision stage=distributed_prefill_complete "
                             "rank=%d elapsed_ms=%.1f",
                             rank,
-                            (time.perf_counter() - started) * 1000,
+                            elapsed * 1000,
                         )
                         logger.info(
                             "deepseek_v4_vision stage=first_token rank=%d", rank
@@ -223,6 +385,13 @@ def install_deepseek_v4_vision_runtime(
                             "deepseek_v4_vision stage=steady_decode_begin rank=%d",
                             rank,
                         )
+                    if manual_chunks:
+                        with suppress(TypeError):
+                            result = replace(
+                                result,
+                                prompt_tokens=original_prompt_tokens,
+                                prompt_tps=prompt_tps,
+                            )
                     yield result
             finally:
                 logger.info("deepseek_v4_vision stage=request_complete rank=%d", rank)
