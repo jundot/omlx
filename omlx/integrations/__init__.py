@@ -9,6 +9,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration
+from omlx.integrations.swival import SwivalIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
     "claude": ClaudeCodeIntegration(),
@@ -19,6 +20,7 @@ INTEGRATIONS: dict[str, Integration] = {
     "hermes": HermesIntegration(),
     "pi": PiIntegration(),
     "copilot": CopilotIntegration(),
+    "swival": SwivalIntegration(),
 }
 
 
@@ -39,6 +41,7 @@ __all__ = [
     "CodexAppIntegration",
     "CopilotIntegration",
     "HermesIntegration",
+    "SwivalIntegration",
     "INTEGRATIONS",
     "get_integration",
     "list_integrations",
