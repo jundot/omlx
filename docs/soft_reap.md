@@ -92,8 +92,22 @@ cache transitions. Admin benchmark snapshots include these counters.
   them in place, so a decode graph built one step ahead still reads current
   residency when it executes. Resident routes therefore release the MoE from
   the completion handler without entering Python.
-- Fast Resource Loading waits on Metal IO tickets without the GIL and fails a
-  ticket that does not complete within 120 s instead of blocking the server.
+- Fast Resource Loading waits on Metal IO tickets without the GIL, on a
+  semaphore signalled by the ticket's completion handler, and fails a ticket
+  that does not complete within 120 s instead of blocking the server. Staged
+  tickets draw their staging buffers from a small pool instead of allocating
+  one per load. `OMLX_FRL_POLL_WAIT=1` restores the earlier polling wait.
+- Streamed prefill keeps several scratch groups of I/O in flight ahead of
+  the group being computed (`OMLX_SCRATCH_PREFETCH_DEPTH`, default 3). The
+  runtime snapshot and the benchmark delta report the scratch path's submit,
+  wait, load, gather, compute and scatter seconds.
+- For Qwen4-Exp checkpoints the PLE gather prefaults the rows a prompt
+  touches through the file descriptor on a thread pool before indexing the
+  MADV_RANDOM mapping (`OMLX_QWEN4_PLE_PREFAULT`, default on;
+  `OMLX_QWEN4_PLE_PREFAULT_WORKERS`, default 16). Without it a 1024-token
+  prompt faulted about 16k random rows one at a time while the GPU idled,
+  and the same prompt took between 3.6 s and 10 s depending on what the page
+  cache still held.
 - The runtime drains the stream and clears the MLX buffer cache after every
   non-decode pass, since a streamed prefill chunk otherwise leaves several
   GiB of short-lived buffers in the pool and the prefill memory guard prices
@@ -115,6 +129,13 @@ experts, top-10; 1024-token prompt, 256 generated, MTP depth 3):
 Above roughly 400 experts the SSD stops mattering and decode is bounded by
 the per-layer host round trip that resolves misses; GPU utilization sits
 near 65 percent while an eager load of the same model reaches 98 percent.
+That round trip measures about 150 us per layer with every expert resident
+(47 us from the GPU finishing to the CPU observing it, 106 us from the CPU
+signal to the next command buffer starting), independent of whether a
+completion handler or a polling thread does the signalling. A GPU-side wait
+is not an option on Apple silicon: a running kernel observes a CPU store
+only when its cache line happens to be evicted, milliseconds to seconds
+later. Fewer route resolutions per token (batching, MTP) are the only lever.
 When every expert is resident the pool switches to its resident mode and
 matches eager speed, but that needs the whole expert set plus, for Qwen4-Exp,
 page cache for the mmapped PLE. Larger scratch banks slowed prompt

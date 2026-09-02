@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mmap
 import os
 import struct
+import time
 import weakref
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +31,8 @@ from ..qwen3_5.language import (
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+
+logger = logging.getLogger(__name__)
 from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
@@ -1623,6 +1628,31 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+_PLE_PREFAULT_WORKERS = 16
+_PLE_PREFAULT_MIN_ROWS = 4
+_PLE_PREFAULT_MAX_CHUNK = 1 << 20
+_ple_prefault_pool: ThreadPoolExecutor | None = None
+
+
+def _ple_prefault_enabled() -> bool:
+    value = os.environ.get("OMLX_QWEN4_PLE_PREFAULT", "1").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _ple_prefault_executor() -> ThreadPoolExecutor:
+    global _ple_prefault_pool
+    if _ple_prefault_pool is None:
+        try:
+            workers = int(os.environ.get("OMLX_QWEN4_PLE_PREFAULT_WORKERS", ""))
+        except ValueError:
+            workers = 0
+        _ple_prefault_pool = ThreadPoolExecutor(
+            max_workers=max(1, workers or _PLE_PREFAULT_WORKERS),
+            thread_name_prefix="qwen4-ple-prefault",
+        )
+    return _ple_prefault_pool
+
+
 class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
@@ -1637,6 +1667,44 @@ class _SafeTensorMMap:
             self._mapping.madvise(mmap.MADV_RANDOM)
         except (AttributeError, OSError):
             pass
+        self.prefault_seconds = 0.0
+        self.prefault_ranges = 0
+
+    def _prefault(self, base: int, row_bytes: int, rows: list[int]) -> None:
+        """Pull the pages behind ``rows`` into the page cache in parallel.
+
+        The mapping is MADV_RANDOM, so the numpy gather below otherwise
+        faults each row synchronously at SSD latency, one page at a time,
+        while the GPU idles.  A prompt touches thousands of random rows per
+        PLE layer; reading their byte ranges through the file descriptor on
+        a thread pool first turns that into a short burst of queued I/O.
+        """
+        if len(rows) < _PLE_PREFAULT_MIN_ROWS or not _ple_prefault_enabled():
+            return
+        page = mmap.PAGESIZE
+        spans: list[tuple[int, int]] = []
+        for row in sorted(set(rows)):
+            start = (base + row * row_bytes) // page * page
+            stop = -(-(base + (row + 1) * row_bytes) // page) * page
+            if spans and start <= spans[-1][1]:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], stop))
+            else:
+                spans.append((start, stop))
+        fd = self._file.fileno()
+        started = time.perf_counter()
+
+        def touch(span: tuple[int, int]) -> None:
+            offset, stop = span
+            while offset < stop:
+                length = min(_PLE_PREFAULT_MAX_CHUNK, stop - offset)
+                read = os.pread(fd, length, offset)
+                if not read:
+                    break
+                offset += len(read)
+
+        list(_ple_prefault_executor().map(touch, spans))
+        self.prefault_seconds += time.perf_counter() - started
+        self.prefault_ranges += len(spans)
 
     def tensor_shape(self, key: str) -> tuple[int, ...]:
         return tuple(self._header[key]["shape"])
@@ -1666,6 +1734,9 @@ class _SafeTensorMMap:
             dtype=np_dtype,
             buffer=self._mapping,
             offset=self._data_start + start,
+        )
+        self._prefault(
+            self._data_start + start, math.prod(shape[1:]) * item_size, rows
         )
         copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
         if dtype == "BF16":
@@ -1850,6 +1921,8 @@ class DiskBackedShardedEmbedding(nn.Module):
         touched = tuple(sorted(set(shard_indices)))
         self.last_touched_shards = touched
         self.rows_read = 0
+        gather_started = time.perf_counter()
+        prefault_before = sum(r.prefault_seconds for r in self._readers.values())
         result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
         for shard_index in touched:
             positions = [
@@ -1881,6 +1954,19 @@ class DiskBackedShardedEmbedding(nn.Module):
             values = values.astype(mx.bfloat16) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
+        self.last_gather_seconds = time.perf_counter() - gather_started
+        self.last_prefault_seconds = (
+            sum(r.prefault_seconds for r in self._readers.values()) - prefault_before
+        )
+        if self.rows_read >= 256 and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Qwen4-Exp PLE gather %s: rows=%d shards=%d gather=%.3fs prefault=%.3fs",
+                self._prefix,
+                self.rows_read,
+                len(touched),
+                self.last_gather_seconds,
+                self.last_prefault_seconds,
+            )
         return result.reshape(*shape, self.dims)
 
     def close(self):

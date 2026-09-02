@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -411,6 +412,12 @@ static double io_wait_clock_now() {
       .count();
 }
 
+struct LoadTicket;
+static void wait_io_ticket(
+    const std::shared_ptr<LoadTicket>& ticket,
+    double timeout_seconds,
+    const char* what);
+
 static void wait_io_command_buffer(
     id<MTLIOCommandBuffer> command_buffer,
     double timeout_seconds,
@@ -446,7 +453,39 @@ struct LoadTicket {
   std::atomic<bool> completion_recorded{false};
   bool direct = false;
   bool finished = false;
+  dispatch_semaphore_t completed = nil;
 };
+
+static void wait_io_ticket(
+    const std::shared_ptr<LoadTicket>& ticket,
+    double timeout_seconds,
+    const char* what) {
+  // The completion handler signals the ticket's semaphore, so the wait is
+  // event-driven and bounded.  A 200 us polling sleep here cost about a
+  // millisecond per wait under macOS timer coalescing, which the inference
+  // thread paid on every scratch group and every decode miss.
+  static const bool force_polling = [] {
+    const char* value = std::getenv("OMLX_FRL_POLL_WAIT");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  if (ticket->completed == nil || force_polling) {
+    wait_io_command_buffer(ticket->command_buffer, timeout_seconds, what);
+    return;
+  }
+  long timed_out = 0;
+  {
+    nb::gil_scoped_release release;
+    timed_out = dispatch_semaphore_wait(
+        ticket->completed,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      static_cast<int64_t>(timeout_seconds * NSEC_PER_SEC)));
+  }
+  if (timed_out != 0) {
+    throw std::runtime_error(
+        std::string(what) + " did not complete within " +
+        std::to_string(static_cast<long>(timeout_seconds)) + " s");
+  }
+}
 
 struct IOQueueStats {
   std::atomic<uint64_t> inflight{0};
@@ -528,8 +567,7 @@ class FastResourceLoader {
       }
 
       auto ticket = std::make_shared<LoadTicket>();
-      ticket->staging = [device_ newBufferWithLength:total_bytes
-                                             options:MTLResourceStorageModeShared];
+      ticket->staging = acquire_staging(total_bytes);
       ticket->status = [device_ newBufferWithLength:sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
       if (ticket->staging == nil || ticket->status == nil) {
@@ -635,8 +673,7 @@ class FastResourceLoader {
         throw std::invalid_argument("Fast resource load ticket is already finished");
       }
       const auto io_started = clock_now();
-      wait_io_command_buffer(
-          ticket->command_buffer, 120.0, "Metal IO command buffer");
+      wait_io_ticket(ticket, 120.0, "Metal IO command buffer");
       const double io_seconds = clock_now() - io_started;
       record_completion(ticket, queue_stats_);
       const uint32_t status = *static_cast<uint32_t*>(ticket->status.contents);
@@ -766,6 +803,8 @@ class FastResourceLoader {
         throw std::runtime_error(
             "Metal FRL blit failed: " + error_string(command_buffer.error));
       }
+      release_staging(ticket->staging);
+      ticket->staging = nil;
       ticket->finished = true;
       nb::dict result;
       result["io_wait_seconds"] = io_seconds;
@@ -780,6 +819,56 @@ class FastResourceLoader {
   }
 
  private:
+  // Staged loads reuse a small pool of shared staging buffers.  Allocating a
+  // fresh 64 MB buffer for every scratch group cost the inference thread
+  // milliseconds per group during streamed prefill.
+  static constexpr size_t kStagingPoolLimit = 8;
+  static constexpr uint64_t kStagingGranularity = 4ull << 20;
+  std::mutex staging_mutex_;
+  std::vector<id<MTLBuffer>> staging_pool_;
+
+  id<MTLBuffer> acquire_staging(uint64_t total_bytes) {
+    const uint64_t rounded =
+        (total_bytes + kStagingGranularity - 1) / kStagingGranularity *
+        kStagingGranularity;
+    {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      size_t best = staging_pool_.size();
+      for (size_t index = 0; index < staging_pool_.size(); ++index) {
+        const uint64_t length = [staging_pool_[index] length];
+        if (length >= total_bytes &&
+            (best == staging_pool_.size() ||
+             length < [staging_pool_[best] length])) {
+          best = index;
+        }
+      }
+      if (best != staging_pool_.size()) {
+        id<MTLBuffer> buffer = staging_pool_[best];
+        staging_pool_.erase(staging_pool_.begin() + best);
+        return buffer;
+      }
+    }
+    return [device_ newBufferWithLength:rounded
+                                options:MTLResourceStorageModeShared];
+  }
+
+  void release_staging(id<MTLBuffer> buffer) {
+    if (buffer == nil) return;
+    std::lock_guard<std::mutex> lock(staging_mutex_);
+    if (staging_pool_.size() >= kStagingPoolLimit) {
+      // Drop the smallest pooled buffer so the pool keeps the most useful sizes.
+      size_t smallest = 0;
+      for (size_t index = 1; index < staging_pool_.size(); ++index) {
+        if ([staging_pool_[index] length] < [staging_pool_[smallest] length]) {
+          smallest = index;
+        }
+      }
+      if ([staging_pool_[smallest] length] >= [buffer length]) return;
+      staging_pool_.erase(staging_pool_.begin() + smallest);
+    }
+    staging_pool_.push_back(buffer);
+  }
+
   static void record_completion(
       const std::shared_ptr<LoadTicket>& ticket,
       const std::shared_ptr<IOQueueStats>& queue_stats) {
@@ -804,10 +893,13 @@ class FastResourceLoader {
     }
     std::weak_ptr<LoadTicket> weak_ticket(ticket);
     auto queue_stats = queue_stats_;
+    ticket->completed = dispatch_semaphore_create(0);
+    dispatch_semaphore_t completed_semaphore = ticket->completed;
     [ticket->command_buffer addCompletedHandler:^(id<MTLIOCommandBuffer>) {
       if (auto completed = weak_ticket.lock()) {
         record_completion(completed, queue_stats);
       }
+      dispatch_semaphore_signal(completed_semaphore);
     }];
     [ticket->command_buffer commit];
   }
@@ -879,6 +971,8 @@ class FastResourceLoader {
 };
 
 }  // namespace
+
+
 
 NB_MODULE(_ext, m) {
   m.doc() = "Metal Fast Resource Loading for oMLX expert banks";

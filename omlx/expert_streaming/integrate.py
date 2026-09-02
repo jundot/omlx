@@ -161,6 +161,7 @@ class ExpertStreamingRuntime:
             "native_demand_destination_fence_skips",
             "elastic_decode_cache_activations",
             "elastic_decode_cache_demotions",
+            "scratch_groups",
         )
         timing_fields = (
             "bank_bind_seconds",
@@ -171,6 +172,12 @@ class ExpertStreamingRuntime:
             "scratch_mlx_materialize_seconds",
             "native_demand_submit_seconds",
             "native_demand_callback_seconds",
+            "scratch_call_seconds",
+            "scratch_load_seconds",
+            "scratch_gather_seconds",
+            "scratch_compute_seconds",
+            "scratch_scatter_seconds",
+            "scratch_submit_seconds",
         )
         totals = {
             key: sum(int(layer.get(key, 0)) for layer in layers)

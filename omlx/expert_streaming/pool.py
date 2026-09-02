@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +64,13 @@ class ExpertPoolStats:
     native_demand_callback_seconds: float = 0.0
     elastic_decode_cache_activations: int = 0
     elastic_decode_cache_demotions: int = 0
+    scratch_call_seconds: float = 0.0
+    scratch_groups: int = 0
+    scratch_load_seconds: float = 0.0
+    scratch_gather_seconds: float = 0.0
+    scratch_compute_seconds: float = 0.0
+    scratch_scatter_seconds: float = 0.0
+    scratch_submit_seconds: float = 0.0
 
     def as_dict(self) -> dict[str, int | float]:
         total = self.pinned_hits + self.cache_hits + self.cache_misses
@@ -93,6 +101,13 @@ class ExpertPoolStats:
             "route_materialize_seconds": self.route_materialize_seconds,
             "just_in_time_loads": self.just_in_time_loads,
             "native_demand_calls": self.native_demand_calls,
+            "scratch_call_seconds": self.scratch_call_seconds,
+            "scratch_groups": self.scratch_groups,
+            "scratch_load_seconds": self.scratch_load_seconds,
+            "scratch_gather_seconds": self.scratch_gather_seconds,
+            "scratch_compute_seconds": self.scratch_compute_seconds,
+            "scratch_scatter_seconds": self.scratch_scatter_seconds,
+            "scratch_submit_seconds": self.scratch_submit_seconds,
             "native_demand_callbacks": self.native_demand_callbacks,
             "native_demand_positions": self.native_demand_positions,
             "native_demand_destination_fence_skips": (
@@ -106,6 +121,16 @@ class ExpertPoolStats:
             "elastic_decode_cache_demotions": self.elastic_decode_cache_demotions,
             "hit_rate": (self.pinned_hits + self.cache_hits) / total if total else 1.0,
         }
+
+
+def _scratch_prefetch_depth() -> int:
+    """Number of scratch groups whose I/O may be in flight ahead of compute."""
+
+    raw = os.environ.get("OMLX_SCRATCH_PREFETCH_DEPTH", "3")
+    try:
+        return int(raw)
+    except ValueError:
+        return 3
 
 
 class _NativeDemandCallback:
@@ -1104,6 +1129,7 @@ class StreamingSwitchGLU(nn.Module):
         """Execute one-shot cold experts without replacing hot-cache rows."""
 
         self.stats.expert_major_calls += 1
+        call_started = time.perf_counter()
         unique = list(dict.fromkeys(values))
         resident = [expert for expert in unique if expert in self._expert_to_slot]
         cold = [expert for expert in unique if expert not in self._expert_to_slot]
@@ -1140,15 +1166,25 @@ class StreamingSwitchGLU(nn.Module):
         flat_output = mx.zeros((len(values), hidden), dtype=x.dtype)
         scratch_base = self.pool_size
         cold_groups = [group for group, is_scratch in groups if is_scratch]
-        prefetched = None
+        # Keep several scratch groups of I/O in flight.  Reads land in the
+        # loader's staging buffers, not the scratch slots, so the depth is
+        # bounded by staging memory rather than by the scratch bank, and a
+        # depth of one left the SSD idle during every group's compute.
+        prefetch_depth = max(1, _scratch_prefetch_depth())
+        prefetch_queue: deque = deque()
         prefetched_index = 0
-        if cold_groups:
-            prefetched = self._reader.read_many_async(
-                self.locations,
-                cold_groups[0],
-                use_file_cache=True,
+        submit_started = time.perf_counter()
+        while prefetched_index < len(cold_groups) and len(prefetch_queue) < prefetch_depth:
+            prefetch_queue.append(
+                self._reader.read_many_async(
+                    self.locations,
+                    cold_groups[prefetched_index],
+                    use_file_cache=True,
+                )
             )
+            prefetched_index += 1
             self.stats.scratch_prefetch_requests += 1
+        self.stats.scratch_submit_seconds += time.perf_counter() - submit_started
 
         for group, is_scratch in groups:
             mask = np.isin(flat_indices, np.asarray(group, dtype=np.int32))
@@ -1158,7 +1194,7 @@ class StreamingSwitchGLU(nn.Module):
             logical_np = flat_indices[positions_np]
             if is_scratch:
                 wait_started = time.perf_counter()
-                cpu_components = prefetched.result()
+                cpu_components = prefetch_queue.popleft().result()
                 self.stats.scratch_prefetch_wait_seconds += (
                     time.perf_counter() - wait_started
                 )
@@ -1172,25 +1208,34 @@ class StreamingSwitchGLU(nn.Module):
                     self.stats.scratch_mlx_materialize_seconds += (
                         time.perf_counter() - materialize_started
                     )
-                prefetched_index += 1
                 if prefetched_index < len(cold_groups):
-                    prefetched = self._reader.read_many_async(
-                        self.locations,
-                        cold_groups[prefetched_index],
-                        use_file_cache=True,
+                    submit_started = time.perf_counter()
+                    prefetch_queue.append(
+                        self._reader.read_many_async(
+                            self.locations,
+                            cold_groups[prefetched_index],
+                            use_file_cache=True,
+                        )
                     )
+                    prefetched_index += 1
                     self.stats.scratch_prefetch_requests += 1
+                    self.stats.scratch_submit_seconds += (
+                        time.perf_counter() - submit_started
+                    )
                 group_slots = list(range(scratch_base, scratch_base + len(group)))
+                load_started = time.perf_counter()
                 self._load_into_slots(
                     group,
                     group_slots,
                     load_kind="scratch",
                     preloaded_components=components,
                 )
+                self.stats.scratch_load_seconds += time.perf_counter() - load_started
                 scratch_map = dict(zip(group, group_slots, strict=True))
                 slot_values = [scratch_map[int(expert)] for expert in logical_np]
             else:
                 slot_values = [self._expert_to_slot[int(expert)] for expert in logical_np]
+            gather_started = time.perf_counter()
             slots = mx.array(slot_values, dtype=mx.int32)
             token_positions = mx.array(positions_np // k, dtype=mx.int32)
             selected = flat_x[token_positions][:, None, :]
@@ -1207,9 +1252,16 @@ class StreamingSwitchGLU(nn.Module):
             ).squeeze(-2)
             if inv_order is not None:
                 output = output[inv_order]
+            compute_started = time.perf_counter()
+            self.stats.scratch_gather_seconds += compute_started - gather_started
             mx.eval(output)
+            scatter_started = time.perf_counter()
+            self.stats.scratch_compute_seconds += scatter_started - compute_started
             flat_output[mx.array(positions_np, dtype=mx.int32)] = output
+            self.stats.scratch_scatter_seconds += time.perf_counter() - scatter_started
+            self.stats.scratch_groups += 1
 
+        self.stats.scratch_call_seconds += time.perf_counter() - call_started
         return flat_output.reshape((*indices.shape, hidden))
 
     def __call__(
