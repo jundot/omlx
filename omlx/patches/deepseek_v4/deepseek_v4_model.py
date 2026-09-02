@@ -2517,6 +2517,10 @@ class Model(nn.Module):
             embeddings = mx.distributed.all_sum(
                 embeddings, group=self._vision_group
             )
+            # Rank zero's pipeline stage replaces this value with recv_like().
+            # Materialize first so its lazy collective cannot be pruned while
+            # peers wait for the embedding broadcast.
+            mx.eval(embeddings)
         elif encode_error is not None:
             raise RuntimeError("DeepSeek-V4 vision encoding failed") from encode_error
         logger.info(

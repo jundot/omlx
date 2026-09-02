@@ -1994,6 +1994,57 @@ class TestDeepSeekV4VisionSuffixes:
         assert embeddings[0, 1:4].tolist() == [[10, 10], [2, 2], [40, 40]]
         assert fake._vision_inputs == ()
 
+    def test_distributed_vision_embeddings_are_materialized_before_pipeline(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        original_eval = mx.eval
+        events = []
+
+        class _Group:
+            @staticmethod
+            def size():
+                return 2
+
+        class _Embedding:
+            weight = mx.zeros((100, 2), dtype=mx.bfloat16)
+
+        def all_sum(value, *, group):
+            assert isinstance(group, _Group)
+            kind = "status" if value.dtype == mx.int32 else "embeddings"
+            events.append(f"all_sum_{kind}")
+            if kind == "status":
+                return mx.array(1, dtype=mx.int32)
+            return mx.ones_like(value)
+
+        def tracked_eval(value):
+            kind = "status" if value.dtype == mx.int32 else "embeddings"
+            events.append(f"eval_{kind}")
+            return original_eval(value)
+
+        monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+        monkeypatch.setattr(mx, "eval", tracked_eval)
+        fake = SimpleNamespace(
+            args=SimpleNamespace(vocab_size=100, hidden_size=2),
+            model=SimpleNamespace(embed_tokens=_Embedding()),
+            _vision_rank=1,
+            _vision_group=_Group(),
+            _vision_inputs=None,
+            _vision_blocks={},
+        )
+
+        embeddings = dsv4.Model._vision_embeddings(fake, mx.array([[100]]))
+
+        assert embeddings.tolist() == [[[1, 1]]]
+        assert events == [
+            "all_sum_status",
+            "eval_status",
+            "all_sum_embeddings",
+            "eval_embeddings",
+        ]
+
     def test_cached_visibility_mask_disables_standard_kernel_path(
         self, applied_patch
     ):
