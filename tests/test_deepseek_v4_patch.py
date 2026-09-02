@@ -290,6 +290,142 @@ class TestTokenizerPatch:
         # Class name preserved for any introspection.
         assert tu.AutoTokenizer.__name__ == "AutoTokenizer"
 
+    @pytest.mark.parametrize(
+        "preconfigured_parser",
+        (False, True),
+        ids=("injected-parser", "preconfigured-parser"),
+    )
+    def test_dsml_start_tokens_include_canonical_newline_context(
+        self, tmp_path, preconfigured_parser
+    ):
+        """The direct mlx-lm server must enter its tool state for V4 DSML.
+
+        DeepSeek's tokenizer can merge ``>\n`` into one token.  Caching an
+        encoding of only the bare opening marker therefore does not match the
+        canonical marker followed by the first invoke on the next line.
+        """
+        script = textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            import mlx_lm.tokenizer_utils as tokenizer_utils
+
+            model_path = Path(sys.argv[1])
+            preconfigured_parser = sys.argv[2] == "true"
+            (model_path / "config.json").write_text(
+                json.dumps({"model_type": "deepseek_v4"})
+            )
+
+            start = "<｜DSML｜tool_calls>"
+            end = "</｜DSML｜tool_calls>"
+
+            class ContextSensitiveTokenizer:
+                def encode(self, text, add_special_tokens=False):
+                    assert add_special_tokens is False
+                    if text == start:
+                        return [10, 11]
+                    if text == start + "\\n":
+                        return [10, 12]
+                    if text == end:
+                        return [13, 14]
+                    raise AssertionError(f"unexpected encoding request: {text!r}")
+
+            class Wrapper(SimpleNamespace):
+                eos_token_ids = (0,)
+                has_thinking = False
+
+                @property
+                def has_tool_calling(self):
+                    return self._tool_parser is not None
+
+                @property
+                def tool_call_start(self):
+                    return self._tool_call_start
+
+                @property
+                def tool_call_end(self):
+                    return self._tool_call_end
+
+                @property
+                def tool_call_start_tokens(self):
+                    return self._tool_call_start_tokens
+
+                @property
+                def tool_call_end_tokens(self):
+                    return self._tool_call_end_tokens
+
+                def encode(self, text, add_special_tokens=False):
+                    return self._tokenizer.encode(text, add_special_tokens)
+
+                def convert_ids_to_tokens(self, token_id):
+                    return str(token_id)
+
+            parser = None
+            if preconfigured_parser:
+                from omlx.patches.deepseek_v4 import tool_parser_v4
+
+                parser = tool_parser_v4.parse_tool_call
+
+            wrapper = Wrapper(
+                _tokenizer=ContextSensitiveTokenizer(),
+                _chat_template=None,
+                _tool_parser=parser,
+                _tool_call_start=None,
+                _tool_call_end=None,
+                _tool_call_start_tokens=(10, 11),
+                _tool_call_end_tokens=(13, 14),
+            )
+            tokenizer_utils.load = lambda *args, **kwargs: wrapper
+
+            from omlx.patches.deepseek_v4.tokenizer_patch import apply_load_patch
+
+            assert apply_load_patch() is True
+            loaded = tokenizer_utils.load(model_path)
+            assert loaded.tool_call_start == start
+            assert loaded.tool_call_start_tokens == (10, 12)
+
+            from mlx_lm.server import ResponseGenerator
+
+            generator = object.__new__(ResponseGenerator)
+            generator._state_machine_cache = {}
+            machine, _ = generator._make_state_machine(
+                "deepseek-v4-test", loaded, [], "normal"
+            )
+
+            state = machine.make_state()
+            current = "normal"
+            for token in (10, 12):
+                state, _, current = machine.match(state, token)
+            assert current == "tool"
+
+            for token in (13, 14):
+                state, _, current = machine.match(state, token)
+            assert current == "normal"
+            """
+        )
+        env = dict(os.environ)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                script,
+                str(tmp_path),
+                str(preconfigured_parser).lower(),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+
     def test_passthrough_on_success(self, applied_patch):
         """When upstream AutoTokenizer.from_pretrained succeeds, the wrapper
         must return its result unmodified — no fallback path taken."""
