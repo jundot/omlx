@@ -340,12 +340,6 @@ def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
         def set_vision_inputs(self, images):
             self.inputs.append(images)
 
-    provider = SimpleNamespace(
-        model=Model(),
-        model_key=("canonical", None, None),
-        is_batchable=True,
-    )
-
     class Cache:
         def fetch_nearest_cache(self, model_key, prompt):
             cache_keys.append(("fetch", model_key))
@@ -359,14 +353,19 @@ def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
             self.model_provider = provider
             self.prompt_cache = Cache()
 
-        def _share_object(self, payload):
-            return payload
+        def _share_request(self, request):
+            return request
 
         def _tokenize(self, _tokenizer, _request, _args):
             return [99], [[99]], ["assistant"], "normal"
 
         def _serve_single(self, request):
-            prompt = self._tokenize(request.tokenizer, request, request.args)[0]
+            _queue, request_payload, request_args = request
+            prompt = self._tokenize(
+                self.model_provider.tokenizer,
+                request_payload,
+                request_args,
+            )[0]
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key,
                 prompt,
@@ -398,16 +397,18 @@ def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
         convert_tokens_to_ids=lambda _token: 99,
         unk_token_id=-1,
     )
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("canonical", None, None),
+        tokenizer=tokenizer,
+        is_batchable=True,
+    )
 
     @dataclass
     class Request:
-        tokenizer: object
-        args: object
         messages: list
 
     request = Request(
-        tokenizer,
-        SimpleNamespace(),
         [
             {
                 "role": "user",
@@ -418,11 +419,14 @@ def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
 
     with install_deepseek_v4_vision_runtime(server, provider, config={}, rank=0):
         generator = ResponseGenerator()
+        shared_request = generator._share_request(
+            (object(), request, SimpleNamespace())
+        )
         if fail_generation:
             with pytest.raises(RuntimeError, match="generation failed"):
-                generator._serve_single(request)
+                generator._serve_single(shared_request)
         else:
-            generator._serve_single(request)
+            generator._serve_single(shared_request)
 
         assert provider.model_key == ("canonical", None, None)
         assert provider.model.inputs[-1] is None

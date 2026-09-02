@@ -3,10 +3,12 @@
 
 import base64
 import io
+import pickle
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 from PIL import Image
 
 from omlx.cluster.deepseek_v4_vision_runtime import (
@@ -158,8 +160,8 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
         def __init__(self, provider):
             self.model_provider = provider
 
-        def _share_object(self, payload):
-            return payload
+        def _share_request(self, request):
+            return request
 
         def _tokenize(self, _tokenizer, _request, _args):
             return [1, 99, 2], [[1, 99, 2]], ["assistant"], "normal"
@@ -174,12 +176,15 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
     server = SimpleNamespace(
         ResponseGenerator=ResponseGenerator, stream_generate=stream_generate
     )
-    provider = SimpleNamespace(
-        model=Model(), model_key=("model", None, None), is_batchable=True
-    )
     tokenizer = SimpleNamespace(
         convert_tokens_to_ids=lambda token: 99 if token == IMAGE_PLACEHOLDER else None,
         unk_token_id=-1,
+    )
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("model", None, None),
+        tokenizer=tokenizer,
+        is_batchable=True,
     )
     request = Request(
         messages=[
@@ -194,10 +199,20 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
     )
 
     with install_deepseek_v4_vision_runtime(server, provider, config=_config(), rank=0):
-        prompt, segments, _types, state = ResponseGenerator(provider)._tokenize(
-            tokenizer, request, SimpleNamespace()
+        generator = ResponseGenerator(provider)
+        args = SimpleNamespace()
+        _queue, shared_request, shared_args = generator._share_request(
+            (object(), request, args)
+        )
+        prompt, segments, _types, state = generator._tokenize(
+            tokenizer, shared_request, shared_args
         )
         assert len(provider.model.images) == 1
+        assert request.messages[0]["content"][0]["type"] == "image_url"
+        assert shared_request.messages[0]["content"][0] == {
+            "type": "text",
+            "text": IMAGE_PLACEHOLDER,
+        }
         streamed = list(server.stream_generate(prompt=prompt))
 
     assert provider.is_batchable is False
@@ -206,3 +221,119 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
     assert state == "normal"
     assert streamed == ["first", "second"]
     assert seen["prefill_step_size"] == len(prompt)
+
+
+@pytest.mark.parametrize("preprocessing_error", [False, True])
+def test_runtime_uses_one_request_broadcast_for_both_ranks(
+    monkeypatch,
+    preprocessing_error,
+):
+    from mlx_lm.server import CompletionRequest
+
+    from omlx.cluster import deepseek_v4_vision_runtime
+
+    prepared = SimpleNamespace(
+        patches=b"pixels",
+        n_vit_h=2,
+        n_vit_w=2,
+        types=(0, 1, 2),
+    )
+
+    def prepare(*_args, **_kwargs):
+        if preprocessing_error:
+            raise ValueError("invalid image")
+        return [1, 2, 3, 4], (prepared,)
+
+    monkeypatch.setattr(deepseek_v4_vision_runtime, "prepare_token_ids", prepare)
+
+    class Bus:
+        payload = None
+        calls = []
+
+    class Model:
+        def set_vision_inputs(self, images):
+            self.images = images
+
+    class ResponseGenerator:
+        def __init__(self, provider):
+            self.model_provider = provider
+
+        def _share_object(self, payload):
+            Bus.calls.append(payload is not None)
+            if payload is not None:
+                Bus.payload = pickle.loads(pickle.dumps(payload))
+            if Bus.payload is None:
+                return None
+            return pickle.loads(pickle.dumps(Bus.payload))
+
+        def _share_request(self, request):
+            shareable = request[1:] if request is not None else None
+            shareable = self._share_object(shareable)
+            if shareable is None:
+                return None
+            queue = request[0] if request is not None else object()
+            return queue, *shareable
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            return [1, 99, 2], [[1, 99, 2]], ["assistant"], "normal"
+
+    server = SimpleNamespace(
+        ResponseGenerator=ResponseGenerator,
+        stream_generate=lambda *_args, **_kwargs: iter(()),
+    )
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda _token: 99,
+        unk_token_id=-1,
+    )
+    providers = [
+        SimpleNamespace(
+            model=Model(),
+            model_key=("model", None, None),
+            tokenizer=tokenizer,
+            is_batchable=True,
+        )
+        for _rank in range(2)
+    ]
+    request = CompletionRequest(
+        request_type="chat",
+        prompt="",
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "image"}}],
+            }
+        ],
+        tools=None,
+        role_mapping=None,
+    )
+    args = SimpleNamespace()
+
+    with install_deepseek_v4_vision_runtime(server, providers[0], config={}, rank=0):
+        rank_zero = ResponseGenerator(providers[0])
+        shared = rank_zero._share_request((object(), request, args))
+        if preprocessing_error:
+            with pytest.raises(RuntimeError, match="invalid image") as rank_zero_error:
+                rank_zero._tokenize(tokenizer, shared[1], shared[2])
+        else:
+            rank_zero_result = rank_zero._tokenize(tokenizer, shared[1], shared[2])
+            rank_zero_key = providers[0].model_key
+            assert providers[0].model.images == (prepared,)
+
+    with install_deepseek_v4_vision_runtime(server, providers[1], config={}, rank=1):
+        rank_one = ResponseGenerator(providers[1])
+        shared = rank_one._share_request(None)
+        if preprocessing_error:
+            with pytest.raises(RuntimeError, match="invalid image") as rank_one_error:
+                rank_one._tokenize(tokenizer, shared[1], shared[2])
+        else:
+            rank_one_result = rank_one._tokenize(tokenizer, shared[1], shared[2])
+            rank_one_key = providers[1].model_key
+            assert providers[1].model.images is None
+
+    assert Bus.calls == [True, False]
+    if preprocessing_error:
+        assert str(rank_zero_error.value) == str(rank_one_error.value)
+    else:
+        assert rank_zero_result == rank_one_result
+        assert rank_zero_key == rank_one_key
+    assert request.messages[0]["content"][0]["type"] == "image_url"

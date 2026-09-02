@@ -69,63 +69,101 @@ def install_deepseek_v4_vision_runtime(
 
     response_type = server_module.ResponseGenerator
     original_tokenize = response_type._tokenize
+    original_share_request = getattr(response_type, "_share_request", None)
     original_serve_single = getattr(response_type, "_serve_single", None)
     original_stream_generate = server_module.stream_generate
     base_model_key = provider.model_key
+    prepared_images_by_digest = {}
     provider.is_batchable = False
 
     def clear_request_state(instance=None):
         provider.model_key = base_model_key
         provider.model.set_vision_inputs(None)
+        prepared_images_by_digest.clear()
         if instance is not None:
             instance._omlx_prefill_step_size_override = False
 
+    def prepare_shared_request(self, request, args):
+        try:
+            messages, image_records = _text_messages_and_images(request.messages)
+            shared_request = replace(request, messages=messages)
+            prompt, _segments, _types, initial_state = original_tokenize(
+                self,
+                self.model_provider.tokenizer,
+                shared_request,
+                args,
+            )
+            image_token_id = self.model_provider.tokenizer.convert_tokens_to_ids(
+                IMAGE_PLACEHOLDER
+            )
+            if (
+                image_token_id is None
+                or image_token_id == self.model_provider.tokenizer.unk_token_id
+            ):
+                raise ValueError(
+                    "DeepSeek image placeholder is missing from tokenizer: "
+                    f"{IMAGE_PLACEHOLDER}"
+                )
+            prompt, prepared_images = prepare_token_ids(
+                prompt,
+                image_records,
+                image_token_id=int(image_token_id),
+                config=config,
+            )
+            digest = _image_digest(prepared_images)
+            prepared_images_by_digest.clear()
+            prepared_images_by_digest[digest] = prepared_images
+            metadata = ("ok", prompt, initial_state, digest)
+        except Exception as exc:
+            logger.exception("deepseek_v4_vision stage=multimodal_prompt_failed rank=0")
+            prepared_images_by_digest.clear()
+            try:
+                shared_request = replace(request, messages=[])
+            except TypeError:
+                shared_request = copy.copy(request)
+                shared_request.messages = []
+            metadata = ("error", type(exc).__name__, str(exc), None)
+        shared_request._omlx_vision_metadata = metadata
+        return shared_request
+
+    def share_request(self, request):
+        if rank == 0 and request is not None:
+            queue, request_payload, request_args = request
+            if _request_has_images(request_payload):
+                request_payload = prepare_shared_request(
+                    self,
+                    request_payload,
+                    request_args,
+                )
+                request = (queue, request_payload, request_args)
+        try:
+            shared_request = original_share_request(self, request)
+            if shared_request is None:
+                clear_request_state(self)
+            return shared_request
+        except Exception:
+            clear_request_state(self)
+            raise
+
     def tokenize(self, tokenizer, request, args):
         self._omlx_prefill_step_size_override = False
-        if not _request_has_images(request):
+        metadata = getattr(request, "_omlx_vision_metadata", None)
+        if metadata is None:
             clear_request_state(self)
             return original_tokenize(self, tokenizer, request, args)
-
-        payload = None
-        prepared_images = None
-        if rank == 0:
-            try:
-                messages, image_records = _text_messages_and_images(request.messages)
-                text_request = replace(request, messages=messages)
-                prompt, _segments, _types, initial_state = original_tokenize(
-                    self, tokenizer, text_request, args
-                )
-                image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
-                if image_token_id is None or image_token_id == tokenizer.unk_token_id:
-                    raise ValueError(
-                        "DeepSeek image placeholder is missing from tokenizer: "
-                        f"{IMAGE_PLACEHOLDER}"
-                    )
-                prompt, prepared_images = prepare_token_ids(
-                    prompt,
-                    image_records,
-                    image_token_id=int(image_token_id),
-                    config=config,
-                )
-                payload = (
-                    "ok",
-                    prompt,
-                    initial_state,
-                    _image_digest(prepared_images),
-                )
-            except Exception as exc:
-                logger.exception(
-                    "deepseek_v4_vision stage=multimodal_prompt_failed rank=0"
-                )
-                payload = ("error", type(exc).__name__, str(exc))
-
-        shared = self._share_object(payload)
-        if shared[0] == "error":
+        if not isinstance(metadata, tuple) or len(metadata) != 4:
+            raise RuntimeError("DeepSeek-V4 vision request metadata is invalid")
+        status, prompt_or_type, initial_state_or_message, digest = metadata
+        if status == "error":
             raise RuntimeError(
                 f"DeepSeek-V4 vision preprocessing failed on rank zero "
-                f"({shared[1]}): {shared[2]}"
+                f"({prompt_or_type}): {initial_state_or_message}"
             )
-        _, prompt, initial_state, digest = shared
+        if status != "ok" or not isinstance(digest, str):
+            raise RuntimeError("DeepSeek-V4 vision request metadata is invalid")
+        prompt = prompt_or_type
+        initial_state = initial_state_or_message
+        prepared_images = prepared_images_by_digest.get(digest) if rank == 0 else None
         self.model_provider.model.set_vision_inputs(prepared_images)
         self.model_provider.model_key = (*base_model_key, "vision", digest)
         self._omlx_prefill_step_size_override = True
@@ -192,6 +230,8 @@ def install_deepseek_v4_vision_runtime(
         yield from original_stream_generate(*args, **kwargs)
 
     response_type._tokenize = tokenize
+    if original_share_request is not None:
+        response_type._share_request = share_request
     if original_serve_single is not None:
         response_type._serve_single = serve_single
     server_module.stream_generate = stream_generate
@@ -205,6 +245,8 @@ def install_deepseek_v4_vision_runtime(
     finally:
         clear_request_state()
         response_type._tokenize = original_tokenize
+        if original_share_request is not None:
+            response_type._share_request = original_share_request
         if original_serve_single is not None:
             response_type._serve_single = original_serve_single
         server_module.stream_generate = original_stream_generate
