@@ -179,7 +179,7 @@ private struct SourceModelSection: View {
             ) {
                 Popup(
                     selection: $selectedModelPath,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -195,7 +195,7 @@ private struct SourceModelSection: View {
                 ) {
                     Popup(
                         selection: $sensitivityModelPath,
-                        width: 320,
+                        width: .controlWide,
                         options: sensitivityOptions
                     )
                 }
@@ -209,7 +209,7 @@ private struct SourceModelSection: View {
                                  comment: "Row sublabel explaining the oQ level tradeoff")) {
                 Popup(
                     selection: $oqLevel,
-                    width: 120,
+                    width: .controlCompact,
                     options: levelOptions
                 )
             }
@@ -475,7 +475,7 @@ private struct EnhancedQuantizationSection: View {
                                             defaultValue: "Automatic",
                                             comment: "Placeholder for an automatically selected oQe imatrix cache path"),
                         mono: true,
-                        width: 320
+                        width: .controlWide
                     )
                 }
 
@@ -973,7 +973,7 @@ private struct UploadModalView: View {
                             placeholder: "hf_…",
                             isSecure: true,
                             mono: true,
-                            width: 220
+                            width: .controlMedium
                         )
                         Button {
                             Task { await vm.validateUploadToken(client: client) }
@@ -1010,7 +1010,7 @@ private struct UploadModalView: View {
                     ) {
                         Popup(
                             selection: $vm.uploadNamespace,
-                            width: 220,
+                            width: .controlMedium,
                             options: namespaceOptions
                         )
                     }
@@ -1063,7 +1063,7 @@ private struct UploadModalView: View {
                             text: $repoName,
                             placeholder: "model-id",
                             mono: true,
-                            width: 240
+                            width: .controlMedium
                         )
                     }
                 }
@@ -1101,7 +1101,7 @@ private struct UploadModalView: View {
                 ) {
                     Popup(
                         selection: $readmeSourcePath,
-                        width: 260,
+                        width: .controlWide,
                         options: readmeOptions
                     )
                 }

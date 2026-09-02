@@ -197,7 +197,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -210,7 +210,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench context picker")) {
                 Popup(
                     selection: $contextProfile,
-                    width: 220,
+                    width: .controlMedium,
                     options: BenchmarkContextProfile.allCases.map {
                         PopupOption(value: $0, label: $0.localizedLabel)
                     }
@@ -272,7 +272,7 @@ private struct ConfigurationSection: View {
                     text: $genLength,
                     placeholder: "128",
                     mono: true,
-                    width: 110
+                    width: .controlCompact
                 )
             }
 

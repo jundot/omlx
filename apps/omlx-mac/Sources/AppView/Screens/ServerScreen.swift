@@ -27,7 +27,7 @@ struct ServerScreen: View {
                                   comment: "Row label for the listen-address picker in Server screen")) {
                     Popup(
                         selection: vm.bind($vm.host, save: { vm.saveHost(services: services) }),
-                        width: 220,
+                        width: .controlMedium,
                         options: [
                             ("127.0.0.1", String(localized: "server.host.local_only",
                                                   defaultValue: "127.0.0.1 (Local only)",
@@ -53,7 +53,7 @@ struct ServerScreen: View {
                                      comment: "Sublabel under the Port field"),
                     isLast: true
                 ) {
-                    TextInput(text: $vm.portText, mono: true, width: 90)
+                    TextInput(text: $vm.portText, mono: true, width: .controlNarrow)
                 }
             }
 
@@ -106,7 +106,7 @@ struct ServerScreen: View {
                     isLast: true) {
                     Popup(
                         selection: vm.bind($vm.logLevel, save: vm.saveLogLevel),
-                        width: 130,
+                        width: .controlCompact,
                         options: [
                             ("error",   String(localized: "server.log_level.error",
                                                 defaultValue: "Error",
@@ -145,7 +145,7 @@ struct ServerScreen: View {
                                      defaultValue: "OMLX_BASE_PATH. Files move and the server restarts when this changes.",
                                      comment: "Sublabel under the Base Path field")
                 ) {
-                    TextInput(text: $vm.basePathText, mono: true, width: 280)
+                    TextInput(text: $vm.basePathText, mono: true, width: .controlWide)
                 }
                 FreeRow {
                     ModelDirectoriesEditor(vm: vm)
@@ -253,7 +253,7 @@ private struct ModelDirectoriesEditor: View {
             TextInput(text: Binding(
                 get: { vm.modelDirText(at: index) },
                 set: { vm.setModelDirText($0, at: index) }
-            ), mono: true, width: 340)
+            ), mono: true, width: .controlWide)
 
             Button {
                 vm.browseModelDirectory(at: index)
@@ -461,7 +461,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.context_window.sub",
                                      defaultValue: "Maximum prompt + completion tokens.",
                                      comment: "Sublabel for the context window field")) {
-                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: 110)
+                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.max_tokens",
                                   defaultValue: "Max Tokens",
@@ -469,7 +469,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.max_tokens.sub",
                                      defaultValue: "Server-wide cap on generated tokens.",
                                      comment: "Sublabel for the max tokens field")) {
-                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: 110)
+                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.temperature",
                                   defaultValue: "Temperature",
@@ -477,7 +477,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.temperature.sub",
                                      defaultValue: "Sampling randomness (0–2).",
                                      comment: "Sublabel for the temperature field")) {
-                    TextInput(text: $vm.samplingTemperatureText, placeholder: "0.7", mono: true, width: 90)
+                    TextInput(text: $vm.samplingTemperatureText, placeholder: "0.7", mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.top_p",
                                   defaultValue: "Top P",
@@ -485,7 +485,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.top_p.sub",
                                      defaultValue: "Nucleus sampling cutoff (0–1).",
                                      comment: "Sublabel for the Top P field")) {
-                    TextInput(text: $vm.samplingTopPText, mono: true, width: 90)
+                    TextInput(text: $vm.samplingTopPText, mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.top_k",
                                   defaultValue: "Top K",
@@ -493,7 +493,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.top_k.sub",
                                      defaultValue: "Limit candidates to top K. 0 = disabled.",
                                      comment: "Sublabel for the Top K field")) {
-                    TextInput(text: $vm.samplingTopKText, mono: true, width: 90)
+                    TextInput(text: $vm.samplingTopKText, mono: true, width: .controlNarrow)
                 }
                 Row(label: String(localized: "server.profile.repetition_penalty",
                                   defaultValue: "Repetition Penalty",
@@ -503,7 +503,7 @@ private struct ServerDefaultProfileEditor: View {
                                      comment: "Sublabel for the repetition penalty field"),
                     isLast: !expanded
                 ) {
-                    TextInput(text: $vm.samplingRepetitionPenaltyText, mono: true, width: 90)
+                    TextInput(text: $vm.samplingRepetitionPenaltyText, mono: true, width: .controlNarrow)
                 }
                 if expanded {
                     // The remaining design rows aren't server-backed yet —
@@ -695,7 +695,7 @@ private struct ServerAdvancedSection: View {
                             text: $vm.maxAudioUploadSizeText,
                             placeholder: "100MB",
                             mono: true,
-                            width: 130
+                            width: .controlCompact
                         )
                     }
                     Row(
@@ -708,7 +708,7 @@ private struct ServerAdvancedSection: View {
                     ) {
                         Popup(
                             selection: vm.bind($vm.sseKeepaliveMode, save: vm.saveSseKeepaliveMode),
-                            width: 130,
+                            width: .controlCompact,
                             options: [
                                 ("chunk",   String(localized: "server.advanced.sse_keepalive.chunk",
                                                     defaultValue: "Chunk",
@@ -735,7 +735,7 @@ private struct ServerAdvancedSection: View {
                             text: $vm.serverAliasesText,
                             placeholder: "omlx.local, oMLX.lan",
                             mono: true,
-                            width: 320
+                            width: .controlWide
                         )
                     }
                 }

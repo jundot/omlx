@@ -32,7 +32,7 @@ struct LogsScreen: View {
                         isLast: true) {
                         Popup(
                             selection: $vm.selectedFile,
-                            width: 220,
+                            width: .controlMedium,
                             options: vm.fileOptions
                         )
                     }
@@ -95,7 +95,7 @@ struct LogsScreen: View {
 
         Popup(
             selection: $vm.lines,
-            width: 110,
+            width: .controlCompact,
             options: lineOptions
         )
     }

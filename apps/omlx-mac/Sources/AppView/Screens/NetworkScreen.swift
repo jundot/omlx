@@ -67,7 +67,7 @@ private struct ProxiesSection: View {
                     text: $vm.httpProxy,
                     placeholder: "http://proxy.local:8080",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
             Row(label: String(localized: "network.row.https_proxy.label",
@@ -77,7 +77,7 @@ private struct ProxiesSection: View {
                     text: $vm.httpsProxy,
                     placeholder: "http://proxy.local:8080",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
             Row(
@@ -93,7 +93,7 @@ private struct ProxiesSection: View {
                     text: $vm.noProxy,
                     placeholder: "localhost,127.0.0.1,*.internal",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }
@@ -129,7 +129,7 @@ private struct TLSSection: View {
                     text: $vm.caBundle,
                     placeholder: "/etc/ssl/certs/ca-bundle.pem",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }

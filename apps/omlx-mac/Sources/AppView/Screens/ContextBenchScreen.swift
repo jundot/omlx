@@ -118,7 +118,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Context Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }

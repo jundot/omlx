@@ -198,7 +198,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Accuracy Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -417,7 +417,7 @@ private struct BenchmarkCard: View {
                         .foregroundStyle(theme.textTertiary)
                     Popup(
                         selection: $sampleSize,
-                        width: 90,
+                        width: .controlNarrow,
                         options: sampleSizeOptions
                     )
                 }

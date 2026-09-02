@@ -803,7 +803,7 @@ private struct SuggestedSection: View {
             HStack(spacing: 6) {
                 Popup(
                     selection: $sort,
-                    width: 170,
+                    width: .controlMedium,
                     options: SuggestedSort.allCases.map { ($0, $0.label) }
                 )
                 Button {

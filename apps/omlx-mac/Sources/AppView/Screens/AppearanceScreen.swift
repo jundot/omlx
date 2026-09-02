@@ -46,7 +46,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the menubar refresh cadence picker"
                     )
                 ) {
-                    Popup(selection: $refreshInterval, width: 110, options: [
+                    Popup(selection: $refreshInterval, width: .controlCompact, options: [
                         (0.5, "0.5 s"),
                         (1.0, "1 s"),
                         (2.0, "2 s"),

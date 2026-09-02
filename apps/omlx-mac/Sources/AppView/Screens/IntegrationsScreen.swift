@@ -79,7 +79,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.opusModel, save: {
                             Task { await vm.save(.opusModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -90,7 +90,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.sonnetModel, save: {
                             Task { await vm.save(.sonnetModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -106,7 +106,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.haikuModel, save: {
                             Task { await vm.save(.haikuModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -139,7 +139,7 @@ private struct ClaudeCodeSection: View {
                         text: $vm.targetContextSizeText,
                         mono: true,
                         suffix: "tk",
-                        width: 130
+                        width: .controlCompact
                     )
                 }
             }
@@ -392,7 +392,7 @@ private struct IntegrationRow: View {
                     Spacer(minLength: 12)
                     Popup(
                         selection: modelBinding,
-                        width: 220,
+                        width: .controlMedium,
                         options: modelOptions
                     )
                 }
@@ -413,7 +413,7 @@ private struct IntegrationRow: View {
                         Spacer(minLength: 12)
                         Popup(
                             selection: profileBinding,
-                            width: 160,
+                            width: .controlMedium,
                             options: [
                                 ("minimal",   String(localized: "integrations.openclaw.profile.minimal",
                                                      defaultValue: "Minimal",
@@ -478,7 +478,7 @@ private struct MCPSection: View {
                     text: $vm.mcpConfigPath,
                     placeholder: "/path/to/mcp.json",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }

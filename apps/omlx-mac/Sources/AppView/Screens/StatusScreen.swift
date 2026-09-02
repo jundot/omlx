@@ -619,7 +619,7 @@ private struct UpdatesSection: View {
                         get: { updates.channel },
                         set: { updates.channel = $0 }
                     ),
-                    width: 190,
+                    width: .controlMedium,
                     options: UpdateChannel.allCases.map { ($0, $0.displayName) }
                 )
             }
