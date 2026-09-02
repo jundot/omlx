@@ -146,6 +146,15 @@ class ModelSettingsRequest(BaseModel):
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
     turboquant_skip_last: bool | None = None
+    # Prefill chunk width in tokens (None = automatic, the scheduler default).
+    # Validated here so a bad width cannot persist and leave the panel lying
+    # about the active configuration. Literal, not a field_validator raising
+    # ValueError — server.py's non-API-route branch puts exc.errors() straight
+    # into a JSONResponse, and Pydantic v2's raw ValueError in ctx is not
+    # JSON-serializable, so the intended 422 reaches the client as a 500. The
+    # engine keeps its own coercion as defence in depth: settings.json is
+    # hand-editable and ModelSettings.from_dict does not validate (#3381).
+    prefill_step_size: Literal[256, 512, 1024, 2048] | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
@@ -574,6 +583,10 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    # Inert on this lane: engine/vlm.py pins diffusion prefill to
+    # DIFFUSION_PREFILL_STEP_SIZE. Clear it server-side so a profile import
+    # cannot persist a width the engine ignores (#3381).
+    settings["prefill_step_size"] = None
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -649,6 +662,9 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    # Same reason as the dict sanitizer: diffusion prefill width is pinned in
+    # engine/vlm.py, so a direct PUT must not persist an override (#3381).
+    settings.prefill_step_size = None
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2407,6 +2423,11 @@ async def update_model_settings(
             True if request.turboquant_skip_last is None
             else bool(request.turboquant_skip_last)
         )
+    if "prefill_step_size" in sent:
+        # Assigned straight through: null is the meaningful "automatic" value on
+        # ModelSettings, and the field type has already rejected anything
+        # outside the supported chunk widths (#3381).
+        current_settings.prefill_step_size = request.prefill_step_size
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.

@@ -441,3 +441,126 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature("m", depth_3_off) == pool._engine_runtime_signature(
         "m", depth_8_off
     )
+
+
+@pytest.mark.asyncio
+async def test_prefill_step_size_is_persisted_and_echoed():
+    """#3381: the per-model prefill chunk override must reach ModelSettings."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(prefill_step_size=1024),
+    )
+
+    assert settings.prefill_step_size == 1024
+    assert result["settings"]["prefill_step_size"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_prefill_step_size_null_clears_to_automatic():
+    """null is the meaningful "automatic" value here, not a no-op (#3381)."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(prefill_step_size=1024)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(prefill_step_size=None),
+    )
+
+    assert settings.prefill_step_size is None
+    # to_dict() drops None, so the panel reads the cleared override back as
+    # Automatic instead of a stale width.
+    assert "prefill_step_size" not in result["settings"]
+
+
+@pytest.mark.asyncio
+async def test_prefill_step_size_untouched_when_not_sent():
+    """`in sent` semantics: a PUT that never mentions the field keeps it."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(prefill_step_size=1024)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(temperature=0.25),
+    )
+
+    assert settings.prefill_step_size == 1024
+
+
+@pytest.mark.parametrize("value", [999999, 3000])
+def test_prefill_step_size_rejects_unsupported_widths(value):
+    """An unvalidated width persists and GET echoes it while the engine
+    coerces a different one, so the panel would lie about the active config
+    (#3381). FastAPI maps this to 422 at the HTTP boundary; _update_settings
+    calls the handler directly, so it surfaces at request construction."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="256, 512, 1024 or 2048"):
+        admin_routes.ModelSettingsRequest(prefill_step_size=value)
+
+
+@pytest.mark.parametrize("value", [256, 512, 1024, 2048, None])
+def test_prefill_step_size_accepts_the_full_select_grid(value):
+    """Every width the panel offers, plus Automatic, must survive validation."""
+    request = admin_routes.ModelSettingsRequest(prefill_step_size=value)
+
+    assert request.prefill_step_size == value
+
+
+def test_prefill_step_size_rejection_stays_json_serializable():
+    """The rejection has to reach the client as a 422, not a 500 (#3381).
+
+    omlx/server.py:780 hands `{"detail": exc.errors()}` straight to a
+    JSONResponse on non-API routes, and Pydantic v2 puts the raw exception
+    object into `ctx` for any validator that raises ValueError. json.dumps
+    then fails and FastAPI turns the intended 422 into a 500 ("Object of type
+    ValueError is not JSON serializable"). This locks the Literal in place
+    against anyone "simplifying" it back to a field_validator.
+    """
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        admin_routes.ModelSettingsRequest(prefill_step_size=999999)
+
+    errors = exc_info.value.errors()
+    # Exactly what the non-API-route branch of the handler does.
+    body = json.dumps({"detail": errors})
+
+    assert errors[0]["type"] == "literal_error"
+    assert "256, 512, 1024 or 2048" in body
+
+
+def test_sanitize_diffusion_settings_dict_clears_prefill_step_size():
+    """A profile import must not persist a width the diffusion lane ignores.
+
+    The dashboard.js guard only covers the UI path, so this sanitizer is the
+    only thing standing between a profile's stored override and settings.json
+    (#3381).
+    """
+    settings = {"prefill_step_size": 512}
+
+    admin_routes._sanitize_diffusion_settings_dict(settings)
+
+    assert settings["prefill_step_size"] is None
+    # Neighbouring resets, to prove the clear lands in the live block rather
+    # than after an early return.
+    assert settings["turboquant_kv_bits"] == 4
+    assert settings["turboquant_skip_last"] is True
+
+
+def test_sanitize_diffusion_model_settings_clears_prefill_step_size():
+    """The direct-API hole: PUT {"prefill_step_size": 512} on a diffusion
+    model must land back on automatic, since engine/vlm.py pins the width
+    (#3381)."""
+    settings = ModelSettings(prefill_step_size=512)
+
+    admin_routes._sanitize_diffusion_model_settings(settings)
+
+    assert settings.prefill_step_size is None
+    assert settings.turboquant_kv_bits == 4
+    assert settings.turboquant_skip_last is True

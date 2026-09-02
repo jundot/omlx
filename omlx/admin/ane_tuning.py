@@ -495,7 +495,20 @@ def _prefill_step_size(engine: Any) -> int | None:
     block boundary or the memory guard, which is why callers point at
     chunk_tokens in the serve log as the authority.
     """
-    config = getattr(engine, "_scheduler_config", None)
+    # engine._scheduler_config is the pool's shared instance, so it never sees
+    # the per-model prefill_step_size override, which lands on the per-engine
+    # copy the live scheduler holds. Read the runtime scheduler first and keep
+    # the shared config as the fallback for an engine that is not started yet,
+    # or the hint would quote 2048 while the engine delivers less — the unsafe
+    # direction, since it recommends a sequence_length the ANE compiles for and
+    # never executes. Traversal copied from benchmark.py:1907-1913;
+    # deliberately .config only, never _qwen35_prefill_floor (#3381).
+    runtime_scheduler = getattr(
+        getattr(getattr(engine, "_engine", None), "engine", None), "scheduler", None
+    )
+    config = getattr(runtime_scheduler, "config", None)
+    if config is None:
+        config = getattr(engine, "_scheduler_config", None)
     try:
         size = int(getattr(config, "prefill_step_size", 0) or 0)
     except (TypeError, ValueError):
