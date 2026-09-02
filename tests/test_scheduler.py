@@ -6758,3 +6758,98 @@ class TestHybridDecodeKvEvalDefault:
             model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
         )
         assert scheduler._decode_eval_kv_cache_interval == 0
+
+
+class TestPrefillStepSizeBlockSizeDecoupling:
+    """A per-model prefill_step_size override must not coarsen the block size.
+
+    The whole per-model override rests on `_enlarge_block_size_for_arrays_cache`
+    raising the block size to `_ARRAYS_CACHE_BLOCK_SIZE` and no further, so any
+    override <= 2048 leaves the boundary count — and the per-boundary snapshot
+    cost — exactly as it is today (#3381).
+    """
+
+    def _fake_scheduler(self, config):
+        stub = type("ArraysCache", (), {})()
+        return SimpleNamespace(
+            config=config,
+            model=SimpleNamespace(make_cache=lambda: [stub]),
+            _qwen35_prefill_floor=0,
+            _ARRAYS_CACHE_BLOCK_SIZE=Scheduler._ARRAYS_CACHE_BLOCK_SIZE,
+            _detect_rotating_window_sizes=lambda: [],
+            _cache_tree_has_arrays_cache=Scheduler._cache_tree_has_arrays_cache,
+        )
+
+    def test_lower_override_leaves_the_block_size_at_2048(self):
+        config = SchedulerConfig(
+            prefill_step_size=1024,
+            paged_cache_block_size=256,
+            paged_ssd_cache_dir="/tmp/x",
+        )
+
+        Scheduler._enlarge_block_size_for_arrays_cache(self._fake_scheduler(config))
+
+        assert config.paged_cache_block_size == 2048
+
+    def test_enlargement_requires_the_ssd_cache_dir(self):
+        """Without a paged SSD dir the method returns early — the precondition
+        that would otherwise make the assertion above vacuous."""
+        config = SchedulerConfig(
+            prefill_step_size=1024,
+            paged_cache_block_size=256,
+            paged_ssd_cache_dir=None,
+        )
+
+        Scheduler._enlarge_block_size_for_arrays_cache(self._fake_scheduler(config))
+
+        assert config.paged_cache_block_size == 256
+
+    def test_qwen35_floor_still_wins_over_a_lower_override(self):
+        fake = SimpleNamespace(
+            config=SchedulerConfig(prefill_step_size=1024),
+            _glm_dsa_adaptive_prefill=None,
+            _minimax_m3_adaptive_prefill=None,
+            _qwen35_prefill_floor=4096,
+        )
+
+        assert Scheduler._base_prefill_step_size(fake, 0, 1 << 20) == 4096
+
+
+class TestGlmDsaAdaptivePrefillWidening:
+    """An override also switches adaptive prefill widening off (#3381).
+
+    Both widening builders gate on `prefill_step_size == 2048`, so picking any
+    other width lands 4x harder than the number suggests: a `glm_moe_dsa` model
+    runs a flat 8192 by default and the configured value once overridden.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _pin_widening_env(self, monkeypatch):
+        # Pin the whole env gate: a developer's environment must not be able to
+        # flip the widening config out from under these assertions.
+        monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", "1")
+        monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", "8192")
+        monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER", "0")
+        monkeypatch.setenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_MIN_REMAINING", "0")
+
+    def test_default_config_widens_to_8192(self, mock_model, mock_tokenizer):
+        mock_model.model_type = "glm_moe_dsa"
+
+        scheduler = Scheduler(
+            model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
+        )
+
+        assert scheduler._glm_dsa_adaptive_prefill is not None
+        assert scheduler._base_prefill_step_size(0, 1 << 20) == 8192
+
+    def test_override_disables_widening(self, mock_model, mock_tokenizer):
+        mock_model.model_type = "glm_moe_dsa"
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=1024),
+        )
+
+        assert scheduler._glm_dsa_adaptive_prefill is None
+        assert scheduler._base_prefill_step_size(0, 1 << 20) == 1024

@@ -45,6 +45,9 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    # Per-model, not universal: the win is model-shape dependent, so a global
+    # template must not push one prefill width onto every model (#3381).
+    "prefill_step_size",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
