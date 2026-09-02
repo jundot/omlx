@@ -3601,13 +3601,30 @@ class Scheduler:
             # so the hard cap is honored before the chunk-end check. Raises
             # RuntimeError if the min chunk would exceed the cap — the
             # #1405 cleanup path catches it and emits an error to the client.
-            n_to_process = self._adaptive_chunk_size(
-                n_to_process,
-                request_id=request.request_id,
-                loop_label="external",
-                kv_len=base_size + processed_tokens,
-                gathered_core=gathered_core,
-            )
+            try:
+                n_to_process = self._adaptive_chunk_size(
+                    n_to_process,
+                    request_id=request.request_id,
+                    loop_label="external",
+                    kv_len=base_size + processed_tokens,
+                    gathered_core=gathered_core,
+                )
+            except _PrefillEvictionNeeded:
+                # The eviction pause re-queues the request keeping its
+                # prompt_cache, which this loop has already advanced in
+                # place by ``processed_tokens``. Commit that progress, or
+                # the retry re-feeds the same tokens on top of the advanced
+                # cache: a duplicated span in the KV, boundary snapshots
+                # labelled one block behind the cache, and every block
+                # stored from there on misaligned — the next prefix hit
+                # generates garbage (GLM-5.3, 02/09, only reachable when the
+                # MTP head's memory pushed the throttle into a paused chunk).
+                if existing_cache is not None and processed_tokens > 0:
+                    request.cached_tokens = (
+                        int(getattr(request, "cached_tokens", 0) or 0) + processed_tokens
+                    )
+                    request.remaining_tokens = tokens[processed_tokens:]
+                raise
 
             # Pre-chunk safety guard: NEVER submit a chunk whose predicted peak
             # would breach the prefill safety cap. The Metal command-buffer
