@@ -158,8 +158,16 @@ struct LinkRow<Icon: View>: View {
         )
     }
 
+    @State private var hovering = false
+
+    // The whole row is one button (System Settings convention for rows
+    // that open a URL); the trailing ↗ is a passive indicator, not a
+    // separate control. Hover feedback replaces FreeRow so the highlight
+    // spans the full row width.
     var body: some View {
-        FreeRow(isLast: isLast) {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
             HStack(spacing: 10) {
                 iconView
                     .foregroundStyle(theme.textSecondary)
@@ -176,13 +184,24 @@ struct LinkRow<Icon: View>: View {
 
                 Spacer(minLength: 8)
 
-                Button {
-                    NSWorkspace.shared.open(url)
-                } label: {
-                    Label("common.open", systemImage: "arrow.up.right.square")
-                        .labelStyle(.iconOnly)
-                }
-                .buttonStyle(.omlx(.plain, size: .small))
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 14))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? theme.hoverBg : .clear)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(theme.rowSep)
+                    .frame(height: 0.5)
+                    .padding(.horizontal, 14)
             }
         }
     }
