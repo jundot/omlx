@@ -575,6 +575,8 @@ class BatchQSAKVCache:
     @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
         length = 0 if cache.index_keys is None else cache.index_offset
+        if isinstance(length, mx.array):
+            length = int(length.item())
         left = target - length
         if cache.index_keys is None:
             keys = mx.zeros(
@@ -593,6 +595,16 @@ class BatchQSAKVCache:
         else:
             keys = cache.index_keys[:, :length]
             positions = cache.index_position_ids[..., :length]
+            # Widen 2-D text positions to the join's widest rank before
+            # padding (#3294 item 2): the runtime update path already
+            # broadcasts text up to MRoPE in _append_indexer_positions; joins
+            # must apply the same rule or the concatenate below sees ranks 2
+            # and 3. Replicating across MRoPE channels matches runtime.
+            if sample_positions.ndim == 3 and positions.ndim == 2:
+                positions = mx.broadcast_to(
+                    positions[None],
+                    (sample_positions.shape[0], *positions.shape),
+                )
         if left:
             keys = mx.pad(keys, [(0, 0), (left, 0), (0, 0)])
             positions = mx.pad(
@@ -612,12 +624,25 @@ class BatchQSAKVCache:
         sample_keys = (
             self.index_keys if self.index_keys is not None else other.index_keys
         )
-        sample_positions = (
-            self.index_position_ids
-            if self.index_position_ids is not None
-            else other.index_position_ids
-        )
-        if sample_keys is None:
+        # Prefer the WIDEST position rank over "first non-None" (#3294 item
+        # 2): promotion only widens, so a 2-D sample would strand a 3-D row
+        # with nothing to promote to, and position_axis would be picked from
+        # the wrong rank. Order-sensitive defect, so pick from both sides.
+        self_positions = self.index_position_ids
+        other_positions = other.index_position_ids
+        if (
+            self_positions is not None
+            and other_positions is not None
+            and self_positions.ndim != other_positions.ndim
+        ):
+            sample_positions = (
+                other_positions if self_positions.ndim == 2 else self_positions
+            )
+        elif self_positions is not None:
+            sample_positions = self_positions
+        else:
+            sample_positions = other_positions
+        if sample_keys is None or sample_positions is None:
             return
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
@@ -660,23 +685,49 @@ class BatchQSAKVCache:
         sample = next((cache for cache in caches if cache.index_keys is not None), None)
         if sample is None:
             return out
-        target = max(cache.offset for cache in caches)
+        # Pick the widest position rank across every cache, not the first
+        # non-None sample (#3294 item 2): promotion only widens, so a 2-D
+        # first sample would strand a 3-D row at concatenate time.
+        widest_positions = sample.index_position_ids
+        for cache in caches:
+            pos = cache.index_position_ids
+            if pos is not None and pos.ndim > widest_positions.ndim:
+                widest_positions = pos
+        # Row length comes from the *indexer* state, not the KV offset
+        # (#3294 item 4). Singleton QSAKVCache.index_keys is a property
+        # already sliced to its valid length; BatchQSAKVCache keeps a raw
+        # capacity buffer, so its valid length is index_offset. The old code
+        # passed cache.offset — an int for singletons but an mx.array of
+        # per-row offsets for batch inputs, making max() and
+        # mx.array([cache.offset]) ill-defined — and conflated KV length
+        # with indexer length. The two coincide whenever the caches are
+        # consistent, so this is behaviour-preserving except where they
+        # diverge, which is exactly the mis-slice this fix removes.
+        def _valid_index_length(cache):
+            if cache.index_keys is None:
+                return 0
+            if isinstance(cache, BatchQSAKVCache):
+                return int(cache.index_offset)
+            return int(cache.index_keys.shape[1])
+
+        lengths = [_valid_index_length(cache) for cache in caches]
+        target = max(lengths)
         rows = [
             cls._pad_index(
                 SimpleNamespace(
                     index_keys=cache.index_keys,
                     index_position_ids=cache.index_position_ids,
-                    index_offset=cache.offset,
-                    offset=mx.array([cache.offset]),
+                    index_offset=length,
+                    offset=mx.array([length]),
                 ),
                 target,
                 sample.index_keys,
-                sample.index_position_ids,
+                widest_positions,
             )
-            for cache in caches
+            for cache, length in zip(caches, lengths)
         ]
         out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
-        position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+        position_axis = 1 if widest_positions.ndim == 3 else 0
         out.index_position_ids = mx.concatenate(
             [row[1] for row in rows], axis=position_axis
         )
