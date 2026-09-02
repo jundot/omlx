@@ -9,6 +9,7 @@ import pytest
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.planner import PipelineAssignment
 from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.exceptions import ModelUnavailableError
 
 
 def _deployment(model_path: str) -> ClusterDeployment:
@@ -36,6 +37,32 @@ def _entry(model_path: str) -> EngineEntry:
         engine_type="batched",
         estimated_size=300,
     )
+
+
+def _vision_entry(model_path) -> EngineEntry:
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "vision_n_layers": 32,
+                "vision_dim": 1024,
+                "vision_n_heads": 16,
+                "vision_inter_dim": 2816,
+                "vision_patch_size": 14,
+                "vision_rope_theta": 10000.0,
+                "vision_downsample_ratio": 3,
+                "vision_max_n_token": 384,
+                "vision_min_pixels": 147456,
+                "vision_max_wh_ratio": 8,
+            }
+        )
+    )
+    entry = _entry(str(model_path))
+    entry.model_id = "deepseek-v4-vision"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    return entry
 
 
 def test_engine_pool_admits_only_rank_zero_resident_weight(tmp_path):
@@ -205,6 +232,71 @@ def test_cluster_model_path_accepts_gated_deepseek_v4_vision(tmp_path):
     assert (
         pool.resolve_cluster_model_id(str(model_path)) == "deepseek-v4-vision"
     )
+
+
+@pytest.mark.parametrize("force_lm", [False, True])
+async def test_gated_vision_deployment_uses_distributed_engine(
+    tmp_path,
+    monkeypatch,
+    force_lm,
+):
+    entry = _vision_entry(tmp_path / "deepseek-v4-vision")
+    deployment = _deployment(entry.model_path)
+    pool = EnginePool()
+    pool._entries[entry.model_id] = entry
+    pool._cluster_registry = SimpleNamespace(
+        get_for_model=lambda model: deployment if model == entry.model_path else None
+    )
+    engine = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+    distributed = MagicMock(return_value=engine)
+    local_vlm = MagicMock(side_effect=AssertionError("local VLM load attempted"))
+    local_llm = MagicMock(side_effect=AssertionError("local LLM load attempted"))
+    monkeypatch.setattr(
+        "omlx.engine.distributed.DistributedBatchedEngine", distributed
+    )
+    monkeypatch.setattr("omlx.engine_pool.VLMBatchedEngine", local_vlm)
+    monkeypatch.setattr("omlx.engine_pool.BatchedEngine", local_llm)
+
+    await pool._load_engine(entry.model_id, force_lm=force_lm)
+
+    distributed.assert_called_once()
+    engine.start.assert_awaited_once()
+    assert entry.engine is engine
+    local_vlm.assert_not_called()
+    local_llm.assert_not_called()
+
+
+async def test_failed_gated_vision_deployment_never_falls_back_locally(
+    tmp_path,
+    monkeypatch,
+):
+    entry = _vision_entry(tmp_path / "deepseek-v4-vision")
+    deployment = _deployment(entry.model_path)
+    pool = EnginePool()
+    pool._entries[entry.model_id] = entry
+    pool._cluster_registry = SimpleNamespace(
+        get_for_model=lambda model: deployment if model == entry.model_path else None
+    )
+    engine = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("rank start failed")),
+        stop=AsyncMock(),
+    )
+    local_vlm = MagicMock(side_effect=AssertionError("local VLM load attempted"))
+    local_llm = MagicMock(side_effect=AssertionError("local LLM load attempted"))
+    monkeypatch.setattr(
+        "omlx.engine.distributed.DistributedBatchedEngine",
+        MagicMock(return_value=engine),
+    )
+    monkeypatch.setattr("omlx.engine_pool.VLMBatchedEngine", local_vlm)
+    monkeypatch.setattr("omlx.engine_pool.BatchedEngine", local_llm)
+    monkeypatch.setattr(pool, "_schedule_failed_load_reclaim", MagicMock())
+
+    with pytest.raises(ModelUnavailableError, match="rank start failed"):
+        await pool._load_engine(entry.model_id)
+
+    assert entry.engine is None
+    local_vlm.assert_not_called()
+    local_llm.assert_not_called()
 
 
 def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
