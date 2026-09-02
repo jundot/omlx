@@ -1434,10 +1434,11 @@ _PREFLIGHT_SCRIPT = (
     # surfaced as diagnostics because each rank loads its own matching wheel.
     "v['python']=platform.python_version()\n"
     "v['admission-ceiling-bytes']=int("
-    "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"
+    "ceiling_breakdown(sys.argv[5]).get('hard_limit',0))\n"
     "v['model-exists']=x.is_dir()\n"
     "if v['model-exists']:\n"
-    "    v.update(validate(x,int(sys.argv[2]),int(sys.argv[3])))\n"
+    "    v.update(validate(x,int(sys.argv[2]),int(sys.argv[3]),"
+    "rank=int(sys.argv[4])))\n"
     "print(json.dumps(v,sort_keys=True))"
 )
 
@@ -1469,6 +1470,7 @@ def preflight_remote_hosts(
             deployment.model,
             assignments[0].start_layer,
             assignments[0].end_layer,
+            rank=assignments[0].rank,
         )
         if local_model_exists
         else {}
@@ -1524,6 +1526,7 @@ def preflight_remote_hosts(
                 home_relative_model_path(deployment.model),
                 str(assignment.start_layer),
                 str(assignment.end_layer),
+                str(assignment.rank),
                 assignment.memory_guard_tier,
             ]
         )

@@ -125,6 +125,7 @@ class RankPrefillGuard:
         cached_tokens: int = 0,
         request_id: str | None = None,
         current_usage_bytes: int | None = None,
+        prefill_step_size: int | None = None,
     ) -> None:
         """Raise ``PrefillMemoryExceededError`` if this prompt will not fit."""
 
@@ -140,13 +141,14 @@ class RankPrefillGuard:
             if current_usage_bytes is None
             else max(0, int(current_usage_bytes))
         )
+        step = self._step if prefill_step_size is None else max(1, int(prefill_step_size))
         try:
             raise_if_prefill_exceeds(
                 self._monitor,
                 prefill_memory_guard=True,
                 hard_limit_bytes=self._ceiling,
                 current_usage_bytes=usage,
-                prefill_step_size=self._step,
+                prefill_step_size=step,
                 num_prompt_tokens=int(num_prompt_tokens),
                 cached_tokens=max(0, int(cached_tokens)),
                 request_id=request_id,
@@ -170,6 +172,7 @@ class RankPrefillGuard:
         request_id: str | None = None,
         current_usage_bytes: int | None = None,
         mx_module: Any | None = None,
+        prefill_step_size: int | None = None,
     ) -> None:
         """Make prefill admission one rank-agreed decision.
 
@@ -189,6 +192,7 @@ class RankPrefillGuard:
                 cached_tokens=cached_tokens,
                 request_id=request_id,
                 current_usage_bytes=current_usage_bytes,
+                prefill_step_size=prefill_step_size,
             )
         except PrefillMemoryExceededError as exc:
             local_error = exc

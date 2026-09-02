@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -627,6 +627,7 @@ def _runtime_assignment(
         "end_layer": assignment.end_layer,
         "layer_count": assignment.layer_count,
         "planned_weight_bytes": assignment.planned_weight_bytes,
+        "coordinator_weight_bytes": assignment.coordinator_weight_bytes,
         "reserve_bytes": assignment.reserve_bytes,
         "capacity_bytes": assignment.capacity_bytes,
         "headroom_bytes": assignment.headroom_bytes,
@@ -749,7 +750,9 @@ def _validate_measured_weight_bytes(
     if measured_weight_bytes is None:
         return
     approved_parameter_bytes = (
-        assignment.fixed_weight_bytes + assignment.layer_weight_bytes
+        assignment.fixed_weight_bytes
+        + assignment.coordinator_weight_bytes
+        + assignment.layer_weight_bytes
     )
     relative_tolerance = (
         approved_parameter_bytes * _MEASURED_WEIGHT_RELATIVE_TOLERANCE_PERCENT + 99
@@ -838,6 +841,7 @@ def _guard_effective_stage(
     per_layer = assignment.layer_weight_bytes / planned_layers
     effective_bytes = int(
         assignment.fixed_weight_bytes
+        + assignment.coordinator_weight_bytes
         + per_layer * effective_layers
         + assignment.kv_cache_bytes
     )
@@ -962,6 +966,26 @@ def run_worker(args: argparse.Namespace) -> int:
     group = mx.distributed.init(backend=init_backend, strict=True)
     rank = group.rank()
     world_size = group.size()
+    try:
+        model_config = json.loads(
+            (Path(args.model).expanduser() / "config.json").read_text()
+        )
+    except OSError:
+        # ModelProvider remains the authority for ordinary text paths (and
+        # test doubles may use a repo ID rather than a local directory). The
+        # staged vision path always has its config sidecar locally.
+        model_config = {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"distributed model config is unreadable: {exc}") from exc
+    from omlx.deepseek_v4_vision import is_deepseek_v4_vision_config
+    from omlx.model_discovery import _has_vision_subconfig
+
+    deepseek_v4_vision = is_deepseek_v4_vision_config(model_config)
+    if _has_vision_subconfig(model_config) and not deepseek_v4_vision:
+        raise RuntimeError(
+            "unsupported distributed VLM family; only "
+            "DeepSeek-V4-Flash-Vision is enabled"
+        )
     if world_size != len(assignments):
         raise RuntimeError(
             f"runtime world size {world_size} does not match plan size "
@@ -983,6 +1007,8 @@ def run_worker(args: argparse.Namespace) -> int:
     marker.update(
         "loading",
         load_stage="initializing",
+        model_family=("deepseek_v4_vision" if deepseek_v4_vision else "text"),
+        vision_owner=(rank == 0 if deepseek_v4_vision else None),
         launcher_parent_pid=launcher_parent_pid,
     )
     marker.start_heartbeat()
@@ -1125,6 +1151,8 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
             ):
                 provider.load_default()
+            if deepseek_v4_vision:
+                provider.is_batchable = False
             protocol = _install_distributed_model_protocol(
                 provider.tokenizer,
                 args.model,
@@ -1150,6 +1178,18 @@ def run_worker(args: argparse.Namespace) -> int:
                 batchable=provider.is_batchable,
                 pipeline_parallel=tensor_parallel_size == 1,
             ) as optimizations:
+                vision_runtime = nullcontext()
+                if deepseek_v4_vision:
+                    from .deepseek_v4_vision_runtime import (
+                        install_deepseek_v4_vision_runtime,
+                    )
+
+                    vision_runtime = install_deepseek_v4_vision_runtime(
+                        mlx_server,
+                        provider,
+                        config=model_config,
+                        rank=rank,
+                    )
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1200,7 +1240,11 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                # Vision must patch the base generator before telemetry creates
+                # its subclass. Then all ranks finish sharing the expanded
+                # prompt before telemetry enters cache/guard collectives.
                 with (
+                    vision_runtime,
                     install_server_telemetry(
                         marker,
                         execution=execution,

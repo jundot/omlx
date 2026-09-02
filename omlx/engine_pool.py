@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .cluster.deployment import ClusterDeployment
@@ -316,8 +316,19 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None:
             return None
+        if entry.engine_type != "batched":
+            from .deepseek_v4_vision import is_deepseek_v4_vision_config
+
+            try:
+                config = json.loads(
+                    Path(entry.model_path, "config.json").read_text()
+                )
+            except (OSError, json.JSONDecodeError):
+                return None
+            if not is_deepseek_v4_vision_config(config):
+                return None
         return registry.get_for_model(entry.model_path)
 
     def _entry_resident_size(self, entry: EngineEntry) -> int:
@@ -899,7 +910,7 @@ class EnginePool:
         )
 
     def resolve_cluster_model_id(self, model_path: str) -> str:
-        """Resolve one downloaded LLM path to its public oMLX model ID.
+        """Resolve one downloaded cluster-capable path to its public model ID.
 
         Cluster deployments are keyed by canonical model path while the public
         API and the engine pool are keyed by model ID.  Activation must join
@@ -923,11 +934,21 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        config: dict[str, Any] = {}
+        try:
+            decoded = json.loads(Path(entry.model_path, "config.json").read_text())
+            if isinstance(decoded, dict):
+                config = decoded
+        except (OSError, json.JSONDecodeError):
+            pass
+        from .deepseek_v4_vision import is_deepseek_v4_vision_config
+
+        supported_vision = is_deepseek_v4_vision_config(config)
+        if entry.engine_type != "batched" and not supported_vision:
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
-                "Distributed cluster inference currently supports text LLM "
-                "models only."
+                "Distributed cluster inference supports text LLM models only, "
+                "plus the explicitly gated DeepSeek-V4-Flash-Vision family."
             )
         return model_id
 
@@ -961,11 +982,20 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            from .deepseek_v4_vision import is_deepseek_v4_vision_config
+
+            try:
+                existing_config = json.loads(config_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                existing_config = {}
+            if (
+                entry.engine_type != "batched"
+                and not is_deepseek_v4_vision_config(existing_config)
+            ):
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
-                    "before activating it as a text cluster model."
+                    "before activating it as a cluster model."
                 )
             return model_id, False
 
@@ -988,10 +1018,13 @@ class EnginePool:
         context = config.get("max_position_embeddings")
         if not isinstance(context, int) or context <= 0:
             context = None
+        from .deepseek_v4_vision import is_deepseek_v4_vision_config
+
+        model_type = "vlm" if is_deepseek_v4_vision_config(config) else "llm"
         self._entries[model_id] = EngineEntry(
             model_id=model_id,
             model_path=str(path),
-            model_type="llm",
+            model_type=model_type,
             engine_type="batched",
             estimated_size=int(estimated_size),
             config_model_type=str(config.get("model_type") or ""),

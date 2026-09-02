@@ -185,6 +185,9 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    original_call = getattr(cls, "_omlx_mtp_base_call", cls.__call__)
+    cls._omlx_mtp_base_call = original_call
+
     import mlx.core as mx
     from mlx_lm.models.base import create_attention_mask
 
@@ -197,7 +200,16 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         cache=None,
         return_raw_hidden: bool = False,
         return_dspark_hidden: bool = False,
+        *,
+        inputs_embeds=None,
     ):
+        if inputs_embeds is not None:
+            return original_call(
+                self,
+                inputs,
+                cache,
+                inputs_embeds=inputs_embeds,
+            )
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
             h[:, :, None, :],
@@ -295,6 +307,8 @@ def _patch_model(dsv4: Any) -> None:
     materialize_cache_arrays = dsv4._materialize_cache_arrays
 
     original_init = cls.__init__
+    original_call = getattr(cls, "_omlx_mtp_base_call", cls.__call__)
+    cls._omlx_mtp_base_call = original_call
 
     def __init__(self, config):
         original_init(self, config)
@@ -352,6 +366,13 @@ def _patch_model(dsv4: Any) -> None:
         n_confirmed: int = 0,
         skip_lm_head: bool = False,
     ):
+        if (
+            getattr(self, "is_vision_model", False)
+            and not getattr(self, "_omlx_mtp_decode_enabled", False)
+            and not return_hidden
+            and not skip_lm_head
+        ):
+            return original_call(self, inputs, cache)
         if skip_lm_head:
             # Chunked prefill discards per-chunk logits (the prompt's final
             # token is scored by the first decode step instead). Run the

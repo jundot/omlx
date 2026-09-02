@@ -938,10 +938,21 @@ def install_server_telemetry(
                 # Keeping the rank vote inside that boundary rejects just this
                 # request; raising from its later cache lookup kills the whole
                 # generation thread.
+                guard_kwargs = {
+                    "cached_tokens": len(prompt) - len(rest),
+                    "mx_module": mx,
+                }
+                if getattr(self, "_omlx_prefill_step_size_override", False):
+                    # The vision runtime prefills the uncached image-bearing
+                    # suffix in one call. Size admission for that actual call,
+                    # without changing the server's configured chunk size.
+                    guard_kwargs["prefill_step_size"] = max(
+                        snapshot_step,
+                        len(rest),
+                    )
                 prefill_guard.check_collective(
                     len(prompt),
-                    cached_tokens=len(prompt) - len(rest),
-                    mx_module=mx,
+                    **guard_kwargs,
                 )
             except Exception:
                 self.prompt_cache.discard_prefetched_cache()

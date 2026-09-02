@@ -3,6 +3,7 @@
 import io
 import json
 import platform
+import shlex
 import signal
 import stat
 import subprocess
@@ -406,6 +407,10 @@ def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
     assert "from omlx._version import __version__" in argv[-1]
     assert "package_version(n)" in argv[-1]
     assert "import omlx.adapter.output_parser" in argv[-1]
+    remote_argv = shlex.split(argv[-1])
+    assert remote_argv[-5:] == ["org/model", "0", "3", "1", "balanced"]
+    assert "rank=int(sys.argv[4])" in remote_argv[2]
+    assert "ceiling_breakdown(sys.argv[5])" in remote_argv[2]
     assert kwargs["timeout"] == 8.0
     assert kwargs["check"] is False
 
@@ -549,13 +554,19 @@ def test_remote_preflight_requires_matching_model_identity(
 ):
     model = tmp_path / "nemotron"
     model.mkdir()
+    validated_ranks = []
+
+    def validate(_path, _start, _end, *, rank):
+        validated_ranks.append(rank)
+        return {
+            "model_identity": "local",
+            "stage_ready": True,
+        }
+
     monkeypatch.setattr(
         launch,
         "validate_staged_model",
-        lambda path, start, end: {
-            "model_identity": "local",
-            "stage_ready": True,
-        },
+        validate,
     )
     versions = _local_runtime_versions() | {
         "cluster-protocol": CLUSTER_PROTOCOL_VERSION,
@@ -579,6 +590,7 @@ def test_remote_preflight_requires_matching_model_identity(
             python_executable="/opt/omlx/bin/python",
             runner=runner,
         )
+    assert validated_ranks == [0]
 
 
 def test_remote_preflight_rejects_an_incomplete_rank_stage(
@@ -590,7 +602,7 @@ def test_remote_preflight_rejects_an_incomplete_rank_stage(
     monkeypatch.setattr(
         launch,
         "validate_staged_model",
-        lambda path, start, end: {
+        lambda path, start, end, *, rank: {
             "model_identity": "same",
             "stage_ready": True,
         },

@@ -1606,6 +1606,7 @@ def _run_staging_job(
                 end_layer=assignment.end_layer,
                 present=present,
                 shards=shards,
+                rank=assignment.rank,
             )
             needed = tuple(
                 name

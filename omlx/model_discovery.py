@@ -568,10 +568,13 @@ def _has_vision_subconfig(config: dict) -> bool:
     Used by the VLM classifier in :func:`detect_model_type` and by other
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
+    from .deepseek_v4_vision import is_deepseek_v4_vision_config
+
     return (
         bool(config.get("vision_config"))
         or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
+        or is_deepseek_v4_vision_config(config)
     )
 
 

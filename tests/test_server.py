@@ -67,6 +67,171 @@ class TestBoundarySnapshotLifecycle:
         assert stale_dir.exists()
 
 
+class TestDistributedMultimodalRouting:
+    """Public API routing tests with no model weights or worker processes."""
+
+    @staticmethod
+    def _patch_engine(monkeypatch, server_module):
+        from types import SimpleNamespace
+
+        engine = SimpleNamespace(
+            supports_multimodal_fallback=True,
+            model_type="deepseek_v4",
+            tokenizer=None,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "get_engine_for_model",
+            AsyncMock(return_value=engine),
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_serving_model_id",
+            lambda _lease, requested: requested,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "get_model_settings_for_request",
+            lambda _model: None,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "get_engine_pool",
+            lambda: SimpleNamespace(get_entry=lambda _model: None),
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_routes_images_to_multimodal_extractor(
+        self, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.api.openai_models import ChatCompletionRequest
+
+        class RoutedError(Exception):
+            pass
+
+        self._patch_engine(monkeypatch, server_module)
+        request = ChatCompletionRequest(
+            model="vision",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,a"},
+                        }
+                    ],
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_preprocess_markitdown_files_for_llm",
+            AsyncMock(return_value=request),
+        )
+        monkeypatch.setattr(
+            server_module,
+            "extract_multimodal_content",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RoutedError()),
+        )
+
+        with pytest.raises(RoutedError):
+            await server_module.create_chat_completion(
+                request,
+                MagicMock(headers={}),
+                True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_messages_preserves_images_for_distributed_vision(
+        self, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.api.anthropic_models import MessagesRequest
+
+        class RoutedError(Exception):
+            pass
+
+        self._patch_engine(monkeypatch, server_module)
+        observed = []
+
+        def convert(*_args, **kwargs):
+            observed.append(kwargs["preserve_images"])
+            raise RoutedError
+
+        monkeypatch.setattr(server_module, "convert_anthropic_to_internal", convert)
+        request = MessagesRequest(
+            model="vision",
+            max_tokens=8,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "a",
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+
+        with pytest.raises(RoutedError):
+            await server_module.create_anthropic_message(
+                request,
+                MagicMock(headers={}),
+                True,
+            )
+        assert observed == [True]
+
+    @pytest.mark.asyncio
+    async def test_responses_preserves_images_for_distributed_vision(self, monkeypatch):
+        import omlx.server as server_module
+        from omlx.api.responses_models import ResponsesRequest
+
+        class RoutedError(Exception):
+            pass
+
+        self._patch_engine(monkeypatch, server_module)
+        observed = []
+
+        def convert(*_args, **kwargs):
+            observed.append(kwargs["preserve_images"])
+            raise RoutedError
+
+        monkeypatch.setattr(
+            server_module, "convert_responses_input_to_messages", convert
+        )
+        request = ResponsesRequest(
+            model="vision",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,a",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        with pytest.raises(RoutedError):
+            await server_module.create_response(
+                request,
+                MagicMock(headers={}),
+                True,
+            )
+        assert observed == [True]
+
+
 class TestDiffusionStructuredOutputGuard:
     class _DiffusionEngine:
         is_diffusion_model = True
