@@ -13,7 +13,7 @@ pinned mlx-lm v0.31.3 (`ed1fca4`) without modifying the upstream package.
 
 | File | Source | Notes |
 |---|---|---|
-| `deepseek_v4_model.py` | PR 1192 `mlx_lm/models/deepseek_v4.py` | 1:1 copy — do not edit |
+| `deepseek_v4_model.py` | adapted from PR 1192 `mlx_lm/models/deepseek_v4.py` | oMLX pipeline and distributed-vision extensions |
 | `hyper_connection.py` | PR 1192 `mlx_lm/models/hyper_connection.py` | 1:1 copy — do not edit |
 | `cache_extras.py` | PR 1192 `mlx_lm/models/cache.py` lines 903-1447 | PoolingCache + BatchPoolingCache, 1:1 |
 | `utils_patch.py` | adapted from PR 1192 `mlx_lm/utils.py` | replacement `load_model` + `_load_safetensors` |
@@ -53,7 +53,9 @@ When mlx-lm merges PR 1192 upstream, simply:
 
 ## Synchronizing with PR 1192 updates
 
-If PR 1192 adds new commits before merge, refresh the 1:1 sources:
+If PR 1192 adds new commits before merge, refresh the unchanged source and
+reapply the documented oMLX pipeline and distributed-vision extensions; do not
+blindly overwrite `deepseek_v4_model.py`:
 
 ```bash
 SHA=<new_head_sha>
