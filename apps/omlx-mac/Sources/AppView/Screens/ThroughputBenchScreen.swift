@@ -245,18 +245,18 @@ private struct ConfigurationSection: View {
                     .disabled(running)
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.context_lengths.title",
-                                  defaultValue: "Context lengths",
-                                  comment: "Inline title above the prompt-length chip row"),
-                    sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
-                                     defaultValue: "Prompt tokens to feed for each single-request trial",
-                                     comment: "Sublabel under the prompt-length chip row"),
+            Row(label: String(localized: "bench.throughput.row.context_lengths.title",
+                              defaultValue: "Context lengths",
+                              comment: "Inline title above the prompt-length chip row"),
+                sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
+                                 defaultValue: "Prompt tokens to feed for each single-request trial",
+                                 comment: "Sublabel under the prompt-length chip row")) {
+                ChipGroup(
                     options: Self.promptLengthOptions,
                     selection: $promptLengths,
                     format: Self.formatPromptLength
                 )
+                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.gen_length.label",
@@ -273,18 +273,18 @@ private struct ConfigurationSection: View {
                 )
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.batch_sizes.title",
-                                  defaultValue: "Batch sizes",
-                                  comment: "Inline title above the batch-size chip row"),
-                    sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
-                                     defaultValue: "Concurrent requests per batch in the continuous-batching phase",
-                                     comment: "Sublabel under the batch-size chip row"),
+            Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
+                              defaultValue: "Batch sizes",
+                              comment: "Inline title above the batch-size chip row"),
+                sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
+                                 defaultValue: "Concurrent requests per batch in the continuous-batching phase",
+                                 comment: "Sublabel under the batch-size chip row")) {
+                ChipGroup(
                     options: Self.batchSizeOptions,
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
             }
 
             Row(isLast: true) {
@@ -354,36 +354,24 @@ private struct ConfigurationSection: View {
     }
 }
 
-// MARK: - Chip row
+// MARK: - Chip group
 
-private struct ChipRow: View {
-    let title: String
-    let sublabel: String
+/// Multi-select strip of toggle chips, used as a `Row` trailing. Styled to
+/// echo the segmented control — quiet fill, accent when selected — but with
+/// detached segments and gaps because multiple values can be active at once.
+private struct ChipGroup: View {
     let options: [Int]
     @Binding var selection: Set<Int>
     let format: (Int) -> String
 
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                Text(sublabel)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            HStack(spacing: 6) {
-                ForEach(options, id: \.self) { value in
-                    Chip(
-                        label: format(value),
-                        isSelected: selection.contains(value),
-                        onTap: { toggle(value) }
-                    )
-                }
-                Spacer(minLength: 0)
+        HStack(spacing: 5) {
+            ForEach(options, id: \.self) { value in
+                Chip(
+                    label: format(value),
+                    isSelected: selection.contains(value),
+                    onTap: { toggle(value) }
+                )
             }
         }
     }
@@ -408,19 +396,16 @@ private struct Chip: View {
         Button(action: onTap) {
             Text(label)
                 .font(.omlxText(11.5, weight: .medium))
-                .foregroundStyle(isSelected ? theme.accentText : theme.textSecondary)
+                // Chips must never compress: under width pressure SwiftUI
+                // would otherwise wrap "128K" to "12/8K". The label column
+                // absorbs the squeeze instead.
+                .fixedSize()
+                .foregroundStyle(isSelected ? theme.accentText : theme.text)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isSelected ? theme.accent : theme.controlBg)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? Color.clear : theme.inputBorder,
-                                    lineWidth: 0.5
-                                )
-                        )
+                        .fill(isSelected ? theme.accent : theme.hoverBg)
                 )
                 .contentShape(Rectangle())
         }
