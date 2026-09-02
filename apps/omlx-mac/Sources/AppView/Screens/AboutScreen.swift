@@ -69,9 +69,9 @@ private struct HeroCard: View {
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.groupBg)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
         .padding(.horizontal, 14)

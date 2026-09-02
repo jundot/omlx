@@ -66,7 +66,7 @@ struct MessageBanner: View {
                 row(icon: "checkmark.circle.fill", text: success, color: theme.greenDot)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, (hasError || hasSuccess) ? 6 : 0)
     }
 

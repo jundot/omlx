@@ -110,7 +110,6 @@ private struct SchedulerSection: View {
                     ],
                     icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]
                 )
-                .frame(width: 240)
             }
         }
     }

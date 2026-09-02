@@ -312,7 +312,7 @@ private struct EstimateStrip: View {
                              defaultValue: "Output size: ~\(outputSizeText)",
                              comment: "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string"))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }

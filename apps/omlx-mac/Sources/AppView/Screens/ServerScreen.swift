@@ -316,7 +316,7 @@ struct ServerHeroCard: View {
         // Hero card surface follows the grouped Settings style. Status is
         // carried by the pill/actions, not by a colored background wash.
         .background(heroBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
     }
@@ -673,7 +673,8 @@ private struct ServerAdvancedSection: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 18)
+            // Matches SectionHeader's indent (card gutter + row inset).
+            .padding(.horizontal, 28)
             .padding(.top, 22)
             .padding(.bottom, 8)
 

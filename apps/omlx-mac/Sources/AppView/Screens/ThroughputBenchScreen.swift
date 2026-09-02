@@ -129,7 +129,7 @@ private struct DeviceChip: View {
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 2)
         .padding(.bottom, 8)
     }
@@ -232,7 +232,6 @@ private struct ConfigurationSection: View {
                                      defaultValue: "Full · 2,048",
                                      comment: "Full 2048-token ANE benchmark warm-up option")),
                 ])
-                .frame(width: 260)
                 .disabled(running)
             }
 
@@ -915,7 +914,7 @@ private struct OwnerHashRow: View {
             }
             .buttonStyle(.omlx(.plain, size: .small))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }

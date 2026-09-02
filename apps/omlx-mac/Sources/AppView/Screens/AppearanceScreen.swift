@@ -138,7 +138,6 @@ struct AppearanceScreen: View {
                             )
                         ),
                     ])
-                    .frame(width: 200)
                 }
             }
 
