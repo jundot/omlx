@@ -7938,13 +7938,23 @@ class Scheduler:
                 f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
             )
 
-    # A 4K prompt is the smallest standard benchmark/workload where a missed
-    # async store is already a multi-second re-prefill.  DeepSeek V4 boundary
-    # snapshots intentionally retain 3584 of 4096 prompt tokens, and their SSD
-    # write can finish just after the first HTTP response is returned.  Include
-    # this workload class in the non-blocking freshness deferral so an immediate
-    # repeated turn waits for that relevant store instead of racing it.
-    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS = 4096
+    # Whether an in-flight store_cache is worth waiting for is decided by the
+    # overlap with it, not by the prompt's length.  What a wait can save is the
+    # re-prefill of the restorable overlap (whole blocks of the effective
+    # paged_cache_block_size -- 256 for KV models, the 2048-token boundary when
+    # the GDN split is active); what it costs is bounded by the store's own
+    # duration, which scales with the tokens THAT store copies (~13-20 us/token
+    # measured on M5 Max, hot cache off) while prefill costs ~0.6-5 ms/token
+    # across current models and machines.  So: never wait when less than one
+    # block is restorable (nothing a wait could make visible), and never wait on
+    # a store more than 16x larger than the overlap (a harness side-request
+    # that shares only the system prompt with a 100K-token turn being stored),
+    # which keeps the worst-case wait well under the prefill it avoids.  A fixed
+    # prompt floor (8192, then 4096 for the DeepSeek V4 3584-of-4096 boundary
+    # snapshot, #2471) reproduced the race one notch lower each time: agent
+    # harnesses firing a 3K follow-up instantly re-prefilled every turn (#3102).
+    # The 4K boundary-snapshot case still waits under the overlap gates.
+    _CACHE_FRESHNESS_WAIT_MAX_STORE_TO_OVERLAP = 16
     _CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS = 8192
     _CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO = 0.30
     _CACHE_FRESHNESS_WAIT_TIMEOUT_S = 4.0
@@ -7970,8 +7980,7 @@ class Scheduler:
             return None
 
         prompt = request.prompt_token_ids or []
-        if len(prompt) < self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS:
-            return None
+        block = max(1, self.config.paged_cache_block_size)
 
         best_rid: str | None = None
         best_future: concurrent.futures.Future | None = None
@@ -7984,6 +7993,18 @@ class Scheduler:
                 continue
 
             common = self._common_prefix_len(prompt, info.tokens)
+            # Per-candidate: only whole blocks can be restored, and a store far
+            # larger than the overlap costs more to wait for than it saves. A
+            # longest-overlap store that fails here must not veto a smaller
+            # store that passes, so filter before ranking.
+            restorable = (common // block) * block
+            if restorable < block:
+                continue
+            if (
+                len(info.tokens)
+                > self._CACHE_FRESHNESS_WAIT_MAX_STORE_TO_OVERLAP * restorable
+            ):
+                continue
             if common > best_common:
                 best_rid = rid
                 best_future = future

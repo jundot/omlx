@@ -822,13 +822,14 @@ class TestSchedulerAddRequest:
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
 
-    def test_admission_does_not_defer_for_short_prompt_even_with_high_ratio(
+    def test_admission_defers_for_short_prompt_with_restorable_overlap(
         self, mock_model, mock_tokenizer
     ):
-        """Prompts below the freshness minimum should never wait on store_cache."""
+        """A sub-4K follow-up waits when whole blocks of the store are reusable (#3102)."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
         prompt = list(range(4095))
+        scheduler.block_aware_cache.fetch_cache.return_value = (None, prompt)
 
         future = MagicMock()
         future.done.return_value = False
@@ -848,8 +849,173 @@ class TestSchedulerAddRequest:
 
         future.result.assert_not_called()
         scheduler.block_aware_cache.fetch_cache.assert_not_called()
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+        wait = scheduler._cache_freshness_waits[request.request_id]
+        assert wait.store_request_id == "req-prev"
+        assert wait.common_prefix == 3584
+
+        future.done.return_value = True
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        scheduler._prepare_prefix_cache_for_request(request)
+        scheduler.block_aware_cache.fetch_cache.assert_called_once()
+        future.result.assert_not_called()
+
+    def test_admission_defers_for_instant_follow_up_on_gdn_boundary_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """The live #3102 shape: 2875-token turn 2 vs a 2048-token boundary store."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 2048
+        prompt = list(range(2875))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(2048)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("block_size", "prompt_len", "store_len", "expected"),
+        [
+            # Less than one 256-token block is restorable: nothing to wait for.
+            (256, 3000, 200, False),
+            # A 2000-token overlap never reaches the 2048 GDN boundary block.
+            (2048, 3000, 2000, False),
+            # Exactly one full block is restorable: wait.
+            (256, 300, 256, True),
+        ],
+    )
+    def test_admission_freshness_gate_requires_one_restorable_block(
+        self, mock_model, mock_tokenizer, block_size, prompt_len, store_len, expected
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = block_size
+        prompt = list(range(prompt_len))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(store_len)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is expected
+        assert (request.request_id in scheduler._cache_freshness_waits) is expected
+        future.result.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("prompt_len", "overlap", "store_len", "expected"),
+        [
+            # A side-request sharing one 2048-token block with a 100K-token
+            # store: the wait would dwarf the prefill it saves.
+            (2300, 2048, 100_000, False),
+            # Exactly 16x the restorable overlap still waits ...
+            (2300, 2048, 16 * 2048, True),
+            # ... one token past it does not.
+            (2300, 2048, 16 * 2048 + 1, False),
+            # Applies above 4K too: a 5K prompt reusing 4096 of a 100K store.
+            (5000, 4096, 100_000, False),
+        ],
+    )
+    def test_admission_freshness_gate_bounds_store_size_by_overlap(
+        self, mock_model, mock_tokenizer, prompt_len, overlap, store_len, expected
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        stored = list(range(store_len))
+        # The prompt diverges from the stored sequence right after `overlap`.
+        prompt = stored[:overlap] + list(range(10**6, 10**6 + prompt_len - overlap))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=stored)
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is expected
+        assert (request.request_id in scheduler._cache_freshness_waits) is expected
+        future.result.assert_not_called()
+
+    def test_admission_freshness_gate_filters_candidates_before_ranking(
+        self, mock_model, mock_tokenizer
+    ):
+        """An oversized longest-overlap store must not veto a smaller eligible one."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        big_store = list(range(100_000))
+        prompt = big_store[:2048] + list(range(10**6, 10**6 + 2300 - 2048))
+        # Shares the first 1024 tokens with the prompt, then diverges.
+        small_store = big_store[:1024] + list(range(2 * 10**6, 2 * 10**6 + 2300 - 1024))
+
+        big_future = MagicMock()
+        big_future.done.return_value = False
+        small_future = MagicMock()
+        small_future.done.return_value = False
+        scheduler._inflight_store_futures["req-big"] = big_future
+        scheduler._inflight_store_info["req-big"] = scheduler_module._InflightStoreInfo(
+            tokens=big_store
+        )
+        scheduler._inflight_store_futures["req-small"] = small_future
+        scheduler._inflight_store_info["req-small"] = (
+            scheduler_module._InflightStoreInfo(tokens=small_store)
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        wait = scheduler._cache_freshness_waits[request.request_id]
+        assert wait.store_request_id == "req-small"
+        assert wait.common_prefix == 1024
+        big_future.result.assert_not_called()
+        small_future.result.assert_not_called()
+
+        # With the only eligible store already visible, nothing is left to wait on.
+        scheduler._cache_freshness_waits.clear()
+        small_future.done.return_value = True
         assert scheduler._should_defer_for_cache_freshness(request) is False
         assert request.request_id not in scheduler._cache_freshness_waits
+
+    def test_scheduler_has_no_prompt_length_freshness_floor(self):
+        assert not hasattr(Scheduler, "_CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS")
 
     def test_admission_defers_for_immediate_4k_boundary_store(
         self, mock_model, mock_tokenizer
