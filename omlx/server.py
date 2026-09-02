@@ -4763,6 +4763,18 @@ async def stream_chat_completion(
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    # Strip leading whitespace from streamed content until the first real
+    # character flows. Reasoning models emit ``<think>...</think>\n\n# Header``;
+    # ThinkingParser strips the tags but leaves the ``\n\n`` between
+    # ``</think>`` and the answer, which the streaming path would otherwise
+    # emit verbatim as the opening content delta. The non-streaming path
+    # ``.strip()``s content, so without this guard the streamed answer starts
+    # with stray newlines that some markdown renderers collapse (issue #1697).
+    # Leading-only: interior newlines are preserved so markdown stays intact.
+    # Partial (assistant-prefill) continuations are exempt: their first token
+    # legitimately continues mid-sentence (" 42" after "The answer is"), so a
+    # leading space is semantic there and must stream through.
+    content_started = bool(kwargs.get("is_partial"))
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4834,6 +4846,10 @@ async def stream_chat_completion(
                 if content_delta:
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
+                    if not content_started:
+                        content_delta = content_delta.lstrip()
+                        if content_delta:
+                            content_started = True
                     if content_delta:
                         chunk = ChatCompletionChunk(
                             id=response_id,
@@ -4893,6 +4909,10 @@ async def stream_chat_completion(
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
+            if not content_started:
+                content_delta = content_delta.lstrip()
+                if content_delta:
+                    content_started = True
             if content_delta:
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -4908,6 +4928,10 @@ async def stream_chat_completion(
 
         if tool_filter:
             remaining = tool_filter.finish()
+            if remaining and not content_started:
+                remaining = remaining.lstrip()
+                if remaining:
+                    content_started = True
             if remaining:
                 chunk = ChatCompletionChunk(
                     id=response_id,

@@ -908,6 +908,184 @@ class TestStreamingHelperFunctions:
         # not one buffered chunk emitted only at completion.
         assert content_deltas == ["Hello", " world"]
 
+    async def _collect_content_deltas(self, engine, **extra) -> List[str]:
+        """Run stream_chat_completion against ``engine`` (no tools) and
+        return the non-empty content deltas in emission order."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+        )
+        messages = [{"role": "user", "content": "Hi"}]
+        events = []
+        async for event in stream_chat_completion(
+            engine, messages, request, max_tokens=256, temperature=0.7, top_p=0.9, top_k=40, **extra
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        return [
+            delta
+            for payload in payloads
+            if payload.get("choices")
+            for delta in [payload["choices"][0].get("delta", {}).get("content")]
+            if delta
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_strips_leading_whitespace_after_think(self):
+        """Issue 1697: a reasoning model emits ``<think>...</think>\\n\\n# Header``.
+        ThinkingParser strips the tags but the ``\\n\\n`` between ``</think>``
+        and the answer survives as the first content delta. The non-streaming
+        path ``.strip()``s assembled content, so streaming must drop that
+        leading whitespace too — while preserving INTERIOR newlines so
+        markdown structure stays intact."""
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>plan",
+                new_text="<think>plan",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<think>plan</think>\n\n",
+                new_text="</think>\n\n",
+                completion_tokens=2,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<think>plan</think>\n\n# Header\n\n- a\n- b",
+                new_text="# Header\n\n- a\n- b",
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        content_deltas = await self._collect_content_deltas(engine)
+
+        # The pure-whitespace "\n\n" delta after </think> is dropped; the
+        # answer streams from its first real character with interior
+        # newlines untouched.
+        assert content_deltas == ["# Header\n\n- a\n- b"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_leading_whitespace_split_across_chunks(self):
+        """Issue 1697, chunk-boundary case: the leading whitespace run spans
+        TWO deltas — a pure-whitespace chunk (dropped entirely) followed by a
+        mixed chunk that still opens with whitespace (lstripped). The
+        ``content_started`` flag must persist across chunk boundaries so the
+        whole leading run goes, not just the first delta's share."""
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>plan</think>\n",
+                new_text="<think>plan</think>\n",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<think>plan</think>\n\n# Header\n\n- a",
+                new_text="\n# Header\n\n- a",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        content_deltas = await self._collect_content_deltas(engine)
+
+        # Chunk 1's "\n" content is dropped (pure whitespace); chunk 2's
+        # leading "\n" is trimmed; everything after the first real
+        # character streams verbatim.
+        assert content_deltas == ["# Header\n\n- a"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_strips_leading_whitespace_in_finish_flush(self):
+        """Issue 1697, finish/flush path: when ThinkingParser.finish() is what
+        produces the content (here via its malformed-thinking recovery — no
+        ``</think>`` ever arrived), the flushed content must get the same
+        leading-whitespace trim as live deltas."""
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<think>",
+                new_text="<think>",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<think>\n\nRecovered answer",
+                new_text="\n\nRecovered answer",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        content_deltas = await self._collect_content_deltas(engine)
+
+        assert content_deltas == ["Recovered answer"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_non_reasoning_content_streams_verbatim(self):
+        """No <think> block: the first content delta already starts with a
+        real character, so the leading-strip guard is a no-op and every delta
+        streams verbatim (non-reasoning output that opens with a real
+        character is unchanged; a whitespace-opening completion is trimmed to
+        match the non-streaming path's ``.strip()``)."""
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="# Title\n\n",
+                new_text="# Title\n\n",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="# Title\n\nbody text",
+                new_text="body text",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        content_deltas = await self._collect_content_deltas(engine)
+
+        assert content_deltas == ["# Title\n\n", "body text"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_completion_partial_continuation_preserves_leading_space(self):
+        """``partial: true`` (assistant-prefill) continuations are exempt from
+        the leading-strip guard: the first token legitimately continues
+        mid-sentence, so its leading space is semantic and must stream
+        through (streaming keeps the space the prefill workflow depends on)."""
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text=" 42.",
+                new_text=" 42.",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            ),
+        ])
+
+        content_deltas = await self._collect_content_deltas(
+            engine, is_partial=True
+        )
+
+        assert content_deltas == [" 42."]
+
     @pytest.mark.asyncio
     async def test_stream_chat_completion_sanitizes_tool_call_markup_inside_reasoning(self):
         """Reasoning deltas should keep prose while suppressing tool-call markup."""
