@@ -22,6 +22,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
+from omlx.integrations.swival import SwivalIntegration
 
 
 def ctx(**overrides) -> IntegrationContext:
@@ -2013,6 +2014,117 @@ class TestCopilotIntegration:
         assert "COPILOT_PROVIDER_WIRE_MODEL" not in env
         assert "COPILOT_PROVIDER_MAX_PROMPT_TOKENS" not in env
         assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
+
+
+class TestSwivalIntegration:
+    def test_get_command(self):
+        swival = SwivalIntegration()
+        cmd = swival.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
+        assert "omlx launch swival" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        swival = SwivalIntegration()
+        cmd = swival.get_command(ctx(port=8000, api_key="", model=""))
+        assert "select-a-model" in cmd
+
+    def test_get_command_omits_swival_only_flags(self):
+        """`omlx launch` rejects swival's provider flags, so the displayed
+        command must not carry them -- it is meant to be copy-pasteable."""
+        swival = SwivalIntegration()
+        cmd = swival.get_command(
+            ctx(port=8000, api_key="key", model="qwen3.5", context_window=32768)
+        )
+        assert "--provider" not in cmd
+        assert "--base-url" not in cmd
+        assert "--api-key" not in cmd
+        assert "--max-context-tokens" not in cmd
+
+    def test_launch_injects_model_and_base_url(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(ctx(port=9000, api_key="key", model="qwen3.5"))
+
+        argv = captured["argv"]
+        assert captured["binary"] == "swival"
+        assert argv[0] == "swival"
+        assert argv[argv.index("--model") + 1] == "qwen3.5"
+        assert argv[argv.index("--provider") + 1] == "generic"
+        # swival appends /v1 itself, so the bare base URL is correct here.
+        assert argv[argv.index("--base-url") + 1] == "http://127.0.0.1:9000"
+        assert argv[argv.index("--api-key") + 1] == "key"
+
+    def test_launch_omits_optional_flags_when_unset(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(ctx(port=8000, api_key="", model=""))
+
+        argv = captured["argv"]
+        assert "--api-key" not in argv
+        assert "--model" not in argv
+        assert "--max-context-tokens" not in argv
+
+    def test_launch_passes_context_window_and_extra_args(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(
+                ctx(
+                    port=8000,
+                    api_key="",
+                    model="qwen3.5",
+                    context_window=32768,
+                    extra_args=("--yolo",),
+                )
+            )
+
+        argv = captured["argv"]
+        assert argv[argv.index("--max-context-tokens") + 1] == "32768"
+        assert argv[-1] == "--yolo"
+
+    def test_launch_scrubs_python_env(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.swival.os.environ", base_env),
+            patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe),
+        ):
+            swival.launch(ctx(port=8000, api_key="", model="qwen3.5"))
+
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+        assert captured["env"]["PATH"] == "/usr/bin"
+
+    def test_type(self):
+        swival = SwivalIntegration()
+        assert swival.type == "env_var"
+        assert swival.display_name == "Swival"
 
 
 class TestIntegrationSettings:

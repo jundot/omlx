@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Swival integration."""
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ class SwivalIntegration(Integration):
             display_name="Swival",
             type="env_var",
             install_check="swival",
-            install_hint="Install swival by following instructions at https://github.com/your-repo/swival",
+            install_hint="uv tool install --python 3.14 swival",
         )
 
     def get_command(self, ctx: IntegrationContext) -> str:
