@@ -89,6 +89,7 @@
 		AAD9D51D2FE2842C00FAEA05 /* ModelsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */; };
 		AAD9D51F2FE2843F00FAEA05 /* DownloadsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */; };
 		AAD9D5212FE2845300FAEA05 /* ModelSettingsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */; };
+		AAD9D5332FE2851100FAEA05 /* ANETuningSessionVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5322FE2851100FAEA05 /* ANETuningSessionVM.swift */; };
 		AAD9D5232FE2846600FAEA05 /* IntegrationsScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */; };
 		AAD9D5252FE2848500FAEA05 /* SecurityScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */; };
 		AAD9D5272FE2849800FAEA05 /* QuantizationScreenVM.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */; };
@@ -233,6 +234,7 @@
 		AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVM.swift; sourceTree = "<group>"; };
+		AAD9D5322FE2851100FAEA05 /* ANETuningSessionVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ANETuningSessionVM.swift; sourceTree = "<group>"; };
 		AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationsScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurityScreenVM.swift; sourceTree = "<group>"; };
 		AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationScreenVM.swift; sourceTree = "<group>"; };
@@ -569,6 +571,7 @@
 				AAD9D51C2FE2842C00FAEA05 /* ModelsScreenVM.swift */,
 				AAD9D51E2FE2843F00FAEA05 /* DownloadsScreenVM.swift */,
 				AAD9D5202FE2845300FAEA05 /* ModelSettingsScreenVM.swift */,
+				AAD9D5322FE2851100FAEA05 /* ANETuningSessionVM.swift */,
 				AAD9D5222FE2846600FAEA05 /* IntegrationsScreenVM.swift */,
 				AAD9D5242FE2848500FAEA05 /* SecurityScreenVM.swift */,
 				AAD9D5262FE2849800FAEA05 /* QuantizationScreenVM.swift */,
@@ -748,6 +751,7 @@
 				6BB00000000000000000000F /* NetworkScreen.swift in Sources */,
 				6BB000000000000000000010 /* PerformanceScreen.swift in Sources */,
 				AAD9D5212FE2845300FAEA05 /* ModelSettingsScreenVM.swift in Sources */,
+				AAD9D5332FE2851100FAEA05 /* ANETuningSessionVM.swift in Sources */,
 				AAD9D5192FE2840100FAEA05 /* StatusScreenVM.swift in Sources */,
 				AAD9D5272FE2849800FAEA05 /* QuantizationScreenVM.swift in Sources */,
 				7BB000000000000000000001 /* AppServices.swift in Sources */,
