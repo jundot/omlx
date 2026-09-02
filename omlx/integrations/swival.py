@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.utils.install import get_cli_command_prefix
@@ -22,30 +21,13 @@ class SwivalIntegration(Integration):
         )
 
     def get_command(self, ctx: IntegrationContext) -> str:
-        # Build the basic command with model and base URL
-        cmd_parts = [
-            f"{get_cli_command_prefix()}",
-            "launch",
-            "swival",
-            "--provider",
-            "generic",
-            "--base-url",
-            ctx.base_url,
-        ]
-        
-        # Add API key if provided
-        if ctx.api_key:
-            cmd_parts.extend(["--api-key", ctx.api_key])
-        
-        # Add model name (this is the required injection)
-        if ctx.model:
-            cmd_parts.extend(["--model", ctx.model])
-        
-        # Add max context tokens 
-        if ctx.context_window:
-            cmd_parts.extend(["--max-context-tokens", str(ctx.context_window)])
-            
-        return " ".join(cmd_parts)
+        # Only flags `omlx launch` itself accepts belong here; the provider /
+        # base-url / context wiring is applied to the real swival binary in
+        # launch() below.
+        return (
+            f"{get_cli_command_prefix()} "
+            f"launch swival --model {ctx.model or 'select-a-model'}"
+        )
 
     def launch(self, ctx: IntegrationContext) -> None:
         # Set up environment for swival
