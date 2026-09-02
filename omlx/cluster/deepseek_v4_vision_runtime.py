@@ -69,14 +69,21 @@ def install_deepseek_v4_vision_runtime(
 
     response_type = server_module.ResponseGenerator
     original_tokenize = response_type._tokenize
+    original_serve_single = getattr(response_type, "_serve_single", None)
     original_stream_generate = server_module.stream_generate
     base_model_key = provider.model_key
     provider.is_batchable = False
 
+    def clear_request_state(instance=None):
+        provider.model_key = base_model_key
+        provider.model.set_vision_inputs(None)
+        if instance is not None:
+            instance._omlx_prefill_step_size_override = False
+
     def tokenize(self, tokenizer, request, args):
+        self._omlx_prefill_step_size_override = False
         if not _request_has_images(request):
-            self.model_provider.model_key = base_model_key
-            self.model_provider.model.set_vision_inputs(None)
+            clear_request_state(self)
             return original_tokenize(self, tokenizer, request, args)
 
         payload = None
@@ -121,6 +128,7 @@ def install_deepseek_v4_vision_runtime(
         _, prompt, initial_state, digest = shared
         self.model_provider.model.set_vision_inputs(prepared_images)
         self.model_provider.model_key = (*base_model_key, "vision", digest)
+        self._omlx_prefill_step_size_override = True
         logger.info(
             "deepseek_v4_vision stage=multimodal_prompt_ready rank=%d "
             "images=%d sequence_length=%d",
@@ -132,6 +140,14 @@ def install_deepseek_v4_vision_runtime(
         # segment also prevents the server from caching a system prefix that
         # crosses the image replacement boundary.
         return prompt, [prompt], ["assistant"], initial_state
+
+    def serve_single(self, request):
+        try:
+            return original_serve_single(self, request)
+        finally:
+            # Keep the image digest through both cache lookup and insertion,
+            # then return ModelProvider to the identity expected by load().
+            clear_request_state(self)
 
     def stream_generate(*args, **kwargs):
         prompt = kwargs.get("prompt")
@@ -176,6 +192,8 @@ def install_deepseek_v4_vision_runtime(
         yield from original_stream_generate(*args, **kwargs)
 
     response_type._tokenize = tokenize
+    if original_serve_single is not None:
+        response_type._serve_single = serve_single
     server_module.stream_generate = stream_generate
     try:
         logger.info(
@@ -185,6 +203,9 @@ def install_deepseek_v4_vision_runtime(
         )
         yield
     finally:
+        clear_request_state()
         response_type._tokenize = original_tokenize
+        if original_serve_single is not None:
+            response_type._serve_single = original_serve_single
         server_module.stream_generate = original_stream_generate
         logger.info("deepseek_v4_vision stage=teardown rank=%d", rank)

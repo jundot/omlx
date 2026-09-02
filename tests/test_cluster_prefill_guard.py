@@ -94,6 +94,30 @@ def test_cached_tokens_are_not_charged_twice():
     guard.check(150_000, cached_tokens=149_000, current_usage_bytes=4 * GiB)
 
 
+def test_request_prefill_step_override_sizes_peak_without_mutating_guard():
+    tokens = 120_000
+    usage = 2 * GiB
+    monitor = rank_monitor(_Model(), layer_count=16)
+    configured_peak = monitor.estimate_prefill_peak_bytes(tokens, 2048)
+    request_peak = monitor.estimate_prefill_peak_bytes(tokens, 16_384)
+    assert configured_peak < request_peak
+    guard = RankPrefillGuard(
+        monitor,
+        ceiling_bytes=int(usage + (configured_peak + request_peak) / 2),
+        prefill_step_size=2048,
+    )
+
+    guard.check(tokens, current_usage_bytes=usage)
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(
+            tokens,
+            current_usage_bytes=usage,
+            prefill_step_size=16_384,
+        )
+
+    assert guard._step == 2048
+
+
 # --- The desync rule: all ranks vote and leave the request together. ---------
 
 

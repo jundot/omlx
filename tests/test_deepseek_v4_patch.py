@@ -1865,6 +1865,234 @@ class TestMakeQuantizationConfigMtp:
             "mode": "mxfp8",
         }
 
+    def test_vision_attention_is_not_forced_to_language_mxfp8(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.wqkv = nn.Linear(8, 24)
+
+        class _Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = _Attention()
+
+        class _Vision(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = [_Block()]
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vision = _Vision()
+                self.language = _Block()
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        assert qcfg["language.attn.wqkv"]["mode"] == "mxfp8"
+        assert "vision.blocks.0.attn.wqkv" not in qcfg
+
+
+class TestDeepSeekV4VisionSuffixes:
+    def test_image_embedding_slices_cover_cache_offset_and_multiple_images(
+        self, applied_patch
+    ):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        first = SimpleNamespace(start=1, types=(0, 2, 4))
+        second = SimpleNamespace(start=6, types=(0, 2, 2, 4))
+
+        def normalized(offset, length):
+            return [
+                (
+                    image.start,
+                    destination.start,
+                    destination.stop,
+                    source.start,
+                    source.stop,
+                )
+                for image, destination, source in dsv4._image_embedding_slices(
+                    (first, second), offset, length
+                )
+            ]
+
+        assert normalized(0, 1) == []
+        assert normalized(2, 1) == [(1, 0, 1, 1, 2)]
+        assert normalized(4, 2) == []
+        assert normalized(3, 5) == [(1, 0, 1, 2, 3), (6, 3, 5, 0, 2)]
+        assert normalized(10, 2) == []
+
+    def test_cached_image_is_not_encoded_when_later_image_overlaps_suffix(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _Embedding:
+            weight = mx.zeros((100, 2))
+
+            def __call__(self, token_ids):
+                return mx.broadcast_to(token_ids[..., None], (*token_ids.shape, 2))
+
+        class _Vision:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, patches, _height, _width):
+                marker = int(patches[0, 0, 0, 0].item())
+                self.calls.append(marker)
+                return mx.array([[marker]], dtype=mx.float32)
+
+        class _Group:
+            @staticmethod
+            def size():
+                return 1
+
+        first = SimpleNamespace(
+            start=0,
+            types=(0, 2, 4),
+            patches=[[[[1]], [[1]], [[1]]]],
+            n_vit_h=1,
+            n_vit_w=1,
+            permutation=(0,),
+        )
+        second = SimpleNamespace(
+            start=5,
+            types=(0, 2, 4),
+            patches=[[[[2]], [[2]], [[2]]]],
+            n_vit_h=1,
+            n_vit_w=1,
+            permutation=(0,),
+        )
+        vision = _Vision()
+        fake = SimpleNamespace(
+            args=SimpleNamespace(vocab_size=100, hidden_size=2),
+            model=SimpleNamespace(embed_tokens=_Embedding()),
+            image_start=mx.full((2,), 10),
+            image_pad=mx.full((2,), 20),
+            image_newline=mx.full((2,), 30),
+            image_end=mx.full((2,), 40),
+            vision=vision,
+            aligner=lambda features, _height, _width: mx.broadcast_to(
+                features, (features.shape[0], 2)
+            ),
+            _vision_rank=0,
+            _vision_group=_Group(),
+            _vision_inputs=(first, second),
+            _vision_blocks={},
+        )
+
+        embeddings = dsv4.Model._vision_embeddings(
+            fake, mx.array([[9, 100, 102, 104, 8]]), offset=4
+        )
+        mx.eval(embeddings)
+
+        assert vision.calls == [2]
+        assert embeddings[0, 1:4].tolist() == [[10, 10], [2, 2], [40, 40]]
+        assert fake._vision_inputs == ()
+
+    def test_cached_visibility_mask_disables_standard_kernel_path(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _Embedding:
+            def __call__(self, inputs):
+                return mx.zeros((*inputs.shape, 2))
+
+        class _Cache:
+            offset = 3
+
+            @staticmethod
+            def make_mask(length, **_kwargs):
+                rows = mx.arange(3, 3 + length)[:, None]
+                columns = mx.arange(3 + length)[None]
+                return rows >= columns
+
+        class _Layer:
+            def __call__(self, h, mask, _cache, _inputs, *, _standard_mask):
+                self.mask = mask
+                self.standard = _standard_mask
+                return h
+
+        layer = _Layer()
+        fake = SimpleNamespace(
+            args=SimpleNamespace(hc_mult=1, sliding_window=128),
+            vocab_size=100,
+            embed_tokens=_Embedding(),
+            pipeline_rank=0,
+            pipeline_size=1,
+            pipeline_layers=[layer],
+            hc_head=lambda h: h,
+            norm=lambda h: h,
+        )
+
+        dsv4.DeepseekV4Model.__call__(
+            fake,
+            mx.array([[102, 103, 104]]),
+            cache=[_Cache()],
+            inputs_embeds=mx.zeros((1, 3, 2)),
+        )
+
+        assert layer.standard is False
+        assert layer.mask.shape == (3, 6)
+        assert bool(mx.all(layer.mask[:, 3:6]).item())
+
+        dsv4.DeepseekV4Model.__call__(
+            fake,
+            mx.array([[1, 2, 3]]),
+            cache=[_Cache()],
+            inputs_embeds=mx.zeros((1, 3, 2)),
+        )
+        assert layer.standard is True
+
+    def test_mtp_disabled_outer_model_preserves_vision_embedding_path(
+        self, applied_patch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        expected = mx.full((1, 3, 2), 7)
+
+        class _Inner:
+            def __call__(self, inputs, cache, *, inputs_embeds=None):
+                self.inputs = inputs
+                self.cache = cache
+                self.inputs_embeds = inputs_embeds
+                return inputs_embeds
+
+        class _Cache:
+            offset = 5
+
+        inner = _Inner()
+        seen = {}
+
+        def vision_embeddings(inputs, offset):
+            seen.update(inputs=inputs, offset=offset)
+            return expected
+
+        fake = SimpleNamespace(
+            args=SimpleNamespace(vocab_size=100),
+            is_vision_model=True,
+            _omlx_mtp_decode_enabled=False,
+            _vision_embeddings=vision_embeddings,
+            model=inner,
+            lm_head=lambda hidden: hidden,
+        )
+        inputs = mx.array([[102, 103, 104]])
+        cache = [_Cache()]
+
+        output = dsv4.Model.__call__(fake, inputs, cache)
+
+        assert output is expected
+        assert seen == {"inputs": inputs, "offset": 5}
+        assert inner.inputs_embeds is expected
+
 
 class TestDeepSeekV4SanitizeAffineSwitchMLP:
     """Sanitize should enable the FP16 affine routed-MoE fast path."""

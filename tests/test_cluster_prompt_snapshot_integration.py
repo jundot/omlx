@@ -5,6 +5,7 @@ prefill and restore the longest prefix on a later miss."""
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 from mlx_lm.models.cache import KVCache
 
 from omlx.cluster.telemetry import install_server_telemetry
@@ -304,3 +305,128 @@ def test_batched_capture_restores_on_a_later_batched_miss(tmp_path, monkeypatch)
 
     assert restored is not None
     assert rest == [999, 998]
+
+
+@pytest.mark.parametrize("fail_generation", [False, True])
+def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
+    monkeypatch,
+    fail_generation,
+):
+    from dataclasses import dataclass
+
+    from omlx.cluster import deepseek_v4_vision_runtime
+    from omlx.cluster.deepseek_v4_vision_runtime import (
+        install_deepseek_v4_vision_runtime,
+    )
+
+    prepared = SimpleNamespace(
+        patches=b"pixels",
+        n_vit_h=2,
+        n_vit_w=2,
+        types=(0, 1, 2),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_vision_runtime,
+        "prepare_token_ids",
+        lambda *_args, **_kwargs: ([1, 2, 3, 4], (prepared,)),
+    )
+    cache_keys = []
+    stream_steps = []
+
+    class Model:
+        def __init__(self):
+            self.inputs = []
+
+        def set_vision_inputs(self, images):
+            self.inputs.append(images)
+
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("canonical", None, None),
+        is_batchable=True,
+    )
+
+    class Cache:
+        def fetch_nearest_cache(self, model_key, prompt):
+            cache_keys.append(("fetch", model_key))
+            return None, prompt
+
+        def insert_cache(self, model_key, _prompt, _cache):
+            cache_keys.append(("insert", model_key))
+
+    class ResponseGenerator:
+        def __init__(self):
+            self.model_provider = provider
+            self.prompt_cache = Cache()
+
+        def _share_object(self, payload):
+            return payload
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            return [99], [[99]], ["assistant"], "normal"
+
+        def _serve_single(self, request):
+            prompt = self._tokenize(request.tokenizer, request, request.args)[0]
+            cache, rest = self.prompt_cache.fetch_nearest_cache(
+                self.model_provider.model_key,
+                prompt,
+            )
+            list(
+                server.stream_generate(
+                    prompt=rest,
+                    prompt_cache=cache,
+                    prefill_step_size=2,
+                )
+            )
+            self.prompt_cache.insert_cache(
+                self.model_provider.model_key,
+                prompt,
+                cache,
+            )
+
+    def stream_generate(*_args, **kwargs):
+        stream_steps.append(kwargs["prefill_step_size"])
+        if fail_generation:
+            raise RuntimeError("generation failed")
+        yield "token"
+
+    server = SimpleNamespace(
+        ResponseGenerator=ResponseGenerator,
+        stream_generate=stream_generate,
+    )
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda _token: 99,
+        unk_token_id=-1,
+    )
+
+    @dataclass
+    class Request:
+        tokenizer: object
+        args: object
+        messages: list
+
+    request = Request(
+        tokenizer,
+        SimpleNamespace(),
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "image"}}],
+            }
+        ],
+    )
+
+    with install_deepseek_v4_vision_runtime(server, provider, config={}, rank=0):
+        generator = ResponseGenerator()
+        if fail_generation:
+            with pytest.raises(RuntimeError, match="generation failed"):
+                generator._serve_single(request)
+        else:
+            generator._serve_single(request)
+
+        assert provider.model_key == ("canonical", None, None)
+        assert provider.model.inputs[-1] is None
+
+    assert stream_steps == [4]
+    assert [len(key) for _, key in cache_keys] == ([5] if fail_generation else [5, 5])
+    assert {key[-2] for _, key in cache_keys} == {"vision"}
