@@ -23,7 +23,7 @@ from omlx.patches.deepseek_v4.vision_inputs import (
     build_image_block,
     prepare_token_ids,
 )
-from omlx.patches.deepseek_v4.vision_model import Aligner, ViT
+from omlx.patches.deepseek_v4.vision_model import Aligner, Attention, ViT
 
 
 def _config():
@@ -117,6 +117,34 @@ def test_tiny_vision_encoder_and_aligner_produce_language_embeddings():
     assert embeddings.dtype == mx.float32
 
 
+def test_vision_attention_splits_fused_qkv_before_head_reshape():
+    config = SimpleNamespace(vision_dim=4, vision_n_heads=2)
+    attention = Attention(config)
+    projection = mx.arange(12).reshape(1, 12)
+    attention.wqkv = lambda _x: projection
+    seen = {}
+
+    def capture(q, k, v, *, scale):
+        seen.update(q=q, k=k, v=v, scale=scale)
+        return v
+
+    original = mx.fast.scaled_dot_product_attention
+    mx.fast.scaled_dot_product_attention = capture
+    try:
+        attention.wo = lambda value: value
+        attention(
+            mx.zeros((1, 4)),
+            mx.ones((1, 1, 1)),
+            mx.zeros((1, 1, 1)),
+        )
+    finally:
+        mx.fast.scaled_dot_product_attention = original
+
+    assert seen["q"].reshape(-1).tolist() == [0, 1, 2, 3]
+    assert seen["k"].reshape(-1).tolist() == [4, 5, 6, 7]
+    assert seen["v"].reshape(-1).tolist() == [8, 9, 10, 11]
+
+
 def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
     @dataclass
     class Request:
@@ -169,10 +197,11 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
         prompt, segments, _types, state = ResponseGenerator(provider)._tokenize(
             tokenizer, request, SimpleNamespace()
         )
+        assert len(provider.model.images) == 1
         streamed = list(server.stream_generate(prompt=prompt))
 
     assert provider.is_batchable is False
-    assert len(provider.model.images) == 1
+    assert provider.model.images is None
     assert segments == [prompt]
     assert state == "normal"
     assert streamed == ["first", "second"]

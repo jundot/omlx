@@ -326,6 +326,8 @@ def validate_staged_model(
     model_path: str | Path,
     start_layer: int,
     end_layer: int,
+    *,
+    rank: int = 0,
 ) -> dict[str, Any]:
     """Prove one rank has its assigned stage, not an unnecessary full model.
 
@@ -343,7 +345,7 @@ def validate_staged_model(
 
     indexed = _indexed_shards(root)
     shards = indexed if indexed is not None else index_shards(root)
-    required = shards_for_stage(shards, start_layer, end_layer)
+    required = shards_for_stage(shards, start_layer, end_layer, rank=rank)
     missing = tuple(shard.name for shard in required if not (root / shard.name).is_file())
     corrupt: list[str] = []
     for shard in required:

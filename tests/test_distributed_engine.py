@@ -52,6 +52,57 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
     return engine
 
 
+def _deepseek_v4_vision_config() -> dict:
+    return {
+        "model_type": "deepseek_v4",
+        "vision_n_layers": 2,
+        "vision_dim": 8,
+        "vision_n_heads": 2,
+        "vision_inter_dim": 16,
+        "vision_patch_size": 2,
+        "vision_rope_theta": 10_000.0,
+        "vision_downsample_ratio": 2,
+        "vision_max_n_token": 32,
+        "vision_min_pixels": 16,
+        "vision_max_wh_ratio": 8,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (_deepseek_v4_vision_config(), True),
+        ({"model_type": "deepseek_v4"}, False),
+        ({"model_type": "llama", "vision_config": None}, False),
+    ],
+)
+async def test_multimodal_api_capability_requires_recognized_distributed_vision(
+    monkeypatch,
+    config,
+    expected,
+):
+    import mlx_lm.utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_download", lambda *_args, **_kwargs: "/model")
+    monkeypatch.setattr(mlx_utils, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        mlx_utils, "load_tokenizer", lambda *_args, **_kwargs: _Tokenizer()
+    )
+    engine = DistributedBatchedEngine(_deployment())
+    monkeypatch.setattr(engine._supervisor, "start", lambda: None)
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: None)
+    engine._supervisor.port = 32000
+
+    assert engine.supports_multimodal_fallback is False
+    await engine.start()
+    try:
+        assert engine.supports_multimodal_fallback is expected
+    finally:
+        await engine.stop()
+    assert engine.supports_multimodal_fallback is False
+
+
 def test_backend_chat_messages_serialize_native_tool_history_once():
     messages = [
         {

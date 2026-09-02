@@ -164,6 +164,7 @@ class DistributedBatchedEngine(BatchedEngine):
         )
         self._client: httpx.AsyncClient | None = None
         self._model_type: str | None = None
+        self._supports_multimodal_fallback = False
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
@@ -193,6 +194,12 @@ class DistributedBatchedEngine(BatchedEngine):
         return self._model_type
 
     @property
+    def supports_multimodal_fallback(self) -> bool:
+        """Whether public chat APIs must preserve multimodal content parts."""
+
+        return self._supports_multimodal_fallback
+
+    @property
     def prefix_cache_enabled(self) -> bool:
         # MLX-LM owns a rank-local LRU prompt cache. It is intentionally not
         # exposed as oMLX's block-aware cache because those formats differ.
@@ -207,6 +214,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if self._loaded:
             return
         self._validate_model_settings()
+        self._supports_multimodal_fallback = False
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
         # are loaded here.
@@ -233,13 +241,14 @@ class DistributedBatchedEngine(BatchedEngine):
         )
         from ..model_discovery import _has_vision_subconfig
 
+        deepseek_v4_vision = is_deepseek_v4_vision_config(config)
         if _has_vision_subconfig(config):
             require_supported_distributed_vlm(config)
             logger.info(
                 "DeepSeek-V4 Vision distributed capability recognized: "
                 "rank 0 owns vision preprocessing/encoder; language uses pipeline"
             )
-        elif is_deepseek_v4_vision_config(config):  # defensive if heuristics change
+        elif deepseek_v4_vision:  # defensive if heuristics change
             require_supported_distributed_vlm(config)
         self._model_type = config.get("model_type")
         self._tokenizer = await asyncio.to_thread(
@@ -248,16 +257,21 @@ class DistributedBatchedEngine(BatchedEngine):
             {"trust_remote_code": self.deployment.trust_remote_code},
             config.get("eos_token_id"),
         )
+        self._supports_multimodal_fallback = deepseek_v4_vision
 
         try:
             await asyncio.to_thread(self._supervisor.start)
         except Exception:
             self._tokenizer = None
             self._model_type = None
+            self._supports_multimodal_fallback = False
             raise
         endpoint = self._supervisor.endpoint
         if endpoint is None:
             await asyncio.to_thread(self._supervisor.stop)
+            self._tokenizer = None
+            self._model_type = None
+            self._supports_multimodal_fallback = False
             raise DistributedLaunchError("distributed endpoint was not created")
         self._client = self._new_client(endpoint)
         self._loaded = True
@@ -301,6 +315,7 @@ class DistributedBatchedEngine(BatchedEngine):
             finally:
                 self._tokenizer = None
                 self._model_type = None
+                self._supports_multimodal_fallback = False
                 self._loaded = False
         logger.info("Distributed engine stopped: %s", self.deployment.deployment_id)
 

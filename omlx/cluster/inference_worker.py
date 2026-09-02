@@ -1240,7 +1240,11 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                # Vision must patch the base generator before telemetry creates
+                # its subclass. Then all ranks finish sharing the expanded
+                # prompt before telemetry enters cache/guard collectives.
                 with (
+                    vision_runtime,
                     install_server_telemetry(
                         marker,
                         execution=execution,
@@ -1271,7 +1275,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         mlx_server,
                         provider.tokenizer,
                     ),
-                    vision_runtime,
                 ):
                     # install_server_telemetry also runs the idle heartbeat for
                     # the length of this block, so "stale" means stalled rather

@@ -509,10 +509,10 @@ def _staged_model(assignment) -> Any:
     )
 
 
-def _worker_argv(tmp_path, *, extra=()):
+def _worker_argv(tmp_path, *, extra=(), model="org/model"):
     return [
         "--model",
-        "org/model",
+        str(model),
         "--backend",
         "ring",
         "--port",
@@ -541,6 +541,7 @@ def _run_rank(
     ceiling: int = 107 * GiB,
     wired_result=(0, None),
     assignment_honored: bool = False,
+    vision: bool = False,
 ):
     """Drive ``run_worker`` through its real argv, recording what it did.
 
@@ -570,6 +571,7 @@ def _run_rank(
         "build_guard_kwargs": None,
         "marker_while_serving": None,
         "pin_at_load": None,
+        "runtime_contexts": [],
     }
 
     # --- process boundaries: never reached in a test -----------------------
@@ -677,7 +679,11 @@ def _run_rank(
 
     @contextlib.contextmanager
     def fake_telemetry(_marker, **_kwargs):
-        yield SimpleNamespace()
+        record["runtime_contexts"].append("telemetry_enter")
+        try:
+            yield SimpleNamespace()
+        finally:
+            record["runtime_contexts"].append("telemetry_exit")
 
     monkeypatch.setattr(inference_worker, "install_server_telemetry", fake_telemetry)
 
@@ -686,6 +692,22 @@ def _run_rank(
         return SimpleNamespace(active=False)
 
     monkeypatch.setattr(inference_worker, "build_guard", fake_build_guard)
+
+    from omlx.cluster import deepseek_v4_vision_runtime
+
+    @contextlib.contextmanager
+    def fake_vision_runtime(*_args, **_kwargs):
+        record["runtime_contexts"].append("vision_enter")
+        try:
+            yield None
+        finally:
+            record["runtime_contexts"].append("vision_exit")
+
+    monkeypatch.setattr(
+        deepseek_v4_vision_runtime,
+        "install_deepseek_v4_vision_runtime",
+        fake_vision_runtime,
+    )
 
     class SpyWatchdog:
         def __init__(self, hosts_by_rank, **kwargs):
@@ -700,12 +722,48 @@ def _run_rank(
 
     pipeline_patch.clear_assigned_stage()
     try:
-        args = build_parser().parse_args(_worker_argv(tmp_path, extra=argv_extra))
+        model = "org/model"
+        if vision:
+            model = tmp_path / "vision-model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "deepseek_v4",
+                        "vision_n_layers": 2,
+                        "vision_dim": 8,
+                        "vision_n_heads": 2,
+                        "vision_inter_dim": 16,
+                        "vision_patch_size": 2,
+                        "vision_rope_theta": 10_000.0,
+                        "vision_downsample_ratio": 2,
+                        "vision_max_n_token": 32,
+                        "vision_min_pixels": 16,
+                        "vision_max_wh_ratio": 8,
+                    }
+                )
+            )
+        args = build_parser().parse_args(
+            _worker_argv(tmp_path, extra=argv_extra, model=model)
+        )
         record["exit_code"] = inference_worker.run_worker(args)
         record["pin_after"] = pipeline_patch.assigned_stage()
     finally:
         pipeline_patch.clear_assigned_stage()
     return record
+
+
+def test_vision_runtime_enters_before_telemetry_and_exits_after_it(
+    monkeypatch, tmp_path
+):
+    record = _run_rank(monkeypatch, tmp_path, vision=True)
+
+    assert record["runtime_contexts"] == [
+        "vision_enter",
+        "telemetry_enter",
+        "telemetry_exit",
+        "vision_exit",
+    ]
 
 
 def test_worker_refuses_excess_resident_weights_before_ready(monkeypatch, tmp_path):

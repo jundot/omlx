@@ -219,7 +219,10 @@ def make_quantization_config(model):
     }
     shared_experts = {k: mxfp8 for k, _ in flat_modules if ".ffn.shared_experts." in k}
     attn = {
-        k: mxfp8 for k, _ in flat_modules if ".attn.w" in k or ".attn.indexer.wq" in k
+        k: mxfp8
+        for k, _ in flat_modules
+        if not k.startswith("vision.")
+        and (".attn.w" in k or ".attn.indexer.wq" in k)
     }
     # MTP fusion projections. Lightning checkpoints use e_proj/h_proj;
     # embedded DSpark uses main_proj on stage 0. These ship as e4m3 weight +
@@ -453,6 +456,83 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
     full_mask = mx.concatenate([mask, pool_mask], axis=-1)
 
     return full_mask
+
+
+def _apply_image_visibility_mask(
+    inputs: mx.array,
+    mask: Optional[mx.array],
+    vocab_size: int,
+) -> Tuple[Optional[mx.array], bool]:
+    """Add full visibility for image spans in the current cache-aware suffix."""
+    batch, length = inputs.shape
+    if length <= 1 or not bool(mx.any(inputs >= vocab_size).item()):
+        return mask, False
+
+    source_length = mask.shape[-1] if mask is not None else length
+    suffix_start = source_length - length
+    visible = mx.zeros((batch, length, source_length), dtype=mx.bool_)
+    has_image_span = False
+    for batch_index, row in enumerate(inputs.tolist()):
+        start = 0 if row and int(row[0]) >= vocab_size else None
+        for index, token in enumerate(row):
+            kind = int(token) - vocab_size
+            if kind == 0:
+                start = index
+            elif kind < 0:
+                start = None
+            elif kind == 4 and start is not None:
+                visible = visible.at[
+                    batch_index,
+                    start : index + 1,
+                    suffix_start + start : suffix_start + index + 1,
+                ].add(True)
+                has_image_span = True
+                start = None
+        if start is not None:
+            visible = visible.at[
+                batch_index,
+                start:length,
+                suffix_start + start : suffix_start + length,
+            ].add(True)
+            has_image_span = True
+
+    if not has_image_span:
+        return mask, False
+    visible = visible[0] if batch == 1 else visible[:, None]
+    return (visible if mask is None else mask | visible), True
+
+
+def _image_embedding_slices(images, offset: int, length: int):
+    """Map absolute image blocks to destination/source slices in a suffix."""
+    suffix_end = offset + length
+    slices = []
+    for image in images or ():
+        image_end = image.start + len(image.types)
+        overlap_start = max(offset, image.start)
+        overlap_end = min(suffix_end, image_end)
+        if overlap_start < overlap_end:
+            slices.append(
+                (
+                    image,
+                    slice(overlap_start - offset, overlap_end - offset),
+                    slice(overlap_start - image.start, overlap_end - image.start),
+                )
+            )
+    return slices
+
+
+def _cache_offset(cache: Optional[Any]) -> int:
+    if not cache:
+        return 0
+    cache_item = cache[0]
+    if isinstance(cache_item, CacheList):
+        cache_item = cache_item[0]
+    offset = getattr(cache_item, "offset", 0)
+    if isinstance(offset, mx.array):
+        if offset.size != 1:
+            raise ValueError("DeepSeek-V4 Vision requires a scalar cache offset.")
+        offset = offset.item()
+    return int(offset)
 
 
 @partial(mx.compile, shapeless=True)
@@ -2268,32 +2348,22 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             window_size=self.args.sliding_window,
             return_array=True,
         )
-        if inputs.shape[1] > 1 and bool(mx.any(inputs >= self.vocab_size).item()):
-            # The checkpoint's sparse local attention extends visibility across
-            # each complete image sentinel block. It otherwise uses ordinary
-            # one-dimensional token positions.
-            visible = mx.zeros(
-                (inputs.shape[1], inputs.shape[1]), dtype=mx.bool_
-            )
-            for row in inputs.tolist():
-                start = None
-                for index, token in enumerate(row):
-                    kind = int(token) - self.vocab_size
-                    if kind == 0:
-                        start = index
-                    elif kind == 4 and start is not None:
-                        visible = visible.at[start : index + 1, start : index + 1].add(
-                            True
-                        )
-                        start = None
-            mask = visible if mask is None else (mask | visible)
+        mask, image_visibility = _apply_image_visibility_mask(
+            inputs, mask, self.vocab_size
+        )
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
-            # This mask was created above from the model's own cache/window.
-            h = layer(h, mask, layer_cache, inputs, _standard_mask=True)
+            # Optimized kernels may reconstruct only the standard causal mask.
+            h = layer(
+                h,
+                mask,
+                layer_cache,
+                inputs,
+                _standard_mask=not image_visibility,
+            )
 
         _materialize_cache_arrays(cache)
 
@@ -2321,6 +2391,7 @@ class Model(nn.Module):
         self._vision_group = mx.distributed.init()
         self._vision_rank = int(self._vision_group.rank())
         self._vision_inputs = None
+        self._vision_blocks = {}
         if config.vision_n_layers > 0 and self._vision_rank == 0:
             from omlx.patches.deepseek_v4.vision_model import Aligner, ViT
 
@@ -2339,8 +2410,9 @@ class Model(nn.Module):
         """Install one request's preprocessed images on coordinator only."""
 
         self._vision_inputs = images if self._vision_rank == 0 else None
+        self._vision_blocks = {}
 
-    def _vision_embeddings(self, inputs: mx.array) -> mx.array:
+    def _vision_embeddings(self, inputs: mx.array, offset: int = 0) -> mx.array:
         import time
 
         logger = logging.getLogger(__name__)
@@ -2365,39 +2437,43 @@ class Model(nn.Module):
                         self.image_end,
                     ]
                 )
+                image_slices = _image_embedding_slices(
+                    self._vision_inputs, offset, inputs.shape[1]
+                )
                 started = time.perf_counter()
                 logger.info(
                     "deepseek_v4_vision stage=vision_encode_begin images=%d",
-                    len(self._vision_inputs),
+                    len(image_slices),
                 )
-                for image in self._vision_inputs:
-                    patches = mx.array(image.patches, dtype=mx.bfloat16)
-                    features = self.aligner(
-                        self.vision(patches, image.n_vit_h, image.n_vit_w),
-                        image.n_vit_h,
-                        image.n_vit_w,
+                for image, destination, source in image_slices:
+                    block = self._vision_blocks.get(image.start)
+                    if block is None:
+                        patches = mx.array(image.patches, dtype=mx.bfloat16)
+                        features = self.aligner(
+                            self.vision(patches, image.n_vit_h, image.n_vit_w),
+                            image.n_vit_h,
+                            image.n_vit_w,
+                        )
+                        features = features[
+                            mx.array(image.permutation, dtype=mx.uint32)
+                        ]
+                        types = mx.array(image.types, dtype=mx.uint32)
+                        block = params[types]
+                        positions = mx.array(
+                            [i for i, kind in enumerate(image.types) if kind == 2],
+                            dtype=mx.uint32,
+                        )
+                        block = block.at[positions].add(features - block[positions])
+                        self._vision_blocks[image.start] = block
+                    current = embeddings[0, destination]
+                    embeddings = embeddings.at[0, destination].add(
+                        block[source] - current
                     )
-                    features = features[
-                        mx.array(image.permutation, dtype=mx.uint32)
-                    ]
-                    types = mx.array(image.types, dtype=mx.uint32)
-                    block = params[types]
-                    positions = mx.array(
-                        [i for i, kind in enumerate(image.types) if kind == 2],
-                        dtype=mx.uint32,
-                    )
-                    block = block.at[positions].add(features - block[positions])
-                    current = embeddings[
-                        0, image.start : image.start + block.shape[0]
-                    ]
-                    embeddings = embeddings.at[
-                        0, image.start : image.start + block.shape[0]
-                    ].add(block - current)
                 mx.eval(embeddings)
                 logger.info(
                     "deepseek_v4_vision stage=vision_encode_complete images=%d "
                     "elapsed_ms=%.1f",
-                    len(self._vision_inputs),
+                    len(image_slices),
                     (time.perf_counter() - started) * 1000,
                 )
             except Exception as exc:
@@ -2408,7 +2484,22 @@ class Model(nn.Module):
                 )
         else:
             embeddings = mx.zeros(shape, dtype=dtype)
-        self._vision_inputs = None
+        suffix_end = offset + inputs.shape[1]
+        self._vision_inputs = (
+            tuple(
+                image
+                for image in self._vision_inputs or ()
+                if image.start + len(image.types) > suffix_end
+            )
+            if encode_error is None
+            else None
+        )
+        pending_starts = {image.start for image in self._vision_inputs or ()}
+        self._vision_blocks = {
+            start: block
+            for start, block in self._vision_blocks.items()
+            if start in pending_starts
+        }
         if self._vision_group.size() > 1:
             # Synchronize success before the large embedding collective so a
             # coordinator-side decode/encode failure cannot strand peers.
@@ -2441,7 +2532,11 @@ class Model(nn.Module):
         multimodal = self.is_vision_model and bool(
             mx.any(inputs >= self.args.vocab_size).item()
         )
-        embeddings = self._vision_embeddings(inputs) if multimodal else None
+        embeddings = (
+            self._vision_embeddings(inputs, _cache_offset(cache))
+            if multimodal
+            else None
+        )
         return self.lm_head(self.model(inputs, cache, inputs_embeds=embeddings))
 
     @property

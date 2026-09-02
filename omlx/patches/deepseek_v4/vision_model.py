@@ -44,10 +44,9 @@ class Attention(nn.Module):
 
     def __call__(self, x, cos, sin):
         count = x.shape[0]
-        q, k, v = mx.split(
-            self.wqkv(x).reshape(count, self.n_heads, 3 * self.head_dim),
-            3,
-            axis=-1,
+        q, k, v = (
+            value.reshape(count, self.n_heads, self.head_dim)
+            for value in mx.split(self.wqkv(x), 3, axis=-1)
         )
         q, k = _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
         q, k, v = (value.transpose(1, 0, 2)[None] for value in (q, k, v))
