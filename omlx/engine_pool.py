@@ -2606,7 +2606,12 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = deployment if effective_type == "batched" else None
+            # Registry admission already limits distributed serving to text
+            # models and the explicitly gated DeepSeek-V4 vision family. Keep
+            # that deployment authoritative even when discovery labels the
+            # public entry as VLM; dropping it here would load the complete
+            # checkpoint in the coordinator instead of dispatching through the
+            # approved pipeline plan.
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
@@ -2796,7 +2801,7 @@ class EnginePool:
                         f"(fallback from DFlash)"
                     )
 
-                elif force_lm and entry.engine_type == "vlm":
+                elif deployment is None and force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model -- fall back to VLMBatchedEngine.
                     logger.warning(
@@ -2834,7 +2839,7 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm":
+                elif deployment is None and entry.engine_type == "vlm":
                     # VLM loading failed -- fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
