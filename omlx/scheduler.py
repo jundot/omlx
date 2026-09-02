@@ -2777,6 +2777,15 @@ class Scheduler:
     # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
     # also leaves old SSD blocks cold until normal eviction removes them.
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
+    _GLM5_NEXT_BLOCK_SIZE = 512
+
+    def _model_type_name(self) -> str:
+        model_type = str(getattr(self.model, "model_type", "") or "")
+        if not model_type:
+            model_type = str(
+                getattr(getattr(self.model, "config", None), "model_type", "") or ""
+            )
+        return model_type
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
@@ -2820,6 +2829,39 @@ class Scheduler:
             int(self.config.prefill_step_size or 0),
             self._qwen35_prefill_floor,
         )
+        # A smaller block keeps more of the prompt tail cached across agent
+        # turns (with 2048, every turn re-prefills up to 2047 tokens), at the
+        # cost of more recurrent-state snapshots. The prefill step follows the
+        # block so chunk boundaries stay identical with the cache on or off.
+        env_block = os.environ.get("OMLX_ARRAYS_CACHE_BLOCK")
+        if env_block:
+            target = int(env_block)
+            self.config.prefill_step_size = target
+            logger.info(
+                "OMLX_ARRAYS_CACHE_BLOCK=%s: paged cache block_size and "
+                "prefill_step_size set to %s for the hybrid model",
+                env_block,
+                target,
+            )
+            self.config.paged_cache_block_size = target
+            return
+        if self._model_type_name().startswith("glm5_next"):
+            # GLM-5.x, measured on a 20-turn growing conversation through the
+            # API (oQ2e, M1 Ultra): with block 2048 the prefix-cache hit stays
+            # pinned at 2048 and every turn re-prefills up to 2047 tokens
+            # (15-21 s per turn); with 512 the hit follows the conversation
+            # (10-14 s, -21%). Prefill chunk sizes above 512 do not move this
+            # model's prefill time (29k tokens: 186/181/186 s at 32/512/1024),
+            # so the step follows the block.
+            target = self._GLM5_NEXT_BLOCK_SIZE
+            self.config.prefill_step_size = target
+            self.config.paged_cache_block_size = target
+            logger.info(
+                "GLM-5.x hybrid model: paged cache block_size and "
+                "prefill_step_size set to %s (agent-turn cache reuse)",
+                target,
+            )
+            return
         if self.config.paged_cache_block_size >= target:
             return
 
