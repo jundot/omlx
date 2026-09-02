@@ -397,20 +397,14 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
         def set_vision_inputs(self, images):
             self.images = images
 
-    provider = SimpleNamespace(
-        model=Model(),
-        model_key=("model", None, None),
-        is_batchable=True,
-    )
-
     class FakeResponseGenerator:
         def __init__(self):
             self.model_provider = provider
             self.prompt_cache = mlx_server.LRUPromptCache()
 
-        def _share_object(self, payload):
-            events.append("share_vision_prompt")
-            return payload
+        def _share_request(self, request):
+            events.append("share_request")
+            return request
 
         def _tokenize(self, _tokenizer, _request, _args):
             events.append("rank_zero_tokenize")
@@ -457,6 +451,12 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
         convert_tokens_to_ids=lambda _token: 99,
         unk_token_id=-1,
     )
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("model", None, None),
+        tokenizer=tokenizer,
+        is_batchable=True,
+    )
     args = SimpleNamespace(prefill_step_size=4)
 
     with (
@@ -464,12 +464,17 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
         install_server_telemetry(_Marker(), prefill_guard=guard, prefill_step_size=4),
     ):
         generator = mlx_server.ResponseGenerator()
-        assert generator._tokenize(tokenizer, request, args)[0] == list(range(10))
+        _queue, shared_request, shared_args = generator._share_request(
+            (object(), request, args)
+        )
+        assert generator._tokenize(tokenizer, shared_request, shared_args)[0] == list(
+            range(10)
+        )
         assert len(provider.model_key) == 5
 
     assert events == [
         "rank_zero_tokenize",
-        "share_vision_prompt",
+        "share_request",
         "cache_lookup",
         "guard_collective",
     ]
