@@ -87,6 +87,35 @@ def test_a_stage_gets_only_its_shards_plus_shared(tmp_path):
     assert "model-00000.safetensors" not in names, "must not ship other stages' layers"
 
 
+def test_deepseek_vision_only_shard_is_staged_only_to_rank_zero(tmp_path):
+    root = _model(tmp_path / "m", layers=4, per_file=2)
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "vision_n_layers": 2,
+                "vision_dim": 8,
+                "vision_n_heads": 2,
+                "vision_inter_dim": 16,
+                "vision_patch_size": 2,
+                "vision_rope_theta": 10000.0,
+                "vision_downsample_ratio": 2,
+                "vision_max_n_token": 16,
+                "vision_min_pixels": 16,
+                "vision_max_wh_ratio": 8,
+            }
+        )
+    )
+    _write_shard(root, "vision.safetensors", ["vision.blocks.0.attn.wqkv.weight"])
+    shards = index_shards(root)
+
+    coordinator = {s.name for s in shards_for_stage(shards, 2, 4, rank=0)}
+    worker = {s.name for s in shards_for_stage(shards, 0, 2, rank=1)}
+
+    assert "vision.safetensors" in coordinator
+    assert "vision.safetensors" not in worker
+
+
 def test_plan_reports_the_saving(tmp_path):
     root = _model(tmp_path / "m", layers=8, per_file=2)
     plan = plan_staging(root, node_id="mbp", start_layer=6, end_layer=8)
@@ -259,6 +288,43 @@ def test_rank_validation_rejects_a_missing_assigned_shard(tmp_path):
 
     assert status["stage_ready"] is False
     assert status["missing_files"] == ["model-00006.safetensors"]
+
+
+def test_rank_one_validation_does_not_require_rank_zero_vision_shards(tmp_path):
+    root = _model(tmp_path / "m", layers=4, per_file=2, with_index=True)
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "vision_n_layers": 2,
+                "vision_dim": 8,
+                "vision_n_heads": 2,
+                "vision_inter_dim": 16,
+                "vision_patch_size": 2,
+                "vision_rope_theta": 10000.0,
+                "vision_downsample_ratio": 2,
+                "vision_max_n_token": 16,
+                "vision_min_pixels": 16,
+                "vision_max_wh_ratio": 8,
+            }
+        )
+    )
+    vision = "vision.safetensors"
+    vision_tensor = "vision.blocks.0.attn.wqkv.weight"
+    _write_shard(root, vision, [vision_tensor])
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"][vision_tensor] = vision
+    index_path.write_text(json.dumps(index))
+    (root / vision).unlink()
+
+    worker = validate_staged_model(root, 2, 4, rank=1)
+    coordinator = validate_staged_model(root, 2, 4, rank=0)
+
+    assert worker["stage_ready"] is True
+    assert vision not in worker["required_files"]
+    assert coordinator["stage_ready"] is False
+    assert coordinator["missing_files"] == [vision]
 
 
 def test_cluster_plan_covers_every_layer_across_nodes(tmp_path):

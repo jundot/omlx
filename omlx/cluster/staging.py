@@ -51,6 +51,7 @@ class ShardInfo:
     size_bytes: int
     layers: frozenset[int]
     has_shared_tensors: bool  # embeddings, lm_head, norms — not layer-scoped
+    has_coordinator_tensors: bool = False  # rank-zero ViT/aligner/sentinels
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,14 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
     files = sorted(root.glob("*.safetensors"))
     if not files:
         raise ValueError(f"no safetensors files in {root}")
+    from omlx.deepseek_v4_vision import is_deepseek_v4_vision_config
+
+    try:
+        coordinator_vision = is_deepseek_v4_vision_config(
+            json.loads((root / "config.json").read_text())
+        )
+    except (OSError, json.JSONDecodeError):
+        coordinator_vision = False
 
     names_by_file: dict[str, list[str]] = {}
     index = root / "model.safetensors.index.json"
@@ -131,18 +140,25 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
             names = _safetensors_tensor_names(path)
         layers = set()
         shared = False
+        coordinator = False
+        from omlx.deepseek_v4_vision import is_deepseek_v4_vision_weight
+
         for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
+            if coordinator_vision and is_deepseek_v4_vision_weight(name):
+                coordinator = True
             else:
-                shared = True
+                match = _LAYER.search(name)
+                if match:
+                    layers.add(int(match.group(1)))
+                else:
+                    shared = True
         shards.append(
             ShardInfo(
                 name=path.name,
                 size_bytes=path.stat().st_size,
                 layers=frozenset(layers),
                 has_shared_tensors=shared,
+                has_coordinator_tensors=coordinator,
             )
         )
     return tuple(shards)
@@ -152,6 +168,8 @@ def shards_for_stage(
     shards: Sequence[ShardInfo],
     start_layer: int,
     end_layer: int,
+    *,
+    rank: int = 0,
 ) -> tuple[ShardInfo, ...]:
     """Files a rank needs to serve layers ``[start_layer, end_layer)``.
 
@@ -164,7 +182,11 @@ def shards_for_stage(
     return tuple(
         shard
         for shard in shards
-        if (shard.layers & wanted) or shard.has_shared_tensors
+        if (
+            (shard.layers & wanted)
+            or shard.has_shared_tensors
+            or (rank == 0 and shard.has_coordinator_tensors)
+        )
     )
 
 
@@ -220,6 +242,14 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     if not index.is_file():
         return None
     payload = json.loads(index.read_text())
+    from omlx.deepseek_v4_vision import is_deepseek_v4_vision_config
+
+    try:
+        coordinator_vision = is_deepseek_v4_vision_config(
+            json.loads((root / "config.json").read_text())
+        )
+    except (OSError, json.JSONDecodeError):
+        coordinator_vision = False
     weight_map = payload.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"{index.name} does not contain a weight map")
@@ -236,18 +266,25 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
         path = root / filename
         layers: set[int] = set()
         shared = False
+        coordinator = False
+        from omlx.deepseek_v4_vision import is_deepseek_v4_vision_weight
+
         for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
+            if coordinator_vision and is_deepseek_v4_vision_weight(name):
+                coordinator = True
             else:
-                shared = True
+                match = _LAYER.search(name)
+                if match:
+                    layers.add(int(match.group(1)))
+                else:
+                    shared = True
         shards.append(
             ShardInfo(
                 name=filename,
                 size_bytes=path.stat().st_size if path.is_file() else 0,
                 layers=frozenset(layers),
                 has_shared_tensors=shared,
+                has_coordinator_tensors=coordinator,
             )
         )
     return tuple(shards)
@@ -289,6 +326,8 @@ def validate_staged_model(
     model_path: str | Path,
     start_layer: int,
     end_layer: int,
+    *,
+    rank: int = 0,
 ) -> dict[str, Any]:
     """Prove one rank has its assigned stage, not an unnecessary full model.
 
@@ -306,7 +345,7 @@ def validate_staged_model(
 
     indexed = _indexed_shards(root)
     shards = indexed if indexed is not None else index_shards(root)
-    required = shards_for_stage(shards, start_layer, end_layer)
+    required = shards_for_stage(shards, start_layer, end_layer, rank=rank)
     missing = tuple(shard.name for shard in required if not (root / shard.name).is_file())
     corrupt: list[str] = []
     for shard in required:
@@ -344,6 +383,7 @@ def model_staging_inventory(model_path: str | Path) -> dict[str, Any]:
                 "size_bytes": shard.size_bytes,
                 "layers": sorted(shard.layers),
                 "has_shared_tensors": shard.has_shared_tensors,
+                "has_coordinator_tensors": shard.has_coordinator_tensors,
             }
             for shard in shards
         ],
@@ -394,6 +434,7 @@ def remote_model_staging_inventory(
             size_bytes = int(item["size_bytes"])
             layers = frozenset(int(layer) for layer in item["layers"])
             shared = item["has_shared_tensors"] is True
+            coordinator = item.get("has_coordinator_tensors") is True
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid shard entry from {ssh_target}") from exc
         if Path(name).name != name or size_bytes < 0 or min(layers, default=0) < 0:
@@ -404,6 +445,7 @@ def remote_model_staging_inventory(
                 size_bytes=size_bytes,
                 layers=layers,
                 has_shared_tensors=shared,
+                has_coordinator_tensors=coordinator,
             )
         )
 
@@ -429,6 +471,7 @@ def plan_staging(
     end_layer: int,
     present: dict[str, int] | None = None,
     shards: Sequence[ShardInfo] | None = None,
+    rank: int = 0,
 ) -> StagingPlan:
     """Work out what one node still needs.
 
@@ -438,7 +481,7 @@ def plan_staging(
     """
 
     shards = tuple(shards) if shards is not None else index_shards(model_path)
-    required = shards_for_stage(shards, start_layer, end_layer)
+    required = shards_for_stage(shards, start_layer, end_layer, rank=rank)
     present = present or {}
     missing = tuple(
         shard for shard in required if present.get(shard.name) != shard.size_bytes
@@ -473,6 +516,7 @@ def plan_cluster_staging(
             end_layer=assignment.end_layer,
             present=present_by_node.get(assignment.node_id),
             shards=shards,
+            rank=getattr(assignment, "rank", 0),
         )
         for assignment in assignments
     )
@@ -556,6 +600,7 @@ def stage_manifest(
                 end_layer=assignment.end_layer,
                 present=present_by_node.get(assignment.node_id),
                 shards=shards,
+                rank=getattr(assignment, "rank", 0),
             )
             for assignment in assignments
         )

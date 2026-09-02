@@ -368,6 +368,119 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     assert mlx_server.BatchGenerator is FakeBatchGenerator
 
 
+def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
+    monkeypatch,
+):
+    from dataclasses import dataclass
+
+    import mlx_lm.server as mlx_server
+
+    from omlx.cluster import deepseek_v4_vision_runtime
+    from omlx.cluster.deepseek_v4_vision_runtime import (
+        install_deepseek_v4_vision_runtime,
+    )
+
+    events = []
+    prepared = SimpleNamespace(
+        patches=b"pixels",
+        n_vit_h=2,
+        n_vit_w=2,
+        types=(0, 1, 2),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_vision_runtime,
+        "prepare_token_ids",
+        lambda *_args, **_kwargs: (list(range(10)), (prepared,)),
+    )
+
+    class Model:
+        def set_vision_inputs(self, images):
+            self.images = images
+
+    provider = SimpleNamespace(
+        model=Model(),
+        model_key=("model", None, None),
+        is_batchable=True,
+    )
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = provider
+            self.prompt_cache = mlx_server.LRUPromptCache()
+
+        def _share_object(self, payload):
+            events.append("share_vision_prompt")
+            return payload
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            events.append("rank_zero_tokenize")
+            return [1, 99, 2], [[1, 99, 2]], ["assistant"], "normal"
+
+    class FakeBatchGenerator:
+        pass
+
+    class FakePromptCache:
+        def fetch_nearest_cache(self, _model, tokens):
+            events.append("cache_lookup")
+            return "cache", tokens[3:]
+
+        def __len__(self):
+            return 1
+
+        @property
+        def nbytes(self):
+            return 64
+
+    class Guard:
+        def check_collective(self, *args, **kwargs):
+            events.append("guard_collective")
+            self.call = args, kwargs
+
+    guard = Guard()
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+
+    @dataclass
+    class Request:
+        messages: list
+
+    request = Request(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "image"}}],
+            }
+        ]
+    )
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda _token: 99,
+        unk_token_id=-1,
+    )
+    args = SimpleNamespace(prefill_step_size=4)
+
+    with (
+        install_deepseek_v4_vision_runtime(mlx_server, provider, config={}, rank=0),
+        install_server_telemetry(_Marker(), prefill_guard=guard, prefill_step_size=4),
+    ):
+        generator = mlx_server.ResponseGenerator()
+        assert generator._tokenize(tokenizer, request, args)[0] == list(range(10))
+        assert len(provider.model_key) == 5
+
+    assert events == [
+        "rank_zero_tokenize",
+        "share_vision_prompt",
+        "cache_lookup",
+        "guard_collective",
+    ]
+    assert guard.call[0] == (10,)
+    assert guard.call[1]["cached_tokens"] == 3
+    assert guard.call[1]["prefill_step_size"] == 7
+    assert args.prefill_step_size == 4
+    assert provider.model_key == ("model", None, None)
+    assert provider.model.images is None
+
+
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(
     monkeypatch,
 ):

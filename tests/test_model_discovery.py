@@ -52,6 +52,39 @@ def _write_safetensors(path, tensors):
         f.write(b"\x00" * offset)
 
 
+def test_detects_deepseek_v4_flat_vision_config(tmp_path):
+    config = {
+        "model_type": "deepseek_v4",
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "vision_n_layers": 32,
+        "vision_dim": 1024,
+        "vision_n_heads": 16,
+        "vision_inter_dim": 2816,
+        "vision_patch_size": 14,
+        "vision_rope_theta": 10000.0,
+        "vision_downsample_ratio": 3,
+        "vision_max_n_token": 384,
+        "vision_min_pixels": 147456,
+        "vision_max_wh_ratio": 8,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    assert detect_model_type(tmp_path) == "vlm"
+
+
+def test_deepseek_v4_text_is_not_misclassified(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "architectures": ["DeepseekV4ForCausalLM"],
+            }
+        )
+    )
+
+    assert detect_model_type(tmp_path) == "llm"
+
+
 class TestIsHelperConfigModelType:
     """Tests for helper (dFlash / Assistant / Draft) model_type detection."""
 
@@ -1209,7 +1242,7 @@ class TestDiscoverModels:
         reranker_dir.mkdir()
         (reranker_dir / "config.json").write_text(
             json.dumps({
-                "model_type": "modernbert",
+                    "model_type": "modernbert",
                 "architectures": ["ModernBertForSequenceClassification"]
             })
         )
@@ -1483,8 +1516,8 @@ class TestReadModelContextLength:
 
     def test_top_level_takes_precedence_over_nested(self, tmp_path):
         self._write(tmp_path, config={
-            "max_position_embeddings": 200000,
-            "text_config": {"max_position_embeddings": 32768},
+                "max_position_embeddings": 200000,
+                "text_config": {"max_position_embeddings": 32768},
         })
         assert _read_model_context_length(tmp_path) == 200000
 

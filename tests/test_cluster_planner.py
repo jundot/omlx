@@ -54,6 +54,57 @@ def test_inspect_safetensors_layout_reads_headers_without_loading_tensors(tmp_pa
     assert layout.tensor_count == 5
 
 
+def test_deepseek_v4_vision_layout_charges_sidecar_only_to_rank_zero(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                "num_hidden_layers": 4,
+                "vision_n_layers": 2,
+                "vision_dim": 8,
+                "vision_n_heads": 2,
+                "vision_inter_dim": 16,
+                "vision_patch_size": 2,
+                "vision_rope_theta": 10000.0,
+                "vision_downsample_ratio": 2,
+                "vision_max_n_token": 16,
+                "vision_min_pixels": 16,
+                "vision_max_wh_ratio": 8,
+            }
+        )
+    )
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("embed.weight", 20),
+            ("vision.patch_embed.proj.weight", 50),
+            ("vision.blocks.0.attn.wqkv.weight", 70),
+            ("aligner.w1.weight", 30),
+            ("image_start", 10),
+            *((f"layers.{index}.weight", 100) for index in range(4)),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+    assert layout.fixed_weight_bytes == 20
+    assert layout.coordinator_weight_bytes == 160
+    assert layout.layer_weight_bytes == (100, 100, 100, 100)
+
+    plan = plan_unequal_pipeline(
+        layout,
+        [
+            NodeBudget(node_id="coordinator", capacity_bytes=480, rank=0),
+            NodeBudget(node_id="worker", capacity_bytes=480, rank=1),
+        ],
+        context_tokens=0,
+    )
+    coordinator, worker = plan.assignments
+    assert coordinator.coordinator_weight_bytes == 160
+    assert worker.coordinator_weight_bytes == 0
+    assert coordinator.layer_count < worker.layer_count
+    assert plan.cluster_resident_weight_bytes == 600
+
+
 def test_inspect_safetensors_layout_rejects_offset_past_file(tmp_path):
     header = {
         "model.layers.0.weight": {
@@ -489,7 +540,7 @@ def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
         )
     # Case and padding are the UI's business, not a reason to refuse a launch.
     assert NodeBudget(
-        node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
+            node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
     ).role == "workstation"
 
 

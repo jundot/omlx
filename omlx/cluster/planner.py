@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import struct
 import subprocess
@@ -33,6 +34,7 @@ _LAYER_PATTERNS = (re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)
 # that fits its weights still dies on the first long prompt.
 _DEFAULT_CONTEXT_TOKENS = 8192
 _MEMORY_GUARD_TIERS = frozenset({"safe", "balanced", "aggressive", "custom"})
+logger = logging.getLogger(__name__)
 
 
 class PlanningError(ValueError):
@@ -94,6 +96,9 @@ class ModelLayout:
     source: str
     fixed_weight_bytes: int
     layer_weight_bytes: tuple[int, ...]
+    # Weights resident only on rank zero.  DeepSeek-V4 Vision keeps its ViT,
+    # aligner, and four sentinel embeddings beside the pipelined text model.
+    coordinator_weight_bytes: int = 0
     tensor_count: int = 0
     activation_bytes_per_token: int = 0
     tensor_parallel_heads: int = 1
@@ -119,6 +124,8 @@ class ModelLayout:
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
             raise ValueError("fixed_weight_bytes must be non-negative")
+        if self.coordinator_weight_bytes < 0:
+            raise ValueError("coordinator_weight_bytes must be non-negative")
         if not self.layer_weight_bytes:
             raise ValueError("at least one layer is required")
         if len(self.layer_weight_bytes) > _MAX_PIPELINE_LAYERS:
@@ -163,7 +170,11 @@ class ModelLayout:
 
     @property
     def total_weight_bytes(self) -> int:
-        return self.fixed_weight_bytes + sum(self.layer_weight_bytes)
+        return (
+            self.fixed_weight_bytes
+            + self.coordinator_weight_bytes
+            + sum(self.layer_weight_bytes)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +182,7 @@ class ModelLayout:
             "tensor_count": self.tensor_count,
             "layer_count": self.layer_count,
             "fixed_weight_bytes": self.fixed_weight_bytes,
+            "coordinator_weight_bytes": self.coordinator_weight_bytes,
             "layer_weight_bytes": list(self.layer_weight_bytes),
             "total_weight_bytes": self.total_weight_bytes,
             "activation_bytes_per_token": self.activation_bytes_per_token,
@@ -204,6 +216,9 @@ class ModelLayout:
                 source=str(payload.get("source", "")),
                 fixed_weight_bytes=int(payload["fixed_weight_bytes"]),
                 layer_weight_bytes=tuple(layers),
+                coordinator_weight_bytes=int(
+                    payload.get("coordinator_weight_bytes", 0)
+                ),
                 tensor_count=int(payload.get("tensor_count", 0)),
                 activation_bytes_per_token=int(
                     payload.get("activation_bytes_per_token", 0)
@@ -347,6 +362,7 @@ class PipelineAssignment:
     predicted_compute_seconds: float | None = None
     predicted_send_seconds: float | None = None
     predicted_stage_seconds: float | None = None
+    coordinator_weight_bytes: int = 0
 
     def __post_init__(self) -> None:
         # Normalised on the way in, not read leniently on the way out: this
@@ -370,7 +386,12 @@ class PipelineAssignment:
         # parallelism the stage's layers are already divided by the TP degree,
         # because shard_linear splits the projections inside each layer. Adding
         # ``sharded_weight_bytes`` on top double-counted the same weights.
-        return self.fixed_weight_bytes + self.layer_weight_bytes + self.kv_cache_bytes
+        return (
+            self.fixed_weight_bytes
+            + self.coordinator_weight_bytes
+            + self.layer_weight_bytes
+            + self.kv_cache_bytes
+        )
 
     @property
     def headroom_bytes(self) -> int:
@@ -389,6 +410,7 @@ class PipelineAssignment:
             "layer_count": self.layer_count,
             "layer_weight_bytes": self.layer_weight_bytes,
             "fixed_weight_bytes": self.fixed_weight_bytes,
+            "coordinator_weight_bytes": self.coordinator_weight_bytes,
             "planned_weight_bytes": self.planned_weight_bytes,
             "reserve_bytes": self.reserve_bytes,
             "capacity_bytes": self.capacity_bytes,
@@ -761,7 +783,14 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     # ``pipeline()`` belongs to the mlx-lm implementation this model does not
     # use, so trusting it (as ``_declares_pipeline`` does) is the false positive
     # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
+    from omlx.deepseek_v4_vision import is_deepseek_v4_vision_config
     from omlx.model_discovery import _has_vision_subconfig
+
+    # This family deliberately reuses the pipeline-capable DeepSeek-V4 text
+    # backbone.  Its vision sidecar is coordinator-only and does not pass
+    # through ``PipelineMixin.pipeline``.
+    if is_deepseek_v4_vision_config(config):
+        return _declares_pipeline(model_type)
 
     if _has_vision_subconfig(config):
         return False
@@ -997,7 +1026,15 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     if not root.is_dir():
         raise PlanningError(f"model path is not a directory: {root}")
 
+    config = _model_config(root)
+    from omlx.deepseek_v4_vision import (
+        is_deepseek_v4_vision_config,
+        is_deepseek_v4_vision_weight,
+    )
+
+    coordinator_vision = is_deepseek_v4_vision_config(config)
     fixed_bytes = 0
+    coordinator_bytes = 0
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
@@ -1028,13 +1065,16 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
-            layer_index = _tensor_layer_index(name)
-            if layer_index is None:
-                fixed_bytes += tensor_bytes
+            if coordinator_vision and is_deepseek_v4_vision_weight(name):
+                coordinator_bytes += tensor_bytes
             else:
-                layer_sizes[layer_index] = (
-                    layer_sizes.get(layer_index, 0) + tensor_bytes
-                )
+                layer_index = _tensor_layer_index(name)
+                if layer_index is None:
+                    fixed_bytes += tensor_bytes
+                else:
+                    layer_sizes[layer_index] = (
+                        layer_sizes.get(layer_index, 0) + tensor_bytes
+                    )
             tensor_count += 1
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:]):
@@ -1054,7 +1094,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     # layers put a stage boundary over weights that do not exist at runtime,
     # and the last stage failed activation with end_layer beyond the model.
     declared_depth = _config_int(
-        _model_config(root), "num_hidden_layers", 0
+        config, "num_hidden_layers", 0
     )
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
@@ -1074,9 +1114,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
-    return ModelLayout(
+    layout = ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
+        coordinator_weight_bytes=coordinator_bytes,
         layer_weight_bytes=tuple(layer_sizes[index] for index in expected_indices),
         tensor_count=tensor_count,
         activation_bytes_per_token=_activation_bytes_per_token(root),
@@ -1084,16 +1125,31 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_parallel_kv_heads=_config_int(
             _model_config(root), "num_key_value_heads", 0
         ),
-        tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
-        supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
-        supports_pipeline=_supports_pipeline(_model_config(root)),
+        tensor_parallel_divisors=_tensor_parallel_divisors(config),
+        # The first implementation is pipeline-only: tensor sharding would
+        # replicate or partition the coordinator sidecar without an ownership
+        # contract.
+        supports_tensor_parallel=(
+            False if coordinator_vision else _supports_tensor_parallel(config)
+        ),
+        supports_pipeline=_supports_pipeline(config),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
-            _model_config(root)
+            config
         ),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
-            _model_config(root)
+            config
         ),
     )
+    if coordinator_vision:
+        logger.info(
+            "deepseek_v4_vision stage=manifest_scanned tensors=%d "
+            "vision_bytes=%d fixed_bytes=%d language_layers=%d",
+            tensor_count,
+            coordinator_bytes,
+            fixed_bytes,
+            layout.layer_count,
+        )
+    return layout
 
 
 # Directory mtime + config mtime + per-shard (name, mtime, size). The shard
@@ -1274,6 +1330,7 @@ def _partition_layers(
     pipeline_nodes: Sequence[NodeBudget],
     *,
     fixed_weight_bytes: int,
+    coordinator_weight_bytes: int = 0,
     layer_resident_sizes: Sequence[int] | None = None,
     activation_bytes_per_token: int = 0,
     workload_profile: ExecutionProfileName = "balanced",
@@ -1319,6 +1376,9 @@ def _partition_layers(
         0: (((0.0, 0.0) + base_score if target_aware else base_score), (0,))
     }
     for node_index, node in enumerate(pipeline_nodes):
+        node_fixed_bytes = fixed_weight_bytes + (
+            coordinator_weight_bytes if node.rank == 0 else 0
+        )
         next_states: dict[
             int,
             tuple[tuple[float, ...], tuple[int, ...]],
@@ -1333,8 +1393,8 @@ def _partition_layers(
                 resident_layer_bytes = (
                     resident_prefix[end] - resident_prefix[start]
                 )
-                planned_weight_bytes = fixed_weight_bytes + layer_bytes
-                planned_resident_bytes = fixed_weight_bytes + resident_layer_bytes
+                planned_weight_bytes = node_fixed_bytes + layer_bytes
+                planned_resident_bytes = node_fixed_bytes + resident_layer_bytes
                 if planned_weight_bytes > node.weight_ceiling_bytes:
                     continue
                 if planned_resident_bytes > node.usable_bytes:
@@ -1386,11 +1446,21 @@ def _partition_layers(
     final = states.get(layer_count)
     if final is None:
         resident_capacity = sum(
-            max(0, node.usable_bytes - fixed_weight_bytes)
+            max(
+                0,
+                node.usable_bytes
+                - fixed_weight_bytes
+                - (coordinator_weight_bytes if node.rank == 0 else 0),
+            )
             for node in pipeline_nodes
         )
         weight_capacity = sum(
-            max(0, node.weight_ceiling_bytes - fixed_weight_bytes)
+            max(
+                0,
+                node.weight_ceiling_bytes
+                - fixed_weight_bytes
+                - (coordinator_weight_bytes if node.rank == 0 else 0),
+            )
             for node in pipeline_nodes
         )
         weight_shortfall = max(0, sum(layer_sizes) - weight_capacity)
@@ -1470,9 +1540,12 @@ def plan_unequal_pipeline(
     if len(set(node_ids)) != len(node_ids):
         raise ValueError("node IDs must be unique")
     for node in nodes:
-        if model.fixed_weight_bytes > node.usable_bytes:
+        node_fixed_bytes = model.fixed_weight_bytes + (
+            model.coordinator_weight_bytes if node.rank == 0 else 0
+        )
+        if node_fixed_bytes > node.usable_bytes:
             raise PlanningError(
-                f"replicated fixed weights do not fit node {node.node_id}"
+                f"fixed weights do not fit node {node.node_id}"
             )
 
     # MLX-LM sends activations from the highest rank (early layers) down to
@@ -1485,6 +1558,7 @@ def plan_unequal_pipeline(
             model.layer_weight_bytes,
             pipeline_nodes,
             fixed_weight_bytes=model.fixed_weight_bytes,
+            coordinator_weight_bytes=model.coordinator_weight_bytes,
             layer_resident_sizes=tuple(
                 weight_bytes + kv_bytes_per_layer
                 for weight_bytes in model.layer_weight_bytes
@@ -1504,7 +1578,15 @@ def plan_unequal_pipeline(
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
         kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
-        planned = model.fixed_weight_bytes + layer_weight_bytes + kv_bytes
+        coordinator_bytes = (
+            model.coordinator_weight_bytes if node.rank == 0 else 0
+        )
+        planned = (
+            model.fixed_weight_bytes
+            + coordinator_bytes
+            + layer_weight_bytes
+            + kv_bytes
+        )
         if planned > node.usable_bytes:
             raise PlanningError(
                 f"stage does not fit node {node.node_id} once KV cache for "
@@ -1527,6 +1609,7 @@ def plan_unequal_pipeline(
                 end_layer=end,
                 layer_weight_bytes=layer_weight_bytes,
                 fixed_weight_bytes=model.fixed_weight_bytes,
+                coordinator_weight_bytes=coordinator_bytes,
                 reserve_bytes=node.reserve_bytes,
                 capacity_bytes=node.capacity_bytes,
                 manual_memory_limit=node.manual_memory_limit,
@@ -1538,7 +1621,11 @@ def plan_unequal_pipeline(
                     model,
                     node,
                     layer_count=end - start,
-                    weight_bytes=model.fixed_weight_bytes + layer_weight_bytes,
+                    weight_bytes=(
+                        model.fixed_weight_bytes
+                        + coordinator_bytes
+                        + layer_weight_bytes
+                    ),
                 ),
                 predicted_compute_seconds=(
                     compute_seconds if performance_aware else None
@@ -1548,6 +1635,17 @@ def plan_unequal_pipeline(
             )
         )
     assignments.sort(key=lambda item: item.rank)
+
+    if model.coordinator_weight_bytes:
+        logger.info(
+            "deepseek_v4_vision stage=plan_constructed vision_rank=0 "
+            "vision_bytes=%d layer_ranges=%s",
+            model.coordinator_weight_bytes,
+            [
+                (item.rank, item.start_layer, item.end_layer)
+                for item in assignments
+            ],
+        )
 
     hash_payload = {
         "model": model.to_dict(),
@@ -1827,6 +1925,11 @@ def plan_hybrid(
         raise ValueError("at least one node is required")
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be at least 1")
+    if tensor_parallel_size > 1 and model.coordinator_weight_bytes:
+        raise PlanningError(
+            "DeepSeek-V4 Vision distributed inference currently supports "
+            "pipeline parallelism only (tensor_parallel_size must be 1)"
+        )
     if len(nodes) % tensor_parallel_size != 0:
         raise PlanningError(
             f"world size {len(nodes)} is not divisible by tensor_parallel_size "

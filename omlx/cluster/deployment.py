@@ -186,6 +186,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             end_layer=int(payload["end_layer"]),
             layer_weight_bytes=int(payload["layer_weight_bytes"]),
             fixed_weight_bytes=int(payload["fixed_weight_bytes"]),
+            coordinator_weight_bytes=int(
+                payload.get("coordinator_weight_bytes", 0)
+            ),
             reserve_bytes=int(payload["reserve_bytes"]),
             capacity_bytes=int(payload["capacity_bytes"]),
             manual_memory_limit=bool(payload.get("manual_memory_limit", False)),
@@ -215,6 +218,7 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
         min(
             assignment.layer_weight_bytes,
             assignment.fixed_weight_bytes,
+            assignment.coordinator_weight_bytes,
             assignment.reserve_bytes,
             assignment.capacity_bytes,
             assignment.kv_cache_bytes,

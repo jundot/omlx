@@ -351,7 +351,7 @@ def assess_model(
         tensor_parallel_ok = bool(layout.supports_tensor_parallel)
     if pipeline_ok is None:
         pipeline_ok = bool(layout.supports_pipeline)
-    weight_bytes = layout.fixed_weight_bytes + sum(layout.layer_weight_bytes)
+    weight_bytes = layout.total_weight_bytes
     name = model_id or Path(layout.source).name
     nodes = list(nodes)
     last_reason = "no node budgets were supplied"
