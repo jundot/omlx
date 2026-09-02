@@ -2821,3 +2821,47 @@ class TestLoopTaxHygiene:
         assert tracker.recently_active(3.0)  # just-finished counts
         tracker.clear()
         assert not tracker.recently_active(3.0)
+
+
+class TestReconcileChunked:
+    def test_reconcile_re_prefills_in_scheduler_chunks(self, monkeypatch):
+        """The reconcile re-prefill uses the generator's prefill step, never a
+        single forward over the whole context: memory and sparse-attention
+        paths differ from the chunked prefill the request already had."""
+        from collections import deque
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        shapes = []
+
+        class _FakeCache:
+            def __init__(self):
+                self.offset = 0
+                self._mtp_undo = None
+
+        def fake_backbone(model, inputs, cache, n_confirmed=0):
+            shapes.append(int(inputs.shape[1]))
+            cache[0].offset += int(inputs.shape[1])
+            arr = np.full((1, int(inputs.shape[1]), 8), -10.0, dtype=np.float32)
+            arr[0, -1, 5] = 10.0
+            return mx.array(arr), None, None
+
+        monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", lambda m: [_FakeCache()])
+        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
+        tokens = list(range(1300))
+        state = batch_generator._MtpState(uid=1, queue=deque())
+        batch = SimpleNamespace(
+            model=object(), uids=[1], tokens=[tokens], _num_tokens=[len(tokens)],
+            samplers=[None], fallback_sampler=lambda lp: mx.argmax(lp, axis=-1).astype(mx.uint32),
+            logits_processors=[], _next_tokens=mx.array([999]), _next_logprobs=[],
+            _token_context=[], prompt_cache=[object()], _omlx_mtp_state=state,
+            prefill_step_size=512,
+        )
+        assert batch_generator._reconcile_mtp_to_standard(batch, state) is True
+        assert shapes == [512, 512, 276], shapes
+        assert batch.prompt_cache[0].offset == 1300
+        assert batch._next_tokens.tolist() == [5]

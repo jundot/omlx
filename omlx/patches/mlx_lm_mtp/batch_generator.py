@@ -1296,8 +1296,23 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
+        # Re-prefill in the scheduler's chunk size, not in one forward: a
+        # single forward of the whole context (13-30k tokens in an agent
+        # loop) both blows memory (the prefill throttle fired only with MTP
+        # on) and lands on sparse-attention paths the chunked prefill never
+        # takes, so the rebuilt cache diverged from a chunked one from layer
+        # 7 on (GLM-5.3, prefill_one_vs_chunks.py). Chunked, it matches the
+        # prefill the request already had.
+        step = int(getattr(gen_batch, "prefill_step_size", 0) or 0) or 512
+        total = int(tok_arr.shape[0])
+        logits = None
         # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
+        for start in range(0, total, step):
+            logits, _, _ = _call_backbone(
+                gen_batch.model, tok_arr[None, start : start + step], new_cache
+            )
+            if start + step < total:
+                mx.eval(logits)
         last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
 
         if state.queue:
