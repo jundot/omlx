@@ -88,11 +88,9 @@ struct ServerScreen: View {
                                      comment: "Sublabel explaining the auto-start on launch setting"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: vm.bind($vm.autoStartOnLaunch, save: {
+                    RowSwitch(isOn: vm.bind($vm.autoStartOnLaunch, save: {
                         vm.saveAutoStartOnLaunch(services: services)
                     }))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
                 }
             }
 
@@ -159,9 +157,7 @@ struct ServerScreen: View {
                                      comment: "Sublabel for enabling Hugging Face local cache discovery"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $vm.hfCacheEnabled)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $vm.hfCacheEnabled)
                 }
             }
             ServerAdvancedSection(vm: vm)

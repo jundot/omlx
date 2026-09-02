@@ -120,10 +120,9 @@ private struct ClaudeCodeSection: View {
                                  comment: "Sublabel for the context scaling toggle"),
                 isLast: !vm.contextScaling
             ) {
-                Toggle("", isOn: vm.bind($vm.contextScaling, save: {
+                RowSwitch(isOn: vm.bind($vm.contextScaling, save: {
                     Task { await vm.save(.contextScaling, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             if vm.contextScaling {
                 Row(

@@ -631,12 +631,10 @@ private struct UpdatesSection: View {
                                  defaultValue: "Look for updates daily in the background",
                                  comment: "Sublabel for the auto-check toggle")
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoCheck },
                     set: { updates.autoCheck = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
@@ -647,12 +645,10 @@ private struct UpdatesSection: View {
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoNotify },
                     set: { updates.autoNotify = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
         }
     }

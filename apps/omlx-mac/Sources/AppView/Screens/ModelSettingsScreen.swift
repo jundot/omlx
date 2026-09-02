@@ -708,8 +708,7 @@ private struct AdvancedTab: View {
                     sublabel: String(localized: "settings.advanced.enable_thinking.sub",
                                      defaultValue: "Enable reasoning/thinking mode for this model",
                                      comment: "Sublabel for the enable-thinking toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.enableThinking))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.enableThinking))
                 }
                 if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
                     Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
@@ -722,7 +721,7 @@ private struct AdvancedTab: View {
                             : String(localized: "settings.advanced.qwen4_ssd_offload.sub",
                                      defaultValue: "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes.",
                                      comment: "Sublabel for the Qwen4 PLE SSD mmap toggle")) {
-                        Toggle("", isOn: vm.bind(
+                        RowSwitch(isOn: vm.bind(
                             $vm.qwen4PleSsdOffload,
                             save: {
                                 Task {
@@ -730,8 +729,6 @@ private struct AdvancedTab: View {
                                 }
                             }
                         ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
@@ -746,8 +743,7 @@ private struct AdvancedTab: View {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
                                       mono: true, suffix: "tk", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -762,8 +758,7 @@ private struct AdvancedTab: View {
                                       placeholder: "4096",
                                       mono: true, suffix: "tk", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.limitToolResults))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.limitToolResults))
                     }
                 }
                 Row(label: String(localized: "settings.advanced.force_sampling.label",
@@ -772,8 +767,7 @@ private struct AdvancedTab: View {
                     sublabel: String(localized: "settings.advanced.force_sampling.sub",
                                      defaultValue: "Override request sampling parameters with configured values",
                                      comment: "Sublabel for the force-sampling toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.forceSampling))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.forceSampling))
                 }
                 Row(label: String(localized: "settings.advanced.reasoning_parser.label",
                                   defaultValue: "Reasoning Parser",
@@ -791,10 +785,9 @@ private struct AdvancedTab: View {
                 sublabel: String(localized: "settings.advanced.pin_memory.sub",
                                  defaultValue: "Keep this model resident between requests",
                                  comment: "Sublabel for the pin-in-memory toggle")) {
-                Toggle("", isOn: vm.bind($vm.isPinned, save: {
+                RowSwitch(isOn: vm.bind($vm.isPinned, save: {
                     Task { await vm.save(.isPinned, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             Row(label: String(localized: "settings.advanced.favorite.label",
                               defaultValue: "Favorite",
@@ -802,10 +795,9 @@ private struct AdvancedTab: View {
                 sublabel: String(localized: "settings.advanced.favorite.sub",
                                  defaultValue: "List this model first in model lists",
                                  comment: "Sublabel for the favorite toggle")) {
-                Toggle("", isOn: vm.bind($vm.isFavorite, save: {
+                RowSwitch(isOn: vm.bind($vm.isFavorite, save: {
                     Task { await vm.save(.isFavorite, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
@@ -818,10 +810,9 @@ private struct AdvancedTab: View {
                                  defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
                                  comment: "Sublabel describing the security implications of trust-remote-code"),
                 isLast: true) {
-                Toggle("", isOn: vm.bind($vm.trustRemoteCode, save: {
+                RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
                 .tint(theme.redDot)
             }
         }
@@ -1114,8 +1105,7 @@ private struct AccelerationSection: View {
                               comment: "Row label for the Lightning MTP toggle"),
                 sublabel: mtpSublabel,
                 isLast: true) {
-                Toggle("", isOn: vm.bindProfile($vm.mtpEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
             }
@@ -1161,8 +1151,7 @@ private struct ExperimentalSection: View {
                     sublabel: String(localized: "settings.experimental.qwen_ane.sub",
                                      defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
                                      comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
@@ -1331,8 +1320,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.dual.sub",
                                          defaultValue: "Pin one resident procedure bank to each physical ANE. Recommended on M3 Ultra.",
                                          comment: "Sublabel describing dual-ANE Qwen prefill")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillDualAne))
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.cpu.label",
                                       defaultValue: "Share MLP Work with CPU",
@@ -1340,8 +1328,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.cpu.sub",
                                          defaultValue: "Requires a separate q4 checkpoint clone whose floating tensors are FP16. Retune the ANE MLP share when enabled.",
                                          comment: "Constraint and tuning guidance for Qwen CPU prefill sharing")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillCpuEnabled))
                     }
                     if vm.qwen35AnePrefillCpuEnabled {
                         Row(label: String(localized: "settings.experimental.qwen_ane.cpu_fraction.label",
@@ -1394,8 +1381,7 @@ private struct ExperimentalSection: View {
                             sublabel: String(localized: "settings.experimental.qwen_ane.cpu_scheduler.sub",
                                              defaultValue: "Distributes independent CPU shards across processor clusters and falls back automatically when unsupported.",
                                              comment: "Sublabel explaining performance-aware CPU scheduling")) {
-                            Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillCpuSharedResource))
-                                .labelsHidden().toggleStyle(.switch)
+                            RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillCpuSharedResource))
                         }
                     }
                     Row(label: String(localized: "settings.experimental.qwen_ane.gdn.label",
@@ -1404,8 +1390,7 @@ private struct ExperimentalSection: View {
                         sublabel: String(localized: "settings.experimental.qwen_ane.gdn.sub",
                                          defaultValue: "Also split eligible GDN z+qkv input projections across ANE and GPU.",
                                          comment: "Sublabel describing Qwen GDN ANE acceleration")) {
-                        Toggle("", isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillGdn))
                     }
                     if vm.qwen35AnePrefillGdn {
                         Row(label: String(localized: "settings.experimental.qwen_ane.gdn_fraction.label",
@@ -1447,8 +1432,7 @@ private struct ExperimentalSection: View {
                             options: ModelSettingsScreenVM.turboquantKvBitsOptions
                         )
                     }
-                    Toggle("", isOn: vm.bindProfile($vm.turboquantKvEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
                 }
@@ -1468,8 +1452,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.indexCacheFreq),
                                       placeholder: "4", mono: true, width: .controlNarrow)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.indexCacheEnabled))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.indexCacheEnabled))
                     }
                 }
             }
@@ -1479,8 +1462,7 @@ private struct ExperimentalSection: View {
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
                 sublabel: specprefillSublabel) {
-                Toggle("", isOn: vm.bindProfile($vm.specprefillEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.specprefillEnabled))
                     .disabled(vm.vlmMtpEnabled)
                     .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
             }
@@ -1522,8 +1504,7 @@ private struct ExperimentalSection: View {
                               defaultValue: "DFlash",
                               comment: "Row label for the DFlash toggle"),
                 sublabel: dflashSublabel) {
-                Toggle("", isOn: vm.bindProfile($vm.dflashEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
                     .disabled(dflashToggleDisabled)
                     .help(dflashHelp)
             }
@@ -1543,8 +1524,7 @@ private struct ExperimentalSection: View {
                     sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
                                      defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
                                      comment: "Sublabel for the DFlash draft quantization toggle")) {
-                    Toggle("", isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                 }
                 if vm.dflashDraftQuantEnabled {
                     Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
@@ -1637,8 +1617,7 @@ private struct ExperimentalSection: View {
                             TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
                                       placeholder: "8", mono: true, suffix: "GiB", width: .controlCompact)
                         }
-                        Toggle("", isOn: vm.bindProfile($vm.dflashInMemoryCache))
-                            .labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: vm.bindProfile($vm.dflashInMemoryCache))
                     }
                 }
                 if vm.dflashInMemoryCache {
@@ -1656,8 +1635,7 @@ private struct ExperimentalSection: View {
                                   defaultValue: "DFlash SSD cache",
                                   comment: "Row label for the DFlash L2 SSD cache toggle"),
                     sublabel: dflashSsdSublabel) {
-                    Toggle("", isOn: vm.bindProfile($vm.dflashSsdCache))
-                        .labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashSsdCache))
                         .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
                 }
                 if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
@@ -1680,8 +1658,7 @@ private struct ExperimentalSection: View {
                               comment: "Row label for the VLM MTP toggle"),
                 sublabel: vlmMtpSublabel,
                 isLast: !vm.vlmMtpEnabled) {
-                Toggle("", isOn: vm.bindProfile($vm.vlmMtpEnabled))
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
                     .disabled(vlmMtpToggleDisabled)
                     .help(vm.vlmMtpConflictReason ?? "")
             }

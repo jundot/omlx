@@ -222,7 +222,7 @@ private struct ConfigurationSection: View {
                                  defaultValue: "Enable per-question reasoning traces (slower)",
                                  comment: "Sublabel under the Accuracy Bench extended-thinking toggle")
             ) {
-                Toggle("", isOn: $enableThinking).labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $enableThinking)
             }
 
             FreeRow {

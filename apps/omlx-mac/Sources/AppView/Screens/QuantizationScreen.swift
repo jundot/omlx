@@ -373,7 +373,7 @@ private struct AdvancedSection: View {
                                              defaultValue: "Exclude vision encoder weights (~2-3% smaller, text-only output)",
                                              comment: "Toggle row sublabel: text-only quantization effect")
                         ) {
-                            Toggle("", isOn: $textOnly).labelsHidden().toggleStyle(.switch)
+                            RowSwitch(isOn: $textOnly)
                         }
                     }
 
@@ -389,9 +389,7 @@ private struct AdvancedSection: View {
                                      defaultValue: "Unavailable — source model has no MTP heads",
                                      comment: "Toggle row sublabel when MTP isn't supported by the chosen source")
                     ) {
-                        Toggle("", isOn: $preserveMtp)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
+                        RowSwitch(isOn: $preserveMtp)
                             .disabled(!selectedHasMTP)
                     }
 
@@ -446,7 +444,7 @@ private struct EnhancedQuantizationSection: View {
                                  comment: "Toggle sublabel explaining what enabling oQe does"),
                 isLast: !enabled
             ) {
-                Toggle("", isOn: $enabled).labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $enabled)
             }
 
             if enabled {
@@ -458,7 +456,7 @@ private struct EnhancedQuantizationSection: View {
                                      defaultValue: "Use a compatible cached imatrix when available; otherwise collect a new one.",
                                      comment: "Toggle sublabel for the oQe imatrix cache reuse option")
                 ) {
-                    Toggle("", isOn: $reuseCache).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $reuseCache)
                 }
 
                 Row(
@@ -488,7 +486,7 @@ private struct EnhancedQuantizationSection: View {
                                      comment: "Toggle sublabel for strict oQe imatrix coverage"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $strictCoverage).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $strictCoverage)
                 }
             }
         }
@@ -1077,7 +1075,7 @@ private struct UploadModalView: View {
                                      comment: "Toggle row sublabel explaining the private flag"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $isPrivate).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $isPrivate)
                 }
             }
         }
@@ -1115,7 +1113,7 @@ private struct UploadModalView: View {
                                          comment: "Toggle row sublabel for the re-download notice"),
                         isLast: true
                     ) {
-                        Toggle("", isOn: $addRedownloadNotice).labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: $addRedownloadNotice)
                     }
                 } else {
                     // Trailing row stays flush even when the toggle is hidden.

@@ -242,9 +242,7 @@ private struct ConfigurationSection: View {
                 sublabel: String(localized: "bench.throughput.row.ane_alignment.sub",
                                  defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
                                  comment: "Explanation of the ANE-aligned throughput benchmark option")) {
-                Toggle("", isOn: $alignPromptToAne)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
+                RowSwitch(isOn: $alignPromptToAne)
                     .disabled(running)
             }
 

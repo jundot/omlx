@@ -216,10 +216,9 @@ private struct AuthenticationSection: View {
                                  comment: "Sublabel for the disable API key verification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: vm.bind($vm.skipApiKeyVerification, save: {
+                RowSwitch(isOn: vm.bind($vm.skipApiKeyVerification, save: {
                     Task { await vm.saveSkipApiKeyVerification(client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
         }
     }

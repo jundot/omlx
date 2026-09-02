@@ -1067,7 +1067,9 @@ struct ProfileDetailCard: View {
                             .foregroundStyle(theme.textSecondary)
                     }
                     .toggleStyle(.switch)
-                    .controlSize(.mini)
+                    // Same switch size as `RowSwitch` so every switch in the
+                    // app reads as one control.
+                    .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
                             .font(.omlxMono(11))

@@ -96,8 +96,7 @@ private struct SchedulerSection: View {
                                  defaultValue: "Split long prompts across scheduler ticks so other requests can interleave.",
                                  comment: "Sublabel for chunked prefill toggle")
             ) {
-                Toggle("", isOn: $vm.chunkedPrefill)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.chunkedPrefill)
             }
             Row(
                 label: String(localized: "performance.scheduler.prefill_priority",
@@ -153,8 +152,7 @@ private struct MemoryLifecycleSection: View {
                                  defaultValue: "Preflight prefill memory before kicking the engine and defer generation scheduling near the ceiling.",
                                  comment: "Sublabel for prefill memory guard")
             ) {
-                Toggle("", isOn: $vm.prefillMemoryGuard)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.prefillMemoryGuard)
             }
             Row(
                 label: String(localized: "performance.memory.guard_tier",
@@ -236,8 +234,7 @@ private struct MemoryLifecycleSection: View {
                                  comment: "Sublabel for model fallback toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: $vm.modelFallback)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.modelFallback)
             }
         }
     }
@@ -307,8 +304,7 @@ private struct CacheSection: View {
                                  defaultValue: "Master switch for the engine's KV cache subsystem.",
                                  comment: "Sublabel for the master cache enable toggle")
             ) {
-                Toggle("", isOn: $vm.cacheEnabled)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.cacheEnabled)
             }
             Row(
                 label: String(localized: "performance.cache.hot_only",
@@ -318,8 +314,7 @@ private struct CacheSection: View {
                                  defaultValue: "Skip SSD spillover. Useful on fast machines with abundant RAM.",
                                  comment: "Sublabel for hot cache only toggle")
             ) {
-                Toggle("", isOn: $vm.hotCacheOnly)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.hotCacheOnly)
                     .disabled(!vm.cacheEnabled)
             }
             Row(
