@@ -1227,7 +1227,7 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
+            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, Swival) to use "
             "the running oMLX server."
         ),
     )
@@ -1236,7 +1236,7 @@ Example directory structure:
         type=str,
         help=(
             "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "openclaw, hermes, pi, swival, or 'list' to show available"
         ),
     )
     launch_parser.add_argument(
