@@ -7,6 +7,8 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from omlx.api.openai_models import ChatCompletionRequest, Message
+from omlx.engine import BaseEngine
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
     InvalidRequestError,
@@ -23,6 +25,7 @@ from omlx.server import (
     _reset_boundary_snapshots_for_server,
     _resolve_metric_durations,
     app,
+    create_chat_completion,
     get_engine,
     get_max_context_window,
     get_sampling_params,
@@ -580,6 +583,109 @@ class TestModelFallback:
             await get_engine("broken-model", EngineType.LLM)
 
         assert exc_info.value.status_code == 409
+
+
+class TestChatCompletionEmptyModelSettings:
+    """Chat completions must not 500 when no per-model settings resolve.
+
+    ``ChatCompletionRequest.model`` has no ``min_length``, so pydantic
+    accepts ``"model": ""``, and ``get_model_settings_for_request()``
+    returns ``None`` for any falsy model id even when a settings manager is
+    mounted. With ``model_fallback`` enabled the request still resolves to
+    the default engine, so it reaches the SpecPrefill fallback branches with
+    ``ms`` None. Those branches guarded on ``_server_state.settings_manager``
+    rather than on ``ms`` and raised ``AttributeError`` on
+    ``ms.specprefill_keep_pct`` / ``ms.specprefill_threshold``.
+    """
+
+    class _FakePool:
+        """Minimal EnginePool double: "" 404s, model_fallback resolves it."""
+
+        def __init__(self, engine):
+            self._engine = engine
+
+        def resolve_model_id(self, model_id, settings_manager=None):
+            return model_id
+
+        def get_entry(self, model_id):
+            return None
+
+        async def get_engine(self, model_id, _lease=False, runtime_settings=None):
+            if not model_id:
+                raise ModelNotFoundError(model_id, [])
+            return self._engine
+
+        async def release_engine(self, model_id):
+            # Load-bearing on the pre-fix run: the AttributeError unwinds
+            # through `except BaseException: await lease.release()`, which
+            # would otherwise raise a second, masking error.
+            pass
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self, tmp_path):
+        state = ServerState()
+        state.global_settings = GlobalSettings()
+        state.global_settings.model.model_fallback = True
+        state.default_model = "default-model"
+        # A real settings manager, so the old `_server_state.settings_manager`
+        # guard was truthy even when the per-request lookup returned None.
+        self.settings_manager = ModelSettingsManager(tmp_path)
+        state.settings_manager = self.settings_manager
+        self.engine = MagicMock(spec=BaseEngine)
+        self.engine.preflight_chat = AsyncMock(return_value=None)
+        self.engine.count_chat_tokens = MagicMock(return_value=5)
+        self.engine.is_diffusion_model = False
+        self.engine.tokenizer = None
+        state.engine_pool = self._FakePool(self.engine)
+        with patch("omlx.server._server_state", state):
+            yield
+
+    @staticmethod
+    def _chat_request(model):
+        # Both response shapes assemble chat_kwargs at the same point and hand
+        # them to engine.preflight_chat(), so either covers the guards; stream=True
+        # avoids the non-streaming branch's _build_chat_completion() coroutine,
+        # which these tests never await.
+        request = ChatCompletionRequest(
+            model=model,
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        http_request = MagicMock()
+        http_request.headers = {}
+        return request, http_request
+
+    @pytest.mark.asyncio
+    async def test_empty_model_fallback_resolves_specprefill_defaults(self):
+        """model="" + model_fallback must not 500 with AttributeError."""
+        request, http_request = self._chat_request("")
+
+        # Returning a response at all is the regression signal: before the fix
+        # this call raised AttributeError out of create_chat_completion.
+        response = await create_chat_completion(request, http_request, True)
+
+        assert response.status_code == 200
+        # No per-model settings were resolvable, so neither SpecPrefill knob
+        # is forwarded and the engine keeps its own defaults.
+        kwargs = self.engine.preflight_chat.await_args.kwargs
+        assert "specprefill_keep_pct" not in kwargs
+        assert "specprefill_threshold" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_model_settings_specprefill_still_forwarded(self):
+        """The relaxed guard must still forward configured per-model values."""
+        self.settings_manager.set_settings(
+            "configured-model",
+            ModelSettings(specprefill_keep_pct=0.3, specprefill_threshold=16384),
+        )
+        request, http_request = self._chat_request("configured-model")
+
+        response = await create_chat_completion(request, http_request, True)
+
+        assert response.status_code == 200
+        kwargs = self.engine.preflight_chat.await_args.kwargs
+        assert kwargs["specprefill_keep_pct"] == 0.3
+        assert kwargs["specprefill_threshold"] == 16384
 
 
 class TestGetEngineLLMTypeValidation:
