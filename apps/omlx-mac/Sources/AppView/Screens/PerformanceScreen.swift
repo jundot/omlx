@@ -27,8 +27,7 @@ struct PerformanceScreen: View {
             MemoryLifecycleSection(vm: vm)
             CacheSection(vm: vm)
 
-            HStack {
-                Spacer()
+            FooterBar(error: vm.lastError) {
                 Button(String(localized: "performance.button.apply",
                               defaultValue: "Apply",
                               comment: "Apply button at the bottom of the Performance screen")) {
@@ -36,16 +35,6 @@ struct PerformanceScreen: View {
                 }
                 .buttonStyle(.omlx(.primary))
                 .disabled(!vm.hasPendingChanges || vm.isSaving)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
             }
         }
         .task { await vm.load(client: services.client) }

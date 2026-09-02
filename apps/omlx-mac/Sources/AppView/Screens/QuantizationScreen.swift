@@ -103,7 +103,11 @@ struct QuantizationScreen: View {
             MessageBanner(error: vm.lastError, success: vm.lastSuccess)
 
             if vm.modelsLoaded && vm.models.isEmpty {
-                EmptyModelsBanner()
+                HintLine(text: String(localized: "quant.empty_models",
+                                      defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
+                                      comment: "Banner shown when no full-precision models are available to quantize"))
+                    .padding(.horizontal, 14)
+                    .padding(.top, 6)
             }
 
             QueueSection(
@@ -490,29 +494,6 @@ private struct EnhancedQuantizationSection: View {
                 }
             }
         }
-    }
-}
-
-private struct EmptyModelsBanner: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 11))
-                .foregroundStyle(theme.textTertiary)
-            Text(String(localized: "quant.empty_models",
-                        defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
-                        comment: "Banner shown when no full-precision models are available to quantize"))
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .background(theme.codeBg)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 18)
-        .padding(.top, 6)
     }
 }
 

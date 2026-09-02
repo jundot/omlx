@@ -27,13 +27,7 @@ struct SecurityScreen: View {
             AuthenticationSection(vm: vm, client: services.client)
             SubKeysSection(vm: vm, client: services.client)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
     }

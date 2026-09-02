@@ -162,8 +162,12 @@ struct ServerScreen: View {
             }
             ServerAdvancedSection(vm: vm)
 
-            HStack {
-                Spacer()
+            FooterBar(
+                hint: String(localized: "server.footer.hint",
+                             defaultValue: "Listen Address, Log Level, and SSE Keep-Alive Mode apply the moment you change them. The rest (port, default profile, storage, aliases) commits when you click Apply. Port and storage changes take effect after a server restart.",
+                             comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"),
+                error: vm.lastError
+            ) {
                 Button(String(localized: "server.button.apply",
                               defaultValue: "Apply",
                               comment: "Button to apply pending server settings: port, default profile, storage, and aliases")) {
@@ -173,10 +177,6 @@ struct ServerScreen: View {
                     .disabled(!vm.hasPendingServerChanges(services: services)
                               || vm.isMovingBasePath)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-
-            HintFooter(error: vm.lastError)
         }
         .task {
             // services.config is already populated by AppDelegate before this
@@ -740,24 +740,4 @@ private struct ServerAdvancedSection: View {
     }
 }
 
-// MARK: - Footer hint
 
-private struct HintFooter: View {
-    let error: String?
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HintLine(text: String(localized: "server.footer.hint",
-                                  defaultValue: "Listen Address, Log Level, and SSE Keep-Alive Mode apply the moment you change them. The rest (port, default profile, storage, aliases) commits when you click Apply. Port and storage changes take effect after a server restart.",
-                                  comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"))
-            if let error {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.redDot)
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 8)
-    }
-}

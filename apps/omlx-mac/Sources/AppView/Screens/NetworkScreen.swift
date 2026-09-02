@@ -25,8 +25,7 @@ struct NetworkScreen: View {
             ProxiesSection(vm: vm)
             TLSSection(vm: vm)
 
-            HStack {
-                Spacer()
+            FooterBar(error: vm.lastError) {
                 Button(String(localized: "network.button.apply",
                               defaultValue: "Apply",
                               comment: "Footer button on the Network screen that commits the edited proxy/TLS values to the server")) {
@@ -35,10 +34,6 @@ struct NetworkScreen: View {
                 .buttonStyle(.omlx(.primary))
                 .disabled(!vm.hasPendingChanges || vm.isSaving)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-
-            HintFooter(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
     }
@@ -136,18 +131,4 @@ private struct TLSSection: View {
     }
 }
 
-// MARK: - Hint footer
 
-private struct HintFooter: View {
-    let error: String?
-
-    var body: some View {
-        if let error {
-            Text(error)
-                .font(.omlxText(11))
-                .foregroundStyle(.red)
-                .padding(.horizontal, 18)
-                .padding(.top, 8)
-        }
-    }
-}

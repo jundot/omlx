@@ -107,13 +107,7 @@ struct DownloadsScreen: View {
                 onShowCard: { repo in vm.showModelCard(repoId: repo) }
             )
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }

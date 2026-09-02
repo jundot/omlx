@@ -125,12 +125,7 @@ struct StatusScreen: View {
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18).padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task(id: vm.scope) {
             await vm.start(client: services.client)
