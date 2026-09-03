@@ -54,6 +54,16 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    # Physically impossible as a per-token cost (KV + SDPA transient of any
+    # served model stays far below this): a reading above it is buffer-pool
+    # growth or load residue divided by a small chunk, and must not seed the
+    # EWMA, blend into it, nor land in last_delta_bytes/last_n_tokens — the
+    # predictor reads that pair as a rate and takes the MAX with the EWMA.
+    # Measured on GLM-5.3-Flash (M1 Ultra): a 14-token warm-up right after
+    # load left 2.2 GB of residue and seeded the EWMA at 157 MB/token, so a
+    # 29K-token prompt ran at the 32-token floor for 186 s; the real cost is
+    # 2.1–5.7 MB/token.
+    _PER_TOKEN_SANITY_BYTES = 32 * 1024**2
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -148,6 +158,18 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
+        if per_token > self._PER_TOKEN_SANITY_BYTES:
+            logger.debug(
+                "PrefillTransientTracker(%s): dropped %.1f-byte/token sample "
+                "above the per-token sanity bound (%d)",
+                self._model_id,
+                per_token,
+                self._PER_TOKEN_SANITY_BYTES,
+            )
+            # Not counted as a sample: the next sane reading has to SEED the
+            # EWMA (an EWMA of 0 would reject every later sample as an
+            # outlier against 0 x ratio).
+            return
         if history.samples == 0:
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:

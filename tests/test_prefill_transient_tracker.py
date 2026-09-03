@@ -78,7 +78,8 @@ class TestEwmaOutlierGuard:
             "EWMA must not reach the ~3690.5 KB/token value observed in "
             "production before this fix"
         )
-        # The raw sample is still visible for diagnostics.
+        # The raw sample is still visible for diagnostics (it is within the
+        # per-token sanity bound; see the test below for the one that is not).
         assert t.last_n_tokens == 185
         assert t.last_delta_bytes == int(10497.1 * 1024 * 185)
 
@@ -151,10 +152,11 @@ class TestObservedMax:
         ewma_before = t.bytes_per_token
         t.update(32, 5 * 1024**3, floor_sample=True)  # above 4GiB clamp
         assert t.observed_max_bytes == 200_000_000, "outlier must not enter"
-        assert t.samples == 3, "outlier still counts as a sample"
-        # This 5GiB/32-token reading is also a >8x EWMA outlier (see
-        # TestEwmaOutlierGuard), so it must not move the EWMA either —
-        # it is excluded from both the observed-max and the EWMA now.
+        # 5GiB over 32 tokens is 168MB/token, above the per-token sanity
+        # bound, so it is dropped before counting: a sample is a reading the
+        # tracker accepted (an accepted-but-zero EWMA would reject every later
+        # sane reading as an outlier against 0 x ratio).
+        assert t.samples == 2, "an impossible per-token reading is not a sample"
         assert t.bytes_per_token == ewma_before
 
     def test_skipped_samples_do_not_touch_max(self):
@@ -226,3 +228,39 @@ class TestExecutionRegimes:
 
         assert t.observed_max_bytes == 900 * 1024**2
         assert t.observed_max_bytes_for(True) == 40 * 1024**2
+
+
+def test_a_sample_rejected_as_an_outlier_does_not_become_the_predictor_rate():
+    """The predictor takes the MAX of the EWMA and
+    `last_delta_bytes / last_n_tokens`. Recording the outlier raw in those two
+    fields handed the predictor the very number the EWMA had rejected:
+    measured end-to-end on GLM-5.3-Flash, `per_token=158198KB` for a 143-token
+    chunk (a 22GB buffer-pool delta) against a real 2.1-5.7MB/token — and the
+    chunk dropped to the 32-token floor, 3.9x slower.
+    """
+    t = PrefillTransientTracker("glm")
+    t.update(2048, 1 * 1024**3)          # sane seed: 0.5MB/token
+    t.update(1024, 600 * 1024**2)        # another sane one
+    sane_rate = t.last_delta_bytes / t.last_n_tokens
+    t.update(143, 22 * 1024**3)          # 158MB/token: physically impossible
+    assert t.last_delta_bytes / t.last_n_tokens == sane_rate, (
+        "a reading above the per-token physical bound must not become the "
+        "`last_delta/last_n` rate the predictor consumes"
+    )
+    t.update(2048, 3 * 1024**3)          # 1.5MB/token: a REAL peak, kept
+    assert t.last_n_tokens == 2048 and t.last_delta_bytes == 3 * 1024**3
+    assert t.bytes_per_token < 1 * 1024**2
+
+
+def test_a_small_seed_carrying_load_residue_does_not_poison_the_ewma():
+    """The 14-token warm-up right after load leaves ~2.2GB of pool residue:
+    157MB/token. The seeding clamp is on TOTAL bytes (4GB), so it passed — and
+    the EWMA was born 30-75x above the real rate. Measured: a 29K-token prompt
+    ran at the 32-token floor for 186s.
+    """
+    t = PrefillTransientTracker("glm")
+    t.update(14, int(2.2 * 1024**3))
+    assert t.bytes_per_token == 0.0, "an impossible seed must not become the EWMA"
+    assert t.last_n_tokens == 0
+    t.update(2048, 4 * 1024**3)  # 2MB/token, the real one
+    assert 1.5 * 1024**2 < t.bytes_per_token < 2.5 * 1024**2
