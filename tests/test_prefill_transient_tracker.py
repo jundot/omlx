@@ -159,6 +159,24 @@ class TestObservedMax:
         assert t.samples == 2, "an impossible per-token reading is not a sample"
         assert t.bytes_per_token == ewma_before
 
+    def test_impossible_rate_under_the_clamp_never_becomes_the_max(self):
+        # The clamp is on TOTAL bytes while the sanity bound is a RATE, so a
+        # small chunk can clear the first and still break the second. Measured
+        # on GLM-5.3-Flash (M1 Ultra): a 32-token floor chunk read 3.54GB —
+        # 110MB/token, comfortably under the 4GiB clamp — and pinned the max
+        # for the rest of the process. Admission charges that max as a flat
+        # floor with no multiplier, so it priced 3.54GB where the analytic
+        # estimate for the same chunk is 0.27GB and refused a 159K-token
+        # prompt by 250MB.
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first sample, excluded
+        t.update(32, 200_000_000, floor_sample=True)  # 6.3MB/token, accepted
+        t.update(32, int(3.54 * 1024**3), floor_sample=True)  # 113MB/token
+        assert t.observed_max_bytes == 200_000_000, (
+            "an impossible per-token rate must not become the admission floor"
+        )
+        assert t.samples == 2, "an impossible per-token reading is not a sample"
+
     def test_skipped_samples_do_not_touch_max(self):
         t = PrefillTransientTracker("m")
         t.update(32, 100_000_000, floor_sample=True)

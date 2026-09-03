@@ -140,6 +140,28 @@ class PrefillTransientTracker:
 
         history = self._history(gathered_core)
 
+        # The sanity bound gates the running max too, so it runs FIRST. The
+        # clamp below is on TOTAL bytes, which a small chunk passes at an
+        # impossible rate: measured on GLM-5.3-Flash (M1 Ultra), a 32-token
+        # floor chunk read 3.54GB (110MB/token), cleared the 4GB clamp, and
+        # pinned observed_max_bytes for the rest of the process. Admission
+        # charges that max as a flat floor with no multiplier, so it then
+        # priced 3.54GB where the analytic estimate for the same chunk is
+        # 0.27GB and refused a 159K-token prompt by 250MB.
+        per_token = transient_bytes / n_tokens
+        if per_token > self._PER_TOKEN_SANITY_BYTES:
+            logger.debug(
+                "PrefillTransientTracker(%s): dropped %.1f-byte/token sample "
+                "above the per-token sanity bound (%d)",
+                self._model_id,
+                per_token,
+                self._PER_TOKEN_SANITY_BYTES,
+            )
+            # Not counted as a sample: the next sane reading has to SEED the
+            # EWMA (an EWMA of 0 would reject every later sample as an
+            # outlier against 0 x ratio).
+            return
+
         # The very first sample in each execution regime carries weight
         # page-fault and load-residue noise, so it seeds that regime's EWMA
         # but is excluded from its running max.
@@ -156,20 +178,6 @@ class PrefillTransientTracker:
                     transient_bytes,
                     self._OBSERVED_MAX_CLAMP_BYTES,
                 )
-
-        per_token = transient_bytes / n_tokens
-        if per_token > self._PER_TOKEN_SANITY_BYTES:
-            logger.debug(
-                "PrefillTransientTracker(%s): dropped %.1f-byte/token sample "
-                "above the per-token sanity bound (%d)",
-                self._model_id,
-                per_token,
-                self._PER_TOKEN_SANITY_BYTES,
-            )
-            # Not counted as a sample: the next sane reading has to SEED the
-            # EWMA (an EWMA of 0 would reject every later sample as an
-            # outlier against 0 x ratio).
-            return
         if history.samples == 0:
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
