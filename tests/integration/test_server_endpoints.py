@@ -2437,3 +2437,100 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+    def test_chat_completion_preserves_non_ascii(self, client, mock_llm_engine):
+        """Non-ASCII text must survive response_format re-serialization (#3402).
+
+        The JSON is re-serialized after schema validation; without
+        ``ensure_ascii=False`` the escapes land inside ``message.content``
+        itself, so the client sees a literal ``\\u0418`` after decoding.
+        """
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text='{"име": "Иван", "град": "София"}',
+                prompt_tokens=10,
+                completion_tokens=8,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Върни JSON"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        assert response.status_code == 200
+        content = response.json()["choices"][0]["message"]["content"]
+        assert "\\u" not in content
+        assert "Иван" in content
+        assert json.loads(content) == {"име": "Иван", "град": "София"}
+
+    def test_responses_preserves_non_ascii(self, client, mock_llm_engine):
+        """Responses API must not ASCII-escape JSON output either."""
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text='{"град": "София", "температура": 15}',
+                prompt_tokens=10,
+                completion_tokens=8,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Върни JSON",
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+        assert response.status_code == 200
+        output_text = response.json()["output"][0]["content"][0]["text"]
+        assert "\\u" not in output_text
+        assert json.loads(output_text) == {"град": "София", "температура": 15}
+
+    def test_responses_stream_preserves_non_ascii(self, client, mock_llm_engine):
+        """The streaming Responses path re-serializes too and must match."""
+
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text='{"град": "София"}',
+                new_text='{"град": "София"}',
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Върни JSON",
+                "text": {"format": {"type": "json_object"}},
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        done = next(
+            event
+            for event in events
+            if event.get("type") == "response.output_text.done"
+        )
+        assert "\\u" not in done["text"]
+        assert json.loads(done["text"]) == {"град": "София"}
