@@ -486,3 +486,24 @@ def test_every_dashboard_locale_names_cluster_tab():
         locale = json.loads(locale_path.read_text())
         missing = {key for key in required if not locale.get(key)}
         assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
+
+
+def test_model_picker_waits_for_the_inventory_and_catalogue_loads():
+    """The picker must not render its options while either load is in flight.
+
+    Both lists are filled asynchronously. Without this gate Alpine re-renders
+    the option list as the loading flags toggle, and the picker flickers
+    between empty and populated on first open.
+    """
+    template = _read("omlx/admin/templates/dashboard/_cluster.html")
+
+    assert (
+        'x-show="clusterShowModelPicker && !clusterNeuralFabricJob()?.live'
+        ' && !clusterModelInventoryLoading && !clusterCatalogueLoading"'
+    ) in template
+    spinner = (
+        '<div x-show="clusterModelInventoryLoading || clusterCatalogueLoading" x-cloak\n'
+        '                                 class="mt-3 flex items-center justify-center py-8">'
+    )
+    assert spinner in template
+    assert "animate-spin" in template
