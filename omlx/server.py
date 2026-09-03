@@ -2657,6 +2657,8 @@ def _markitdown_virtual_model_status() -> dict:
         "config_model_type": "markitdown",
         "thinking_default": None,
         "preserve_thinking_default": None,
+        "reasoning_effort_options": None,
+        "reasoning_effort_default": None,
         "source_type": "builtin",
         "source_repo_id": None,
         "last_access": None,
