@@ -885,6 +885,19 @@ class TestRuntimeCacheObservability:
             "block_size": 1024,
             "indexed_blocks": 12,
             "ssd_cache": shared_ssd_stats,
+            "exact_resident_cache": {
+                "entries": 1,
+                "size_bytes": 3 * 1024**3,
+                "max_entries": 1,
+                "max_bytes": 8 * 1024**3,
+                "hits": 4,
+                "misses": 2,
+                "active_leases": 1,
+                "leases_total": 4,
+                "fallbacks_total": 2,
+                "evictions": 3,
+                "oversize_rejections": 1,
+            },
         }
 
         manager_b = MagicMock()
@@ -942,10 +955,17 @@ class TestRuntimeCacheObservability:
         assert rows["model-a"]["indexed_blocks"] == 12
         assert rows["model-a"]["num_files"] == 3
         assert rows["model-a"]["total_size_bytes"] == 4096
+        assert rows["model-a"]["exact_resident_cache"]["entries"] == 1
+        assert rows["model-a"]["exact_resident_cache"]["active_leases"] == 1
         assert rows["model-b"]["block_size"] == 2048
         assert rows["model-b"]["indexed_blocks"] == 4
         assert rows["model-b"]["num_files"] == 7
         assert rows["model-b"]["total_size_bytes"] == 8192
+        assert payload["exact_resident_entries"] == 1
+        assert payload["exact_resident_size_bytes"] == 3 * 1024**3
+        assert payload["exact_resident_max_bytes"] == 8 * 1024**3
+        assert payload["exact_resident_hits"] == 4
+        assert payload["exact_resident_fallbacks"] == 2
         for row in rows.values():
             assert row["gdn_checkpoint_loads"] == 0
             assert row["gdn_checkpoint_walkbacks"] == 0

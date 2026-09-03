@@ -722,7 +722,14 @@ class SizedArraysCache:
 
     def advance(self, N):
         """Delegate to inner cache."""
-        return self._inner.advance(N)
+        result = self._inner.advance(N)
+        # Keep the wrapper's logical timeline synchronized with the recurrent
+        # state.  Prefix-restored SizedArraysCache instances otherwise retain
+        # the old boundary count (for example 98,304) after a suffix advance,
+        # making exact resident-cache validation fail closed even though the
+        # underlying ArraysCache has advanced to the current prompt length.
+        self._token_count += int(N)
+        return result
 
     def make_mask(self, N):
         """Delegate to inner cache."""

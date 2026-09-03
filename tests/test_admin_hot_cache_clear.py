@@ -32,16 +32,28 @@ def _pool(models, entries=None):
     return pool
 
 
-def _loaded_entry(clear_hot_cache_mock, executor, stream="engine-stream"):
+def _loaded_entry(
+    clear_hot_cache_mock,
+    executor,
+    stream="engine-stream",
+    exact_resident_clear=None,
+):
     """Build the entry.engine._engine.engine.scheduler chain a loaded model has."""
     scheduler = SimpleNamespace(
         paged_ssd_cache_manager=SimpleNamespace(
             clear_hot_cache=clear_hot_cache_mock,
         ),
         _cache_rate_tracker=None,
+        _exact_resident_cache=SimpleNamespace(
+            clear=(exact_resident_clear or MagicMock(return_value=0))
+        ),
         _stream=stream,
     )
-    core = SimpleNamespace(scheduler=scheduler, _mlx_executor=executor)
+    core = SimpleNamespace(
+        scheduler=scheduler,
+        _mlx_executor=executor,
+        disarm_keepwarm_cache=MagicMock(),
+    )
     return SimpleNamespace(
         engine=SimpleNamespace(
             _engine=SimpleNamespace(engine=core),
@@ -109,6 +121,7 @@ class TestHotCacheClear:
                 result = _run_clear()
 
         assert clear_mock.called
+        entry.engine._engine.engine.disarm_keepwarm_cache.assert_called_once_with()
         assert result["total_cleared"] == 7
         assert env.clear_cache.called
         env.synchronize.assert_any_call("loaded-stream")
@@ -121,8 +134,32 @@ class TestHotCacheClear:
         ):
             result = _run_clear()
 
-        assert set(result.keys()) == {"status", "total_cleared", "bytes_reclaimed"}
+        assert set(result.keys()) == {
+            "status",
+            "total_cleared",
+            "exact_resident_cleared",
+            "bytes_reclaimed",
+        }
         assert result["status"] == "ok"
+
+    def test_clears_exact_resident_entries_and_reports_them(self):
+        exact_clear = MagicMock(return_value=2)
+        with _reclaim_env() as env:
+            entry = _loaded_entry(
+                MagicMock(return_value=3),
+                env._executor,
+                exact_resident_clear=exact_clear,
+            )
+            pool = _pool(
+                models=[{"id": MODEL_ID, "loaded": True}],
+                entries={MODEL_ID: entry},
+            )
+            with patch.object(admin_routes, "_get_engine_pool", return_value=pool):
+                result = _run_clear()
+
+        exact_clear.assert_called_once_with()
+        assert result["exact_resident_cleared"] == 2
+        assert result["total_cleared"] == 5
 
 
 class TestClearReachesOrphans:

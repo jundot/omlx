@@ -300,6 +300,20 @@ class TestBlockAwarePrefixCache:
             assert mx.array_equal(restored_keys, keys).item()
             assert mx.array_equal(restored_values, values).item()
 
+            extended_cache, matched_tokens = (
+                restarted_prefix_cache.restore_exact_terminal_prefix(
+                    "warm-extended-prefix",
+                    [*tokens, 7, 8],
+                    promote_to_hot_cache=False,
+                )
+            )
+            assert extended_cache is not None
+            assert matched_tokens == len(tokens)
+            extended_keys, extended_values = extended_cache[0].state
+            assert extended_keys.shape[2] == len(tokens)
+            assert mx.array_equal(extended_keys, keys).item()
+            assert mx.array_equal(extended_values, values).item()
+
             changed_tokens = [*tokens[:-1], 99]
             assert (
                 restarted_prefix_cache.fetch_exact_prefix(

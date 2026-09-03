@@ -888,7 +888,9 @@ class TestBatchedEngineSpecPrefillForwarding:
         engine = BatchedEngine(model_name="test-model")
         engine._loaded = True
         engine._engine = SimpleNamespace(
-            generate=AsyncMock(return_value=self._fake_output())
+            generate=AsyncMock(return_value=self._fake_output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+            notify_admission_pending=MagicMock(),
         )
 
         await engine.generate(
@@ -909,12 +911,101 @@ class TestBatchedEngineSpecPrefillForwarding:
         engine = BatchedEngine(model_name="test-model")
         engine._loaded = True
         engine._engine = SimpleNamespace(
-            generate=AsyncMock(return_value=self._fake_output())
+            generate=AsyncMock(return_value=self._fake_output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+            notify_admission_pending=MagicMock(),
         )
 
         await engine.generate("a prompt", tools=tools)
 
         assert engine._engine.generate.call_args.kwargs["tools"] == tools
+        engine._engine.notify_admission_pending.assert_called_once_with()
+        engine._engine.schedule_prompt_tail_prewarm.assert_called_once_with(
+            "a prompt"
+        )
+
+    @pytest.mark.asyncio
+    async def test_generate_skip_cache_store_does_not_arm_prompt_tail(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+        )
+
+        await engine.generate("a prompt", skip_cache_store=True)
+
+        engine._engine.schedule_prompt_tail_prewarm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_error_does_not_arm_prompt_tail(self):
+        from omlx.engine.batched import BatchedEngine
+
+        async def stream_outputs(_request_id):
+            yield SimpleNamespace(
+                output_text="",
+                new_text="",
+                prompt_tokens=5,
+                completion_tokens=0,
+                finished=True,
+                finish_reason="error",
+                tool_calls=None,
+                cached_tokens=0,
+                first_token_at=None,
+                error="failed",
+            )
+
+        core = SimpleNamespace(
+            add_request=AsyncMock(return_value="request-error"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+        )
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = core
+
+        async for _ in engine.stream_generate("a prompt"):
+            pass
+
+        core.abort_request.assert_awaited_once_with("request-error")
+        core.schedule_prompt_tail_prewarm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_consumer_cancel_does_not_arm_prompt_tail(self):
+        from omlx.engine.batched import BatchedEngine
+
+        async def stream_outputs(_request_id):
+            yield SimpleNamespace(
+                output_text="partial",
+                new_text="partial",
+                prompt_tokens=5,
+                completion_tokens=1,
+                finished=False,
+                finish_reason=None,
+                tool_calls=None,
+                cached_tokens=0,
+                first_token_at=None,
+            )
+
+        core = SimpleNamespace(
+            add_request=AsyncMock(return_value="request-cancel"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+        )
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = core
+
+        stream = engine.stream_generate("a prompt")
+        await stream.__anext__()
+        await stream.aclose()
+
+        core.abort_request.assert_awaited_once_with("request-cancel")
+        core.schedule_prompt_tail_prewarm.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_generate_omits_specprefill_when_absent(self):

@@ -121,7 +121,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, latent_metal_keepwarm_enabled: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -323,6 +323,15 @@
                     hot_cache_size_bytes: 0,
                     hot_cache_entries: 0,
                     hot_cache_max_bytes: 0,
+                    exact_resident_entries: 0,
+                    exact_resident_size_bytes: 0,
+                    exact_resident_max_entries: 0,
+                    exact_resident_max_bytes: 0,
+                    exact_resident_hits: 0,
+                    exact_resident_misses: 0,
+                    exact_resident_active_leases: 0,
+                    exact_resident_fallbacks: 0,
+                    exact_resident_evictions: 0,
                     disk_max_bytes: 0,
                 },
             },
@@ -6707,6 +6716,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            latent_metal_keepwarm_enabled: this.globalSettings.server.latent_metal_keepwarm_enabled,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -9183,9 +9193,24 @@
             },
 
             get runtimeHotCachePercent() {
+                const maxBytes = this.runtimeMemoryCacheMaxBytes;
+                if (!maxBytes) return 0;
+                return Math.min(100, (this.runtimeMemoryCacheSizeBytes / maxBytes) * 100);
+            },
+
+            get runtimeMemoryCacheSizeBytes() {
                 const rc = this.stats.runtime_cache;
-                if (!rc || !rc.hot_cache_max_bytes) return 0;
-                return Math.min(100, (rc.hot_cache_size_bytes / rc.hot_cache_max_bytes) * 100);
+                return (rc?.hot_cache_size_bytes || 0) + (rc?.exact_resident_size_bytes || 0);
+            },
+
+            get runtimeMemoryCacheMaxBytes() {
+                const rc = this.stats.runtime_cache;
+                return (rc?.hot_cache_max_bytes || 0) + (rc?.exact_resident_max_bytes || 0);
+            },
+
+            get runtimeMemoryCacheEntries() {
+                const rc = this.stats.runtime_cache;
+                return (rc?.hot_cache_entries || 0) + (rc?.exact_resident_entries || 0);
             },
 
             get runtimeSsdCachePercent() {

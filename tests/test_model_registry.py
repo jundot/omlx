@@ -55,6 +55,31 @@ class TestModelRegistry:
         is_owned, _ = registry.is_owned(model)
         assert is_owned is False
 
+    def test_release_by_id_does_not_require_model_reference(self):
+        """Teardown can preserve ordering without retaining model weights."""
+        registry = get_registry()
+        model = MagicMock()
+        engine = MagicMock()
+        engine_id = "test-engine-release-by-id"
+        model_id = id(model)
+
+        registry.acquire(model, engine, engine_id)
+
+        assert registry.release_by_id(model_id, engine_id) is True
+        assert registry.is_owned(model) == (False, None)
+
+    def test_release_by_id_rejects_wrong_owner(self):
+        registry = get_registry()
+        model = MagicMock()
+        engine = MagicMock()
+        engine_id = "test-engine-release-by-id-owner"
+
+        registry.acquire(model, engine, engine_id)
+
+        assert registry.release_by_id(id(model), "wrong-engine") is False
+        assert registry.is_owned(model) == (True, engine_id)
+        registry.release(model, engine_id)
+
     def test_release_wrong_owner(self):
         """Test that release fails for wrong owner."""
         registry = get_registry()
@@ -77,7 +102,7 @@ class TestModelRegistry:
         registry.release(model, engine_id)
 
     def test_force_ownership_transfer(self):
-        """Test that force=True transfers ownership."""
+        """A force flag cannot bypass a different live owner."""
         registry = get_registry()
         model = MagicMock()
         engine1 = MagicMock()
@@ -87,19 +112,32 @@ class TestModelRegistry:
         # First engine acquires
         registry.acquire(model, engine1, "engine-1")
 
-        # Second engine forces ownership
-        registry.acquire(model, engine2, "engine-2", force=True)
+        with pytest.raises(ModelOwnershipError):
+            registry.acquire(model, engine2, "engine-2", force=True)
 
-        # engine1 scheduler should have been reset
-        engine1.scheduler.deep_reset.assert_called_once()
-
-        # engine2 should be owner now
+        engine1.scheduler.deep_reset.assert_not_called()
         is_owned, owner_id = registry.is_owned(model)
         assert is_owned is True
-        assert owner_id == "engine-2"
+        assert owner_id == "engine-1"
 
         # Cleanup
-        registry.release(model, "engine-2")
+        registry.release(model, "engine-1")
+
+    def test_force_rejection_does_not_mutate_previous_owner(self):
+        registry = get_registry()
+        model = MagicMock()
+        owner = MagicMock()
+        owner.scheduler = MagicMock()
+        owner._cancel_prompt_tail_prewarm = MagicMock()
+        replacement = MagicMock()
+        registry.acquire(model, owner, "old-owner")
+        with pytest.raises(ModelOwnershipError):
+            registry.acquire(model, replacement, "new-owner", force=True)
+
+        owner._cancel_prompt_tail_prewarm.assert_not_called()
+        owner.scheduler.deep_reset.assert_not_called()
+        assert registry.is_owned(model) == (True, "old-owner")
+        registry.release(model, "old-owner")
 
     def test_no_force_raises_error(self):
         """Test that force=False raises error when model is owned."""
@@ -206,11 +244,10 @@ class TestMultiEngine:
             registry.release(model, engine_id)
 
     def test_sequential_ownership_with_force(self):
-        """Test that sequential engines work with force=True."""
+        """Legacy force works only after each prior owner releases."""
         registry = get_registry()
         model = MagicMock()
 
-        prev_engine = None
         for i in range(3):
             engine = MagicMock()
             engine.scheduler = MagicMock()
@@ -219,18 +256,10 @@ class TestMultiEngine:
             result = registry.acquire(model, engine, engine_id, force=True)
             assert result is True
 
-            # If there was a previous engine, it should have been reset
-            if prev_engine is not None:
-                prev_engine.scheduler.deep_reset.assert_called_once()
-
             is_owned, owner = registry.is_owned(model)
             assert is_owned is True
             assert owner == engine_id
-
-            prev_engine = engine
-
-        # Cleanup
-        registry.release(model, f"force-engine-{2}")
+            registry.release(model, engine_id)
 
     def test_multiple_models_different_engines(self):
         """Test that different models can have different owners."""
@@ -260,7 +289,7 @@ class TestCacheRecovery:
     """Tests for cache recovery scenarios."""
 
     def test_scheduler_reset_on_force(self):
-        """Test that scheduler is reset when ownership is forced."""
+        """Live ownership cannot be reset from a replacement engine."""
         registry = get_registry()
         model = MagicMock()
 
@@ -272,13 +301,13 @@ class TestCacheRecovery:
         engine2 = MagicMock()
 
         registry.acquire(model, engine1, "engine-1")
-        registry.acquire(model, engine2, "engine-2", force=True)
+        with pytest.raises(ModelOwnershipError):
+            registry.acquire(model, engine2, "engine-2", force=True)
 
-        # First engine's scheduler should have been reset
-        engine1.scheduler.deep_reset.assert_called_once()
+        engine1.scheduler.deep_reset.assert_not_called()
 
         # Cleanup
-        registry.release(model, "engine-2")
+        registry.release(model, "engine-1")
 
     def test_scheduler_reset_handles_missing_scheduler(self):
         """Test that scheduler reset handles engine without scheduler."""
@@ -293,15 +322,15 @@ class TestCacheRecovery:
 
         registry.acquire(model, engine1, "engine-1")
 
-        # Should not raise even though engine1 has no scheduler
-        registry.acquire(model, engine2, "engine-2", force=True)
+        with pytest.raises(ModelOwnershipError):
+            registry.acquire(model, engine2, "engine-2", force=True)
 
-        # Should have transferred ownership
         is_owned, owner = registry.is_owned(model)
-        assert owner == "engine-2"
+        assert is_owned is True
+        assert owner == "engine-1"
 
         # Cleanup
-        registry.release(model, "engine-2")
+        registry.release(model, "engine-1")
 
     def test_weak_ref_cleanup_on_gc(self):
         """Test that weak references are cleaned up on garbage collection."""
@@ -340,7 +369,7 @@ class TestModelRegistryEdgeCases:
         assert result is False
 
     def test_multiple_force_transfers(self):
-        """Test multiple sequential force transfers."""
+        """Repeated force attempts cannot replace the first live owner."""
         registry = get_registry()
         model = MagicMock()
 
@@ -350,20 +379,23 @@ class TestModelRegistryEdgeCases:
             engine.scheduler = MagicMock()
             engines.append(engine)
 
-            registry.acquire(model, engine, f"transfer-engine-{i}", force=True)
+            if i == 0:
+                registry.acquire(model, engine, f"transfer-engine-{i}", force=True)
+            else:
+                with pytest.raises(ModelOwnershipError):
+                    registry.acquire(
+                        model,
+                        engine,
+                        f"transfer-engine-{i}",
+                        force=True,
+                    )
+            assert registry.is_owned(model) == (True, "transfer-engine-0")
 
-            is_owned, owner = registry.is_owned(model)
-            assert owner == f"transfer-engine-{i}"
-
-        # All previous engines should have had scheduler reset
-        for engine in engines[:-1]:
-            engine.scheduler.deep_reset.assert_called_once()
-
-        # Last engine should not have been reset
-        engines[-1].scheduler.deep_reset.assert_not_called()
+        for engine in engines:
+            engine.scheduler.deep_reset.assert_not_called()
 
         # Cleanup
-        registry.release(model, "transfer-engine-4")
+        registry.release(model, "transfer-engine-0")
 
     def test_acquire_after_gc_cleanup(self):
         """Test acquiring after previous owner was garbage collected."""

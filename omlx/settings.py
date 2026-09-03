@@ -162,6 +162,16 @@ def burst_decode_env(mode: str) -> dict[str, str]:
     }
 
 
+def latent_metal_keepwarm_env(enabled: bool) -> dict[str, str]:
+    """Map the persisted experimental switch to the engine environment."""
+
+    value = "1" if enabled else "0"
+    return {
+        "OMLX_KEEPWARM": value,
+        "OMLX_KEEPWARM_PROMPT_TAIL": value,
+    }
+
+
 @dataclass
 class ServerSettings:
     """Server configuration settings."""
@@ -175,6 +185,7 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    latent_metal_keepwarm_enabled: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
@@ -204,6 +215,9 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            latent_metal_keepwarm_enabled=bool(
+                data.get("latent_metal_keepwarm_enabled", False)
+            ),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
@@ -1096,6 +1110,10 @@ class GlobalSettings:
         if preserve_mid_system_cache := os.getenv("OMLX_PRESERVE_MID_SYSTEM_CACHE"):
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if latent_keepwarm := os.getenv("OMLX_KEEPWARM"):
+            self.server.latent_metal_keepwarm_enabled = (
+                latent_keepwarm.strip().lower() in {"1", "true", "yes", "on"}
             )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size

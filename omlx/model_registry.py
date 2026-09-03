@@ -66,13 +66,14 @@ class ModelRegistry:
             model: The MLX model
             engine: The EngineCore instance
             engine_id: Unique identifier for the engine
-            force: If True, forcibly take ownership (resets previous owner)
+            force: Legacy compatibility flag. It may replace a stale weakref,
+                but a different live owner must still close explicitly.
 
         Returns:
             True if ownership acquired
 
         Raises:
-            ModelOwnershipError: If model is owned and force=False
+            ModelOwnershipError: If another live engine owns the model.
         """
         model_id = id(model)
 
@@ -82,18 +83,15 @@ class ModelRegistry:
                 owner = weak_ref()
 
                 if owner is not None and owner_id != engine_id:
-                    if force:
-                        # Reset the previous owner's scheduler
-                        logger.warning(
-                            f"Model ownership transfer: {owner_id} -> {engine_id}"
-                        )
-                        self._reset_owner(owner)
-                    else:
-                        raise ModelOwnershipError(
-                            f"Model is already owned by engine {owner_id}. "
-                            f"Use force=True or call release() on the "
-                            f"previous engine first."
-                        )
+                    # Resetting only the prior scheduler is not an ownership
+                    # transfer: that core still holds the shared model and its
+                    # later close() can release resources under the replacement
+                    # engine.  Fail closed even for the legacy force flag; the
+                    # owner must complete orderly close/unload first.
+                    raise ModelOwnershipError(
+                        f"Model is already owned by live engine {owner_id}. "
+                        "Close or unload the previous engine before reuse."
+                    )
 
             # Register new owner
             self._owners[model_id] = (weakref.ref(engine), engine_id)
@@ -122,6 +120,29 @@ class ModelRegistry:
                     return True
         return False
 
+    def release_by_id(self, model_id: int, engine_id: str) -> bool:
+        """Release ownership using only the registry's non-owning key.
+
+        Engine teardown must preserve its lease through final Metal reclaim,
+        but retaining the model object until that point also retains every
+        weight.  This owner-checked variant lets teardown keep ordering with
+        only ``id(model)`` and no strong reference to the graph.
+        """
+
+        model_id = int(model_id)
+        with self._registry_lock:
+            if model_id in self._owners:
+                _, owner_id = self._owners[model_id]
+                if owner_id == engine_id:
+                    del self._owners[model_id]
+                    logger.debug(
+                        "Engine %s released model %s by id",
+                        engine_id,
+                        model_id,
+                    )
+                    return True
+        return False
+
     def is_owned(self, model: Any) -> Tuple[bool, Optional[str]]:
         """
         Check if a model is owned.
@@ -140,14 +161,6 @@ class ModelRegistry:
                     # Owner was garbage collected, clean up
                     del self._owners[model_id]
         return (False, None)
-
-    def _reset_owner(self, owner: Any) -> None:
-        """Reset the scheduler of a previous owner."""
-        try:
-            if hasattr(owner, 'scheduler'):
-                owner.scheduler.deep_reset()
-        except Exception as e:
-            logger.warning(f"Failed to reset previous owner: {e}")
 
     def cleanup(self) -> int:
         """

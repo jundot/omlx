@@ -47,6 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.exact_resident import ExactResidentPrefixCache
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -72,7 +73,7 @@ from .speculative.vlm_mtp import (
 )
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
-from .utils.hardware import format_bytes
+from .utils.hardware import format_bytes, get_max_working_set_bytes
 from .utils.metal_sync import (
     _default_generation_stream,
     _mx_buffer_access_lock,
@@ -1589,6 +1590,12 @@ class SchedulerConfig:
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
+    # Experimental hot-only exact terminal handoff. Disabled by default until
+    # detached-clone + delayed-durable persistence is physically proven.
+    # Opt-in retains the newest exact terminal cache in RAM and leaves the
+    # existing older paged/SSD chain as its crash/concurrent-claim fallback.
+    exact_resident_cache_slots: int = 0
+    exact_resident_cache_max_bytes: int = 8 * 1024**3
     # Store top-level ArraysCache recurrent state as SSD sidecars while the
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False
@@ -2089,6 +2096,40 @@ class Scheduler:
         # blocking the scheduler step that continues existing decode/prefill.
         self._cache_freshness_waits: dict[str, _CacheFreshnessWait] = {}
         self._prefix_cache_prepared: set[str] = set()
+        self._exact_resident_cache = ExactResidentPrefixCache(
+            max_entries=max(
+                0,
+                _env_int(
+                    "OMLX_EXACT_RESIDENT_MAX_ENTRIES",
+                    _env_int(
+                        "OMLX_EXACT_RESIDENT_CACHE_SLOTS",
+                        int(self.config.exact_resident_cache_slots),
+                    ),
+                ),
+            ),
+            max_bytes=max(
+                0,
+                _env_int(
+                    "OMLX_EXACT_RESIDENT_MAX_BYTES",
+                    _env_int(
+                        "OMLX_EXACT_RESIDENT_CACHE_MAX_BYTES",
+                        int(self.config.exact_resident_cache_max_bytes),
+                    ),
+                ),
+            ),
+        )
+        self._exact_resident_leases: set[str] = set()
+        self._exact_resident_pool_invalidations = 0
+        self._exact_resident_pool_invalidated_bytes = 0
+        self._exact_resident_pool_invalidation_ms = 0.0
+        if self._exact_resident_cache.max_entries > 0:
+            logger.warning(
+                "Experimental exact resident cache enabled: entries=%d "
+                "max_bytes=%.2fGiB; newest terminal state is hot-only and "
+                "the older paged/SSD chain remains the durable fallback",
+                self._exact_resident_cache.max_entries,
+                self._exact_resident_cache.max_bytes / 1024**3,
+            )
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -2302,6 +2343,14 @@ class Scheduler:
         Tracks total ms and invocation count per named phase. Intended for
         boundary capture / store_cache / hot cache eviction hot paths.
         """
+        # Focused cache-contract tests and third-party embedders sometimes
+        # construct Scheduler via __new__ to avoid loading a model. Keep
+        # diagnostics backward-compatible with those constructor-bypassing
+        # callers; production instances initialize both maps in __init__.
+        if not hasattr(self, "_phase_total_ms"):
+            self._phase_total_ms = defaultdict(float)
+        if not hasattr(self, "_phase_count"):
+            self._phase_count = defaultdict(int)
         t0 = time.perf_counter()
         try:
             yield
@@ -2415,7 +2464,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-    ) -> None:
+    ) -> int:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
@@ -2448,6 +2497,9 @@ class Scheduler:
 
         paged_cache_manager and block_aware_cache rely on
         threading.RLock so concurrent access from main and worker is safe.
+
+        Returns the number of cache tokens registered in the paged tier. A
+        zero result means the caller must not publish a deferred resident L0.
         """
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
@@ -2484,12 +2536,17 @@ class Scheduler:
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
+            durable_tokens = getattr(block_table, "num_tokens", 0)
+            if type(durable_tokens) is not int:
+                durable_tokens = 0
             if block_table and self.paged_cache_manager is not None:
                 self.paged_cache_manager.release_for_eviction(block_table.block_ids)
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
+            return max(0, durable_tokens)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+            return 0
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -2512,17 +2569,26 @@ class Scheduler:
                 pending.append((uid, request_id, future))
                 continue
             # Surface worker exceptions for visibility (don't crash step loop).
+            stored_durable_tokens = 0
             if future is not None:
                 try:
-                    exc = future.exception()
+                    result = future.result()
                 except concurrent.futures.CancelledError:
                     logger.warning("Async store_cache for %s was cancelled", request_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Async store_cache for %s raised: %s", request_id, exc
+                    )
                 else:
-                    if exc is not None:
-                        logger.warning(
-                            "Async store_cache for %s raised: %s", request_id, exc
-                        )
+                    if type(result) is int:
+                        stored_durable_tokens = max(0, result)
             try:
+                request = self.requests.get(request_id)
+                if request is not None:
+                    self._publish_deferred_exact_resident_cache(
+                        request,
+                        stored_durable_tokens,
+                    )
                 # Run batch_generator.remove on the inference thread.
                 try:
                     _safe_sync_stream(self._stream)
@@ -4575,6 +4641,9 @@ class Scheduler:
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
+        leases = getattr(self, "_exact_resident_leases", None)
+        if leases is not None:
+            leases.discard(request_id)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
@@ -5137,6 +5206,8 @@ class Scheduler:
         request: "Request",
         tokens: list[int],
         existing_cache: "list[Any] | None",
+        *,
+        process_all_tokens: bool = False,
     ) -> _PrefillState:
         """Initialise a _PrefillState for a non-VLM request.
 
@@ -5177,8 +5248,8 @@ class Scheduler:
             )
             base_size = request.cached_tokens
 
-        prefill_tokens = tokens[:-1]
-        last_token = tokens[-1:]
+        prefill_tokens = tokens if process_all_tokens else tokens[:-1]
+        last_token = [] if process_all_tokens else tokens[-1:]
         # Build the input row on the engine stream so chunk eval graphs stay
         # single-stream (see _do_external_prefill, #2197/#2183).
         with mx.stream(self._stream):
@@ -5194,7 +5265,11 @@ class Scheduler:
             emitted_boundaries={},
             boundary_enabled=boundary_enabled,
             block_size=block_size,
-            total_length=len(tokens),
+            # Progress code reports ``total_length - 1`` because ordinary
+            # generation leaves one kickoff token. A prewarm-only pass
+            # processes every real token, so add one synthetic accounting
+            # slot while keeping the token row itself unchanged.
+            total_length=len(tokens) + (1 if process_all_tokens else 0),
         )
 
     def _step_prefill_chunk(self, state: _PrefillState) -> bool:
@@ -5220,8 +5295,16 @@ class Scheduler:
             state.tokens_processed, remaining
         )
         n = min(prefill_step_size, remaining)
+        prewarm_chunk_size = int(
+            getattr(state.request, "_prompt_tail_prewarm_chunk_size", 0) or 0
+        )
+        cache_prewarm_only = bool(
+            getattr(state.request, "_cache_prewarm_only", False)
+        )
+        if prewarm_chunk_size > 0:
+            n = min(n, prewarm_chunk_size)
 
-        if state.tokens_processed == 0:
+        if state.tokens_processed == 0 and not cache_prewarm_only:
             _sync_and_clear_cache(self._stream)
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
@@ -5287,17 +5370,18 @@ class Scheduler:
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
-        self._record_chunk_transient(
-            n,
-            _throttle_pre,
-            _throttle_post,
-            request_id=state.request.request_id,
-            loop_label="chunked_step",
-            kv_len=state.base_size + state.tokens_processed,
-            requested_step=prefill_step_size,
-            gathered_core=gathered_core,
-        )
-        self._maybe_record_fixed_state_bytes(state.cache)
+        if not cache_prewarm_only:
+            self._record_chunk_transient(
+                n,
+                _throttle_pre,
+                _throttle_post,
+                request_id=state.request.request_id,
+                loop_label="chunked_step",
+                kv_len=state.base_size + state.tokens_processed,
+                requested_step=prefill_step_size,
+                gathered_core=gathered_core,
+            )
+            self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
         # Boundary snapshot
@@ -5318,16 +5402,17 @@ class Scheduler:
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
         # via the temp_uid mapping; the chunked path has no temp uid so we
         # talk to the tracker directly with the request_id.
-        get_prefill_tracker().update(
-            state.request.request_id,
-            state.tokens_processed,
-            state.total_length - 1,
-            (
-                self.config.model_name
-                if self.config.model_name
-                else ""
-            ),
-        )
+        if not cache_prewarm_only:
+            get_prefill_tracker().update(
+                state.request.request_id,
+                state.tokens_processed,
+                state.total_length - 1,
+                (
+                    self.config.model_name
+                    if self.config.model_name
+                    else ""
+                ),
+            )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
         # pool and IOAccelerator-backed allocations that don't show up in
@@ -5391,10 +5476,12 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        if self._should_clear_after_chunk():
+        if not cache_prewarm_only and self._should_clear_after_chunk():
             _sync_and_clear_cache(self._stream)
         chunk_dt = time.perf_counter() - _t_chunk_start
-        if getattr(state.request, "benchmark_trace", False):
+        if not cache_prewarm_only and getattr(
+            state.request, "benchmark_trace", False
+        ):
             _ane_sequence = int(
                 getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
             )
@@ -5424,11 +5511,16 @@ class Scheduler:
             )
         # Full-size chunks only: boundary/tail slivers under-measure, and
         # the running max must reflect sustained capability.
-        if chunk_dt > 0.0 and n >= _CONTENDED_CHUNK_FLOOR:
+        if (
+            not cache_prewarm_only
+            and chunk_dt > 0.0
+            and n >= _CONTENDED_CHUNK_FLOOR
+        ):
             rate = n / chunk_dt
             if self._prefill_tps_best is None or rate > self._prefill_tps_best:
                 self._prefill_tps_best = rate
-        self._accrue_decode_debt(chunk_dt)
+        if not cache_prewarm_only:
+            self._accrue_decode_debt(chunk_dt)
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
@@ -5515,6 +5607,13 @@ class Scheduler:
                 return
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+        stage_stable_boundary = getattr(
+            self,
+            "_stage_stable_prompt_boundary",
+            None,
+        )
+        if callable(stage_stable_boundary):
+            stage_stable_boundary(request, state.cache)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -5858,6 +5957,134 @@ class Scheduler:
             snapshot_cache,
             total_tokens,
         )
+        incremental_store_active = getattr(
+            self,
+            "_qwen35_mtp_incremental_store_active",
+            None,
+        )
+        if callable(incremental_store_active) and incremental_store_active(
+            request
+        ):
+            self._store_qwen35_mtp_prefill_boundary(
+                request,
+                prompt_cache,
+                total_tokens,
+            )
+
+    def _qwen35_mtp_incremental_store_active(self, request: "Request") -> bool:
+        """Whether this request needs prefill-owned block materialization.
+
+        Generic Qwen3.5 MTP can leave terminal cache views attached to a lazy
+        verifier graph.  Serializing those views after generation has finished
+        can re-evaluate the whole context.  Qwen4 owns a separate exact target
+        transaction and is deliberately excluded by its distinct model type.
+        """
+        if getattr(request, "skip_cache_store", False):
+            return False
+        if self.block_aware_cache is None:
+            return False
+        return self._qwen35_mtp_target_only_prewarm_enabled()
+
+    def _qwen35_mtp_target_only_prewarm_enabled(self) -> bool:
+        """Whether idle target-only reconstruction is valid for this model."""
+        if not self._resident_cache_spec_decode_active():
+            return False
+        candidates = [self.model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(self.model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        return any(
+            str(
+                getattr(candidate, "model_type", None)
+                or getattr(getattr(candidate, "config", None), "model_type", "")
+                or ""
+            ).startswith("qwen3_5")
+            for candidate in candidates
+        )
+
+    def _store_qwen35_mtp_prefill_boundary(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        total_tokens: int,
+    ) -> None:
+        """Persist one newly completed Qwen3.5 block on the owner thread.
+
+        ``store_cache`` extends the request's existing block table, so each
+        invocation slices and copies only the newest block.  No full cache
+        snapshot is retained, and completion can release the block table
+        without touching the terminal MTP graph.
+        """
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = list(request.prompt_token_ids or [])
+        if (
+            block_size <= 0
+            or total_tokens <= 0
+            or total_tokens % block_size != 0
+            or total_tokens > len(prompt_tokens)
+        ):
+            return
+        try:
+            with mx.stream(self._stream):
+                extracted, model_cache_config = self._extract_cache_states(prompt_cache)
+                if not extracted:
+                    return
+                block_table = self.block_aware_cache.store_cache(
+                    request.request_id,
+                    prompt_tokens[:total_tokens],
+                    extracted,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots={total_tokens: extracted},
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    hot_cache_write_back=not self._bypass_hot_cache_under_pressure(),
+                )
+            stored_tokens = int(getattr(block_table, "num_tokens", 0) or 0)
+            if stored_tokens < total_tokens:
+                logger.warning(
+                    "Qwen3.5 MTP incremental store stopped at %d/%d tokens for %s",
+                    stored_tokens,
+                    total_tokens,
+                    request.request_id,
+                )
+                return
+            request.block_table = block_table
+            request._qwen35_mtp_prefill_durable_tokens = stored_tokens
+            request._exact_resident_durable_fallback_tokens = max(
+                int(
+                    getattr(
+                        request,
+                        "_exact_resident_durable_fallback_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+                stored_tokens,
+            )
+            logger.info(
+                "Qwen3.5 MTP prefill boundary persisted incrementally for %s: "
+                "tokens=%d block_size=%d",
+                request.request_id,
+                stored_tokens,
+                block_size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Qwen3.5 MTP incremental boundary store failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+
+    def _qwen35_mtp_prefill_store_covers_prompt(self, request: "Request") -> bool:
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_len = len(request.prompt_token_ids or [])
+        required = ((prompt_len - 1) // block_size) * block_size if block_size else 0
+        stored = int(
+            getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+        )
+        return required > 0 and stored >= required
 
     def _build_sampler_and_processors(
         self, sampling_params: SamplingParams, request: Any = None
@@ -8188,20 +8415,1840 @@ class Scheduler:
         )
         return True
 
+    @staticmethod
+    def _resident_cache_leaf_objects(cache_list: list[Any]):
+        """Yield cache leaves while treating composite caches as containers."""
+
+        stack = list(reversed(cache_list))
+        while stack:
+            cache_obj = stack.pop()
+            sub_caches = getattr(cache_obj, "caches", None)
+            if isinstance(sub_caches, (list, tuple)):
+                stack.extend(reversed(sub_caches))
+            else:
+                yield cache_obj
+
+    def _resident_cache_spec_decode_active(self) -> bool:
+        """Fail closed while speculative decode can leave a verified queue.
+
+        Lightning MTP may have target KV/recurrent state ahead of the emitted
+        ``all_tokens`` queue.  Matching public offsets is not enough to prove
+        that positionless Arrays/GDN state represents the visible terminal
+        token.  Exact resident reuse stays disabled until the MTP path exposes
+        and tests an explicit terminal queue rollback/drain contract.
+        """
+
+        if getattr(self, "_vlm_mtp_drafter", None) is not None:
+            return True
+        model = getattr(self, "model", None)
+        candidates = [model]
+        for attr in ("language_model", "_language_model"):
+            inner = getattr(model, attr, None)
+            if inner is not None and inner is not model:
+                candidates.append(inner)
+        return any(
+            bool(
+                getattr(candidate, "_omlx_mtp_decode_enabled", False)
+                or getattr(candidate, "_omlx_dspark_decode_enabled", False)
+            )
+            for candidate in candidates
+            if candidate is not None
+        )
+
+    def _resident_cache_qwen4_target_only_enabled(self) -> bool:
+        """Whether a dependency proves exact Qwen4 target-only reuse.
+
+        PR #3330 does not set these markers. They are supplied only by the
+        separately reviewed Qwen4 terminal rollback/drain contract, so this
+        branch fails closed for Qwen4 when used on its own.
+        """
+
+        if getattr(self, "_vlm_mtp_drafter", None) is not None:
+            return False
+        model = getattr(self, "model", None)
+        candidates = [model]
+        for attr in ("language_model", "_language_model", "model"):
+            candidate = getattr(model, attr, None)
+            if candidate is not None and candidate not in candidates:
+                candidates.append(candidate)
+        for wrapper in list(candidates):
+            inner = getattr(wrapper, "model", None)
+            if inner is not None and inner not in candidates:
+                candidates.append(inner)
+        return any(
+            getattr(candidate, "_omlx_mtp_terminal_commit_v1", False) is True
+            and getattr(
+                candidate,
+                "_omlx_mtp_suffix_local_capability",
+                None,
+            )
+            == "qwen4-verified-text-v1"
+            for candidate in candidates
+            if candidate is not None
+        )
+
+    @classmethod
+    def _resident_cache_nbytes(cls, cache_list: list[Any]) -> int | None:
+        """Count concrete resident arrays once, including QSA auxiliaries."""
+
+        seen_cache_objects: set[int] = set()
+        seen_containers: set[int] = set()
+        seen_arrays: set[int] = set()
+        total = 0
+
+        def visit(value: Any) -> None:
+            nonlocal total
+            if isinstance(value, mx.array):
+                identity = id(value)
+                if identity not in seen_arrays:
+                    seen_arrays.add(identity)
+                    total += int(value.nbytes)
+                return
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value.values():
+                    visit(item)
+                return
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value:
+                    visit(item)
+            # Do not recurse into arbitrary objects referenced by a cache
+            # (notably QSA's pooled-indexer tag, which is a model module).
+            # Root cache objects are expanded explicitly below.
+
+        def visit_cache_object(cache_obj: Any) -> bool:
+            identity = id(cache_obj)
+            if identity in seen_cache_objects:
+                return True
+            seen_cache_objects.add(identity)
+            try:
+                attributes = vars(cache_obj)
+            except TypeError:
+                return False
+            for name, value in attributes.items():
+                if name == "_pooled_index_tag":
+                    continue
+                if name == "_inner":
+                    if not visit_cache_object(value):
+                        return False
+                else:
+                    visit(value)
+            return True
+
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            if not visit_cache_object(cache_obj):
+                return None
+        return total if seen_arrays else None
+
+    @classmethod
+    def _resident_cache_arrays(cls, cache_list: list[Any]) -> list[mx.array]:
+        """Collect concrete cache-owned arrays once for owner-stream eval."""
+
+        arrays: list[mx.array] = []
+        seen_objects: set[int] = set()
+        seen_containers: set[int] = set()
+        seen_arrays: set[int] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, mx.array):
+                identity = id(value)
+                if identity not in seen_arrays:
+                    seen_arrays.add(identity)
+                    arrays.append(value)
+                return
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return
+            if isinstance(value, dict):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value.values():
+                    visit(item)
+                return
+            if isinstance(value, (list, tuple)):
+                identity = id(value)
+                if identity in seen_containers:
+                    return
+                seen_containers.add(identity)
+                for item in value:
+                    visit(item)
+
+        def visit_cache(cache_obj: Any) -> None:
+            identity = id(cache_obj)
+            if identity in seen_objects:
+                return
+            seen_objects.add(identity)
+            for name, value in vars(cache_obj).items():
+                if name == "_pooled_index_tag":
+                    continue
+                if name == "_inner":
+                    visit_cache(value)
+                else:
+                    visit(value)
+
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            visit_cache(cache_obj)
+        return arrays
+
+    def _stage_stable_prompt_boundary(
+        self,
+        request: Request,
+        cache_list: list[Any] | None,
+    ) -> bool:
+        """Detach an already-computed, provider-proved prompt boundary.
+
+        This is staged on the request and published only after normal terminal
+        cleanup proves the request stayed singleton.  It therefore adds no
+        claimable cache while BatchGenerator still owns the source merge.
+        """
+
+        request._stable_prompt_resident_candidate = None
+        if (
+            not isinstance(cache_list, list)
+            or not cache_list
+            or getattr(request, "skip_cache_store", False)
+            or not self._request_is_text_only_for_resident_cache(request)
+            or self._exact_resident_cache.max_entries < 2
+            or self.running
+            or self.waiting
+            or any(
+                candidate.request_id != request.request_id
+                for candidate in self.prefilling
+            )
+        ):
+            return False
+
+        source_tokens = list(request.prompt_token_ids or [])
+        source_cache_tokens = len(source_tokens) - 1
+        if source_cache_tokens < 2:
+            return False
+
+        # Do not hold a context-sized N-1 clone while long generic-Qwen3.5
+        # MTP decode mutates the live target graph. The prompt's full blocks
+        # were already persisted during prefill; idle prompt-tail maintenance
+        # reconstructs only the bounded non-block suffix after decode and then
+        # publishes this exact boundary without any live mutation beside it.
+        block_size = int(self.config.paged_cache_block_size or 0)
+        if (
+            block_size > 0
+            and source_cache_tokens >= block_size
+            and self._qwen35_mtp_target_only_prewarm_enabled()
+            and int(
+                getattr(request, "_qwen35_mtp_prefill_durable_tokens", 0) or 0
+            )
+            >= (source_cache_tokens // block_size) * block_size
+        ):
+            logger.info(
+                "Deferring long Qwen3.5 MTP stable boundary for %s to idle "
+                "prompt-tail reconstruction (tokens=%d)",
+                request.request_id,
+                source_cache_tokens,
+            )
+            return False
+
+        from .cache.exact_boundary import (
+            plan_hybrid_arrays_kv_boundary,
+            plan_plain_kv_boundary,
+        )
+
+        qwen4_provider = self._resident_cache_qwen4_target_only_enabled()
+        provider_name = "qwen4-qsa" if qwen4_provider else "plain-kv-v1"
+        block_size = int(self.config.paged_cache_block_size or 0)
+        stable_token_count = source_cache_tokens
+        plain_kv_plan = None
+        hybrid_plan = None
+        if not qwen4_provider:
+            # Generic V1 is target-only plain KV. Any speculative drafter or
+            # non-exact cache graph remains outside its proof.
+            if self._resident_cache_spec_decode_active() or block_size <= 0:
+                return False
+            # Plain chat templates may rewrite more than one generation-marker
+            # token between turns. The preceding already-durable block boundary
+            # is template-independent while bounding replay to one cache block.
+            stable_token_count = (
+                source_cache_tokens // block_size
+            ) * block_size
+            if stable_token_count < 2:
+                return False
+            plain_kv_plan = plan_plain_kv_boundary(
+                cache_list,
+                source_tokens=len(source_tokens),
+                source_cache_tokens=source_cache_tokens,
+                target_tokens=stable_token_count,
+            )
+            if plain_kv_plan is None:
+                # Recurrent state cannot be inverted to the coarse block
+                # boundary. A finalized B1 ArraysCache+KVCache graph can,
+                # however, be copied exactly at its already-computed N-1
+                # timeline. Exact token matching makes a changed template tail
+                # a safe miss rather than a correctness risk.
+                stable_token_count = source_cache_tokens
+                hybrid_plan = plan_hybrid_arrays_kv_boundary(
+                    cache_list,
+                    source_tokens=len(source_tokens),
+                    target_tokens=stable_token_count,
+                )
+                if hybrid_plan is None:
+                    return False
+                provider_name = "hybrid-arrays-kv-v1"
+        stable_tokens = source_tokens[:stable_token_count]
+        required_durable = (
+            (len(stable_tokens) // block_size) * block_size
+            if block_size > 0
+            else 0
+        )
+        durable_tokens = int(
+            getattr(request, "_exact_resident_durable_fallback_tokens", 0) or 0
+        )
+        # Initial cold turns still use the ordinary prompt store plus idle
+        # prewarm. Immediate publication is reserved for a boundary whose crash
+        # fallback is already independently durable.
+        if required_durable > durable_tokens:
+            return False
+
+        estimated_bytes = (
+            self._resident_cache_nbytes(cache_list)
+            if qwen4_provider
+            else (
+                plain_kv_plan.estimated_nbytes
+                if plain_kv_plan is not None
+                else hybrid_plan.estimated_nbytes
+            )
+        )
+        if estimated_bytes is None or estimated_bytes <= 0:
+            return False
+        can_fit = getattr(
+            self._exact_resident_cache,
+            "can_fit_protected_candidate",
+            None,
+        )
+        if callable(can_fit) and not can_fit(
+            stable_tokens,
+            estimated_cache_nbytes=estimated_bytes,
+        ):
+            return False
+
+        cap_candidates = [
+            int(getattr(self, name, 0) or 0)
+            for name in (
+                "_memory_abort_limit_bytes",
+                "_memory_metal_cap_bytes",
+                "_memory_static_ceiling_bytes",
+            )
+        ]
+        with suppress(Exception):
+            cap_candidates.append(int(get_max_working_set_bytes() or 0))
+        cap_candidates = [value for value in cap_candidates if value > 0]
+        physical_cap = min(cap_candidates) if cap_candidates else 0
+        if (
+            physical_cap <= 0
+            or self._current_usage_bytes() + estimated_bytes > physical_cap
+            or estimated_bytes > self._exact_resident_cache.max_bytes
+        ):
+            return False
+
+        started = time.perf_counter()
+        try:
+            from .cache.exact_boundary import (
+                materialize_hybrid_arrays_kv_boundary,
+                materialize_plain_kv_boundary,
+            )
+            from .patches.mlx_lm_mtp import prompt_priming
+
+            generation = self._exact_resident_cache.generation()
+            source_arrays = self._resident_cache_arrays(cache_list)
+            if not source_arrays:
+                return False
+            source_array_ids = {id(array) for array in source_arrays}
+            with mx.stream(self._stream):
+                if qwen4_provider:
+                    cloned = prompt_priming._cache_at_offset(
+                        cache_list,
+                        len(stable_tokens),
+                    )
+                    provider_nbytes = None
+                elif plain_kv_plan is not None:
+                    detached = materialize_plain_kv_boundary(
+                        plain_kv_plan,
+                        stream=self._stream,
+                    )
+                    cloned = detached.cache if detached is not None else None
+                    provider_nbytes = (
+                        detached.nbytes if detached is not None else None
+                    )
+                else:
+                    detached = materialize_hybrid_arrays_kv_boundary(
+                        hybrid_plan,
+                        stream=self._stream,
+                    )
+                    cloned = detached.cache if detached is not None else None
+                    provider_nbytes = (
+                        detached.nbytes if detached is not None else None
+                    )
+                if not cloned:
+                    return False
+                if not self._invalidate_resident_pool_with_telemetry(
+                    cloned,
+                    phase="stable-prompt-capture",
+                ):
+                    return False
+                arrays = self._resident_cache_arrays(cloned)
+                if not arrays:
+                    return False
+                # The resident entry must own every mutable MLX array.  A
+                # shallow cache-object copy is not enough: source decode can
+                # otherwise mutate a published boundary after validation.
+                if source_array_ids.intersection(id(array) for array in arrays):
+                    logger.warning(
+                        "Stable prompt boundary rejected for %s: detached "
+                        "clone shares cache-owned arrays with the live source",
+                        request.request_id,
+                    )
+                    return False
+                mx.eval(*arrays)
+            if not self._resident_cache_matches_token_count(
+                cloned,
+                len(stable_tokens),
+            ):
+                return False
+            cache_nbytes = self._resident_cache_nbytes(cloned)
+            if (
+                cache_nbytes is None
+                or cache_nbytes <= 0
+                or (
+                    provider_nbytes is not None
+                    and cache_nbytes != provider_nbytes
+                )
+                or cache_nbytes > self._exact_resident_cache.max_bytes
+                or self._current_usage_bytes() > physical_cap
+            ):
+                return False
+        except Exception as exc:  # noqa: BLE001 - cache providers fail closed
+            request._stable_prompt_resident_candidate = None
+            logger.warning(
+                "Stable prompt boundary capture failed closed for %s: %s",
+                request.request_id,
+                exc,
+            )
+            return False
+        capture_ms = (time.perf_counter() - started) * 1000.0
+        request._stable_prompt_resident_candidate = (
+            stable_tokens,
+            cloned,
+            cache_nbytes,
+            min(durable_tokens, len(stable_tokens)),
+            generation,
+            capture_ms,
+        )
+        logger.info(
+            "Stable prompt boundary captured for %s: provider=%s tokens=%d "
+            "size=%.2fGiB clone=%.1fms publication=deferred-until-terminal",
+            request.request_id,
+            provider_name,
+            len(stable_tokens),
+            cache_nbytes / 1024**3,
+            capture_ms,
+        )
+        return True
+
+    def _publish_stable_prompt_boundary(self, request: Request) -> bool:
+        """Publish a staged N-1 boundary after singleton terminal cleanup."""
+
+        candidate = getattr(request, "_stable_prompt_resident_candidate", None)
+        request._stable_prompt_resident_candidate = None
+        if not (isinstance(candidate, tuple) and len(candidate) == 6):
+            return False
+        tokens, cache_list, cache_nbytes, durable_tokens, generation, capture_ms = (
+            candidate
+        )
+        if not (
+            isinstance(tokens, list)
+            and isinstance(cache_list, list)
+            and self._resident_cache_matches_token_count(cache_list, len(tokens))
+        ):
+            return False
+        published = self._exact_resident_cache.put(
+            tokens,
+            cache_list,
+            cache_nbytes=cache_nbytes,
+            durable_tokens=durable_tokens,
+            protect_longer_prefix=True,
+            expected_generation=generation,
+        )
+        if published:
+            logger.info(
+                "Stable prompt boundary published for %s: tokens=%d size=%.2fGiB "
+                "capture=%.1fms durable_tokens=%d",
+                request.request_id,
+                len(tokens),
+                cache_nbytes / 1024**3,
+                capture_ms,
+                durable_tokens,
+            )
+        return published
+
+    @classmethod
+    def _invalidate_resident_derived_state(
+        cls, cache_list: list[Any]
+    ) -> tuple[bool, int]:
+        """Drop QSA's rebuildable pooled bank before retaining or leasing it."""
+
+        dropped_bytes = 0
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            class_name = type(cache_obj).__name__
+            if class_name not in {"QSAKVCache", "QSAQuantizedKVCache"}:
+                continue
+            invalidate = getattr(cache_obj, "_invalidate_pooled_indexer", None)
+            if not callable(invalidate):
+                return False, dropped_bytes
+            try:
+                pooled = getattr(cache_obj, "_pooled_index_keys", None)
+                if isinstance(pooled, mx.array):
+                    dropped_bytes += int(pooled.nbytes)
+                invalidate()
+                cache_obj._omlx_text_position_ids_qualified = False
+            except Exception:
+                return False, dropped_bytes
+        return True, dropped_bytes
+
+    def _invalidate_resident_pool_with_telemetry(
+        self,
+        cache_list: list[Any],
+        *,
+        phase: str,
+    ) -> bool:
+        started = time.perf_counter()
+        ok, dropped_bytes = self._invalidate_resident_derived_state(cache_list)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if dropped_bytes > 0:
+            self._exact_resident_pool_invalidations = int(
+                getattr(self, "_exact_resident_pool_invalidations", 0)
+            ) + 1
+            self._exact_resident_pool_invalidated_bytes = int(
+                getattr(self, "_exact_resident_pool_invalidated_bytes", 0)
+            ) + dropped_bytes
+            self._exact_resident_pool_invalidation_ms = float(
+                getattr(self, "_exact_resident_pool_invalidation_ms", 0.0)
+            ) + elapsed_ms
+            logger.info(
+                "Exact resident QSA pool invalidated (%s): %.2fMiB in %.3fms; "
+                "first decode rebuild is included in physical TTFT A/B",
+                phase,
+                dropped_bytes / 1024**2,
+                elapsed_ms,
+            )
+        return ok
+
+    @classmethod
+    def _resident_cache_matches_token_count(
+        cls,
+        cache_list: list[Any],
+        token_count: int,
+    ) -> bool:
+        """Prove every readable cache timeline is the exact terminal state."""
+
+        if not cache_list or token_count <= 0:
+            return False
+        def axis_two_length(value: Any) -> int | None:
+            if isinstance(value, mx.array):
+                return int(value.shape[2]) if value.ndim >= 3 else None
+            if isinstance(value, (list, tuple)) and value:
+                lengths = [axis_two_length(item) for item in value]
+                if any(length is None for length in lengths):
+                    return None
+                return (
+                    lengths[0]
+                    if all(length == lengths[0] for length in lengths)
+                    else None
+                )
+            return None
+
+        def validate_qsa(cache_obj: Any) -> bool:
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is not int or offset != token_count:
+                return False
+            keys_len = axis_two_length(getattr(cache_obj, "keys", None))
+            values_len = axis_two_length(getattr(cache_obj, "values", None))
+            # QSA uses geometric backing buffers. ``offset`` is the exact
+            # logical KV boundary while keys/values may retain spare capacity
+            # for later appends; state access slices them to that offset. A
+            # backing shorter than the ledger is corrupt, but extra capacity
+            # is expected and does not represent additional committed tokens.
+            if (
+                keys_len is None
+                or values_len is None
+                or keys_len < token_count
+                or values_len < token_count
+            ):
+                return False
+
+            raw_keys = getattr(cache_obj, "_index_keys", None)
+            raw_positions = getattr(cache_obj, "_index_position_ids", None)
+            raw_offset = getattr(cache_obj, "_index_offset", None)
+            if (
+                not isinstance(raw_keys, mx.array)
+                or raw_keys.ndim != 3
+                or raw_keys.shape[0] != 1
+                or not isinstance(raw_positions, mx.array)
+                or raw_positions.ndim not in {2, 3}
+                or raw_offset != token_count
+                or raw_keys.shape[1] < token_count
+                or raw_positions.shape[-1] < token_count
+            ):
+                return False
+            logical_keys = getattr(cache_obj, "index_keys", None)
+            logical_positions = getattr(cache_obj, "index_position_ids", None)
+            if (
+                not isinstance(logical_keys, mx.array)
+                or logical_keys.shape[1] != token_count
+                or not isinstance(logical_positions, mx.array)
+                or logical_positions.shape[-1] != token_count
+            ):
+                return False
+
+            public_index_offset = getattr(cache_obj, "index_offset", None)
+            if public_index_offset is not None and public_index_offset != token_count:
+                return False
+
+            # Resident entries are text-only.  A VLM-shaped three-plane
+            # position history is admissible only when all planes are exactly
+            # equal, the same proof used by Qwen4's text verify qualification.
+            expected_positions = mx.arange(token_count, dtype=mx.int32)
+            if logical_positions.ndim == 2:
+                if logical_positions.shape[0] != 1 or not bool(
+                    mx.array_equal(
+                        logical_positions[0].astype(mx.int32),
+                        expected_positions,
+                    ).item()
+                ):
+                    return False
+            elif (
+                logical_positions.ndim != 3
+                or logical_positions.shape[:2] != (3, 1)
+                or not bool(
+                    (
+                        mx.all(logical_positions[0] == logical_positions[1])
+                        & mx.all(logical_positions[0] == logical_positions[2])
+                    ).item()
+                )
+                or not bool(
+                    mx.array_equal(
+                        logical_positions[0, 0].astype(mx.int32),
+                        expected_positions,
+                    ).item()
+                )
+            ):
+                return False
+            raw_prefix = raw_positions[..., :token_count]
+            if not bool(
+                mx.array_equal(
+                    raw_prefix.astype(mx.int32),
+                    logical_positions.astype(mx.int32),
+                ).item()
+            ):
+                return False
+            qualified = getattr(
+                cache_obj, "_omlx_text_position_ids_qualified", False
+            )
+            if qualified is not False and qualified is not True:
+                return False
+
+            pooled = getattr(cache_obj, "_pooled_index_keys", None)
+            pooled_offset = getattr(cache_obj, "_pooled_index_offset", None)
+            pooled_ratio = getattr(cache_obj, "_pooled_index_ratio", None)
+            pooled_tag = getattr(cache_obj, "_pooled_index_tag", None)
+            if pooled is None:
+                return (
+                    pooled_offset == 0
+                    and pooled_ratio is None
+                    and pooled_tag is None
+                )
+            if (
+                not isinstance(pooled, mx.array)
+                or pooled.ndim != 3
+                or pooled.shape[0] != 1
+                or type(pooled_ratio) is not int
+                or pooled_ratio <= 0
+                or pooled_offset != token_count // pooled_ratio
+                or pooled.shape[1] < pooled_offset
+                or pooled_tag is None
+            ):
+                return False
+            # Content is derived from model-owned normalization/RoPE modules
+            # and cannot be proven from offsets alone.  Staging/acquisition
+            # invalidates this bank, so reaching a non-empty bank here means
+            # the invalidation contract did not run.
+            return False
+
+        offsets: list[int] = []
+        validated_leaves = 0
+        positionless_exact_types = frozenset({"ArraysCache", "SizedArraysCache"})
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            # A speculative rollback snapshot means this is not a committed
+            # terminal cache even if its public offset happens to match.
+            if any(
+                getattr(cache_obj, attr, None) is not None
+                for attr in (
+                    "rollback_state",
+                    "_qwen4_exp_ple_speculative_state",
+                    "_mtp_undo",
+                )
+            ):
+                return False
+            class_name = type(cache_obj).__name__
+            if class_name in {"QSAKVCache", "QSAQuantizedKVCache"}:
+                if not validate_qsa(cache_obj):
+                    return False
+                offsets.append(token_count)
+                validated_leaves += 1
+                continue
+            if "QSA" in class_name:
+                # A new/foreign QSA family needs an explicit auxiliary-state
+                # proof before it may retain mutable resident state.
+                return False
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is int:
+                offsets.append(offset)
+                validated_leaves += 1
+            elif offset is not None and getattr(offset, "size", 0) == 1:
+                try:
+                    offsets.append(int(offset.reshape(()).item()))
+                    validated_leaves += 1
+                except Exception:
+                    return False
+            elif class_name in positionless_exact_types:
+                state = getattr(cache_obj, "cache", None)
+                if not isinstance(state, list) or not state or any(
+                    item is None for item in state
+                ):
+                    return False
+                if class_name == "SizedArraysCache" and getattr(
+                    cache_obj, "_token_count", None
+                ) != token_count:
+                    return False
+                validated_leaves += 1
+            else:
+                # Unknown positionless state cannot prove which token prefix
+                # it summarizes.  The paged cache remains the safe fallback.
+                return False
+        return (
+            validated_leaves > 0
+            and bool(offsets)
+            and all(offset == token_count for offset in offsets)
+        )
+
+    @staticmethod
+    def _request_is_text_only_for_resident_cache(request: Request) -> bool:
+        """Media state is keyed separately and must never enter this text tier."""
+
+        return not (
+            request.images
+            or request.videos
+            or request.vlm_inputs_embeds is not None
+            or request.vlm_extra_keys_for_cache
+            or request.vlm_extra_key_ranges_for_cache
+        )
+
+    @classmethod
+    def _resident_cache_timeline_observation(cls, cache_list: Any) -> str:
+        """Return bounded reason telemetry without dumping long-context shapes."""
+
+        if not isinstance(cache_list, list):
+            return f"cache_type={type(cache_list).__name__}"
+        offsets: set[int] = set()
+        recurrent_counts: set[int] = set()
+        rollback: set[str] = set()
+        leaves = 0
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            leaves += 1
+            offset = getattr(cache_obj, "offset", None)
+            if type(offset) is int:
+                offsets.add(offset)
+            elif offset is not None and getattr(offset, "size", 0) == 1:
+                try:
+                    offsets.add(int(offset.reshape(()).item()))
+                except Exception:
+                    pass
+            token_count = getattr(cache_obj, "_token_count", None)
+            if type(token_count) is int:
+                recurrent_counts.add(token_count)
+            for attr in (
+                "rollback_state",
+                "_qwen4_exp_ple_speculative_state",
+                "_mtp_undo",
+                "_mtp_draft_stash",
+                "_undo",
+            ):
+                if getattr(cache_obj, attr, None) is not None:
+                    rollback.add(attr)
+        return (
+            f"leaves={leaves} offsets={sorted(offsets)[:8]} "
+            f"recurrent_counts={sorted(recurrent_counts)[:8]} "
+            f"rollback={sorted(rollback)}"
+        )
+
+    @classmethod
+    def _resident_qsa_timeline_observation(
+        cls,
+        cache_list: Any,
+        token_count: int,
+    ) -> list[dict[str, Any]]:
+        """Return bounded QSA invariant telemetry after a failed proof."""
+
+        rows: list[dict[str, Any]] = []
+        if not isinstance(cache_list, list):
+            return rows
+        expected = mx.arange(token_count, dtype=mx.int32)
+        for cache_obj in cls._resident_cache_leaf_objects(cache_list):
+            if type(cache_obj).__name__ not in {
+                "QSAKVCache",
+                "QSAQuantizedKVCache",
+            }:
+                continue
+            raw_positions = getattr(cache_obj, "_index_position_ids", None)
+            logical_positions = getattr(cache_obj, "index_position_ids", None)
+            position_exact = False
+            planes_equal = None
+            raw_logical_equal = False
+            try:
+                if isinstance(logical_positions, mx.array):
+                    if logical_positions.ndim == 2:
+                        position_exact = bool(
+                            mx.array_equal(
+                                logical_positions[0].astype(mx.int32),
+                                expected,
+                            ).item()
+                        )
+                    elif logical_positions.ndim == 3:
+                        planes_equal = bool(
+                            (
+                                mx.all(
+                                    logical_positions[0]
+                                    == logical_positions[1]
+                                )
+                                & mx.all(
+                                    logical_positions[0]
+                                    == logical_positions[2]
+                                )
+                            ).item()
+                        )
+                        position_exact = bool(
+                            mx.array_equal(
+                                logical_positions[0, 0].astype(mx.int32),
+                                expected,
+                            ).item()
+                        )
+                if (
+                    isinstance(raw_positions, mx.array)
+                    and isinstance(logical_positions, mx.array)
+                ):
+                    raw_logical_equal = bool(
+                        mx.array_equal(
+                            raw_positions[..., :token_count].astype(mx.int32),
+                            logical_positions.astype(mx.int32),
+                        ).item()
+                    )
+            except Exception:
+                pass
+            rows.append(
+                {
+                    "type": type(cache_obj).__name__,
+                    "offset": getattr(cache_obj, "offset", None),
+                    "kv": (
+                        getattr(getattr(cache_obj, "keys", None), "shape", None),
+                        getattr(getattr(cache_obj, "values", None), "shape", None),
+                    ),
+                    "raw_keys": getattr(
+                        getattr(cache_obj, "_index_keys", None),
+                        "shape",
+                        None,
+                    ),
+                    "raw_positions": getattr(raw_positions, "shape", None),
+                    "raw_offset": getattr(cache_obj, "_index_offset", None),
+                    "logical_keys": getattr(
+                        getattr(cache_obj, "index_keys", None),
+                        "shape",
+                        None,
+                    ),
+                    "logical_positions": getattr(
+                        logical_positions,
+                        "shape",
+                        None,
+                    ),
+                    "public_index_offset": getattr(
+                        cache_obj,
+                        "index_offset",
+                        None,
+                    ),
+                    "position_exact": position_exact,
+                    "planes_equal": planes_equal,
+                    "raw_logical_equal": raw_logical_equal,
+                    "qualified": getattr(
+                        cache_obj,
+                        "_omlx_text_position_ids_qualified",
+                        None,
+                    ),
+                    "pooled": (
+                        getattr(
+                            getattr(cache_obj, "_pooled_index_keys", None),
+                            "shape",
+                            None,
+                        ),
+                        getattr(cache_obj, "_pooled_index_offset", None),
+                        getattr(cache_obj, "_pooled_index_ratio", None),
+                        getattr(cache_obj, "_pooled_index_tag", None) is not None,
+                    ),
+                }
+            )
+            if len(rows) >= 2:
+                break
+        return rows
+
+    def _stage_terminal_prompt_boundary_source(
+        self,
+        request: Request,
+        cache_list: Any,
+        cache_tokens: Any,
+    ) -> None:
+        """Retain an exact Qwen4 terminal cache solely for durable refill.
+
+        The terminal post-emit hook may retire its BatchGenerator row before
+        cleanup. Boundary snapshots already contain recurrent state at each
+        prompt boundary, but intentionally omit sliceable QSA/KV state. Keep
+        the proved terminal cache reachable on the request so cleanup can fill
+        only those sliceable placeholders. This ownership is independent of
+        the optional exact-resident L0 tier and is released with the request
+        after the durable store worker completes.
+        """
+
+        request._terminal_prompt_boundary_source = None
+        if (
+            getattr(request, "_mtp_exact_terminal_proved", None)
+            != "qwen4-target-only-v1"
+            or request.specprefill_indices is not None
+            or getattr(request, "skip_cache_store", False)
+            or not self._request_is_text_only_for_resident_cache(request)
+            or not isinstance(cache_list, list)
+            or not cache_list
+            or not isinstance(cache_tokens, (list, tuple))
+            or not cache_tokens
+        ):
+            return
+        try:
+            tokens = [int(token) for token in cache_tokens]
+        except (TypeError, ValueError):
+            return
+        if not self._invalidate_resident_pool_with_telemetry(
+            cache_list,
+            phase="durable-source",
+        ):
+            return
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            logger.warning(
+                "Skipping terminal prompt-boundary source for %s: cache "
+                "timeline does not match its %s-token ledger",
+                request.request_id,
+                len(tokens),
+            )
+            return
+        request._terminal_prompt_boundary_source = (tokens, cache_list)
+
+    def _stage_exact_resident_cache(
+        self,
+        request: Request,
+        cache_list: Any,
+        cache_tokens: Any,
+    ) -> None:
+        """Attach a validated terminal cache candidate to ``request``.
+
+        Cleanup attempts the bounded L0 insertion *before* deciding whether
+        to skip the latest durable extension.  A disabled/oversize/rejected
+        insertion therefore keeps the ordinary SSD store path.  A successful
+        insertion is hot-only and immediately claimable; the same mutable
+        arrays are never handed to the asynchronous writer.
+        """
+
+        terminal_proof = getattr(request, "_mtp_exact_terminal_proved", None)
+        attempted_qwen4 = terminal_proof == "qwen4-target-only-v1"
+        terminal_proved = terminal_proof in {
+            "qwen4-target-only-v1",
+            "mtp-standard-terminal-v1",
+        }
+        if (
+            getattr(self, "_exact_resident_cache", None) is None
+            or self._exact_resident_cache.max_entries <= 0
+            or self._exact_resident_cache.max_bytes <= 0
+            or request.specprefill_indices is not None
+            or getattr(request, "skip_cache_store", False)
+            or (
+                self._resident_cache_spec_decode_active()
+                and not (
+                    terminal_proved
+                    and (
+                        (
+                            attempted_qwen4
+                            and self._resident_cache_qwen4_target_only_enabled()
+                        )
+                        or terminal_proof == "mtp-standard-terminal-v1"
+                    )
+                )
+            )
+            or not self._request_is_text_only_for_resident_cache(request)
+            or not isinstance(cache_list, list)
+            or not cache_list
+            or not isinstance(cache_tokens, (list, tuple))
+            or not cache_tokens
+        ):
+            return
+        # In non-speculative mlx-lm GenerationBatch.next(), ``_step`` appends
+        # the forwarded token to both the physical cache and ``all_tokens``
+        # before Response.prompt_cache is extracted.  Those two fields are
+        # therefore one exact terminal transaction.  Parser stops detach the
+        # same pair through BatchGenerator.extract_cache().  The MTP gate
+        # above is load-bearing: its verified emit queue breaks this contract
+        # until an explicit terminal rollback/drain is available.
+        tokens = [int(token) for token in cache_tokens]
+        if not self._invalidate_resident_pool_with_telemetry(
+            cache_list, phase="publish"
+        ):
+            return
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            logger.debug(
+                "Skipping exact resident cache for %s: cache offsets do not "
+                "prove the %d-token terminal state",
+                request.request_id,
+                len(tokens),
+            )
+            return
+        cache_nbytes = self._resident_cache_nbytes(cache_list)
+        if cache_nbytes is None or cache_nbytes <= 0:
+            logger.debug(
+                "Skipping exact resident cache for %s: concrete cache bytes "
+                "could not be measured",
+                request.request_id,
+            )
+            return
+        if cache_nbytes > self._exact_resident_cache.max_bytes:
+            logger.info(
+                "Exact resident cache bypass for %s: %.2fGiB exceeds %.2fGiB "
+                "budget; retaining normal durable store",
+                request.request_id,
+                cache_nbytes / 1024**3,
+                self._exact_resident_cache.max_bytes / 1024**3,
+            )
+            return
+        request._exact_resident_candidate = (
+            tokens,
+            cache_list,
+            cache_nbytes,
+        )
+
+    def _publish_exact_resident_cache(
+        self,
+        request: Request,
+    ) -> bool:
+        candidate = getattr(request, "_exact_resident_candidate", None)
+        request._exact_resident_candidate = None
+        if not (
+            isinstance(candidate, tuple)
+            and len(candidate) == 3
+            and isinstance(candidate[0], list)
+            and isinstance(candidate[1], list)
+        ):
+            return False
+        tokens, cache_list, cache_nbytes = candidate
+        if not self._resident_cache_matches_token_count(cache_list, len(tokens)):
+            return False
+        durable_tokens = getattr(
+            request,
+            "_exact_resident_durable_fallback_tokens",
+            0,
+        )
+        if type(durable_tokens) is not int:
+            durable_tokens = 0
+        durable_tokens = max(0, min(durable_tokens, len(tokens)))
+        if self._exact_resident_cache.put(
+            tokens,
+            cache_list,
+            cache_nbytes=cache_nbytes,
+            durable_tokens=durable_tokens,
+            terminal_proof=getattr(request, "_mtp_exact_terminal_proved", None),
+        ):
+            logger.info(
+                "Exact resident cache staged for %s: tokens=%d size=%.2fGiB "
+                "durability=paged-boundary durable_tokens=%d",
+                request.request_id,
+                len(tokens),
+                cache_nbytes / 1024**3,
+                durable_tokens,
+            )
+            return True
+        return False
+
+    def _persist_exact_resident_cache_on_shutdown(self) -> int:
+        """Persist the newest validated terminal cache before engine teardown.
+
+        Exact-resident L0 is intentionally RAM-only during serving so the next
+        turn is instantaneous.  A model swap/reload must not discard that
+        terminal tail, however.  The existing exact-terminal SSD domain stores
+        the complete (possibly partial-block) chain without exposing it to
+        ordinary prefix matching; reload can then probe it as an extending
+        exact prefix.  This runs only after async request stores have drained
+        and on the scheduler owner thread, so MLX arrays are materialized
+        safely before the SSD writer takes ownership.
+        """
+
+        prefix_cache = getattr(self, "block_aware_cache", None)
+        if (
+            prefix_cache is None
+            or getattr(prefix_cache, "paged_ssd_cache", None) is None
+            or not hasattr(self._exact_resident_cache, "snapshot_entries")
+        ):
+            return 0
+        persisted = 0
+        for index, (tokens, raw_cache, _proof) in enumerate(
+            self._exact_resident_cache.snapshot_entries()
+        ):
+            if not tokens or not isinstance(raw_cache, list) or not raw_cache:
+                continue
+            try:
+                with mx.stream(self._stream):
+                    _safe_sync_stream(self._stream)
+                    extracted, model_cache_config = self._extract_cache_states(
+                        raw_cache
+                    )
+                if not extracted:
+                    continue
+                request_id = f"shutdown-exact-{time.time_ns()}-{index}"
+                stored = prefix_cache.store_exact_prefix(
+                    request_id,
+                    tokens,
+                    extracted,
+                    model_cache_config=model_cache_config,
+                )
+                if stored is not None and stored.num_tokens == len(tokens):
+                    persisted += 1
+                    logger.info(
+                        "Persisted exact resident terminal for reload: "
+                        "tokens=%d blocks=%d",
+                        len(tokens),
+                        len(stored.block_ids),
+                    )
+                else:
+                    logger.info(
+                        "Exact resident terminal persistence skipped: tokens=%d",
+                        len(tokens),
+                    )
+            except Exception as exc:  # noqa: BLE001 - teardown must continue
+                logger.warning(
+                    "Exact resident terminal persistence failed closed: %s",
+                    exc,
+                )
+        return persisted
+
+    def _exact_resident_required_durable_tokens(self, request: Request) -> int:
+        """Largest full-block prompt boundary safe for generation kickoff."""
+
+        block_size = int(self.config.paged_cache_block_size or 0)
+        prompt_tokens = request.prompt_token_ids or []
+        if block_size <= 0 or len(prompt_tokens) <= 1:
+            return 0
+        # Stateful caches cannot generically trim an exact N-token hit to N-1.
+        # The last reusable durable boundary must therefore be strictly before
+        # the prompt end, matching _prepare_prefix_cache_for_request.
+        return ((len(prompt_tokens) - 1) // block_size) * block_size
+
+    def _publish_deferred_exact_resident_cache(
+        self,
+        request: Request,
+        stored_durable_tokens: int,
+    ) -> bool:
+        """Publish a terminal L0 only after its independent store is durable."""
+
+        required = getattr(request, "_exact_resident_publish_after_store", None)
+        request._exact_resident_publish_after_store = None
+        if type(required) is not int or required <= 0:
+            return False
+        if (
+            type(stored_durable_tokens) is not int
+            or stored_durable_tokens < required
+        ):
+            request._exact_resident_candidate = None
+            logger.warning(
+                "Exact resident cache not published for %s: durable prompt "
+                "boundary reached %d/%d tokens",
+                request.request_id,
+                (
+                    stored_durable_tokens
+                    if type(stored_durable_tokens) is int
+                    else 0
+                ),
+                required,
+            )
+            return False
+
+        request._exact_resident_durable_fallback_tokens = stored_durable_tokens
+        published = self._publish_exact_resident_cache(request)
+        if published:
+            logger.info(
+                "Published deferred exact resident handoff for %s after "
+                "durable prompt boundary reached %d tokens",
+                request.request_id,
+                stored_durable_tokens,
+            )
+        return published
+
+    def _restore_exact_resident_cache(self, request: Request) -> bool:
+        """Transfer one exact terminal cache directly into ``request``."""
+
+        if not self._request_is_text_only_for_resident_cache(request):
+            return False
+        resident_cache = getattr(self, "_exact_resident_cache", None)
+        if (
+            resident_cache is None
+            or resident_cache.max_entries <= 0
+            or resident_cache.max_bytes <= 0
+        ):
+            return False
+        prompt_tokens = request.prompt_token_ids or []
+        started = time.perf_counter()
+        with self._phase_timer("exact_resident_lookup"):
+            allowed_terminal_proofs = None
+            if self._resident_cache_spec_decode_active():
+                allowed_terminal_proofs = {
+                    "qwen4-target-only-v1",
+                    "mtp-standard-terminal-v1",
+                    "mtp-target-only-stable-v1",
+                }
+            hit = resident_cache.acquire_prefix(
+                prompt_tokens,
+                allowed_terminal_proofs=allowed_terminal_proofs,
+            )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if hit is None:
+            return False
+        if not self._invalidate_resident_pool_with_telemetry(
+            hit.cache, phase="lease"
+        ):
+            return False
+        if not self._resident_cache_matches_token_count(
+            hit.cache, hit.cached_tokens
+        ):
+            logger.warning(
+                "Exact resident cache failed terminal-offset validation for %s; "
+                "falling back to paged prefix cache",
+                request.request_id,
+            )
+            return False
+
+        request.prompt_cache = hit.cache
+        request.cached_tokens = hit.cached_tokens
+        request.remaining_tokens = prompt_tokens[hit.cached_tokens :]
+        request.shared_prefix_blocks = 0
+        request.block_table = None
+        request._exact_resident_hit = True
+        request._exact_resident_durable_fallback_tokens = hit.durable_tokens
+        leases = getattr(self, "_exact_resident_leases", None)
+        if leases is None:
+            leases = set()
+            self._exact_resident_leases = leases
+        leases.add(request.request_id)
+        logger.info(
+            "Prefix cache restore for %s: source=exact-resident cached=%d "
+            "suffix=%d lookup=%.3fms retained=%.2fGiB",
+            request.request_id,
+            hit.cached_tokens,
+            len(request.remaining_tokens),
+            elapsed_ms,
+            hit.cache_nbytes / 1024**3,
+        )
+        return True
+
+    def _exact_resident_stats(self) -> dict[str, int]:
+        resident_cache = getattr(self, "_exact_resident_cache", None)
+        stats = resident_cache.stats() if resident_cache is not None else {}
+        stats["active_leases"] = len(
+            getattr(self, "_exact_resident_leases", ())
+        )
+        # Explicit aliases make dashboard/operator interpretation clear.
+        stats["leases_total"] = int(stats.get("hits", 0))
+        stats["fallbacks_total"] = int(stats.get("misses", 0))
+        stats["pool_invalidations"] = int(
+            getattr(self, "_exact_resident_pool_invalidations", 0)
+        )
+        stats["pool_invalidated_bytes"] = int(
+            getattr(self, "_exact_resident_pool_invalidated_bytes", 0)
+        )
+        stats["pool_invalidation_ms"] = float(
+            getattr(self, "_exact_resident_pool_invalidation_ms", 0.0)
+        )
+        return stats
+
+    @contextmanager
+    def _suppress_prompt_tail_cache_observability(self):
+        """Keep idle maintenance out of user cache/phase accounting.
+
+        Prompt-tail prewarm deliberately reads and promotes the ordinary
+        durable prefix, but it is not a user request and must not inflate hit
+        rate, tokens-saved, SSD-load, or endpoint phase metrics. The owning
+        scheduler's serialized MLX lane prevents a user cache operation from
+        racing while these snapshots are restored.
+        """
+
+        prefix_cache = getattr(self, "block_aware_cache", None)
+        prefix_counter_names = (
+            "_hits",
+            "_misses",
+            "_tokens_saved",
+            "_partial_block_skips",
+            "_partial_tokens_skipped",
+            "_tokens_matched_total",
+            "_tokens_requested_total",
+            "_last_partial_tokens_skipped",
+            "_last_tokens_to_next_block",
+            "_exact_prefix_hits",
+            "_exact_prefix_misses",
+            "_exact_prefix_tokens_restored",
+            "_exact_prefix_stores",
+            "_exact_prefix_store_failures",
+            "_gdn_checkpoint_loads",
+            "_gdn_checkpoint_walkbacks",
+        )
+        prefix_snapshot = {
+            name: getattr(prefix_cache, name)
+            for name in prefix_counter_names
+            if prefix_cache is not None and hasattr(prefix_cache, name)
+        }
+        ssd_manager = getattr(self, "paged_ssd_cache_manager", None)
+        ssd_stats = getattr(ssd_manager, "_stats", None)
+        ssd_snapshot = dict(ssd_stats) if isinstance(ssd_stats, dict) else None
+        phase_total = getattr(self, "_phase_total_ms", None)
+        phase_count = getattr(self, "_phase_count", None)
+        phase_total_snapshot = dict(phase_total) if phase_total is not None else None
+        phase_count_snapshot = dict(phase_count) if phase_count is not None else None
+        try:
+            yield
+        finally:
+            for name, value in prefix_snapshot.items():
+                setattr(prefix_cache, name, value)
+            if ssd_snapshot is not None and isinstance(ssd_stats, dict):
+                ssd_stats.clear()
+                ssd_stats.update(ssd_snapshot)
+            if phase_total_snapshot is not None and phase_total is not None:
+                phase_total.clear()
+                phase_total.update(phase_total_snapshot)
+            if phase_count_snapshot is not None and phase_count is not None:
+                phase_count.clear()
+                phase_count.update(phase_count_snapshot)
+
+    def prewarm_prompt_tail(
+        self,
+        prompt: str | list[int],
+        *,
+        min_tokens: int = 256,
+        max_tokens: int = 262144,
+        max_suffix_tokens: int = 4096,
+        chunk_size: int = 128,
+        abort_requested: Callable[[], bool] | None = None,
+        publish_if_current: (
+            Callable[[list[int], list[Any], int, int], bool] | None
+        ) = None,
+    ) -> dict[str, Any]:
+        """Publish an exact arbitrary prompt tail into resident L0.
+
+        This is the target-only counterpart to ThunderMLX visible transcript
+        prewarm. It reuses the ordinary durable prefix, evaluates only a
+        bounded suffix on the owning MLX lane, performs no sampling or MTP
+        work, and publishes cache state at the stable ``N - 1`` prompt
+        boundary. Chat clients commonly replace the final assistant-generation
+        marker when they render the next turn; retaining that marker therefore
+        misses even though every earlier token is unchanged. A future request
+        must still add a non-empty suffix before ExactResidentPrefixCache will
+        transfer ownership, so generation kickoff never needs a generic
+        recurrent-cache trim.
+        """
+
+        result: dict[str, Any] = {"status": "skipped", "reason": "unknown"}
+        if self.has_requests() or self._others_decoding():
+            result["reason"] = "scheduler-busy"
+            return result
+        if self._exact_resident_cache.max_entries <= 0:
+            result["reason"] = "resident-disabled"
+            return result
+        if (
+            self._resident_cache_spec_decode_active()
+            and not self._resident_cache_qwen4_target_only_enabled()
+            and not self._qwen35_mtp_target_only_prewarm_enabled()
+        ):
+            # A hidden target-only pass is reusable during speculative decode
+            # only when the model advertises the same verified Qwen4 terminal
+            # transaction used by normal exact-resident handoff.  Other
+            # speculative families may leave target state ahead of their
+            # public token ledger, so do not allocate an entry that restore
+            # must reject (or, worse, might later learn to accept broadly).
+            result["reason"] = "speculative-terminal-unproved"
+            return result
+
+        try:
+            source_prompt_tokens = (
+                self.tokenizer.encode(prompt)
+                if isinstance(prompt, str)
+                else [int(token) for token in prompt]
+            )
+        except Exception as exc:
+            result.update(reason="tokenize-failed", error=str(exc)[:200])
+            return result
+        # The final rendered token is an unstable generation boundary for
+        # chat clients. Keep the exact state immediately before it.
+        stable_boundary_trimmed_tokens = 1 if source_prompt_tokens else 0
+        prompt_tokens = (
+            source_prompt_tokens[:-stable_boundary_trimmed_tokens]
+            if stable_boundary_trimmed_tokens
+            else []
+        )
+        result.update(
+            source_prompt_tokens=len(source_prompt_tokens),
+            stable_boundary_trimmed_tokens=stable_boundary_trimmed_tokens,
+        )
+        if len(prompt_tokens) < max(2, int(min_tokens)):
+            result.update(reason="prompt-too-short", prompt_tokens=len(prompt_tokens))
+            return result
+        if max_tokens > 0 and len(prompt_tokens) > int(max_tokens):
+            result.update(reason="prompt-too-large", prompt_tokens=len(prompt_tokens))
+            return result
+        qwen4_boundary = self._resident_cache_qwen4_target_only_enabled()
+        minimum_resident_tokens = len(prompt_tokens)
+        if not qwen4_boundary:
+            prewarm_block_size = int(
+                getattr(
+                    getattr(self, "config", None),
+                    "paged_cache_block_size",
+                    0,
+                )
+                or 0
+            )
+            durable_boundary = (
+                (len(prompt_tokens) // prewarm_block_size) * prewarm_block_size
+                if prewarm_block_size > 0
+                else 0
+            )
+            if durable_boundary >= 2:
+                minimum_resident_tokens = durable_boundary
+        contains_prefix = getattr(
+            self._exact_resident_cache,
+            "contains_prefix",
+            None,
+        )
+        contains_exact = getattr(self._exact_resident_cache, "contains_exact", None)
+        already_resident = (
+            contains_prefix(
+                prompt_tokens,
+                minimum_tokens=minimum_resident_tokens,
+            )
+            if callable(contains_prefix)
+            else callable(contains_exact) and contains_exact(prompt_tokens)
+        )
+        if already_resident:
+            result.update(
+                reason="stable-boundary-already-resident",
+                prompt_tokens=len(prompt_tokens),
+            )
+            return result
+        if (
+            (abort_requested is not None and abort_requested())
+            or self._others_decoding()
+        ):
+            result["reason"] = "admission-pending"
+            return result
+
+        # Idle optimization must never trigger model eviction or rely on the
+        # user's optional memory-guard switch. Price a full-N scratch cache
+        # against the stable physical/Metal ceilings before reconstructing a
+        # single prefix block. If this model cannot produce a trustworthy
+        # estimate, skip and preserve the current hot entry.
+        current_usage = self._current_usage_bytes()
+        estimate = self._admission_estimate(
+            num_prompt_tokens=len(prompt_tokens),
+            cached_tokens=0,
+            current=current_usage,
+        )
+        cap_candidates = [
+            int(getattr(self, name, 0) or 0)
+            for name in (
+                "_memory_abort_limit_bytes",
+                "_memory_metal_cap_bytes",
+                "_memory_static_ceiling_bytes",
+            )
+        ]
+        try:
+            cap_candidates.append(int(get_max_working_set_bytes() or 0))
+        except Exception:
+            pass
+        cap_candidates = [value for value in cap_candidates if value > 0]
+        physical_cap = min(cap_candidates) if cap_candidates else 0
+        if estimate is None or physical_cap <= 0:
+            result["reason"] = "memory-estimate-unavailable"
+            return result
+        if (
+            estimate.estimated > physical_cap
+            or estimate.kv_exact > self._exact_resident_cache.max_bytes
+        ):
+            result.update(
+                reason="memory-headroom-rejected",
+                estimated_bytes=int(estimate.estimated),
+                resident_bytes=int(estimate.kv_exact),
+                limit_bytes=int(physical_cap),
+            )
+            return result
+        can_fit_protected = getattr(
+            self._exact_resident_cache,
+            "can_fit_protected_candidate",
+            None,
+        )
+        if callable(can_fit_protected) and not can_fit_protected(
+            prompt_tokens,
+            estimated_cache_nbytes=int(estimate.kv_exact),
+        ):
+            result.update(
+                reason="protected-terminal-budget",
+                resident_bytes=int(estimate.kv_exact),
+                limit_bytes=int(self._exact_resident_cache.max_bytes),
+            )
+            return result
+
+        request_id = f"keepwarm-tail-{time.time_ns()}"
+        request = Request(
+            request_id=request_id,
+            prompt=prompt_tokens,
+            sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+            skip_cache_store=True,
+        )
+        request.prompt_token_ids = prompt_tokens
+        request.num_prompt_tokens = len(prompt_tokens)
+        request._cache_prewarm_only = True
+        request._specprefill_enabled = False
+        request._prompt_tail_prewarm_chunk_size = max(64, int(chunk_size))
+
+        original_cache: list[Any] | None = None
+        prefilled_cache: list[Any] | None = None
+        state: _PrefillState | None = None
+        original_cached_tokens = 0
+        original_durable_tokens = 0
+        published = False
+        started = time.perf_counter()
+        # Hidden prompt-tail evaluation is target-only.  Qwen4 prompt
+        # priming normally observes target forwards and builds model-global
+        # MTP state for the next decode.  That state is useful for a user
+        # request but is both wasted and unsafe to leak out of an idle cache
+        # maintenance pass, so make the exclusion explicit rather than
+        # relying on the current runtime's priming setting.
+        from .patches.mlx_lm_mtp import prompt_priming
+
+        prompt_priming.drop_ctx(getattr(self, "model", None))
+        try:
+            with self._suppress_prompt_tail_cache_observability():
+                with mx.stream(self._stream):
+                    self._prepare_prefix_cache_for_request(request)
+            original_cache = request.prompt_cache
+            original_cached_tokens = max(0, int(request.cached_tokens or 0))
+            original_durable_tokens = max(
+                0,
+                int(
+                    getattr(
+                        request,
+                        "_exact_resident_durable_fallback_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            remaining = (
+                list(request.remaining_tokens)
+                if request.remaining_tokens is not None
+                else prompt_tokens
+            )
+            result.update(
+                prompt_tokens=len(prompt_tokens),
+                cached_tokens=original_cached_tokens,
+                suffix_tokens=len(remaining),
+            )
+            if original_cached_tokens <= 0 or original_cache is None:
+                result["reason"] = "no-reusable-prefix"
+                return result
+            if len(remaining) > max(1, int(max_suffix_tokens)):
+                result["reason"] = "suffix-too-large"
+                return result
+            if (
+                (abort_requested is not None and abort_requested())
+                or self._others_decoding()
+            ):
+                result["reason"] = "admission-pending"
+                return result
+            if not self._validate_cache(original_cache):
+                result["reason"] = "restored-cache-invalid"
+                return result
+            preflight_rejection = self._preflight_memory_check(request)
+            if preflight_rejection is not None:
+                result.update(
+                    reason="memory-headroom-rejected",
+                    estimated_bytes=preflight_rejection.estimated_bytes,
+                    limit_bytes=preflight_rejection.limit_bytes,
+                )
+                return result
+
+            with prompt_priming.suppress_capture():
+                state = self._begin_prefill(
+                    request,
+                    remaining,
+                    original_cache,
+                    process_all_tokens=True,
+                )
+                # Resident prewarm is memory-only. Durable 4K snapshots remain
+                # the restart fallback and must not be rewritten by this
+                # hidden pass.
+                state.boundary_enabled = False
+                while not self._step_prefill_chunk(state):
+                    if (
+                        (abort_requested is not None and abort_requested())
+                        or self._others_decoding()
+                    ):
+                        result["reason"] = "admission-arrived"
+                        return result
+                if (
+                    (abort_requested is not None and abort_requested())
+                    or self._others_decoding()
+                ):
+                    result["reason"] = "admission-arrived"
+                    return result
+
+                prefilled_cache = state.cache
+                self._finalize_chunked_prefill_cache_for_insert(
+                    request,
+                    prefilled_cache,
+                )
+            if not self._invalidate_resident_pool_with_telemetry(
+                prefilled_cache,
+                phase="prompt-tail-prewarm",
+            ):
+                result["reason"] = "derived-state-invalidation-failed"
+                return result
+            if not self._resident_cache_matches_token_count(
+                prefilled_cache,
+                len(prompt_tokens),
+            ):
+                logger.info(
+                    "Latent prompt-tail timeline mismatch: expected=%d %s qsa=%s",
+                    len(prompt_tokens),
+                    self._resident_cache_timeline_observation(prefilled_cache),
+                    self._resident_qsa_timeline_observation(
+                        prefilled_cache,
+                        len(prompt_tokens),
+                    ),
+                )
+                result["reason"] = "timeline-mismatch"
+                return result
+            cache_nbytes = self._resident_cache_nbytes(prefilled_cache)
+            if cache_nbytes is None or cache_nbytes <= 0:
+                result["reason"] = "cache-size-unavailable"
+                return result
+            durable_tokens = min(original_durable_tokens, len(prompt_tokens))
+            if (
+                (abort_requested is not None and abort_requested())
+                or self._others_decoding()
+            ):
+                result["reason"] = "admission-arrived"
+                return result
+            if publish_if_current is None:
+                published = self._exact_resident_cache.put(
+                    prompt_tokens,
+                    prefilled_cache,
+                    cache_nbytes=cache_nbytes,
+                    durable_tokens=durable_tokens,
+                    protect_longer_prefix=True,
+                )
+            else:
+                published = publish_if_current(
+                    prompt_tokens,
+                    prefilled_cache,
+                    cache_nbytes,
+                    durable_tokens,
+                )
+            if not published:
+                result["reason"] = "resident-budget-rejected"
+                return result
+            result.update(
+                status="published",
+                reason="ok",
+                cache_nbytes=cache_nbytes,
+                durable_tokens=durable_tokens,
+            )
+            logger.info(
+                "Latent prompt-tail prewarm published: prompt=%d cached=%d "
+                "suffix=%d size=%.2fGiB elapsed=%.1fms",
+                len(prompt_tokens),
+                original_cached_tokens,
+                len(remaining),
+                cache_nbytes / 1024**3,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return result
+        except Exception as exc:
+            logger.warning("Latent prompt-tail prewarm failed closed: %s", exc)
+            result.update(reason="exception", error=str(exc)[:200])
+            return result
+        finally:
+            self._release_paged_cache_for_request(request_id)
+            self._clear_request_admission_bookkeeping(request_id)
+            get_prefill_tracker().remove(request_id)
+            request.prompt_cache = None
+            request._terminal_prompt_boundary_source = None
+            original_cache = None
+            prefilled_cache = None
+            state = None
+            model = getattr(self, "model", None)
+            prompt_priming.drop_ctx(model)
+            if hasattr(model, "clear_vlm_position_state"):
+                model.clear_vlm_position_state()
+            if hasattr(model, "clear_pending_embeddings"):
+                model.clear_pending_embeddings()
+            # Use the same delayed IOKit-safe reclamation path as ordinary
+            # request completion. Immediate mx.clear_cache here can race
+            # completeMemory callbacks and can flush another engine's warm
+            # allocator pool.
+            self._schedule_deferred_metal_clear()
+            result["elapsed_ms"] = (time.perf_counter() - started) * 1000.0
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
 
+        request._exact_resident_durable_fallback_tokens = 0
+
+        # Fastest exact path: the preceding turn's already-detached live
+        # cache.  Ownership is exclusive and token identity is proven before
+        # use.  Any miss falls through to the durable block cache unchanged.
+        if (
+            not getattr(request, "_cache_prewarm_only", False)
+            and self._restore_exact_resident_cache(request)
+        ):
+            try:
+                from .patches.mlx_lm_mtp import prompt_priming
+
+                if not getattr(request, "_cache_prewarm_only", False):
+                    prompt_priming.prepare_prefix_context(
+                        self.model,
+                        request_id=request.request_id,
+                        prompt_tokens=request.prompt_token_ids,
+                        cached_tokens=request.cached_tokens,
+                        prefix_cache=self.block_aware_cache,
+                        extra_keys=request.vlm_extra_keys_for_cache,
+                        extra_key_token_start=(
+                            request.vlm_extra_key_token_start_for_cache
+                        ),
+                        extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "MTP resident-prefix preparation failed closed for %s: %s",
+                    request.request_id,
+                    exc,
+                )
+            if not getattr(request, "_cache_prewarm_only", False):
+                self._log_prefix_divergence(request)
+                self._try_specprefill_scoring(request)
+            self._prefix_cache_prepared.add(request.request_id)
+            return
+
+        # Reload-safe exact terminal chain: unlike RAM L0 this survives an
+        # engine/model swap. It is all-or-nothing and text-only; ordinary
+        # paged lookup remains the fallback when no terminal chain matches.
+        if (
+            not getattr(request, "_cache_prewarm_only", False)
+            and self.block_aware_cache is not None
+            and self.paged_ssd_cache_manager is not None
+            and self._request_is_text_only_for_resident_cache(request)
+        ):
+            try:
+                restored_exact, exact_tokens = (
+                    self.block_aware_cache.restore_exact_terminal_prefix(
+                        request.request_id,
+                        list(request.prompt_token_ids or []),
+                        promote_to_hot_cache=True,
+                    )
+                )
+            except Exception as exc:
+                restored_exact, exact_tokens = None, 0
+                logger.debug(
+                    "Persistent exact-terminal restore failed closed for %s: %s",
+                    request.request_id,
+                    exc,
+                )
+            if (
+                restored_exact is not None
+                and exact_tokens > 0
+                and exact_tokens < len(request.prompt_token_ids or [])
+            ):
+                request.prompt_cache = restored_exact
+                request.cached_tokens = exact_tokens
+                request.remaining_tokens = request.prompt_token_ids[exact_tokens:]
+                request.shared_prefix_blocks = 0
+                request.block_table = None
+                request._exact_resident_durable_fallback_tokens = exact_tokens
+                logger.info(
+                    "Prefix cache restore for %s: source=ssd-exact-terminal "
+                    "cached=%d suffix=%d",
+                    request.request_id,
+                    exact_tokens,
+                    len(request.remaining_tokens),
+                )
+                try:
+                    from .patches.mlx_lm_mtp import prompt_priming
+
+                    prompt_priming.prepare_prefix_context(
+                        self.model,
+                        request_id=request.request_id,
+                        prompt_tokens=request.prompt_token_ids,
+                        cached_tokens=request.cached_tokens,
+                        prefix_cache=self.block_aware_cache,
+                        extra_keys=request.vlm_extra_keys_for_cache,
+                        extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                        extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "MTP persistent exact-terminal preparation failed closed "
+                        "for %s: %s",
+                        request.request_id,
+                        exc,
+                    )
+                self._prefix_cache_prepared.add(request.request_id)
+                return
+
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
-            block_table, remaining = self.block_aware_cache.fetch_cache(
-                request.request_id,
-                request.prompt_token_ids,
-                extra_keys=request.vlm_extra_keys_for_cache,
-                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-            )
+            fetch_started = time.perf_counter()
+            with self._phase_timer("prefix_cache_lookup"):
+                block_table, remaining = self.block_aware_cache.fetch_cache(
+                    request.request_id,
+                    request.prompt_token_ids,
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=(
+                        request.vlm_extra_key_token_start_for_cache
+                    ),
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                )
+            fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
             # A split GDN sidecar represents state at a full block boundary.
             # Exact-hit generation needs N-1 state, which Arrays/GDN cannot
             # produce by trimming one token. Re-prefill only the final block.
@@ -8229,24 +10276,33 @@ class Scheduler:
                 bypass_hot_cache = self._bypass_hot_cache_under_pressure()
                 if bypass_hot_cache:
                     logger.info(
-                        "Skipping hot-cache preload for %s under memory pressure",
+                        "Skipping hot-cache promotion for %s under memory pressure",
                         request.request_id,
                     )
-                else:
-                    self.block_aware_cache.preload_blocks(block_table)
+                # ``preload_blocks`` used to load blocks in parallel.  It is
+                # now intentionally serialized on the inference thread for
+                # Metal safety, so calling it immediately before
+                # reconstruct_cache loads and deserializes the same chain
+                # twice.  Direct reconstruction already promotes each SSD
+                # block as it is consumed.
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
                 original_tokens = block_table.num_tokens
-                if bypass_hot_cache:
-                    reconstructed = self.block_aware_cache.reconstruct_cache(
-                        block_table,
-                        promote_to_hot_cache=False,
-                    )
-                else:
-                    reconstructed = self.block_aware_cache.reconstruct_cache(
-                        block_table
-                    )
+                reconstruct_started = time.perf_counter()
+                with self._phase_timer("prefix_cache_reconstruct"):
+                    if bypass_hot_cache:
+                        reconstructed = self.block_aware_cache.reconstruct_cache(
+                            block_table,
+                            promote_to_hot_cache=False,
+                        )
+                    else:
+                        reconstructed = self.block_aware_cache.reconstruct_cache(
+                            block_table
+                        )
+                reconstruct_ms = (
+                    time.perf_counter() - reconstruct_started
+                ) * 1000.0
                 if reconstructed:
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
@@ -8328,6 +10384,22 @@ class Scheduler:
                             f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks, "
                             f"{len(request.remaining_tokens)} tokens remaining, cache reconstructed"
                         )
+                    logger.info(
+                        "Prefix cache restore for %s: source=paged cached=%d "
+                        "suffix=%d blocks=%d lookup=%.3fms reconstruct=%.3fms "
+                        "promote=%s",
+                        request.request_id,
+                        request.cached_tokens,
+                        len(request.remaining_tokens),
+                        request.shared_prefix_blocks,
+                        fetch_ms,
+                        reconstruct_ms,
+                        not bypass_hot_cache,
+                    )
+                    request._exact_resident_durable_fallback_tokens = max(
+                        0,
+                        int(request.cached_tokens or 0),
+                    )
                 else:
                     # Reconstruction failed, treat as cache miss
                     if self.paged_cache_manager is not None:
@@ -8352,16 +10424,17 @@ class Scheduler:
         try:
             from .patches.mlx_lm_mtp import prompt_priming
 
-            prompt_priming.prepare_prefix_context(
-                self.model,
-                request_id=request.request_id,
-                prompt_tokens=request.prompt_token_ids,
-                cached_tokens=request.cached_tokens,
-                prefix_cache=self.block_aware_cache,
-                extra_keys=request.vlm_extra_keys_for_cache,
-                extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-            )
+            if not getattr(request, "_cache_prewarm_only", False):
+                prompt_priming.prepare_prefix_context(
+                    self.model,
+                    request_id=request.request_id,
+                    prompt_tokens=request.prompt_token_ids,
+                    cached_tokens=request.cached_tokens,
+                    prefix_cache=self.block_aware_cache,
+                    extra_keys=request.vlm_extra_keys_for_cache,
+                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                )
         except Exception as exc:
             logger.debug(
                 "MTP prefix-history preparation failed closed for %s: %s",
@@ -8372,11 +10445,13 @@ class Scheduler:
         # Trace where this prompt diverges from recently stored cache
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
-        self._log_prefix_divergence(request)
+        if not getattr(request, "_cache_prewarm_only", False):
+            self._log_prefix_divergence(request)
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
-        self._try_specprefill_scoring(request)
+        if not getattr(request, "_cache_prewarm_only", False):
+            self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
     def add_request(self, request: Request) -> None:
@@ -9266,6 +11341,13 @@ class Scheduler:
         if not self._pending_pressure_clear:
             return False
         self._pending_pressure_clear = False
+        dropped = self._exact_resident_cache.clear()
+        if dropped:
+            logger.info(
+                "Hard-pressure reclaim dropped %d exact resident cache entr%s",
+                dropped,
+                "y" if dropped == 1 else "ies",
+            )
         return True
 
     def _process_pending_reclaim(self) -> None:
@@ -9285,6 +11367,8 @@ class Scheduler:
         if self.running or self.prefilling or self.waiting:
             return
         self._pending_reclaim_request = False
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         before = self._current_usage_bytes()
         # Wrapped in try-except because this can be the first step after an
         # engine-loop error recovery, when Metal may already be in an error
@@ -9465,6 +11549,11 @@ class Scheduler:
             or self._pending_reclaim_request
             or self._pending_pressure_clear
         )
+
+    def has_active_user_requests(self) -> bool:
+        """Return real user work, excluding post-finish cache housekeeping."""
+
+        return bool(self.waiting or self.prefilling or self.running)
 
     def has_pending_route_preflight_cleanup(self) -> bool:
         """Return whether finished-request memory is still being reclaimed.
@@ -10812,6 +12901,13 @@ class Scheduler:
             # See vllm-mlx-patched commit 8d4052b for the same root cause
             # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
+            stage_stable_boundary = getattr(
+                self,
+                "_stage_stable_prompt_boundary",
+                None,
+            )
+            if callable(stage_stable_boundary):
+                stage_stable_boundary(request, cache_to_use)
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
             # step's eval graph stays single-stream (#2235, see
@@ -11079,9 +13175,96 @@ class Scheduler:
                                 request.output_text = output.output_text
                                 break
 
-                # Extract cache for future reuse.
-                # In the new API, prompt_cache is a direct value (not callable).
+                # Retain the exact detached terminal cache + the token list
+                # that mlx-lm says is physically represented by it.  Parser-
+                # initiated stops do not populate Response.prompt_cache, but
+                # the row is still live here and can be detached explicitly.
+                # This resident candidate is separate from the durable store
+                # below: its token identity may include protocol delimiters
+                # hidden from the API response, which is precisely why a
+                # future prompt must match it exactly before reuse.
                 raw_cache = getattr(response, "prompt_cache", None)
+                resident_tokens = getattr(response, "all_tokens", None)
+                resident_cache = None
+                if self.batch_generator is not None:
+                    try:
+                        # A request admitted from a reconstructed prefix may
+                        # leave ``Response.prompt_cache`` in its one-row
+                        # Batch* representation.  The executable resident tier
+                        # owns a singleton cache tree; normalize through the
+                        # same extraction seam used for parser stops even when
+                        # the response already carries a raw cache.  Keep
+                        # ``raw_cache`` unchanged for the durable block writer.
+                        detached = self.batch_generator.extract_cache([response.uid])
+                        if isinstance(detached, dict):
+                            resident_cache, resident_tokens = detached.get(
+                                response.uid, (None, None)
+                            )
+                        elif isinstance(detached, (list, tuple)):
+                            resident_cache = detached
+                            if resident_tokens is None:
+                                uids = list(
+                                    getattr(self.batch_generator, "uids", ())
+                                )
+                                tokens = getattr(self.batch_generator, "tokens", None)
+                                if response.uid in uids and tokens is not None:
+                                    resident_tokens = tokens[uids.index(response.uid)]
+                    except (TypeError, AttributeError, KeyError, ValueError):
+                        # GenerationBatch exposes the older integer-index
+                        # extraction API, while mlx-lm BatchGenerator accepts
+                        # a UID list and returns a mapping.  A paged-prefix
+                        # restore commonly leaves the active row in the
+                        # former representation; normalize that row to the
+                        # singleton cache tree before validation.
+                        try:
+                            uids = list(getattr(self.batch_generator, "uids", ()))
+                            index = uids.index(response.uid)
+                            resident_cache = self.batch_generator.extract_cache(index)
+                            tokens = getattr(self.batch_generator, "tokens", None)
+                            if tokens is not None:
+                                resident_tokens = tokens[index]
+                        except (TypeError, AttributeError, KeyError, ValueError):
+                            resident_cache = None
+                    except Exception as exc:
+                        logger.debug(
+                            "Could not detach singleton resident cache for %s: %s",
+                            request_id,
+                            exc,
+                        )
+                if resident_cache is None:
+                    resident_cache = raw_cache
+                if resident_cache is not None and resident_tokens is None:
+                    # Some GenerationBatch response wrappers expose the exact
+                    # cache list but omit ``all_tokens`` after filtering the
+                    # finished row. The scheduler owns the same cumulative
+                    # token ledger; use it only as a paired fallback and let
+                    # the physical cache-offset validator fail closed if the
+                    # wrapper's timeline is not exact.
+                    resident_tokens = list(request.prompt_token_ids or []) + list(
+                        request.output_token_ids or []
+                    )
+                if getattr(
+                    response,
+                    "_omlx_mtp_standard_terminal_exact",
+                    False,
+                ):
+                    request._mtp_exact_terminal_proved = (
+                        "mtp-standard-terminal-v1"
+                    )
+                self._stage_exact_resident_cache(
+                    request,
+                    resident_cache,
+                    resident_tokens,
+                )
+
+                # Extract cache for durable/block reuse.  Only the response-
+                # owned terminal cache uses the existing store path.  A cache
+                # detached solely for a parser stop can contain hidden
+                # protocol tokens that request.output_token_ids intentionally
+                # omits; pairing it with that shorter sequence would be an
+                # unsafe durable cache entry, so the prompt-boundary fallback
+                # remains authoritative for that case.
+                # In the new API, prompt_cache is a direct value (not callable).
                 if raw_cache is not None:
                     try:
                         # SpecPrefill: sparse KV data can't be stored in
@@ -11183,6 +13366,60 @@ class Scheduler:
 
         for request_id in finished_ids:
             request = self.running.get(request_id)
+            singleton_resident_eligible = bool(
+                request is not None
+                and len(finished_ids) == 1
+                and len(self.running) == 1
+                and not self.prefilling
+            )
+            resident_handoff = False
+            if singleton_resident_eligible:
+                required_durable_tokens = (
+                    self._exact_resident_required_durable_tokens(request)
+                )
+                durable_fallback_tokens = getattr(
+                    request,
+                    "_exact_resident_durable_fallback_tokens",
+                    0,
+                )
+                if type(durable_fallback_tokens) is not int:
+                    durable_fallback_tokens = 0
+                candidate = getattr(request, "_exact_resident_candidate", None)
+                if (
+                    candidate is not None
+                    and self.block_aware_cache is not None
+                    and required_durable_tokens > durable_fallback_tokens
+                ):
+                    # The terminal cache includes generated tokens and cannot
+                    # serve an identical shorter prompt. Keep it private until
+                    # this request's independent block-aligned prompt boundary
+                    # has finished storing; otherwise a one-slot replacement
+                    # can evict the only undurable copy and leave B2 at zero.
+                    request._exact_resident_publish_after_store = (
+                        required_durable_tokens
+                    )
+                    logger.info(
+                        "Deferring exact resident publication for %s until "
+                        "durable prompt boundary reaches %d tokens (current=%d)",
+                        request_id,
+                        required_durable_tokens,
+                        durable_fallback_tokens,
+                    )
+                else:
+                    resident_handoff = self._publish_exact_resident_cache(request)
+                stable_handoff = self._publish_stable_prompt_boundary(request)
+                resident_handoff = resident_handoff or stable_handoff
+            elif request is not None and getattr(
+                request, "_exact_resident_candidate", None
+            ) is not None:
+                logger.info(
+                    "Exact resident handoff bypass for %s: concurrent/batched "
+                    "completion keeps normal durable persistence",
+                    request_id,
+                )
+                request._stable_prompt_resident_candidate = None
+            if request is not None and not singleton_resident_eligible:
+                request._stable_prompt_resident_candidate = None
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
@@ -11191,6 +13428,7 @@ class Scheduler:
             # handles _extract_tensor_bytes (CPU memcpy) + index/queue
             # registration. batch_generator.remove(uid) is deferred and
             # picked up at the next step's _drain_pending_async_removes.
+            synchronous_store_tokens = 0
             store_future = None
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
@@ -11199,7 +13437,33 @@ class Scheduler:
                     # prep, no host memcpy, no SSD write. They still take
                     # the block leak-guard branch below so their paged
                     # blocks are released for eviction.
-                    skip_store = getattr(request, "skip_cache_store", False)
+                    prefill_store_complete = (
+                        self._qwen35_mtp_prefill_store_covers_prompt(request)
+                    )
+                    skip_store = (
+                        getattr(request, "skip_cache_store", False)
+                        or resident_handoff
+                        or prefill_store_complete
+                    )
+                    if resident_handoff:
+                        # Do not let the async durable writer read arrays held
+                        # by the immediately claimable resident lease.  Older
+                        # paged/SSD blocks remain the exact fallback; this
+                        # newest terminal state is intentionally hot-only
+                        # until a serialized idle-store design lands.
+                        logger.info(
+                            "Deferring latest durable cache extension for %s: "
+                            "exact resident handoff is immediately claimable",
+                            request_id,
+                        )
+                    elif prefill_store_complete:
+                        logger.info(
+                            "Skipping terminal cache materialization for %s: "
+                            "Qwen3.5 MTP prompt blocks were persisted during prefill",
+                            request_id,
+                        )
+                        self.block_aware_cache.release_cache(request_id)
+                        request.block_table = None
                     if skip_store or (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
@@ -11417,16 +13681,18 @@ class Scheduler:
                                 )
                             else:
                                 # Executor unavailable — synchronous fallback.
-                                self._async_store_cache_worker(
-                                    request_id,
-                                    token_sequence_to_store,
-                                    cache_to_store,
-                                    model_cache_config,
-                                    intermediate_snapshots,
-                                    request.vlm_extra_keys_for_cache,
-                                    request.vlm_extra_key_token_start_for_cache,
-                                    request.vlm_extra_key_ranges_for_cache,
-                                    hot_cache_write_back,
+                                synchronous_store_tokens = (
+                                    self._async_store_cache_worker(
+                                        request_id,
+                                        token_sequence_to_store,
+                                        cache_to_store,
+                                        model_cache_config,
+                                        intermediate_snapshots,
+                                        request.vlm_extra_keys_for_cache,
+                                        request.vlm_extra_key_token_start_for_cache,
+                                        request.vlm_extra_key_ranges_for_cache,
+                                        hot_cache_write_back,
+                                    )
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
@@ -11486,6 +13752,12 @@ class Scheduler:
                                 block_table.block_ids
                             )
                         self.block_aware_cache.clear_request_entry(request_id)
+
+            if request is not None and store_future is None:
+                self._publish_deferred_exact_resident_cache(
+                    request,
+                    synchronous_store_tokens,
+                )
 
             # Remove from running
             if request_id in self.running:
@@ -11635,6 +13907,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         self._cache_rate_tracker.clear()
         self._boundary_snapshot_diagnostics.clear()
         self._last_prefix_cache_lookup = None
@@ -12324,6 +14598,7 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        stats["exact_resident_cache"] = self._exact_resident_stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -12396,6 +14671,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         self._cache_rate_tracker.clear()
         self._boundary_snapshot_diagnostics.clear()
         self._last_prefix_cache_lookup = None
@@ -12539,6 +14816,12 @@ class Scheduler:
         self._close_specprefill_draft_cache_manager()
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
+        # Preserve the newest validated exact terminal before dropping the
+        # engine-owned RAM L0. The SSD manager then flushes its normal hot
+        # blocks and closes below.
+        self._persist_exact_resident_cache_on_shutdown()
+        self._exact_resident_cache.clear()
+        self._exact_resident_leases.clear()
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -13424,6 +15707,8 @@ class Scheduler:
                     }
                 )
             stats["specprefill_cache"] = specprefill_cache_stats
+
+        stats["exact_resident_cache"] = self._exact_resident_stats()
 
         counters = self._collect_cache_counters()
         if counters:

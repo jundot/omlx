@@ -473,6 +473,16 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
         assert prompt_priming.prime_ctx_stats(model) is None
 
+    def test_qwen35_default_prime_window_is_bounded(self, model, monkeypatch):
+        """A generic Qwen3.5 MTP head must not duplicate an unbounded prompt."""
+        monkeypatch.delenv("OMLX_MTP_PRIME_WINDOW", raising=False)
+        assert prompt_priming.prime_window(model) == 512
+
+    def test_explicit_zero_keeps_unlimited_prime_window(self, model, monkeypatch):
+        """Operators may opt back into full-history priming after measuring it."""
+        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "0")
+        assert prompt_priming.prime_window(model) == 0
+
     def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
         """A warm prefix cache leaves only a small remainder to fold; the
         window must cap that folded span (the head-KV it exists to bound),

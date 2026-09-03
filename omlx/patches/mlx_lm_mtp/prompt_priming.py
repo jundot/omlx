@@ -85,8 +85,25 @@ def priming_enabled() -> bool:
     )
 
 
-def prime_window() -> int:
-    """Max tokens to fold into one prime context; 0 = unlimited.
+_GENERIC_QWEN35_SAFE_PRIME_WINDOW = 512
+
+
+def _host_model_type(host: Any) -> str:
+    """Best-effort model-family identifier without importing model modules."""
+    for candidate in (
+        host,
+        getattr(host, "args", None),
+        getattr(host, "config", None),
+        getattr(getattr(host, "model", None), "config", None),
+    ):
+        value = getattr(candidate, "model_type", None)
+        if isinstance(value, str) and value:
+            return value.lower()
+    return ""
+
+
+def prime_window(host: Any | None = None) -> int:
+    """Max tokens to fold into one prime context; explicit 0 = unlimited.
 
     Escape hatch for the head-cache memory cost of priming (one
     full-attention layer of KV over the folded span). The cap is measured
@@ -94,11 +111,23 @@ def prime_window() -> int:
     that is only the boundary remainder, not the full prompt — so a
     long-context request with a small remainder still primes. A remainder
     larger than the window runs unprimed.
+
+    Generic Qwen3.5/VLM MTP owns a full-attention drafter cache and cannot
+    safely restore partial drafter history after a target-cache hit.  Bound
+    that known family by default so a normal agent transcript cannot
+    materialize an unbounded second history.  Skipping priming is lossless:
+    MTP remains enabled and the target model still verifies every draft.
+    An explicit ``OMLX_MTP_PRIME_WINDOW=0`` retains the operator override.
     """
-    try:
-        return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
-    except ValueError:
-        return 0
+    configured = os.environ.get("OMLX_MTP_PRIME_WINDOW")
+    if configured is not None:
+        try:
+            return max(0, int(configured))
+        except ValueError:
+            return 0
+    if host is not None and _host_model_type(host).startswith("qwen3_5"):
+        return _GENERIC_QWEN35_SAFE_PRIME_WINDOW
+    return 0
 
 
 @contextmanager
@@ -337,6 +366,17 @@ def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
 
     import mlx.core as mx
 
+    def detach_value(value: Any) -> Any:
+        if isinstance(value, mx.array):
+            return value + 0
+        if isinstance(value, list):
+            return [detach_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(detach_value(item) for item in value)
+        if isinstance(value, dict):
+            return {key: detach_value(item) for key, item in value.items()}
+        return value
+
     def clone_one(entry: Any) -> Any:
         if entry is None:
             return None
@@ -344,11 +384,19 @@ def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
         if subs is not None:
             return type(entry)(*[clone_one(sub) for sub in subs])
         clone = copy.copy(entry)
+        # oMLX wraps restored recurrent ArraysCache state in
+        # SizedArraysCache. A shallow wrapper copy still shares ``_inner`` and
+        # its live slot list, so later decode would mutate a supposedly detached
+        # prompt-boundary candidate. Clone the owned inner cache recursively
+        # before copying the wrapper's remaining scalar/array metadata.
+        inner = vars(entry).get("_inner")
+        if inner is not None:
+            clone._inner = clone_one(inner)
         for attr, value in vars(entry).items():
-            if isinstance(value, mx.array):
-                setattr(clone, attr, value + 0)
-            elif isinstance(value, list):
-                setattr(clone, attr, list(value))
+            if attr == "_inner":
+                continue
+            if isinstance(value, (mx.array, list, tuple, dict)):
+                setattr(clone, attr, detach_value(value))
         return clone
 
     return [clone_one(entry) for entry in cache]
@@ -673,7 +721,7 @@ def maybe_capture(
     if ctx is not None and ctx.window_exceeded:
         ctx.expected_offset = offset_after
         return
-    window = prime_window()
+    window = prime_window(host)
     if window:
         # Cap by the primed span (the head-KV the window exists to bound),
         # not the absolute prompt offset: on a warm prefix cache only the

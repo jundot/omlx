@@ -227,6 +227,8 @@ class TestVLMToolForwarding:
         core = SimpleNamespace(
             _mlx_executor=executor,
             generate=AsyncMock(return_value=self._output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+            notify_admission_pending=MagicMock(),
         )
         engine = _make_loaded_engine(model_type="muse_glimmer")
         engine._engine = core
@@ -244,6 +246,10 @@ class TestVLMToolForwarding:
             executor.shutdown(wait=False)
 
         assert core.generate.call_args.kwargs["tools"] == self.tools
+        # Chat announces before executor-bound message preparation; generate
+        # repeats the signal for direct-call coverage.
+        assert core.notify_admission_pending.call_count == 2
+        core.schedule_prompt_tail_prewarm.assert_called_once_with("prompt")
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -260,6 +266,7 @@ class TestVLMToolForwarding:
             add_request=AsyncMock(return_value="request-1"),
             stream_outputs=stream_outputs,
             abort_request=AsyncMock(return_value=True),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
         )
         engine = _make_loaded_engine(model_type="muse_glimmer")
         engine._engine = core
@@ -278,6 +285,114 @@ class TestVLMToolForwarding:
             executor.shutdown(wait=False)
 
         assert core.add_request.call_args.kwargs["tools"] == self.tools
+        core.schedule_prompt_tail_prewarm.assert_called_once_with("prompt")
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_media_stream_does_not_arm_prompt_tail(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        async def stream_outputs(request_id):
+            yield self._output(streaming=True)
+
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            add_request=AsyncMock(return_value="request-media"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+        try:
+            async for _ in engine.stream_generate(
+                "prompt",
+                vlm_inputs_embeds=object(),
+            ):
+                pass
+        finally:
+            executor.shutdown(wait=False)
+
+        core.schedule_prompt_tail_prewarm.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    @pytest.mark.parametrize(
+        "media_kwargs",
+        [
+            {"vlm_inputs_embeds": object()},
+            {"vlm_extra_kwargs": {"audio_features": object()}},
+            {"vlm_image_hash": "video-or-image-key"},
+            {"vlm_cache_key_ranges": [(0, "media-key")]},
+        ],
+    )
+    async def test_nonstream_media_never_arms_prompt_tail(self, media_kwargs):
+        core = SimpleNamespace(
+            generate=AsyncMock(return_value=self._output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+            notify_admission_pending=MagicMock(),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        await engine.generate("prompt", **media_kwargs)
+
+        core.schedule_prompt_tail_prewarm.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_media_turn_then_pure_text_turn_arms_only_text_tail(self):
+        core = SimpleNamespace(
+            generate=AsyncMock(return_value=self._output()),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+            notify_admission_pending=MagicMock(),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        await engine.generate("image prompt", vlm_inputs_embeds=object())
+        await engine.generate("fresh text prompt")
+
+        core.schedule_prompt_tail_prewarm.assert_called_once_with(
+            "fresh text prompt"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_terminal_error_does_not_arm_prompt_tail(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        async def stream_outputs(_request_id):
+            output = self._output(streaming=True)
+            output.error = "failed"
+            yield output
+
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            add_request=AsyncMock(return_value="request-error"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+            schedule_prompt_tail_prewarm=MagicMock(return_value=True),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            async for _ in engine.stream_generate("prompt"):
+                pass
+        finally:
+            executor.shutdown(wait=False)
+
+        core.abort_request.assert_awaited_once_with("request-error")
+        core.schedule_prompt_tail_prewarm.assert_not_called()
 
 
 class TestVLMDiffusionLane:

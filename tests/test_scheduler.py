@@ -412,10 +412,12 @@ class TestSchedulerAddRequest:
         *,
         hot_cache_max_size: int = 1024,
         hot_cache_only: bool = False,
+        exact_resident_cache_slots: int = 0,
     ):
         config = SchedulerConfig(
             hot_cache_max_size=hot_cache_max_size,
             hot_cache_only=hot_cache_only,
+            exact_resident_cache_slots=exact_resident_cache_slots,
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -650,10 +652,10 @@ class TestSchedulerAddRequest:
         )
         scheduler._current_usage_bytes.assert_called_once_with()
 
-    def test_add_request_below_pressure_keeps_hot_cache_preload_and_promotion(
+    def test_add_request_below_pressure_promotes_during_single_reconstruction(
         self, mock_model, mock_tokenizer
     ):
-        """Normal memory state should preserve existing hot-cache acceleration."""
+        """Normal state promotes while reconstructing, without a duplicate preload."""
         from omlx.cache.paged_cache import BlockTable
 
         scheduler = self._scheduler_with_mock_block_cache(
@@ -682,7 +684,7 @@ class TestSchedulerAddRequest:
         scheduler.add_request(request)
         scheduler._prepare_prefix_cache_for_request(request)
 
-        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
             block_table
         )
@@ -720,11 +722,73 @@ class TestSchedulerAddRequest:
         scheduler.add_request(request)
         scheduler._prepare_prefix_cache_for_request(request)
 
-        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
             block_table
         )
         scheduler._current_usage_bytes.assert_not_called()
+
+    @pytest.mark.parametrize("batch_size", [2, 4, 6])
+    def test_same_prefix_batch_has_one_resident_lease_and_durable_fallbacks(
+        self, mock_model, mock_tokenizer, batch_size
+    ):
+        """B2/B4/B6 never share one mutable resident cache object."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = self._scheduler_with_mock_block_cache(
+            mock_model,
+            mock_tokenizer,
+            exact_resident_cache_slots=1,
+        )
+        scheduler._current_usage_bytes = MagicMock(return_value=99)
+        resident = [
+            SimpleNamespace(
+                offset=3,
+                rollback_state=None,
+                buffer=mx.zeros((8,), dtype=mx.uint8),
+            )
+        ]
+        assert scheduler._exact_resident_cache.put(
+            [1, 2, 3], resident, cache_nbytes=8
+        )
+
+        tables = [
+            BlockTable(
+                request_id=f"fallback-{row}",
+                block_ids=[row + 1],
+                num_tokens=3,
+            )
+            for row in range(batch_size - 1)
+        ]
+        scheduler.block_aware_cache.fetch_cache.side_effect = [
+            (table, [100 + row]) for row, table in enumerate(tables)
+        ]
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [MagicMock()]
+
+        requests = []
+        for row in range(batch_size):
+            request = Request(
+                request_id=f"claim-{row}",
+                prompt=[1, 2, 3, 100 + row],
+                sampling_params=SamplingParams(max_tokens=4),
+            )
+            scheduler.add_request(request)
+            scheduler._prepare_prefix_cache_for_request(request)
+            requests.append(request)
+
+        resident_hits = [
+            request for request in requests if getattr(request, "_exact_resident_hit", False)
+        ]
+        assert len(resident_hits) == 1
+        assert resident_hits[0].prompt_cache is resident
+        assert scheduler.block_aware_cache.fetch_cache.call_count == batch_size - 1
+        assert (
+            scheduler.block_aware_cache.reconstruct_cache.call_count
+            == batch_size - 1
+        )
+        stats = scheduler._exact_resident_stats()
+        assert stats["active_leases"] == 1
+        assert stats["fallbacks_total"] == batch_size - 1
 
     def test_admission_defers_for_relevant_inflight_store(
         self, mock_model, mock_tokenizer
@@ -2727,6 +2791,347 @@ class TestSchedulerBoundarySnapshots:
         args, kwargs = scheduler.block_aware_cache.store_cache.call_args
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt + output
 
+    def test_cleanup_finished_exact_resident_is_immediate_and_hot_only(
+        self, mock_model, mock_tokenizer
+    ):
+        """L0 never races an immediate claimant against the async SSD writer."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(exact_resident_cache_slots=1),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._store_cache_executor = MagicMock()
+
+        request = Request(
+            request_id="req-resident-hot-only",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        request.output_token_ids = [4]
+        cache = [
+            SimpleNamespace(
+                offset=4,
+                rollback_state=None,
+                buffer=mx.zeros((8,), dtype=mx.uint8),
+            )
+        ]
+        request._extracted_cache = [{"state": (cache[0].buffer,)}]
+        request._model_cache_config = None
+        request._exact_resident_candidate = ([1, 2, 3, 4], cache, 8)
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        scheduler._store_cache_executor.submit.assert_not_called()
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        hit = scheduler._exact_resident_cache.acquire_prefix([1, 2, 3, 4, 5])
+        assert hit is not None
+        assert hit.cache is cache
+
+    def test_cleanup_finished_long_resident_publishes_only_after_durable_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """A first long turn cannot make its terminal state the only prefix copy."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=1,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+
+        request = Request(
+            request_id="req-resident-needs-durable-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        request.output_token_ids = [10]
+        buffer = mx.zeros((8,), dtype=mx.uint8)
+        terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=buffer,
+            )
+        ]
+        request._extracted_cache = [
+            {
+                "state": (buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        request._model_cache_config = None
+        request._exact_resident_candidate = (
+            list(range(11)),
+            terminal_cache,
+            8,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        def store_with_boundary(*_args, **_kwargs):
+            # The terminal cache is still private while its independent prompt
+            # boundary is serialized, so a claimant cannot race this reader.
+            assert scheduler._exact_resident_cache.stats()["entries"] == 0
+            return SimpleNamespace(num_tokens=8, block_ids=[])
+
+        scheduler.block_aware_cache.store_cache.side_effect = store_with_boundary
+
+        scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        # The terminal ledger includes the generated token and therefore cannot
+        # serve the byte-identical, shorter ten-token prompt.
+        assert scheduler._exact_resident_cache.acquire_prefix(list(range(10))) is None
+
+        # The next serial one-token prime restores the durable eight-token
+        # boundary. It can replace the one-slot terminal immediately without
+        # repeating the store or losing the fallback needed by an identical B2.
+        second = Request(
+            request_id="req-resident-second-prime",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        second.prompt_token_ids = list(range(10))
+        second.num_prompt_tokens = 10
+        second.output_token_ids = [10]
+        second_buffer = mx.zeros((8,), dtype=mx.uint8)
+        second_terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=second_buffer,
+            )
+        ]
+        second._extracted_cache = [
+            {
+                "state": (second_buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        second._model_cache_config = None
+        second._exact_resident_candidate = (
+            list(range(11)),
+            second_terminal_cache,
+            8,
+        )
+        second._exact_resident_durable_fallback_tokens = 8
+        scheduler.running[second.request_id] = second
+        scheduler.requests[second.request_id] = second
+
+        scheduler._cleanup_finished({second.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        assert scheduler._exact_resident_cache.stats()["evictions"] == 1
+        assert scheduler._exact_resident_cache.acquire_prefix(list(range(10))) is None
+        hit = scheduler._exact_resident_cache.acquire_prefix(list(range(12)))
+        assert hit is not None
+        assert hit.cache is second_terminal_cache
+        assert hit.cached_tokens == 11
+        assert hit.durable_tokens == 8
+
+    def test_cleanup_finished_async_store_gates_resident_publication(
+        self, mock_model, mock_tokenizer
+    ):
+        """An async terminal handoff becomes claimable only after store success."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=1,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+        scheduler.batch_generator = MagicMock()
+        scheduler._store_cache_executor = MagicMock()
+
+        request = Request(
+            request_id="req-resident-async-boundary",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request.num_prompt_tokens = 10
+        request.output_token_ids = [10]
+        buffer = mx.zeros((8,), dtype=mx.uint8)
+        terminal_cache = [
+            SimpleNamespace(
+                offset=11,
+                rollback_state=None,
+                buffer=buffer,
+            )
+        ]
+        request._extracted_cache = [
+            {
+                "state": (buffer,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+        request._model_cache_config = None
+        request._exact_resident_candidate = (
+            list(range(11)),
+            terminal_cache,
+            8,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = 7
+        scheduler.uid_to_request_id[7] = request.request_id
+
+        store_future = concurrent.futures.Future()
+        scheduler._store_cache_executor.submit.return_value = store_future
+
+        scheduler._cleanup_finished({request.request_id})
+
+        assert scheduler._exact_resident_cache.stats()["entries"] == 0
+        assert request._exact_resident_publish_after_store == 8
+        store_future.set_result(8)
+        with patch("omlx.scheduler._safe_sync_stream"):
+            assert scheduler._drain_pending_async_removes()
+
+        hit = scheduler._exact_resident_cache.acquire_prefix(list(range(12)))
+        assert hit is not None
+        assert hit.cache is terminal_cache
+        assert hit.durable_tokens == 8
+
+    def test_deferred_resident_fails_closed_when_boundary_store_is_short(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(exact_resident_cache_slots=1),
+        )
+        request = Request(
+            request_id="req-resident-short-store",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request._exact_resident_candidate = ([1, 2, 3], [object()], 1)
+        request._exact_resident_publish_after_store = 8
+
+        assert not scheduler._publish_deferred_exact_resident_cache(request, 4)
+        assert request._exact_resident_candidate is None
+        assert scheduler._exact_resident_cache.stats()["entries"] == 0
+
+    @pytest.mark.parametrize(
+        ("slots", "max_bytes"),
+        [(0, 8), (1, 4)],
+        ids=["default-disabled", "oversize"],
+    )
+    def test_cleanup_finished_failed_resident_reservation_keeps_durable_store(
+        self, mock_model, mock_tokenizer, slots, max_bytes
+    ):
+        """A disabled/oversize L0 candidate never suppresses SSD persistence."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                exact_resident_cache_slots=slots,
+                exact_resident_cache_max_bytes=max_bytes,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+
+        request = Request(
+            request_id=f"req-resident-fallback-{slots}-{max_bytes}",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+        request.output_token_ids = [4]
+        buffer = mx.zeros((8,), dtype=mx.uint8)
+        cache = [
+            SimpleNamespace(
+                offset=4,
+                rollback_state=None,
+                buffer=buffer,
+            )
+        ]
+        request._extracted_cache = [{"state": (buffer,)}]
+        request._model_cache_config = None
+        # Exercise the cleanup-time atomic reservation even though normal
+        # staging already refuses disabled/oversize configurations.
+        request._exact_resident_candidate = ([1, 2, 3, 4], cache, 8)
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+
+        scheduler._cleanup_finished({request.request_id})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        assert scheduler._exact_resident_cache.stats()["entries"] == 0
+
+    @pytest.mark.parametrize("batch_size", [2, 4, 6])
+    def test_concurrent_completions_keep_all_durable_stores_and_no_l0_eviction(
+        self, mock_model, mock_tokenizer, batch_size
+    ):
+        """Hot-only L0 is B1-only; B2/B4/B6 cannot starve N-1 checkpoints."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(exact_resident_cache_slots=1),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = False
+
+        finished = set()
+        for row in range(batch_size):
+            request_id = f"resident-batch-finish-{row}"
+            request = Request(
+                request_id=request_id,
+                prompt="hello",
+                sampling_params=SamplingParams(),
+            )
+            request.prompt_token_ids = [1, 2, 3]
+            request.num_prompt_tokens = 3
+            request.output_token_ids = [10 + row]
+            buffer = mx.zeros((8,), dtype=mx.uint8)
+            cache = [
+                SimpleNamespace(
+                    offset=4,
+                    rollback_state=None,
+                    buffer=buffer,
+                )
+            ]
+            request._extracted_cache = [{"state": (buffer,)}]
+            request._model_cache_config = None
+            request._exact_resident_candidate = (
+                [1, 2, 3, 10 + row],
+                cache,
+                8,
+            )
+            scheduler.running[request_id] = request
+            scheduler.requests[request_id] = request
+            finished.add(request_id)
+
+        scheduler._cleanup_finished(finished)
+
+        assert scheduler.block_aware_cache.store_cache.call_count == batch_size
+        resident_stats = scheduler._exact_resident_cache.stats()
+        assert resident_stats["entries"] == 0
+        assert resident_stats["evictions"] == 0
+
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer
     ):
@@ -3040,6 +3445,97 @@ class TestSchedulerBoundarySnapshots:
 
         assert request.request_id in scheduler._boundary_cache_snapshots
         assert 4 in scheduler._boundary_cache_snapshots[request.request_id]
+
+    def test_qwen35_mtp_prefill_boundary_store_extends_one_block(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        mock_model.model_type = "qwen3_5"
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-prefill-store",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(9))
+        extracted = [{"class_name": "KVCache", "state": ("k", "v")}]
+        monkeypatch.setattr(
+            scheduler,
+            "_extract_cache_states",
+            lambda cache: (extracted, None),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_bypass_hot_cache_under_pressure",
+            lambda: False,
+        )
+        table = SimpleNamespace(num_tokens=4)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.block_aware_cache.store_cache.return_value = table
+
+        scheduler._store_qwen35_mtp_prefill_boundary(request, [object()], 4)
+
+        call = scheduler.block_aware_cache.store_cache.call_args
+        assert call.args[1] == [0, 1, 2, 3]
+        assert call.kwargs["boundary_snapshots"] == {4: extracted}
+        assert request._qwen35_mtp_prefill_durable_tokens == 4
+        assert request._exact_resident_durable_fallback_tokens == 4
+
+    def test_qwen35_prefill_store_coverage_uses_prompt_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        request = Request(
+            request_id="req-qwen35-store-cover",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(11))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        assert scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+        request._qwen35_mtp_prefill_durable_tokens = 4
+        assert not scheduler._qwen35_mtp_prefill_store_covers_prompt(request)
+
+    def test_long_qwen35_mtp_boundary_defers_to_idle_prewarm(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=4,
+                exact_resident_cache_slots=2,
+            ),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-qwen35-idle-stable",
+            prompt="text",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(10))
+        request._qwen35_mtp_prefill_durable_tokens = 8
+        monkeypatch.setattr(
+            scheduler,
+            "_qwen35_mtp_target_only_prewarm_enabled",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_resident_cache_arrays",
+            lambda cache: (_ for _ in ()).throw(
+                AssertionError("long boundary cloned before decode")
+            ),
+        )
+
+        assert not scheduler._stage_stable_prompt_boundary(request, [object()])
 
 
 class TestSchedulerRotatingBlockAlignment:
@@ -5744,7 +6240,10 @@ class TestOutputParserSmoke:
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=tokenizer,
-            config=SchedulerConfig(model_name="test-model"),
+            config=SchedulerConfig(
+                model_name="test-model",
+                exact_resident_cache_slots=1,
+            ),
         )
         scheduler._output_parser_factory = _ParserStopFactory()
 
@@ -5761,9 +6260,37 @@ class TestOutputParserSmoke:
         scheduler.requests[request.request_id] = request
         scheduler.uid_to_request_id[99] = request.request_id
         scheduler.request_id_to_uid[request.request_id] = 99
+        detached_cache = [
+            SimpleNamespace(
+                offset=4,
+                rollback_state=None,
+                buffer=mx.zeros((8,), dtype=mx.uint8),
+            )
+        ]
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            99: (detached_cache, [1, 2, 3, 11])
+        }
+        raw_batch_cache = [
+            SimpleNamespace(
+                offset=mx.array([4]),
+                rollback_state=None,
+                buffer=mx.zeros((8,), dtype=mx.uint8),
+            )
+        ]
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type(
+                "Resp",
+                (),
+                {
+                    "uid": 99,
+                    "token": 11,
+                    "finish_reason": None,
+                    "prompt_cache": raw_batch_cache,
+                    "all_tokens": [1, 2, 3, 11],
+                },
+            )(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
@@ -5771,6 +6298,11 @@ class TestOutputParserSmoke:
         assert finished_ids == {"parser-stop-req"}
         assert outputs[-1].finished is True
         assert outputs[-1].finish_reason == "stop"
+        # The resident tier keys the physical cache by BatchGenerator's raw
+        # token timeline, not the parser-filtered API output.
+        assert request._exact_resident_candidate[0] == [1, 2, 3, 11]
+        assert request._exact_resident_candidate[1] is detached_cache
+        assert request._exact_resident_candidate[1] is not raw_batch_cache
 
     def test_deepseek_v4_tool_block_end_stops_batch_row(self, mock_model):
         mock_model.config.model_type = "deepseek_v4"

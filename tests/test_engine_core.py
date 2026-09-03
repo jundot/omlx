@@ -637,8 +637,11 @@ class TestEngineCoreClose:
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
             engine.close()
 
-            # Should have called release
-            mock_registry.return_value.release.assert_called()
+            # Final teardown releases by the non-owning registry key so the
+            # model graph can die before Metal reclaim.
+            mock_registry.return_value.release_by_id.assert_called_once_with(
+                id(mock_model), engine.engine_id
+            )
 
     def test_close_idempotent(self, mock_model, mock_tokenizer):
         """Test close() can be called multiple times safely."""

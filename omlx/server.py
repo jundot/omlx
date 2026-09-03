@@ -1884,6 +1884,13 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    if global_settings is not None:
+        from .settings import latent_metal_keepwarm_env
+
+        for env_name, env_value in latent_metal_keepwarm_env(
+            getattr(global_settings.server, "latent_metal_keepwarm_enabled", False)
+        ).items():
+            os.environ[env_name] = env_value
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)

@@ -39,7 +39,12 @@ from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
     merge_chat_template_kwargs,
 )
-from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
+from ..settings import (
+    BURST_DECODE_MODES,
+    SubKeyEntry,
+    burst_decode_env,
+    latent_metal_keepwarm_env,
+)
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
     DDGS_TEXT_BACKENDS,
@@ -258,6 +263,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    latent_metal_keepwarm_enabled: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -3563,6 +3569,11 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 "preserve_mid_system_cache",
                 True,
             ),
+            "latent_metal_keepwarm_enabled": getattr(
+                global_settings.server,
+                "latent_metal_keepwarm_enabled",
+                False,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -3817,6 +3828,31 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.latent_metal_keepwarm_enabled is not None:
+        enabled = bool(request.latent_metal_keepwarm_enabled)
+        global_settings.server.latent_metal_keepwarm_enabled = enabled
+        # Future Batched/VLM engines snapshot this environment-backed policy.
+        for _key, _value in latent_metal_keepwarm_env(enabled).items():
+            os.environ[_key] = _value
+
+        # Loaded engines retain their request/cache history while the controller
+        # swaps only the master bit.  No model reload or cache rewrite occurs.
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            configure_pool = getattr(
+                pool,
+                "configure_latent_metal_keepwarm",
+                None,
+            )
+            if callable(configure_pool):
+                configure_pool(enabled)
+        runtime_applied.append("latent_metal_keepwarm_enabled")
+        logger.info(
+            "Latent Metal keepwarm %s",
+            "enabled" if enabled else "disabled",
+        )
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -4941,6 +4977,19 @@ def _build_runtime_cache_observability(
             "total_num_files": 0,
             "total_size_bytes": 0,
             "effective_block_sizes": [],
+            "disk_max_bytes": 0,
+            "hot_cache_max_bytes": 0,
+            "hot_cache_size_bytes": 0,
+            "hot_cache_entries": 0,
+            "exact_resident_entries": 0,
+            "exact_resident_size_bytes": 0,
+            "exact_resident_max_entries": 0,
+            "exact_resident_max_bytes": 0,
+            "exact_resident_hits": 0,
+            "exact_resident_misses": 0,
+            "exact_resident_active_leases": 0,
+            "exact_resident_fallbacks": 0,
+            "exact_resident_evictions": 0,
         }
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
@@ -4963,6 +5012,15 @@ def _build_runtime_cache_observability(
         "hot_cache_max_bytes": 0,
         "hot_cache_size_bytes": 0,
         "hot_cache_entries": 0,
+        "exact_resident_entries": 0,
+        "exact_resident_size_bytes": 0,
+        "exact_resident_max_entries": 0,
+        "exact_resident_max_bytes": 0,
+        "exact_resident_hits": 0,
+        "exact_resident_misses": 0,
+        "exact_resident_active_leases": 0,
+        "exact_resident_fallbacks": 0,
+        "exact_resident_evictions": 0,
     }
 
     engine_pool = _get_engine_pool()
@@ -5057,6 +5115,44 @@ def _build_runtime_cache_observability(
             prefix_stats = prefix_stats.to_dict()
         elif not isinstance(prefix_stats, dict):
             prefix_stats = {}
+
+        exact_resident_stats = runtime_stats.get("exact_resident_cache")
+        if not isinstance(exact_resident_stats, dict):
+            exact_resident_stats = {}
+        exact_resident_payload = {
+            "entries": int(exact_resident_stats.get("entries", 0) or 0),
+            "size_bytes": int(exact_resident_stats.get("size_bytes", 0) or 0),
+            "max_entries": int(exact_resident_stats.get("max_entries", 0) or 0),
+            "max_bytes": int(exact_resident_stats.get("max_bytes", 0) or 0),
+            "hits": int(exact_resident_stats.get("hits", 0) or 0),
+            "misses": int(exact_resident_stats.get("misses", 0) or 0),
+            "active_leases": int(
+                exact_resident_stats.get("active_leases", 0) or 0
+            ),
+            "leases_total": int(
+                exact_resident_stats.get("leases_total", 0) or 0
+            ),
+            # Immediate hot-only L0 has no pending writer state. Keep an
+            # explicit zero field so dashboard/API clients can share a stable
+            # schema with a future delayed-durable implementation.
+            "pending": int(exact_resident_stats.get("pending", 0) or 0),
+            "fallbacks_total": int(
+                exact_resident_stats.get("fallbacks_total", 0) or 0
+            ),
+            "evictions": int(exact_resident_stats.get("evictions", 0) or 0),
+            "oversize_rejections": int(
+                exact_resident_stats.get("oversize_rejections", 0) or 0
+            ),
+            "pool_invalidations": int(
+                exact_resident_stats.get("pool_invalidations", 0) or 0
+            ),
+            "pool_invalidated_bytes": int(
+                exact_resident_stats.get("pool_invalidated_bytes", 0) or 0
+            ),
+            "pool_invalidation_ms": float(
+                exact_resident_stats.get("pool_invalidation_ms", 0) or 0
+            ),
+        }
 
         indexed_blocks_value = indexed_blocks if isinstance(indexed_blocks, int) else 0
         if not isinstance(block_size, int) or block_size <= 0:
@@ -5155,6 +5251,7 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "exact_resident_cache": exact_resident_payload,
             "gdn_checkpoint_loads": int(
                 prefix_stats.get("gdn_checkpoint_loads", 0) or 0
             ),
@@ -5181,6 +5278,19 @@ def _build_runtime_cache_observability(
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
+        payload["exact_resident_entries"] += exact_resident_payload["entries"]
+        payload["exact_resident_size_bytes"] += exact_resident_payload["size_bytes"]
+        payload["exact_resident_max_entries"] += exact_resident_payload["max_entries"]
+        payload["exact_resident_max_bytes"] += exact_resident_payload["max_bytes"]
+        payload["exact_resident_hits"] += exact_resident_payload["hits"]
+        payload["exact_resident_misses"] += exact_resident_payload["misses"]
+        payload["exact_resident_active_leases"] += exact_resident_payload[
+            "active_leases"
+        ]
+        payload["exact_resident_fallbacks"] += exact_resident_payload[
+            "fallbacks_total"
+        ]
+        payload["exact_resident_evictions"] += exact_resident_payload["evictions"]
 
         if isinstance(block_size, int) and block_size > 0:
             block_sizes.add(block_size)
@@ -5699,8 +5809,24 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
 
     footprint_before = get_phys_footprint()
     total_cleared = 0
+    exact_resident_cleared = 0
     reclaim_targets = []
     for model_id, scheduler, core in _iter_loaded_scheduler_records():
+        disarm_keepwarm = getattr(core, "disarm_keepwarm_cache", None)
+        if callable(disarm_keepwarm):
+            disarm_keepwarm()
+        resident_cache = getattr(scheduler, "_exact_resident_cache", None)
+        if resident_cache is not None and hasattr(resident_cache, "clear"):
+            try:
+                cleared = int(resident_cache.clear() or 0)
+                exact_resident_cleared += cleared
+                total_cleared += cleared
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear exact resident cache for model '%s': %s",
+                    model_id,
+                    exc,
+                )
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
         if ssd_manager is not None and hasattr(ssd_manager, "clear_hot_cache"):
             try:
@@ -5759,6 +5885,7 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     return {
         "status": "ok",
         "total_cleared": total_cleared,
+        "exact_resident_cleared": exact_resident_cleared,
         "bytes_reclaimed": bytes_reclaimed,
     }
 

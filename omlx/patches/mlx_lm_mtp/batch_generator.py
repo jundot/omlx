@@ -1570,6 +1570,83 @@ def _clear_rollback(prompt_cache: List[Any]) -> None:
             c._undo_chain = False
 
 
+def _iter_mtp_cache_leaves(cache_list: List[Any]):
+    pending = list(reversed(cache_list))
+    while pending:
+        cache = pending.pop()
+        children = getattr(cache, "caches", None)
+        if isinstance(children, (list, tuple)):
+            pending.extend(reversed(children))
+        else:
+            yield cache
+
+
+def _is_generic_qwen35_mtp_model(model: Any) -> bool:
+    """Keep this proof on Qwen3.5/3.6; Qwen4 owns another transaction."""
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model", "model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+    for wrapper in list(candidates):
+        inner = getattr(wrapper, "model", None)
+        if inner is not None and inner not in candidates:
+            candidates.append(inner)
+    for candidate in candidates:
+        values = [
+            getattr(candidate, "model_type", None),
+            getattr(getattr(candidate, "args", None), "model_type", None),
+            getattr(getattr(candidate, "config", None), "model_type", None),
+            type(candidate).__module__,
+        ]
+        if any(
+            str(value or "").startswith(("qwen3_5", "qwen3_6"))
+            or ".qwen3_5" in str(value or "")
+            or ".qwen3_6" in str(value or "")
+            for value in values
+        ):
+            return True
+    return False
+
+
+def _generic_mtp_terminal_cache_is_exact(gen_batch: Any) -> bool:
+    """Prove a generic-Qwen MTP target cache already matches output."""
+
+    if not _is_generic_qwen35_mtp_model(getattr(gen_batch, "model", None)):
+        return False
+    tokens = getattr(gen_batch, "tokens", None)
+    prompt_cache = getattr(gen_batch, "prompt_cache", None)
+    if (
+        not isinstance(tokens, list)
+        or len(tokens) != 1
+        or not isinstance(tokens[0], list)
+        or not tokens[0]
+        or not isinstance(prompt_cache, list)
+        or not prompt_cache
+    ):
+        return False
+
+    offsets = []
+    for cache in _iter_mtp_cache_leaves(prompt_cache):
+        offset = getattr(cache, "offset", None)
+        if isinstance(offset, int):
+            offsets.append(offset)
+        for marker in (
+            "rollback_state",
+            "_mtp_draft_stash",
+            "_mtp_undo",
+            "_undo",
+        ):
+            if getattr(cache, marker, None) is not None:
+                return False
+    return bool(
+        offsets
+        and all(offset == offsets[0] for offset in offsets)
+        and offsets[0] == len(tokens[0])
+    )
+
+
 def _ensure_uint32(arr):
     """Ensure a 1-element mx.array is uint32 (cache update_and_fetch expects it)."""
     import mlx.core as mx
@@ -3506,8 +3583,30 @@ def _emit_response(
         finish_reason = "stop"
 
     if finish_reason is not None:
-        prompt_cache = gen_batch.extract_cache(0)
-        all_tokens = gen_batch.tokens[0]
+        # Legacy Qwen3.5-style MTP does not have Qwen4's explicit two-phase
+        # target transaction. Its verifier may leave the backbone cache ahead
+        # of the visible terminal token while a queued draft is still parked.
+        # Never replay the full committed ledger merely to manufacture a cache
+        # candidate after the response is already complete: at long context
+        # that one-shot attention graph can consume hundreds of GB. The output
+        # is already target-verified and final. Publish the live cache only when
+        # its exact target timeline is proved; otherwise fail closed on cache
+        # reuse and let oMLX's block-aligned durable prefix plus idle target-only
+        # tail reconstruction create the next exact resident entry.
+        standard_terminal_exact = False
+        active_state = getattr(gen_batch, "_omlx_mtp_state", None)
+        if active_state is not None:
+            standard_terminal_exact = _generic_mtp_terminal_cache_is_exact(
+                gen_batch
+            )
+            if not standard_terminal_exact:
+                logger.info(
+                    "MTP terminal cache proof missed; skipping full-history "
+                    "replay and suppressing terminal candidate for uid=%s",
+                    getattr(active_state, "uid", "?"),
+                )
+        prompt_cache = gen_batch.extract_cache(0) if standard_terminal_exact else None
+        all_tokens = gen_batch.tokens[0] if standard_terminal_exact else None
         response = Response(
             uid=gen_batch.uids[0],
             token=token_id,
@@ -3518,6 +3617,8 @@ def _emit_response(
             prompt_cache=prompt_cache,
             all_tokens=all_tokens,
         )
+        if standard_terminal_exact:
+            response._omlx_mtp_standard_terminal_exact = True
         if stats is not None:
             _log_mtp_stats(gen_batch.uids[0], stats, finish_reason)
         # Drop state *before* filter([]) so the patched_filter epilogue

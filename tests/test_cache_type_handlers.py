@@ -907,6 +907,7 @@ class TestSizedArraysCache:
         wrapper.advance(10)
 
         mock_inner.advance.assert_called_once_with(10)
+        assert wrapper._token_count == 110
 
     def test_extract_preserves_token_count(self):
         """Test extract() preserves token_count."""

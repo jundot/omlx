@@ -1590,8 +1590,10 @@ class BlockAwarePrefixCache(CacheManager):
             return None
 
         try:
-            if promote_to_hot_cache:
-                self.preload_blocks(block_table)
+            # reconstruct_cache performs the same SSD load and promotes each
+            # block as it is consumed.  preload_blocks is serialized for Metal
+            # safety, so running it here would deserialize the exact chain
+            # twice before returning it.
             restored_cache = self.reconstruct_cache(
                 block_table,
                 promote_to_hot_cache=promote_to_hot_cache,
@@ -1602,6 +1604,134 @@ class BlockAwarePrefixCache(CacheManager):
             self._exact_prefix_hits += 1
             self._exact_prefix_tokens_restored += len(tokens)
             return restored_cache
+        finally:
+            self.release_cache(request_id)
+
+    def _lookup_or_register_exact_block(
+        self, block_hash: BlockHash, token_count: int
+    ) -> CacheBlock | None:
+        """Resolve an exact-terminal block from RAM or the durable index."""
+
+        block = self.paged_cache.cached_block_hash_to_block.get_block(block_hash)
+        if block is not None:
+            return block if block.token_count == token_count else None
+        if self.paged_ssd_cache is None or not self.paged_ssd_cache.has_block(block_hash):
+            return None
+        block = self.paged_cache.allocate_block()
+        if block is None:
+            return None
+        block.block_hash = block_hash
+        block.token_count = token_count
+        block.ref_count = 0
+        self.paged_cache.cached_block_hash_to_block.insert(block_hash, block)
+        return block
+
+    def fetch_exact_terminal_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        max_search_blocks: int = 16,
+    ) -> tuple[BlockTable | None, int]:
+        """Find a persisted exact-terminal chain that prefixes ``tokens``.
+
+        Exact-terminal persistence uses a domain-separated final block so a
+        partial tail cannot collide with ordinary prefix blocks.  On reload,
+        the new prompt commonly extends that terminal; probe the final few
+        block boundaries and terminal lengths, then continue generation from
+        the longest verified terminal prefix.
+        """
+
+        if not tokens or self.paged_ssd_cache is None or self.block_size <= 0:
+            return None, 0
+        block_size = int(self.block_size)
+        latest_start = ((len(tokens) - 1) // block_size) * block_size
+        earliest_start = max(
+            0,
+            latest_start - max(1, int(max_search_blocks)) * block_size,
+        )
+        for start in range(latest_start, earliest_start - 1, -block_size):
+            prefix_tokens = tokens[:start]
+            full_blocks, matched = self.paged_cache.get_computed_blocks(prefix_tokens)
+            if matched != start:
+                continue
+            parent_hash = full_blocks[-1].block_hash if full_blocks else None
+            max_terminal = min(block_size, len(tokens) - start)
+            for terminal_count in range(max_terminal, 0, -1):
+                terminal_hash = compute_block_hash(
+                    parent_hash,
+                    tokens[start : start + terminal_count],
+                    extra_keys=(_EXACT_PREFIX_TERMINAL_KEY,),
+                    model_name=self.paged_cache.model_name,
+                )
+                terminal = self._lookup_or_register_exact_block(
+                    terminal_hash,
+                    terminal_count,
+                )
+                if terminal is None:
+                    continue
+                acquired: list[CacheBlock] = []
+                valid = True
+                for block in full_blocks:
+                    expected = block.block_hash
+                    if expected is None:
+                        valid = False
+                        break
+                    owned = self.paged_cache.acquire_cached_block(block.block_id, expected)
+                    if owned is None:
+                        valid = False
+                        break
+                    acquired.append(owned)
+                if valid:
+                    owned_terminal = self.paged_cache.acquire_cached_block(
+                        terminal.block_id,
+                        terminal_hash,
+                    )
+                    if owned_terminal is not None:
+                        acquired.append(owned_terminal)
+                    else:
+                        valid = False
+                if not valid:
+                    if acquired:
+                        self.paged_cache.free_blocks(acquired)
+                    continue
+                table = self.paged_cache.create_block_table(request_id)
+                for block in acquired:
+                    table.add_block(block.block_id, block.token_count)
+                self._request_tables[request_id] = BlockCacheEntry(
+                    block_table=table,
+                    last_access=time.time(),
+                )
+                return table, start + terminal_count
+        return None, 0
+
+    def restore_exact_terminal_prefix(
+        self,
+        request_id: str,
+        tokens: list[int],
+        *,
+        promote_to_hot_cache: bool,
+        max_search_blocks: int = 16,
+    ) -> tuple[list[Any] | None, int]:
+        """Reconstruct a persisted exact-terminal prefix and return its length."""
+
+        table, matched_tokens = self.fetch_exact_terminal_prefix(
+            request_id,
+            tokens,
+            max_search_blocks=max_search_blocks,
+        )
+        if table is None:
+            return None, 0
+        try:
+            restored = self.reconstruct_cache(
+                table,
+                promote_to_hot_cache=promote_to_hot_cache,
+            )
+            if restored is None or table.num_tokens != matched_tokens:
+                return None, 0
+            self._exact_prefix_hits += 1
+            self._exact_prefix_tokens_restored += matched_tokens
+            return restored, matched_tokens
         finally:
             self.release_cache(request_id)
 

@@ -50,6 +50,7 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
+from .keepwarm import KeepwarmConfig
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
@@ -287,6 +288,10 @@ class EnginePool:
         self._get_admission_soft_target: object | None = None  # Set by server
         self._get_residency_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        # Desired process-wide policy closes the live-toggle/model-load race.
+        # A freshly published engine reconciles this value, while toggles also
+        # visit every engine already present in the registry.
+        self._latent_metal_keepwarm_enabled = KeepwarmConfig.from_env().enabled
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         # Requests whose prefill already got a pooled-buffer reclaim pass.
@@ -2097,6 +2102,20 @@ class EnginePool:
         except AttributeError:
             return None
 
+    def _apply_latent_metal_keepwarm_to_engine(self, engine: object) -> None:
+        core = self._resolve_engine_core_from_engine(engine)
+        configure = getattr(core, "configure_keepwarm", None)
+        if callable(configure):
+            configure(self._latent_metal_keepwarm_enabled)
+
+    def configure_latent_metal_keepwarm(self, enabled: bool) -> None:
+        """Hot-apply one policy to loaded engines and future load publication."""
+
+        self._latent_metal_keepwarm_enabled = bool(enabled)
+        for entry in self._entries.values():
+            if entry.engine is not None:
+                self._apply_latent_metal_keepwarm_to_engine(entry.engine)
+
     async def _reclaim_pooled_buffers_for_prefill(
         self, model_id: str, request_id: str
     ) -> int:
@@ -2926,6 +2945,9 @@ class EnginePool:
 
             self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
+            # Reconcile after publication. If settings raced this load, either
+            # the update now sees this entry or this read sees the new pool bit.
+            self._apply_latent_metal_keepwarm_to_engine(engine)
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True

@@ -33,6 +33,7 @@ from omlx.settings import (
     get_ssd_capacity,
     get_system_memory,
     init_settings,
+    latent_metal_keepwarm_env,
     reset_settings,
     resolve_default_base_path,
 )
@@ -52,6 +53,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.latent_metal_keepwarm_enabled is False
         assert settings.distributed_inference_enabled is False
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
@@ -83,6 +85,7 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "latent_metal_keepwarm_enabled": False,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
         }
@@ -125,6 +128,12 @@ class TestServerSettings:
         """Missing preserve_mid_system_cache keeps the cache-friendly default."""
         settings = ServerSettings.from_dict({})
         assert settings.preserve_mid_system_cache is True
+
+    def test_latent_metal_keepwarm_is_default_off_and_round_trips(self):
+        assert ServerSettings.from_dict({}).latent_metal_keepwarm_enabled is False
+        settings = ServerSettings.from_dict({"latent_metal_keepwarm_enabled": True})
+        assert settings.latent_metal_keepwarm_enabled is True
+        assert settings.to_dict()["latent_metal_keepwarm_enabled"] is True
 
     def test_from_dict_auto_start_on_launch(self):
         """auto_start_on_launch round-trips through from_dict / to_dict."""
@@ -227,6 +236,17 @@ class TestBurstDecodeEnv:
             "OMLX_DECODE_BURST_MAX_STEPS",
             "OMLX_DECODE_BURST_BUDGET_SINGLE_S",
         }
+
+
+def test_latent_metal_keepwarm_env_maps_boolean_master_switch():
+    assert latent_metal_keepwarm_env(True) == {
+        "OMLX_KEEPWARM": "1",
+        "OMLX_KEEPWARM_PROMPT_TAIL": "1",
+    }
+    assert latent_metal_keepwarm_env(False) == {
+        "OMLX_KEEPWARM": "0",
+        "OMLX_KEEPWARM_PROMPT_TAIL": "0",
+    }
 
 
 class TestModelSettings:

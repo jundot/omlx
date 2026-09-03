@@ -80,6 +80,11 @@ class BatchedEngine(BaseEngine):
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
 
+    def _notify_admission_pending(self) -> None:
+        notify = getattr(self._engine, "notify_admission_pending", None)
+        if callable(notify):
+            notify()
+
     async def _preflight_or_raise_with_eviction(
         self,
         scheduler: Any,
@@ -870,6 +875,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         from ..request import SamplingParams
 
@@ -895,6 +901,7 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        allow_prompt_tail_prewarm = not bool(kwargs.get("skip_cache_store", False))
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -902,6 +909,14 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             **specprefill_kwargs,
         )
+        if allow_prompt_tail_prewarm:
+            schedule_prewarm = getattr(
+                self._engine,
+                "schedule_prompt_tail_prewarm",
+                None,
+            )
+            if callable(schedule_prewarm):
+                schedule_prewarm(prompt)
 
         text = clean_special_tokens(output.output_text)
 
@@ -948,6 +963,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         from ..request import SamplingParams
 
@@ -972,6 +988,7 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        allow_prompt_tail_prewarm = not bool(kwargs.get("skip_cache_store", False))
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -995,7 +1012,7 @@ class BatchedEngine(BaseEngine):
                 # may stop iterating after receiving the final output,
                 # which triggers GeneratorExit at the yield point -
                 # code after yield would never execute.
-                if output.finished:
+                if output.finished and not getattr(output, "error", None):
                     finished_normally = True
 
                 yield GenerationOutput(
@@ -1042,6 +1059,14 @@ class BatchedEngine(BaseEngine):
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
                 )
+                if allow_prompt_tail_prewarm:
+                    schedule_prewarm = getattr(
+                        engine,
+                        "schedule_prompt_tail_prewarm",
+                        None,
+                    )
+                    if callable(schedule_prewarm):
+                        schedule_prewarm(prompt)
 
     async def chat(
         self,
@@ -1076,6 +1101,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         # Preprocess messages for Harmony (gpt-oss) models
         messages = self._preprocess_messages(messages)
@@ -1134,6 +1160,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
@@ -1182,6 +1209,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -1233,6 +1261,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         # Preprocess messages for Harmony (gpt-oss) models
         messages = self._preprocess_messages(messages)
