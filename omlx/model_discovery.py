@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .models.sentence_transformers import is_modernbert_cross_encoder
+
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
@@ -615,6 +617,12 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    # A modular SentenceTransformers CrossEncoder keeps the bare backbone
+    # architecture in config.json; its validated module chain is the more
+    # specific reranker signal and must win before embedding detection.
+    if is_modernbert_cross_encoder(model_path):
+        return "reranker"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
