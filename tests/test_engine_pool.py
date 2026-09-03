@@ -1435,6 +1435,26 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+    def test_runtime_signature_tracks_dflash_fallback_cooldown(
+        self, pool_with_mock_engines
+    ):
+        """A profile override changing the auto-revert cooldown must change
+        the runtime signature — otherwise the pool reuses an engine built
+        with the old cooldown instead of rebuilding with the new one."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        base = ModelSettings(dflash_enabled=True, dflash_draft_model="/draft")
+        longer = ModelSettings(
+            dflash_enabled=True,
+            dflash_draft_model="/draft",
+            dflash_fallback_cooldown_secs=60,
+        )
+
+        assert pool._engine_runtime_signature(
+            "model-a", base
+        ) != pool._engine_runtime_signature("model-a", longer)
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines
