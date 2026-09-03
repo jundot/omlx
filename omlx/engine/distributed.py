@@ -167,6 +167,8 @@ class DistributedBatchedEngine(BatchedEngine):
         self._supports_multimodal_fallback = False
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._peer_health: tuple[float, bool, str] | None = None
         self._peer_health_lock = asyncio.Lock()
 
@@ -188,6 +190,32 @@ class DistributedBatchedEngine(BatchedEngine):
                 max_keepalive_connections=8,
             ),
         )
+
+    @staticmethod
+    async def _run_supervisor_operation(operation: Any) -> Any:
+        """Finish a blocking supervisor operation before propagating cancellation.
+
+        ``asyncio.to_thread`` cannot stop its worker when the awaiting task is
+        cancelled. Releasing the lifecycle lock at that point would allow a
+        second start or stop to race the still-running supervisor operation.
+        Shield the worker and defer cancellation until its result is known.
+        """
+
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        if cancellation is not None:
+            try:
+                task.result()
+            except BaseException as exc:
+                raise cancellation from exc
+            raise cancellation
+        return task.result()
 
     @property
     def model_type(self) -> str | None:
@@ -211,77 +239,79 @@ class DistributedBatchedEngine(BatchedEngine):
         return self._supervisor.status().to_dict()
 
     async def start(self) -> None:
-        if self._loaded:
-            return
-        self._validate_model_settings()
-        self._supports_multimodal_fallback = False
+        async with self._lifecycle_lock:
+            if self._loaded:
+                return
+            self._validate_model_settings()
 
-        # Tokenizer/config metadata stays in the oMLX process. No model weights
-        # are loaded here.
-        from mlx_lm.utils import _download, load_config, load_tokenizer
+            # Tokenizer/config metadata stays in the oMLX process. No model weights
+            # are loaded here.
+            from mlx_lm.utils import _download, load_config, load_tokenizer
 
-        metadata_path = await asyncio.to_thread(
-            _download,
-            self.deployment.model,
-            allow_patterns=[
-                "*.json",
-                "*.py",
-                "tokenizer.model",
-                "*.tiktoken",
-                "tiktoken.model",
-                "*.txt",
-                "*.jsonl",
-                "*.jinja",
-            ],
-        )
-        config = await asyncio.to_thread(load_config, metadata_path)
-        from ..deepseek_v4_vision import (
-            is_deepseek_v4_vision_config,
-            require_supported_distributed_vlm,
-        )
-        from ..model_discovery import _has_vision_subconfig
-
-        deepseek_v4_vision = is_deepseek_v4_vision_config(config)
-        if _has_vision_subconfig(config):
-            require_supported_distributed_vlm(config)
-            logger.info(
-                "DeepSeek-V4 Vision distributed capability recognized: "
-                "rank 0 owns vision preprocessing/encoder; language uses pipeline"
+            metadata_path = await asyncio.to_thread(
+                _download,
+                self.deployment.model,
+                allow_patterns=[
+                    "*.json",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jsonl",
+                    "*.jinja",
+                ],
             )
-        elif deepseek_v4_vision:  # defensive if heuristics change
-            require_supported_distributed_vlm(config)
-        self._model_type = config.get("model_type")
-        self._tokenizer = await asyncio.to_thread(
-            load_tokenizer,
-            metadata_path,
-            {"trust_remote_code": self.deployment.trust_remote_code},
-            config.get("eos_token_id"),
-        )
-        self._supports_multimodal_fallback = deepseek_v4_vision
+            config = await asyncio.to_thread(load_config, metadata_path)
+            from ..deepseek_v4_vision import (
+                is_deepseek_v4_vision_config,
+                require_supported_distributed_vlm,
+            )
+            from ..model_discovery import _has_vision_subconfig
 
-        try:
-            await asyncio.to_thread(self._supervisor.start)
-        except Exception:
-            self._tokenizer = None
-            self._model_type = None
-            self._supports_multimodal_fallback = False
-            raise
-        endpoint = self._supervisor.endpoint
-        if endpoint is None:
-            await asyncio.to_thread(self._supervisor.stop)
-            self._tokenizer = None
-            self._model_type = None
-            self._supports_multimodal_fallback = False
-            raise DistributedLaunchError("distributed endpoint was not created")
-        self._client = self._new_client(endpoint)
-        self._loaded = True
-        logger.info(
-            "Distributed engine ready: model=%s ranks=%d backend=%s plan=%s",
-            self.deployment.model,
-            self.deployment.world_size,
-            self.deployment.backend,
-            self.deployment.plan_hash[:16],
-        )
+            deepseek_v4_vision = is_deepseek_v4_vision_config(config)
+            if _has_vision_subconfig(config):
+                require_supported_distributed_vlm(config)
+                logger.info(
+                    "DeepSeek-V4 Vision distributed capability recognized: "
+                    "rank 0 owns vision preprocessing/encoder; language uses pipeline"
+                )
+            elif deepseek_v4_vision:  # defensive if heuristics change
+                require_supported_distributed_vlm(config)
+            model_type = config.get("model_type")
+            tokenizer = await asyncio.to_thread(
+                load_tokenizer,
+                metadata_path,
+                {"trust_remote_code": self.deployment.trust_remote_code},
+                config.get("eos_token_id"),
+            )
+
+            try:
+                await self._run_supervisor_operation(self._supervisor.start)
+            except asyncio.CancelledError:
+                try:
+                    await self._run_supervisor_operation(self._supervisor.stop)
+                except Exception:  # noqa: BLE001 - preserve cancellation
+                    logger.exception(
+                        "Could not stop distributed deployment after cancelled start"
+                    )
+                raise
+            endpoint = self._supervisor.endpoint
+            if endpoint is None:
+                await self._run_supervisor_operation(self._supervisor.stop)
+                raise DistributedLaunchError("distributed endpoint was not created")
+            self._client = self._new_client(endpoint)
+            self._tokenizer = tokenizer
+            self._model_type = model_type
+            self._supports_multimodal_fallback = deepseek_v4_vision
+            self._loaded = True
+            logger.info(
+                "Distributed engine ready: model=%s ranks=%d backend=%s plan=%s",
+                self.deployment.model,
+                self.deployment.world_size,
+                self.deployment.backend,
+                self.deployment.plan_hash[:16],
+            )
 
     def _validate_model_settings(self) -> None:
         settings = self._model_settings
@@ -305,36 +335,102 @@ class DistributedBatchedEngine(BatchedEngine):
             )
 
     async def stop(self) -> None:
-        client, self._client = self._client, None
-        try:
-            if client is not None:
-                await client.aclose()
-        finally:
+        async with self._lifecycle_lock:
+            client, self._client = self._client, None
+            self._loaded = False
+            self._peer_health = None
             try:
-                await asyncio.to_thread(self._supervisor.stop)
+                if client is not None:
+                    await client.aclose()
             finally:
-                self._tokenizer = None
-                self._model_type = None
-                self._supports_multimodal_fallback = False
-                self._loaded = False
+                try:
+                    await self._run_supervisor_operation(self._supervisor.stop)
+                finally:
+                    self._tokenizer = None
+                    self._model_type = None
+                    self._supports_multimodal_fallback = False
         logger.info("Distributed engine stopped: %s", self.deployment.deployment_id)
 
-    def _ensure_available(self) -> httpx.AsyncClient:
+    async def _fail_closed(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        reason: str,
+    ) -> None:
+        """Stop every rank after an abandoned private request.
+
+        MLX-LM cannot observe a disconnected socket while blocked inside a
+        prefill kernel or collective. Closing the HTTP client alone can leave
+        that work resident indefinitely, so the only safe cancellation boundary
+        is the supervisor-owned process group. One abandoned request therefore
+        cancels every concurrent request on this distributed deployment.
+
+        The client identity check prevents a stale request from stopping a job
+        that another lifecycle operation has already replaced.
+        """
+
+        async with self._lifecycle_lock:
+            if self._client is not client:
+                return
+            self._client = None
+            self._loaded = False
+            self._peer_health = None
+            logger.warning(
+                "Stopping distributed deployment %s after %s",
+                self.deployment.deployment_id,
+                reason,
+            )
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - teardown must continue to ranks
+                logger.exception("Could not close failed rank-zero client")
+            try:
+                await self._run_supervisor_operation(self._supervisor.stop)
+            except Exception:  # noqa: BLE001 - preserve the request failure
+                logger.exception(
+                    "Could not fully stop failed distributed deployment %s",
+                    self.deployment.deployment_id,
+                )
+
+    async def _teardown_failed_request(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        reason: str,
+    ) -> None:
+        """Run fail-closed teardown even if the request is cancelled again."""
+
+        task = asyncio.create_task(self._fail_closed(client, reason=reason))
+        self._teardown_tasks.add(task)
+        task.add_done_callback(self._teardown_tasks.discard)
+        await asyncio.shield(task)
+
+    async def _ensure_available(self) -> httpx.AsyncClient:
         client = self._client
         status = self._supervisor.status()
         if not self._loaded or client is None:
             raise DistributedInferenceError("distributed engine is not loaded")
-        if status.returncode is not None:
+        if status.returncode is not None or status.failure_reason:
             detail = status.failure_reason or ""
             tail = " · ".join(
                 line.strip() for line in status.stderr_tail[-3:] if line.strip()
             )[:1000]
             if tail and tail not in detail:
                 detail = f"{detail} · Worker log: {tail}" if detail else tail
-            suffix = f": {detail}" if detail else ""
-            raise DistributedInferenceError(
-                f"distributed job exited with code {status.returncode}{suffix}"
+            if status.returncode is not None:
+                suffix = f": {detail}" if detail else ""
+                error = DistributedInferenceError(
+                    f"distributed job exited with code {status.returncode}{suffix}"
+                )
+            else:
+                error = DistributedInferenceError(
+                    f"distributed cluster failure: {detail}"
+                )
+            await self._teardown_failed_request(
+                client,
+                reason="reported distributed supervisor failure",
             )
+            raise error
         return client
 
     def _read_timeout_error(self, *, stream: bool) -> DistributedInferenceError:
@@ -688,7 +784,7 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if not self._loaded:
             await self.start()
-        client = self._ensure_available()
+        client = await self._ensure_available()
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -718,12 +814,33 @@ class DistributedBatchedEngine(BatchedEngine):
             self._raise_for_backend(response)
             body = response.json()
         except httpx.ReadTimeout as exc:
-            raise self._read_timeout_error(stream=False) from exc
-        except httpx.HTTPError as exc:
-            raise await self._transport_failure_error(
-                exc,
-                stream=False,
-            ) from exc
+            error = self._read_timeout_error(stream=False)
+            await self._teardown_failed_request(
+                client,
+                reason="rank-zero request read timeout",
+            )
+            raise error from exc
+        except asyncio.CancelledError:
+            await self._teardown_failed_request(
+                client,
+                reason="cancelled rank-zero request",
+            )
+            raise
+        except httpx.TransportError as exc:
+            try:
+                error = await self._transport_failure_error(
+                    exc,
+                    stream=False,
+                )
+            finally:
+                await self._teardown_failed_request(
+                    client,
+                    reason=(
+                        "rank-zero request transport failure "
+                        f"({type(exc).__name__})"
+                    ),
+                )
+            raise error from exc
         except json.JSONDecodeError as exc:
             raise DistributedInferenceError(
                 "rank-zero backend returned invalid chat JSON"
@@ -793,7 +910,7 @@ class DistributedBatchedEngine(BatchedEngine):
             return
         if not self._loaded:
             await self.start()
-        client = self._ensure_available()
+        client = await self._ensure_available()
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -817,6 +934,7 @@ class DistributedBatchedEngine(BatchedEngine):
         request_started_at = time.monotonic()
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
+        request_resolved = False
 
         await self._enter_request()
         try:
@@ -843,13 +961,21 @@ class DistributedBatchedEngine(BatchedEngine):
                         if attempt_index + 1 < len(attempts):
                             attempt_index += 1
                             continue
+                        request_resolved = True
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
-                        if not data or data == "[DONE]":
+                        if not data:
                             continue
+                        if data == "[DONE]":
+                            if finish_reason is None:
+                                raise DistributedInferenceError(
+                                    "rank-zero chat stream ended before a terminal event"
+                                )
+                            request_resolved = True
+                            break
                         try:
                             event = json.loads(data)
                         except json.JSONDecodeError as exc:
@@ -967,19 +1093,34 @@ class DistributedBatchedEngine(BatchedEngine):
                                 generated_until=now,
                                 first_token_at=first_token_at,
                             )
+                    if not request_resolved:
+                        raise DistributedInferenceError(
+                            "rank-zero chat stream ended before [DONE]"
+                        )
                     break
         except (TypeError, ValueError) as exc:
             raise DistributedInferenceError(
                 "rank-zero backend emitted invalid chat token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
-            raise self._read_timeout_error(stream=True) from exc
-        except httpx.HTTPError as exc:
-            raise await self._transport_failure_error(
+            error = self._read_timeout_error(stream=True)
+            raise error from exc
+        except asyncio.CancelledError:
+            raise
+        except GeneratorExit:
+            raise
+        except httpx.TransportError as exc:
+            error = await self._transport_failure_error(
                 exc,
                 stream=True,
-            ) from exc
+            )
+            raise error from exc
         finally:
+            if not request_resolved:
+                await self._teardown_failed_request(
+                    client,
+                    reason="abandoned or failed rank-zero chat stream",
+                )
             await self._leave_request()
 
         pending_final_text = ""
@@ -1027,7 +1168,7 @@ class DistributedBatchedEngine(BatchedEngine):
     ) -> GenerationOutput:
         if not self._loaded:
             await self.start()
-        client = self._ensure_available()
+        client = await self._ensure_available()
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1056,12 +1197,33 @@ class DistributedBatchedEngine(BatchedEngine):
             self._raise_for_backend(response)
             body = response.json()
         except httpx.ReadTimeout as exc:
-            raise self._read_timeout_error(stream=False) from exc
-        except httpx.HTTPError as exc:
-            raise await self._transport_failure_error(
-                exc,
-                stream=False,
-            ) from exc
+            error = self._read_timeout_error(stream=False)
+            await self._teardown_failed_request(
+                client,
+                reason="rank-zero request read timeout",
+            )
+            raise error from exc
+        except asyncio.CancelledError:
+            await self._teardown_failed_request(
+                client,
+                reason="cancelled rank-zero request",
+            )
+            raise
+        except httpx.TransportError as exc:
+            try:
+                error = await self._transport_failure_error(
+                    exc,
+                    stream=False,
+                )
+            finally:
+                await self._teardown_failed_request(
+                    client,
+                    reason=(
+                        "rank-zero request transport failure "
+                        f"({type(exc).__name__})"
+                    ),
+                )
+            raise error from exc
         except json.JSONDecodeError as exc:
             raise DistributedInferenceError(
                 "rank-zero backend returned invalid completion JSON"
@@ -1104,7 +1266,7 @@ class DistributedBatchedEngine(BatchedEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
-        client = self._ensure_available()
+        client = await self._ensure_available()
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1126,6 +1288,7 @@ class DistributedBatchedEngine(BatchedEngine):
         full_text = ""
         first_token_at: float | None = None
         request_started_at = time.monotonic()
+        request_resolved = False
 
         await self._enter_request()
         try:
@@ -1149,13 +1312,21 @@ class DistributedBatchedEngine(BatchedEngine):
                         if attempt_index + 1 < len(attempts):
                             attempt_index += 1
                             continue
+                        request_resolved = True
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
-                        if not data or data == "[DONE]":
+                        if not data:
                             continue
+                        if data == "[DONE]":
+                            if finish_reason is None:
+                                raise DistributedInferenceError(
+                                    "rank-zero completion stream ended before a terminal event"
+                                )
+                            request_resolved = True
+                            break
                         try:
                             event = json.loads(data)
                         except json.JSONDecodeError as exc:
@@ -1224,19 +1395,34 @@ class DistributedBatchedEngine(BatchedEngine):
                                 generated_until=now,
                                 first_token_at=first_token_at,
                             )
+                    if not request_resolved:
+                        raise DistributedInferenceError(
+                            "rank-zero completion stream ended before [DONE]"
+                        )
                     break
         except (TypeError, ValueError) as exc:
             raise DistributedInferenceError(
                 "rank-zero backend emitted invalid token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
-            raise self._read_timeout_error(stream=True) from exc
-        except httpx.HTTPError as exc:
-            raise await self._transport_failure_error(
+            error = self._read_timeout_error(stream=True)
+            raise error from exc
+        except asyncio.CancelledError:
+            raise
+        except GeneratorExit:
+            raise
+        except httpx.TransportError as exc:
+            error = await self._transport_failure_error(
                 exc,
                 stream=True,
-            ) from exc
+            )
+            raise error from exc
         finally:
+            if not request_resolved:
+                await self._teardown_failed_request(
+                    client,
+                    reason="abandoned or failed rank-zero completion stream",
+                )
             await self._leave_request()
 
         finished_at = time.monotonic()
@@ -1347,15 +1533,7 @@ class DistributedBatchedEngine(BatchedEngine):
         round trip per peer and is cached for ``_PEER_HEALTH_TTL`` seconds.
         """
 
-        status = self._supervisor.status()
-        if status.returncode is not None:
-            raise DistributedInferenceError(
-                f"distributed job exited with code {status.returncode}"
-            )
-        if status.failure_reason:
-            raise DistributedInferenceError(
-                f"distributed cluster failure: {status.failure_reason}"
-            )
+        client = await self._ensure_available()
         cached = self._peer_health
         if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
             async with self._peer_health_lock:
@@ -1389,17 +1567,24 @@ class DistributedBatchedEngine(BatchedEngine):
                         )
                     self._peer_health = cached
         if not cached[1]:
-            raise DistributedInferenceError(
-                f"cluster is not serving: {cached[2]}"
+            error = DistributedInferenceError(f"cluster is not serving: {cached[2]}")
+            await self._teardown_failed_request(
+                client,
+                reason="unhealthy distributed peer",
             )
+            raise error
 
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        if not self._loaded:
+            await self.start()
         await self._require_healthy_cluster()
         return None
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
+        if not self._loaded:
+            await self.start()
         await self._require_healthy_cluster()
         return None
 
@@ -1425,13 +1610,9 @@ class DistributedBatchedEngine(BatchedEngine):
         reason: str | None = None,
         error_code: str | None = None,
     ) -> int:
-        # Closing the private client disconnects all rank-zero handlers. The
-        # MLX-LM handler cancels their generation contexts in ``finally``.
         active = self._active_requests
-        client, self._client = self._client, None
-        if client is not None:
-            await client.aclose()
-            endpoint = self._supervisor.endpoint
-            if endpoint is not None and self._loaded:
-                self._client = self._new_client(endpoint)
+        # MLX-LM may be blocked inside a prefill kernel and unable to observe a
+        # closed private socket. Abort must use the supervisor's bounded local
+        # and remote process reaping rather than leave rank work resident.
+        await self.stop()
         return active

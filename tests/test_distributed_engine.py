@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -238,37 +241,307 @@ def _stalled_engine():
         )
 
     engine._supervisor.status = status
-    return engine, status_calls
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    return engine, status_calls, stop_calls, engine._client
 
 
 @pytest.mark.asyncio
 async def test_distributed_generate_bounds_rank_zero_read_stalls():
-    engine, status_calls = _stalled_engine()
-    try:
-        with pytest.raises(
-            DistributedInferenceError,
-            match="request timed out.*no rank-zero data.*cluster was ready",
-        ):
-            await engine.generate("hello")
-    finally:
-        await engine._client.aclose()
+    engine, status_calls, stop_calls, client = _stalled_engine()
+    with pytest.raises(
+        DistributedInferenceError,
+        match="request timed out.*no rank-zero data.*cluster was ready",
+    ):
+        await engine.generate("hello")
 
     assert len(status_calls) == 2, "availability must be rechecked after timeout"
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+    assert engine.has_active_requests() is False
 
 
 @pytest.mark.asyncio
 async def test_distributed_stream_bounds_rank_zero_read_stalls():
-    engine, status_calls = _stalled_engine()
-    try:
-        with pytest.raises(
-            DistributedInferenceError,
-            match="stream timed out.*no rank-zero data.*cluster was ready",
-        ):
-            [output async for output in engine.stream_generate("hello")]
-    finally:
-        await engine._client.aclose()
+    engine, status_calls, stop_calls, client = _stalled_engine()
+    with pytest.raises(
+        DistributedInferenceError,
+        match="stream timed out.*no rank-zero data.*cluster was ready",
+    ):
+        [output async for output in engine.stream_generate("hello")]
 
     assert len(status_calls) == 2, "availability must be rechecked after timeout"
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_distributed_request_stops_every_rank():
+    started = asyncio.Event()
+
+    async def handler(_request):
+        started.set()
+        await asyncio.Event().wait()
+
+    engine = _ready_engine(handler)
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    request = asyncio.create_task(engine.generate("hello"))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+    assert engine.has_active_requests() is False
+
+
+class _PartialSSEStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield (
+            b'data: {"choices":[{"text":"one","finish_reason":null}]}'
+            b"\n\n"
+        )
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_closing_partial_distributed_stream_stops_every_rank():
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_PartialSSEStream(),
+        )
+
+    engine = _ready_engine(handler)
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    stream = engine.stream_generate("hello")
+
+    output = await anext(stream)
+    assert output.new_text == "one"
+    await stream.aclose()
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
+async def test_successful_distributed_stream_keeps_cluster_loaded():
+    def handler(_request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"choices":[{"text":"ok","finish_reason":null}]}\n\n'
+                'data: {"choices":[{"text":"","finish_reason":"stop"}]}\n\n'
+                "data: [DONE]\n\n"
+            ),
+        )
+
+    engine = _ready_engine(handler)
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    try:
+        outputs = [output async for output in engine.stream_generate("hello")]
+    finally:
+        await client.aclose()
+
+    assert "".join(output.new_text for output in outputs) == "ok"
+    assert stop_calls == []
+    assert engine._client is client
+    assert engine._loaded is True
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_engine_retains_metadata_and_preflight_restarts():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    client = engine._client
+    tokenizer = engine._tokenizer
+    engine._model_type = "llama"
+    engine._supports_multimodal_fallback = True
+    engine._supervisor.stop = lambda: None
+
+    await engine._teardown_failed_request(client, reason="test failure")
+
+    assert engine._tokenizer is tokenizer
+    assert engine._model_type == "llama"
+    assert engine._supports_multimodal_fallback is True
+    engine.start = AsyncMock()
+    engine._require_healthy_cluster = AsyncMock()
+
+    await engine.preflight_completion("hello")
+
+    engine.start.assert_awaited_once_with()
+    engine._require_healthy_cluster.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_failed_restart_preserves_retained_engine_metadata(monkeypatch):
+    import mlx_lm.utils as mlx_utils
+
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    client = engine._client
+    tokenizer = engine._tokenizer
+    engine._model_type = "llama"
+    engine._supports_multimodal_fallback = True
+    engine._supervisor.stop = lambda: None
+    await engine._teardown_failed_request(client, reason="test failure")
+
+    monkeypatch.setattr(mlx_utils, "_download", lambda *_args, **_kwargs: "/model")
+    monkeypatch.setattr(
+        mlx_utils,
+        "load_config",
+        lambda _path: {"model_type": "replacement"},
+    )
+    def fail_start():
+        raise RuntimeError("launch failed")
+
+    # Reach the supervisor failure after loading replacement metadata, then
+    # ensure that metadata is not published over the last pool-valid state.
+    monkeypatch.setattr(mlx_utils, "load_tokenizer", lambda *_args, **_kwargs: object())
+    engine._supervisor.start = fail_start
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await engine.start()
+
+    assert engine._tokenizer is tokenizer
+    assert engine._model_type == "llama"
+    assert engine._supports_multimodal_fallback is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_supervisor_start_finishes_and_stops_before_unlock(monkeypatch):
+    import mlx_lm.utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_download", lambda *_args, **_kwargs: "/model")
+    monkeypatch.setattr(mlx_utils, "load_config", lambda _path: {"model_type": "llama"})
+    monkeypatch.setattr(
+        mlx_utils, "load_tokenizer", lambda *_args, **_kwargs: _Tokenizer()
+    )
+    engine = DistributedBatchedEngine(_deployment())
+    started = threading.Event()
+    release = threading.Event()
+    stop_calls = []
+
+    def blocking_start():
+        started.set()
+        release.wait()
+
+    engine._supervisor.start = blocking_start
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    task = asyncio.create_task(engine.start())
+    assert await asyncio.to_thread(started.wait, 1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert engine._lifecycle_lock.locked()
+    assert task.done() is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+
+    assert stop_calls == [True]
+    assert engine._lifecycle_lock.locked() is False
+    assert engine._loaded is False
+    assert engine._tokenizer is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_supervisor_stop_finishes_before_unlock():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_stop():
+        started.set()
+        release.wait()
+
+    engine._supervisor.stop = blocking_stop
+    task = asyncio.create_task(engine.stop())
+    assert await asyncio.to_thread(started.wait, 1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert engine._lifecycle_lock.locked()
+    assert task.done() is False
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+
+    assert engine._lifecycle_lock.locked() is False
+    assert engine._loaded is False
+    assert engine._tokenizer is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_distributed_failures_stop_supervisor_once():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    await asyncio.gather(
+        engine._teardown_failed_request(client, reason="first failure"),
+        engine._teardown_failed_request(client, reason="second failure"),
+    )
+
+    assert stop_calls == [True]
+    assert engine._client is None
+    assert engine._loaded is False
+
+
+@pytest.mark.asyncio
+async def test_stale_distributed_request_cannot_stop_replacement_job():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    stale_client = engine._client
+    replacement_client = httpx.AsyncClient(base_url="http://127.0.0.1:2")
+    engine._client = replacement_client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    try:
+        await engine._teardown_failed_request(stale_client, reason="stale failure")
+        assert stop_calls == []
+        assert engine._client is replacement_client
+        assert engine._loaded is True
+    finally:
+        await stale_client.aclose()
+        await replacement_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_abort_all_distributed_requests_hard_stops_cluster():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    client = engine._client
+    engine._active_requests = 3
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    aborted = await engine.abort_all_requests(reason="memory pressure")
+
+    assert aborted == 3
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 def test_chat_payload_folds_thinking_budget_into_chat_template_kwargs():
@@ -776,14 +1049,19 @@ async def test_distributed_stream_rejects_malformed_usage():
         )
 
     engine = _ready_engine(handler)
-    try:
-        with pytest.raises(
-            DistributedInferenceError,
-            match="invalid token details",
-        ):
-            [output async for output in engine.stream_generate("test")]
-    finally:
-        await engine._client.aclose()
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    with pytest.raises(
+        DistributedInferenceError,
+        match="invalid token details",
+    ):
+        [output async for output in engine.stream_generate("test")]
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
@@ -792,11 +1070,98 @@ async def test_distributed_engine_surfaces_bounded_backend_error():
         return httpx.Response(503, json={"error": "rank 1 failed"})
 
     engine = _ready_engine(handler)
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
     try:
         with pytest.raises(DistributedInferenceError, match="HTTP 503.*rank 1"):
             await engine.generate("hello")
     finally:
-        await engine._client.aclose()
+        await client.aclose()
+
+    assert stop_calls == []
+    assert engine._client is client
+    assert engine._loaded is True
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_backend_error_keeps_cluster_loaded():
+    engine = _ready_engine(
+        lambda _request: httpx.Response(503, json={"error": "rank 1 busy"})
+    )
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    try:
+        with pytest.raises(DistributedInferenceError, match="HTTP 503.*rank 1 busy"):
+            [output async for output in engine.stream_generate("hello")]
+    finally:
+        await client.aclose()
+
+    assert stop_calls == []
+    assert engine._client is client
+    assert engine._loaded is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["completion", "chat"])
+async def test_distributed_stream_early_eof_stops_every_rank(kind):
+    if kind == "chat":
+        event = {"choices": [{"delta": {"content": "one"}}]}
+    else:
+        event = {"choices": [{"text": "one", "finish_reason": None}]}
+
+    engine = _ready_engine(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\n",
+        )
+    )
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    stream = (
+        engine.stream_chat([{"role": "user", "content": "hello"}])
+        if kind == "chat"
+        else engine.stream_generate("hello")
+    )
+    with pytest.raises(DistributedInferenceError, match=r"ended before \[DONE\]"):
+        [output async for output in stream]
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["completion", "chat"])
+async def test_distributed_stream_done_without_terminal_event_stops_every_rank(kind):
+    engine = _ready_engine(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="data: [DONE]\n\n",
+        )
+    )
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    stream = (
+        engine.stream_chat([{"role": "user", "content": "hello"}])
+        if kind == "chat"
+        else engine.stream_generate("hello")
+    )
+    with pytest.raises(DistributedInferenceError, match="before a terminal event"):
+        [output async for output in stream]
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
@@ -808,23 +1173,34 @@ async def test_distributed_transport_error_surfaces_peer_failure_reason():
         )
 
     engine = _ready_engine(handler)
-    engine._supervisor.status = lambda: SimpleNamespace(
-        returncode=1,
-        failure_reason=(
-            "Studio stopped publishing its runtime heartbeat. "
-            "Check oMLX is running on that Mac."
-        ),
-        phase="failed",
-        stderr_tail=(),
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    statuses = iter(
+        (
+            SimpleNamespace(returncode=None, failure_reason=None, phase="ready"),
+            SimpleNamespace(
+                returncode=1,
+                failure_reason=(
+                    "Studio stopped publishing its runtime heartbeat. "
+                    "Check oMLX is running on that Mac."
+                ),
+                phase="failed",
+                stderr_tail=(),
+            ),
+        )
     )
-    try:
-        with pytest.raises(
-            DistributedInferenceError,
-            match="Studio stopped publishing its runtime heartbeat",
-        ):
-            await engine.generate("hello")
-    finally:
-        await engine._client.aclose()
+    engine._supervisor.status = lambda: next(statuses)
+    with pytest.raises(
+        DistributedInferenceError,
+        match="Studio stopped publishing its runtime heartbeat",
+    ):
+        await engine.generate("hello")
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
@@ -836,20 +1212,89 @@ async def test_distributed_transport_error_reports_bounded_launcher_exit():
         )
 
     engine = _ready_engine(handler)
-    engine._supervisor.status = lambda: SimpleNamespace(
-        returncode=1,
-        failure_reason=None,
-        phase="failed",
-        stderr_tail=("rank 1 out of memory",),
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    statuses = iter(
+        (
+            SimpleNamespace(returncode=None, failure_reason=None, phase="ready"),
+            SimpleNamespace(
+                returncode=1,
+                failure_reason=None,
+                phase="failed",
+                stderr_tail=("rank 1 out of memory",),
+            ),
+        )
     )
-    try:
-        with pytest.raises(
-            DistributedInferenceError,
-            match="exited with code 1.*rank 1 out of memory",
-        ):
-            await engine.generate("hello")
-    finally:
-        await engine._client.aclose()
+    engine._supervisor.status = lambda: next(statuses)
+    with pytest.raises(
+        DistributedInferenceError,
+        match="exited with code 1.*rank 1 out of memory",
+    ):
+        await engine.generate("hello")
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_transport_error_stops_every_rank():
+    def handler(request):
+        raise httpx.ConnectError("connection reset", request=request)
+
+    engine = _ready_engine(handler)
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+    engine._supervisor.status = lambda: SimpleNamespace(
+        returncode=None,
+        failure_reason=None,
+        phase="ready",
+        stderr_tail=(),
+    )
+
+    with pytest.raises(
+        DistributedInferenceError,
+        match="stream failed.*ConnectError",
+    ):
+        [output async for output in engine.stream_generate("hello")]
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_transport_diagnosis_still_stops_every_rank():
+    def handler(request):
+        raise httpx.ConnectError("connection reset", request=request)
+
+    engine = _ready_engine(handler)
+    client = engine._client
+    diagnosis_started = asyncio.Event()
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    async def blocked_diagnosis(_exc, *, stream):
+        assert stream is False
+        diagnosis_started.set()
+        await asyncio.Event().wait()
+
+    engine._transport_failure_error = blocked_diagnosis
+    task = asyncio.create_task(engine.generate("hello"))
+    await diagnosis_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
@@ -1173,6 +1618,9 @@ async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch)
     # The 200 commits before a streaming body runs, so preflight is the last
     # point a half-dead cluster can still become a clean HTTP error (#2708).
     engine = _ready_engine(lambda request: httpx.Response(200))
+    client = engine._client
+    stop_calls = []
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: stop_calls.append(True))
     monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
     monkeypatch.setattr(
         distributed,
@@ -1187,11 +1635,13 @@ async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch)
         "describe_failure",
         lambda health: "rank 1 (peer) stopped heartbeating",
     )
-    try:
-        with pytest.raises(DistributedInferenceError, match="not serving"):
-            await engine.preflight_chat([{"role": "user", "content": "hi"}])
-    finally:
-        await engine._client.aclose()
+    with pytest.raises(DistributedInferenceError, match="not serving"):
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
@@ -1217,23 +1667,30 @@ async def test_preflight_caches_the_peer_health_read(monkeypatch):
 @pytest.mark.asyncio
 async def test_preflight_rejects_a_reported_failure_without_probing(monkeypatch):
     engine = _ready_engine(lambda request: httpx.Response(200))
+    client = engine._client
+    stop_calls = []
+    monkeypatch.setattr(engine._supervisor, "stop", lambda: stop_calls.append(True))
     monkeypatch.setattr(
         engine._supervisor,
         "status",
         lambda: SimpleNamespace(
-            returncode=None, failure_reason="rank 1 connection closed"
+            returncode=None,
+            failure_reason="rank 1 connection closed",
+            stderr_tail=(),
         ),
     )
     probed = []
     monkeypatch.setattr(
         distributed, "check_peers", lambda *a, **k: probed.append(1) or ()
     )
-    try:
-        with pytest.raises(DistributedInferenceError, match="rank 1 connection"):
-            await engine.preflight_chat([{"role": "user", "content": "hi"}])
-        assert probed == []
-    finally:
-        await engine._client.aclose()
+    with pytest.raises(DistributedInferenceError, match="rank 1 connection"):
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+
+    assert probed == []
+    assert stop_calls == [True]
+    assert client.is_closed
+    assert engine._client is None
+    assert engine._loaded is False
 
 
 @pytest.mark.asyncio
