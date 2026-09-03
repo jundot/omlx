@@ -1437,12 +1437,12 @@ class TestSSDWriteBackSaturation:
             mgr.close()
 
     def test_cold_store_sustained_full_uses_inline_fallback(self, tmp_path):
-        """Site 2: save_block waits on a full queue before writing inline.
+        """Site 2: save_block polls a full queue before writing inline.
 
         Hot cache disabled. Even if ``full()`` reports saturation, the cold
-        path must still proceed to ``put(timeout=1.0)`` so transient writer
-        bursts get a chance to drain. Sustained ``queue.Full`` from the put
-        call should write inline and return success.
+        path must still poll ``put(timeout=0.05)`` so transient writer bursts
+        get a chance to drain and shutdown can interrupt admission. Sustained
+        ``queue.Full`` should write inline and return success.
         """
         import queue as _queue
         from unittest.mock import patch
@@ -1462,6 +1462,10 @@ class TestSSDWriteBackSaturation:
             with (
                 patch.object(mgr._write_queue, "full", return_value=True),
                 patch.object(mgr._write_queue, "put", side_effect=full_put),
+                patch(
+                    "omlx.cache.paged_ssd_cache.time.monotonic",
+                    side_effect=[0.0, 0.0, 0.05, 0.1, 1.0],
+                ),
             ):
                 cache_data = self._make_cache_data()
                 block_hash = b"cold_preflight_drop_00"
@@ -1474,7 +1478,7 @@ class TestSSDWriteBackSaturation:
                 )
                 assert ok is True
 
-            assert calls == [1.0]
+            assert calls == [0.05, 0.05]
             stats = mgr.get_stats()
             assert stats.ssd_write_drops == 0
             assert stats.ssd_inline_write_fallbacks == 1

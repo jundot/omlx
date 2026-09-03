@@ -14,6 +14,17 @@ from omlx.model_registry import (
 )
 
 
+def _dispatch_runs_fn(fn):
+    """Make a mock executor's ``submit`` execute the submitted callable.
+
+    ``_reset_owner`` routes deep_reset() through ``owner._mlx_executor.submit``
+    and then awaits ``future.result(timeout=...)``; this helper executes the
+    submitted callable synchronously so tests can observe it was called.
+    """
+    fn()
+    return MagicMock()
+
+
 class TestModelRegistry:
     """Tests for ModelRegistry class."""
 
@@ -82,6 +93,7 @@ class TestModelRegistry:
         model = MagicMock()
         engine1 = MagicMock()
         engine1.scheduler = MagicMock()
+        engine1._mlx_executor.submit.side_effect = _dispatch_runs_fn
         engine2 = MagicMock()
 
         # First engine acquires
@@ -90,8 +102,13 @@ class TestModelRegistry:
         # Second engine forces ownership
         registry.acquire(model, engine2, "engine-2", force=True)
 
-        # engine1 scheduler should have been reset
+        # engine1 scheduler should have been reset (via its MLX executor)
         engine1.scheduler.deep_reset.assert_called_once()
+        engine1._mlx_executor.submit.assert_called_once()
+        assert (
+            engine1._mlx_executor.submit.call_args.args[0]
+            is engine1.scheduler.deep_reset
+        )
 
         # engine2 should be owner now
         is_owned, owner_id = registry.is_owned(model)
@@ -214,6 +231,7 @@ class TestMultiEngine:
         for i in range(3):
             engine = MagicMock()
             engine.scheduler = MagicMock()
+            engine._mlx_executor.submit.side_effect = _dispatch_runs_fn
             engine_id = f"force-engine-{i}"
 
             result = registry.acquire(model, engine, engine_id, force=True)
@@ -267,6 +285,7 @@ class TestCacheRecovery:
         # First engine with scheduler
         engine1 = MagicMock()
         engine1.scheduler = MagicMock()
+        engine1._mlx_executor.submit.side_effect = _dispatch_runs_fn
 
         # Second engine
         engine2 = MagicMock()
@@ -274,34 +293,38 @@ class TestCacheRecovery:
         registry.acquire(model, engine1, "engine-1")
         registry.acquire(model, engine2, "engine-2", force=True)
 
-        # First engine's scheduler should have been reset
+        # First engine's scheduler should have been reset (via its executor)
         engine1.scheduler.deep_reset.assert_called_once()
 
         # Cleanup
         registry.release(model, "engine-2")
 
     def test_scheduler_reset_handles_missing_scheduler(self):
-        """Test that scheduler reset handles engine without scheduler."""
+        """A forced transfer must be aborted when the previous owner cannot be
+        reset via its MLX executor (no usable scheduler/executor routing)."""
         registry = get_registry()
         model = MagicMock()
 
-        # First engine without scheduler attribute
-        engine1 = MagicMock(spec=[])  # No scheduler attribute
+        # First engine with no scheduler attribute (spec restricts attrs)
+        engine1 = MagicMock(spec=[])  # No scheduler / no _mlx_executor
 
         # Second engine
         engine2 = MagicMock()
 
         registry.acquire(model, engine1, "engine-1")
 
-        # Should not raise even though engine1 has no scheduler
-        registry.acquire(model, engine2, "engine-2", force=True)
+        # Transfer must abort rather than register a new owner over an owner
+        # that could not be torn down.
+        with pytest.raises(ModelOwnershipError):
+            registry.acquire(model, engine2, "engine-2", force=True)
 
-        # Should have transferred ownership
+        # Ownership stays with the previous engine
         is_owned, owner = registry.is_owned(model)
-        assert owner == "engine-2"
+        assert is_owned is True
+        assert owner == "engine-1"
 
         # Cleanup
-        registry.release(model, "engine-2")
+        registry.release(model, "engine-1")
 
     def test_weak_ref_cleanup_on_gc(self):
         """Test that weak references are cleaned up on garbage collection."""
@@ -348,6 +371,7 @@ class TestModelRegistryEdgeCases:
         for i in range(5):
             engine = MagicMock()
             engine.scheduler = MagicMock()
+            engine._mlx_executor.submit.side_effect = _dispatch_runs_fn
             engines.append(engine)
 
             registry.acquire(model, engine, f"transfer-engine-{i}", force=True)

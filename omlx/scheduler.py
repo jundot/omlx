@@ -8527,21 +8527,38 @@ class Scheduler:
         else:
             logger.info("SpecPrefill: draft model set (no SSD cache)")
 
-    def _close_specprefill_draft_cache_manager(self) -> bool:
+    def _close_specprefill_draft_cache_manager(
+        self,
+        *,
+        deadline: float | None = None,
+        begin_shutdown: bool = True,
+    ) -> bool:
         manager = self._draft_paged_ssd_cache_manager
         if manager is None:
             return True
         try:
-            manager.close()
+            if deadline is None:
+                manager.close()
+            else:
+                if begin_shutdown:
+                    manager.begin_shutdown(deadline=deadline)
+                manager.close(deadline=deadline)
         except Exception as e:
             logger.warning("SpecPrefill draft SSD cache shutdown error: %s", e)
             return False
         writer_thread = getattr(manager, "_writer_thread", None)
         if writer_thread is not None and writer_thread.is_alive():
+            if deadline is None:
+                logger.warning(
+                    "SpecPrefill draft SSD cache writer remains active after shutdown"
+                )
+                return False
+            # Finite-deadline close leaves final state cleanup to the writer.
+            # Drop the scheduler reference so deep_reset() cannot reopen an
+            # unbounded close after the shared persistence budget expires.
             logger.warning(
-                "SpecPrefill draft SSD cache writer remains active after shutdown"
+                "SpecPrefill draft SSD cache writer is finishing deferred cleanup"
             )
-            return False
 
         self._draft_paged_ssd_cache_manager = None
         return True
@@ -12414,12 +12431,20 @@ class Scheduler:
         # re-issue below hard pressure (issue #2179).
         self._deferred_clear_at = None
 
-    def deep_reset(self) -> None:
+    def deep_reset(
+        self, *, persistence_deadline: float | None = None
+    ) -> None:
         """
         Deep reset that clears ALL cache state including model-level caches.
 
         This is more aggressive than reset() and should be used when
         switching engines or recovering from errors.
+
+        Args:
+            persistence_deadline: Optional absolute ``time.monotonic()``
+                deadline propagated to the specprefill draft SSD cache close so
+                a bounded teardown stays bounded. ``None`` retains the legacy
+                full-flush behavior for that cache.
         """
         # Standard reset first
         self.reset()
@@ -12447,7 +12472,9 @@ class Scheduler:
                 self._boundary_snapshot_store.shutdown()
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
-        self._close_specprefill_draft_cache_manager()
+        self._close_specprefill_draft_cache_manager(
+            deadline=persistence_deadline, begin_shutdown=False
+        )
         self.paged_cache_manager = None
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
@@ -12462,16 +12489,34 @@ class Scheduler:
 
         logger.info("Deep reset completed - all caches cleared")
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, persistence_deadline: float | None = None) -> None:
         """
         Graceful shutdown.
 
         Flushes hot cache to SSD and closes the background writer.
         paged SSD cache files are NOT cleared to allow reuse on reload.
+
+        Args:
+            persistence_deadline: Optional absolute ``time.monotonic()`` deadline
+                shared by store-worker quiescing and SSD close. ``None`` retains
+                full-flush behavior.
         """
         logger.info("Scheduler shutdown initiated...")
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)
+        persistence_budget_s = None
+        if persistence_deadline is not None:
+            persistence_budget_s = max(0.0, persistence_deadline - time.monotonic())
+        if self.paged_ssd_cache_manager is not None:
+            # Close admission before waiting: active store workers observe
+            # this signal and stop before extracting/queueing another block.
+            # A no-deadline caller still gets the legacy complete flush.
+            self.paged_ssd_cache_manager.begin_shutdown(deadline=persistence_deadline)
+        draft_paged_ssd_cache_manager = self._draft_paged_ssd_cache_manager
+        if draft_paged_ssd_cache_manager is not None:
+            draft_paged_ssd_cache_manager.begin_shutdown(
+                deadline=persistence_deadline
+            )
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
         # below before the executor is asked to shut down.
@@ -12486,13 +12531,21 @@ class Scheduler:
                         "Waiting for %d inflight async store_cache future(s)...",
                         len(inflight),
                     )
+                    wait_timeout = FATAL_TEARDOWN_TIMEOUT_S
+                    if persistence_deadline is not None:
+                        wait_timeout = max(0.0, persistence_deadline - time.monotonic())
                     _done, not_done = concurrent.futures.wait(
-                        inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+                        inflight, timeout=wait_timeout
                     )
                     if not_done:
+                        timeout_budget = (
+                            FATAL_TEARDOWN_TIMEOUT_S
+                            if persistence_budget_s is None
+                            else persistence_budget_s
+                        )
                         fatal_exit(
                             "Scheduler shutdown timed out after "
-                            f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for "
+                            f"{timeout_budget:g}s waiting for "
                             f"{len(not_done)} async store_cache future(s)"
                         )
                 self._drain_pending_async_removes()
@@ -12500,7 +12553,12 @@ class Scheduler:
                     clear_future = self._store_cache_executor.submit(
                         clear_thread_streams
                     )
-                    clear_future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+                    clear_timeout = FATAL_TEARDOWN_TIMEOUT_S
+                    if persistence_deadline is not None:
+                        clear_timeout = max(
+                            0.0, persistence_deadline - time.monotonic()
+                        )
+                    clear_future.result(timeout=clear_timeout)
                 except concurrent.futures.TimeoutError:
                     fatal_exit(
                         "Scheduler shutdown timed out after "
@@ -12536,11 +12594,17 @@ class Scheduler:
             except Exception as e:
                 logger.warning("Boundary snapshot store shutdown error: %s", e)
             self._boundary_snapshot_store = None
-        self._close_specprefill_draft_cache_manager()
+        self._close_specprefill_draft_cache_manager(
+            deadline=persistence_deadline,
+            begin_shutdown=False,
+        )
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
         if self.paged_ssd_cache_manager is not None:
-            self.paged_ssd_cache_manager.close()
+            if persistence_deadline is None:
+                self.paged_ssd_cache_manager.close()
+            else:
+                self.paged_ssd_cache_manager.close(deadline=persistence_deadline)
             self.paged_ssd_cache_manager = None
         # Release whatever the per-path unregisters did not reach, so nothing
         # survives this engine in the module-level row registry.

@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+_PENDING_WRITE_PUT_POLL_SECONDS = 0.05
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
@@ -160,6 +162,11 @@ _MAX_PENDING_WRITES = _compute_max_pending_writes()
 # subsequent saves drain the remainder; bounds per-call latency at the
 # cost of taking multiple saves to fully reconverge.
 _MAX_INLINE_UNLINKS_PER_SAVE = 32
+
+# Monotonic counter for unique `_write_block_file` temp filenames. Combined with
+# the PID, it guarantees two managers writing the same block hash never collide
+# on a deterministic `<stem>_tmp.safetensors` name.
+_TMP_COUNTER = itertools.count()
 
 
 # Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
@@ -1775,6 +1782,15 @@ class PagedSSDCacheManager(CacheManager):
         # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
         # _enqueue_ssd_write (holds _pending_write_hashes_lock).
         self._pending_write_buffers: dict[bytes, dict] = {}
+        # Separate write admission from writer-thread termination. Scheduler
+        # shutdown closes admission before waiting for active store workers;
+        # the writer remains alive until close() flushes already accepted data.
+        self._persistence_shutdown = threading.Event()
+        self._persistence_shutdown_lock = threading.Lock()
+        self._persistence_deadline: float | None = None
+        self._close_cleanup_lock = threading.Lock()
+        self._close_cleanup_requested = False
+        self._close_cleanup_done = False
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -1808,6 +1824,28 @@ class PagedSSDCacheManager(CacheManager):
         )
 
     # --- Hot cache helpers ---
+
+    @property
+    def accepting_writes(self) -> bool:
+        """Whether cache producers may submit new persistence work."""
+        return not self._persistence_shutdown.is_set()
+
+    def begin_shutdown(self, *, deadline: float | None = None) -> None:
+        """Stop accepting new writes while keeping the writer available to drain."""
+        # Publish the stop signal before waiting for an enqueue attempt that
+        # may currently hold the admission lock during its short queue poll.
+        # That producer then observes the event and rolls back on its next pass
+        # instead of repeatedly reacquiring the lock and starving shutdown.
+        # Publish a finite deadline before the stop signal so producers woken by
+        # the event cannot misclassify bounded teardown as a no-deadline flush.
+        if deadline is not None and (
+            self._persistence_deadline is None or deadline < self._persistence_deadline
+        ):
+            self._persistence_deadline = float(deadline)
+        self._persistence_shutdown.set()
+        # Wait for any current short queue-admission poll to release ownership.
+        with self._persistence_shutdown_lock:
+            pass
 
     @staticmethod
     def _hot_cache_entry_size(entry: dict) -> int:
@@ -1888,22 +1926,61 @@ class PagedSSDCacheManager(CacheManager):
         for evicted_hash, evicted in evicted_entries:
             self._handle_hot_cache_eviction(evicted_hash, evicted)
 
+    def _put_ssd_write_item(
+        self,
+        item: tuple,
+        *,
+        blocking: bool = False,
+        deadline: float | None = None,
+    ) -> str:
+        """Try to queue one write, returning queued, saturated, or stopped."""
+        queue_deadline = time.monotonic() + _PENDING_WRITE_PUT_TIMEOUT_SECONDS
+        while True:
+            try:
+                # Linearize admission with begin_shutdown(). The event itself
+                # is published before that method waits for this short poll.
+                with self._persistence_shutdown_lock:
+                    now = time.monotonic()
+                    if self._persistence_shutdown.is_set() and not blocking:
+                        return "stopped"
+                    queue_remaining = queue_deadline - now
+                    if queue_remaining <= 0:
+                        return "saturated"
+                    put_timeout = min(_PENDING_WRITE_PUT_POLL_SECONDS, queue_remaining)
+                    if deadline is not None:
+                        persistence_remaining = deadline - now
+                        if persistence_remaining <= 0:
+                            return "stopped"
+                        put_timeout = min(put_timeout, persistence_remaining)
+                    self._write_queue.put(item, timeout=put_timeout)
+            except queue.Full:
+                continue
+            return "queued"
+
     def _enqueue_ssd_write(
         self,
         block_hash: bytes,
         entry: dict,
         *,
         blocking: bool = False,
+        deadline: float | None = None,
     ) -> bool:
         """Enqueue a hot cache entry for SSD background write.
 
         Used when evicting from hot cache or flushing on shutdown.
         Adds block to SSD index before enqueueing write.
 
-        All callers wait briefly for queue space. If saturation persists, the
-        caller writes inline so dirty hot-cache blocks are never dropped just
-        because the background writer is behind.
+        All callers wait briefly for queue space. Without a shutdown deadline,
+        saturation falls back to an inline write so dirty blocks are not
+        dropped. Deadline teardown never starts unbounded inline I/O: it rolls
+        back provisional pending/index state and returns ``False``.
         """
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        if self._persistence_shutdown.is_set() and not blocking:
+            if self._persistence_deadline is None:
+                self._defer_ssd_write_until_close(block_hash, entry)
+            return False
         if self._hot_cache_only:
             return False
         if not entry.get("dirty", True):
@@ -1923,43 +2000,86 @@ class PagedSSDCacheManager(CacheManager):
         #    for a block that has no file and no buffer entry yet.
         with self._pending_write_hashes_lock:
             if block_hash in self._pending_write_buffers:
-                return True
-            self._pending_write_buffers[block_hash] = entry
+                if block_hash in self._pending_write_hashes:
+                    return True
+            else:
+                self._pending_write_buffers[block_hash] = entry
             self._pending_write_hashes.add(block_hash)
 
         # 2. Index second — makes the block discoverable in has_block/contains.
+        index_added = False
         if not self._index.contains(block_hash):
-            self._enforce_size_limit_for_new_block(blk_meta.file_size)
+            self._enforce_size_limit_for_new_block(
+                blk_meta.file_size,
+                deadline=deadline,
+            )
+            if deadline is not None and time.monotonic() >= deadline:
+                self._stats["ssd_write_drops"] += 1
+                logger.warning(
+                    "SSD persistence deadline reached during enqueue preparation; "
+                    "dropping block %s instead of writing inline",
+                    block_hash.hex()[:16],
+                )
+                self._clear_pending_write(block_hash)
+                return False
             self._incompatible_index.remove(block_hash)
             self._index.add(blk_meta)
+            index_added = True
 
-        # 3. Queue third — enqueue for background writer.
-        try:
-            item = (block_hash, tensors_raw, metadata, file_path)
-            # Non-blocking callers (hot-cache LRU spill) also wait so a
-            # transient writer backlog doesn't silently drop blocks. Blocking
-            # callers (shutdown flush) use the same bounded wait.
-            self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
+        item = (block_hash, tensors_raw, metadata, file_path)
+        queue_status = self._put_ssd_write_item(
+            item, blocking=blocking, deadline=deadline
+        )
+        if queue_status == "queued":
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
             )
             return True
-        except queue.Full:
-            self._stats["ssd_inline_write_fallbacks"] += 1
-            logger.warning(
-                f"SSD write queue saturated (cap={self._max_pending_writes}); "
-                f"writing evicted block {block_hash.hex()[:16]} inline"
+
+        if (
+            queue_status == "stopped"
+            and deadline is None
+            and self._persistence_deadline is None
+        ):
+            # A no-deadline shutdown promises a complete flush. Keep ownership
+            # of this already-admitted dirty entry, but mark it as not queued so
+            # close() can promote and submit it after active workers quiesce.
+            with self._pending_write_hashes_lock:
+                self._pending_write_hashes.discard(block_hash)
+                self._pending_write_buffers[block_hash] = entry
+            logger.debug(
+                "Deferred block %s for no-deadline shutdown flush",
+                block_hash.hex()[:16],
             )
-            ok = self._write_block_file(
-                block_hash,
-                tensors_raw,
-                metadata,
-                file_path,
-                source="inline-fallback",
+            return False
+
+        if queue_status == "stopped" or deadline is not None:
+            self._stats["ssd_write_drops"] += 1
+            logger.warning(
+                "SSD persistence shutdown/deadline reached; dropping block %s "
+                "instead of writing inline",
+                block_hash.hex()[:16],
             )
             self._clear_pending_write(block_hash)
-            return ok
+            if index_added:
+                self._index.remove(block_hash)
+            return False
+
+        self._stats["ssd_inline_write_fallbacks"] += 1
+        logger.warning(
+            f"SSD write queue saturated (cap={self._max_pending_writes}); "
+            f"writing evicted block {block_hash.hex()[:16]} inline"
+        )
+        ok = self._write_block_file(
+            block_hash,
+            tensors_raw,
+            metadata,
+            file_path,
+            source="inline-fallback",
+        )
+        self._clear_pending_write(block_hash)
+        return ok
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
         """Get entry from hot cache, updating LRU order. Returns None on miss."""
@@ -2989,7 +3109,13 @@ class PagedSSDCacheManager(CacheManager):
         temp_path = None
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            # Use a UNIQUE temp filename so two managers writing the same block
+            # hash (same final path) never collide on a deterministic
+            # ``<stem>_tmp.safetensors`` name. PID + monotonic counter keeps the
+            # rename atomic w.r.t. namespaces even across processes.
+            temp_path = file_path.with_name(
+                f"{file_path.stem}_tmp_{os.getpid()}_{next(_TMP_COUNTER)}"
+            )
             actual_size = _write_safetensors_no_mx(
                 str(temp_path), tensors_raw, metadata
             )
@@ -3047,11 +3173,21 @@ class PagedSSDCacheManager(CacheManager):
                 )
             self._stats["errors"] += 1
             self._index.remove(block_hash)
-            for p in (temp_path, file_path):
+            # Unlink ONLY the temp file we created. A rename failure means some
+            # other manager may already own/committed the FINAL ``file_path``;
+            # unlinking it here could silently destroy another manager's
+            # committed block. Only the success/eviction path above may touch
+            # the final path.
+            if temp_path is not None and isinstance(temp_path, Path) and temp_path.exists():
                 with contextlib.suppress(Exception):
-                    if p is not None and isinstance(p, Path) and p.exists():
-                        p.unlink()
+                    temp_path.unlink()
             return False
+
+    def _defer_ssd_write_until_close(self, block_hash: bytes, entry: dict) -> None:
+        """Retain an admitted dirty entry for a no-deadline close flush."""
+        with self._pending_write_hashes_lock:
+            if block_hash not in self._pending_write_hashes:
+                self._pending_write_buffers[block_hash] = entry
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -3071,6 +3207,13 @@ class PagedSSDCacheManager(CacheManager):
                 entry["dirty"] = False
 
     def _writer_loop(self) -> None:
+        """Run the writer and release deferred close state on thread exit."""
+        try:
+            self._run_writer_loop()
+        finally:
+            self._finalize_close_state()
+
+    def _run_writer_loop(self) -> None:
         """Background writer that drains the write queue.
 
         Runs in a dedicated daemon thread. Writes full safetensors files
@@ -3109,6 +3252,26 @@ class PagedSSDCacheManager(CacheManager):
                 # writer thread blocks waiting for more work.
                 item = None
                 block_hash = tensors_raw = metadata = file_path = None
+
+    def _request_close_cleanup(self) -> None:
+        """Allow the writer-exit path to release manager-owned buffers."""
+        with self._close_cleanup_lock:
+            self._close_cleanup_requested = True
+
+    def _finalize_close_state(self) -> None:
+        """Release close-owned state once no writer can access it."""
+        with self._close_cleanup_lock:
+            if not self._close_cleanup_requested or self._close_cleanup_done:
+                return
+            with self._hot_cache_lock:
+                self._hot_cache.clear()
+                self._hot_cache_total_bytes = 0
+            if self._hot_cache_budget is not None:
+                self._hot_cache_budget.forget_owner(self)
+            with self._pending_write_hashes_lock:
+                self._pending_write_buffers.clear()
+                self._pending_write_hashes.clear()
+            self._close_cleanup_done = True
 
     def save_block(
         self,
@@ -3149,6 +3312,8 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             True if enqueued successfully, False otherwise.
         """
+        if not self.accepting_writes:
+            return False
         if not HAS_MLX:
             logger.error("MLX not available, cannot save block")
             return False
@@ -3522,38 +3687,63 @@ class PagedSSDCacheManager(CacheManager):
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.add(block_hash)
 
-            # Enqueue full file write for background thread. Wait on Full so
-            # transient bursts (faster than the writer can drain) don't
-            # immediately punch holes in the cache chain.
-            try:
-                self._write_queue.put(
-                    (block_hash, tensors_raw, metadata, file_path),
-                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
-                )
-            except queue.Full:
-                self._stats["ssd_inline_write_fallbacks"] += 1
-                logger.warning(
-                    f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
-                    f"writing {block_hash.hex()[:16]} inline"
-                )
-                ok = self._write_block_file(
-                    block_hash,
-                    tensors_raw,
-                    metadata,
-                    file_path,
-                    source="inline-fallback",
-                )
-                self._clear_pending_write(block_hash, remove_hot_cache=True)
-                if not ok:
-                    return False
+            item = (block_hash, tensors_raw, metadata, file_path)
+            queue_status = self._put_ssd_write_item(item)
+            if queue_status == "queued":
                 self._stats["saves"] += 1
+                logger.debug(
+                    f"Enqueued block for SSD cache write: "
+                    f"{block_hash.hex()[:16]}..., "
+                    f"size={format_bytes(estimated_size)}"
+                )
                 return True
 
-            self._stats["saves"] += 1
-            logger.debug(
-                f"Enqueued block for SSD cache write: {block_hash.hex()[:16]}..., "
-                f"size={format_bytes(estimated_size)}"
+            if queue_status == "stopped" and self._persistence_deadline is None:
+                # A no-deadline shutdown promises a complete flush. This direct
+                # path stages data in _hot_cache even when the hot cache is
+                # disabled, so transfer that temporary entry into deferred
+                # pending ownership for close() to promote after workers quiesce.
+                with self._hot_cache_lock:
+                    deferred_entry = self._hot_cache.pop(block_hash, None)
+                    if deferred_entry is not None:
+                        with self._pending_write_hashes_lock:
+                            self._pending_write_hashes.discard(block_hash)
+                            self._pending_write_buffers[block_hash] = deferred_entry
+                if deferred_entry is not None:
+                    self._stats["saves"] += 1
+                    logger.debug(
+                        "Deferred direct block %s for no-deadline shutdown flush",
+                        block_hash.hex()[:16],
+                    )
+                    return True
+
+            if queue_status == "stopped":
+                self._stats["ssd_write_drops"] += 1
+                logger.warning(
+                    "SSD persistence shutdown reached; dropping block %s "
+                    "instead of writing inline",
+                    block_hash.hex()[:16],
+                )
+                self._clear_pending_write(block_hash, remove_hot_cache=True)
+                self._index.remove(block_hash)
+                return False
+
+            self._stats["ssd_inline_write_fallbacks"] += 1
+            logger.warning(
+                f"SSD cache write queue saturated (cap={self._max_pending_writes}); "
+                f"writing {block_hash.hex()[:16]} inline"
             )
+            ok = self._write_block_file(
+                block_hash,
+                tensors_raw,
+                metadata,
+                file_path,
+                source="inline-fallback",
+            )
+            self._clear_pending_write(block_hash, remove_hot_cache=True)
+            if not ok:
+                return False
+            self._stats["saves"] += 1
             return True
 
         except Exception as e:
@@ -4517,6 +4707,7 @@ class PagedSSDCacheManager(CacheManager):
         self,
         target_size: int,
         max_count: int | None = None,
+        deadline: float | None = None,
     ) -> list[tuple[Any, Any]]:
         """Remove globally oldest tracked main or sidecar files.
 
@@ -4529,6 +4720,8 @@ class PagedSSDCacheManager(CacheManager):
         evicted: list[tuple[Any, Any]] = []
 
         while self._tracked_ssd_size() > target_size:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             if max_count is not None and len(evicted) >= max_count:
                 break
 
@@ -4567,6 +4760,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         max_unlinks: int | None = None,
         unbounded: bool = False,
+        deadline: float | None = None,
     ) -> None:
         """Enforce size limit before adding a new block.
 
@@ -4576,6 +4770,8 @@ class PagedSSDCacheManager(CacheManager):
         actual size avoids cache oscillation around the configured limit.
         """
         effective_max = self._get_effective_max_size()
+        if deadline is not None and time.monotonic() >= deadline:
+            return
 
         # Warn when disk pressure shrinks effective limit well below configured
         # (throttled to once per 60s to avoid log spam)
@@ -4601,6 +4797,7 @@ class PagedSSDCacheManager(CacheManager):
             evicted = self._evict_tracked_until_size(
                 target_size,
                 max_count=max_count,
+                deadline=deadline,
             )
             # Inline unlinks on the calling thread. Eviction typically returns
             # a single entry per save because the tracked LRU walk stops as
@@ -4616,9 +4813,17 @@ class PagedSSDCacheManager(CacheManager):
             # entries in their indexes so subsequent saves drain the rest.
             # Bounds per-call latency at the cost of taking multiple saves
             # to fully reconverge.
+            unlinked = 0
             for source_index, metadata in evicted:
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Keep the remaining entries logically evicted. Restoring
+                    # them can race with a writer that observed the index miss
+                    # and unlinked its file, leaving stale indexed metadata.
+                    # Any untouched file is rediscovered by the next startup scan.
+                    break
                 self._unlink_evicted(metadata, source_index)
-            if max_count is not None and len(evicted) >= max_count:
+                unlinked += 1
+            if max_count is not None and unlinked >= max_count:
                 logger.debug(
                     f"Inline eviction capped at {max_count} entries; "
                     f"{self._tracked_ssd_size() - target_size} bytes remain "
@@ -4982,19 +5187,45 @@ class PagedSSDCacheManager(CacheManager):
                 **self._stats,
             }
 
-    def close(self) -> None:
-        """Close the SSD cache manager, flushing hot cache and pending writes."""
+    def close(self, *, deadline: float | None = None) -> None:
+        """Close the manager, using one absolute deadline for flush and join.
+
+        ``deadline=None`` preserves complete-flush behavior. When a deadline
+        expires while the writer is still alive, state owned by that daemon
+        thread is retained until the thread exits.
+        """
+        # Sticky finite deadline: if the caller passes None but a finite
+        # deadline was already installed (e.g. by an earlier begin_shutdown /
+        # close during this teardown), reuse it so no later call runs
+        # unbounded teardown.
+        effective = deadline if deadline is not None else self._persistence_deadline
+        self.begin_shutdown(deadline=effective)
+        shutdown_deadline = self._persistence_deadline if effective is not None else None
         logger.info("Shutting down PagedSSDCacheManager...")
 
         # Flush hot cache entries to SSD before shutdown.
-        # Dirty blocks wait for queue space first; sustained saturation falls
-        # back to an inline write on this thread.
+        # Dirty blocks wait for queue space first. Only no-deadline close falls
+        # back to an inline write on sustained saturation.
+        entries_to_flush: dict[bytes, dict] = {}
         if self._hot_cache_enabled:
             with self._hot_cache_lock:
-                entries_to_flush = list(self._hot_cache.items())
+                entries_to_flush.update(self._hot_cache)
+        with self._pending_write_hashes_lock:
+            for block_hash, entry in self._pending_write_buffers.items():
+                if block_hash not in self._pending_write_hashes:
+                    entries_to_flush.setdefault(block_hash, entry)
+
+        if entries_to_flush:
+            flush_items = list(entries_to_flush.items())
             flushed = 0
             failed = 0
-            for block_hash, entry in entries_to_flush:
+            for block_hash, entry in flush_items:
+                if (
+                    shutdown_deadline is not None
+                    and time.monotonic() >= shutdown_deadline
+                ):
+                    failed += len(entries_to_flush) - flushed - failed
+                    break
                 if self._writer_thread and not self._writer_thread.is_alive():
                     logger.warning(
                         "Writer thread died during shutdown flush, "
@@ -5007,7 +5238,12 @@ class PagedSSDCacheManager(CacheManager):
                     continue
                 if blk_meta and blk_meta.file_path.exists():
                     continue
-                if self._enqueue_ssd_write(block_hash, entry, blocking=True):
+                if self._enqueue_ssd_write(
+                    block_hash,
+                    entry,
+                    blocking=True,
+                    deadline=shutdown_deadline,
+                ):
                     flushed += 1
                 else:
                     failed += 1
@@ -5016,7 +5252,9 @@ class PagedSSDCacheManager(CacheManager):
             if failed:
                 logger.warning(f"Failed to flush {failed} hot cache blocks")
 
-        # Signal writer thread to stop (after processing remaining queue)
+        # Signal the writer only after making its finally path responsible for
+        # releasing retained state. This closes the exit-before-handoff race.
+        self._request_close_cleanup()
         if self._writer_thread:
             self._writer_shutdown.set()
 
@@ -5028,21 +5266,23 @@ class PagedSSDCacheManager(CacheManager):
 
             # Wait for writer to finish — longer timeout to allow flush
             timeout = 120 if self._hot_cache_enabled else 60
+            if shutdown_deadline is not None:
+                timeout = max(0.0, shutdown_deadline - time.monotonic())
             self._writer_thread.join(timeout=timeout)
             if self._writer_thread.is_alive():
                 logger.warning(
                     f"SSD cache writer thread did not stop within {timeout}s"
                 )
 
-        # Clear hot cache and pending write buffer
-        with self._hot_cache_lock:
-            self._hot_cache.clear()
-            self._hot_cache_total_bytes = 0
-        if self._hot_cache_budget is not None:
-            self._hot_cache_budget.forget_owner(self)
-        with self._pending_write_hashes_lock:
-            self._pending_write_buffers.clear()
-            self._pending_write_hashes.clear()
+        writer_alive = (
+            self._writer_thread is not None and self._writer_thread.is_alive()
+        )
+        if writer_alive:
+            # Buffers remain reachable and budgeted while the writer owns them;
+            # _writer_loop() releases them in its finally path.
+            logger.warning("SSD cache close cleanup deferred until writer exit")
+        else:
+            self._finalize_close_state()
 
         logger.debug("PagedSSDCacheManager closed")
 

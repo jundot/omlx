@@ -14,6 +14,8 @@ Note: Uses pytest-asyncio for async tests.
 
 import asyncio
 import concurrent.futures
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -673,6 +675,151 @@ class TestEngineCoreClose:
 
             future.result.assert_called_once_with(timeout=60.0)
             assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
+
+    def test_close_fatal_exits_when_executor_rejects_submission(
+        self, mock_model, mock_tokenizer
+    ):
+        """A rejecting MLX executor means teardown could not be dispatched.
+
+        Regression for the old behavior that only logged a warning and carried
+        on, reporting the engine closed even though neither shutdown() nor
+        deep_reset() ran on the executor stream.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            executor = MagicMock()
+            executor.submit.side_effect = RuntimeError("executor shutting down")
+            engine._mlx_executor = executor
+
+            with (
+                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
+                pytest.raises(SystemExit),
+            ):
+                engine.close()
+
+            fatal.assert_called_once()
+            assert "could not dispatch" in fatal.call_args.args[0]
+
+    def test_close_fatal_exits_when_ssd_writer_survives(
+        self, mock_model, mock_tokenizer
+    ):
+        """A surviving SSD cache writer must not be reported as clean teardown.
+
+        A replacement manager (e.g. a new engine opening the same cache dir)
+        would corrupt committed blocks while the old writer drains, so close()
+        must terminate rather than drop the manager reference.
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            scheduler = engine.scheduler
+            assert scheduler is not None
+            manager = MagicMock()
+            writer_thread = MagicMock()
+            writer_thread.is_alive.return_value = True
+            manager._writer_thread = writer_thread
+            scheduler.paged_ssd_cache_manager = manager
+
+            def shutdown(*, persistence_deadline=None):
+                pass
+
+            def deep_reset(*, persistence_deadline=None):
+                pass
+
+            scheduler.shutdown = shutdown
+            scheduler.deep_reset = deep_reset
+
+            with (
+                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
+                pytest.raises(SystemExit),
+            ):
+                engine.close()
+
+            manager.close.assert_called_once()
+            fatal.assert_called_once()
+            assert "writer thread survived close" in fatal.call_args.args[0]
+
+    def test_close_runs_shutdown_and_deep_reset_on_mlx_executor_with_budget(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler cleanup stays on the MLX worker and receives its SSD budget."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            caller_thread = threading.get_ident()
+            seen: dict[str, int | float | None] = {}
+            scheduler = engine.scheduler
+            assert scheduler is not None
+
+            def shutdown(*, persistence_deadline=None):
+                seen["shutdown_thread"] = threading.get_ident()
+                seen["persistence_deadline"] = persistence_deadline
+                time.sleep(0.01)
+                seen["shutdown_completed"] = 1
+
+            def deep_reset(*, persistence_deadline=None):
+                seen["deep_reset_thread"] = threading.get_ident()
+
+            scheduler.shutdown = shutdown
+            scheduler.deep_reset = deep_reset
+            engine.close()
+
+        assert seen["shutdown_thread"] != caller_thread
+        assert seen["shutdown_thread"] == seen["deep_reset_thread"]
+        deadline = seen["persistence_deadline"]
+        assert isinstance(deadline, float)
+        assert 0 < deadline - time.monotonic() <= 60.0
+        assert seen["shutdown_completed"] == 1
+
+    def test_close_does_not_retry_worker_runtime_error_on_caller_thread(
+        self, mock_model, mock_tokenizer
+    ):
+        """Worker exceptions must not rerun scheduler teardown off its executor."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            scheduler = engine.scheduler
+            assert scheduler is not None
+            caller_thread = threading.get_ident()
+            shutdown_threads: list[int] = []
+
+            def failing_shutdown(*, persistence_deadline=None):
+                shutdown_threads.append(threading.get_ident())
+                raise RuntimeError("worker teardown failure")
+
+            scheduler.shutdown = failing_shutdown
+            scheduler.deep_reset = MagicMock()
+            engine.close()
+
+        assert len(shutdown_threads) == 1
+        assert shutdown_threads[0] != caller_thread
+
+    def test_close_fallback_reuses_scheduler_persistence_deadline(
+        self, mock_model, mock_tokenizer
+    ):
+        """A failed Scheduler shutdown must not reopen unbounded SSD flushing."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            scheduler = engine.scheduler
+            assert scheduler is not None
+            manager = MagicMock()
+            manager._writer_thread = None
+            scheduler.paged_ssd_cache_manager = manager
+            shutdown_kwargs: dict[str, float] = {}
+
+            def failing_shutdown(**kwargs):
+                shutdown_kwargs.update(kwargs)
+                raise RuntimeError("shutdown failed after starting SSD teardown")
+
+            scheduler.shutdown = failing_shutdown
+            scheduler.deep_reset = MagicMock()
+            engine.close()
+
+        assert set(shutdown_kwargs) == {"persistence_deadline"}
+        deadline = shutdown_kwargs["persistence_deadline"]
+        manager.close.assert_called_once_with(deadline=deadline)
 
 
 class TestEngineCoreGetCacheStats:
@@ -1525,6 +1672,7 @@ class TestEngineCoreCloseReleasesSSDManager:
 
             scheduler = engine.scheduler
             manager = MagicMock()
+            manager._writer_thread = None
             scheduler.paged_ssd_cache_manager = manager
             scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
 
@@ -1533,23 +1681,35 @@ class TestEngineCoreCloseReleasesSSDManager:
             manager.close.assert_called_once()
             assert scheduler.paged_ssd_cache_manager is None
 
-    def test_manager_closed_when_executor_fallback_raises(
+    def test_manager_fatal_exits_when_executor_rejects_submission(
         self, mock_model, mock_tokenizer
     ):
+        """A shut-down MLX executor rejects submission; teardown cannot be
+        dispatched off the close thread, so close() is fatal.
+
+        This replaced the old fallback that logged a warning and continued:
+        under that behavior the executor fallback path relied on a live
+        executor, which a shut-down executor cannot provide.
+        """
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
 
             scheduler = engine.scheduler
             manager = MagicMock()
+            manager._writer_thread = None
             scheduler.paged_ssd_cache_manager = manager
             scheduler.shutdown = MagicMock(side_effect=ValueError("boom"))
             engine._mlx_executor.shutdown(wait=True)
 
-            engine.close()  # must not raise
+            with (
+                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
+                pytest.raises(SystemExit),
+            ):
+                engine.close()
 
-            manager.close.assert_called_once()
-            assert scheduler.paged_ssd_cache_manager is None
+            fatal.assert_called_once()
+            assert "could not dispatch" in fatal.call_args.args[0]
 
     def test_manager_closed_on_normal_close(self, mock_model, mock_tokenizer):
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -1558,6 +1718,7 @@ class TestEngineCoreCloseReleasesSSDManager:
 
             scheduler = engine.scheduler
             manager = MagicMock()
+            manager._writer_thread = None
             scheduler.paged_ssd_cache_manager = manager
 
             engine.close()
