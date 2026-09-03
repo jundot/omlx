@@ -56,6 +56,111 @@ from . import prompt_priming
 
 logger = logging.getLogger(__name__)
 
+# Compact proposal vocabulary (challenge 7b33621). The draft lm_head readout
+# is narrowed from the full 248,320 rows to the 98,304 token-prefix rows plus
+# Qwen's text/control tokens 248,044…248,069 (98330 real rows; the Swift pads
+# to 98336 for its qmv N % 8 shape): ~60% less lm_head output work per draft
+# step. Draft-only — the target decides every emitted token.
+_COMPACT_PREFIX_ROWS = 98304
+_COMPACT_CTRL_START = 248044
+_COMPACT_CTRL_END = 248070
+_COMPACT_DRAFT_ENV = "OMLX_QWEN_COMPACT_DRAFT"
+
+
+def _compact_draft_enabled() -> bool:
+    import os
+
+    return os.environ.get(_COMPACT_DRAFT_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+_KV_ONLY_HISTORY_ENV = "OMLX_QWEN_KV_ONLY_HISTORY"
+
+
+_FUSED_PROJ_ENV = "OMLX_QWEN_FUSED_PROJ"
+
+
+def _fused_proj_enabled() -> bool:
+    """Default on (challenge 45c257f1). ``OMLX_QWEN_FUSED_PROJ=0`` restores
+    the separate projection launches (the ablation seam)."""
+    import os
+
+    return os.environ.get(_FUSED_PROJ_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _try_build_fused_in_proj(gdn: Any) -> tuple | None:
+    """Concatenate the GDN input projections (qkv, z, b, a) on the output
+    axis for one affine quantized matmul. Rows are independent, so this is
+    bit-exact with four separate launches. Returns None when any projection
+    is unquantized or the quantizations mismatch."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    ps = [
+        getattr(gdn, "in_proj_qkv", None),
+        getattr(gdn, "in_proj_z", None),
+        getattr(gdn, "in_proj_b", None),
+        getattr(gdn, "in_proj_a", None),
+    ]
+    if not all(isinstance(p, nn.QuantizedLinear) for p in ps):
+        return None
+    gs = ps[0].group_size
+    bits = ps[0].bits
+    if not all(p.group_size == gs and p.bits == bits for p in ps):
+        return None
+    if any(p.biases is None for p in ps):
+        return None
+    w = mx.concatenate([p.weight for p in ps], axis=0)
+    s = mx.concatenate([p.scales for p in ps], axis=0)
+    z = mx.concatenate([p.biases for p in ps], axis=0)
+    outs = [p.weight.shape[0] for p in ps]
+    return (w, s, z, gs, bits, outs[0], outs[1], outs[2])
+
+
+def _try_build_fused_gate_up(mlp: Any) -> tuple | None:
+    """Concatenate the SwiGLU gate/up projections on the output axis for one
+    affine quantized matmul (challenge 45c257f1). Returns None when either
+    projection is unquantized or the quantizations mismatch."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    g = getattr(mlp, "gate_proj", None)
+    u = getattr(mlp, "up_proj", None)
+    if not isinstance(g, nn.QuantizedLinear) or not isinstance(u, nn.QuantizedLinear):
+        return None
+    if g.group_size != u.group_size or g.bits != u.bits:
+        return None
+    if g.biases is None or u.biases is None:
+        return None
+    w = mx.concatenate([g.weight, u.weight], axis=0)
+    s = mx.concatenate([g.scales, u.scales], axis=0)
+    z = mx.concatenate([g.biases, u.biases], axis=0)
+    return (w, s, z, g.group_size, g.bits, g.weight.shape[0])
+
+
+def _kv_only_history_enabled() -> bool:
+    """Opt-in (challenge a3104b04). Token-exact but measured neutral on
+    M4 Max (87.30 vs 87.43 ms/tok, 128-tok MTP) — per the port bar a
+    neutral optimization ships opt-in, not default-on. Set to 1 to enable the
+    K/V-only committed-history head flush."""
+    import os
+
+    return os.environ.get(_KV_ONLY_HISTORY_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` is the function we previously installed.
 
@@ -101,10 +206,243 @@ def apply() -> bool:
     _patch_outer_model(q35)
     _patch_qwen3_5_moe()
 
+    _patch_attention_packed_qkv(q35)
+    _patch_mlp_gate_up_fusion(q35)
+    _patch_gdn_compiled_fusions(q35)
+
     if not hasattr(q35.TextModel, "_omlx_mtp_patched"):
         q35.TextModel._omlx_mtp_patched = "patch"
         logger.info("Qwen3.5/3.6 MTP model patch applied (PR 990)")
     return True
+
+
+def _patch_mlp_gate_up_fusion(q35: Any) -> None:
+    """Replace ``Qwen3NextMLP.__call__`` with a packed gate/up body
+    (challenge 45c257f1). The two SwiGLU projections run as ONE affine
+    matmul over concat-on-N rows — rows are independent, so it is bit-exact
+    with the separate launches; the concat is built lazily from the attached
+    quantized linears and cached on the instance. Unquantized (bf16 MTP head)
+    or mismatched projections fall back."""
+    cls = q35.MLP
+    if _is_our_method(cls, "__call__", "_omlx_mlp_fused_marker"):
+        return
+
+    import mlx.core as mx
+
+    def __call__(self, x):
+        pack = getattr(self, "_omlx_fused_gate_up", None)
+        if pack is None:
+            if (
+                getattr(self, "_omlx_qwen35_scope", False)
+                and _fused_proj_enabled()
+            ):
+                pack = _try_build_fused_gate_up(self)
+            if pack is None:
+                pack = False
+            self._omlx_fused_gate_up = pack
+        if pack is False:
+            return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        w, s, z, gs, bits, gate_out = pack
+        y = mx.quantized_matmul(
+            x, w, s, z, transpose=True, group_size=gs, bits=bits
+        )
+        gate = y[..., :gate_out]
+        up = y[..., gate_out:]
+        return self.down_proj(swiglu(gate, up))
+
+    from mlx_lm.models.qwen3_next import swiglu
+
+    __call__._omlx_mlp_fused_marker = True
+    cls.__call__ = __call__
+
+
+# ---------------------------------------------------------------------------
+# GatedDeltaNet — compiled post-norm SiLU product (challenge 6cb6c963).
+# ---------------------------------------------------------------------------
+_COMPILED_FUSIONS_ENV = "OMLX_QWEN_COMPILED_FUSIONS"
+
+
+def _compiled_fusions_enabled() -> bool:
+    """Opt-in (challenge 6cb6c963). The Swift fuses the fp32 g+beta producer
+    and the post-norm SiLU product into compiled Metal passes. In Python,
+    mlx-lm's ``compute_g`` is already compiled (shapeless); the two-output
+    g+beta fusion is NOT ported — the laguna C1 finding shows two-output
+    compiled functions consuming a shared intermediate can diverge from eager
+    at ULP in MLX 0.32, and beta feeds the verify recurrence where fidelity is
+    absolute. The single-output post-norm SiLU product is safe (C1: single-
+    output compiled fusions are bit-exact) and is offered opt-in here; it
+    measured marginal on M4 Max."""
+    import os
+
+    return os.environ.get(_COMPILED_FUSIONS_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _patch_gdn_compiled_fusions(q35: Any) -> None:
+    """Optionally route the GDN post-norm SiLU product through a compiled
+    single-output function. Behavior is identical to eager unless
+    ``OMLX_QWEN_COMPILED_FUSIONS=1``."""
+    try:
+        from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated, _precise_swiglu
+    except ImportError:
+        return
+    if getattr(Qwen3NextRMSNormGated, "_omlx_compiled_swiglu_patched", False):
+        return
+
+    import mlx.core as mx
+
+    compiled_swiglu = mx.compile(
+        lambda h, gate, x: _precise_swiglu(h, gate, x)
+    )
+
+    def __call__(self, hidden_states, gate=None):
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+        if gate is not None:
+            if _compiled_fusions_enabled():
+                return compiled_swiglu(hidden_states, gate, x)
+            return _precise_swiglu(hidden_states, gate, x)
+        return x.astype(hidden_states.dtype)
+
+    Qwen3NextRMSNormGated.__call__ = __call__
+    Qwen3NextRMSNormGated._omlx_compiled_swiglu_patched = True
+
+_PACKED_QKV_ENV = "OMLX_QWEN_PACKED_QKV"
+
+
+def _packed_qkv_enabled() -> bool:
+    """Default on; ``OMLX_QWEN_PACKED_QKV=0`` restores the exact
+    pre-change three-projection path (the ablation seam)."""
+    import os
+
+    return os.environ.get(_PACKED_QKV_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _try_build_packed_qkv(attn: Any) -> Optional[tuple]:
+    """One affine quantized GEMM for Q+gate/K/V by concatenating the already
+    packed weights on the output axis. Rows are independent, so the single
+    matmul is bit-exact with three separate quantized_matmul calls; an
+    unquantized projection (bf16 MTP head) or mismatched quantization falls
+    back to None and the stock path stays."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    q = getattr(attn, "q_proj", None)
+    k = getattr(attn, "k_proj", None)
+    v = getattr(attn, "v_proj", None)
+    if not all(isinstance(p, nn.QuantizedLinear) for p in (q, k, v)):
+        return None
+    gs = q.group_size
+    bits = q.bits
+    if not (k.group_size == gs and v.group_size == gs):
+        return None
+    if not (k.bits == bits and v.bits == bits):
+        return None
+    if q.biases is None or k.biases is None or v.biases is None:
+        return None
+    w = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+    s = mx.concatenate([q.scales, k.scales, v.scales], axis=0)
+    z = mx.concatenate([q.biases, k.biases, v.biases], axis=0)
+    return (w, s, z, gs, bits, q.weight.shape[0], k.weight.shape[0])
+
+
+def _patch_attention_packed_qkv(q35: Any) -> None:
+    """Replace ``Qwen3NextAttention.__call__`` with a packed-Q/K/V body.
+
+    Engages only for instances tagged ``_omlx_qwen35_scope`` (qwen3_5
+    DecoderLayer marks its full-attention sublayer) whose q/k/v projections
+    are all compatible QuantizedLinear; every other instance keeps the stock
+    three-projection path byte-for-byte.
+    """
+    cls = q35.Attention
+    if _is_our_method(cls, "__call__", "_omlx_packed_qkv_marker"):
+        return
+
+    import mlx.core as mx
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    def __call__(self, x, mask=None, cache=None):
+        pack = getattr(self, "_omlx_packed_qkv", None)
+        if pack is None:
+            if getattr(self, "_omlx_qwen35_scope", False) and _packed_qkv_enabled():
+                pack = _try_build_packed_qkv(self)
+            if pack is None:
+                pack = False
+            self._omlx_packed_qkv = pack
+
+        B, L, _ = x.shape
+        if pack is False:
+            q_proj_output = self.q_proj(x)
+            keys_in = self.k_proj(x)
+            values_in = self.v_proj(x)
+        else:
+            w, s, z, gs, bits, q_out, k_out = pack
+            y = mx.quantized_matmul(
+                x, w, s, z, transpose=True, group_size=gs, bits=bits
+            )
+            q_proj_output = y[..., :q_out]
+            keys_in = y[..., q_out : q_out + k_out]
+            values_in = y[..., q_out + k_out :]
+
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
+        keys = keys_in
+        values = values_in
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
+
+    __call__._omlx_packed_qkv_marker = True
+    cls.__call__ = __call__
+
+    def append_history_kv(self, x, cache=None):
+        """Append rows to the attention cache without producing a query
+        output (challenge a3104b04 — MTP-head committed-history flush).
+        The target never uses this proposal-head maintenance primitive."""
+        B, L, _ = x.shape
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        if cache is not None:
+            keys = self.rope(keys, offset=cache.offset)
+        else:
+            keys = self.rope(keys)
+        if cache is not None:
+            cache.update_and_fetch(keys=keys, values=values)
+        return keys, values
+
+    cls.append_history_kv = append_history_kv
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +520,12 @@ def _register_mtp_classes(q35: Any) -> None:
             h = x + r
             return h + self.mlp(self.post_attention_layernorm(h))
 
+        def append_history_kv(self, x, cache=None):
+            """Populate this layer's K/V history without computing a dead
+            layer output (challenge a3104b04). Only valid when no later MTP
+            layer consumes that output — the single-layer head guarantees it."""
+            self.self_attn.append_history_kv(self.input_layernorm(x), cache)
+
     class MTPModule(nn.Module):
         """Multi-Token Prediction head from PR #990.
 
@@ -218,6 +562,40 @@ def _register_mtp_classes(q35: Any) -> None:
 
             return self.norm(fused)
 
+        def mtp_last_hidden_kv_only(
+            self, hidden_states, next_token_ids, embed_tokens, cache=None
+        ):
+            """Run one proposal flush while omitting leading-row outputs that
+            have no consumer (challenge a3104b04). Every supplied row still
+            participates in the fusion stage and contributes K/V state; only
+            the final row needs a full decoder output. Multi-layer heads fail
+            closed (None) before mutating cache state."""
+            layers = self.layers
+            if (
+                len(layers) != 1
+                or cache is None
+                or len(cache) != 1
+                or hidden_states.shape[1] <= 1
+                or next_token_ids.shape[1] != hidden_states.shape[1]
+            ):
+                return None
+
+            embeds = embed_tokens(next_token_ids)
+            e = self.pre_fc_norm_embedding(embeds)
+            h = self.pre_fc_norm_hidden(hidden_states)
+            fused = self.fc(mx.concatenate([e, h], axis=-1))
+            history_count = fused.shape[1] - 1
+
+            layer = layers[0]
+            c = cache[0]
+            layer.append_history_kv(
+                fused[:, :history_count], cache=c
+            )
+
+            current = fused[:, history_count:]
+            mask = create_attention_mask(current, c)
+            return self.norm(layer(current, mask=mask, cache=c))
+
     q35.MTPDecoderLayer = MTPDecoderLayer
     q35.MTPModule = MTPModule
 
@@ -234,6 +612,11 @@ def _patch_gated_delta_net(q35: Any) -> None:
     the same helper can run on the prefix (n_confirmed tokens) and the
     suffix (draft tokens) separately, snapshotting the SSM/conv state in
     between for rollback on draft rejection.
+
+    ``_fused_in_proj`` (challenge 45c257f1) packs the four input projections
+    (qkv, z, b, a) into one concat-on-N affine matmul — rows are independent,
+    so it is bit-exact with the separate launches; unquantized (bf16 head)
+    or mismatched projections fall back.
     """
     cls = q35.GatedDeltaNet
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
@@ -252,6 +635,27 @@ def _patch_gated_delta_net(q35: Any) -> None:
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
     from mlx_lm.models.gated_delta import gated_delta_update
+
+    def _fused_in_proj(self, inputs):
+        """One affine quantized matmul for qkv+z+b+a, sliced back."""
+        pack = getattr(self, "_omlx_fused_in_proj", None)
+        if pack is None:
+            if _fused_proj_enabled():
+                pack = _try_build_fused_in_proj(self)
+            if pack is None:
+                pack = False
+            self._omlx_fused_in_proj = pack
+        if pack is False:
+            return None
+        w, s, z, gs, bits, qkv_out, z_out, b_out = pack
+        y = mx.quantized_matmul(
+            inputs, w, s, z, transpose=True, group_size=gs, bits=bits
+        )
+        qkv = y[..., :qkv_out]
+        z = y[..., qkv_out : qkv_out + z_out]
+        b = y[..., qkv_out + z_out : qkv_out + z_out + b_out]
+        a = y[..., qkv_out + z_out + b_out :]
+        return qkv, z, b, a
 
     def _process_chunk(
         self,
@@ -312,10 +716,19 @@ def _patch_gated_delta_net(q35: Any) -> None:
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        # Fused qkv+z+b+a input projection (challenge 45c257f1): one affine
+        # matmul over concat-on-N rows, bit-exact with the separate launches.
+        fused = self._fused_in_proj(inputs)
+        if fused is None:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(
+                B, S, self.num_v_heads, self.head_v_dim
+            )
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
+        else:
+            qkv, z, b, a = fused
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -365,6 +778,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
         return out
 
     cls._process_chunk = _process_chunk
+    cls._fused_in_proj = _fused_in_proj
     __call__._omlx_mtp_call_marker = True
     if dflash_base is not None:
         # Compose with the armed dflash guard instead of replacing it
@@ -382,6 +796,25 @@ def _patch_decoder_layer(q35: Any) -> None:
     cls = q35.DecoderLayer
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
+
+    if not getattr(cls, "_omlx_mtp_init_wrapped", False):
+        original_init = cls.__init__
+
+        def __init__(self, args, layer_idx):
+            original_init(self, args, layer_idx)
+            # Mark full-attention sublayers built inside the qwen3_5 decoder
+            # so the packed-Q/K/V attention path (challenge 088f763b) engages
+            # only for this model family, never for qwen3_next models that
+            # share the Qwen3NextAttention class.
+            sa = getattr(self, "self_attn", None)
+            if sa is not None:
+                sa._omlx_qwen35_scope = True
+            mlp = getattr(self, "mlp", None)
+            if mlp is not None:
+                mlp._omlx_qwen35_scope = True
+
+        cls.__init__ = __init__
+        cls._omlx_mtp_init_wrapped = True
 
     def __call__(self, x, mask=None, cache=None, n_confirmed: int = 0):
         if self.is_linear:
@@ -531,6 +964,8 @@ def _patch_text_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        draft_mode: bool = False,
+        kv_only_history: bool = False,
     ):
         """MTP-head forward.
 
@@ -540,7 +975,42 @@ def _patch_text_model(q35: Any) -> None:
         (0 = all): the depth-k history+draft fold only needs logits at the
         final position, and the vocab is large enough (~250k) that skipping
         the other rows matters.
+
+        ``draft_mode`` (challenge 7b33621) narrows the proposal lm_head to
+        the compact draft vocabulary — the 98,304 token-prefix rows plus
+        Qwen's control tokens 248,044…248,069 — instead of the full
+        248,320-row projection. Draft ids drawn from the compact readout are
+        mapped back to the tokenizer's id space by ``map_draft_token_ids``
+        before they reach the verify block. Only the PROPOSAL side changes —
+        the target decides every emitted token, so token fidelity is
+        untouched.
+
+        ``kv_only_history`` (challenge a3104b04) runs a committed-history
+        flush so leading rows only append K/V state (their decoder outputs
+        are dead); the final row runs the full layer and its post-norm hidden
+        is returned. Falls back to the full forward when the head is
+        multi-layer or the flush is a single row.
         """
+        if kv_only_history and _kv_only_history_enabled():
+            mtp_out = self.mtp.mtp_last_hidden_kv_only(
+                hidden_states,
+                next_token_ids,
+                self.model.embed_tokens,
+                mtp_cache,
+            )
+            if mtp_out is not None:
+                logits_source = mtp_out
+                if logits_keep and logits_source.shape[1] > logits_keep:
+                    logits_source = logits_source[:, -logits_keep:, :]
+                if draft_mode and self._omlx_compact_draft_active():
+                    logits = self._compact_draft_logits(logits_source)
+                elif self.args.tie_word_embeddings:
+                    logits = self.model.embed_tokens.as_linear(logits_source)
+                else:
+                    logits = self.lm_head(logits_source)
+                if return_hidden:
+                    return logits, mtp_out
+                return logits
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -550,13 +1020,95 @@ def _patch_text_model(q35: Any) -> None:
         logits_source = mtp_out
         if logits_keep and logits_source.shape[1] > logits_keep:
             logits_source = logits_source[:, -logits_keep:, :]
-        if self.args.tie_word_embeddings:
+        if draft_mode and self._omlx_compact_draft_active():
+            logits = self._compact_draft_logits(logits_source)
+        elif self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(logits_source)
         else:
             logits = self.lm_head(logits_source)
         if return_hidden:
             return logits, mtp_out
         return logits
+
+    # -- compact draft vocabulary (challenge 7b33621) -----------------------
+
+    def _omlx_compact_draft_active(self) -> bool:
+        """Compact proposal vocabulary applies to the untied 248-320-vocab
+        backbone with no declared draft_lm_head (the pinned bf16 head ships
+        none)."""
+        return (
+            _compact_draft_enabled()
+            and not self.args.tie_word_embeddings
+            and int(getattr(self.args, "vocab_size", 0) or 0) == 248320
+            and not getattr(self, "_omlx_draft_head_declared", False)
+        )
+
+    def _compact_draft_head(self):
+        head = getattr(self, "_omlx_compact_draft_cache", None)
+        if head is not None:
+            return head
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        untied = self.lm_head
+
+        def compact_rows(arr):
+            return mx.concatenate(
+                [
+                    arr[0:_COMPACT_PREFIX_ROWS],
+                    arr[_COMPACT_CTRL_START:_COMPACT_CTRL_END],
+                ],
+                axis=0,
+            )
+
+        if isinstance(untied, nn.QuantizedLinear):
+            head = (
+                "quantized",
+                compact_rows(untied.weight),
+                compact_rows(untied.scales),
+                compact_rows(untied.biases),
+                untied.group_size,
+                untied.bits,
+            )
+        else:
+            bias = compact_rows(untied.bias) if untied.bias is not None else None
+            head = ("dense", compact_rows(untied.weight), bias, None)
+        self._omlx_compact_draft_cache = head
+        return head
+
+    def _compact_draft_logits(self, logits_source):
+        """Project through the compact draft lm_head (98330 real rows; the
+        Swift pads to 98336 for qmv_fast's N % 8 shape and slices the padding
+        off before argmax — Python's quantized_matmul needs no padding, and
+        the padding is unreachable either way)."""
+        import mlx.core as mx
+
+        head = self._compact_draft_head()
+        if head[0] == "quantized":
+            _, w, s, z, gs, bits = head
+            return mx.quantized_matmul(
+                logits_source, w, s, z, transpose=True, group_size=gs, bits=bits
+            )
+        _, weight, bias, _ = head
+        out = logits_source @ weight.T
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def map_draft_token_ids(self, ids):
+        """Map compact draft ids back to the tokenizer's full id space.
+        The low 98,304 rows keep their ids; the appended control rows are
+        248,044 … 248,069. Full-vocabulary proposals return the input
+        unchanged."""
+        if not self._omlx_compact_draft_active():
+            return ids
+        import mlx.core as mx
+
+        return mx.where(
+            ids < _COMPACT_PREFIX_ROWS,
+            ids,
+            ids + (_COMPACT_CTRL_START - _COMPACT_PREFIX_ROWS),
+        )
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -748,6 +1300,10 @@ def _patch_text_model(q35: Any) -> None:
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
+    cls._omlx_compact_draft_active = _omlx_compact_draft_active
+    cls.map_draft_token_ids = map_draft_token_ids
+    cls._compact_draft_head = _compact_draft_head
+    cls._compact_draft_logits = _compact_draft_logits
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +1340,8 @@ def _patch_outer_model(q35: Any) -> None:
         mtp_cache,
         return_hidden: bool = False,
         logits_keep: int = 0,
+        draft_mode: bool = False,
+        kv_only_history: bool = False,
     ):
         return self.language_model.mtp_forward(
             hidden_states,
@@ -791,10 +1349,18 @@ def _patch_outer_model(q35: Any) -> None:
             mtp_cache,
             return_hidden=return_hidden,
             logits_keep=logits_keep,
+            draft_mode=draft_mode,
+            kv_only_history=kv_only_history,
         )
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
+
+    def map_draft_token_ids(self, ids):
+        return self.language_model.map_draft_token_ids(ids)
+
+    def _omlx_compact_draft_active(self) -> bool:
+        return self.language_model._omlx_compact_draft_active()
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         return self.language_model.mtp_partial_rollback(cache, accepted, num_drafts)
@@ -804,6 +1370,8 @@ def _patch_outer_model(q35: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.map_draft_token_ids = map_draft_token_ids
+    cls._omlx_compact_draft_active = _omlx_compact_draft_active
     # Informational marker for external code that just wants to know "is
     # this class touched by the MTP patch". Idempotency itself uses the
     # function-level _omlx_mtp_call_marker above.
