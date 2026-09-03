@@ -2284,6 +2284,30 @@ class VLMBatchedEngine(BaseEngine):
                 logger.warning("Error closing vision feature cache", exc_info=True)
             self._vision_cache = None
 
+        # Qwen ANE prefill attaches native procedure banks to model modules.
+        # Release those native references after the engine has stopped and
+        # before the wrapper drops the VLM model, otherwise unload can leave
+        # the ANE allocation waiting on an unrelated GC pass.
+        if self._vlm_model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                released, programs = release_qwen35_ane_prefill(self._vlm_model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on VLM engine stop",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                # ANE is optional; keep the existing VLM teardown guarantees
+                # even when its optional release helper is unavailable.
+                logger.warning(
+                    "ANE prefill state release failed during VLM stop",
+                    exc_info=True,
+                )
+
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim

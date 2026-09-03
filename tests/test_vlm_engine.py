@@ -2345,6 +2345,44 @@ class TestStopSafety:
         assert events == ["stop", "vision_cache", "inner_close"]
 
     @pytest.mark.asyncio
+    async def test_stop_releases_ane_state_before_dropping_vlm_model(self):
+        """VLM stop releases ANE banks while the model is still reachable."""
+        engine = _make_loaded_engine()
+        model = engine._vlm_model
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = MagicMock()
+        events = []
+
+        def release_ane_state(value):
+            events.append((value is model, engine._vlm_model is model))
+            return 3, 6
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=release_ane_state,
+        ):
+            await engine.stop()
+
+        assert events == [(True, True)]
+        assert engine._vlm_model is None
+
+    @pytest.mark.asyncio
+    async def test_stop_continues_when_ane_state_release_fails(self):
+        """A failed optional ANE release still clears VLM references."""
+        engine = _make_loaded_engine()
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = MagicMock()
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=RuntimeError("native release unavailable"),
+        ):
+            await engine.stop()
+
+        assert engine._vlm_model is None
+        assert engine._engine is None
+
+    @pytest.mark.asyncio
     async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
         """Diffusion workers see cancellation before model refs are cleared."""
         engine = _make_loaded_engine(model_type="diffusion_gemma")
