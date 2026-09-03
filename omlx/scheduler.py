@@ -6830,6 +6830,22 @@ class Scheduler:
         if not self._detect_boundary_snapshot_need():
             return
 
+        # Reasoning-model requests cache prompt tokens only (the
+        # needs_think_prefix branch of the final-response store), so a
+        # snapshot keyed past the prompt can never pass
+        # _get_boundary_store_override's tc <= len(cacheable_sequence)
+        # filter. Skip before paying the extraction and the sidecar write.
+        if request.needs_think_prefix and total_tokens > request.num_prompt_tokens:
+            self._boundary_snapshot_diagnostics.record(
+                "capture_skipped",
+                reason="beyond_cacheable_bound",
+                request_id=request.request_id,
+                token_count=total_tokens,
+                block_size=block_size,
+                source="decode",
+            )
+            return
+
         self._boundary_snapshot_diagnostics.record(
             "capture_attempt",
             request_id=request.request_id,
@@ -11439,7 +11455,7 @@ class Scheduler:
                             available_boundaries = len(
                                 self._boundary_cache_snapshots.get(request_id, {})
                             )
-                            self._boundary_snapshot_diagnostics.record(
+                            skip_event = self._boundary_snapshot_diagnostics.record(
                                 "store_skip",
                                 reason="boundary_snapshot_unavailable",
                                 request_id=request_id,
@@ -11449,7 +11465,8 @@ class Scheduler:
                             )
                             logger.info(
                                 "Skipping cache store for %s: reason=%s "
-                                "tokens=%d block_size=%d available_boundaries=%d; "
+                                "tokens=%d block_size=%d available_boundaries=%d "
+                                "cause=%s; "
                                 "storing live non-sliceable state would corrupt "
                                 "later prefix hits",
                                 request_id,
@@ -11457,6 +11474,7 @@ class Scheduler:
                                 len(cacheable_sequence),
                                 self.config.paged_cache_block_size,
                                 available_boundaries,
+                                skip_event.get("cause", "unspecified"),
                             )
                             block_table = None
                             if self.paged_cache_manager:

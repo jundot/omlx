@@ -2515,6 +2515,78 @@ class TestSchedulerBoundarySnapshots:
         assert diagnostics["captures"] == 0
         assert diagnostics["reasons"]["cache_offset_mismatch"] == 1
 
+    def test_decode_capture_skipped_beyond_cacheable_bound(
+        self, mock_model, mock_tokenizer
+    ):
+        """Reasoning-model requests (needs_think_prefix) cache prompt tokens
+        only, so a decode-time snapshot keyed past the prompt can never pass
+        the store's tc <= len(cacheable_sequence) filter — the capture must
+        be skipped BEFORE extraction and any sidecar write."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+        scheduler.batch_generator = MagicMock()
+        scheduler._boundary_snapshot_store = MagicMock()
+
+        request = Request(
+            request_id="req-think",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11]
+        request.num_prompt_tokens = 2
+        request.output_token_ids = [12, 13]  # Total = 4 (boundary), past prompt
+        request.needs_think_prefix = True
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        scheduler.batch_generator.extract_cache.assert_not_called()
+        scheduler._boundary_snapshot_store.save.assert_not_called()
+        assert "req-think" not in scheduler._boundary_cache_snapshots
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["capture_attempts"] == 0
+        assert diagnostics["captures"] == 0
+        assert diagnostics["reasons"]["beyond_cacheable_bound"] == 1
+
+    def test_decode_capture_at_prompt_boundary_with_think_prefix(
+        self, mock_model, mock_tokenizer
+    ):
+        """The suppression bound is strict: a reasoning-model capture whose
+        token count equals the prompt length (tc == cacheable bound) is still
+        storable and must proceed."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        mock_layer_cache.offset = 4
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.extract_cache.return_value = {
+            123: ([mock_layer_cache], [10, 11, 12, 13])
+        }
+
+        request = Request(
+            request_id="req-think-eq",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [10, 11, 12, 13]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = []  # Total = 4 == prompt == boundary
+        request.needs_think_prefix = True
+
+        scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        assert 4 in scheduler._boundary_cache_snapshots["req-think-eq"]
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["capture_attempts"] == 1
+        assert diagnostics["captures"] == 1
+        assert "beyond_cacheable_bound" not in diagnostics["reasons"]
+
     @staticmethod
     def _cache_list_layer(leaf_offset: int):
         """CacheList-style wrapper: no own offset, sub-caches carry it."""
@@ -2633,6 +2705,7 @@ class TestSchedulerBoundarySnapshots:
         }
         assert diagnostics["last_event"]["cause"] == "no_snapshots"
         assert "reason=boundary_snapshot_unavailable" in caplog.text
+        assert "cause=no_snapshots" in caplog.text
 
     def test_prefix_lookup_observation_explains_reprefill_boundary(
         self, mock_model, mock_tokenizer
