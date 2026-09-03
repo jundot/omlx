@@ -2011,6 +2011,7 @@ Object.assign(component, {
   previewClusterWeightBalance: async () => calls.push('preview'),
   loadClusterRuntime: async () => calls.push('runtime'),
   loadClusterIncidents: async () => calls.push('incidents'),
+  loadPrefixCacheTopology: async () => calls.push('prefix-cache'),
   discoverClusterPeers: async () => calls.push('discover'),
   loadClusterJoinStatus: async () => calls.push('join'),
 });
@@ -2026,7 +2027,7 @@ Object.assign(component, {
     )
 
     assert result == {
-        "calls": ["preview", "runtime", "incidents", "discover", "join"]
+        "calls": ["preview", "runtime", "incidents", "prefix-cache", "discover", "join"]
     }
 
 

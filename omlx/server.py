@@ -668,10 +668,20 @@ def _register_cluster_routes() -> None:
     from .cluster.routes import join_router as cluster_join_router
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
+    from .cluster.prefix_cache_api import router as prefix_cache_router
+    from .cluster.prefix_cache_api import set_engine_pool_getter as set_prefix_cache_getter
 
     set_cluster_getters(get_engine_pool)
+    set_prefix_cache_getter(get_engine_pool)
     app.include_router(
         cluster_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+    app.include_router(
+        prefix_cache_router,
         dependencies=[
             Depends(require_admin),
             Depends(require_distributed_inference_enabled),
