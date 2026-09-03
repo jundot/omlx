@@ -383,6 +383,34 @@ class TestThinkingParser:
         assert t == ""
         assert c == "open but never closed"
 
+    def test_truncated_does_not_recover_thinking_as_content(self):
+        """max_tokens cut the model off mid-thought (finish_reason=length).
+        The close tag is missing because we stopped it, not because it
+        finished without one, so the accumulated text is reasoning and must
+        not be re-emitted as the answer."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("Let me work through the problem. ")
+        parser.feed("Step one is to recall the definition")
+        t, c = parser.finish(truncated=True)
+        assert t == ""
+        assert c == ""
+
+    def test_truncated_flag_does_not_disturb_a_normal_close(self):
+        """The flag only gates the recovery branch; a stream that closed its
+        block behaves the same either way."""
+        for truncated in (False, True):
+            parser = ThinkingParser(start_in_thinking=True)
+            t, c = parser.feed("reasoning</think>the answer")
+            assert t == "reasoning"
+            assert c == "the answer"
+            assert parser.finish(truncated=truncated) == ("", "")
+
+    def test_truncated_default_is_false(self):
+        """Callers that do not pass the flag keep the old recovery."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("never closed")
+        assert parser.finish() == ("", "never closed")
+
 
 class TestCleanSpecialTokens:
     """Tests for clean_special_tokens (preserves think tags)."""
