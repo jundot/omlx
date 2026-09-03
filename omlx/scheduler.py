@@ -179,17 +179,20 @@ class _PreflightRejection:
 @dataclass
 class _AdmissionEstimate:
     """Single deterministic admission estimate shared by every preflight
-    path: ``current + kv_exact + transient`` is compared against both the
-    dynamic hard limit and the prefill safety cap. ``kv_exact`` is the
-    exact-shape resident KV (full + window-capped rotating + fixed state),
-    ``transient`` the floor-chunk charge including the session's observed
-    max chunk transient."""
+    path: ``current + kv_exact + transient + writeback`` is compared against
+    both the dynamic hard limit and the prefill safety cap. ``kv_exact`` is
+    the exact-shape resident KV (full + window-capped rotating + fixed
+    state), ``transient`` the floor-chunk charge including the session's
+    observed max chunk transient, ``writeback`` the serialized non-sliceable
+    state of one future boundary snapshot created after admission. Existing
+    pending buffers are already included in ``current`` via phys_footprint."""
 
     kv_exact: int
     transient: int
     floor_chunk: int
     kv_len: int
     estimated: int
+    writeback: int = 0
 
 
 @dataclass
@@ -4120,6 +4123,35 @@ class Scheduler:
         )
         raise _PrefillEvictionNeeded(eviction_request)
 
+    def _boundary_snapshot_bytes_at(self, abs_tokens: int) -> int:
+        """Bytes of the boundary snapshot emitted exactly at ``abs_tokens``.
+
+        Returns 0 unless ``abs_tokens`` lands exactly on a block boundary
+        (a value the boundary-limited prefill step actually reaches) and the
+        snapshot gates hold. Pricing the snapshot the upcoming chunk will
+        emit lets the mid-prefill guard reserve it *before* the chunk runs,
+        instead of discovering after sampling phys_footprint that the just
+        emitted snapshot pushed the process over the physical Metal cap.
+        """
+        if (
+            self._boundary_snapshot_store is None
+            or self.block_aware_cache is None
+            or self.memory_monitor is None
+        ):
+            return 0
+        block_size = int(self.config.paged_cache_block_size or 0)
+        if block_size <= 0 or not self._detect_boundary_snapshot_need():
+            return 0
+        abs_tokens = int(abs_tokens)
+        if abs_tokens <= 0 or abs_tokens % block_size != 0:
+            return 0
+        return int(
+            self.memory_monitor.estimate_boundary_snapshot_bytes(
+                abs_tokens,
+                block_size=block_size,
+            )
+        )
+
     def _guard_prefill_chunk(
         self,
         n_tokens: int,
@@ -4151,9 +4183,14 @@ class Scheduler:
         else:
             min_chunk = max(1, self._prefill_min_chunk_tokens)
         current = self._current_usage_bytes()
+        # Price the boundary snapshot this chunk will emit at the boundary it
+        # lands on. The boundary-limited prefill step makes ``kv_len + n_tokens``
+        # a block boundary, so the snapshot is emitted immediately after this
+        # chunk and must be reserved before submission, not discovered after.
+        wb = self._boundary_snapshot_bytes_at(kv_len + n_tokens)
         if current + self._admission_transient_bound(
             n_tokens, kv_len, gathered_core=gathered_core
-        ) <= cap:
+        ) + wb <= cap:
             return n_tokens
 
         # Predicted to breach — reclaim transients and re-measure once.
@@ -4161,7 +4198,7 @@ class Scheduler:
         min_transient = self._admission_transient_bound(
             min_chunk, kv_len, gathered_core=gathered_core
         )
-        if current + min_transient > cap:
+        if current + min_transient + wb > cap:
             maybe_raise_eviction = getattr(
                 self, "_raise_prefill_eviction_if_available", None
             )
@@ -4246,7 +4283,9 @@ class Scheduler:
         per_token = self._predicted_chunk_transient(
             n_tokens, kv_len, gathered_core=gathered_core
         ) / n_tokens
-        safe_n = int((cap - current) / per_token) if per_token > 0 else n_tokens
+        safe_n = (
+            int((cap - current - wb) / per_token) if per_token > 0 else n_tokens
+        )
         n_fit = max(min_chunk, min(n_tokens, safe_n))
         # Same quantization as the adaptive throttle: an off-grid size here
         # would reintroduce the near-miss buffers _snap_chunk_size exists to
@@ -9706,7 +9745,7 @@ class Scheduler:
                 request_id=request.request_id,
                 current=current,
                 target_cap=hard_limit,
-                predicted_transient=peak,
+                predicted_transient=peak + est.writeback,
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
@@ -9716,6 +9755,7 @@ class Scheduler:
                 current=current,
                 peak=peak,
                 hard_limit=hard_limit,
+                writeback=est.writeback,
             )
             return _PreflightRejection(
                 message=message,
@@ -9740,6 +9780,56 @@ class Scheduler:
             return safety_rejection
         return None
 
+    def _expected_boundary_snapshot_bytes(
+        self, *, num_prompt_tokens: int, cached_tokens: int
+    ) -> int:
+        """Largest future boundary-snapshot bytes created after admission.
+
+        Existing pending SSD buffers are already resident in
+        ``phys_footprint`` and therefore already included in ``current``.
+        Charge only a new boundary snapshot that this request can create,
+        and only for a cache layout that actually requires one. Prefill emits
+        at most one snapshot per chunk and immediately samples phys_footprint
+        before the next chunk, so later queued snapshots are already included
+        in ``current`` by the mid-prefill guard. The admission-only increment
+        is therefore the SINGLE LARGEST future snapshot the suffix will
+        create, not the last boundary crossed: a compacted pooling-cache
+        snapshot size is not monotonic in token count (it oscillates with
+        ``token_count % ratio``), so the final boundary is not necessarily
+        the largest one. We take the max over every reachable boundary so the
+        admission charge bounds the worst snapshot this request can emit.
+        """
+        if (
+            self._boundary_snapshot_store is None
+            or self.block_aware_cache is None
+            or self.memory_monitor is None
+        ):
+            return 0
+        block_size = int(self.config.paged_cache_block_size or 0)
+        if block_size <= 0 or not self._detect_boundary_snapshot_need():
+            return 0
+
+        # External prefill evaluates the final token in BatchGenerator. The
+        # snapshot callback runs only at block boundaries crossed by the new
+        # suffix, so a request that stops in the cached block creates none.
+        prefilled_tokens = max(int(num_prompt_tokens) - 1, 0)
+        cached = max(int(cached_tokens), 0)
+        first = ((cached // block_size) + 1) * block_size
+        last = (prefilled_tokens // block_size) * block_size
+        if last <= cached or first > last:
+            return 0
+        best = 0
+        for boundary in range(first, last + 1, block_size):
+            bytes_at = int(
+                self.memory_monitor.estimate_boundary_snapshot_bytes(
+                    boundary,
+                    block_size=block_size,
+                )
+            )
+            if bytes_at > best:
+                best = bytes_at
+        return best
+
     def _admission_estimate(
         self,
         *,
@@ -9750,7 +9840,7 @@ class Scheduler:
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
-        One formula: ``current + kv_exact + transient`` where
+        One formula: ``current + kv_exact + transient + writeback`` where
 
         - ``kv_exact`` is the exact-shape resident KV this prefill will
           allocate (full-attention layers linear in new tokens, sliding
@@ -9759,7 +9849,10 @@ class Scheduler:
         - ``transient`` is the floor-chunk charge at the full prompt kv_len,
           floored by the session's observed max chunk transient (chunk
           transients are size-invariant, so the throttle cannot get under
-          it by shrinking).
+          it by shrinking),
+        - ``writeback`` is one future boundary snapshot's serialized
+          non-sliceable state. Existing pending raw buffers stay in
+          ``current`` and are never charged again.
 
         Charging the floor chunk instead of ``prefill_step_size`` is
         deliberate: when memory is tight the adaptive throttle runs the same
@@ -9807,12 +9900,17 @@ class Scheduler:
         )
         if kv_exact <= 0 and transient <= 0:
             return None
+        writeback = self._expected_boundary_snapshot_bytes(
+            num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
+        )
         return _AdmissionEstimate(
             kv_exact=kv_exact,
             transient=transient,
             floor_chunk=floor_chunk,
             kv_len=kv_len,
-            estimated=int(current) + kv_exact + transient,
+            estimated=int(current) + kv_exact + transient + writeback,
+            writeback=writeback,
         )
 
     def _format_rejection_message(
@@ -9822,6 +9920,7 @@ class Scheduler:
         current: int,
         peak: int,
         hard_limit: int,
+        writeback: int = 0,
     ) -> str:
         """Build the prefill-rejection diagnostic.
 
@@ -9850,9 +9949,13 @@ class Scheduler:
             tail="reduce context length",
         )
 
+        writeback_str = (
+            f" + SSD write-back {format_bytes(writeback)}" if writeback > 0 else ""
+        )
         return (
             f"Prefill would require ~{format_bytes(estimated)} peak "
-            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+            f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}"
+            f"{writeback_str}) "
             f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
             f"{advice}."
         )
@@ -9906,6 +10009,7 @@ class Scheduler:
                 current=current,
                 peak=est.kv_exact + est.transient,
                 hard_limit=admission_limit,
+                writeback=est.writeback,
             )
 
             logger.warning(
@@ -9986,7 +10090,9 @@ class Scheduler:
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
                 target_cap_bytes=int(admission_limit),
-                predicted_transient_bytes=int(est.kv_exact + est.transient),
+                predicted_transient_bytes=int(
+                    est.kv_exact + est.transient + est.writeback
+                ),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
@@ -10030,7 +10136,7 @@ class Scheduler:
 
         kv_growth = est.kv_exact
         min_transient = est.transient
-        estimated = int(current_usage_bytes) + kv_growth + min_transient
+        estimated = int(current_usage_bytes) + kv_growth + min_transient + est.writeback
         if estimated <= cap:
             return None
 
@@ -10051,6 +10157,11 @@ class Scheduler:
             fmt=format_bytes,
             tail="reduce context length",
         )
+        writeback_str = (
+            f" + SSD write-back {format_bytes(est.writeback)}"
+            if est.writeback > 0
+            else ""
+        )
         message = (
             "Prefill context too large for available memory "
             f"(preflight safety guard, kv_len={est.kv_len}, "
@@ -10058,7 +10169,8 @@ class Scheduler:
             f"~{format_bytes(estimated)} "
             f"(current {format_bytes(current_usage_bytes)} + "
             f"KV {format_bytes(kv_growth)} + "
-            f"min-chunk transient {format_bytes(min_transient)}) "
+            f"min-chunk transient {format_bytes(min_transient)}"
+            f"{writeback_str}) "
             f"but prefill safety cap is {format_bytes(cap)} "
             f"({round(margin * 100)}% of {binding_str} ceiling "
             f"{format_bytes(base_cap)}). {advice}."

@@ -1120,3 +1120,242 @@ def test_qwen4_image_request_preflight_stays_dense():
     ):
         rejection = scheduler._preflight_memory_check(request)
     assert rejection is not None
+
+
+def _configure_snapshot_layout(
+    scheduler: Scheduler,
+    cache_class_name: str,
+    *,
+    snapshot_bytes: int = 4096,
+) -> MagicMock:
+    cache_type = type(cache_class_name, (), {})
+    assert scheduler.model is not None
+    scheduler.model.make_cache = lambda: [cache_type()]
+    scheduler.config.paged_cache_block_size = 64
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._boundary_snapshot_store = MagicMock()
+    assert scheduler.memory_monitor is not None
+    estimator = MagicMock(return_value=snapshot_bytes)
+    scheduler.memory_monitor.estimate_boundary_snapshot_bytes = estimator
+    return estimator
+
+
+def test_admission_does_not_recharge_existing_pending_writeback():
+    """Pending raw buffers are already included in ``phys_footprint`` and
+    must not be added to the admission estimate a second time."""
+    scheduler = _make_scheduler()
+    _configure_snapshot_layout(scheduler, "ArraysCache")
+    snapshot_store = scheduler._boundary_snapshot_store
+    assert snapshot_store is not None
+    snapshot_store.pending_bytes = 1000
+    pending_write_bytes = MagicMock(return_value=2000)
+    paged_cache_manager = MagicMock()
+    paged_cache_manager.pending_write_bytes = pending_write_bytes
+    scheduler.paged_cache_manager = paged_cache_manager
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=0, current=3000
+    )
+
+    assert est is not None
+    assert est.writeback == 4096
+    assert est.estimated == 3000 + est.kv_exact + est.transient + 4096
+    pending_write_bytes.assert_not_called()
+
+
+def test_pure_kv_cache_layout_receives_zero_snapshot_charge():
+    """Sliceable KVCache models do not create boundary snapshots even when
+    the paged SSD cache and snapshot store are configured."""
+    scheduler = _make_scheduler()
+    snapshot_bytes = _configure_snapshot_layout(scheduler, "KVCache")
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=0, current=0
+    )
+
+    assert est is not None
+    assert est.writeback == 0
+    assert est.estimated == est.kv_exact + est.transient
+    snapshot_bytes.assert_not_called()
+
+
+def test_non_sliceable_layout_receives_future_snapshot_charge():
+    scheduler = _make_scheduler()
+    snapshot_bytes = _configure_snapshot_layout(scheduler, "ArraysCache")
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=0, current=0
+    )
+
+    assert est is not None
+    assert est.writeback == 4096
+    assert est.estimated == est.kv_exact + est.transient + 4096
+    # The estimator is now probed once per reachable boundary (FIX A1), so the
+    # old exact single-call assertion no longer applies. We only pin that it
+    # was exercised and that every probe landed on a block boundary.
+    assert snapshot_bytes.call_args_list, "estimator must be probed per boundary"
+    assert all(
+        call.kwargs.get("block_size") == 64 for call in snapshot_bytes.call_args_list
+    )
+    assert all(call.args[0] % 64 == 0 for call in snapshot_bytes.call_args_list)
+
+
+def test_expected_boundary_snapshot_prices_max_not_last():
+    """Compacted pooling-cache snapshot size oscillates with ``token_count %
+    ratio``, so the FINAL boundary crossed is not necessarily the LARGEST.
+    Admission must price the max over every reachable boundary, not the last
+    one (FIX A1)."""
+    scheduler = _make_scheduler()
+    _configure_snapshot_layout(scheduler, "ArraysCache")
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+
+    def oscillating(tokens, *, block_size):
+        assert block_size == 64
+        # Value is maximal at interior boundaries (b//64 % 7 == 6) and only
+        # 4096+1000 at the FINAL boundary (65472, b//64=1023, 1023%7==1).
+        return 4096 + ((tokens // 64) % 7) * 1000
+
+    monitor.estimate_boundary_snapshot_bytes = oscillating
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=0, current=0
+    )
+
+    assert est is not None
+    # Max over boundaries 64..65472 step 64 of (4096 + ((b//64)%7)*1000):
+    # (b//64)%7 reaches 6 at e.g. b=384, giving 4096+6000 = 10096. The final
+    # boundary 65472 (b//64=1023, 1023%7==1) is only 4096+1000 = 5096, so a
+    # last-boundary price would under-reserve by 5000 bytes.
+    assert est.writeback == 10096
+    assert est.estimated == est.kv_exact + est.transient + 10096
+
+
+def test_preflight_eviction_includes_future_snapshot_charge():
+    scheduler = _make_scheduler()
+    _configure_snapshot_layout(scheduler, "ArraysCache")
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=65536,
+            cached_tokens=0,
+            current=0,
+        )
+        eviction = scheduler.preflight_eviction_request(num_prompt_tokens=65536)
+
+    assert est is not None
+    assert eviction is not None
+    assert eviction.predicted_transient_bytes == (
+        est.kv_exact + est.transient + est.writeback
+    )
+
+
+def test_request_preflight_eviction_includes_future_snapshot_charge():
+    scheduler = _make_scheduler()
+    _configure_snapshot_layout(scheduler, "ArraysCache")
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    scheduler._memory_abort_limit_bytes = 10**18
+    scheduler._current_usage_bytes = MagicMock(return_value=0)
+    scheduler._raise_prefill_eviction_if_available = MagicMock()
+    request = _make_request(65536)
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536,
+        cached_tokens=0,
+        current=0,
+    )
+    rejection = scheduler._preflight_memory_check(request)
+
+    assert est is not None
+    assert rejection is not None
+    assert (
+        scheduler._raise_prefill_eviction_if_available.call_args.kwargs[
+            "predicted_transient"
+        ]
+        == est.kv_exact + est.transient + est.writeback
+    )
+
+
+def test_no_writeback_charge_without_ssd_persistence():
+    """No SSD persistence configured -> no write-back charge; the estimate
+    stays current + KV + transient."""
+    scheduler = _make_scheduler()
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=65536, cached_tokens=0, current=0
+        )
+    assert est is not None
+    assert est.writeback == 0
+    assert est.estimated == est.kv_exact + est.transient
+
+
+def test_preflight_rejection_names_ssd_writeback_component():
+    """The rejection message breaks out future boundary-snapshot write-back."""
+    scheduler = _make_scheduler()
+    _configure_snapshot_layout(scheduler, "ArraysCache")
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        rejection = scheduler._preflight_memory_check(_make_request(65536))
+    assert rejection is not None
+    assert "SSD write-back" in rejection.message
+    assert "Prefill would require" in rejection.message
+
+
+def test_guard_prefill_chunk_prices_upcoming_boundary_snapshot():
+    """FIX A2: the mid-prefill guard must price the boundary snapshot the
+    chunk is about to emit at the block boundary it lands on. A chunk whose
+    ``current + transient`` fits the cap but whose ``current + transient +
+    writeback`` does not must NOT pass through — it must shrink, reserving the
+    snapshot before the chunk runs instead of discovering it after sampling."""
+    scheduler = _make_scheduler()
+    estimator = _configure_snapshot_layout(scheduler, "ArraysCache")
+    scheduler._prefill_speed_priority = False
+    base_cap, cap, margin = 90_000, 68_000, 0.90
+    scheduler._prefill_abort_description = MagicMock(
+        return_value=(base_cap, cap, margin)
+    )
+    scheduler._current_usage_bytes = MagicMock(return_value=40_000)
+    scheduler._reclaim_prefill_headroom = MagicMock(return_value=40_000)
+    scheduler._predicted_chunk_transient = MagicMock(return_value=25_600)  # 512*50
+    scheduler._admission_transient_bound = MagicMock(
+        side_effect=lambda n_tokens, kv_len, gathered_core=False: n_tokens * 50
+    )
+    scheduler._prefill_min_chunk_tokens = 32
+    scheduler._snap_chunk_size = lambda n, requested: n  # keep safe_n exact
+
+    n = scheduler._guard_prefill_chunk(
+        512, kv_len=6400, progress=0, loop_label="test"
+    )
+
+    # Without the writeback, current+transient(512)=40_000+25_600=65_600 <=
+    # cap(68_000), so the guard would pass the 512-token chunk straight
+    # through. The 4096-byte snapshot reserved by FIX A2 pushes the predicted
+    # peak to 69_696 > cap, so the guard shrinks:
+    #   safe_n = int((68_000 - 40_000 - 4096) / 50) = 478.
+    assert n == 478
+    assert n < 512
+    # The guard queried the estimator at the exact boundary the chunk lands on
+    # (kv_len=6400 + 512 = 6912, a multiple of block_size 64).
+    assert any(
+        call.args[0] == 6912 and call.kwargs.get("block_size") == 64
+        for call in estimator.call_args_list
+    )
+    # Sanity: transient alone fits, transient + writeback is what breaches.
+    assert 40_000 + 25_600 <= cap
+    assert 40_000 + 25_600 + 4096 > cap

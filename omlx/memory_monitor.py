@@ -163,6 +163,10 @@ class PrefillMemoryProfile(Protocol):
         self, num_tokens: int, *, chunk_tokens: int = 1
     ) -> int: ...
 
+    def estimate_boundary_snapshot_bytes(
+        self, num_tokens: int, *, block_size: int
+    ) -> int: ...
+
     def estimate_prefill_transient_bytes(
         self, query_tokens: int, kv_len: int
     ) -> int: ...
@@ -707,6 +711,35 @@ class MemoryMonitor:
 
         return total + self._fixed_state_bytes
 
+    def estimate_boundary_snapshot_bytes(
+        self, num_tokens: int, *, block_size: int
+    ) -> int:
+        """Serialized non-sliceable state in one boundary snapshot.
+
+        Full ``KVCache`` layers are block-sliceable and therefore excluded.
+        Rotating caches serialize their post-chunk window (not the temporary
+        ``window + chunk - 1`` resident peak); fixed recurrent state is copied
+        once. Model-specific profiles can refine this for other cache shapes.
+        """
+        if num_tokens <= 0 or block_size <= 0:
+            return 0
+        total = int(self._fixed_state_bytes)
+        if self._prefill_memory_profile is not None:
+            return total + int(
+                self._prefill_memory_profile.estimate_boundary_snapshot_bytes(
+                    num_tokens,
+                    block_size=block_size,
+                )
+            )
+        if self._rotating_layer_specs:
+            kv_heads = self._num_kv_heads or 0
+            dim = self._head_dim or 0
+            if kv_heads and dim:
+                per_token = kv_heads * dim * self._score_dtype_size * 2
+                for count, window in self._rotating_layer_specs:
+                    total += count * min(int(num_tokens), window) * per_token
+        return int(total)
+
     def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0
@@ -1046,6 +1079,26 @@ class _DeepSeekV4PrefillMemoryProfile:
         carry = 2 * ratio * projection_dim if overlap and num_tokens >= ratio else 0
         return pooled + buffers + carry
 
+    def _pool_snapshot_elements(
+        self,
+        num_tokens: int,
+        *,
+        block_size: int,
+        ratio: int,
+        pooled_dim: int,
+        overlap: bool,
+    ) -> int:
+        """Serialized PoolingCache state after boundary delta compaction."""
+        pooled_end = num_tokens // ratio
+        pooled_start = max(0, num_tokens - block_size) // ratio
+        pooled = max(0, pooled_end - pooled_start) * pooled_dim
+        projection_dim = pooled_dim * (2 if overlap else 1)
+        # PoolingCache.state exposes only the populated remainder slices;
+        # zero-remainder boundaries serialize no buffer payload.
+        buffers = 2 * (num_tokens % ratio) * projection_dim
+        carry = 2 * ratio * projection_dim if overlap and num_tokens >= ratio else 0
+        return pooled + buffers + carry
+
     def estimate_resident_kv_bytes(
         self, num_tokens: int, *, chunk_tokens: int = 1
     ) -> int:
@@ -1078,6 +1131,47 @@ class _DeepSeekV4PrefillMemoryProfile:
         if self.ratio128_layers:
             pool = self._pool_cache_elements(
                 num_tokens,
+                ratio=128,
+                pooled_dim=self.head_dim,
+                overlap=False,
+            )
+            total_elements += self.ratio128_layers * pool
+
+        return int(total_elements * self.dtype_size)
+
+    def estimate_boundary_snapshot_bytes(
+        self, num_tokens: int, *, block_size: int
+    ) -> int:
+        """Raw bytes serialized by the compacted boundary-snapshot path."""
+        if num_tokens <= 0 or block_size <= 0:
+            return 0
+
+        num_tokens = int(num_tokens)
+        block_size = int(block_size)
+        local_tokens = min(num_tokens, self.sliding_window)
+        total_elements = self.local_layers * local_tokens * self.head_dim
+
+        if self.ratio4_layers:
+            main_pool = self._pool_snapshot_elements(
+                num_tokens,
+                block_size=block_size,
+                ratio=4,
+                pooled_dim=self.head_dim,
+                overlap=True,
+            )
+            index_pool = self._pool_snapshot_elements(
+                num_tokens,
+                block_size=block_size,
+                ratio=4,
+                pooled_dim=self.index_head_dim,
+                overlap=True,
+            )
+            total_elements += self.ratio4_layers * (main_pool + index_pool)
+
+        if self.ratio128_layers:
+            pool = self._pool_snapshot_elements(
+                num_tokens,
+                block_size=block_size,
                 ratio=128,
                 pooled_dim=self.head_dim,
                 overlap=False,
@@ -1275,6 +1369,12 @@ class _Qwen4ExpPrefillMemoryProfile:
             + 3 * 8
         )
         return int(self.qsa_layers * per_layer * int(num_tokens))
+
+    def estimate_boundary_snapshot_bytes(
+        self, num_tokens: int, *, block_size: int
+    ) -> int:
+        """QSA state is block-sliceable; GDN state is charged separately."""
+        return 0
 
     def estimate_prefill_transient_bytes(
         self,
