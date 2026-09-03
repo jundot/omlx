@@ -194,11 +194,13 @@ class TestCompletionKeepaliveSharesStreamId:
     def test_frame_uses_given_response_id(self):
         from omlx.server import _completion_keepalive_chunk
 
-        frame = _completion_keepalive_chunk("cmpl-abc123")
+        model = 'GLM-5.3-Flash-oQ4e "quoted"'
+        frame = _completion_keepalive_chunk("cmpl-abc123", model)
         assert frame.startswith("data: ")
         assert frame.endswith("\n\n")
         payload = json.loads(frame.removeprefix("data: ").strip())
         assert payload["id"] == "cmpl-abc123"
+        assert payload["model"] == model
         assert payload["object"] == "text_completion"
         assert payload["choices"][0]["text"] == ""
         assert payload["choices"][0]["finish_reason"] is None
@@ -207,7 +209,9 @@ class TestCompletionKeepaliveSharesStreamId:
         from omlx.server import _completion_keepalive_chunk
 
         payload = json.loads(
-            _completion_keepalive_chunk("cmpl-real").removeprefix("data: ").strip()
+            _completion_keepalive_chunk("cmpl-real", "test-model")
+            .removeprefix("data: ")
+            .strip()
         )
         assert payload["id"] != "cmpl-keepalive"
 
@@ -225,11 +229,13 @@ class TestChatKeepaliveSharesStreamId:
     def test_frame_uses_given_response_id(self):
         from omlx.server import _chat_keepalive_chunk
 
-        frame = _chat_keepalive_chunk("chatcmpl-abc123")
+        model = 'GLM-5.3-Flash-oQ4e "quoted"'
+        frame = _chat_keepalive_chunk("chatcmpl-abc123", model)
         assert frame.startswith("data: ")
         assert frame.endswith("\n\n")
         payload = json.loads(frame.removeprefix("data: ").strip())
         assert payload["id"] == "chatcmpl-abc123"
+        assert payload["model"] == model
         assert payload["object"] == "chat.completion.chunk"
         assert payload["choices"][0]["delta"]["role"] == "assistant"
         assert payload["choices"][0]["delta"]["content"] == ""
@@ -239,7 +245,9 @@ class TestChatKeepaliveSharesStreamId:
         from omlx.server import _chat_keepalive_chunk
 
         payload = json.loads(
-            _chat_keepalive_chunk("chatcmpl-real").removeprefix("data: ").strip()
+            _chat_keepalive_chunk("chatcmpl-real", "test-model")
+            .removeprefix("data: ")
+            .strip()
         )
         assert payload["id"] != "chatcmpl-keepalive"
 
@@ -268,7 +276,10 @@ class TestChatKeepaliveCarriesRole:
     def test_id_sharing_frame_carries_assistant_role(self):
         from omlx.server import _chat_keepalive_chunk
 
-        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        assert (
+            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x", "test-model"))
+            == "assistant"
+        )
 
 
 class TestResolveKeepalive:
