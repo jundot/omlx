@@ -201,10 +201,18 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipTextModel",
 }
 
+# Bidirectional Llama rerankers (e.g. nvidia/llama-nemotron-rerank-1b-v2).
+# The architecture string alone separates them from their embedding sibling,
+# LlamaBidirectionalModel, so no directory-name heuristic is needed.
+LLAMA_BIDIRECTIONAL_RERANKER_ARCHITECTURE = (
+    "LlamaBidirectionalForSequenceClassification"
+)
+
 # Supported reranker architectures
 SUPPORTED_RERANKER_ARCHITECTURES = {
     "ModernBertForSequenceClassification",  # via mlx-embeddings
     "XLMRobertaForSequenceClassification",  # omlx native implementation
+    LLAMA_BIDIRECTIONAL_RERANKER_ARCHITECTURE,  # omlx native implementation
     "JinaForRanking",  # Jina v3 listwise reranker
 }
 
