@@ -49,10 +49,19 @@ def merge_reasoning_effort_chat_template_kwargs(
     chat_template_kwargs: dict[str, Any] | None,
     reasoning_effort: Any | None,
 ) -> dict[str, Any] | None:
-    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    """Forward an API reasoning effort without overriding explicit template kwargs.
+
+    ``"none"`` is a client-side off switch: it turns thinking off via
+    ``enable_thinking=False`` instead of reaching the template, whose
+    whitelists (e.g. Qwen 3.8's ``xhigh/medium/low``) do not include it.
+    An explicit ``enable_thinking`` in the request kwargs still wins.
+    """
     merged = dict(chat_template_kwargs or {})
     if reasoning_effort is not None:
-        merged.setdefault("reasoning_effort", reasoning_effort)
+        if reasoning_effort == "none":
+            merged.setdefault("enable_thinking", False)
+        else:
+            merged.setdefault("reasoning_effort", reasoning_effort)
     return merged or None
 
 

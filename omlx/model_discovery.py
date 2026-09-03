@@ -380,6 +380,9 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    # Reasoning levels discerned from the template (None = no set discernible)
+    reasoning_effort_options: list[str] | None = None
+    reasoning_effort_default: str | None = None  # Template default for reasoning_effort (None = unknown)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
@@ -778,23 +781,13 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect a model's effective thinking default from local metadata.
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Read the model's chat template text from local metadata.
 
-    Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour, including narrow model-family serving
-    recommendations when the raw template deliberately defaults to opt-in:
-
-    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
-      servers pass ``enable_thinking=true`` by default).
-    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
-      enables thinking when ``enable_thinking`` is truthy,
-      ``default(false)``).
-    * **None** — template does not reference ``enable_thinking`` (model has
-      no thinking toggle).
+    Tries the standalone ``chat_template.jinja`` file first, then falls
+    back to the ``chat_template`` key in ``tokenizer_config.json``.
+    Returns None when neither source is available.
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
     template_text = None
     jinja_path = model_path / "chat_template.jinja"
     if jinja_path.exists():
@@ -811,6 +804,26 @@ def detect_thinking_default(model_path: Path) -> bool | None:
             except Exception:
                 pass
 
+    return template_text
+
+
+def detect_thinking_default(model_path: Path) -> bool | None:
+    """Detect a model's effective thinking default from local metadata.
+
+    Inspects the Jinja chat template for ``enable_thinking`` references and
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
+
+    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
+    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
+      enables thinking when ``enable_thinking`` is truthy,
+      ``default(false)``).
+    * **None** — template does not reference ``enable_thinking`` (model has
+      no thinking toggle).
+    """
+    template_text = _read_chat_template_text(model_path)
     if not template_text or "enable_thinking" not in template_text:
         return None
 
@@ -838,6 +851,20 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     # changing its thinking default.
     if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
         return True
+    # Same statement made by a fallback ternary rather than a filter:
+    # ``enable_thinking = enable_thinking if enable_thinking is defined
+    # else true`` (Nemotron, Qwen fixed-template repos).
+    if re.search(r"enable_thinking\s*=\s*[^=\n]{0,80}?\belse\s+[Tt]rue\b", template_text):
+        return True
+    # Opt-in: thinking is emitted only when the caller asks for it, so the
+    # effective default is OFF. Covers ``enable_thinking is defined and
+    # enable_thinking is true`` (Qwen 3.5) and ``enable_thinking == true``
+    # (LongCat), neither of which the ``default(false)`` scan below sees.
+    if re.search(
+        r"enable_thinking\s+is\s+defined\s+and\s+(?:not\s+)?enable_thinking\s+is\s+true|enable_thinking\s*==\s*[Tt]rue",
+        template_text,
+    ):
+        return False
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
 
@@ -931,26 +958,90 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
-    if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
-
+    template_text = _read_chat_template_text(model_path)
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+def detect_reasoning_effort(model_path: Path) -> tuple[list[str] | None, str | None]:
+    """Detect the reasoning levels the template names, and its default.
+
+    Returns ``(options, default)``. ``options`` are the levels the template
+    itself mentions, deduped in first-seen order, or None when it names none.
+    This is fact extraction only: no level is invented, no level is removed,
+    and ordering carries no meaning — clients pick the presentation vocabulary
+    and sort.
+
+    Enforcement style is irrelevant, because both styles enumerate the same
+    thing. Tuple/list membership, dict-map keys, ``==``/``!=`` comparisons and
+    ``set`` assignments all count, whether the template rejects unknown values
+    with ``raise_exception`` or quietly normalises them.
+
+    ``default`` comes from a ``| default('X')`` filter, an
+    ``if reasoning_effort is not defined -> set ... = "X"`` block, or a
+    ``... else 'X'`` fallback ternary. None when unknown; numeric defaults are
+    not exposed.
+    """
+    template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None, None
+
+    # An effort-named binding: reasoning_effort, resolved_reasoning_effort,
+    # effective_reasoning_effort, _effort_raw, effort_map, ns_state.effort...
+    # The name may *start* with "effort", so it cannot be anchored past it.
+    var = r"\b[A-Za-z0-9_.]*effort[A-Za-z0-9_.]*\b"
+    lit = r"['\"]([A-Za-z0-9_.-]+)['\"]"
+
+    levels: list[str] = []
+
+    # Membership against a tuple *or list* literal — ``effort in ('a','b')``,
+    # ``effort not in ['a','b']``. Enforcement (raise) vs normalisation (else)
+    # is not distinguished: both enumerate the levels the template recognises.
+    for m in re.finditer(
+        rf"{var}\s+(?:not\s+)?in\s+([\[(][^\])]+[\])])", template_text, re.I
+    ):
+        levels += re.findall(lit, m.group(1))
+    # Dict maps: the keys are the levels (``effort_map = {'low': 0.2, ...}``).
+    for m in re.finditer(
+        rf"\bset\s+{var}\s*=\s*\{{([^}}]+)\}}", template_text, re.I
+    ):
+        levels += re.findall(rf"{lit}\s*:", m.group(1))
+    # Equality comparisons and elif chains enumerate accepted values.
+    for m in re.finditer(rf"{var}\s*(?:==|!=)\s*{lit}", template_text, re.I):
+        levels.append(m.group(1))
+    # Canonical assignments: ``set <effort> = 'low'``.
+    for m in re.finditer(rf"\bset\s+{var}\s*=\s*{lit}", template_text, re.I):
+        levels.append(m.group(1))
+
+    # Default: ``reasoning_effort|default('X')`` filter, else the
+    # ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
+    # block, else a fallback ternary that lands on a literal when the
+    # incoming value is missing or unrecognised (GLM-5.3's
+    # ``reasoning_effort if ... else 'max'``, Qwen-fixed templates'
+    # ``... else 'medium'``).
+    default: str | None = None
+    for pattern, flags in (
+        (rf"reasoning_effort\s*\|\s*default\(\s*{lit}\s*\)", 0),
+        (
+            rf"reasoning_effort\s+is\s+not\s+defined.{{0,160}}?\bset\s+reasoning_effort\s*=\s*{lit}",
+            re.S,
+        ),
+        (rf"{var}\s*=\s*[^=\n]{{0,160}}?\belse\s+{lit}", 0),
+    ):
+        m = re.search(pattern, template_text, flags)
+        if m:
+            default = m.group(1)
+            break
+
+    # The default is itself an accepted level, so it belongs in the menu.
+    if default is not None:
+        levels.append(default)
+
+    options: list[str] | None = list(dict.fromkeys(levels)) or None
+
+    return options, default
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1502,6 +1593,7 @@ def _register_model(
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
+        reasoning_effort_options, reasoning_effort_default = detect_reasoning_effort(model_dir)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1514,6 +1606,8 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_effort_options=reasoning_effort_options,
+            reasoning_effort_default=reasoning_effort_default,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
