@@ -302,6 +302,7 @@ def test_prefill_snapshot_decoupled_from_live_cache():
     """In-memory prefill boundary snapshots must capture the state AT the
     boundary. Storing the live cache objects aliased every boundary to
     the prefill's final state (KVCache mutates its buffer in place)."""
+    from collections import defaultdict
     from types import SimpleNamespace
 
     from omlx.scheduler import Scheduler
@@ -319,7 +320,10 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         _boundary_snapshot_required=False,
         _stream=mx.default_stream(mx.default_device()),
         _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,
+        _phase_total_ms=defaultdict(float),
+        _phase_count=defaultdict(int),
     )
+    stub._phase_timer = lambda phase: Scheduler._phase_timer(stub, phase)
     stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
         stub, caches
     )

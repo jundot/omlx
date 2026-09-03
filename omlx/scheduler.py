@@ -6438,33 +6438,48 @@ class Scheduler:
         # Offload snapshot to SSD if store is available, keeping only a
         # None marker in the dict.  Falls back to in-memory storage when
         # the SSD store is unavailable or the write fails.
-        if self._boundary_snapshot_store is not None:
-            # Keep the extraction + serialization eval on the per-engine
-            # stream, mirroring _eval_snapshot_cache on the in-memory path
-            # below. save() slices the live cache state and mx.eval's it on
-            # this (owner) thread; unwrapped, those ops bind to gpu,0 and
-            # split the prefill graph across streams (#2330 hardening).
-            with mx.stream(self._stream):
-                saved = self._boundary_snapshot_store.save(
-                    request_id,
-                    token_count,
-                    snapshot_cache,
-                    self._extract_snapshot_cache_states,
-                    block_size=block_size,
-                )
-            if saved:
-                self._boundary_cache_snapshots[request_id][token_count] = None
-                storage = "ssd"
+        # The persist branch runs synchronously inside prefill (slice + eval of
+        # the recurrent state, serialization, SSD pending-slot wait). Time it so
+        # the cost shows up in the phase log next to the decode-side capture
+        # phases instead of hiding inside prefill wall time (#3070).
+        with self._phase_timer("prefill_boundary_capture"):
+            if self._boundary_snapshot_store is not None:
+                # Keep the extraction + serialization eval on the per-engine
+                # stream, mirroring _eval_snapshot_cache on the in-memory path
+                # below. save() slices the live cache state and mx.eval's it on
+                # this (owner) thread; unwrapped, those ops bind to gpu,0 and
+                # split the prefill graph across streams (#2330 hardening).
+                with mx.stream(self._stream):
+                    saved = self._boundary_snapshot_store.save(
+                        request_id,
+                        token_count,
+                        snapshot_cache,
+                        self._extract_snapshot_cache_states,
+                        block_size=block_size,
+                    )
+                if saved:
+                    self._boundary_cache_snapshots[request_id][token_count] = None
+                    storage = "ssd"
+                else:
+                    self._boundary_snapshot_diagnostics.record(
+                        "ssd_fallback",
+                        reason="ssd_save_failed",
+                        request_id=request_id,
+                        token_count=token_count,
+                        block_size=block_size,
+                        source="prefill",
+                        storage="memory",
+                    )
+                    self._boundary_cache_snapshots[request_id][token_count] = (
+                        _compact_boundary_snapshot_value(
+                            self._prefill_snapshot_value(snapshot_cache),
+                            token_count,
+                            block_size,
+                            self._stream,
+                        )
+                    )
+                    storage = "memory"
             else:
-                self._boundary_snapshot_diagnostics.record(
-                    "ssd_fallback",
-                    reason="ssd_save_failed",
-                    request_id=request_id,
-                    token_count=token_count,
-                    block_size=block_size,
-                    source="prefill",
-                    storage="memory",
-                )
                 self._boundary_cache_snapshots[request_id][token_count] = (
                     _compact_boundary_snapshot_value(
                         self._prefill_snapshot_value(snapshot_cache),
@@ -6474,16 +6489,6 @@ class Scheduler:
                     )
                 )
                 storage = "memory"
-        else:
-            self._boundary_cache_snapshots[request_id][token_count] = (
-                _compact_boundary_snapshot_value(
-                    self._prefill_snapshot_value(snapshot_cache),
-                    token_count,
-                    block_size,
-                    self._stream,
-                )
-            )
-            storage = "memory"
 
         self._boundary_snapshot_required = True
         self._enable_mtp_boundary_alignment()

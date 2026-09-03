@@ -3000,6 +3000,99 @@ class TestSchedulerBoundarySnapshots:
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
 
+    def _prefill_boundary_scheduler(self, mock_model, mock_tokenizer, store=None):
+        """Scheduler, registered request and stateful stub cache for the timer tests."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_store = store
+        request = Request(
+            request_id="req-prefill-timer",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        snapshot_cache = [type("RotatingKVCache", (), {})()]
+        return scheduler, request, snapshot_cache
+
+    def test_prefill_boundary_snapshot_times_memory_capture(
+        self, mock_model, mock_tokenizer
+    ):
+        """The in-memory persist path must land in the phase timers.
+
+        #3070: the decode-side capture is timed in three phases while the
+        prefill-side twin ran untimed inside prefill, so its cost never
+        appeared in ``Cache phase timings``.
+        """
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer
+        )
+
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert (
+            scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
+        )
+        assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
+
+    def test_prefill_boundary_snapshot_times_ssd_capture(
+        self, mock_model, mock_tokenizer
+    ):
+        """The SSD persist path is timed; the snapshot entry stays a marker."""
+        store = MagicMock()
+        store.save.return_value = True
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer, store=store
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert scheduler._boundary_cache_snapshots[request.request_id][4] is None
+        diag = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diag["captures_ssd"] == 1
+        assert diag["last_event"]["event"] == "capture_success"
+        assert diag["last_event"]["storage"] == "ssd"
+
+    def test_prefill_boundary_snapshot_times_ssd_fallback(
+        self, mock_model, mock_tokenizer
+    ):
+        """A failed SSD save falls back to memory inside the same timed phase."""
+        store = MagicMock()
+        store.save.return_value = False
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer, store=store
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert scheduler._boundary_cache_snapshots[request.request_id][4] is not None
+        diag = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diag["ssd_fallbacks"] == 1
+        assert diag["captures_memory"] == 1
+        assert diag["last_event"]["event"] == "capture_success"
+        assert diag["last_event"]["storage"] == "memory"
+
+    def test_prefill_boundary_snapshot_unaligned_is_not_timed(
+        self, mock_model, mock_tokenizer
+    ):
+        """Early returns happen before the persist branch and record no phase."""
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 3)
+
+        assert "prefill_boundary_capture" not in scheduler.get_phase_stats()
+        diag = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diag["reasons"]["unaligned_token_count"] == 1
+        assert diag["last_event"]["event"] == "capture_skipped"
+        assert diag["last_event"]["reason"] == "unaligned_token_count"
+
     def test_emit_prefill_boundary_snapshot_persists_before_uid_assignment(
         self, mock_model, mock_tokenizer
     ):
