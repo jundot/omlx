@@ -36,6 +36,7 @@ from .qsa_fast import (
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
+_QSA_DIRECT_VERIFY_MIN_TOKENS = 65_536
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,7 @@ class _QSAIndexerCache:
         self._index_position_ids = None
         self._index_offset = 0
         self._index_capacity_managed = True
+        self._omlx_text_position_ids_qualified = False
         self._invalidate_pooled_indexer()
 
     @property
@@ -198,6 +200,7 @@ class _QSAIndexerCache:
         self._index_position_ids = position_ids
         self._index_offset = 0 if keys is None else int(keys.shape[1])
         self._index_capacity_managed = False
+        self._omlx_text_position_ids_qualified = False
         self._invalidate_pooled_indexer()
 
     @staticmethod
@@ -253,6 +256,11 @@ class _QSAIndexerCache:
         length = int(keys.shape[1])
         if position_ids.shape[-1] != length:
             raise ValueError("QSA index update keys and positions are misaligned")
+        # A general 3-D update may carry genuine image/video MRoPE.  Revoke a
+        # prior text qualification; the target-verify route deliberately
+        # collapses its already-qualified equal planes to 2-D before append.
+        if position_ids.ndim == 3:
+            self._omlx_text_position_ids_qualified = False
 
         if self._index_position_ids is not None:
             if self._index_position_ids.ndim == 3 and position_ids.ndim == 2:
@@ -354,7 +362,23 @@ class _QSAIndexerCache:
 
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
-        self._invalidate_pooled_indexer()
+        # Speculative rollback changes only a suffix of the raw index state.
+        # Completed blocks strictly before the new logical end are immutable,
+        # so retain their normalized/RoPE-rotated rows.  Rewind to the last
+        # complete block: a partially retained block may contain rejected
+        # verify tokens and must be recomputed on the next append.
+        if (
+            self._pooled_index_keys is None
+            or self._pooled_index_ratio is None
+            or self._pooled_index_ratio <= 0
+        ):
+            self._invalidate_pooled_indexer()
+            return
+        complete_blocks = self._index_offset // self._pooled_index_ratio
+        self._pooled_index_offset = min(
+            self._pooled_index_offset,
+            complete_blocks,
+        )
 
     @property
     def indexer_nbytes(self):
@@ -501,6 +525,51 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     @property
     def nbytes(self):
         return super().nbytes + self.indexer_nbytes
+
+
+def _qualified_text_verify_position_ids(
+    position_ids: Optional[mx.array],
+    cache: Optional[Any],
+) -> Optional[mx.array]:
+    """Collapse equal 3-plane text MRoPE only after exact history proof.
+
+    mlx-vlm can carry ordinary text positions in the VLM-shaped
+    ``[3, 1, L]`` container.  Qwen4's direct verify path is text-only, so a
+    rank check alone rejects that valid case.  Qualify the current positions
+    and the complete cached QSA position history once; genuine multimodal
+    planes remain divergent and fail closed.  The cache marker survives normal
+    verify appends and is revoked by any later general 3-D index update.
+    """
+
+    if not (
+        isinstance(position_ids, mx.array)
+        and position_ids.ndim == 3
+        and position_ids.shape[0] == 3
+        and position_ids.shape[1] == 1
+        and type(cache) is QSAKVCache
+    ):
+        return position_ids
+    if getattr(cache, "_omlx_text_position_ids_qualified", False):
+        return position_ids[0]
+
+    cached = cache.index_position_ids
+    if cached is None:
+        return position_ids
+    current_equal = mx.all(position_ids[0] == position_ids[1]) & mx.all(
+        position_ids[0] == position_ids[2]
+    )
+    if cached.ndim == 2:
+        history_equal = mx.array(True)
+    elif cached.ndim == 3 and cached.shape[0] == 3 and cached.shape[1] == 1:
+        history_equal = mx.all(cached[0] == cached[1]) & mx.all(
+            cached[0] == cached[2]
+        )
+    else:
+        return position_ids
+    if not bool((current_equal & history_equal).item()):
+        return position_ids
+    cache._omlx_text_position_ids_qualified = True
+    return position_ids[0]
 
 
 class BatchQSAKVCache:
@@ -1210,19 +1279,77 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         prospective_blocks = (cache.offset + 1) // self.indexer.compress_ratio
         return prospective_blocks > self.indexer.block_topk
 
+    def _gathered_text_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Admit only the exact batch-one Lightning-MTP verify geometry.
+
+        The general target-verify implementation evaluates each row against
+        the full K/V cache.  QSA selection is still exact, but the boolean mask
+        does not make dense SDPA sparse.  This route preserves each verify
+        position's selector and causal boundary while sending the whole window
+        through the same direct selected-block implementation as prefill.
+        """
+
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            target_verify
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 2 <= x.shape[1] <= 9
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+
+        # A speculative rollback must restore all four QSA cache components.
+        # Never enter the direct route if a restored/foreign cache omitted or
+        # misaligned the auxiliary indexer state.
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+
+        prospective_tokens = cache.offset + x.shape[1]
+        prospective_blocks = prospective_tokens // self.indexer.compress_ratio
+        return bool(
+            prospective_tokens >= _QSA_DIRECT_VERIFY_MIN_TOKENS
+            and prospective_blocks > self.indexer.block_topk
+        )
+
     def _gathered_text_prefill(
         self,
         x: mx.array,
         cache: QSAKVCache,
         position_ids: Optional[mx.array] = None,
+        *,
+        target_verify: bool = False,
     ) -> mx.array:
-        """Project once, append both caches, and attend only to selected K/V."""
+        """Project once, append both caches, and attend only to selected K/V.
+
+        ``target_verify`` retains the canonical verify-shaped projection
+        routing while the direct QSA kernel evaluates every verify row's own
+        exact selected block set and causal tail.
+        """
 
         batch, length, _ = x.shape
         q_proj_output, keys, values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj),
             x,
-            False,
+            target_verify,
         )
         queries, gate = mx.split(
             q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
@@ -1258,7 +1385,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         keys, values = cache.update_and_fetch(keys, values)
 
-        projected = self.indexer.index_qk_proj(x).reshape(
+        projected = _target_verify_linear(
+            self.indexer.index_qk_proj,
+            x,
+            target_verify,
+        ).reshape(
             batch,
             length,
             self.indexer.n_heads + self.indexer.kv_heads,
@@ -1301,7 +1432,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             pooled_index_keys=pooled_index_keys,
         )
         output = output.reshape(batch, length, -1)
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _target_verify_linear(
+            self.o_proj,
+            output * mx.sigmoid(gate),
+            target_verify,
+        )
 
     def _gathered_text_decode(
         self,
@@ -1408,6 +1543,21 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        if self._gathered_text_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            return self._gathered_text_prefill(
+                x,
+                cache,
+                position_ids,
+                target_verify=True,
+            )
+
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -2476,6 +2626,12 @@ class Qwen4ExpModel(nn.Module):
         hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if gdn_sink is not None and cache:
+            position_ids = _qualified_text_verify_position_ids(
+                position_ids,
+                cache[self.fa_idx],
+            )
 
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])

@@ -54,6 +54,11 @@ instantiate_dsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 // Qwen4 QSA scores use the same validated M3 Steel tile, but write fp32 after
 // reducing the fixed four heads. Keeping this in the existing metallib also
 // lets stale extension builds fail closed at the missing ABI symbol.
+// MTP verify has at most eight rows.  BM8 retains the identical BK16 MMA
+// sequence for those rows while avoiding the 56 unused rows in the prefill
+// tile; BM64 remains the production prefill route.
+instantiate_qwen4_qsa_indexer_score(float16, half, 8, 64, 16, 1, 2);
+instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 8, 64, 16, 1, 2);
 instantiate_qwen4_qsa_indexer_score(float16, half, 64, 64, 16, 2, 2);
 instantiate_qwen4_qsa_indexer_score(bfloat16, bfloat16_t, 64, 64, 16, 2, 2);
 

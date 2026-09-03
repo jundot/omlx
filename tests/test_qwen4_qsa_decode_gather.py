@@ -110,6 +110,102 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
+def test_qwen4_verify_window_uses_direct_qsa_and_matches_official(monkeypatch):
+    config = _tiny_text_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    attention = language.Qwen4ExpAttention(config)
+    monkeypatch.setattr(language, "_QSA_DIRECT_VERIFY_MIN_TOKENS", 0)
+    mx.eval(attention.parameters())
+    fast_cache = language.QSAKVCache()
+    reference_cache = language.QSAKVCache()
+
+    mx.random.seed(29)
+    prefix = mx.random.normal((1, 10, config.hidden_size))
+    verify = mx.random.normal((1, 4, config.hidden_size))
+    mx.eval(
+        attention(prefix, mask="causal", cache=fast_cache),
+        attention(prefix, mask="causal", cache=reference_cache),
+    )
+
+    calls = []
+    original = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape[2], args[1].shape[2]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    actual = attention(
+        verify,
+        mask="causal",
+        cache=fast_cache,
+        target_verify=True,
+    )
+
+    monkeypatch.setattr(
+        language.Qwen4ExpAttention,
+        "_gathered_text_verify_eligible",
+        lambda *args, **kwargs: False,
+    )
+    expected = attention(
+        verify,
+        mask="causal",
+        cache=reference_cache,
+        target_verify=True,
+    )
+    mx.eval(actual, expected)
+
+    assert calls == [(4, 14)]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert mx.array_equal(
+        mx.argmax(actual, axis=-1),
+        mx.argmax(expected, axis=-1),
+    ).item()
+    assert fast_cache.offset == reference_cache.offset == 14
+    for fast_value, reference_value in zip(
+        fast_cache.state,
+        reference_cache.state,
+    ):
+        assert mx.array_equal(fast_value, reference_value).item()
+
+
+def test_qwen4_verify_window_eligibility_fails_closed(monkeypatch):
+    config = _tiny_text_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    attention = language.Qwen4ExpAttention(config)
+    monkeypatch.setattr(language, "_QSA_DIRECT_VERIFY_MIN_TOKENS", 0)
+    cache = language.QSAKVCache()
+    prefix = mx.random.normal((1, 10, config.hidden_size))
+    mx.eval(attention(prefix, mask="causal", cache=cache))
+    window = mx.random.normal((1, 6, config.hidden_size))
+
+    assert attention._gathered_text_verify_eligible(
+        window, None, cache, None, None, True
+    )
+    assert not attention._gathered_text_verify_eligible(
+        window, None, cache, None, None, False
+    )
+    assert not attention._gathered_text_verify_eligible(
+        window, None, cache, mx.zeros((3, 1, 6), dtype=mx.int32), None, True
+    )
+    assert not attention._gathered_text_verify_eligible(
+        mx.broadcast_to(window, (2, 6, config.hidden_size)),
+        None,
+        cache,
+        None,
+        None,
+        True,
+    )
+
+    incomplete = language.QSAKVCache()
+    incomplete.offset = cache.offset
+    assert not attention._gathered_text_verify_eligible(
+        window, None, incomplete, None, None, True
+    )
+
+
 def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language

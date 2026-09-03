@@ -307,10 +307,16 @@ class Qwen4QSAIndexerScoresPrimitive : public Primitive {
 
     out.set_data(allocator::malloc(out.nbytes()));
 
-    constexpr int bm = 64;
+    // Lightning-MTP verifies at most eight rows.  The prefill BM64 kernel
+    // otherwise executes eight 8-row MMA fragments for a six-row window and
+    // makes that wasted work grow with the full QSA index.  BK and the MMA
+    // fragment reduction order stay identical; only the unused M tiles are
+    // removed, so retained FP32 scores are bit-for-bit equal.
+    const bool verify_tile = q.shape(2) <= 8;
+    const int bm = verify_tile ? 8 : 64;
     constexpr int bn = 64;
     constexpr int bk = 16;
-    constexpr int wm = 2;
+    const int wm = verify_tile ? 1 : 2;
     constexpr int wn = 2;
     const int B = q.shape(0);
     const int H = q.shape(1);

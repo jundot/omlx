@@ -190,6 +190,39 @@ def test_qwen4_qsa_native_scores_and_topk_match_fp32_reference(dtype):
     assert mx.array_equal(_topk_sets(actual, 64), _topk_sets(expected, 64)).item()
 
 
+@pytest.mark.parametrize("rows", [1, 6, 8])
+@pytest.mark.skipif(
+    not _native_available(),
+    reason="native Qwen4 QSA indexer-score ABI is unavailable",
+)
+def test_qwen4_qsa_native_verify_tile_is_bit_exact(rows):
+    mx.random.seed(1731 + rows)
+    q = (mx.random.normal((1, 4, rows, 128)) * 0.25).astype(mx.bfloat16)
+    k = (mx.random.normal((1, 1, 521, 128)) * 0.25).astype(mx.bfloat16)
+    mask_q_offset = 2048
+
+    actual = fast.qwen4_qsa_indexer_scores(
+        q,
+        k,
+        mask_ratio=4,
+        mask_q_offset=mask_q_offset,
+    )
+    expected = _reference_scores(
+        q,
+        k,
+        mask_ratio=4,
+        mask_q_offset=mask_q_offset,
+    )
+    mx.eval(actual, expected)
+
+    assert actual.shape == (1, rows, 521)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(
+        _topk_sets(actual, 64),
+        _topk_sets(expected, 64),
+    ).item()
+
+
 @pytest.mark.skipif(
     not _native_available(),
     reason="native Qwen4 QSA indexer-score ABI is unavailable",
