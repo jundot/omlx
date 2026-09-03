@@ -226,6 +226,7 @@ class QuantizedSwitchLinear(nn.Module):
             sorted_indices
             and x.ndim == 3
             and x.shape[-2] == 1
+            and x.dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 32
             and self.bits == 4
             and self.mode == "mxfp4"
@@ -265,6 +266,26 @@ class QuantizedSwitchLinear(nn.Module):
             and self["weight"].dtype == mx.uint32
             and self["scales"].dtype == dtype
             and biases.dtype == dtype
+        )
+
+    def _is_fp16_compatible(self) -> bool:
+        """Return whether this projection can safely consume fp16 input."""
+        weight = self["weight"]
+        scales = self["scales"]
+        if self._has_affine_metadata_dtype(mx.float16):
+            return True
+        return (
+            self.mode == "mxfp4"
+            and self.group_size == 32
+            and self.bits == 4
+            and self.get("biases") is None
+            and "bias" not in self
+            and weight.dtype == mx.uint32
+            and scales.dtype == mx.uint8
+            and weight.ndim == scales.ndim == 3
+            and weight.shape[:2] == scales.shape[:2]
+            and weight.shape[2] * 32
+            == scales.shape[2] * self.group_size * self.bits
         )
 
     def _native_block_kind(self, x, sorted_indices: bool, dtype=None) -> str | None:
@@ -397,6 +418,17 @@ class SwiGLU(nn.Module):
         return swiglu(gate, x)
 
 
+def _needs_fp16_moe_rescue(projections) -> bool:
+    """Return whether a compatible projection triplet needs fp16 rescue."""
+    if not all(isinstance(p, QuantizedSwitchLinear) for p in projections):
+        return False
+    # Resolve sanitizer-induced fp16 affine metadata without narrowing triplets
+    # that contain no such metadata.
+    return any(
+        p._has_affine_metadata_dtype(mx.float16) for p in projections
+    ) and all(p._is_fp16_compatible() for p in projections)
+
+
 class SwitchGLU(nn.Module):
     def __init__(
         self,
@@ -428,10 +460,9 @@ class SwitchGLU(nn.Module):
         block_plan = None
         native_kinds = None
         projections = (self.up_proj, self.gate_proj, self.down_proj)
-        use_f16_moe = original_dtype == mx.bfloat16 and all(
-            isinstance(p, QuantizedSwitchLinear)
-            and p._has_affine_metadata_dtype(mx.float16)
-            for p in projections
+        use_f16_moe = (
+            original_dtype == mx.bfloat16
+            and _needs_fp16_moe_rescue(projections)
         )
         if do_sort and all(isinstance(p, QuantizedSwitchLinear) for p in projections):
             native_kinds = tuple(p._native_block_kind(x, do_sort) for p in projections)
@@ -440,8 +471,9 @@ class SwitchGLU(nn.Module):
                     p._native_block_kind(x, do_sort, dtype=mx.float16)
                     for p in projections
                 )
-                if all(kind == "mxfp4" for kind in f16_native_kinds) or all(
-                    kind == "affine" for kind in f16_native_kinds
+                if _needs_fp16_moe_rescue(projections) and (
+                    all(kind == "mxfp4" for kind in f16_native_kinds)
+                    or all(kind == "affine" for kind in f16_native_kinds)
                 ):
                     native_kinds = f16_native_kinds
                     use_f16_moe = True
