@@ -26,7 +26,7 @@ from omlx.engine_core import (
 )
 from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
 from omlx.output_collector import RequestOutputCollector
-from omlx.request import RequestOutput, SamplingParams
+from omlx.request import RequestOutput, SamplingParams, current_client_request_id
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
 
@@ -336,6 +336,30 @@ class TestEngineCoreAddRequest:
 
                 assert request_id == "custom-request-001"
             finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_add_request_records_the_callers_request_id(
+        self, mock_model, mock_tokenizer
+    ):
+        """The caller's X-Request-ID in the task context is stamped on the request."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            token = current_client_request_id.set("caller-123")
+
+            try:
+                await engine.start()
+
+                request_id = await engine.add_request(prompt="Hello")
+
+                request = engine.scheduler.get_request(request_id)
+                assert request is not None
+                assert request.client_request_id == "caller-123"
+            finally:
+                current_client_request_id.reset(token)
                 await engine.stop()
                 engine.close()
 

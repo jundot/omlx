@@ -5279,6 +5279,19 @@ async def get_server_activity(is_admin: bool = Depends(require_admin)):
     return {"active_models": _build_active_models_data()}
 
 
+def _client_request_id_fields(request) -> dict:
+    """Return the caller's own request id for an activity row, if it sent one.
+
+    The engine's request id is internal and never returned over HTTP, so a
+    client polling the activity API cannot otherwise tell which in-flight row
+    is its own once two requests run concurrently. Omitted entirely for
+    requests without an ``X-Request-ID`` header, so their rows keep the
+    existing shape.
+    """
+    client_request_id = getattr(request, "client_request_id", None)
+    return {"client_request_id": client_request_id} if client_request_id else {}
+
+
 def _build_active_models_data() -> dict:
     """Build active models status for the dashboard Active Models card."""
     from ..model_discovery import format_size
@@ -5375,6 +5388,7 @@ def _build_active_models_data() -> dict:
                         "queue_position": idx,
                         "elapsed_seconds": max(0.0, now - req.arrival_time),
                         "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                        **_client_request_id_fields(req),
                     }
                     for idx, req in enumerate(waiting_queue, start=1)
                 ]
@@ -5387,6 +5401,8 @@ def _build_active_models_data() -> dict:
                 activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
+        for row in prefilling:
+            row.update(_client_request_id_fields(running_by_id.get(row["request_id"])))
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
             active_request_ids = set(running_by_id) | prefilling_ids
@@ -5419,6 +5435,7 @@ def _build_active_models_data() -> dict:
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                    **_client_request_id_fields(req),
                 }
             )
 
