@@ -34,6 +34,7 @@ from omlx.cache.paged_ssd_cache import (
     _write_safetensors_no_mx,
     parse_size,
 )
+from omlx.utils.formatting import format_bytes
 
 
 def _has_mlx() -> bool:
@@ -1261,6 +1262,369 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    # -- Startup scan: reason tally + same-model block_size WARNING --------------
+    #
+    # Since e6939218 (#1413) blocks that fail the compatibility check are never
+    # indexed, so the per-hit "Cache block size mismatch" WARNING in
+    # prefix_cache.py cannot fire for them. After the ArraysCache block size
+    # moved 2048 -> 4096 on large hosts (#3066) the only trace of a dead cache
+    # was the INFO ``skipped_incompatible=N`` count, indistinguishable from
+    # legitimate multi-model sharing of the directory.
+
+    def _scan_records(self, caplog, cache_dir, **expectations):
+        # Only the scan under test: an earlier manager in the same test (or
+        # a suite-wide INFO level left by another test) must not leak records.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            manager = PagedSSDCacheManager(
+                cache_dir=cache_dir,
+                max_size_bytes=1024**3,
+                **expectations,
+            )
+        summaries = [
+            r for r in caplog.records if "SSD cache scan complete" in r.message
+        ]
+        size_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "block_size=" in r.message
+        ]
+        assert len(summaries) == 1, "scan completion log not emitted exactly once"
+        return manager, summaries[0], size_warnings
+
+    def test_scan_warns_same_model_block_size_mismatch(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """Same-model blocks rejected on block_size alone get ONE WARNING."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        stale_a = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x50" + b"\x00" * 31,
+            num_layers=40,
+            model_name="m",
+            block_size=2048,
+        )
+        stale_b = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x51" + b"\x00" * 31,
+            num_layers=40,
+            model_name="m",
+            block_size=2048,
+        )
+        stale_c = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x52" + b"\x00" * 31,
+            num_layers=40,
+            model_name="m",
+            block_size=1024,
+        )
+        other = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x53" + b"\x00" * 31,
+            num_layers=40,
+            model_name="other",
+            block_size=4096,
+        )
+
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+
+        assert len(size_warnings) == 1
+        warning = size_warnings[0]
+        assert warning.name == "omlx.cache.paged_ssd_cache"
+        assert caplog.records.index(warning) > caplog.records.index(summary)
+        stale_bytes = sum(p.stat().st_size for p in (stale_a, stale_b, stale_c))
+        for needle in (
+            "3 block",
+            format_bytes(stale_bytes),
+            "block_size=2048",
+            "block_size=1024",
+            "configured block_size=4096",
+            "'m'",
+            "cannot be reused",
+            "LRU eviction",
+            "POST /api/ssd-cache/clear",
+        ):
+            assert needle in warning.message, needle
+
+        assert "skipped_incompatible=4 blocks" in summary.message
+        assert summary.message.endswith(" [reasons: model_name=1, block_size=3]")
+        for h in (0x50, 0x51, 0x52, 0x53):
+            assert not manager.has_block(bytes([h]) + b"\x00" * 31)
+        for path in (stale_a, stale_b, stale_c, other):
+            assert path.exists()
+
+    def test_scan_block_size_warning_absent_for_model_name_mismatch(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """Another model sharing the directory is INFO-only."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        paths = [
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x60 + i]) + b"\x00" * 31,
+                num_layers=40,
+                model_name="other",
+                block_size=4096,
+            )
+            for i in range(2)
+        ]
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+        assert size_warnings == []
+        assert "skipped_incompatible=2 blocks" in summary.message
+        assert summary.message.endswith(" [reasons: model_name=2]")
+        for i, path in enumerate(paths):
+            assert not manager.has_block(bytes([0x60 + i]) + b"\x00" * 31)
+            assert path.exists()
+
+    def test_scan_block_size_warning_absent_for_layer_count_mismatch(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """A same-model layer-count mismatch is INFO-only."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        paths = [
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x60 + i]) + b"\x00" * 31,
+                num_layers=30,
+                model_name="m",
+                block_size=4096,
+            )
+            for i in range(2)
+        ]
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+        assert size_warnings == []
+        assert "skipped_incompatible=2 blocks" in summary.message
+        assert summary.message.endswith(" [reasons: num_layers=2]")
+        for i, path in enumerate(paths):
+            assert not manager.has_block(bytes([0x60 + i]) + b"\x00" * 31)
+            assert path.exists()
+
+    def test_scan_block_size_warning_absent_without_expected_model_name(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """No positive model match (empty expectation) -> tally only, no WARNING.
+
+        ``factory.py`` passes ``config.model_name or ""``; with no expected
+        model the check is skipped and another model's blocks must never be
+        reported as this model's dead blocks.
+        """
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        paths = [
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x60 + i]) + b"\x00" * 31,
+                num_layers=40,
+                model_name="other",
+                block_size=2048,
+            )
+            for i in range(2)
+        ]
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+        assert size_warnings == []
+        assert "skipped_incompatible=2 blocks" in summary.message
+        assert summary.message.endswith(" [reasons: block_size=2]")
+        for i, path in enumerate(paths):
+            assert not manager.has_block(bytes([0x60 + i]) + b"\x00" * 31)
+            assert path.exists()
+
+    def test_scan_block_size_warning_absent_for_legacy_unstamped_size(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """A same-model block with no stamped size (0) is rejected but is not
+        "another block size": it counts under the reason tally only."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x60" + b"\x00" * 31,
+            num_layers=40,
+            model_name="m",
+            block_size=0,
+        )
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+        assert size_warnings == []
+        assert "skipped_incompatible=1 blocks" in summary.message
+        assert summary.message.endswith(" [reasons: block_size=1]")
+        assert not manager.has_block(b"\x60" + b"\x00" * 31)
+        assert path.exists()
+
+    def test_scan_block_size_warning_absent_when_expected_block_size_unset(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """With no expected block size mixed sizes index exactly as today."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        for i, size in enumerate((2048, 4096)):
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x60 + i]) + b"\x00" * 31,
+                num_layers=40,
+                model_name="m",
+                block_size=size,
+            )
+        manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=0,
+        )
+        assert size_warnings == []
+        assert "skipped_incompatible" not in summary.message
+        assert "[reasons:" not in summary.message
+        for i in range(2):
+            assert manager.has_block(bytes([0x60 + i]) + b"\x00" * 31)
+
+    def _reason_manager(self, tmp_path: Path):
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+            expected_layer_cache_types=["KVCache"],
+        )
+
+    @staticmethod
+    def _metadata(**overrides) -> PagedSSDBlockMetadata:
+        fields = dict(
+            block_hash=b"\x01" * 32,
+            file_path=Path("/nonexistent/block.safetensors"),
+            file_size=1,
+            token_count=32,
+            created_at=0.0,
+            last_access=0.0,
+            num_layers=40,
+            model_name="m",
+            block_size=4096,
+            cache_signature="",
+            layer_cache_types=["KVCache"],
+        )
+        fields.update(overrides)
+        return PagedSSDBlockMetadata(**fields)
+
+    def test_incompatibility_reason_labels_single_failures(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Each single failing check maps to its own label; compatible -> None."""
+        manager = self._reason_manager(tmp_path)
+        split_signature = json.dumps({"payload_layout": "split"})
+        cases = [
+            (self._metadata(), None),
+            (self._metadata(model_name="other"), "model_name"),
+            (self._metadata(num_layers=30), "num_layers"),
+            (self._metadata(block_size=2048), "block_size"),
+            (self._metadata(block_size=0), "block_size"),
+            (self._metadata(layer_cache_types=["ArraysCache"]), "layer_cache_types"),
+            (self._metadata(cache_signature=split_signature), "cache_signature"),
+        ]
+        # The rejecting signature really is rejected by the signature check
+        # alone, so the label below is that check's and not a side effect.
+        assert not manager._is_compatible_cache_signature(
+            self._metadata(cache_signature=split_signature)
+        )
+        for metadata, expected in cases:
+            assert manager._incompatibility_reason(metadata) == expected, expected
+            assert manager._is_compatible_block(metadata) is (expected is None)
+
+    def test_incompatibility_reason_first_failure_ordering(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """Multiple failures report the FIRST check in the fixed order."""
+        manager = self._reason_manager(tmp_path)
+        split_signature = json.dumps({"payload_layout": "split"})
+        assert (
+            manager._incompatibility_reason(
+                self._metadata(model_name="other", block_size=2048)
+            )
+            == "model_name"
+        )
+        assert (
+            manager._incompatibility_reason(
+                self._metadata(num_layers=30, block_size=2048)
+            )
+            == "num_layers"
+        )
+        assert (
+            manager._incompatibility_reason(
+                self._metadata(block_size=2048, layer_cache_types=["ArraysCache"])
+            )
+            == "block_size"
+        )
+        assert (
+            manager._incompatibility_reason(
+                self._metadata(
+                    layer_cache_types=["ArraysCache"], cache_signature=split_signature
+                )
+            )
+            == "layer_cache_types"
+        )
+
+        # Through the scan: a same-model block wrong on BOTH layers and size is
+        # a num_layers reject and must not trigger the block_size WARNING.
+        mx = mock_mlx
+        cache_dir = tmp_path / "scan_dir"
+        self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            b"\x70" + b"\x00" * 31,
+            num_layers=30,
+            model_name="m",
+            block_size=2048,
+        )
+        _manager, summary, size_warnings = self._scan_records(
+            caplog,
+            cache_dir,
+            expected_model_name="m",
+            expected_num_layers=40,
+            expected_block_size=4096,
+        )
+        assert size_warnings == []
+        assert summary.message.endswith(" [reasons: num_layers=1]")
 
     def test_model_switch_enforces_shared_ssd_limit_on_new_save(
         self, tmp_path: Path, mock_mlx

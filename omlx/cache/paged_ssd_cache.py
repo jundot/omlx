@@ -2250,6 +2250,13 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        # Why each incompatible block was rejected, and — separately — the
+        # blocks of THIS model that were rejected only because they were
+        # written with another paged block size (the #3066 upgrade path,
+        # where the ArraysCache block size moved 2048 -> 4096 on large hosts
+        # and the whole cache went dark with no signal beyond the count).
+        reason_counts: dict[str, int] = {}
+        same_model_size_mismatch: dict[int, tuple[int, int]] = {}
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2262,9 +2269,31 @@ class PagedSSDCacheManager(CacheManager):
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
                         continue
-                    if not self._is_compatible_block(metadata):
+                    reason = self._incompatibility_reason(metadata)
+                    if reason is not None:
                         skipped_incompatible += 1
                         skipped_incompatible_bytes += metadata.file_size
+                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                        # Only a POSITIVE model match counts toward the
+                        # warning: with no expected model name the model
+                        # check is skipped, and another model's blocks must
+                        # never be reported as this model's dead blocks.
+                        # Legacy blocks with no stamped size (0) are rejected
+                        # under the same label but are not "another block
+                        # size", so they stay out of the warning.
+                        if (
+                            reason == "block_size"
+                            and metadata.block_size > 0
+                            and self._expected_model_name
+                            and metadata.model_name == self._expected_model_name
+                        ):
+                            count, size = same_model_size_mismatch.get(
+                                metadata.block_size, (0, 0)
+                            )
+                            same_model_size_mismatch[metadata.block_size] = (
+                                count + 1,
+                                size + metadata.file_size,
+                            )
                         self._incompatible_index.add(metadata)
                         continue
                     self._index.add(metadata)
@@ -2295,7 +2324,42 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
+        if skipped_incompatible > 0:
+            # Same order as the checks in _incompatibility_reason.
+            reasons = ", ".join(
+                f"{name}={reason_counts[name]}"
+                for name in (
+                    "model_name",
+                    "num_layers",
+                    "block_size",
+                    "layer_cache_types",
+                    "cache_signature",
+                )
+                if reason_counts.get(name)
+            )
+            log_msg += f" [reasons: {reasons}]"
         logger.info(log_msg)
+
+        if same_model_size_mismatch:
+            stale_blocks = sum(
+                count for count, _size in same_model_size_mismatch.values()
+            )
+            stale_bytes = sum(
+                size for _count, size in same_model_size_mismatch.values()
+            )
+            stale_sizes = ", ".join(
+                f"block_size={size} ({count})"
+                for size, (count, _bytes) in sorted(same_model_size_mismatch.items())
+            )
+            logger.warning(
+                f"SSD cache: {stale_blocks} block(s) ({format_bytes(stale_bytes)}) "
+                f"for model '{self._expected_model_name}' were written with "
+                f"{stale_sizes} but this server uses configured "
+                f"block_size={self._expected_block_size}; blocks of another "
+                f"block size cannot be reused. They stay on disk and count "
+                f"against the SSD cache budget until LRU eviction or "
+                f"POST /api/ssd-cache/clear reclaims them."
+            )
 
         # Startup can find a cache directory that already exceeds the shared
         # SSD budget. Converge immediately before serving requests.
@@ -2591,29 +2655,38 @@ class PagedSSDCacheManager(CacheManager):
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a block can be indexed for this manager."""
+        return self._incompatibility_reason(metadata) is None
+
+    def _incompatibility_reason(self, metadata: PagedSSDBlockMetadata) -> str | None:
+        """Name the first compatibility check a block fails, or None if it passes.
+
+        Same checks and order as the boolean gate used to have; the label lets
+        the startup scan tell "another model shares this directory" from
+        "this model's blocks were written with another block_size".
+        """
         if self._expected_model_name and metadata.model_name:
             if metadata.model_name != self._expected_model_name:
-                return False
+                return "model_name"
         if self._expected_num_layers > 0 and metadata.num_layers > 0:
             if metadata.num_layers != self._expected_num_layers:
-                return False
+                return "num_layers"
         if self._expected_block_size > 0:
             if metadata.block_size <= 0:
-                return False
+                return "block_size"
             if metadata.block_size != self._expected_block_size:
-                return False
+                return "block_size"
         if self._expected_layer_cache_types is not None:
             if _canonicalize_layer_cache_types(
                 metadata.layer_cache_types
             ) != _canonicalize_layer_cache_types(self._expected_layer_cache_types):
-                return False
+                return "layer_cache_types"
         # Always gate the payload layout.  A manager without any other
         # expectation still must not index a split block as an embedded block
         # (or vice versa).  Signatures from before layout stamping default to
         # embedded inside ``_is_compatible_cache_signature``.
         if not self._is_compatible_cache_signature(metadata):
-            return False
-        return True
+            return "cache_signature"
+        return None
 
     def _is_compatible_cache_signature(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a saved cache_signature matches enabled checks."""
