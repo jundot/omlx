@@ -950,7 +950,9 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
     return True
 
 
-def detect_reasoning_effort(model_path: Path) -> tuple[list[str] | None, str | None]:
+def detect_reasoning_effort(
+    model_path: Path, config_model_type: str | None = None
+) -> tuple[list[str] | None, str | None]:
     """Detect the model chat template's ``reasoning_effort`` contract.
 
     Returns an ``(options, default)`` tuple:
@@ -967,7 +969,24 @@ def detect_reasoning_effort(model_path: Path) -> tuple[list[str] | None, str | N
       ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
       block. None when unknown (numeric or implicit defaults are not
       exposed).
+
+    A model served through an oMLX chat-template patch has no template on disk
+    to read, so such a patch declares its own vocabulary and is consulted
+    first (see ``chat_template_patches``). ``config_model_type`` is the
+    ``model_type`` from ``config.json``; it is read here when not supplied.
     """
+    from .chat_template_patches import reasoning_effort_vocabulary_for
+
+    if config_model_type is None:
+        try:
+            with (model_path / "config.json").open(encoding="utf-8") as config_file:
+                config_model_type = str(json.load(config_file).get("model_type", ""))
+        except (OSError, json.JSONDecodeError):
+            config_model_type = ""
+    patched = reasoning_effort_vocabulary_for(config_model_type)
+    if patched is not None:
+        return patched
+
     template_text = _read_chat_template_text(model_path)
     if not template_text or "reasoning_effort" not in template_text:
         return None, None
@@ -1553,7 +1572,9 @@ def _register_model(
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
-        reasoning_effort_options, reasoning_effort_default = detect_reasoning_effort(model_dir)
+        reasoning_effort_options, reasoning_effort_default = detect_reasoning_effort(
+            model_dir, config_model_type
+        )
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
