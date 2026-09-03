@@ -115,6 +115,20 @@ def test_vision_prefill_chunks_never_split_an_image_block():
     ]
 
 
+def test_vision_prefill_chunks_isolate_image_from_surrounding_text():
+    prompt = [1, 2, 101, 100, 102, 103, 104, 3, 4]
+
+    chunks = vision_prefill_chunks(
+        prompt,
+        vocab_size=100,
+        max_chunk_tokens=16,
+    )
+
+    # The leading IMAGE_PAD belongs to the image block. Keeping text out of
+    # this model call bounds the non-standard image-visibility attention path.
+    assert chunks == ((0, 2), (2, 7), (7, 9))
+
+
 def test_vision_prefill_chunks_accept_a_cache_suffix_inside_an_image():
     chunks = vision_prefill_chunks(
         [101, 102, 103, 104, 7, 8],

@@ -45,10 +45,19 @@ _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+# Dynamic ceilings legitimately move a little while daemon bookkeeping and
+# SSH probes run. Keep the allowance small: a multi-GiB tolerance could admit
+# one reload after every crash and compound the very driver leak this barrier
+# exists to contain.
+_RECOVERY_CEILING_TOLERANCE_BYTES = 256 * 1024**2
 
 
 class DistributedLaunchError(RuntimeError):
     """Raised when a distributed job cannot become or remain ready."""
+
+
+class DistributedMemoryRecoveryError(DistributedLaunchError):
+    """Raised when ranks exited but accelerator memory is not reusable yet."""
 
 
 @dataclass(frozen=True)
@@ -121,6 +130,32 @@ def _wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
             return False
         time.sleep(min(0.05, remaining))
     return True
+
+
+def _boot_session_id() -> str:
+    """Return a stable identifier that changes after a host reboot."""
+
+    linux_boot_id = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        value = linux_boot_id.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        value = result.stdout.strip()
+        if result.returncode == 0 and value:
+            return hashlib.sha256(value.encode()).hexdigest()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
 
 
 def _available_launch_ports(
@@ -1142,6 +1177,7 @@ def probe_remote_admission_ceiling(
     ssh_target: str,
     *,
     python_executable: str | None = None,
+    memory_guard_tier: str = "",
     timeout: float = 8.0,
     runner: SSHRunner = subprocess.run,
 ) -> int:
@@ -1173,24 +1209,36 @@ def probe_remote_admission_ceiling(
     except Exception:
         local_port = 8000
     ports = tuple(dict.fromkeys((local_port, 9000)))
-    script = (
-        "import json,urllib.request\n"
-        "ceiling=0\n"
-        f"for port in {ports!r}:\n"
-        "    try:\n"
-        "        with urllib.request.urlopen("
-        "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
-        "            health=json.load(response)\n"
-        "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
-        "        if ceiling>0:\n"
-        "            break\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "if ceiling<=0:\n"
-        "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
-        "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
-        "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
-    )
+    if memory_guard_tier:
+        # Recovery checks must use the tier signed into this deployment. The
+        # peer daemon's /health value reflects its own current UI setting and
+        # can therefore be more permissive than the rank we are about to
+        # restart.
+        script = (
+            "import json\n"
+            "from omlx.cluster.memory_guard import ceiling_breakdown\n"
+            f"ceiling=int(ceiling_breakdown({memory_guard_tier!r}).get('hard_limit',0))\n"
+            "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
+        )
+    else:
+        script = (
+            "import json,urllib.request\n"
+            "ceiling=0\n"
+            f"for port in {ports!r}:\n"
+            "    try:\n"
+            "        with urllib.request.urlopen("
+            "'http://127.0.0.1:%d/health'%port,timeout=2) as response:\n"
+            "            health=json.load(response)\n"
+            "        ceiling=int(health.get('engine_pool',{}).get('final_ceiling',0))\n"
+            "        if ceiling>0:\n"
+            "            break\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "if ceiling<=0:\n"
+            "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
+            "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
+            "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
+        )
 
     def _read(executable: str) -> subprocess.CompletedProcess[str]:
         return _run_cluster_ssh(
@@ -1729,16 +1777,21 @@ class DistributedJobSupervisor:
         state_dir: str = "~/.omlx/cluster/runtime",
         load_timeout: float = 1800.0,
         stop_timeout: float = 10.0,
+        recovery_timeout: float = 10.0,
         preflight: bool = True,
     ) -> None:
-        if load_timeout <= 0 or stop_timeout <= 0:
-            raise ValueError("supervisor timeouts must be positive")
+        if load_timeout <= 0 or stop_timeout <= 0 or recovery_timeout < 0:
+            raise ValueError(
+                "load/stop timeouts must be positive and recovery timeout "
+                "must be non-negative"
+            )
         self.deployment = deployment
         self.python_executable = _validate_python_executable(python_executable)
         self.cwd = cwd
         self.state_dir = state_dir
         self.load_timeout = load_timeout
         self.stop_timeout = stop_timeout
+        self.recovery_timeout = recovery_timeout
         self.preflight = preflight
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
@@ -1746,6 +1799,11 @@ class DistributedJobSupervisor:
         self.ready_event: dict[str, Any] | None = None
         self.rank_ready_events: dict[int, dict[str, Any]] = {}
         self.failure_event: dict[str, Any] | None = None
+        self._recovery_required_reason: str | None = None
+        self._teardown_failure_reason: str | None = None
+        self._teardown_incomplete = False
+        self._pending_process_group: int | None = None
+        self._recovery_baseline_by_rank: dict[int, int] = {}
         self._phase = "stopped"
         self._temporary: tempfile.TemporaryDirectory[str] | None = None
         self._stdout = deque(maxlen=_LOG_HISTORY)
@@ -1760,12 +1818,17 @@ class DistributedJobSupervisor:
     def start(self) -> dict[str, Any]:
         if self.process is not None:
             raise RuntimeError("distributed job is already started")
+        self._check_recovery_quarantine()
         self._phase = "preflight"
         if self.preflight:
-            preflight_remote_hosts(
+            preflight_status = preflight_remote_hosts(
                 self.deployment,
                 python_executable=self.python_executable,
             )
+            self._recovery_baseline_by_rank = {
+                int(item["rank"]): int(item.get("admission_ceiling_bytes") or 0)
+                for item in preflight_status
+            }
 
         self._temporary = tempfile.TemporaryDirectory(prefix="omlx-distributed-launch-")
         hostfile = Path(self._temporary.name) / "hostfile.json"
@@ -1812,8 +1875,14 @@ class DistributedJobSupervisor:
             self._phase = "ready"
             self.ready_event = event
             return event
-        except Exception:
-            self._terminate()
+        except Exception as start_error:
+            try:
+                self._terminate()
+            except Exception as cleanup_error:
+                raise DistributedLaunchError(
+                    f"distributed start failed: {start_error}; cleanup also "
+                    f"failed: {cleanup_error}"
+                ) from start_error
             raise
 
     def _start_readers(self) -> None:
@@ -1934,13 +2003,25 @@ class DistributedJobSupervisor:
 
     def _terminate(self) -> None:
         process = self.process
-        if process is not None:
-            process_group = process.pid
+        teardown_failures: list[str] = []
+        verify_teardown = process is not None or self._teardown_incomplete
+        verify_recovery = process is not None or self._recovery_marker_path().is_file()
+        process_group = (
+            process.pid if process is not None else self._pending_process_group
+        )
+        if process_group is not None:
             deadline = time.monotonic() + self.stop_timeout
             if _process_group_alive(process_group):
-                with suppress(ProcessLookupError):
+                try:
                     os.killpg(process_group, signal.SIGTERM)
-            if process.poll() is None:
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    teardown_failures.append(
+                        f"local launch process group {process_group} could not "
+                        "be signaled"
+                    )
+            if process is not None and process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(
                         timeout=max(0.0, deadline - time.monotonic())
@@ -1953,13 +2034,39 @@ class DistributedJobSupervisor:
             # group has disappeared.
             remaining = max(0.0, deadline - time.monotonic())
             if not _wait_for_process_group_exit(process_group, remaining):
-                with suppress(ProcessLookupError):
+                try:
                     os.killpg(process_group, signal.SIGKILL)
-                _wait_for_process_group_exit(process_group, 2.0)
-            if process.poll() is None:
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    teardown_failures.append(
+                        f"local launch process group {process_group} could not "
+                        "be killed"
+                    )
+                if not _wait_for_process_group_exit(process_group, 2.0):
+                    teardown_failures.append(
+                        f"local launch process group {process_group} survived SIGKILL"
+                    )
+            if process is not None and process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
-        self._reap_remote_ranks()
+            if process is not None and process.poll() is None:
+                teardown_failures.append(
+                    f"launcher process {process.pid} could not be reaped"
+                )
+        remote_reports = self._reap_remote_ranks()
+        for report in remote_reports:
+            if verify_teardown and report["action"] in {
+                "unreachable",
+                "kill-failed",
+                "identity-mismatch",
+                "marker-unreadable",
+                "no-marker",
+                "no-report",
+            }:
+                teardown_failures.append(
+                    f"rank {report['rank']} on {report['host']}: {report['action']}"
+                )
         for reader in self._readers:
             reader.join(timeout=0.5)
         self._readers.clear()
@@ -1978,7 +2085,29 @@ class DistributedJobSupervisor:
             self._temporary.cleanup()
             self._temporary = None
 
-    def _reap_remote_ranks(self, *, runner: SSHRunner = subprocess.run) -> None:
+        if teardown_failures:
+            self._teardown_incomplete = True
+            self._pending_process_group = process_group
+            self._phase = "teardown_failed"
+            self._teardown_failure_reason = "; ".join(teardown_failures)
+            self._write_recovery_quarantine(
+                self._teardown_failure_reason,
+                unconfirmed_process=True,
+            )
+            raise DistributedLaunchError(
+                "distributed teardown could not confirm every rank exited; "
+                "reload is blocked because a surviving rank may still own Metal "
+                "memory: " + self._teardown_failure_reason
+            )
+        self._teardown_incomplete = False
+        self._pending_process_group = None
+        self._teardown_failure_reason = None
+        if verify_recovery:
+            self._wait_for_memory_recovery()
+
+    def _reap_remote_ranks(
+        self, *, runner: SSHRunner = subprocess.run
+    ) -> list[dict[str, Any]]:
         """Kill rank workers on peer hosts that the local group kill cannot reach.
 
         ``mlx.launch`` runs each rank through SSH in its own process group on
@@ -1998,8 +2127,9 @@ class DistributedJobSupervisor:
         what it did as one JSON line so a failed reap is visible in the logs
         instead of passing as a clean stop.
         """
+        reports: list[dict[str, Any]] = []
         if not self.deployment or not self.deployment.hosts:
-            return
+            return reports
         for rank, host in enumerate(self.deployment.hosts):
             if host.ssh in _LOOPBACK_TARGETS:
                 continue
@@ -2089,6 +2219,9 @@ class DistributedJobSupervisor:
                     host.ssh,
                     exc,
                 )
+                reports.append(
+                    {"rank": rank, "host": host.ssh, "action": "unreachable"}
+                )
                 continue
             action = ""
             for line in reversed(completed.stdout.strip().splitlines()):
@@ -2125,6 +2258,197 @@ class DistributedJobSupervisor:
                     host.ssh,
                     completed.returncode,
                 )
+                action = "no-report"
+            reports.append({"rank": rank, "host": host.ssh, "action": action})
+        return reports
+
+    def _recovery_marker_path(self) -> Path:
+        return (
+            Path(self.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-memory-recovery.json"
+        )
+
+    def _probe_recovery_capacity(self) -> list[dict[str, Any]]:
+        """Read every host's live ceiling without starting another rank."""
+
+        from .memory_guard import ceiling_breakdown
+
+        assignments = sorted(self.deployment.assignments, key=lambda item: item.rank)
+        results: list[dict[str, Any]] = []
+        for host, assignment in zip(
+            self.deployment.hosts, assignments, strict=True
+        ):
+            if host.ssh in _LOOPBACK_TARGETS:
+                ceiling = int(
+                    ceiling_breakdown(assignment.memory_guard_tier).get(
+                        "hard_limit", 0
+                    )
+                )
+            else:
+                ceiling = probe_remote_admission_ceiling(
+                    host.ssh,
+                    python_executable=host.python_executable,
+                    memory_guard_tier=assignment.memory_guard_tier,
+                    timeout=min(8.0, max(1.0, self.stop_timeout)),
+                )
+            results.append(
+                {
+                    "rank": assignment.rank,
+                    "node_id": host.node_id,
+                    "admission_ceiling_bytes": ceiling,
+                }
+            )
+        return results
+
+    def _recovery_failure(self) -> str | None:
+        try:
+            status = self._probe_recovery_capacity()
+            _validate_deployment_admission(self.deployment, status)
+        except Exception as exc:  # noqa: BLE001 - an unreadable host is not safe
+            return str(exc) or type(exc).__name__
+        by_rank = {int(item["rank"]): item for item in status}
+        regressed: list[str] = []
+        gib = 1024**3
+        for assignment in self.deployment.assignments:
+            baseline = self._recovery_baseline_by_rank.get(assignment.rank, 0)
+            current = int(
+                by_rank.get(assignment.rank, {}).get("admission_ceiling_bytes") or 0
+            )
+            if baseline > 0 and current < baseline - _RECOVERY_CEILING_TOLERANCE_BYTES:
+                regressed.append(
+                    f"rank {assignment.rank} ({assignment.node_id}) recovered "
+                    f"only {current / gib:.1f} GiB of its {baseline / gib:.1f} "
+                    "GiB pre-launch ceiling"
+                )
+        if regressed:
+            return "; ".join(regressed)
+        return None
+
+    def _write_recovery_quarantine(
+        self, reason: str, *, unconfirmed_process: bool = False
+    ) -> None:
+        path = self._recovery_marker_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": 1,
+                "deployment_id": self.deployment.deployment_id,
+                "plan_hash": self.deployment.plan_hash,
+                "created_at": time.time(),
+                "reason": reason[:_LOG_LINE_LIMIT],
+                "kind": (
+                    "unconfirmed_process"
+                    if unconfirmed_process
+                    else "memory_recovery"
+                ),
+                "boot_session_id": _boot_session_id(),
+                "baseline_ceiling_bytes": {
+                    str(rank): ceiling
+                    for rank, ceiling in self._recovery_baseline_by_rank.items()
+                    if ceiling > 0
+                },
+            }
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, sort_keys=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary)
+        except OSError:
+            # The in-memory supervisor still blocks this unload. Persistence
+            # only extends the quarantine across a daemon restart.
+            logger.exception("Could not persist distributed memory quarantine")
+
+    def _clear_recovery_quarantine(self) -> None:
+        with suppress(FileNotFoundError):
+            self._recovery_marker_path().unlink()
+
+    def _recovery_required_error(self, reason: str) -> DistributedMemoryRecoveryError:
+        return DistributedMemoryRecoveryError(
+            "All distributed rank processes exited, but their live memory "
+            "ceilings have not recovered enough to reload this plan. Reload is "
+            "quarantined to avoid compounding retained Metal/accelerator memory. "
+            f"{reason}. Wait for memory pressure to settle; if it does not, "
+            "reboot the affected Mac before retrying."
+        )
+
+    def _check_recovery_quarantine(self) -> None:
+        """Honor a previous crash quarantine before launching any process."""
+
+        if not self._recovery_marker_path().is_file():
+            return
+        try:
+            marker = json.loads(
+                self._recovery_marker_path().read_text(encoding="utf-8")
+            )
+            if marker.get("kind") == "unconfirmed_process":
+                marker_boot = str(marker.get("boot_session_id") or "")
+                current_boot = _boot_session_id()
+                if not marker_boot or not current_boot or marker_boot == current_boot:
+                    reason = str(
+                        marker.get("reason")
+                        or "a previous teardown could not confirm every rank exited"
+                    )
+                    self._phase = "teardown_failed"
+                    self._teardown_failure_reason = reason
+                    raise DistributedLaunchError(
+                        "Distributed reload remains quarantined because a rank "
+                        "process was not confirmed dead in this boot session: "
+                        f"{reason}. Reboot the affected host before retrying."
+                    )
+            baselines = marker.get("baseline_ceiling_bytes", {})
+            if isinstance(baselines, dict):
+                self._recovery_baseline_by_rank = {
+                    int(rank): int(ceiling)
+                    for rank, ceiling in baselines.items()
+                    if int(ceiling) > 0
+                }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # A malformed marker still means the previous teardown asked us
+            # not to launch. Re-probe against plan-fit and replace it with a
+            # valid marker if memory remains unavailable.
+            logger.warning(
+                "Distributed memory quarantine marker is unreadable: %s",
+                self._recovery_marker_path(),
+            )
+        reason = self._recovery_failure()
+        if reason is None:
+            self._clear_recovery_quarantine()
+            self._recovery_required_reason = None
+            logger.info(
+                "Distributed memory recovered for %s; clearing reload quarantine",
+                self.deployment.deployment_id,
+            )
+            return
+        self._phase = "recovery_required"
+        self._recovery_required_reason = reason
+        raise self._recovery_required_error(reason)
+
+    def _wait_for_memory_recovery(self) -> None:
+        """Require live capacity recovery after ranks have been fully reaped."""
+
+        deadline = time.monotonic() + self.recovery_timeout
+        while True:
+            reason = self._recovery_failure()
+            if reason is None:
+                self._clear_recovery_quarantine()
+                self._recovery_required_reason = None
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._write_recovery_quarantine(reason)
+                self._phase = "recovery_required"
+                self._recovery_required_reason = reason
+                raise self._recovery_required_error(reason)
+            time.sleep(min(0.5, remaining))
 
     def _exit_detail(self, returncode: int | None) -> str:
         failure_reason = self._failure_reason() or self._runtime_failure_reason()
@@ -2205,7 +2529,11 @@ class DistributedJobSupervisor:
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
             stderr_tail=tuple(self._stderr)[-20:],
-            failure_reason=self._failure_reason(),
+            failure_reason=(
+                self._failure_reason()
+                or self._teardown_failure_reason
+                or self._recovery_required_reason
+            ),
             ranks=tuple(
                 dict(self.rank_ready_events[rank])
                 for rank in sorted(self.rank_ready_events)

@@ -43,41 +43,65 @@ def vision_prefill_chunks(
     configured = max(1, int(max_chunk_tokens))
 
     spans: list[tuple[int, int]] = []
-    # A prompt-cache hit may leave this suffix part-way through an image
-    # block.  The model uses the same rule: any image sentinel in position
-    # zero means the current suffix starts inside a block.
-    first_kind = values[0] - int(vocab_size)
-    start = 0 if values[0] >= int(vocab_size) and first_kind != IMAGE_START else None
+    # An image block can have up to three alignment pads before IMAGE_START.
+    # Treat the complete contiguous sentinel run as the protected span. A
+    # prompt-cache hit may also leave this suffix part-way through a block.
+    start = None
+    saw_start = False
     for index, token in enumerate(values):
         kind = token - int(vocab_size)
-        if kind == IMAGE_START:
+        if kind < 0:
             if start is not None:
-                raise ValueError("nested DeepSeek image sentinel blocks are invalid")
+                raise ValueError("DeepSeek image sentinel block is incomplete")
+            continue
+        if start is None:
+            if kind == IMAGE_END:
+                if index == 0:
+                    # The cached prefix can end immediately before IMAGE_END.
+                    spans.append((0, 1))
+                    continue
+                raise ValueError("DeepSeek image end sentinel has no start")
             start = index
+            saw_start = kind == IMAGE_START
+            continue
+        if kind == IMAGE_START:
+            if saw_start:
+                raise ValueError("nested DeepSeek image sentinel blocks are invalid")
+            saw_start = True
         elif kind == IMAGE_END:
-            if start is None:
+            if not saw_start and start != 0:
                 raise ValueError("DeepSeek image end sentinel has no start")
             spans.append((start, index + 1))
             start = None
+            saw_start = False
     if start is not None:
         raise ValueError("DeepSeek image sentinel block is incomplete")
 
     chunks: list[tuple[int, int]] = []
     position = 0
     total = len(values)
-    while position < total:
-        # Return to the configured cadence after an image forced an early or
-        # oversized chunk. This preserves ordinary prompt-snapshot boundaries
-        # for the text suffix instead of shifting every later chunk.
-        boundary = min(((position // configured) + 1) * configured, total)
-        for begin, end in spans:
-            if begin < boundary < end:
-                boundary = begin if begin > position else end
-                break
-        if boundary <= position:  # pragma: no cover - defensive invariant
-            raise RuntimeError("could not construct an image-safe prefill chunk")
-        chunks.append((position, boundary))
-        position = boundary
+
+    def append_text_until(limit: int) -> None:
+        nonlocal position
+        while position < limit:
+            # Keep ordinary text chunks on the configured global cadence so
+            # prompt snapshots remain reusable across requests.
+            boundary = min(((position // configured) + 1) * configured, limit)
+            if boundary <= position:  # pragma: no cover - defensive invariant
+                raise RuntimeError("could not construct a text prefill chunk")
+            chunks.append((position, boundary))
+            position = boundary
+
+    for begin, end in spans:
+        append_text_until(begin)
+        # Isolate every image block even when it would fit inside a normal
+        # text chunk. Image visibility disables standard causal kernels for
+        # the whole model call; mixing surrounding text into that call can
+        # produce a much larger attention transient and hang Metal before the
+        # next progress keepalive.
+        chunks.append((begin, end))
+        position = end
+    append_text_until(total)
     return tuple(chunks)
 
 

@@ -18,6 +18,7 @@ from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    DistributedMemoryRecoveryError,
     _available_launch_ports,
     _cluster_ssh_argv,
     _install_cluster_ssh_wrapper,
@@ -313,6 +314,8 @@ def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
 
     supervisor.stop()
 
@@ -353,11 +356,114 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
 
     supervisor.stop()
 
     assert signals == [(43211, signal.SIGTERM)]
     assert supervisor.process is None
+
+
+def test_supervisor_refuses_clean_teardown_when_rank_group_survives(
+    monkeypatch, tmp_path
+):
+    class Launcher:
+        pid = 43212
+        stdout = None
+        stderr = None
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    supervisor.process = Launcher()
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch, "_wait_for_process_group_exit", lambda _pgid, _timeout: False
+    )
+    monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+
+    with pytest.raises(DistributedLaunchError, match="survived SIGKILL"):
+        supervisor.stop()
+
+    assert supervisor.process is None
+    assert supervisor._recovery_marker_path().is_file()
+
+    recreated = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path)
+    )
+    with pytest.raises(DistributedLaunchError, match="not confirmed dead"):
+        recreated._check_recovery_quarantine()
+
+
+def test_supervisor_quarantines_reload_until_live_capacity_recovers(
+    monkeypatch, tmp_path
+):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+        recovery_timeout=0,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_probe_recovery_capacity",
+        lambda: [
+            {"rank": 0, "admission_ceiling_bytes": 1},
+            {"rank": 1, "admission_ceiling_bytes": 1},
+        ],
+    )
+
+    with pytest.raises(DistributedMemoryRecoveryError, match="quarantined"):
+        supervisor._wait_for_memory_recovery()
+
+    marker = supervisor._recovery_marker_path()
+    assert marker.is_file()
+
+    recreated = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path)
+    )
+    monkeypatch.setattr(
+        recreated,
+        "_probe_recovery_capacity",
+        lambda: [
+            {"rank": 0, "admission_ceiling_bytes": 1024},
+            {"rank": 1, "admission_ceiling_bytes": 1024},
+        ],
+    )
+
+    recreated._check_recovery_quarantine()
+
+    assert not marker.exists()
+
+
+def test_recovery_requires_prelaunch_ceiling_not_merely_plan_fit(monkeypatch):
+    gib = 1024**3
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, recovery_timeout=0
+    )
+    supervisor._recovery_baseline_by_rank = {0: 100 * gib, 1: 100 * gib}
+    monkeypatch.setattr(
+        supervisor,
+        "_probe_recovery_capacity",
+        lambda: [
+            {"rank": 0, "admission_ceiling_bytes": 95 * gib},
+            {"rank": 1, "admission_ceiling_bytes": 100 * gib},
+        ],
+    )
+
+    reason = supervisor._recovery_failure()
+
+    assert reason is not None
+    assert "recovered only 95.0 GiB of its 100.0 GiB pre-launch ceiling" in reason
 
 
 def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
