@@ -634,6 +634,11 @@ class EnginePool:
         # engine, but a stale value must not force one when MTP is off.
         if mtp_active:
             add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
+        # The chunk width is read once when the engine copies the scheduler
+        # config, so a change has to reload an already-loaded engine or it
+        # keeps running the old width while the panel reports the new one. No
+        # dependent field here, so the add is unconditional (#3381).
+        add("prefill_step_size", data.get("prefill_step_size"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)

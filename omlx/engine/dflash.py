@@ -43,6 +43,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _warn_scheduler_unreachable_once,
+    resolve_prefill_step_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -323,6 +324,13 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # the fallback engine may start long after this engine was built.
         self._scheduler_config = (
             copy.copy(scheduler_config) if scheduler_config else scheduler_config
+        )
+        # Resolve on the snapshot so both consumers see the same width: the
+        # prefill guard sized from prefill_step_size below, and the fallback
+        # engine handed this same config. Sizing the guard from 2048 while the
+        # fallback engine runs the override would be a split brain (#3381).
+        resolve_prefill_step_size(
+            self._scheduler_config, self._model_settings, self._model_name
         )
         self._omlx_ssd_cache_dir = (
             Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None

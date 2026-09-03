@@ -650,6 +650,21 @@ def test_prefill_step_size_reads_scheduler_config():
     assert ane_tuning._prefill_step_size(bad) is None
 
 
+def test_prefill_step_size_prefers_the_runtime_scheduler_config():
+    """#3381: _scheduler_config is the pool's shared instance and never sees
+    the per-model override, so quoting it would recommend a sequence_length
+    wider than the delivered chunk — the ANE then compiles and never runs."""
+    engine = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(prefill_step_size=2048),
+        _engine=SimpleNamespace(
+            engine=SimpleNamespace(
+                scheduler=SimpleNamespace(config=SimpleNamespace(prefill_step_size=512))
+            )
+        ),
+    )
+    assert ane_tuning._prefill_step_size(engine) == 512
+
+
 def _measure_env(monkeypatch, *, trace):
     """Stub out everything _measure_candidate needs except the guard itself."""
 

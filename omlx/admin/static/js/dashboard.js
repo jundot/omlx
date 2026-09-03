@@ -5,6 +5,12 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    // Model types whose adaptive prefill widening gates on prefill_step_size === 2048
+    // (patches/glm_moe_dsa and patches/minimax_m3 generate_patch.py), so an explicit
+    // 2048 and Automatic are the same setting and only Automatic is offered (#3381).
+    const PREFILL_WIDENING_MODEL_TYPES = new Set([
+        'glm_moe_dsa', 'minimax_m3', 'minimax_m3_vl',
+    ]);
     const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
@@ -28,6 +34,9 @@
         'turboquant_kv_enabled',
         'turboquant_kv_bits',
         'turboquant_skip_last',
+        // engine/vlm.py hard-codes prefill_step_size on the diffusion path, so the
+        // override provably cannot apply there (#3381).
+        'prefill_step_size',
         'qwen35_ane_prefill_enabled',
         'qwen35_ane_prefill_sequence_length',
         'qwen35_ane_prefill_tail_padding_min_tokens',
@@ -7390,6 +7399,13 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    // Unset renders as Automatic. On a widening model type a stored
+                    // 2048 is also shown as Automatic: the two leave an identical
+                    // effective width and 2048 is not offered there (#3381).
+                    prefill_step_size: (s.prefill_step_size === 2048
+                        && PREFILL_WIDENING_MODEL_TYPES.has(model?.config_model_type || ''))
+                        ? null
+                        : (s.prefill_step_size ?? null),
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -8319,6 +8335,10 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                // The Automatic option arrives as a non-numeric string, so
+                                // it must clear to null: 0 would fail the request validator
+                                // and 2048 is a different, non-automatic setting (#3381).
+                                prefill_step_size: Number(this.modelSettings.prefill_step_size) || null,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default
@@ -8433,6 +8453,7 @@
                                     max_tool_result_tokens: 0,
                                     turboquant_kv_enabled: false,
                                     turboquant_kv_bits: 4,
+                                    prefill_step_size: null,
                                     qwen35_ane_prefill_enabled: false,
                                     qwen35_ane_prefill_sequence_length: 2048,
                                     qwen35_ane_prefill_tail_padding_min_tokens: 0,
@@ -8537,6 +8558,7 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.prefill_step_size = null;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
                         this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;

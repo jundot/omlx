@@ -21,6 +21,8 @@ from .base import (
     _clear_teardown_references,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    log_effective_prefill_step_size,
+    resolve_prefill_step_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -560,6 +562,9 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        resolve_prefill_step_size(
+            scheduler_config, self._model_settings, self._model_name
+        )
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -578,6 +583,7 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        log_effective_prefill_step_size(scheduler, self._model_name)
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,

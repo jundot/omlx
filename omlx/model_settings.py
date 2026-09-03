@@ -114,6 +114,8 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        prefill_step_size: Tokens processed per prefill pass (None = scheduler
+            default 2048).
         qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
             ANE/GPU prompt processing.
         qwen35_ane_prefill_sequence_length: Exact flattened token count routed
@@ -237,6 +239,13 @@ class ModelSettings:
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
+
+    # Per-model prefill chunk width. None keeps today's scheduler default of 2048.
+    # Only divisors of the 2048-token ArraysCache block are accepted: a step that
+    # does not divide it leaves ragged tails at every block edge, so prefill would
+    # no longer run on identical forward boundaries with the cache on and off
+    # (scheduler.py:2773) (#3381).
+    prefill_step_size: Optional[int] = None
 
     # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
     # Off by default because the fixed-shape ANE models add load-time/runtime

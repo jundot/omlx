@@ -306,3 +306,87 @@ def test_js_embedded_translations_escape_apostrophes():
         r"'\{\{ t\('[a-z_.0-9]+'\) \}\}'", _model_settings_template()
     )
     assert unsafe == []
+
+
+def test_prefill_step_size_card_is_fully_localized():
+    html = _model_settings_template()
+    section = _section(html, "<!-- Prefill chunk size -->", "<!-- SpecPrefill -->")
+
+    assert "{{ t('modal.model_settings.prefill_step_size') }}" in section
+    assert "{{ t('modal.model_settings.prefill_step_size_hint') }}" in section
+    assert "{{ t('modal.model_settings.prefill_step_size_auto') }}" in section
+    assert ">Prefill Chunk Size<" not in section
+    assert ">Automatic (2048)<" not in section
+
+
+def test_prefill_step_size_hides_2048_only_on_widening_model_types():
+    """On glm_moe_dsa / minimax_m3* an explicit 2048 and Automatic leave the
+    same effective width, so 2048 would be a guaranteed-false label (#3381).
+    The other three widths must stay unconditional."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- Prefill chunk size -->", "<!-- SpecPrefill -->")
+
+    assert 'x-model="modelSettings.prefill_step_size"' in section
+    assert '<option :value="null">' in section
+
+    guard = "PREFILL_WIDENING_MODEL_TYPES.has(selectedModel?.config_model_type || '')"
+    assert guard in section
+    before, after = section.split(f'<template x-if="!{guard}">', 1)
+
+    # Match the option tags, not bare digits: the rationale comment above the
+    # x-if legitimately mentions 2048.
+    for width in ("256", "512", "1024"):
+        assert f'<option value="{width}">' in before, f"{width} must be unconditional"
+    assert '<option value="2048">' not in before
+    assert '<option value="2048">' in after.split("</template>", 1)[0]
+
+
+def test_prefill_step_size_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx/admin/i18n"
+    keys = {
+        "modal.model_settings.prefill_step_size",
+        "modal.model_settings.prefill_step_size_hint",
+        "modal.model_settings.prefill_step_size_auto",
+    }
+
+    for locale_path in sorted(i18n_dir.glob("*.json")):
+        translations = json.loads(locale_path.read_text())
+        missing_keys = keys - translations.keys()
+        assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
+
+
+def test_prefill_step_size_is_wired_into_every_dashboard_seam():
+    """A future seam landing without the field silently drops the override:
+    the state builder shows a stale width, the payload omits it, the diffusion
+    override leaks it onto a hard-coded path, or the defaults reset keeps it
+    (#3381)."""
+    script = _dashboard_script()
+
+    assert "const PREFILL_WIDENING_MODEL_TYPES = new Set([" in script
+
+    diffusion_fields = _section(
+        script, "DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([", "]);"
+    )
+    assert "'prefill_step_size'," in diffusion_fields
+
+    save = _section(
+        script, "async saveModelSettings() {", "async loadGenerationDefaults() {"
+    )
+    payload, diffusion_override = save.split("if (isDiffusion) {", 1)
+    seams = {
+        "buildModelSettingsState": _section(
+            script,
+            "buildModelSettingsState(model, settings) {",
+            "_resetPresetApplicableFields()",
+        ),
+        "saveModelSettings payload": payload,
+        "saveModelSettings isDiffusion override": diffusion_override.split(
+            "return payload;", 1
+        )[0],
+        "loadGenerationDefaults": _section(
+            script, "async loadGenerationDefaults() {", "// Status tab functions"
+        ),
+    }
+    for name, seam in seams.items():
+        assert "prefill_step_size" in seam, f"{name} does not carry prefill_step_size"
