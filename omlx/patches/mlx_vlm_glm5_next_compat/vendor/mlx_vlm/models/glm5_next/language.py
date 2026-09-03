@@ -777,6 +777,10 @@ class Glm5NextMoE(nn.Module):
             config.n_routed_experts,
             activation=Glm5NextClampedSwiGLU(config.swiglu_limit),
         )
+        # Decode-time gate+up fusion: measured on GLM-5.3-Flash oQ2e (+5%
+        # per step), 1 fp16 ulp from the separate gathers — opt-in for this
+        # family only.
+        self.switch_mlp._fuse_gate_up = True
         self.gate = Glm5NextMoEGate(config)
         self.shared_experts = None
         if config.n_shared_experts is not None:

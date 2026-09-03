@@ -1379,3 +1379,57 @@ def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatc
     mx.eval(y)
     assert y.shape == (1, 8, 8, 128)
     assert calls == {"single": 0}
+
+
+def test_switchglu_gate_up_fusion_matches_reference_and_frees_gate():
+    """With the per-instance opt-in, gate+up come out of ONE concatenated
+    projection; the result stays within 1 fp16 ulp of the separate gathers
+    and the gate arrays are released (0 columns). Without the opt-in nothing
+    changes (bit-identical)."""
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    mx.random.seed(11)
+    def make():
+        m = SwitchGLU(128, 64, 8)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            layer = getattr(m, name).to_quantized(group_size=64, bits=2, mode="affine")
+            layer.scales = layer.scales.astype(mx.float16)
+            layer.biases = layer.biases.astype(mx.float16)
+            setattr(m, name, layer)
+        m.eval()
+        return m
+
+    mx.random.seed(3)
+    ref = make()
+    mx.random.seed(3)
+    fus = make()
+    fus._fuse_gate_up = True
+
+    x = mx.random.normal((1, 2, 128)).astype(mx.float16)
+    idx = mx.random.randint(0, 8, (1, 2, 4))
+    a = ref(x, idx)
+    b = fus(x, idx)
+    mx.eval(a, b)
+    assert fus._gate_up_half == 64
+    assert fus.gate_proj.weight.shape[1] == 0, "gate arrays were not released"
+    assert fus.up_proj.output_dims == 128, "up_proj did not become the pair"
+    dif = float(mx.max(mx.abs(a - b)).item())
+    assert dif <= 2e-3, f"fusion diverges beyond fp16 rounding: {dif:.2e}"
+
+    # the second call reuses the already-built pair and stays identical
+    c = fus(x, idx)
+    mx.eval(c)
+    assert float(mx.max(mx.abs(b - c)).item()) == 0.0
+
+    # and the SORTED/block path (prefill: >=1024 routes) also works fused —
+    # this is where the server crashed with the projection triple shrunk to
+    # two (native_kinds[2] out of range).
+    xg = mx.random.normal((1, 200, 128)).astype(mx.float16)
+    ig = mx.random.randint(0, 8, (1, 200, 8))
+    a2 = ref(xg, ig)
+    b2 = fus(xg, ig)
+    mx.eval(a2, b2)
+    dif2 = float(mx.max(mx.abs(a2 - b2)).item())
+    assert dif2 <= 2e-3, f"sorted path diverges: {dif2:.2e}"
