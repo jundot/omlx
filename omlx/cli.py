@@ -63,6 +63,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
         "hot_cache_write_through",
+        "cache_inspection",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -313,8 +314,10 @@ def serve_command(args):
         else:
             scheduler_config.hot_cache_max_size = 0
 
-        # Write-through: explicit CLI flag > settings file (already mapped by
+        # Cache flags: explicit CLI flag > settings file (already mapped by
         # settings.to_scheduler_config()).
+        if getattr(args, "cache_inspection", None) is not None:
+            scheduler_config.cache_inspection = bool(args.cache_inspection)
         if getattr(args, "hot_cache_write_through", None) is not None:
             scheduler_config.hot_cache_write_through = bool(
                 args.hot_cache_write_through
@@ -1135,6 +1138,13 @@ Example directory structure:
         default=None,
         help="Persist every hot-cache block to SSD immediately (write-through). "
         "Keeps RAM-speed resume while retaining SSD durability for all sessions.",
+    )
+    serve_parser.add_argument(
+        "--cache-inspection",
+        action="store_true",
+        default=None,
+        help="Save token IDs and readable text alongside SSD cache blocks. "
+        "Opt-in: exposes prompt content; files are removed with their cache blocks.",
     )
     serve_parser.add_argument(
         "--no-cache",

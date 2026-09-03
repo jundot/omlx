@@ -337,6 +337,8 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # Opt-in: persists recoverable prompt content next to paged SSD blocks.
+    cache_inspection: bool = False
     # Reuse Apple's AOT-compiled ANE programs across server restarts
     # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
     # once, at the first ANE compile, so a change applies on restart.
@@ -437,6 +439,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "cache_inspection": self.cache_inspection,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -488,6 +491,7 @@ class CacheSettings:
                 data.get("hot_cache_write_through", False)
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
+            cache_inspection=data.get("cache_inspection", False) is True,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -1125,6 +1129,8 @@ class GlobalSettings:
                 )
 
         # Cache settings
+        if inspection := os.getenv("OMLX_CACHE_INSPECTION"):
+            self.cache.cache_inspection = inspection.lower() in ("true", "1", "yes")
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
             self.cache.enabled = cache_enabled.lower() in ("true", "1", "yes")
         if ssd_cache_dir := os.getenv("OMLX_SSD_CACHE_DIR"):
@@ -1299,6 +1305,8 @@ class GlobalSettings:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
         if getattr(args, "hot_cache_write_through", None) is not None:
             self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
+        if getattr(args, "cache_inspection", None) is not None:
+            self.cache.cache_inspection = bool(args.cache_inspection)
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -1722,6 +1730,7 @@ class GlobalSettings:
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
+            cache_inspection=self.cache.cache_inspection,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size

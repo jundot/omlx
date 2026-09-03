@@ -289,6 +289,7 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
     hot_cache_write_through: bool | None = None
+    cache_inspection: bool | None = None
     ane_compile_cache: bool | None = None
     gdn_snapshot_storage: str | None = None
     gdn_ssd_split_enabled: bool | None = None
@@ -994,6 +995,7 @@ async def _apply_cache_settings_runtime(
     pool._scheduler_config.hot_cache_write_through = (
         global_settings.cache.hot_cache_write_through
     )
+    pool._scheduler_config.cache_inspection = global_settings.cache.cache_inspection
     pool._scheduler_config.gdn_ssd_split_enabled = (
         global_settings.cache.get_gdn_ssd_split_enabled()
     )
@@ -3615,6 +3617,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
+            "cache_inspection": global_settings.cache.cache_inspection,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
             "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
             "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
@@ -4152,6 +4155,9 @@ async def update_global_settings(
         )
     # Apply cache settings
     cache_changed = False
+    if request.cache_inspection is not None:
+        global_settings.cache.cache_inspection = request.cache_inspection
+        cache_changed = True
     if request.cache_enabled is not None:
         global_settings.cache.enabled = request.cache_enabled
         cache_changed = True

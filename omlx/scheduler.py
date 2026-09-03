@@ -1586,6 +1586,7 @@ class SchedulerConfig:
     # RAM *and* persisted to SSD immediately, instead of deferring the SSD
     # write to hot-cache eviction or shutdown.
     hot_cache_write_through: bool = False
+    cache_inspection: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
@@ -2415,6 +2416,7 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        inspection_media: tuple[dict[str, Any], ...] = (),
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2469,6 +2471,11 @@ class Scheduler:
                         extra_keys=extra_keys,
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
+                        **(
+                            {"inspection_media": inspection_media}
+                            if inspection_media
+                            else {}
+                        ),
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2481,6 +2488,11 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
+                        **(
+                            {"inspection_media": inspection_media}
+                            if inspection_media
+                            else {}
+                        ),
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -11397,6 +11409,7 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        request.cache_inspection_media,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -11427,6 +11440,7 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
+                                    request.cache_inspection_media,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
@@ -13024,6 +13038,22 @@ class Scheduler:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
 
             # Initialize paged SSD cache manager for SSD storage
+            inspection_renderer = None
+            if self.config.cache_inspection and not self.config.hot_cache_only:
+                from .cache.inspection import InspectionRenderer
+
+                try:
+                    inspection_renderer = InspectionRenderer(
+                        self.tokenizer, self.config.model_name
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Cache inspection tokenizer unavailable (%s); saving IDs with annotations",
+                        type(exc).__name__,
+                    )
+                    inspection_renderer = InspectionRenderer(
+                        None, self.config.model_name
+                    )
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
@@ -13038,6 +13068,7 @@ class Scheduler:
                 expected_block_size_tokens=self.config.paged_cache_block_size,
                 expected_kv_bytes_per_token=expected_kv_bytes_per_token,
                 gdn_sidecar_state_dtype=self.config.gdn_sidecar_state_dtype,
+                inspection_renderer=inspection_renderer,
             )
 
             # Connect paged SSD cache manager to PagedCacheManager

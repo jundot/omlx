@@ -3300,6 +3300,19 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
 
+            if getattr(
+                self._scheduler_config, "cache_inspection", False
+            ) is True and not getattr(self._scheduler_config, "hot_cache_only", False):
+                from ..cache.inspection import image_context_descriptors
+
+                # Transport only CPU metadata. EngineCore extracts this key
+                # before model kwargs reach the scheduler/forward pass.
+                extra_kwargs["_cache_inspection_media"] = image_context_descriptors(
+                    [image.size for image in images],
+                    image_hash,
+                    image_cache_key_ranges,
+                    [count for _, count in image_message_ranges],
+                )
             # Extract token IDs as list
             token_ids = (
                 input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()

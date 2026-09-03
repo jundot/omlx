@@ -498,6 +498,8 @@
   "settings.advanced.cache": "キャッシュ",
   "settings.advanced.initial_cache_blocks": "初期キャッシュブロック数",
   "settings.advanced.initial_cache_blocks_hint": "起動時に事前割り当てするブロック数。大きいほど動的割り当てのオーバーヘッドが減少。",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "Write-Through Hot Cache",
   "settings.advanced.hot_cache_write_through_hint": "ブロックを RAM に保持しつつ、SSD へも即時書き込みます。過去のセッションは再起動やクラッシュ後も保持され、最近のセッションは RAM 速度で復元されます。",
   "settings.advanced.ane_compile_cache": "コンパイル済み ANE プログラムを再利用",

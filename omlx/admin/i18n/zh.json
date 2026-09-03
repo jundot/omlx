@@ -498,6 +498,8 @@
   "settings.advanced.cache": "缓存",
   "settings.advanced.initial_cache_blocks": "初始缓存块数",
   "settings.advanced.initial_cache_blocks_hint": "启动时预分配的块数。值越大，动态分配开销越小。",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "写透 Hot Cache",
   "settings.advanced.hot_cache_write_through_hint": "块保留在 RAM 中的同时立即写入 SSD。旧会话在重启和崩溃后仍然保留，最近的会话以 RAM 速度恢复。",
   "settings.advanced.ane_compile_cache": "复用已编译的 ANE 程序",

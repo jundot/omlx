@@ -498,6 +498,8 @@
   "settings.advanced.cache": "캐시",
   "settings.advanced.initial_cache_blocks": "초기 캐시 블록 수",
   "settings.advanced.initial_cache_blocks_hint": "시작 시 미리 할당할 블록 수. 높을수록 동적 할당 오버헤드 감소.",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "Write-Through Hot Cache",
   "settings.advanced.hot_cache_write_through_hint": "블록을 RAM에 유지하면서 동시에 SSD에도 즉시 기록합니다. 이전 세션은 재시작과 크래시 후에도 유지되고, 최근 세션은 RAM 속도로 복원됩니다.",
   "settings.advanced.ane_compile_cache": "컴파일된 ANE 프로그램 재사용",

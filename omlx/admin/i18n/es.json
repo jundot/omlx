@@ -498,6 +498,8 @@
   "settings.advanced.cache": "Caché",
   "settings.advanced.initial_cache_blocks": "Bloques Iniciales de Caché",
   "settings.advanced.initial_cache_blocks_hint": "Bloques pre-asignados al inicio. Valores más altos reducen la sobrecarga de asignación dinámica.",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "Caché Activa Write-Through",
   "settings.advanced.hot_cache_write_through_hint": "Mantener los bloques en RAM y escribirlos en SSD de inmediato. Las sesiones antiguas sobreviven a reinicios y fallos; las recientes se reanudan a velocidad de RAM.",
   "settings.advanced.ane_compile_cache": "Reuse Compiled ANE Programs",

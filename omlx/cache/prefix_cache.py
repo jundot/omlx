@@ -24,6 +24,7 @@ except ImportError:
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .hybrid_cache import ModelCacheConfig
+from .inspection import BlockInspection, media_context_for_block
 from .interface import CacheManager
 from .paged_cache import (
     BlockHash,
@@ -740,6 +741,45 @@ class BlockAwarePrefixCache(CacheManager):
         logger.debug(f"Cache miss for {request_id}")
         return None, tokens
 
+    def _inspection_for_block(
+        self,
+        tokens: list[int],
+        start: int,
+        end: int,
+        parent_hash: bytes | None,
+        media: tuple[dict[str, Any], ...],
+    ) -> BlockInspection | None:
+        if (
+            self.paged_ssd_cache is None
+            or self.paged_ssd_cache.inspection_enabled is not True
+        ):
+            return None
+        return BlockInspection(
+            tuple(tokens[start:end]),
+            start,
+            parent_hash.hex() if parent_hash is not None else None,
+            media_context_for_block(media, start, end),
+        )
+
+    def _backfill_inspection(
+        self,
+        block_hash: bytes,
+        tokens: list[int],
+        start: int,
+        end: int,
+        parent_hash: bytes | None,
+        media: tuple[dict[str, Any], ...],
+    ) -> None:
+        manager = self.paged_ssd_cache
+        if manager is None or manager.inspection_enabled is not True:
+            return
+        metadata = manager.get_block_metadata(block_hash)
+        if metadata is None or metadata.inspection_complete:
+            return
+        inspection = self._inspection_for_block(tokens, start, end, parent_hash, media)
+        if inspection is not None:
+            manager.backfill_inspection(block_hash, inspection)
+
     def store_cache(
         self,
         request_id: str,
@@ -752,6 +792,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
         _store_exact_terminal: bool = False,
+        inspection_media: tuple[dict[str, Any], ...] = (),
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -832,6 +873,22 @@ class BlockAwarePrefixCache(CacheManager):
         # Determine tokens we need to cache (not already in block_table)
         existing_tokens = block_table.num_tokens
         new_tokens = tokens[existing_tokens:]
+
+        if (
+            self.paged_ssd_cache is not None
+            and self.paged_ssd_cache.inspection_enabled is True
+        ):
+            offset = 0
+            parent = None
+            for block_id in block_table.block_ids:
+                cached = self.paged_cache.allocated_blocks.get(block_id)
+                if cached is None or cached.block_hash is None:
+                    break
+                end = offset + cached.token_count
+                self._backfill_inspection(
+                    cached.block_hash, tokens, offset, end, parent, inspection_media
+                )
+                offset, parent = end, cached.block_hash
 
         if not new_tokens:
             # All tokens already cached
@@ -1018,6 +1075,14 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=block_extra_keys,
                 )
                 if existing_block:
+                    self._backfill_inspection(
+                        existing_block.block_hash,
+                        tokens,
+                        global_start,
+                        global_end,
+                        parent_hash,
+                        inspection_media,
+                    )
                     if split_gdn_layout and not self._has_split_gdn_checkpoint(
                         existing_block.block_hash, layer_cache_types
                     ):
@@ -1257,6 +1322,12 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
+                    inspection = self._inspection_for_block(
+                        tokens, global_start, global_end, parent_hash, inspection_media
+                    )
+                    inspection_kwargs = (
+                        {"inspection": inspection} if inspection is not None else {}
+                    )
                     if hot_cache_write_back:
                         saved = self.paged_ssd_cache.save_block(
                             block_hash=block.block_hash,
@@ -1266,6 +1337,7 @@ class BlockAwarePrefixCache(CacheManager):
                             layer_cache_types=layer_cache_types,
                             layer_meta_states=block_meta,
                             replace_existing=False,
+                            **inspection_kwargs,
                         )
                     else:
                         saved = self.paged_ssd_cache.save_block(
@@ -1277,6 +1349,7 @@ class BlockAwarePrefixCache(CacheManager):
                             layer_meta_states=block_meta,
                             hot_cache_write_back=False,
                             replace_existing=False,
+                            **inspection_kwargs,
                         )
                     if saved:
                         if split_gdn_layout:

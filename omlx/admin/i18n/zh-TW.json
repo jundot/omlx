@@ -498,6 +498,8 @@
   "settings.advanced.cache": "快取",
   "settings.advanced.initial_cache_blocks": "初始快取區塊數",
   "settings.advanced.initial_cache_blocks_hint": "啟動時預先分配的區塊數。數值越高，動態分配的開銷越小。",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "寫透 Hot Cache",
   "settings.advanced.hot_cache_write_through_hint": "區塊保留在 RAM 中的同時立即寫入 SSD。舊工作階段在重新啟動和當機後仍然保留，最近的工作階段以 RAM 速度恢復。",
   "settings.advanced.ane_compile_cache": "重複使用已編譯的 ANE 程式",

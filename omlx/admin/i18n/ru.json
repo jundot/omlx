@@ -498,6 +498,8 @@
   "settings.advanced.cache": "Кэш",
   "settings.advanced.initial_cache_blocks": "Начальные блоки кэша",
   "settings.advanced.initial_cache_blocks_hint": "Блоки предварительно выделяются при запуске. Более высокие значения уменьшают накладные расходы на динамическое выделение.",
+  "settings.advanced.cache_inspection": "Save Cache Inspection Files",
+  "settings.advanced.cache_inspection_hint": "Save exact token IDs and readable text beside SSD cache blocks. Exposes prompt content, including system instructions and tool results. Files are removed with their cache blocks. Turning this off stops new capture; clear the cache to remove existing files. Has no effect in RAM-only mode.",
   "settings.advanced.hot_cache_write_through": "Сквозная запись горячего кэша",
   "settings.advanced.hot_cache_write_through_hint": "Блоки остаются в RAM и сразу записываются на SSD. Старые сессии переживают перезапуски и сбои, недавние возобновляются со скоростью RAM.",
   "settings.advanced.ane_compile_cache": "Reuse Compiled ANE Programs",

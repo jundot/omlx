@@ -28,6 +28,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,15 @@ import numpy as np
 
 from omlx.utils.formatting import format_bytes
 
+from .inspection import BlockInspection, InspectionRenderer
+from .inspection_files import (
+    atomic_write,
+    block_file_lock,
+    cleanup_orphans,
+    sidecar_paths,
+    sidecar_sizes,
+    unlink_block_files,
+)
 from .interface import CacheManager
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
@@ -1003,6 +1013,8 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
+    # Inspection availability never affects KV compatibility or cache hits.
+    inspection_complete: bool = False
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1051,6 +1063,12 @@ class PagedSSDBlockMetadata:
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
         )
+
+
+@dataclass(frozen=True)
+class _InspectionWrite:
+    metadata: PagedSSDBlockMetadata
+    inspection: BlockInspection
 
 
 class PagedSSDCacheIndex:
@@ -1600,6 +1618,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_layer_cache_types: list[str] | None = None,
         gdn_ssd_split_enabled: bool = False,
         gdn_sidecar_state_dtype: str = "fp32",
+        inspection_renderer: InspectionRenderer | None = None,
     ):
         """
         Initialize the SSD cache manager.
@@ -1652,6 +1671,8 @@ class PagedSSDCacheManager(CacheManager):
                 payload layout and enable the durable-sidecar profile. The
                 file/index API itself remains available only in SSD-backed
                 mode; split blocks use format version 5.
+            inspection_renderer: Optional independent CPU decoder for token
+                sidecars. None disables capture; ignored in RAM-only mode.
         """
         self._cache_dir = cache_dir
         self._max_size = max_size_bytes
@@ -1662,6 +1683,9 @@ class PagedSSDCacheManager(CacheManager):
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
         self._hot_cache_only = hot_cache_only
+        self._inspection_renderer = None if hot_cache_only else inspection_renderer
+        self._inspection_pending: set[bytes] = set()
+        self._inspection_pending_lock = threading.Lock()
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
         self._expected_block_size = expected_block_size
@@ -1726,6 +1750,9 @@ class PagedSSDCacheManager(CacheManager):
             "preload_time_ms": 0.0,
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
+            "inspection_writes": 0,
+            "inspection_errors": 0,
+            "inspection_backfill_drops": 0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -1817,10 +1844,14 @@ class PagedSSDCacheManager(CacheManager):
         Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
         loaded from SSD, not from active inference — safe to retain).
         """
+        inspection = entry.get("inspection")
+        overhead = inspection.estimated_bytes if inspection is not None else 0
         if "arrays" in entry:
-            return sum(arr.nbytes for arr in entry["arrays"].values())
+            return sum(arr.nbytes for arr in entry["arrays"].values()) + overhead
         if "tensors_raw" in entry:
-            return sum(len(raw) for raw, _, _ in entry["tensors_raw"].values())
+            return (
+                sum(len(raw) for raw, _, _ in entry["tensors_raw"].values()) + overhead
+            )
         return 0
 
     def _effective_hot_cache_max_bytes(self) -> int:
@@ -1935,7 +1966,14 @@ class PagedSSDCacheManager(CacheManager):
 
         # 3. Queue third — enqueue for background writer.
         try:
-            item = (block_hash, tensors_raw, metadata, file_path)
+            item = (
+                block_hash,
+                tensors_raw,
+                metadata,
+                file_path,
+                blk_meta,
+                entry.get("inspection"),
+            )
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
@@ -1957,8 +1995,10 @@ class PagedSSDCacheManager(CacheManager):
                 metadata,
                 file_path,
                 source="inline-fallback",
+                expected_metadata=blk_meta,
+                inspection=entry.get("inspection"),
             )
-            self._clear_pending_write(block_hash)
+            self._clear_pending_write(block_hash, expected_metadata=blk_meta)
             return ok
 
     def _hot_cache_get(self, block_hash: bytes) -> dict | None:
@@ -2256,11 +2296,20 @@ class PagedSSDCacheManager(CacheManager):
             if not subdir_path.exists():
                 continue
 
+            try:
+                cleanup_orphans(subdir_path)
+            except OSError as exc:
+                logger.warning("Inspection cleanup failed in %s: %s", subdir_path, exc)
+
             for file_path in subdir_path.glob("*.safetensors"):
                 scanned += 1
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
+                        continue
+                    if file_path.stem != metadata.block_hash.hex():
+                        # An interrupted/in-flight tensor temporary is not a
+                        # committed cache entry, even if its header is readable.
                         continue
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
@@ -2958,10 +3007,11 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     return None
 
+            inspection_size, inspection_complete = sidecar_sizes(file_path)
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
-                file_size=file_stat.st_size,
+                file_size=file_stat.st_size + inspection_size,
                 token_count=int(metadata.get("token_count", 0)),
                 created_at=file_stat.st_ctime,
                 last_access=file_stat.st_mtime,
@@ -2971,10 +3021,94 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=metadata.get("cache_signature", ""),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                inspection_complete=inspection_complete,
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
             return None
+
+    @property
+    def inspection_enabled(self) -> bool:
+        return self._inspection_renderer is not None
+
+    def backfill_inspection(
+        self, block_hash: bytes, inspection: BlockInspection
+    ) -> None:
+        """Queue missing sidecars without rewriting KV or blocking on the queue."""
+        if not self.inspection_enabled:
+            return
+        metadata = self._index.get(block_hash)
+        if metadata is None or metadata.inspection_complete:
+            return
+        if metadata.token_count != len(inspection.token_ids):
+            return
+        with self._inspection_pending_lock:
+            if block_hash in self._inspection_pending:
+                return
+            self._inspection_pending.add(block_hash)
+        try:
+            self._write_queue.put_nowait(_InspectionWrite(metadata, inspection))
+        except queue.Full:
+            with self._inspection_pending_lock:
+                self._inspection_pending.discard(block_hash)
+            self._stats["inspection_backfill_drops"] += 1
+
+    def _write_inspection(
+        self, metadata: PagedSSDBlockMetadata, inspection: BlockInspection | None
+    ) -> None:
+        if inspection is None or self._inspection_renderer is None:
+            return
+        path = metadata.file_path
+        block_hash = metadata.block_hash
+        try:
+            if len(inspection.token_ids) != metadata.token_count:
+                raise ValueError("inspection token count does not match cached block")
+            if (
+                metadata.inspection_complete
+                or self._index.get(block_hash) is not metadata
+            ):
+                return
+            tokens, rendered = self._inspection_renderer.render(block_hash, inspection)
+            with block_file_lock(path):
+                # Check again after rendering: eviction/clear can run meanwhile.
+                if self._index.get(block_hash) is not metadata or not path.is_file():
+                    return
+                token_path, text_path = sidecar_paths(path)
+                atomic_write(token_path, tokens)
+                atomic_write(text_path, rendered)
+                _fsync_parent_dir(path)
+                metadata.inspection_complete = True
+                self._stats["inspection_writes"] += 1
+        except Exception as exc:
+            self._stats["inspection_errors"] += 1
+            if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                with self._lock:
+                    self._disk_usage_cache = None
+            # Do not log decoded content or make tensor persistence fail.
+            logger.warning(
+                "Cache inspection write failed for %s (%s)",
+                block_hash.hex()[:16],
+                type(exc).__name__,
+            )
+        finally:
+            with block_file_lock(path):
+                if self._index.get(block_hash) is metadata and path.is_file():
+                    try:
+                        size, complete = sidecar_sizes(path)
+                        metadata.inspection_complete = complete
+                        self._index.update_file_size(
+                            block_hash, path.stat().st_size + size
+                        )
+                    except OSError:
+                        pass
+
+        # Backfill also consumes the shared SSD budget. Reconcile after actual
+        # sizes are known, outside the file lock (manager lock comes first).
+        try:
+            self._enforce_size_limit_for_new_block(0)
+        except Exception as exc:
+            self._stats["inspection_errors"] += 1
+            logger.warning("Inspection size reconciliation failed (%s)", type(exc).__name__)
 
     def _write_block_file(
         self,
@@ -2984,24 +3118,43 @@ class PagedSSDCacheManager(CacheManager):
         file_path: Path,
         *,
         source: str,
+        expected_metadata: PagedSSDBlockMetadata | None = None,
+        inspection: BlockInspection | None = None,
     ) -> bool:
         """Write one serialized block to disk from raw tensor bytes."""
         temp_path = None
         try:
+            if expected_metadata is None:
+                expected_metadata = self._index.get(block_hash)
+            if (
+                expected_metadata is None
+                or self._index.get(block_hash) is not expected_metadata
+            ):
+                return True  # The queued block was evicted or replaced.
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            temp_path = file_path.with_name(
+                file_path.stem + "_" + uuid.uuid4().hex + "_tmp.safetensors"
+            )
             actual_size = _write_safetensors_no_mx(
                 str(temp_path), tensors_raw, metadata
             )
 
-            os.rename(str(temp_path), str(file_path))
-            _fsync_parent_dir(file_path)
+            with block_file_lock(file_path):
+                if self._index.get(block_hash) is not expected_metadata:
+                    temp_path.unlink(missing_ok=True)
+                    return True
+                os.rename(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
+                sidecar_size, complete = sidecar_sizes(file_path)
+                expected_metadata.inspection_complete = complete
+                self._index.update_file_size(block_hash, actual_size + sidecar_size)
 
             # The block is now durable on disk; bump the persist counter
             # before any cleanup so ``saves_persisted`` reflects rename
             # success even if the post-rename eviction check below unlinks it.
             self._stats["saves_persisted"] += 1
-            self._index.update_file_size(block_hash, actual_size)
+
+            self._write_inspection(expected_metadata, inspection)
 
             # Check if block was evicted while write was pending.
             if not self._index.contains(block_hash):
@@ -3010,8 +3163,10 @@ class PagedSSDCacheManager(CacheManager):
                     block_hash.hex()[:16],
                     source,
                 )
-                with contextlib.suppress(Exception):
-                    file_path.unlink()
+                with block_file_lock(file_path):
+                    if not self._index.contains(block_hash):
+                        with contextlib.suppress(OSError):
+                            unlink_block_files(file_path)
             return True
         except Exception as e:
             if isinstance(e, OSError) and e.errno in (
@@ -3046,28 +3201,53 @@ class PagedSSDCacheManager(CacheManager):
                     e,
                 )
             self._stats["errors"] += 1
-            self._index.remove(block_hash)
-            for p in (temp_path, file_path):
-                with contextlib.suppress(Exception):
-                    if p is not None and isinstance(p, Path) and p.exists():
-                        p.unlink()
+            with block_file_lock(file_path):
+                if self._index.get(block_hash) is expected_metadata:
+                    self._index.remove(block_hash)
+                    with contextlib.suppress(OSError):
+                        unlink_block_files(file_path)
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
             return False
 
     def _clear_pending_write(
-        self, block_hash: bytes, *, remove_hot_cache: bool = False
+        self,
+        block_hash: bytes,
+        *,
+        remove_hot_cache: bool = False,
+        expected_metadata: PagedSSDBlockMetadata | None = None,
     ) -> None:
         """Clear pending-write bookkeeping after a queued or inline write."""
-        with self._pending_write_hashes_lock:
+        removed = None
+        with self._hot_cache_lock, self._pending_write_hashes_lock:
+            entries = (
+                self._hot_cache.get(block_hash),
+                self._pending_write_buffers.get(block_hash),
+            )
+            if expected_metadata is not None and any(
+                entry is not None
+                and entry.get("block_metadata") is not expected_metadata
+                for entry in entries
+            ):
+                return
             self._pending_write_hashes.discard(block_hash)
             self._pending_write_buffers.pop(block_hash, None)
-        if remove_hot_cache:
-            self._hot_cache_remove(block_hash)
+            if remove_hot_cache:
+                removed = self._hot_cache.pop(block_hash, None)
+                if removed is not None and self._hot_cache_enabled:
+                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(removed)
+        if removed is not None and self._hot_cache_budget is not None:
+            self._hot_cache_budget.forget(self, block_hash)
 
-    def _mark_hot_cache_clean(self, block_hash: bytes) -> None:
+    def _mark_hot_cache_clean(self, block_hash: bytes, expected_metadata=None) -> None:
         """Mark a retained hot entry durable after its SSD write commits."""
         with self._hot_cache_lock:
             entry = self._hot_cache.get(block_hash)
-            if entry is not None:
+            if entry is not None and (
+                expected_metadata is None
+                or entry.get("block_metadata") is expected_metadata
+            ):
                 entry["dirty"] = False
 
     def _writer_loop(self) -> None:
@@ -3094,21 +3274,45 @@ class PagedSSDCacheManager(CacheManager):
             if item is None:  # Sentinel for shutdown
                 break
 
-            block_hash, tensors_raw, metadata, file_path = item
+            if isinstance(item, _InspectionWrite):
+                try:
+                    self._write_inspection(item.metadata, item.inspection)
+                finally:
+                    with self._inspection_pending_lock:
+                        self._inspection_pending.discard(item.metadata.block_hash)
+                continue
+
+            (
+                block_hash,
+                tensors_raw,
+                metadata,
+                file_path,
+                expected_metadata,
+                inspection,
+            ) = item
             try:
                 write_succeeded = self._write_block_file(
-                    block_hash, tensors_raw, metadata, file_path, source="background"
+                    block_hash,
+                    tensors_raw,
+                    metadata,
+                    file_path,
+                    source="background",
+                    expected_metadata=expected_metadata,
+                    inspection=inspection,
                 )
                 if write_succeeded:
-                    self._mark_hot_cache_clean(block_hash)
+                    self._mark_hot_cache_clean(block_hash, expected_metadata)
                 self._clear_pending_write(
-                    block_hash, remove_hot_cache=not self._hot_cache_enabled
+                    block_hash,
+                    remove_hot_cache=not self._hot_cache_enabled,
+                    expected_metadata=expected_metadata,
                 )
             finally:
                 # Avoid pinning the last raw tensor-byte batch while the
                 # writer thread blocks waiting for more work.
                 item = None
                 block_hash = tensors_raw = metadata = file_path = None
+                expected_metadata = inspection = None
 
     def save_block(
         self,
@@ -3120,6 +3324,7 @@ class PagedSSDCacheManager(CacheManager):
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
         replace_existing: bool = False,
+        inspection: BlockInspection | None = None,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3145,6 +3350,8 @@ class PagedSSDCacheManager(CacheManager):
                 for the same content hash. This is reserved for promoting a
                 non-sliceable prefix-cache placeholder into a valid boundary
                 snapshot; normal deduplicated saves must leave it False.
+            inspection: Exact IDs and CPU-only context for this block. Optional
+                sidecars never participate in KV restoration or compatibility.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -3154,6 +3361,8 @@ class PagedSSDCacheManager(CacheManager):
             return False
 
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
+        if not self.inspection_enabled:
+            inspection = None
 
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If
@@ -3175,6 +3384,8 @@ class PagedSSDCacheManager(CacheManager):
             and self._is_compatible_block(indexed_metadata)
         ):
             self._index.touch(block_hash)
+            if inspection is not None:
+                self.backfill_inspection(block_hash, inspection)
             self._stats["hits"] += 1
             return True
         if indexed_metadata is not None:
@@ -3437,6 +3648,8 @@ class PagedSSDCacheManager(CacheManager):
             estimated_size = (
                 sum(len(raw) for raw, _, _ in tensors_raw.values()) + header_overhead
             )
+            if inspection is not None:
+                estimated_size += inspection.estimated_bytes
 
             now = time.time()
             block_metadata = PagedSSDBlockMetadata(
@@ -3469,6 +3682,7 @@ class PagedSSDCacheManager(CacheManager):
                 "layer_cache_types": layer_cache_types,
                 "block_metadata": block_metadata,
                 "dirty": True,
+                "inspection": inspection,
             }
 
             if self._hot_cache_enabled and (
@@ -3527,7 +3741,14 @@ class PagedSSDCacheManager(CacheManager):
             # immediately punch holes in the cache chain.
             try:
                 self._write_queue.put(
-                    (block_hash, tensors_raw, metadata, file_path),
+                    (
+                        block_hash,
+                        tensors_raw,
+                        metadata,
+                        file_path,
+                        block_metadata,
+                        inspection,
+                    ),
                     timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
                 )
             except queue.Full:
@@ -3542,8 +3763,12 @@ class PagedSSDCacheManager(CacheManager):
                     metadata,
                     file_path,
                     source="inline-fallback",
+                    expected_metadata=block_metadata,
+                    inspection=inspection,
                 )
-                self._clear_pending_write(block_hash, remove_hot_cache=True)
+                self._clear_pending_write(
+                    block_hash, remove_hot_cache=True, expected_metadata=block_metadata
+                )
                 if not ok:
                     return False
                 self._stats["saves"] += 1
@@ -3884,10 +4109,8 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["errors"] += 1
             # Remove corrupted entry
             self._index.remove(block_hash)
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
+            with contextlib.suppress(OSError):
+                unlink_block_files(file_path)
             return None
 
     def load_block_with_metadata(
@@ -4089,10 +4312,8 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["errors"] += 1
             # Remove corrupted entry
             self._index.remove(block_hash)
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
+            with contextlib.suppress(OSError):
+                unlink_block_files(file_path)
             return None, None
 
     def get_block_metadata(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
@@ -4464,12 +4685,25 @@ class PagedSSDCacheManager(CacheManager):
                 return False
 
             try:
-                if metadata.file_path.exists():
-                    metadata.file_path.unlink()
-                    logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
+                with block_file_lock(metadata.file_path):
+                    current = self._index.get(block_hash)
+                    if current is not None and current is not metadata:
+                        return True  # Do not delete a newly saved incarnation.
+                    unlink_block_files(metadata.file_path)
+                logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to delete SSD cache file: {e}")
+                # Keep failed deletions tracked so retries and accounting work.
+                with contextlib.suppress(OSError):
+                    size, complete = sidecar_sizes(metadata.file_path)
+                    metadata.file_size = metadata.file_path.stat().st_size + size
+                    metadata.inspection_complete = complete
+                (
+                    self._index
+                    if incompatible_metadata is None
+                    else self._incompatible_index
+                ).add(metadata)
                 return False
 
     # Use at most 99% of available disk space to avoid filling disk completely
@@ -4680,10 +4914,20 @@ class PagedSSDCacheManager(CacheManager):
                     self._stats["evict_unlink_failures"] += 1
                     return
             else:
-                metadata.file_path.unlink(missing_ok=True)
+                with block_file_lock(metadata.file_path):
+                    # A new incarnation of this hash owns its own files.
+                    current = self._index.get(metadata.block_hash)
+                    if current is not None and current is not metadata:
+                        return
+                    unlink_block_files(metadata.file_path)
             self._stats["evictions"] += 1
         except OSError as e:
             restore_index = source_index or self._index
+            if isinstance(metadata, PagedSSDBlockMetadata):
+                with contextlib.suppress(OSError):
+                    size, complete = sidecar_sizes(metadata.file_path)
+                    metadata.file_size = metadata.file_path.stat().st_size + size
+                    metadata.inspection_complete = complete
             # Restore the index entry so total_size matches disk reality.
             # The re-added entry lands at the LRU tail (most-recently
             # touched), which deprioritises immediate re-eviction.
@@ -4788,12 +5032,29 @@ class PagedSSDCacheManager(CacheManager):
         """
         with self._lock:
             count = 0
+            # RAM-only dirty entries must not flush back to disk after clear.
+            with self._hot_cache_lock:
+                self._hot_cache.clear()
+                self._hot_cache_total_bytes = 0
+            if self._hot_cache_budget is not None:
+                self._hot_cache_budget.forget_owner(self)
             block_hashes = (
                 self._index.get_all_hashes() + self._incompatible_index.get_all_hashes()
             )
             for block_hash in dict.fromkeys(block_hashes):
                 if self.delete_block(block_hash):
                     count += 1
+
+            if self._cache_dir is not None and not self._hot_cache_only:
+                for subdir in self.SUBDIR_CHARS:
+                    directory = self._cache_dir / subdir
+                    if directory.is_dir():
+                        try:
+                            cleanup_orphans(directory)
+                        except OSError as exc:
+                            logger.warning(
+                                "Inspection cleanup failed in %s: %s", directory, exc
+                            )
 
             for signature_digest, source_block_hash in list(
                 self._gdn_sidecar_index.get_all_keys()
@@ -4859,6 +5120,9 @@ class PagedSSDCacheManager(CacheManager):
                 ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                inspection_writes=self._stats["inspection_writes"],
+                inspection_errors=self._stats["inspection_errors"],
+                inspection_backfill_drops=self._stats["inspection_backfill_drops"],
             )
 
     @property
@@ -4940,6 +5204,9 @@ class PagedSSDCacheManager(CacheManager):
                 ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                inspection_writes=self._stats["inspection_writes"],
+                inspection_errors=self._stats["inspection_errors"],
+                inspection_backfill_drops=self._stats["inspection_backfill_drops"],
             )
 
     def get_stats_dict(self) -> dict[str, Any]:
