@@ -211,7 +211,7 @@ class EngineEntry:
         None  # True when template supports preserve_thinking (Qwen 3.6+)
     )
     reasoning_effort_options: list[str] | None = (
-        None  # Strict whitelist from template (None = free-form or unsupported)
+        None  # Reasoning levels discerned from the template (None = no set discernible)
     )
     reasoning_effort_default: str | None = (
         None  # Template default for reasoning_effort (None = unknown)

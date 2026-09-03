@@ -380,7 +380,8 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
-    reasoning_effort_options: list[str] | None = None  # Strict whitelist from template (None = free-form or unsupported)
+    # Reasoning levels discerned from the template (None = no set discernible)
+    reasoning_effort_options: list[str] | None = None
     reasoning_effort_default: str | None = None  # Template default for reasoning_effort (None = unknown)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
@@ -850,6 +851,20 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     # changing its thinking default.
     if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
         return True
+    # Same statement made by a fallback ternary rather than a filter:
+    # ``enable_thinking = enable_thinking if enable_thinking is defined
+    # else true`` (Nemotron, Qwen fixed-template repos).
+    if re.search(r"enable_thinking\s*=\s*[^=\n]{0,80}?\belse\s+[Tt]rue\b", template_text):
+        return True
+    # Opt-in: thinking is emitted only when the caller asks for it, so the
+    # effective default is OFF. Covers ``enable_thinking is defined and
+    # enable_thinking is true`` (Qwen 3.5) and ``enable_thinking == true``
+    # (LongCat), neither of which the ``default(false)`` scan below sees.
+    if re.search(
+        r"enable_thinking\s+is\s+defined\s+and\s+(?:not\s+)?enable_thinking\s+is\s+true|enable_thinking\s*==\s*[Tt]rue",
+        template_text,
+    ):
+        return False
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
 
@@ -951,55 +966,80 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
 
 
 def detect_reasoning_effort(model_path: Path) -> tuple[list[str] | None, str | None]:
-    """Detect the model chat template's ``reasoning_effort`` contract.
+    """Detect the reasoning levels the template names, and its default.
 
-    Returns an ``(options, default)`` tuple:
+    Returns ``(options, default)``. ``options`` are the levels the template
+    itself mentions, deduped in first-seen order, or None when it names none.
+    This is fact extraction only: no level is invented, no level is removed,
+    and ordering carries no meaning — clients pick the presentation vocabulary
+    and sort.
 
-    * ``options`` — strict whitelist of accepted values, or None when the
-      template accepts free-form/numeric values or has no
-      ``reasoning_effort`` parameter at all. Only templates that enforce a
-      tuple-literal membership check (e.g. Qwen 3.8's
-      ``reasoning_effort not in ('xhigh', 'medium', 'low')`` +
-      ``raise_exception``) yield a whitelist; dict maps and numeric ranges
-      are not strict, so they must not be used for validation.
-    * ``default`` — the template's default value, detected from a
-      ``reasoning_effort | default('X')`` filter or an
-      ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
-      block. None when unknown (numeric or implicit defaults are not
-      exposed).
+    Enforcement style is irrelevant, because both styles enumerate the same
+    thing. Tuple/list membership, dict-map keys, ``==``/``!=`` comparisons and
+    ``set`` assignments all count, whether the template rejects unknown values
+    with ``raise_exception`` or quietly normalises them.
+
+    ``default`` comes from a ``| default('X')`` filter, an
+    ``if reasoning_effort is not defined -> set ... = "X"`` block, or a
+    ``... else 'X'`` fallback ternary. None when unknown; numeric defaults are
+    not exposed.
     """
     template_text = _read_chat_template_text(model_path)
     if not template_text or "reasoning_effort" not in template_text:
         return None, None
 
-    # Strict whitelist: an effort-named variable checked ``in`` / ``not in``
-    # against a tuple literal. Dict maps (``key not in effort_map``) and
-    # numeric ranges do not match.
-    options: list[str] | None = None
-    m = re.search(r"[\w]*effort[\w]*\s+(?:not\s+)?in\s*\(([^)]+)\)", template_text)
-    if m:
-        values = re.findall(r"['\"]([A-Za-z0-9_-]+)['\"]", m.group(1))
-        if values:
-            options = values
+    # An effort-named binding: reasoning_effort, resolved_reasoning_effort,
+    # effective_reasoning_effort, _effort_raw, effort_map, ns_state.effort...
+    # The name may *start* with "effort", so it cannot be anchored past it.
+    var = r"\b[A-Za-z0-9_.]*effort[A-Za-z0-9_.]*\b"
+    lit = r"['\"]([A-Za-z0-9_.-]+)['\"]"
+
+    levels: list[str] = []
+
+    # Membership against a tuple *or list* literal — ``effort in ('a','b')``,
+    # ``effort not in ['a','b']``. Enforcement (raise) vs normalisation (else)
+    # is not distinguished: both enumerate the levels the template recognises.
+    for m in re.finditer(
+        rf"{var}\s+(?:not\s+)?in\s+([\[(][^\])]+[\])])", template_text, re.I
+    ):
+        levels += re.findall(lit, m.group(1))
+    # Dict maps: the keys are the levels (``effort_map = {'low': 0.2, ...}``).
+    for m in re.finditer(
+        rf"\bset\s+{var}\s*=\s*\{{([^}}]+)\}}", template_text, re.I
+    ):
+        levels += re.findall(rf"{lit}\s*:", m.group(1))
+    # Equality comparisons and elif chains enumerate accepted values.
+    for m in re.finditer(rf"{var}\s*(?:==|!=)\s*{lit}", template_text, re.I):
+        levels.append(m.group(1))
+    # Canonical assignments: ``set <effort> = 'low'``.
+    for m in re.finditer(rf"\bset\s+{var}\s*=\s*{lit}", template_text, re.I):
+        levels.append(m.group(1))
 
     # Default: ``reasoning_effort|default('X')`` filter, else the
     # ``if reasoning_effort is not defined -> set reasoning_effort = "X"``
-    # block.
+    # block, else a fallback ternary that lands on a literal when the
+    # incoming value is missing or unrecognised (GLM-5.3's
+    # ``reasoning_effort if ... else 'max'``, Qwen-fixed templates'
+    # ``... else 'medium'``).
     default: str | None = None
-    m = re.search(
-        r"reasoning_effort\s*\|\s*default\(\s*['\"]([A-Za-z0-9_-]+)['\"]\s*\)",
-        template_text,
-    )
-    if m:
-        default = m.group(1)
-    else:
-        m = re.search(
-            r"reasoning_effort\s+is\s+not\s+defined.{0,160}?\bset\s+reasoning_effort\s*=\s*['\"]([A-Za-z0-9_-]+)['\"]",
-            template_text,
+    for pattern, flags in (
+        (rf"reasoning_effort\s*\|\s*default\(\s*{lit}\s*\)", 0),
+        (
+            rf"reasoning_effort\s+is\s+not\s+defined.{{0,160}}?\bset\s+reasoning_effort\s*=\s*{lit}",
             re.S,
-        )
+        ),
+        (rf"{var}\s*=\s*[^=\n]{{0,160}}?\belse\s+{lit}", 0),
+    ):
+        m = re.search(pattern, template_text, flags)
         if m:
             default = m.group(1)
+            break
+
+    # The default is itself an accepted level, so it belongs in the menu.
+    if default is not None:
+        levels.append(default)
+
+    options: list[str] | None = list(dict.fromkeys(levels)) or None
 
     return options, default
 
