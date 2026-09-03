@@ -2042,8 +2042,11 @@ class _DepthController:
         # and priciest measured depths. Falls back to the prior until two
         # depths exist. This is what self-calibrates the controller to the real
         # (model x chip x context) marginal instead of a hardcoded value.
-        if len(self.t) >= 2:
-            depths = sorted(self.t)
+        # Depth 0 is the plain step, which sits below the L=1 -> L=2 verify
+        # jump (see _t_est): including it in the slope overstates the per-row
+        # marginal. Only speculative depths define the slope.
+        depths = sorted(d for d in self.t if d > 0)
+        if len(depths) >= 2:
             lo, hi = depths[0], depths[-1]
             if hi > lo:
                 slope = (self.t[hi] - self.t[lo]) / (hi - lo)
