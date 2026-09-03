@@ -1221,6 +1221,11 @@ class ProcessMemoryEnforcer:
                     # executor without a Scheduler, so an unresolvable
                     # scheduler is their normal shape, not a wrapper break.
                     # Warning here reads as a guard regression (#2312).
+                    # They still receive the soft watermark: engines with a
+                    # decode-fairness gate resume per-forward cache clearing
+                    # once usage crosses it (forward_fairness.py).
+                    with suppress(Exception):
+                        engine.set_memory_soft_limit(soft_limit)
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made

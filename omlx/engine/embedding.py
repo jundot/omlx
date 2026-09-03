@@ -10,6 +10,7 @@ streaming or chat completion.
 import asyncio
 import gc
 import logging
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -17,6 +18,7 @@ import mlx.core as mx
 from ..engine_core import get_mlx_executor
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
 from .base import BaseNonStreamingEngine
+from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,12 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             )
         self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None
+        # Embedding forwards bypass the Scheduler, so they must take part
+        # in decode fairness themselves (see forward_fairness.py). The key
+        # only has to differ from every Scheduler's registry key.
+        self._fairness = ForwardFairnessGate(
+            f"embed:{model_name}:{id(self):x}", scheduler_config
+        )
 
     @property
     def model_name(self) -> str:
@@ -166,10 +174,21 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             order = sorted(range(len(input_items)), key=lambda i: _input_length(input_items[i]))
             ordered_items = [input_items[i] for i in order]
 
-            for start in range(0, len(ordered_items), batch_size):
-                batch = ordered_items[start:start + batch_size]
+            fairness = self._fairness
+            index = 0
+            while index < len(ordered_items):
+                # While another engine decodes, forwards are capped in
+                # time (via the measured per-item duration) so the
+                # victim's stall stays bounded; uncontended forwards use
+                # the full configured batch size.
+                cap = fairness.chunk_cap()
+                size = batch_size if cap is None else max(1, min(batch_size, cap))
+                batch = ordered_items[index:index + size]
+                index += len(batch)
 
-                def _embed_sync():
+                def _embed_sync(batch=batch):
+                    contended = fairness.wait_turn()
+                    start_ts = time.perf_counter()
                     try:
                         return model.embed(
                             inputs=batch,
@@ -179,7 +198,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                         )
                     finally:
                         mx.synchronize()
-                        mx.clear_cache()
+                        fairness.settle(
+                            time.perf_counter() - start_ts, len(batch), contended
+                        )
+                        if fairness.should_clear_cache():
+                            mx.clear_cache()
 
                 output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
                 embeddings.extend(output.embeddings)
@@ -188,7 +211,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                     dimensions = output.dimensions
                 self._update_activity(
                     activity_id,
-                    completed_items=min(start + len(batch), len(input_items)),
+                    completed_items=min(index, len(input_items)),
                     token_count=total_tokens,
                     dimensions=dimensions,
                 )
