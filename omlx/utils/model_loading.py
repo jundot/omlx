@@ -1109,7 +1109,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
 
 def _configure_ngram_spec(model_settings: Any | None) -> None:
-    """Arm or disarm n-gram lookup drafting from per-model settings.
+    """Arm or disarm prompt-lookup drafting (n-gram history lookup) from per-model settings.
 
     Called on both MTP activation branches (the qwen4_exp loader branch and
     the generic whitelist branch) right after set_mtp_depth. With no settings
@@ -1133,7 +1133,7 @@ def _configure_ngram_spec(model_settings: Any | None) -> None:
     # tests stub the mtp module with MagicMock; only log over the real tuple
     if is_ngram_spec_enabled() and isinstance(params, tuple) and len(params) == 4:
         logger.info(
-            "n-gram drafter armed: match_len=%d draft_max=%d draft_min=%d "
+            "prompt-lookup drafter armed: match_len=%d draft_max=%d draft_min=%d "
             "freq_rule=%s", *params,
         )
 
