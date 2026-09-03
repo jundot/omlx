@@ -557,6 +557,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
+        verbose=getattr(args, "verbose", False),
     )
 
     # Launch
@@ -1226,7 +1227,7 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
+            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, Swival) to use "
             "the running oMLX server."
         ),
     )
@@ -1235,7 +1236,17 @@ Example directory structure:
         type=str,
         help=(
             "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "openclaw, hermes, pi, swival, or 'list' to show available"
+        ),
+    )
+    launch_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help=(
+            "Print the tool command line before launching it (API keys are "
+            "masked). Pass a tool's own -v after -- instead."
         ),
     )
     launch_parser.add_argument(

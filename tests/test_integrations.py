@@ -22,6 +22,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
+from omlx.integrations.swival import SwivalIntegration
 
 
 def ctx(**overrides) -> IntegrationContext:
@@ -38,7 +39,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 8
+        assert len(integrations) == 9
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -49,6 +50,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "swival",
         }
 
     def test_get_integration(self):
@@ -2014,6 +2016,117 @@ class TestCopilotIntegration:
         assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
 
 
+class TestSwivalIntegration:
+    def test_get_command(self):
+        swival = SwivalIntegration()
+        cmd = swival.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
+        assert "omlx launch swival" in cmd
+        assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        swival = SwivalIntegration()
+        cmd = swival.get_command(ctx(port=8000, api_key="", model=""))
+        assert "select-a-model" in cmd
+
+    def test_get_command_omits_swival_only_flags(self):
+        """`omlx launch` rejects swival's provider flags, so the displayed
+        command must not carry them -- it is meant to be copy-pasteable."""
+        swival = SwivalIntegration()
+        cmd = swival.get_command(
+            ctx(port=8000, api_key="key", model="qwen3.5", context_window=32768)
+        )
+        assert "--provider" not in cmd
+        assert "--base-url" not in cmd
+        assert "--api-key" not in cmd
+        assert "--max-context-tokens" not in cmd
+
+    def test_launch_injects_model_and_base_url(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["binary"] = binary
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(ctx(port=9000, api_key="key", model="qwen3.5"))
+
+        argv = captured["argv"]
+        assert captured["binary"] == "swival"
+        assert argv[0] == "swival"
+        assert argv[argv.index("--model") + 1] == "qwen3.5"
+        assert argv[argv.index("--provider") + 1] == "generic"
+        # swival appends /v1 itself, so the bare base URL is correct here.
+        assert argv[argv.index("--base-url") + 1] == "http://127.0.0.1:9000"
+        assert argv[argv.index("--api-key") + 1] == "key"
+
+    def test_launch_omits_optional_flags_when_unset(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(ctx(port=8000, api_key="", model=""))
+
+        argv = captured["argv"]
+        assert "--api-key" not in argv
+        assert "--model" not in argv
+        assert "--max-context-tokens" not in argv
+
+    def test_launch_passes_context_window_and_extra_args(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["argv"] = argv
+
+        with patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe):
+            swival.launch(
+                ctx(
+                    port=8000,
+                    api_key="",
+                    model="qwen3.5",
+                    context_window=32768,
+                    extra_args=("--yolo",),
+                )
+            )
+
+        argv = captured["argv"]
+        assert argv[argv.index("--max-context-tokens") + 1] == "32768"
+        assert argv[-1] == "--yolo"
+
+    def test_launch_scrubs_python_env(self):
+        swival = SwivalIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        base_env = {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/bundle/python",
+            "PYTHONPATH": "/bundle/lib",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        with (
+            patch("omlx.integrations.swival.os.environ", base_env),
+            patch("omlx.integrations.swival.os.execvpe", side_effect=fake_execvpe),
+        ):
+            swival.launch(ctx(port=8000, api_key="", model="qwen3.5"))
+
+        assert "PYTHONHOME" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+        assert captured["env"]["PATH"] == "/usr/bin"
+
+    def test_type(self):
+        swival = SwivalIntegration()
+        assert swival.type == "env_var"
+        assert swival.display_name == "Swival"
+
+
 class TestIntegrationSettings:
     def test_settings_dataclass(self):
         from omlx.settings import IntegrationSettings
@@ -2062,3 +2175,77 @@ class TestIntegrationSettings:
 
         settings = IntegrationSettings.from_dict({})
         assert settings.codex_model is None
+
+
+class TestVerboseCommandEcho:
+    """`omlx launch -v` prints the tool command line with secrets masked."""
+
+    def test_echo_prints_masked_command(self, capsys):
+        integration = get_integration("swival")
+        launch_ctx = ctx(api_key="sk-secret", model="qwen3-coder", verbose=True)
+
+        integration._echo_command(
+            launch_ctx,
+            ["swival", "--api-key", launch_ctx.api_key, "--model", launch_ctx.model],
+        )
+
+        out = capsys.readouterr().out
+        assert out == "$ swival --api-key REDACTED --model qwen3-coder\n"
+        assert "sk-secret" not in out
+
+    def test_echo_silent_without_verbose(self, capsys):
+        integration = get_integration("swival")
+        launch_ctx = ctx(api_key="sk-secret")
+
+        integration._echo_command(
+            launch_ctx, ["swival", "--api-key", launch_ctx.api_key]
+        )
+
+        assert capsys.readouterr().out == ""
+
+    def test_echo_quotes_arguments_with_spaces(self, capsys):
+        integration = get_integration("codex")
+        launch_ctx = ctx(verbose=True)
+
+        integration._echo_command(launch_ctx, ["codex", "--resume", "session id"])
+
+        assert capsys.readouterr().out == "$ codex --resume 'session id'\n"
+
+    def test_context_defaults_to_non_verbose(self):
+        assert ctx().verbose is False
+
+
+class TestMaskSecrets:
+    def test_masks_separate_flag_value(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--api-key", "k"], "k") == [
+            "t",
+            "--api-key",
+            "REDACTED",
+        ]
+
+    def test_masks_equals_form(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--api-key=k"], "k") == ["t", "--api-key=REDACTED"]
+
+    def test_masks_key_embedded_in_other_argument(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--base-url", "http://u:k@h/v1"], "k") == [
+            "t",
+            "--base-url",
+            "http://u:REDACTED@h/v1",
+        ]
+
+    def test_leaves_non_secret_arguments_untouched(self):
+        from omlx.integrations.base import _mask_secrets
+
+        args = ["t", "--model", "m", "--max-context-tokens", "32768"]
+        assert _mask_secrets(args, "") == args
+
+    def test_empty_key_does_not_mask_everything(self):
+        from omlx.integrations.base import _mask_secrets
+
+        assert _mask_secrets(["t", "--model", "m"], "") == ["t", "--model", "m"]
