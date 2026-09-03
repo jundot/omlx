@@ -37,7 +37,7 @@ def test_cluster_navigation_exists_for_desktop_and_mobile():
 
     assert dashboard.count('{% include "dashboard/_cluster.html" %}') == 1
     assert navbar.count("setMainTab('cluster')") == 2
-    assert navbar.count("mainTab === 'cluster'") == 2
+    assert navbar.count("mainTab === 'cluster'") == 3
     assert navbar.count("navbar.tab.cluster") == 2
     assert navbar.count(
         'x-show="globalSettings.server.distributed_inference_active"'

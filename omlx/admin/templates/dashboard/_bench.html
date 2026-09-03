@@ -9,7 +9,7 @@
                 </div>
             </th>
             {% endmacro %}
-            <div x-show="mainTab === 'bench'" x-cloak>
+            <div x-show="mainTab === 'bench'" x-cloak role="tabpanel" id="panel-bench" aria-labelledby="tab-bench">
                 <!-- Sub-tab navigation -->
                 <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
                     <button

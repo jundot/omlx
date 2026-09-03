@@ -13,6 +13,8 @@
         <!-- Modal -->
         <div class="flex min-h-full items-center justify-center p-4">
             <div class="relative bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-4xl p-4 sm:p-8"
+                 role="dialog" aria-modal="true"
+                 aria-labelledby="model-settings-modal-title"
                  @click.stop
                  x-transition:enter="transition ease-out duration-200"
                  x-transition:enter-start="opacity-0 scale-95"
@@ -25,7 +27,7 @@
                 <div class="flex items-center justify-between mb-6">
                     <div>
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
-                        <h4 class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
+                        <h4 id="model-settings-modal-title" class="text-xl font-bold tracking-tight text-neutral-900" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
                     </div>
                     <button @click="showModelSettingsModal = false"
                             class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">

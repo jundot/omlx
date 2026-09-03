@@ -2,7 +2,7 @@
 <html lang="{{ current_lang }}">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}oMLX Admin{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="/admin/static/favicon.svg">
 
@@ -114,12 +114,20 @@
             box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
         }
 
-        /* Clear keyboard focus indicator (complements the enhanced-readability
+/* Clear keyboard focus indicator (complements the enhanced-readability
            contrast boost). Visible on :focus-visible only, so mouse users see
            no extra chrome while keyboard users always see where focus is. */
         :focus-visible {
             outline: 2px solid var(--focus-ring-color) !important;
             outline-offset: 2px;
+        }
+
+        /* Dashboard nav tabs: subtle focus ring that reads naturally next to the
+           selected-state pill instead of a stark default blue outline. Keyboard-only
+           (:focus-visible) so a mouse click never leaves a lingering ring. */
+        [role="tab"]:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(0,0,0,0.12);
         }
 
         /* Respect "Reduce Motion" (accessibility): collapse CSS transitions
