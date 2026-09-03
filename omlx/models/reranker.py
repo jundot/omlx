@@ -8,6 +8,7 @@ and CausalLM-based reranker models on Apple's MLX framework.
 Supports:
 - ModernBertForSequenceClassification (via mlx-embeddings)
 - XLMRobertaForSequenceClassification (omlx native implementation)
+- LlamaBidirectionalForSequenceClassification (omlx native implementation)
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
@@ -22,6 +23,7 @@ import mlx.core as mx
 
 from ..model_discovery import (
     CAUSAL_LM_RERANKER_ARCHITECTURES,
+    LLAMA_BIDIRECTIONAL_RERANKER_ARCHITECTURE,
     MULTIMODAL_RERANKER_ARCHITECTURES,
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
@@ -53,7 +55,12 @@ class RerankOutput:
     """Output from rerank operation."""
 
     scores: list[float]
-    """Relevance scores for each document (0 to 1)."""
+    """Relevance scores for each document.
+
+    Most architectures emit a 0-to-1 score. Models whose reference
+    implementation documents a raw logit (LlamaBidirectional rerankers) emit
+    unbounded signed scores instead, so compare them by rank, not magnitude.
+    """
 
     indices: list[int]
     """Document indices sorted by score (descending)."""
@@ -112,6 +119,7 @@ class MLXRerankerModel:
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._is_llama_bidirectional = False
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
         self._doc_embed_token_id: int | None = None
@@ -230,6 +238,74 @@ class MLXRerankerModel:
         )
 
         return model, tokenizer
+
+    @staticmethod
+    def _load_llama_bidirectional_tokenizer(model_path: Path) -> Any:
+        """Load the tokenizer without resolving the model config.
+
+        These checkpoints declare a custom ``model_type`` plus an ``auto_map``,
+        so AutoTokenizer resolves the *model* config to decide about remote
+        code -- and transformers >= 5 cannot parse the transformers-4.44-era
+        rope block they ship. The tokenizer is fully self-describing, so load
+        it directly: the model config is already parsed into ModelArgs, and
+        this keeps the repository's own Python out of the process entirely.
+        """
+        from transformers import PreTrainedTokenizerFast
+
+        declared_class = None
+        tokenizer_config_path = model_path / "tokenizer_config.json"
+        if tokenizer_config_path.exists():
+            with open(tokenizer_config_path) as f:
+                declared_class = json.load(f).get("tokenizer_class")
+        if declared_class not in (None, "PreTrainedTokenizerFast"):
+            raise ValueError(
+                "LlamaBidirectional rerankers are expected to ship a "
+                f"PreTrainedTokenizerFast tokenizer; got {declared_class!r}."
+            )
+
+        # The reference implementation pads left and falls back to the EOS
+        # token when the tokenizer ships no pad token.
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            str(model_path),
+            padding_side="left",
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
+
+    def _load_llama_bidirectional(self) -> Tuple[Any, Any]:
+        """Load a bidirectional Llama reranker using the omlx native model."""
+        import mlx.core as mx
+
+        from .llama_bidirectional_reranker import Model, ModelArgs
+
+        model_path = Path(self.model_name)
+
+        with open(model_path / "config.json") as f:
+            config_dict = json.load(f)
+
+        config = ModelArgs(
+            **{
+                k: v
+                for k, v in config_dict.items()
+                if k in ModelArgs.__dataclass_fields__
+            }
+        )
+
+        model = Model(config)
+
+        # mx.load reads safetensors straight into MLX arrays and handles the
+        # bfloat16 weights these checkpoints ship; see _load_xlm_roberta.
+        weights = {}
+        for weight_file in model_path.glob("*.safetensors"):
+            weights.update(mx.load(str(weight_file)))
+        weights = model.sanitize(weights)
+
+        model.load_weights(list(weights.items()))
+        mx.eval(model.parameters())
+        model.train(False)
+
+        return model, self._load_llama_bidirectional_tokenizer(model_path)
 
     def _load_vl_reranker(self) -> Tuple[Any, Any]:
         """Load a multimodal reranker (e.g., Qwen3-VL-Reranker) via mlx-embeddings.
@@ -822,6 +898,11 @@ class MLXRerankerModel:
                 # Use omlx native implementation
                 self.model, self.processor = self._load_xlm_roberta()
                 self._num_labels = getattr(self.model.config, "num_labels", None)
+            elif arch == LLAMA_BIDIRECTIONAL_RERANKER_ARCHITECTURE:
+                # Use omlx native implementation
+                self.model, self.processor = self._load_llama_bidirectional()
+                self._is_llama_bidirectional = True
+                self._num_labels = getattr(self.model.config, "num_labels", None)
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 patch_qwen3_vl_processor_for_torch_free_image_loading()
@@ -930,6 +1011,7 @@ class MLXRerankerModel:
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._is_llama_bidirectional = False
         self._token_true_id = None
         self._token_false_id = None
         self._doc_embed_token_id = None
@@ -947,6 +1029,10 @@ class MLXRerankerModel:
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
     _DEFAULT_MAX_LENGTH_CAUSAL_LM = 8192
+    # LlamaBidirectional rerankers are trained and evaluated to 8192 tokens.
+    # Their tokenizer_config.json still carries the base model's 4096
+    # model_max_length, so the default is pinned here rather than read from it.
+    _DEFAULT_MAX_LENGTH_LLAMA_BIDIRECTIONAL = 8192
 
     def rerank(
         self,
@@ -1002,6 +1088,15 @@ class MLXRerankerModel:
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
             return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
+        elif self._is_llama_bidirectional:
+            effective_max_length = (
+                max_length
+                if max_length is not None
+                else self._DEFAULT_MAX_LENGTH_LLAMA_BIDIRECTIONAL
+            )
+            return self._rerank_llama_bidirectional(
+                query_str, docs_str, effective_max_length
+            )
         else:
             effective_max_length = (
                 max_length
@@ -1311,6 +1406,117 @@ class MLXRerankerModel:
             total_tokens=total_tokens,
         )
 
+    def _forward_seq_logits(
+        self,
+        input_ids: mx.array,
+        attention_mask: mx.array,
+    ) -> mx.array:
+        """Run the classification head, preferring the compiled logits path.
+
+        Shared by every SequenceClassification reranker so the compile
+        fallback is defined once. Returns logits of shape
+        (batch_size, num_labels), already evaluated.
+        """
+        logits = None
+        if self._is_compiled and self._compiled_seq_logits is not None:
+            try:
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+                logits = self._compiled_seq_logits(model_inputs)
+            except Exception as e:
+                logger.warning(
+                    f"compiled reranker path failed for {self.model_name}: {e}; "
+                    f"disabling compile and falling back to eager forward()"
+                )
+                self._is_compiled = False
+                self._compiled_seq_logits = None
+
+        if logits is None:
+            if not callable(self.model):
+                raise ValueError("SequenceClassification model is not initialized.")
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+            # pooler_output shape: (batch_size, num_labels)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                logits = outputs.pooler_output
+            else:
+                raise ValueError(
+                    "Model output does not contain pooler_output. "
+                    "Ensure the model is a SequenceClassification model."
+                )
+
+        mx.eval(logits)
+        return logits
+
+    @staticmethod
+    def _format_llama_bidirectional_prompt(query: str, document: str) -> str:
+        """Render one pair with the reference prompt template.
+
+        Byte-identical to the upstream model card and its vLLM chat template.
+        The spacing around the two newlines is part of the template, and the
+        pair is encoded as a single sequence: a Llama tokenizer has no
+        sentence-pair scheme, so pair encoding would feed the model an
+        off-distribution input without raising.
+        """
+        return f"question:{query} \n \n passage:{document}"
+
+    def _rerank_llama_bidirectional(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: int = 8192,
+    ) -> RerankOutput:
+        """Rerank using a bidirectional Llama sequence-classification head."""
+        processor = self.processor
+        if not callable(processor):
+            raise ValueError("LlamaBidirectional processor is not initialized.")
+
+        texts = [
+            self._format_llama_bidirectional_prompt(query, document)
+            for document in documents
+        ]
+
+        inputs = processor(
+            texts,
+            max_length=max_length,
+            padding=True,
+            truncation=True,
+            return_tensors="np",
+        )
+
+        input_ids = mx.array(inputs["input_ids"])
+        attention_mask = mx.array(inputs["attention_mask"])
+
+        logits = self._forward_seq_logits(input_ids, attention_mask)
+
+        if logits.shape[-1] != 1:
+            raise ValueError(
+                "LlamaBidirectional rerankers expect a single-label head; "
+                f"got {logits.shape[-1]} labels."
+            )
+        # Raw signed logits, deliberately not squashed: the reference documents
+        # the score as a logit and leaves any sigmoid to the caller.
+        scores = logits.squeeze(-1).tolist()
+
+        indexed_scores = list(enumerate(scores))
+        indexed_scores.sort(key=lambda x: x[1], reverse=True)
+        sorted_indices = [idx for idx, _ in indexed_scores]
+
+        # Count the real tokens actually scored. _count_tokens assumes the
+        # (query, document) pair encoding this path deliberately avoids.
+        total_tokens = int(attention_mask.sum().item())
+
+        return RerankOutput(
+            scores=scores,
+            indices=sorted_indices,
+            total_tokens=total_tokens,
+        )
+
     def _rerank_seq_classification(
         self,
         query: str,
@@ -1347,43 +1553,7 @@ class MLXRerankerModel:
         input_ids = mx.array(inputs["input_ids"])
         attention_mask = mx.array(inputs["attention_mask"])
 
-        # Forward pass (compiled primitive logits path when available)
-        logits = None
-        if self._is_compiled and self._compiled_seq_logits is not None:
-            try:
-                model_inputs = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                }
-                logits = self._compiled_seq_logits(model_inputs)
-            except Exception as e:
-                logger.warning(
-                    f"compiled reranker path failed for {self.model_name}: {e}; "
-                    f"disabling compile and falling back to eager forward()"
-                )
-                self._is_compiled = False
-                self._compiled_seq_logits = None
-
-        if logits is None:
-            if not callable(self.model):
-                raise ValueError("SequenceClassification model is not initialized.")
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-
-            # Extract scores from pooler_output
-            # pooler_output shape: (batch_size, num_labels)
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                logits = outputs.pooler_output
-            else:
-                raise ValueError(
-                    "Model output does not contain pooler_output. "
-                    "Ensure the model is a SequenceClassification model."
-                )
-
-        # Ensure computation is done
-        mx.eval(logits)
+        logits = self._forward_seq_logits(input_ids, attention_mask)
 
         # Extract relevance scores
         # For binary classification (num_labels=1), score is already sigmoid applied
