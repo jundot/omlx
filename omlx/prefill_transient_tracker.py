@@ -68,9 +68,19 @@ class PrefillTransientTracker:
         return self._gathered_history if gathered_core is True else self._dense_history
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
-        """Accumulate footprint released since the last positive sample."""
+        """Hold the LARGEST footprint released since the last positive sample.
+
+        The charge prices one reallocation of the pool MLX gave back, so it is
+        bounded by the biggest single release — not by their sum. Summing made
+        the charge grow without limit across a run of negative deltas: measured
+        on GLM-5.3-Flash-oQ2e, a short conversation stacked 22.97GB of charge on
+        top of a 1.02GB computed transient, and every long prompt after it was
+        rejected by the pre-chunk guard at a 124GB ceiling.
+        """
         if reclaimed_bytes > 0:
-            self._recent_reclaim_bytes += int(reclaimed_bytes)
+            self._recent_reclaim_bytes = max(
+                self._recent_reclaim_bytes, int(reclaimed_bytes)
+            )
 
     def clear_reclaim(self) -> None:
         """Drop the charge once any positive measurement confirms realloc.
