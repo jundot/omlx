@@ -1,6 +1,7 @@
 # DeepSeek-V4-Flash-Vision two-Mac validation
 
-Status: experimental; single-Mac/loopback validated, physical two-Mac run pending.
+Status: experimental; single-Mac/loopback and the core physical two-Mac path
+validated. The latest crash-recovery hardening awaits another physical-pair run.
 
 This path is intentionally specific to
 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`. Rank 0 preprocesses images, owns
@@ -35,6 +36,37 @@ Pair Mac B in Mac A's **Cluster** tab. Prefer the direct Thunderbolt addresses;
 use Ring first, then JACCL only after the baseline succeeds.
 
 ## Ordered test procedure
+
+### Single-Mac hardware canary
+
+Before a scarce two-Mac test window, run the download-free canary on any
+Apple-silicon Mac:
+
+```bash
+uv run omlx cluster hardware-canary --json \
+  | tee /tmp/omlx-hardware-canary.json
+```
+
+It uses the real Metal backend and runs the existing worker lifecycle,
+two-rank loopback all-sum, and unequal pipeline smokes. It also executes a tiny
+DeepSeek-V4 vision encoder and image-visibility attention call, asserting that
+a 2k-token text/image/text prompt isolates its image span and stays below a
+256 MiB transient bound. Finally, a separate process holds 128 MiB of evaluated
+Metal memory and ignores `SIGTERM`; the production distributed supervisor must
+escalate it, reap the complete process group, persist a simulated
+retained-memory reload quarantine, reject the reload, and clear the quarantine
+only after the capacity probe recovers.
+
+The allocation is deliberately too small to create memory pressure. It can be
+changed within the hard safety range of 16–512 MiB using
+`--allocation-mib`. The command reports a clear skip on non-Apple-silicon or
+Metal-unavailable hosts and always places temporary markers in a disposable
+directory.
+
+A pass validates the local Metal code paths and deterministic containment
+logic. It does **not** reproduce an IOGPU leak, load the full checkpoint, or
+validate cross-host Ring, Thunderbolt, or JACCL. Continue with the physical
+procedure below for those claims.
 
 1. Verify connectivity on both Macs.
 

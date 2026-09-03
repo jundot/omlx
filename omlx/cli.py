@@ -891,6 +891,37 @@ def cluster_command(args) -> int:
             print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
         return 0
 
+    if action == "hardware-canary":
+        from .cluster.hardware_canary import (
+            HardwareCanaryError,
+            HardwareCanarySkipError,
+            run_local_hardware_canary,
+        )
+
+        try:
+            result = run_local_hardware_canary(
+                timeout=args.timeout,
+                allocation_mib=args.allocation_mib,
+            )
+        except HardwareCanarySkipError as exc:
+            result = {"ok": False, "skipped": True, "reason": str(exc)}
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(f"oMLX Apple-silicon hardware canary skipped: {exc}")
+            return 0
+        except (HardwareCanaryError, OSError, RuntimeError, ValueError) as exc:
+            print(f"Cluster hardware canary failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print("oMLX Apple-silicon hardware canary passed")
+            print("Checks:      worker, collective, pipeline, vision, crash recovery")
+            print(f"Elapsed:     {result['elapsed_seconds']:.3f}s")
+            print("Scope:       one Mac, two ranks over loopback")
+        return 0
+
     if action == "plan":
         import socket
 
@@ -1385,6 +1416,27 @@ Example directory structure:
         help="Overall pipeline deadline in seconds (default: 30)",
     )
     cluster_pipeline_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+    cluster_hardware_parser = cluster_subparsers.add_parser(
+        "hardware-canary",
+        help="Run safe Metal, two-rank, and crash-recovery checks on one Mac",
+    )
+    cluster_hardware_parser.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=45.0,
+        help="Per-check deadline in seconds (default: 45)",
+    )
+    cluster_hardware_parser.add_argument(
+        "--allocation-mib",
+        type=_positive_int,
+        default=128,
+        help="Metal allocation held during fault injection, 16-512 MiB (default: 128)",
+    )
+    cluster_hardware_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON",

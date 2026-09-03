@@ -404,6 +404,50 @@ def test_supervisor_refuses_clean_teardown_when_rank_group_survives(
         recreated._check_recovery_quarantine()
 
 
+def test_supervisor_reaps_sigkilled_group_leader_before_liveness_recheck(
+    monkeypatch, tmp_path
+):
+    class Launcher:
+        pid = 43213
+        stdout = None
+        stderr = None
+        returncode = None
+        wait_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired("launcher", timeout)
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    launcher = Launcher()
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    supervisor.process = launcher
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: launcher.returncode is not None,
+    )
+    monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
+
+    supervisor.stop()
+
+    assert launcher.returncode == -signal.SIGKILL
+    assert not supervisor._recovery_marker_path().exists()
+
+
 def test_supervisor_quarantines_reload_until_live_capacity_recovers(
     monkeypatch, tmp_path
 ):

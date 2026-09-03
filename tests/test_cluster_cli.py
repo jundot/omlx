@@ -18,6 +18,7 @@ def test_cluster_help_is_exposed():
     assert "worker-smoke" in result.stdout
     assert "collective-smoke" in result.stdout
     assert "pipeline-smoke" in result.stdout
+    assert "hardware-canary" in result.stdout
     assert "plan" in result.stdout
 
 

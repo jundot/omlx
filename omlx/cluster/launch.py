@@ -2043,6 +2043,14 @@ class DistributedJobSupervisor:
                         f"local launch process group {process_group} could not "
                         "be killed"
                     )
+                # Reap the launcher before probing its process group again.
+                # A SIGKILLed group leader remains visible as a zombie until
+                # its parent calls wait(), so killpg(..., 0) otherwise reports
+                # a cleanly killed one-process group as still alive and leaves
+                # a false reboot-required quarantine behind.
+                if process is not None and process.poll() is None:
+                    with suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=2.0)
                 if not _wait_for_process_group_exit(process_group, 2.0):
                     teardown_failures.append(
                         f"local launch process group {process_group} survived SIGKILL"
