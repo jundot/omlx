@@ -2,8 +2,9 @@
 """Tests for DFlash engine integration."""
 
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1529,6 +1530,35 @@ class TestDFlashActivityTracking:
         engine._reset_activity_tracking()
         assert engine.get_activity_snapshot()["active_requests"] == 0
         assert engine.has_active_requests() is False
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_abort_signals_active_generations(self):
+        engine = self._engine()
+        first = threading.Event()
+        second = threading.Event()
+        engine._register_stop_event(first)
+        engine._register_stop_event(second)
+
+        assert engine.has_active_requests() is True
+        assert await engine.abort_all_requests() == 2
+        assert first.is_set()
+        assert second.is_set()
+
+        # Repeated pressure polls must not count the same request twice.
+        assert await engine.abort_all_requests() == 0
+
+        engine._unregister_stop_event(first)
+        engine._unregister_stop_event(second)
+        assert engine.has_active_requests() is False
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_abort_delegates_to_fallback(self):
+        engine = self._engine()
+        engine._fallback_engine = MagicMock()
+        engine._fallback_engine.abort_all_requests = AsyncMock(return_value=3)
+
+        assert await engine.abort_all_requests() == 3
+        engine._fallback_engine.abort_all_requests.assert_awaited_once()
 
 
 class TestDFlashRuntimeCacheStats:
