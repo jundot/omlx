@@ -384,6 +384,91 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     return out.astype(queries.dtype)
 
 
+def _chunked_dense_fallback_attention(real_cache, queries, keys, values, scale, mask):
+    """Dequantize-and-attend over bounded query/KV tiles, never the whole
+    resident cache in one shot (#3090).
+
+    Reached when quantized_attention isn't applicable (below the long-
+    prefill threshold) or raised. ``real_cache.dequantize()`` with no
+    explicit views defaults to the ENTIRE resident cache, and the views
+    the caller can actually pass here (this call's own ``keys``/``values``)
+    are themselves the same full-cache state proxy that default falls back
+    to -- passing them explicitly doesn't narrow anything, confirmed
+    against the pinned mlx-vlm by tracing ``update_and_fetch`` (there is no
+    call path in the pinned wheel where a narrower view reaches this
+    dispatcher). So the only way to bound this fallback's transient is to
+    tile it ourselves.
+
+    Mirrors quantized_attention's own tile schedule (query_block x
+    key_chunk, same constants #3108 already prices this fallback against)
+    and mask/GQA handling (_apply_attention_mask, the (B, n_kv, n_repeats,
+    L, D) reshape) exactly -- but scores real dequantized fp32 keys/values
+    with plain einsum instead of codebook lookups, and combines chunks with
+    a standard online-softmax accumulator (no query-side rotation: that is
+    a quantization-codec concern, irrelevant once the data is real).
+    """
+    from mlx_vlm.turboquant import TurboQuantSplitState
+
+    from ..turboquant_kv import _slice_state_range, _state_length
+
+    keys_state = real_cache._unwrap(keys)
+    values_state = real_cache._unwrap(values)
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = (
+        keys_state.low.norms.shape[1]
+        if isinstance(keys_state, TurboQuantSplitState)
+        else keys_state.norms.shape[1]
+    )
+    n_repeats = n_q_heads // n_kv_heads
+    total_tokens = _state_length(keys_state)
+    value_dim = real_cache.value_codec.dim
+
+    grouped_queries = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+
+    out_blocks = []
+    for q_start in range(0, L, _LONG_PREFILL_QUERY_BLOCK_SIZE):
+        q_end = min(L, q_start + _LONG_PREFILL_QUERY_BLOCK_SIZE)
+        q_block = grouped_queries[..., q_start:q_end, :]
+        qt = q_end - q_start
+
+        acc = mx.zeros((B, n_kv_heads, n_repeats, qt, value_dim), dtype=mx.float32)
+        denom = mx.zeros((B, n_kv_heads, n_repeats, qt), dtype=mx.float32)
+        m_running = mx.full(
+            (B, n_kv_heads, n_repeats, qt), -float("inf"), dtype=mx.float32
+        )
+
+        for k_start in range(0, total_tokens, _LONG_PREFILL_KEY_CHUNK_SIZE):
+            k_end = min(total_tokens, k_start + _LONG_PREFILL_KEY_CHUNK_SIZE)
+            dq_keys, dq_values = real_cache.dequantize(
+                keys_state=_slice_state_range(keys_state, k_start, k_end),
+                values_state=_slice_state_range(values_state, k_start, k_end),
+            )
+
+            scores = mx.einsum("bhmld,bhtd->bhmlt", q_block, dq_keys)
+            scores = real_cache._apply_attention_mask(
+                scores, mask, q_start, q_end, k_start, k_end, L, total_tokens
+            )
+
+            chunk_max = mx.max(scores, axis=-1)
+            new_max = mx.maximum(m_running, chunk_max)
+            prev_scale = mx.exp(m_running - new_max)
+            p = mx.exp(scores - new_max[..., None])
+
+            acc = acc * prev_scale[..., None] + mx.einsum(
+                "bhmlt,bhtd->bhmld", p, dq_values
+            )
+            denom = denom * prev_scale + mx.sum(p, axis=-1)
+            m_running = new_max
+            mx.eval(acc, denom, m_running)  # bound the live graph to one KV chunk
+
+        out_blocks.append(acc / mx.maximum(denom[..., None], _STATS_EPS))
+        mx.eval(out_blocks[-1])
+
+    out = mx.concatenate(out_blocks, axis=3)
+    out = out.reshape(B, n_q_heads, L, value_dim)
+    return out.astype(queries.dtype)
+
+
 def _patch_update_eval_policy() -> None:
     """Skip the per-layer eval for decode-shaped multi-row cache appends.
 
@@ -654,9 +739,29 @@ def apply_turboquant_attention_patch() -> bool:
             )
             if result is not None:
                 return result
+            # Dense fallback: quantized_attention wasn't applicable (below
+            # the long-prefill threshold) or failed above, and the cache's
+            # own prefill_attention() declined (returned None). Tile the
+            # dequantize+attend instead of doing it in one shot -- neither
+            # this call's own keys/values NOR an explicit dequantize()
+            # narrows anything (both are the same full-resident state
+            # proxy dequantize() defaults to), confirmed by tracing
+            # update_and_fetch in the pinned wheel: there is no call path
+            # where a narrower view reaches this dispatcher (#3090). See
+            # _chunked_dense_fallback_attention's own docstring for the
+            # tile schedule and why it's memory-safe at long context.
+            try:
+                return _chunked_dense_fallback_attention(
+                    real_cache, queries, keys, values, scale, mask
+                )
+            except Exception:
+                logger.debug(
+                    "TurboQuant chunked dense fallback failed; using "
+                    "single-shot dequantize+SDPA",
+                    exc_info=True,
+                )
             dequantized_keys, dequantized_values = real_cache.dequantize(
-                keys_state=keys,
-                values_state=values,
+                keys_state=keys, values_state=values
             )
             return mx.fast.scaled_dot_product_attention(
                 queries,
