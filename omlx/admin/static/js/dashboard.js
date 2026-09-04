@@ -334,6 +334,17 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            // Usage & Cost card state (current session vs lifetime, estimated cloud API cost)
+            usageSession: {
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                estimated_api_cost_usd: null,
+            },
+            usageLifetime: {
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                estimated_api_cost_usd: null,
+            },
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
@@ -8997,6 +9008,22 @@
                 } catch (err) {
                     console.error('Failed to load stats:', err);
                 }
+                await this.loadUsage();
+            },
+
+            async loadUsage() {
+                try {
+                    const sessionResp = await fetch('/admin/api/usage/lifetime?scope=session');
+                    if (sessionResp.ok) {
+                        this.usageSession = { ...this.usageSession, ...(await sessionResp.json()) };
+                    }
+                    const lifetimeResp = await fetch('/admin/api/usage/lifetime?scope=alltime');
+                    if (lifetimeResp.ok) {
+                        this.usageLifetime = { ...this.usageLifetime, ...(await lifetimeResp.json()) };
+                    }
+                } catch (err) {
+                    console.error('Failed to load usage & cost:', err);
+                }
             },
 
             async clearStats() {
@@ -9064,6 +9091,11 @@
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            formatCost(usd) {
+                if (usd === null || usd === undefined) return window.t('status.usage.unknown_cost');
+                return '$' + usd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
             },
 
             cacheObsCumulative(stats, selectedModel) {

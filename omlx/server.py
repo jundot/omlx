@@ -195,6 +195,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .usage_ledger import close_current_session
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -577,7 +578,9 @@ async def lifespan(app: FastAPI):
         preload_task.cancel()
         with suppress(asyncio.CancelledError):
             await preload_task
-    get_server_metrics().save_alltime()
+    _shutdown_metrics = get_server_metrics()
+    _shutdown_metrics.save_alltime()
+    close_current_session(_shutdown_metrics)
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -2017,7 +2020,8 @@ def init_server(
 
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
-    reset_server_metrics(stats_path=stats_path)
+    ledger_path = base_path / "usage_sessions.jsonl"
+    reset_server_metrics(stats_path=stats_path, ledger_path=ledger_path)
 
     logger.info(
         f"Server initialized with {_server_state.engine_pool.model_count} models"
