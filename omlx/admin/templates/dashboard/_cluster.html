@@ -916,6 +916,16 @@
                              x-text="clusterStatus.transport.rdma.enabled
                                 ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
                                 : 'RDMA not enabled'"></div>
+                        {# Readiness-ladder copy (B3): the node's reason/remedy render
+                           verbatim until the collective is proven. #}
+                        <template x-if="clusterStatus.transport.readiness && clusterStatus.transport.readiness.state !== 'collective_ok'">
+                            <div class="text-xs mt-2 space-y-0.5">
+                                <div class="text-neutral-500"
+                                     x-text="clusterStatus.transport.readiness.reason"></div>
+                                <div class="text-neutral-400"
+                                     x-text="clusterStatus.transport.readiness.remedy"></div>
+                            </div>
+                        </template>
                     </div>
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">
