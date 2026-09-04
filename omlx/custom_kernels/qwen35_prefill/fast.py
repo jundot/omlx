@@ -824,7 +824,35 @@ _nax_available_cache: bool | None = None
 _stock_nax_cache: bool | None = None
 _qmm_nax_cache: bool | None = None
 
-QMM_NAX_VARIANT = int(os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0"))
+# Bundled NAX tiles (must match qwen_q_affine_nax_variant in qwen35_prefill.cpp):
+#   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
+#   3: bn 128   4: bk 32   5: wm4 wn1
+# benchmarks/bench_qwen35_nax_qmm_variants.py compares them against stock.
+NAX_QMM_VARIANTS = range(6)
+_qmm_nax_variant_warned = False
+
+
+def _resolve_qmm_nax_variant() -> int:
+    global _qmm_nax_variant_warned
+    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0").strip()
+    try:
+        variant = int(raw)
+    except ValueError:
+        variant = -1
+    if variant in NAX_QMM_VARIANTS:
+        return variant
+    if not _qmm_nax_variant_warned:
+        _qmm_nax_variant_warned = True
+        logger.warning(
+            "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
+            "(valid: 0-%d); using variant 0",
+            raw,
+            NAX_QMM_VARIANTS[-1],
+        )
+    return 0
+
+
+QMM_NAX_VARIANT = _resolve_qmm_nax_variant()
 
 
 def _nax_available_fallback(
