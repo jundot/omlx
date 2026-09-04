@@ -104,10 +104,16 @@ class ModelLayout:
     # partitions. Qwen3-Next linear attention and Nemotron-H Mamba layers have
     # additional dimensions beyond the regular attention/KV pair.
     tensor_parallel_divisors: tuple[int, ...] = ()
-    # Resident KV-cache bytes one layer adds per token. Reserved per node in
-    # proportion to the layers it holds, so a plan that fits the weights
-    # still fits once a long prompt fills the cache.
-    kv_bytes_per_token_per_layer: int = 0
+    # Resident KV-cache bytes each layer adds per token, one entry per layer
+    # (mirrors layer_weight_bytes' shape, not a scalar applied uniformly).
+    # Reserved per node in proportion to the layers it holds, so a plan that
+    # fits the weights still fits once a long prompt fills the cache. Hybrid
+    # architectures mix constant-state layers (Gated DeltaNet, Mamba) with
+    # real growing-KV layers -- see _kv_bytes_per_token_by_layer. Empty means
+    # "unknown" (a synthetic layout built before download, or a config this
+    # module cannot read), which is distinct from a real all-zero tuple for a
+    # model whose every layer is constant-state.
+    kv_bytes_per_token_by_layer: tuple[int, ...] = ()
     # MLA models keep one latent cache per layer that every tensor-parallel
     # member holds whole; sharding divides the heads, not this cache.
     kv_replicated_across_tp: bool = False
@@ -127,6 +133,16 @@ class ModelLayout:
             )
         if any(size < 0 for size in self.layer_weight_bytes):
             raise ValueError("layer weights must be non-negative")
+        if self.kv_bytes_per_token_by_layer and len(
+            self.kv_bytes_per_token_by_layer
+        ) != len(self.layer_weight_bytes):
+            raise ValueError(
+                "kv_bytes_per_token_by_layer must have one entry per layer"
+            )
+        if any(size < 0 for size in self.kv_bytes_per_token_by_layer):
+            raise ValueError(
+                "kv_bytes_per_token_by_layer values must be non-negative"
+            )
         if self.tensor_count < 0:
             raise ValueError("tensor_count must be non-negative")
         if self.activation_bytes_per_token < 0:
@@ -135,8 +151,6 @@ class ModelLayout:
             raise ValueError("tensor_parallel_heads must be at least 1")
         if self.tensor_parallel_kv_heads < 0:
             raise ValueError("tensor_parallel_kv_heads must be non-negative")
-        if self.kv_bytes_per_token_per_layer < 0:
-            raise ValueError("kv_bytes_per_token_per_layer must be non-negative")
         if self.tensor_parallel_kv_heads == 0:
             object.__setattr__(
                 self, "tensor_parallel_kv_heads", self.tensor_parallel_heads
@@ -179,7 +193,7 @@ class ModelLayout:
             "tensor_parallel_divisors": list(self.tensor_parallel_divisors),
             "supports_tensor_parallel": self.supports_tensor_parallel,
             "supports_pipeline": self.supports_pipeline,
-            "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
+            "kv_bytes_per_token_by_layer": list(self.kv_bytes_per_token_by_layer),
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
 
@@ -216,8 +230,9 @@ class ModelLayout:
                     int(value)
                     for value in payload.get("tensor_parallel_divisors", ())
                 ),
-                kv_bytes_per_token_per_layer=int(
-                    payload.get("kv_bytes_per_token_per_layer", 0)
+                kv_bytes_per_token_by_layer=tuple(
+                    int(value)
+                    for value in payload.get("kv_bytes_per_token_by_layer", ())
                 ),
                 kv_replicated_across_tp=bool(
                     payload.get("kv_replicated_across_tp", False)
@@ -880,6 +895,143 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     return kv_heads * head_dim * 2 * dtype_size
 
 
+# Attention types whose state does not grow with context length -- Gated
+# DeltaNet's constant-size recurrent state, chiefly. A layer of this type
+# contributes nothing to the *marginal* cost of more context tokens (the
+# small constant state itself is already folded into observed weight and
+# activation footprint, not something this pass separately budgets).
+_CONSTANT_STATE_LAYER_TYPES = frozenset({"linear_attention"})
+
+# Nemotron-H's ``layers_block_type`` vocabulary is unrelated to Qwen's
+# ``layer_types`` one (see _layers_block_type below): only "attention" gets a
+# real growing KVCache in mlx_lm's Model.make_cache(). "mamba" gets a
+# constant-size ArraysCache (same shape of fact as linear_attention above).
+# "moe" and "mlp" layers get no cache entry at all -- verified directly
+# against mlx_lm/models/nemotron_h.py's Model.make_cache() and
+# NemotronHBlock.__call__, which only ever pass a cache to "M" (mamba) and
+# "*" (attention) blocks.
+_CONSTANT_STATE_BLOCK_TYPES = frozenset({"mamba", "moe", "mlp"})
+
+
+def _config_field_by_name(
+    config: dict[str, Any], layer_count: int, field_name: str
+) -> tuple[str, ...] | None:
+    """This model's per-layer type list read from ``field_name``, or ``None``.
+
+    Checked in the same nested ``text_config``/``language_config``/
+    ``llm_config`` locations ``_config_int`` already searches: VLM
+    checkpoints (Qwen3.8-27B among them) nest ``layer_types`` under
+    ``text_config`` alongside every other decoder field this module reads
+    from there. Shared by both ``_layer_types`` (Qwen-family's
+    ``layer_types`` field) and ``_layers_block_type`` (Nemotron-H's
+    differently-named ``layers_block_type`` field, confirmed top-level --
+    not nested -- in this model's real downloaded config.json) since the
+    lookup shape is identical; only the field name and the per-type
+    classification differ. A length mismatch against ``layer_count`` is
+    treated the same as absence -- this module cannot confidently line the
+    list up against ``layer_weight_bytes`` index-for-index, so it falls back
+    to the uniform, pre-hybrid-aware behavior rather than guess an
+    alignment.
+    """
+
+    candidates = [config]
+    for nested in ("text_config", "language_config", "llm_config"):
+        value = config.get(nested)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        value = candidate.get(field_name)
+        if (
+            isinstance(value, list)
+            and len(value) == layer_count
+            and all(isinstance(item, str) for item in value)
+        ):
+            return tuple(value)
+    return None
+
+
+def _layer_types(config: dict[str, Any], layer_count: int) -> tuple[str, ...] | None:
+    """This model's per-layer attention type from ``config["layer_types"]``.
+
+    Qwen-family vocabulary: ``"full_attention"``/``"sliding_attention"``
+    (grows) vs. ``"linear_attention"`` (constant state). See
+    ``_config_field_by_name`` for the lookup shape.
+    """
+
+    return _config_field_by_name(config, layer_count, "layer_types")
+
+
+def _layers_block_type(
+    config: dict[str, Any], layer_count: int
+) -> tuple[str, ...] | None:
+    """This model's per-layer block type from ``config["layers_block_type"]``.
+
+    Nemotron-H's vocabulary, unrelated to Qwen's ``layer_types`` field this
+    planner already reads: ``"mamba"``/``"moe"``/``"mlp"`` (no growing KV
+    cache) vs. ``"attention"`` (grows). See ``_config_field_by_name`` for the
+    lookup shape.
+    """
+
+    return _config_field_by_name(config, layer_count, "layers_block_type")
+
+
+def _kv_bytes_per_token_by_layer(
+    config: dict[str, Any], layer_count: int
+) -> tuple[int, ...]:
+    """Resident KV-cache bytes each layer adds per token, one entry per layer.
+
+    Many current models are hybrid: Qwen3.5/3.6's Gated DeltaNet layers hold
+    constant-size recurrent state, not a cache that grows with context, and
+    only a minority of layers (``"full_attention"`` in
+    ``config["layer_types"]``) actually do. Charging every layer the uniform
+    per-token rate -- what this planner did before this function existed --
+    overestimates KV reservation by the ratio of constant-state to growing
+    layers: confirmed at 48:16, a ~4x overestimate, on Qwen3.8-27B's real
+    ``config.json``.
+
+    ``"sliding_attention"`` is treated as full attention: conservative
+    (no under-reservation) and unchanged from today, since no window-capping
+    logic exists to size it more precisely and no model this planner
+    currently targets has one (only a speculative-decode draft checkpoint
+    does, and drafts are not planned by this code path).
+
+    Nemotron-H models use a completely different config field,
+    ``layers_block_type`` (not ``layer_types``), with its own vocabulary --
+    see ``_layers_block_type`` and ``_CONSTANT_STATE_BLOCK_TYPES``. Only 6 of
+    Nemotron-3.5-Lightning-30B-A3B's 52 layers are real attention layers; the
+    rest are mamba (constant-size state) or moe/mlp (no cache at all), so
+    charging every layer the uniform rate overestimated this model's KV
+    reservation by the same shape of ratio Qwen's fix addressed. If a config
+    somehow defines both fields (not expected for any real model), this
+    checks ``layer_types`` first and only falls through to
+    ``layers_block_type`` when it is absent or unusable -- an explicit,
+    documented tie-break, not an accidental one -- since the two vocabularies
+    are not interchangeable and must never be classified against each
+    other's rules.
+
+    Falls back to a uniform tuple -- today's behavior, unchanged -- when
+    neither field is present, readable, or lines up with ``layer_count``.
+    This is the regression guard: every pure-transformer model without
+    either field sees exactly the same numbers as before this function
+    existed.
+    """
+
+    uniform = _kv_bytes_per_token_per_layer(config)
+    layer_types = _layer_types(config, layer_count)
+    if layer_types is not None:
+        return tuple(
+            0 if layer_type in _CONSTANT_STATE_LAYER_TYPES else uniform
+            for layer_type in layer_types
+        )
+    block_types = _layers_block_type(config, layer_count)
+    if block_types is not None:
+        return tuple(
+            0 if block_type in _CONSTANT_STATE_BLOCK_TYPES else uniform
+            for block_type in block_types
+        )
+    return (uniform,) * layer_count
+
+
 def _attention_head_count(model_path: Path) -> int:
     """Attention heads per layer, which bounds the tensor-parallel degree.
 
@@ -1087,8 +1239,8 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
         supports_pipeline=_supports_pipeline(_model_config(root)),
-        kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
-            _model_config(root)
+        kv_bytes_per_token_by_layer=_kv_bytes_per_token_by_layer(
+            _model_config(root), len(expected_indices)
         ),
         kv_replicated_across_tp=_kv_cache_replicated_across_tp(
             _model_config(root)
@@ -1479,22 +1631,32 @@ def plan_unequal_pipeline(
     # rank zero (late layers / HTTP coordinator), so partition in reverse rank.
     pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
-    kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
+    # One entry per layer, not a scalar applied uniformly: hybrid
+    # architectures mix constant-state layers with real growing-KV ones, so
+    # _partition_layers must see which specific layers are expensive to place
+    # stage boundaries correctly, not just the aggregate a stage ends up
+    # holding.
+    kv_bytes_per_layer = tuple(
+        _kv_bytes_for_stage(model, slice(index, index + 1), context_tokens)
+        for index in range(len(model.layer_weight_bytes))
+    )
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,
             pipeline_nodes,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + kv_bytes
+                for weight_bytes, kv_bytes in zip(
+                    model.layer_weight_bytes, kv_bytes_per_layer
+                )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
         )
     except PlanningError as exc:
-        if kv_bytes_per_layer:
+        if any(kv_bytes_per_layer):
             raise PlanningError(
                 f"model weights and KV cache for {context_tokens} tokens do not "
                 f"fit the supplied per-node budgets: {exc}"
@@ -1503,7 +1665,7 @@ def plan_unequal_pipeline(
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
-        kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
+        kv_bytes = _kv_bytes_for_stage(model, slice(start, end), context_tokens)
         planned = model.fixed_weight_bytes + layer_weight_bytes + kv_bytes
         if planned > node.usable_bytes:
             raise PlanningError(
@@ -1533,11 +1695,13 @@ def plan_unequal_pipeline(
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
                 kv_cache_bytes=kv_bytes,
-                kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
+                kv_bytes_per_token=_kv_bytes_per_token_for_stage(
+                    model, slice(start, end)
+                ),
                 max_context_tokens=_max_context_for_stage(
                     model,
                     node,
-                    layer_count=end - start,
+                    layer_slice=slice(start, end),
                     weight_bytes=model.fixed_weight_bytes + layer_weight_bytes,
                 ),
                 predicted_compute_seconds=(
@@ -1685,21 +1849,25 @@ def format_shard_plan(plan: ShardPlan) -> str:
 
 def _kv_bytes_for_stage(
     model: ModelLayout,
-    layer_count: int,
+    layer_slice: slice,
     context_tokens: int,
     tensor_parallel_size: int = 1,
 ) -> int:
     """KV bytes a node holds for its layers at the planned context length.
 
-    KV is per layer, so a node reserves in proportion to the layers it carries.
-    Under tensor parallelism the heads of each layer are split across the
-    group, so each member holds its share — except an MLA latent cache, which
-    is not per-head and stays whole on every member.
+    KV is per layer and hybrid architectures mix constant-state layers with
+    real growing-KV ones, so this sums the specific layers a stage holds
+    (``model.kv_bytes_per_token_by_layer[layer_slice]``) rather than
+    multiplying a uniform rate by a layer count. Under tensor parallelism the
+    heads of each layer are split across the group, so each member holds its
+    share — except an MLA latent cache, which is not per-head and stays
+    whole on every member.
     """
 
-    if model.kv_bytes_per_token_per_layer <= 0 or context_tokens <= 0:
+    kv_by_layer = model.kv_bytes_per_token_by_layer
+    if not kv_by_layer or context_tokens <= 0:
         return 0
-    total = model.kv_bytes_per_token_per_layer * layer_count * context_tokens
+    total = sum(kv_by_layer[layer_slice]) * context_tokens
     if model.kv_replicated_across_tp:
         return total
     return total // max(1, tensor_parallel_size)
@@ -1707,14 +1875,15 @@ def _kv_bytes_for_stage(
 
 def _kv_bytes_per_token_for_stage(
     model: ModelLayout,
-    layer_count: int,
+    layer_slice: slice,
     tensor_parallel_size: int = 1,
 ) -> int:
     """What one more token of context costs this node."""
 
-    if model.kv_bytes_per_token_per_layer <= 0:
+    kv_by_layer = model.kv_bytes_per_token_by_layer
+    if not kv_by_layer:
         return 0
-    per_token = model.kv_bytes_per_token_per_layer * layer_count
+    per_token = sum(kv_by_layer[layer_slice])
     if model.kv_replicated_across_tp:
         return per_token
     return per_token // max(1, tensor_parallel_size)
@@ -1724,7 +1893,7 @@ def _max_context_for_stage(
     model: ModelLayout,
     node: NodeBudget,
     *,
-    layer_count: int,
+    layer_slice: slice,
     weight_bytes: int,
     tensor_parallel_size: int = 1,
 ) -> int:
@@ -1739,7 +1908,7 @@ def _max_context_for_stage(
     """
 
     per_token = _kv_bytes_per_token_for_stage(
-        model, layer_count, tensor_parallel_size
+        model, layer_slice, tensor_parallel_size
     )
     if per_token <= 0:
         return 0
@@ -1917,24 +2086,36 @@ def plan_hybrid(
     # the same degree when assignments are materialised below. A replicated
     # MLA cache is the exception: every member pays it whole, so at the
     # aggregate level one layer costs the group N caches.
-    kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
+    # One entry per layer, not a scalar applied uniformly -- see the matching
+    # comment in plan_unequal_pipeline. Left un-divided by tensor_parallel_size
+    # here (default tp=1 inside _kv_bytes_for_stage), matching the aggregate
+    # stage_budgets accounting described above; the replicated-MLA exception
+    # is applied per layer afterward instead of once uniformly.
+    kv_bytes_per_layer = tuple(
+        _kv_bytes_for_stage(model, slice(index, index + 1), context_tokens)
+        for index in range(len(model.layer_weight_bytes))
+    )
     if model.kv_replicated_across_tp:
-        kv_bytes_per_layer *= tensor_parallel_size
+        kv_bytes_per_layer = tuple(
+            value * tensor_parallel_size for value in kv_bytes_per_layer
+        )
     try:
         ranges = _partition_layers(
             model.layer_weight_bytes,
             stage_budgets,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + kv_bytes
+                for weight_bytes, kv_bytes in zip(
+                    model.layer_weight_bytes, kv_bytes_per_layer
+                )
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
         )
     except PlanningError as exc:
-        if kv_bytes_per_layer:
+        if any(kv_bytes_per_layer):
             raise PlanningError(
                 f"model weights and KV cache for {context_tokens} tokens do not "
                 f"fit the supplied per-node budgets: {exc}"
@@ -1951,7 +2132,7 @@ def plan_hybrid(
         per_member = stage_layer_bytes // tensor_parallel_size
         remainder = stage_layer_bytes % tensor_parallel_size
         kv_bytes = _kv_bytes_for_stage(
-            model, end - start, context_tokens, tensor_parallel_size
+            model, slice(start, end), context_tokens, tensor_parallel_size
         )
         for tp_rank, node in enumerate(group):
             held_layer_bytes = per_member + (1 if tp_rank < remainder else 0)
@@ -1985,12 +2166,12 @@ def plan_hybrid(
                     tensor_parallel_size=tensor_parallel_size,
                     kv_cache_bytes=kv_bytes,
                     kv_bytes_per_token=_kv_bytes_per_token_for_stage(
-                        model, end - start, tensor_parallel_size
+                        model, slice(start, end), tensor_parallel_size
                     ),
                     max_context_tokens=_max_context_for_stage(
                         model,
                         node,
-                        layer_count=end - start,
+                        layer_slice=slice(start, end),
                         weight_bytes=model.fixed_weight_bytes + held_layer_bytes,
                         tensor_parallel_size=tensor_parallel_size,
                     ),
