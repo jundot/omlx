@@ -487,6 +487,8 @@
   "cluster.pairing.shared_secret_placeholder": "至少 16 个字符",
   "cluster.pairing.generate": "生成",
   "cluster.pairing.copy": "复制",
+  "settings.advanced.gpu_keepwarm": "空闲时保持 GPU 温热",
+  "settings.advanced.gpu_keepwarm_hint": "GPU 空闲时会降频，下一个请求要承担升频的代价。M1 Ultra 上用 GLM-5.3-Flash 实测（04/09）：请求间隔 8 秒时，关闭为 17.5-18.5 tok/s，开启为 23.8-24.5。连续请求不变。消耗的是空闲功耗，不是质量。下次启动服务器时生效。",
   "settings.advanced.burst_decode": "突发解码",
   "settings.advanced.burst_decode_hint": "内部批量处理 Token 以加快生成速度。级别越高速度越快但流式输出块越大；级别越低流式输出越平滑。即时生效，无需重启。",
   "settings.advanced.burst_decode_off": "关闭（最平滑流式输出）",

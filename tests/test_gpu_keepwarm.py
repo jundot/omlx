@@ -8,10 +8,20 @@ import mlx.core as mx
 from omlx.engine_core import EngineConfig, _keepwarm_tick
 
 
-def test_desligado_de_fabrica():
-    """Ninguém paga por ele sem pedir — nem pela config, nem pelo ambiente."""
-    assert EngineConfig().gpu_keepwarm is False
-    assert os.environ.get("OMLX_GPU_KEEPWARM") != "1"
+def test_ligado_de_fabrica():
+    """Medido no servidor: +29% a +40% com pausa entre pedidos, custo zero em rajada."""
+    assert EngineConfig().gpu_keepwarm is True
+    from omlx.settings import ServerSettings
+
+    assert ServerSettings().gpu_keepwarm is True
+
+
+def test_o_ambiente_desliga():
+    """OMLX_GPU_KEEPWARM=0 vence a config, para um A/B sem tocar no ajuste salvo."""
+    from omlx.settings import ServerSettings
+
+    assert ServerSettings.from_dict({"gpu_keepwarm": False}).gpu_keepwarm is False
+    assert ServerSettings.from_dict({}).gpu_keepwarm is True
 
 
 def test_o_tique_roda_e_nao_deixa_lixo():

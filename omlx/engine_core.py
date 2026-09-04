@@ -201,10 +201,12 @@ class EngineConfig:
     # step after a 20 ms gap takes 47.9 ms, and after a 100 ms gap 59.8 ms
     # (+38%). A trivial matmul running during the gap brings both back to
     # 43.9 and 43.0 ms. An agent pauses between turns, so its first tokens
-    # pay that ramp. Off by default: the win is real on the bench, and the
-    # server-side measurement is what decides whether it ships on.
+    # pay that ramp. Confirmed on the server itself, two rounds per arm
+    # (5 x 300 tokens, 8 s between requests): 17.5-18.5 tok/s without it and
+    # 23.8-24.5 with it, +29% to +40%, and back-to-back requests unchanged.
+    # On by default; the global setting or OMLX_GPU_KEEPWARM=0 turns it off.
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
-    gpu_keepwarm: bool = False  # see step_interval above; OMLX_GPU_KEEPWARM=1 forces it
+    gpu_keepwarm: bool = True  # see step_interval above; OMLX_GPU_KEEPWARM=0 turns it off
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
     # Decode burst: run several scheduler.step() calls per run_in_executor
     # hand-off instead of one. Each decode token otherwise bounces back to the
@@ -431,8 +433,11 @@ class EngineCore:
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
-        keepwarm = os.environ.get(_KEEPWARM_ENV) == "1" or getattr(
-            self.config, "gpu_keepwarm", False
+        _env = os.environ.get(_KEEPWARM_ENV)
+        keepwarm = (
+            _env == "1"
+            if _env is not None
+            else bool(getattr(self.config, "gpu_keepwarm", True))
         )
         if keepwarm:
             logger.info("GPU keepwarm on: idle loop ticks a trivial kernel")
