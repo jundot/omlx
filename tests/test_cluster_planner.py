@@ -96,9 +96,14 @@ def test_inspect_safetensors_layout_rejects_overlapping_offsets(tmp_path):
 def test_mtp_layers_past_the_declared_depth_are_not_decoder_layers(tmp_path):
     """DeepSeek/GLM MTP heads live at index ``num_hidden_layers`` and up.
 
-    The runtime model never instantiates them, so counting them as decoder
-    layers put the last stage boundary past the model and activation failed
-    with ``end_layer`` beyond the loaded layers.
+    The runtime model never instantiates them as decoder layers, so counting
+    them there put the last stage boundary past the model and activation
+    failed with ``end_layer`` beyond the loaded layers. Their bytes are not
+    simply dropped, though: the MTP head is replicated (never sharded) on
+    every rank, so they must land in ``fixed_weight_bytes`` -- otherwise a
+    distributed deployment with ``mtp_enabled=True`` fails closed at
+    ``_validate_measured_weight_bytes`` the moment the head is actually
+    loaded, since the approved budget would be short by exactly this much.
     """
 
     (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
@@ -116,6 +121,38 @@ def test_mtp_layers_past_the_declared_depth_are_not_decoder_layers(tmp_path):
 
     assert layout.layer_count == 2
     assert layout.layer_weight_bytes == (500, 400)
+    assert layout.fixed_weight_bytes == 100 + 900  # embed + replicated MTP head
+    assert layout.tensor_count == 4
+
+
+def test_qwen_style_mtp_head_does_not_inflate_layer_zero(tmp_path):
+    """Qwen3.5/3.6 ships its MTP head on disk as ``mtp.layers.0.*``.
+
+    That collides by name with the real decoder layer 0 -- both match the
+    ``layers.N`` pattern -- so it must be routed to ``fixed_weight_bytes``
+    by the ``mtp.`` name predicate (_is_mtp_head_tensor), not left to fall
+    into ``layer_sizes[0]`` where it would inflate layer 0 and, under TP,
+    get silently divided by the tensor-parallel degree despite being
+    replicated on every rank.
+    """
+
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_proj.weight", 500),
+            ("model.layers.1.self_attn.q_proj.weight", 400),
+            ("mtp.layers.0.self_attn.q_proj.weight", 777),  # the MTP head
+            ("mtp.norm.weight", 30),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.layer_weight_bytes == (500, 400)
+    assert layout.fixed_weight_bytes == 100 + 777 + 30
+    assert layout.tensor_count == 5
 
 
 def test_layers_past_an_undeclared_depth_are_kept(tmp_path):
@@ -560,9 +597,9 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     calls = []
     real_inspect = planner.inspect_safetensors_layout
 
-    def counting_inspect(path):
+    def counting_inspect(path, *, text_only=False):
         calls.append(str(path))
-        return real_inspect(path)
+        return real_inspect(path, text_only=text_only)
 
     monkeypatch.setattr(planner, "inspect_safetensors_layout", counting_inspect)
 
@@ -641,6 +678,25 @@ def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
     )
     config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
     assert planner._supports_pipeline(config) is False
+
+
+def test_supports_pipeline_true_for_vision_config_when_text_only(monkeypatch):
+    """#2845 review (post-#2819 heads-up): a text-only deployment of a VLM
+    loads through plain mlx-lm, the same ``mlx_lm.models.<model_type>``
+    module a pure-text checkpoint of that architecture uses -- not through
+    mlx-vlm's wrapper -- so the vision-subconfig false-negative from
+    ``test_supports_pipeline_false_for_vision_config_vlm`` must not apply
+    when the caller is specifically sizing a text-only deployment."""
+
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
+    assert planner._supports_pipeline(config, text_only=True) is True
+    # Vision-enabled sizing of the exact same config is unaffected.
+    assert planner._supports_pipeline(config, text_only=False) is False
 
 
 def test_supports_pipeline_true_for_text_model(monkeypatch):

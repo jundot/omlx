@@ -86,6 +86,180 @@ from . import prompt_priming as _prompt_priming
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Distributed (pure tensor-parallel cluster) coordination
+# ---------------------------------------------------------------------------
+#
+# Single-node MTP runs one live _DepthController per sequence and reads its
+# ``.cur`` / ``.should_exit()`` directly. Under TP=N clustering every rank
+# runs an identical copy of this module against an identical model shard, so
+# a naive "every rank runs its own controller" would let each rank's
+# wall-clock-driven controller (see _DepthController's docstring: it is
+# deliberately per-machine, per-load) pick a *different* depth on the same
+# cycle -- a shape mismatch in the very next TP collective, which hangs
+# silently rather than raising. Only rank 0 ("coordinator") is ever allowed
+# to construct a live controller (_mtp_depth_controller_allowed); every other
+# rank adopts whatever depth/park decision the coordinator broadcasts each
+# cycle via _sync_distributed_mtp_cycle, instead of deciding locally.
+#
+# Disabled (``_DISTRIBUTED_MTP is None``) by default and for every
+# single-node caller. Only inference_worker.py calls configure_distributed_mtp,
+# and only for a pure-TP deployment with mtp_enabled=True
+# (DistributedBatchedEngine._validate_model_settings is the gate that decides
+# whether a deployment reaches that call at all).
+
+
+@dataclass(frozen=True)
+class _DistributedMtpContext:
+    group: Any
+    coordinator: bool
+    checksum: bool = True
+
+
+_DISTRIBUTED_MTP: Optional[_DistributedMtpContext] = None
+
+
+def configure_distributed_mtp(
+    *, group: Any = None, coordinator: bool = False, checksum: bool = True
+) -> None:
+    """Enable (or disable) rank-0-owned MTP depth/park coordination.
+
+    Called once by ``inference_worker.run_worker`` before serving starts.
+    ``group`` is the rank's ``mx.distributed`` group; pass ``None`` to
+    disable (the default -- every single-node engine leaves this alone).
+    ``coordinator`` must be true on exactly one rank (rank 0). ``checksum``
+    gates the debug-mode per-cycle desync detector
+    (``OMLX_MTP_DISTRIBUTED_CHECKSUM`` at the call site) -- it changes only
+    whether a detected mismatch raises, never the collective's payload shape,
+    so every rank must agree on it (it comes from the same launch argv).
+    """
+    global _DISTRIBUTED_MTP
+    _DISTRIBUTED_MTP = (
+        _DistributedMtpContext(group=group, coordinator=bool(coordinator), checksum=bool(checksum))
+        if group is not None
+        else None
+    )
+
+
+def _mtp_depth_controller_allowed() -> bool:
+    """False on a non-coordinator rank of a distributed MTP deployment."""
+    ctx = _DISTRIBUTED_MTP
+    return ctx is None or ctx.coordinator
+
+
+_MTP_HASH_MODULUS = 1 << 20  # keeps hash * (<=64 ranks) well inside int32
+
+
+def _mtp_cycle_hash(k: int, m: int, queue_len: int, committed: Any) -> int:
+    """A small, cheap, deterministic fingerprint of one MTP cycle's outcome.
+
+    Folds in the draft depth used, the accepted count, the post-commit queue
+    length (catches queue-state drift from the late-join/handoff path), and
+    every committed token id -- exactly what a per-rank divergence in the
+    accept/reject decision or the committed tokens would change. Not
+    cryptographic; it only needs to be cheap and to disagree when the state
+    it is measuring disagrees.
+    """
+    h = 1469598103934665603  # FNV-1a offset basis (64-bit), truncated use
+    for value in (
+        int(k),
+        int(m),
+        int(queue_len),
+        *(int(t) for t in (committed.tolist() if hasattr(committed, "tolist") else committed)),
+    ):
+        h = ((h ^ (value & 0xFFFFFFFF)) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h % _MTP_HASH_MODULUS
+
+
+def _default_mtp_all_sum(payload: Tuple[int, int, int], group: Any) -> Tuple[int, int, int]:
+    import mlx.core as mx
+
+    array = mx.array(list(payload), dtype=mx.int32)
+    result = mx.distributed.all_sum(array, group=group)
+    mx.eval(result)
+    return tuple(int(v) for v in result.tolist())
+
+
+def _sync_distributed_mtp_cycle(
+    state: "_MtpState",
+    k: int,
+    m: int,
+    committed: Any,
+    *,
+    all_sum: Optional[Any] = None,
+) -> None:
+    """Broadcast rank 0's depth/park decision; verify every rank agrees.
+
+    Runs once per completed MTP cycle, only when this sequence is under
+    distributed coordination (``state._omlx_dist_sync``, set once at MTP
+    activation). A single ``mx.distributed.all_sum`` of ``[depth, park,
+    checksum]`` carries the coordinator's decision to every other rank --
+    fewer, not more, synchronization points than one collective per token.
+    The coordinator contributes its real values; every other rank
+    contributes zeros for the first two elements (so the sum equals exactly
+    the coordinator's decision) and its own real checksum for the third
+    (so the sum equals ``local_checksum * world_size`` iff every rank agrees).
+
+    ``all_sum`` is an injectable ``(payload, group) -> payload``-shaped seam
+    for tests; production callers leave it as ``None`` (real
+    ``mx.distributed.all_sum``).
+    """
+    ctx = _DISTRIBUTED_MTP
+    if ctx is None or not state._omlx_dist_sync:
+        return
+    collective = all_sum or _default_mtp_all_sum
+
+    if ctx.coordinator:
+        depth_contrib = (
+            int(state.controller.cur) if state.controller is not None else int(state.depth)
+        )
+        park_contrib = (
+            1 if (state.controller is not None and state.controller.should_exit()) else 0
+        )
+    else:
+        depth_contrib = 0
+        park_contrib = 0
+    local_hash = _mtp_cycle_hash(k, m, len(state.queue), committed)
+
+    agreed_depth, agreed_park, hash_sum = collective(
+        (depth_contrib, park_contrib, local_hash), ctx.group
+    )
+
+    if ctx.checksum:
+        world_size = int(ctx.group.size()) if ctx.group is not None else 1
+        expected = local_hash * world_size
+        if hash_sum != expected:
+            raise RuntimeError(
+                "MTP distributed desync detected: ranks disagree on this "
+                f"cycle's [depth={k}, accepted={m}, committed tokens] "
+                f"(local checksum={local_hash}, summed={hash_sum}, expected "
+                f"{expected} if every rank agreed). Continuing would produce "
+                "a shape mismatch in the next tensor-parallel collective and "
+                "hang rather than fail. Set "
+                "OMLX_MTP_DISTRIBUTED_CHECKSUM=0 to disable this check once "
+                "trust is established."
+            )
+
+    state.depth = max(0, int(agreed_depth))
+    state._dist_should_exit = bool(agreed_park)
+
+
+def _mtp_should_exit(state: "_MtpState") -> bool:
+    """Whether this sequence should park to the standard step this cycle.
+
+    Single-node (or the coordinator's own authoritative view): read the
+    live controller directly, unchanged from the original PR-990-derived
+    behavior. Distributed worker ranks have no controller at all
+    (_mtp_depth_controller_allowed) and instead read the coordinator's
+    broadcast decision, stashed by _sync_distributed_mtp_cycle -- without
+    this, a worker would never park even after the coordinator did, and the
+    two ranks would diverge on which method the next next() call takes.
+    """
+    if _DISTRIBUTED_MTP is not None and state._omlx_dist_sync:
+        return state._dist_should_exit
+    return state.controller is not None and state.controller.should_exit()
+
+
 def _set_verify_qmm_armed(flag: bool) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
@@ -750,7 +924,22 @@ class _MtpState:
     draft_sampler: Optional[Any] = None
     # Adaptive depth controller (None = fixed depth). Chooses how many
     # drafts the next chain builds from rolling accept/latency estimates.
+    # Only ever constructed on the coordinator rank of a distributed MTP
+    # deployment (_mtp_depth_controller_allowed) -- every other rank keeps
+    # this None and reads ``depth`` / _mtp_should_exit()'s broadcast value
+    # instead of deciding locally (see _sync_distributed_mtp_cycle).
     controller: Optional[Any] = None
+    # True for the lifetime of this sequence when it is under distributed
+    # (pure-TP cluster) MTP coordination -- set once at activation from
+    # ``_DISTRIBUTED_MTP is not None and depth > 1``, so every rank computes
+    # it identically from the same uniform, CLI-derived inputs. Gates whether
+    # _sync_distributed_mtp_cycle / _mtp_should_exit consult the broadcast
+    # decision at all; a depth-1 or non-chain sequence has nothing to
+    # synchronize and this stays False.
+    _omlx_dist_sync: bool = False
+    # Rank 0's broadcast park-to-standard-decode decision for this cycle,
+    # consumed by _mtp_should_exit on ranks with no local controller.
+    _dist_should_exit: bool = False
 
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
@@ -2482,7 +2671,13 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if depth > 1:
+        # Distributed-sync eligibility must be computed identically on every
+        # rank: depth and _DISTRIBUTED_MTP's presence are both uniform
+        # (CLI-derived), so this line evaluates the same way everywhere,
+        # unlike "state.controller is not None" which is coordinator-only by
+        # construction.
+        state._omlx_dist_sync = _DISTRIBUTED_MTP is not None and depth > 1
+        if depth > 1 and _mtp_depth_controller_allowed():
             state.controller = _DepthController(
                 depth,
                 marginal_ms=getattr(
@@ -2792,12 +2987,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
-    if (
-        state.chain
-        and state.controller is not None
-        and state.controller.should_exit()
-        and not state.queue
-    ):
+    if state.chain and _mtp_should_exit(state) and not state.queue:
         # Emit this cycle's token either way; on a successful handoff the
         # next next() call runs the standard step with _next_tokens set.
         _park_mtp_to_standard(gen_batch, state)
@@ -3125,6 +3315,12 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
             state,
             was_warmup=was_warmup,
         )
+    # Outside the controller-is-not-None guard on purpose: every rank
+    # (including the workers that never construct a controller) must reach
+    # this collective, or the coordinator hangs waiting for a peer that took
+    # a different branch. No-ops instantly when state._omlx_dist_sync is
+    # False (single-node, or a non-distributed / depth<=1 sequence).
+    _sync_distributed_mtp_cycle(state, k, m, committed)
 
 
 def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:

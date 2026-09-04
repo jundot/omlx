@@ -513,6 +513,39 @@ def _tensor_layer_index(name: str) -> int | None:
     return None
 
 
+def _is_mtp_head_tensor(name: str) -> bool:
+    """Whether ``name`` belongs to a native MTP head, not the decoder stack.
+
+    MTP heads (Qwen3.5/3.6's ``mtp.layers.0.*``, DeepSeek-V4/GLM's
+    ``model.layers.<num_hidden_layers>.*``) are attached by
+    ``omlx.patches.mlx_lm_mtp`` as a module separate from the transformer
+    decoder stack, and mlx-lm's native TP ``.shard()`` never visits it (it
+    walks the model's own known layer list, which does not include an
+    attribute our patch added) — so it is always replicated on every rank,
+    never sharded. Its tensor names, though, collide with the decoder-layer
+    naming pattern one of two ways depending on architecture: Qwen-style
+    head layers are locally numbered from 0, landing on real decoder layer 0
+    (inflating that layer's per-rank budget and, under TP, silently dividing
+    replicated head bytes by the TP degree); DeepSeek/GLM-style heads sit at
+    a phantom layer index >= ``num_hidden_layers``. Both must be excluded
+    from ``layer_weight_bytes`` bucketing and instead counted separately as
+    a replicated ``fixed_weight_bytes`` addend — see ``inspect_safetensors_layout``.
+    """
+
+    return ".mtp." in name or name.startswith("mtp.")
+
+
+def _is_vision_tensor(name: str) -> bool:
+    """A vision-tower/projector tensor mlx-lm's ``sanitize`` drops when a
+    VLM checkpoint is loaded text-only. Only meaningful for VLM checkpoints
+    -- see ``inspect_safetensors_layout``'s ``text_only`` gating, since a
+    pure-text checkpoint never has these prefixes at all."""
+
+    from omlx.model_discovery import _VISION_WEIGHT_PREFIXES
+
+    return name.startswith(_VISION_WEIGHT_PREFIXES)
+
+
 def _activation_bytes_per_token(model_path: Path) -> int:
     """Best-effort FP16/BF16 hidden-state size used by the link cost model."""
 
@@ -727,7 +760,7 @@ def _model_source(model_type: str) -> str:
     return ""
 
 
-def _supports_pipeline(config: dict[str, Any]) -> bool:
+def _supports_pipeline(config: dict[str, Any], *, text_only: bool = False) -> bool:
     """Whether this architecture can be split into pipeline stages.
 
     mlx-lm gates on ``hasattr(model, "model") and hasattr(model.model,
@@ -740,6 +773,15 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     MiniMax-M3 was reported as fitting across two Macs on memory alone, and
     that cost 61.7 GiB of staging and two launches before the load raised
     "The model does not support pipelining but a pipeline_group was provided".
+
+    ``text_only`` matters for a VLM checkpoint: with vision enabled it loads
+    through mlx-vlm's wrapper (see the vision-subconfig guard below), but a
+    text-only deployment loads it through plain mlx-lm instead -- the exact
+    same ``mlx_lm.models.<model_type>`` module a pure-text checkpoint of that
+    architecture would use -- so the vision-subconfig false-negative does not
+    apply and the capability probe must fall through to ``_declares_pipeline``
+    same as any other architecture (#2819's own gate is only correct for the
+    vision-enabled load path it was written for).
     """
 
     model_type = config.get("model_type")
@@ -755,16 +797,18 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     )
     if declared is not None:
         return bool(declared)
-    # A checkpoint carrying a vision sub-config is served by mlx-vlm, whose
-    # loaded wrapper never exposes ``model.model.pipeline`` — the exact
-    # attribute progressive_loading gates on. Its text backbone's source-level
-    # ``pipeline()`` belongs to the mlx-lm implementation this model does not
-    # use, so trusting it (as ``_declares_pipeline`` does) is the false positive
-    # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
-    from omlx.model_discovery import _has_vision_subconfig
+    if not text_only:
+        # A checkpoint carrying a vision sub-config is served by mlx-vlm,
+        # whose loaded wrapper never exposes ``model.model.pipeline`` — the
+        # exact attribute progressive_loading gates on. Its text backbone's
+        # source-level ``pipeline()`` belongs to the mlx-lm implementation
+        # this (vision-enabled) load does not use, so trusting it (as
+        # ``_declares_pipeline`` does) is the false positive that offered
+        # pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
+        from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
-        return False
+        if _has_vision_subconfig(config):
+            return False
     return _declares_pipeline(model_type)
 
 
@@ -990,14 +1034,53 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
-    """Read only safetensors headers and total weights by transformer layer."""
+def inspect_safetensors_layout(
+    model_path: str | Path, *, text_only: bool = False
+) -> ModelLayout:
+    """Read only safetensors headers and total weights by transformer layer.
+
+    ``text_only`` is the caller's own intent for THIS measurement, not a
+    property inferred from the checkpoint's shape: a VLM checkpoint sizes
+    full (vision tower included) unless the caller is specifically sizing a
+    text-only deployment of it, so the catalogue -- which measures every
+    checkpoint once, deployment-agnostic -- keeps advertising full sizes for
+    VLMs nobody has flagged text-only, while a concrete text-only deployment
+    (``ClusterDeployment.text_only``) can size against what it will actually
+    load. Default False keeps that catalogue-safe behavior.
+    """
 
     root = Path(model_path).expanduser()
     if not root.is_dir():
         raise PlanningError(f"model path is not a directory: {root}")
 
+    # A VLM checkpoint only ever runs distributed text-only, so exclude the
+    # vision tower and MTP heads it will not load from the layer/fixed sizing.
+    from omlx.model_discovery import _has_vision_subconfig
+
+    model_config = _model_config(root)
+    text_only_vlm = _has_vision_subconfig(model_config)
+    # DeepSeek-V4/GLM-style checkpoints store their MTP head on disk as
+    # ordinary "model.layers.<n>.*" tensors at index >= num_hidden_layers
+    # (sanitize renames them to "mtp.*" only after mlx_lm.load() reads the
+    # file, too late for this header-only inspection to see) -- so unlike
+    # Qwen3.5/3.6/gemma4/nemotron_h, which already save MTP weights on disk
+    # under an "mtp."-prefixed name matching _is_mtp_head_tensor, these two
+    # architectures are only identifiable by layer index. declared_depth
+    # doubles as that boundary.
+    declared_depth = _config_int(model_config, "num_hidden_layers", 0)
+
     fixed_bytes = 0
+    # MTP head tensors are validated and counted like any other tensor, but
+    # tracked apart from layer_sizes/fixed_bytes so a non-VLM MTP checkpoint's
+    # head bytes are never divided by the per-layer TP split (Qwen-style
+    # local layer-0 numbering collides with the real decoder layer 0) or
+    # silently dropped as a phantom deep layer (DeepSeek/GLM-style numbering
+    # past num_hidden_layers). Folded into fixed_bytes -- replicated on every
+    # rank, matching how the head is actually loaded (mlx-lm's native TP
+    # .shard() never visits it, see _is_mtp_head_tensor) -- once every tensor
+    # has been walked, so this is exact from the safetensors headers, not a
+    # guess.
+    mtp_bytes = 0
     layer_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
@@ -1028,7 +1111,36 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
+            # Validate every tensor (dedup + overlap above), but do not size
+            # the families a text-only load never loads into layer_sizes/
+            # fixed_bytes. MTP draft heads are never sharded (see
+            # _is_mtp_head_tensor) so they're counted separately into
+            # mtp_bytes below, not skipped outright as the pre-#2970 code
+            # did (which silently dropped their bytes from TP memory
+            # planning entirely). The vision tower only applies when the
+            # caller is actually sizing a text-only VLM deployment
+            # (``text_only``).
+            if text_only and _is_vision_tensor(name):
+                continue
+            if _is_mtp_head_tensor(name):
+                mtp_bytes += tensor_bytes
+                tensor_count += 1
+                continue
             layer_index = _tensor_layer_index(name)
+            if (
+                layer_index is not None
+                and declared_depth > 0
+                and layer_index >= declared_depth
+            ):
+                # DeepSeek-V4/GLM-style on-disk MTP head: an ordinary-looking
+                # "model.layers.<n>.*" tensor whose index sits past the
+                # declared decoder depth (see the declared_depth comment
+                # above). Not visible to _is_mtp_head_tensor before sanitize
+                # renames it, so the layer-index boundary is the only signal
+                # available from headers alone.
+                mtp_bytes += tensor_bytes
+                tensor_count += 1
+                continue
             if layer_index is None:
                 fixed_bytes += tensor_bytes
             else:
@@ -1048,14 +1160,12 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "could not identify transformer layers in safetensors names"
         )
-    # Checkpoints may carry layers past the declared depth: DeepSeek/GLM-style
-    # multi-token-prediction heads live at index num_hidden_layers and up, and
-    # the runtime model never instantiates them. Counting them as decoder
-    # layers put a stage boundary over weights that do not exist at runtime,
-    # and the last stage failed activation with end_layer beyond the model.
-    declared_depth = _config_int(
-        _model_config(root), "num_hidden_layers", 0
-    )
+    # Belt-and-suspenders fallback: the loop above already routes MTP-head
+    # tensors past declared_depth into mtp_bytes by index, so layer_sizes
+    # should never actually reach here with an index >= declared_depth.
+    # Left in place in case some other, non-MTP checkpoint shape trips it —
+    # dropping those (instead of misattributing a stage boundary to weights
+    # that do not exist at runtime) is what this originally guarded against.
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
             index: size
@@ -1074,6 +1184,14 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
+    # Replicated on every rank (mlx-lm's native TP .shard() never visits the
+    # MTP head), so it belongs in fixed_weight_bytes, not divided across a
+    # layer's per-rank TP split. Added unconditionally, even when this
+    # checkpoint's deployment will run with mtp_enabled=False: it only widens
+    # the approved budget, and _validate_measured_weight_bytes
+    # (inference_worker.py) fails closed on measured > approved, never on
+    # slack headroom.
+    fixed_bytes += mtp_bytes
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
@@ -1086,7 +1204,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         ),
         tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
-        supports_pipeline=_supports_pipeline(_model_config(root)),
+        supports_pipeline=_supports_pipeline(
+            _model_config(root), text_only=text_only
+        ),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
             _model_config(root)
         ),
@@ -1101,11 +1221,13 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
 # mtime (no entry added or removed) nor config.json's, and a stale layout
 # would silently mis-size every plan built from it.
 _LayoutFingerprint = tuple[float, float, tuple[tuple[str, float, int], ...]]
-_LAYOUT_CACHE: dict[str, tuple[_LayoutFingerprint, ModelLayout]] = {}
+_LAYOUT_CACHE: dict[tuple[str, bool], tuple[_LayoutFingerprint, ModelLayout]] = {}
 _LAYOUT_CACHE_LOCK = threading.Lock()
 
 
-def complete_model_layout(model_path: str | Path) -> ModelLayout:
+def complete_model_layout(
+    model_path: str | Path, *, text_only: bool = False
+) -> ModelLayout:
     """Layout of a model this node holds in full, refusing one it holds part of.
 
     A pipeline rank keeps its own stage's shards and nothing else. Where the
@@ -1119,8 +1241,12 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     autoconfigure tick (the admin dashboard's cluster tab polls every ~10s
     while open), so opening and re-parsing every safetensors shard's header
     each call put real, sustained disk I/O and CPU load on a node that may be
-    mid-inference. Layouts are cached per resolved path and only recomputed
-    when the model directory or its config.json actually changed.
+    mid-inference. Layouts are cached per (resolved path, ``text_only``) and
+    only recomputed when the model directory or its config.json actually
+    changed -- ``text_only`` is part of the cache key, not just an argument,
+    since the same path measured for the catalogue (text_only=False, full
+    size) and for a concrete text-only deployment (text_only=True, vision
+    excluded) must not collide on one cached answer.
     """
 
     root = Path(model_path).expanduser()
@@ -1133,7 +1259,7 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
 
     maybe_apply_pre_load_patches(str(root))
 
-    resolved = str(root.resolve())
+    cache_key = (str(root.resolve()), text_only)
     try:
         shard_stats = []
         for shard_path in sorted(root.glob("*.safetensors")):
@@ -1150,15 +1276,15 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     layout: ModelLayout | None = None
     if fingerprint is not None:
         with _LAYOUT_CACHE_LOCK:
-            cached = _LAYOUT_CACHE.get(resolved)
+            cached = _LAYOUT_CACHE.get(cache_key)
         if cached is not None and cached[0] == fingerprint:
             layout = cached[1]
 
     if layout is None:
-        layout = inspect_safetensors_layout(root)
+        layout = inspect_safetensors_layout(root, text_only=text_only)
         if fingerprint is not None:
             with _LAYOUT_CACHE_LOCK:
-                _LAYOUT_CACHE[resolved] = (fingerprint, layout)
+                _LAYOUT_CACHE[cache_key] = (fingerprint, layout)
 
     declared = _config_int(_model_config(root), "num_hidden_layers", 0)
     # Multi-token-prediction and draft heads add layers past the declared

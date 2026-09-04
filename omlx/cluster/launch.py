@@ -419,6 +419,12 @@ def build_mlx_launch_argv(
         argv.append("--async-overlap")
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
+    if deployment.mtp_enabled:
+        argv.append("--mtp-enabled")
+        if deployment.mtp_num_draft_tokens is not None:
+            argv.extend(
+                ["--mtp-num-draft-tokens", str(deployment.mtp_num_draft_tokens)]
+            )
     return argv
 
 

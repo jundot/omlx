@@ -50,35 +50,49 @@ def _emit_event(payload: dict[str, Any]) -> None:
     )
 
 
-def _cross_thread_generation_stream(mx: Any) -> Any:
-    """Create the one MLX stream used by both rank loading and generation.
+def _cross_thread_generation_stream(mx: Any) -> tuple[Any, Any]:
+    """Create the MLX streams used by both rank loading and generation.
 
     ``mlx_lm.server.ResponseGenerator`` performs generation on a background
     thread. A regular MLX stream exists only on the thread that created it, so
     eagerly loading and validating a distributed model on the rank's main
     thread leaves lazy graph nodes referring to a stream that the generation
     thread cannot see. MLX 0.32's thread-unsafe stream is deliberately the
-    cross-thread variant; the worker serializes model work on this one stream.
+    cross-thread variant; the worker serializes model work on these streams.
+
+    Two streams, not one: plain single-node decode never touches the CPU
+    device from the generation thread, so a GPU-only thread-unsafe stream was
+    enough until native MTP's distributed depth/park coordination
+    (``_sync_distributed_mtp_cycle``) and the collectives inside a
+    tensor-parallel forward pass started requiring one too. Without a CPU
+    default stream registered on the generation thread, the first such op
+    fails with "There is no Stream(cpu, N) in current thread." — the same
+    class of bug ``test_eager_load_graph_is_visible_to_mlx_lm_generation_thread``
+    already regression-tests for the GPU stream.
     """
 
-    stream = mx.new_thread_unsafe_stream(mx.default_device())
-    mx.set_default_stream(stream)
-    return stream
+    gpu_stream = mx.new_thread_unsafe_stream(mx.default_device())
+    mx.set_default_stream(gpu_stream)
+    cpu_stream = mx.new_thread_unsafe_stream(mx.cpu)
+    mx.set_default_stream(cpu_stream)
+    return gpu_stream, cpu_stream
 
 
 @contextmanager
 def _bind_generation_thread_stream(
     response_generator_type: Any,
     mx: Any,
-    stream: Any,
+    streams: tuple[Any, Any],
 ):
-    """Install the rank's cross-thread stream before MLX-LM starts decoding."""
+    """Install the rank's cross-thread streams before MLX-LM starts decoding."""
 
+    gpu_stream, cpu_stream = streams
     original_generate = response_generator_type._generate
 
     @wraps(original_generate)
     def generate_on_rank_stream(instance: Any) -> Any:
-        mx.set_default_stream(stream)
+        mx.set_default_stream(gpu_stream)
+        mx.set_default_stream(cpu_stream)
         return original_generate(instance)
 
     response_generator_type._generate = generate_on_rank_stream
@@ -386,6 +400,25 @@ class RuntimeMarker:
             thread.join(timeout=timeout)
 
 
+def _worker_mtp_settings(args: argparse.Namespace) -> SimpleNamespace:
+    """A minimal ``model_settings``-shaped object for pre-load patch dispatch.
+
+    ``maybe_apply_pre_load_patches`` only reads ``mtp_enabled`` and
+    ``mtp_num_draft_tokens`` off its ``model_settings`` argument (it never
+    sees the rank's full ``ModelSettings`` -- the rank process only has the
+    two CLI flags threaded onto its launch argv). Always returning an object
+    (never None) keeps the call site's behavior identical to the single-node
+    path when MTP is off: ``mtp_enabled=False`` still runs the sanitize-only
+    branch that keeps a checkpoint carrying unused ``mtp.*`` weights loading
+    correctly.
+    """
+
+    return SimpleNamespace(
+        mtp_enabled=bool(getattr(args, "mtp_enabled", False)),
+        mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", None),
+    )
+
+
 def _server_arguments(
     args: argparse.Namespace,
     *,
@@ -645,13 +678,31 @@ def _runtime_assignment(
     return result
 
 
+def _resolve_pipeline_model(model: Any) -> Any:
+    """The module that owns the mutable transformer layer list, or None.
+
+    Most text architectures expose it as ``model.model``, but wrapper models —
+    the qwen3_5 / qwen3_5_moe VLM family served text-only — nest it under
+    ``language_model.model``. Reuse the tensor strategy's resolver so validation
+    and sharding agree on which object is the pipeline stage.
+    """
+
+    from .tensor_strategies import _common_layer_owner
+
+    try:
+        owner, _layers = _common_layer_owner(model)
+        return owner
+    except RuntimeError:
+        return None
+
+
 def _validate_loaded_stage(
     model: Any,
     assignment: PipelineAssignment,
 ) -> None:
     """Fail closed if a model-specific pipeline hook ignored the shard plan."""
 
-    pipeline_model = getattr(model, "model", None)
+    pipeline_model = _resolve_pipeline_model(model)
     if pipeline_model is None:
         raise RuntimeError("loaded model does not expose an MLX pipeline model")
     start = getattr(pipeline_model, "start_idx", None)
@@ -693,7 +744,7 @@ def _loaded_stage(model: Any) -> dict[str, Any]:
     cannot be read, which is still the honest answer: not "the plan".
     """
 
-    pipeline_model = getattr(model, "model", None)
+    pipeline_model = _resolve_pipeline_model(model)
     layers = getattr(pipeline_model, "layers", None)
     return {
         "loaded_start_layer": getattr(pipeline_model, "start_idx", None),
@@ -1058,7 +1109,40 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        # Must run before provider.load_default() below: apply_mlx_lm_mtp_patch
+        # (invoked inside maybe_apply_pre_load_patches when this rank's model
+        # has MTP heads) documents that its __init__/sanitize/from_dict
+        # patches must be live before mlx_lm.load() so the loaded model sees
+        # MTP weights. A minimal settings-like object carries only the two
+        # attributes that function reads off model_settings for MTP
+        # (mtp_enabled, mtp_num_draft_tokens) -- the rank process never
+        # receives the full ModelSettings, only what --mtp-enabled /
+        # --mtp-num-draft-tokens threaded onto its launch argv (see
+        # build_mlx_launch_argv / ClusterDeployment.mtp_enabled).
+        maybe_apply_pre_load_patches(
+            args.model, model_settings=_worker_mtp_settings(args)
+        )
+        # Rank-0-owned depth/park coordination for MTP under TP clustering
+        # (see omlx.patches.mlx_lm_mtp.batch_generator's distributed-MTP
+        # section). Gated on tensor_parallel_size == world_size (pure TP,
+        # no pipeline stages) as defense in depth --
+        # DistributedBatchedEngine._validate_model_settings and
+        # ClusterDeployment.__post_init__ both already refuse to launch a
+        # pipeline-parallel plan with mtp_enabled=True, so this should
+        # always be true here, but a rank silently running independent
+        # per-machine depth controllers is exactly the "hangs instead of
+        # crashes" failure mode this whole feature exists to avoid.
+        if args.mtp_enabled and tensor_parallel_size == world_size:
+            from omlx.patches.mlx_lm_mtp.batch_generator import (
+                configure_distributed_mtp,
+            )
+
+            checksum_env = os.environ.get("OMLX_MTP_DISTRIBUTED_CHECKSUM", "1")
+            configure_distributed_mtp(
+                group=group,
+                coordinator=rank == 0,
+                checksum=checksum_env not in ("0", "false", "False", ""),
+            )
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1319,6 +1403,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-cache-ssd", action="store_true")
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
+    parser.add_argument(
+        "--mtp-enabled",
+        action="store_true",
+        help=(
+            "Attach and run native MTP (mlx_lm_mtp patch) on this rank. Only "
+            "valid for a pure tensor-parallel deployment -- "
+            "DistributedBatchedEngine._validate_model_settings refuses to "
+            "launch a pipeline-parallel plan with this set."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Max MTP draft depth. Omit to defer to "
+            "maybe_apply_pre_load_patches' per-model-type default."
+        ),
+    )
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)
     parser.add_argument(
         "--tuning-reason",
