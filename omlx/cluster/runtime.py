@@ -15,6 +15,9 @@ from .performance import ExecutionSettings, NodePerformanceProfile
 
 _MAX_MARKERS = 64
 _MAX_MARKER_BYTES = 64 * 1024
+# Written by the launcher (see launch.DistributedSupervisor._recovery_marker_path)
+# into the same state directory. These are quarantine records, not rank markers.
+_RECOVERY_MARKER_SUFFIX = "-memory-recovery.json"
 _PHASES = {"loading", "ready", "peer_lost", "launcher_lost", "failed"}
 _LOAD_STAGES = {"initializing", "loading_weights", "validating", "ready"}
 _BACKENDS = {"ring", "jaccl", "jaccl-ring"}
@@ -577,7 +580,16 @@ def read_runtime_markers(
 
     jobs: list[dict[str, Any]] = []
     warnings: list[str] = []
-    candidates = [path for path in entries if path.name.endswith(".json")]
+    candidates = [
+        path
+        for path in entries
+        if path.name.endswith(".json")
+        # Memory-recovery quarantine records share this directory but use a
+        # different schema enforced separately by the launcher. Reporting them
+        # here produced a spurious "invalid string fields" warning on every
+        # diagnostics read after a quarantined teardown.
+        and not path.name.endswith(_RECOVERY_MARKER_SUFFIX)
+    ]
     if len(candidates) > _MAX_MARKERS:
         warnings.append(f"runtime marker limit exceeded; showing first {_MAX_MARKERS}")
     for path in candidates[:_MAX_MARKERS]:

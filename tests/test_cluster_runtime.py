@@ -346,3 +346,26 @@ def test_runtime_markers_ignore_symlinks_and_invalid_json(tmp_path):
 
     assert result["jobs"] == []
     assert len(result["warnings"]) == 2
+
+
+def test_runtime_markers_skip_memory_recovery_quarantine(tmp_path):
+    (tmp_path / "job.json").write_text(json.dumps(_marker()))
+    (tmp_path / "nemotron-pool-memory-recovery.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "nemotron-pool",
+                "plan_hash": "b" * 64,
+                "created_at": 1788508364.0,
+                "reason": "rank 1 on peer: no-marker",
+                "kind": "unconfirmed_process",
+                "boot_session_id": "boot",
+                "baseline_ceiling_bytes": {"0": 115448725504, "1": 115448725504},
+            }
+        )
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert [job["rank"] for job in result["jobs"]] == [1]
