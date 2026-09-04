@@ -271,6 +271,88 @@ class TestChatKeepaliveCarriesRole:
         assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
 
 
+class TestCallableKeepaliveChunk:
+    """_with_sse_keepalive must accept a zero-arg callable, resolved fresh
+    at each emission, alongside the existing static-string behavior."""
+
+    @pytest.mark.asyncio
+    async def test_callable_is_invoked_for_initial_frame(self):
+        calls = []
+
+        def build():
+            calls.append(1)
+            return f"data: progress-{len(calls)}\n\n"
+
+        async def gen():
+            yield "data: real\n\n"
+
+        items = await _collect(_with_sse_keepalive(gen(), keepalive_chunk=build))
+        assert items[0] == "data: progress-1\n\n"
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_callable_returning_none_skips_emission(self):
+        async def gen():
+            yield "data: real\n\n"
+
+        items = await _collect(
+            _with_sse_keepalive(gen(), keepalive_chunk=lambda: None)
+        )
+        # No keepalive frame emitted, just the real chunk passed through
+        assert items == ["data: real\n\n"]
+
+
+class TestChatProgressKeepaliveChunk:
+    """_chat_progress_keepalive_chunk embeds live tracker progress when
+    available, and falls back to the plain no-op keepalive otherwise."""
+
+    def setup_method(self):
+        from omlx.prefill_progress import get_prefill_tracker
+
+        get_prefill_tracker().clear()
+
+    def teardown_method(self):
+        from omlx.prefill_progress import get_prefill_tracker
+
+        get_prefill_tracker().clear()
+
+    def test_falls_back_when_no_tracker_entry(self):
+        from omlx.server import _chat_keepalive_chunk, _chat_progress_keepalive_chunk
+
+        frame = _chat_progress_keepalive_chunk("chatcmpl-x", "req-missing")
+        assert frame == _chat_keepalive_chunk("chatcmpl-x")
+
+    def test_embeds_progress_when_entry_present(self):
+        from omlx.prefill_progress import get_prefill_tracker
+        from omlx.server import _chat_progress_keepalive_chunk
+
+        get_prefill_tracker().update("req-1", 2048, 8192, "llama-3b")
+        frame = _chat_progress_keepalive_chunk("chatcmpl-x", "req-1")
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        # Required chat.completion.chunk fields stay intact (additive-only).
+        assert payload["id"] == "chatcmpl-x"
+        assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["role"] == "assistant"
+        assert payload["choices"][0]["delta"]["content"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+        # Additive progress field.
+        progress = payload["omlx_progress"]
+        assert progress["phase"] == "prefill"
+        assert progress["processed"] == 2048
+        assert progress["total"] == 8192
+
+    def test_decode_phase_progress_is_embedded(self):
+        from omlx.prefill_progress import get_prefill_tracker
+        from omlx.server import _chat_progress_keepalive_chunk
+
+        get_prefill_tracker().update("req-1", 10, 256, "llama-3b", phase="decode")
+        frame = _chat_progress_keepalive_chunk("chatcmpl-x", "req-1")
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload["omlx_progress"]["phase"] == "decode"
+        assert payload["omlx_progress"]["processed"] == 10
+        assert payload["omlx_progress"]["total"] == 256
+
+
 class TestResolveKeepalive:
     """Tests for _resolve_keepalive helper that maps settings to wire format."""
 

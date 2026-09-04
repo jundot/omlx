@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -194,6 +194,7 @@ from .exceptions import (
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -2181,6 +2182,44 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     )
 
 
+def _chat_progress_keepalive_chunk(response_id: str, request_id: str) -> str:
+    """Keepalive frame carrying live prefill/decode progress when available.
+
+    Same wire shape and client-compatibility reasoning as
+    ``_chat_keepalive_chunk`` (shared ``id``, ``role`` on the delta), plus an
+    additive, non-standard ``omlx_progress`` field with the tracker's
+    current phase/processed/total/speed/eta for this request. Additive only
+    — conformant OpenAI accumulators that ignore unknown fields see an
+    ordinary no-op chunk. Falls back to the plain keepalive once the tracker
+    has no entry for this request (not yet started, or already past
+    prefill+decode tracking granularity).
+    """
+    entry = get_prefill_tracker().get(request_id)
+    if entry is None:
+        return _chat_keepalive_chunk(response_id)
+    payload = {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "keepalive",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+        "omlx_progress": {
+            "phase": entry.get("phase"),
+            "processed": entry.get("processed"),
+            "total": entry.get("total"),
+            "speed": entry.get("speed"),
+            "eta": entry.get("eta"),
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 async def _safe_anext(ait):
     """Wrapper for __anext__ that converts StopAsyncIteration to a sentinel.
 
@@ -2198,7 +2237,7 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
-    keepalive_chunk: Optional[str] = _KEEPALIVE_COMMENT,
+    keepalive_chunk: Optional[Union[str, Callable[[], Optional[str]]]] = _KEEPALIVE_COMMENT,
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to send periodic keepalive frames.
 
@@ -2207,13 +2246,18 @@ async def _with_sse_keepalive(
     This wrapper periodically yields a keepalive frame to hold the
     connection open. The frame format depends on caller-supplied
     keepalive_chunk: a legacy SSE comment, a protocol-aware no-op event,
-    or None to disable emission entirely.
+    a zero-arg callable evaluated fresh at each emission (e.g. to embed
+    live prefill/decode progress), or None to disable emission entirely.
 
     When http_request is provided, also polls for client disconnect
     between prefill steps. This detects cancellation during long prefills
     where uvicorn's ASGI disconnect message is not delivered until after
     the generator yields.
     """
+
+    def _resolve_keepalive_frame() -> Optional[str]:
+        return keepalive_chunk() if callable(keepalive_chunk) else keepalive_chunk
+
     ait = generator.__aiter__()
     task = None
     keepalive_elapsed = 0.0
@@ -2236,7 +2280,9 @@ async def _with_sse_keepalive(
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
     if keepalive_chunk is not None:
-        yield keepalive_chunk
+        frame = _resolve_keepalive_frame()
+        if frame is not None:
+            yield frame
 
     try:
         while True:
@@ -2274,7 +2320,9 @@ async def _with_sse_keepalive(
                 if keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
                     if keepalive_chunk is not None:
-                        yield keepalive_chunk
+                        frame = _resolve_keepalive_frame()
+                        if frame is not None:
+                            yield frame
             if task.done():
                 try:
                     result = task.result()
@@ -3895,22 +3943,31 @@ async def create_chat_completion(
         # handled exception, but response already started" and the client sees
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
+        # Pre-mint the completion id for both branches: it becomes the
+        # generation request_id (threaded through chat_kwargs below) so the
+        # PrefillProgressTracker entry, the SSE keepalive frame (see
+        # _chat_keepalive_chunk), and the eventual response all share one id
+        # instead of three unrelated ones.
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        chat_kwargs["request_id"] = response_id
+
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
-            request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
-            # Pre-mint the completion id so the keepalive frame (emitted before the
-            # generator starts) can share it. See _chat_keepalive_chunk.
-            response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
+                # response_id doubles as the generation request_id (see
+                # chat_kwargs["request_id"] above), so this looks up the
+                # same tracker entry the scheduler is updating live.
+                keepalive = lambda: _chat_progress_keepalive_chunk(  # noqa: E731
+                    response_id, response_id
+                )
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning

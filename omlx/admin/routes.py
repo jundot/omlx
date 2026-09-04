@@ -5410,6 +5410,15 @@ def _build_active_models_data() -> dict:
             tokens_per_second = (
                 generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
             )
+            max_tokens = getattr(req, "max_tokens", None) if req else None
+            remaining_tokens = (
+                max_tokens - generated_tokens if max_tokens is not None else None
+            )
+            eta = (
+                remaining_tokens / tokens_per_second
+                if remaining_tokens and remaining_tokens > 0 and tokens_per_second > 0
+                else None
+            )
             generating.append(
                 {
                     "request_id": rid,
@@ -5418,7 +5427,8 @@ def _build_active_models_data() -> dict:
                     "tokens_per_second": tokens_per_second,
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
-                    "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                    "max_tokens": max_tokens,
+                    "eta": round(eta, 1) if eta is not None else None,
                 }
             )
 

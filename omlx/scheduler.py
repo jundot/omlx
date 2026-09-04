@@ -11024,6 +11024,25 @@ class Scheduler:
 
             if not is_finished:
                 self._maybe_capture_boundary_snapshot(request, response.uid)
+                # Throttled decode-phase progress (every 8 tokens, not every
+                # token) so the tracker's O(1) lock isn't hit on every decode
+                # step across many concurrent requests. Reuses the same
+                # tracker/entry prefill already populates (phase="prefill")
+                # so SSE/dashboard consumers key on one request_id regardless
+                # of phase.
+                if (
+                    request.num_output_tokens > completion_tokens_before
+                    and request.num_output_tokens % 8 == 0
+                ):
+                    max_tokens = getattr(request.sampling_params, "max_tokens", None)
+                    if max_tokens:
+                        get_prefill_tracker().update(
+                            request_id=request_id,
+                            processed=request.num_output_tokens,
+                            total=max_tokens,
+                            model_id=self.config.model_name,
+                            phase="decode",
+                        )
 
             # Handle finished requests
             if is_finished:
@@ -11035,6 +11054,11 @@ class Scheduler:
                 output.finished = True
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
+                # Most requests finish via EOS/stop well before max_tokens,
+                # so update()'s own processed>=total auto-remove never fires
+                # for them — remove explicitly here instead of leaking an
+                # entry for the tracker's lifetime.
+                get_prefill_tracker().remove(request_id)
 
                 if parser_session is not None:
                     final_result = parser_session.finalize()
