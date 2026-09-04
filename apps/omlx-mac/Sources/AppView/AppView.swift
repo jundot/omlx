@@ -15,14 +15,18 @@ struct AppView: View {
     @State private var presentedUpdate: AvailableUpdate?
 
     @Environment(\.colorScheme) private var scheme
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
 
     var body: some View {
         let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         let section = selectedSection
 
-        NavigationSplitView {
+        // The sidebar is the only way to switch screens, so it must never
+        // collapse: pin visibility to `.all` and remove the toolbar toggle,
+        // matching System Settings.
+        NavigationSplitView(columnVisibility: .constant(.all)) {
             SettingsSidebar(selection: bindingForSelection())
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             ContentScaffold(section: section, detailTitle: detailTitle) {
                 screen(for: section)
@@ -34,18 +38,20 @@ struct AppView: View {
         // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
         .environment(\.omlxTheme, theme)
-        .onChange(of: services.requestedSection) { _, requested in
+        .onChange(of: services.requestedSection, initial: true) { _, requested in
             // A screen asked us to navigate elsewhere (e.g. "Edit on
             // Server →" from the per-model Profiles tab). Clear the
             // request after applying so the same section can be requested
-            // twice in a row.
+            // twice in a row. `initial: true` also applies a request set
+            // before the window first mounted (e.g. "Model Settings…" from
+            // the menubar while AppView had never been opened).
             if let requested {
                 if requested != .models { services.modelDetailID = nil }
                 selection = requested
                 services.requestedSection = nil
             }
         }
-        .onReceive(services.updates.$confirmationUpdate) { update in
+        .onChange(of: services.updates.confirmationUpdate, initial: true) { _, update in
             presentedUpdate = update
         }
         .sheet(item: $presentedUpdate, onDismiss: {
@@ -96,6 +102,7 @@ struct AppView: View {
     private func screen(for section: AppSection) -> some View {
         switch section {
         case .server:       ServerScreen()
+        case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
         case .status:       StatusScreen()
@@ -111,6 +118,7 @@ struct AppView: View {
         case .quantization: QuantizationScreen()
         case .throughputBench: ThroughputBenchScreen(vm: services.throughputBench)
         case .accuracyBench:   AccuracyBenchScreen(vm: services.accuracyBench)
+        case .contextBench:    ContextBenchScreen(vm: services.contextBench)
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
         }
@@ -122,7 +130,7 @@ struct AppView: View {
 @MainActor
 private struct UpdateConfirmationSheet: View {
     let update: AvailableUpdate
-    @ObservedObject var updates: UpdateController
+    let updates: UpdateController
     let onLater: () -> Void
     let onConfirm: () -> Void
 
@@ -439,6 +447,7 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
+                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)
@@ -461,6 +470,7 @@ private struct SettingsSidebar: View {
             Section {
                 SidebarRow(section: .throughputBench)
                 SidebarRow(section: .accuracyBench)
+                SidebarRow(section: .contextBench)
             } header: {
                 Text(String(localized: "sidebar.group.benchmark",
                             defaultValue: "Benchmark",
@@ -501,55 +511,30 @@ private struct ContentScaffold<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
 
-    /// Resolved section title, rendered as content (not via .navigationTitle)
-    /// because the window toolbar is hidden — Settings.app pattern.
     private var titleText: String { detailTitle ?? section.title }
-
-    @ViewBuilder
-    private func sectionTitleHeader() -> some View {
-        Text(titleText)
-            .font(.omlxText(28, weight: .bold))
-            .foregroundStyle(theme.text)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // Match the 14pt horizontal padding screen cards apply
-            // internally so the title's left edge aligns with the
-            // cards' left edge inside the 720pt centered frame.
-            .padding(.horizontal, 14)
-            .padding(.top, 36)
-            .padding(.bottom, 6)
-    }
 
     var body: some View {
         Group {
             if section.fillsContentArea {
-                // Skip the outer ScrollView so the screen can claim the
-                // available height (Logs uses this for its monospace pane).
-                VStack(alignment: .leading, spacing: 0) {
-                    sectionTitleHeader()
-                    content()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                }
-                .frame(maxWidth: 720, alignment: .topLeading)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.bottom, 18)
-                .background(theme.windowBg)
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .frame(maxWidth: 720, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.bottom, 18)
+                    .background(theme.windowBg)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            sectionTitleHeader()
-                            content()
-                                .padding(.top, 8)
-                        }
+                        content()
                         // Wrap title + content together in a single max-width
                         // frame so the section title and the cards share the
                         // same left edge (Settings.app pattern: large title
                         // sits flush with content, not offset).
-                        .frame(maxWidth: 720, alignment: .topLeading)
-                        .frame(maxWidth: .infinity, alignment: .top)
-                        .padding(.bottom, 36)
+                            .frame(maxWidth: 720, alignment: .topLeading)
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .padding(.bottom, 36)
                     }
                     // Deep-link scroll: when another screen (e.g. the
                     // per-model "Edit on Server →" link) requested a
@@ -575,11 +560,35 @@ private struct ContentScaffold<Content: View>: View {
                 }
             }
         }
+        .navigationTitle(titleText)
+        .modifier(ToolbarHeightKeeper())
         .background(theme.windowBg)
-        // Title is rendered as content via sectionTitleHeader() — no
-        // .navigationTitle here because the window toolbar is hidden in
-        // AppView (matches the Settings.app pattern of inline titles on
-        // floating-glass sidebar layouts).
+    }
+}
+
+/// macOS collapses the unified toolbar to a compact title bar on panes
+/// that contribute no toolbar items. With the sidebar toggle removed,
+/// only screens with their own items (Logs, Model Settings) kept the
+/// full-height bar — so every screen contributes an invisible item to
+/// keep the height uniform. On macOS 26 the Liquid Glass capsule that
+/// toolbars draw around every item must be hidden explicitly, or the
+/// invisible item shows up as a small vertical bar.
+private struct ToolbarHeightKeeper: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.toolbar {
+                ToolbarItem {
+                    Color.clear.frame(width: 1, height: 1)
+                }
+                .sharedBackgroundVisibility(.hidden)
+            }
+        } else {
+            content.toolbar {
+                ToolbarItem {
+                    Color.clear.frame(width: 1, height: 1)
+                }
+            }
+        }
     }
 }
 

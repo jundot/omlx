@@ -79,6 +79,14 @@ class TestParseSize:
         with pytest.raises(ValueError):
             parse_size("1XB")  # Invalid unit
 
+    @pytest.mark.parametrize(
+        "value", ["infMB", "-infMB", "nanMB", "1e999MB", "1e308TB"]
+    )
+    def test_parse_non_finite_raises_value_error(self, value):
+        """Non-finite unit values are rejected as invalid size strings."""
+        with pytest.raises(ValueError, match="Invalid size string"):
+            parse_size(value)
+
 
 class TestServerConfig:
     """Test cases for ServerConfig dataclass."""
@@ -193,6 +201,9 @@ class TestPagedSSDCacheConfig:
         assert config.enabled is False
         assert config.cache_dir is None
         assert config.max_size == "100GB"
+        assert config.gdn_snapshot_storage == "auto"
+        assert config.effective_gdn_ssd_split_enabled is False
+        assert config.gdn_sidecar_state_dtype == "fp32"
 
     def test_custom_values(self):
         """Test custom configuration values."""
@@ -204,6 +215,26 @@ class TestPagedSSDCacheConfig:
         assert config.enabled is True
         assert config.cache_dir == Path("/tmp/cache")
         assert config.max_size == "50GB"
+        assert config.effective_gdn_ssd_split_enabled is True
+
+    def test_explicit_gdn_storage_modes_preserve_legacy_bool(self):
+        config = PagedSSDCacheConfig(enabled=True)
+        config.gdn_snapshot_storage = "embedded"
+        assert config.gdn_ssd_split_enabled is False
+        assert config.effective_gdn_ssd_split_enabled is False
+        config.gdn_snapshot_storage = "ssd_sidecar"
+        assert config.gdn_ssd_split_enabled is True
+        assert config.effective_gdn_ssd_split_enabled is True
+
+    def test_invalid_gdn_storage_env_warns_and_keeps_auto(self, caplog):
+        with patch.dict(
+            os.environ,
+            {"OMLX_GDN_SNAPSHOT_STORAGE": "invalid-mode"},
+            clear=False,
+        ):
+            config = OMLXConfig.from_env()
+        assert config.paged_ssd_cache.gdn_snapshot_storage == "auto"
+        assert "gdn_snapshot_storage" in caplog.text
 
     def test_max_size_bytes_property(self):
         """Test max_size_bytes property calculation."""

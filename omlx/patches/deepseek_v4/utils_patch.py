@@ -42,6 +42,27 @@ SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 _PATCHED = False
 
 
+def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
+    """Keep the native ratio-128 attention path off for sub-4-bit V4."""
+    if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+        return True
+
+    quantizations = [config.get("quantization"), config.get("quantization_config")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        quantizations.append(text_config.get("quantization_config"))
+
+    for quantization in quantizations:
+        bits = quantization.get("bits") if isinstance(quantization, dict) else None
+        if (
+            isinstance(bits, (int, float))
+            and not isinstance(bits, bool)
+            and float(bits) < 4
+        ):
+            return False
+    return True
+
+
 def _load_safetensors(path: str) -> dict:
     """Load a safetensors file with a dtype fallback for F8_E8M0.
 
@@ -115,6 +136,16 @@ def _build_patched_load_model() -> Callable:
         if model_config is not None:
             config.update(model_config)
 
+        if (
+            (model_file := config.get("model_file")) is not None
+            and not trust_remote_code
+        ):
+            raise ValueError(
+                f"The model at {model_path} requires executing custom model "
+                f"code ({model_file!r}). Pass trust_remote_code=True if you "
+                "trust this model."
+            )
+
         weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
         if not weight_files and strict:
@@ -124,13 +155,7 @@ def _build_patched_load_model() -> Callable:
         for wf in weight_files:
             weights.update(_load_safetensors(wf))  # PR 1192 change
 
-        if (model_file := config.get("model_file")) is not None:
-            if not trust_remote_code:
-                raise ValueError(
-                    f"The model at {model_path} requires executing custom model "
-                    f"code ({model_file!r}). Pass trust_remote_code=True if you "
-                    "trust this model."
-                )
+        if model_file is not None:
             spec = importlib.util.spec_from_file_location(
                 "custom_model",
                 model_path / model_file,
@@ -145,6 +170,11 @@ def _build_patched_load_model() -> Callable:
             text_config = config.get("text_config", {})
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
+
+        if str(config.get("model_type", "")).startswith("deepseek_v4"):
+            config["use_native_ratio128_attention"] = bool(
+                config.get("use_native_ratio128_attention", True)
+            ) and _native_ratio128_attention_enabled(config)
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)

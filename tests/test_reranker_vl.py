@@ -8,14 +8,22 @@ import pytest
 
 try:
     import mlx.core as mx
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
+from omlx.exceptions import InvalidRequestError
 from omlx.models.reranker import (
     MLXRerankerModel,
     RerankOutput,
     _coerce_item_to_text,
+)
+
+IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 
 
@@ -77,8 +85,8 @@ class TestVLItemBuilder:
         with patch(
             "omlx.models.reranker.load_image", return_value=fake_img
         ) as mock_load:
-            result = model._build_vl_item({"image": "https://x/y.jpg"})
-        mock_load.assert_called_once_with("https://x/y.jpg")
+            result = model._build_vl_item({"image": IMAGE_DATA_URI})
+        mock_load.assert_called_once_with(IMAGE_DATA_URI, field="image")
         assert result == {"image": fake_img}
 
     def test_dict_text_and_image(self, tmp_path):
@@ -86,9 +94,15 @@ class TestVLItemBuilder:
         fake_img = object()
         with patch(
             "omlx.models.reranker.load_image", return_value=fake_img
-        ):
-            result = model._build_vl_item({"text": "t", "image": "i"})
+        ) as mock_load:
+            result = model._build_vl_item({"text": "t", "image": IMAGE_DATA_URI})
+        mock_load.assert_called_once_with(IMAGE_DATA_URI, field="image")
         assert result == {"text": "t", "image": fake_img}
+
+    def test_dict_image_rejects_url(self, tmp_path):
+        model = MLXRerankerModel(str(tmp_path))
+        with pytest.raises(InvalidRequestError):
+            model._build_vl_item({"image": "https://x/y.jpg"})
 
     def test_empty_dict_raises(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
@@ -146,14 +160,12 @@ class TestVLRerankScoring:
         model.processor = MagicMock()
 
         fake_img = object()
-        with patch(
-            "omlx.models.reranker.load_image", return_value=fake_img
-        ):
+        with patch("omlx.models.reranker.load_image", return_value=fake_img):
             output = model._rerank_vl(
                 query={"text": "a dog"},
                 documents=[
                     {"text": "desc"},
-                    {"image": "https://x/dog.jpg"},
+                    {"image": IMAGE_DATA_URI},
                 ],
                 max_length=8192,
             )

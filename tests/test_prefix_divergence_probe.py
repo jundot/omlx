@@ -88,6 +88,68 @@ class TestDivergenceProbe:
         assert "vs stored req-b" in caplog.text
         assert "common_prefix=3/5" in caplog.text
 
+    def test_large_reprefill_logs_one_info_line(self, caplog):
+        """A big re-prefill that shared at least one block with a stored
+        sequence gets a single INFO line naming the divergence position
+        (#2333/#2349 triage), with no decoded prompt content at INFO."""
+        sched = _make_scheduler()
+        stored = list(range(10000))
+        sched._cache_probe_seqs.append(("req-old", stored))
+        # Diverges at 8000: reused 6144 (3 blocks), re-prefills 6000.
+        prompt = list(range(8000)) + [999999] * 4143
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._log_prefix_divergence(_request(prompt, cached_tokens=6144))
+
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(infos) == 1
+        msg = infos[0].getMessage()
+        assert "re-prefills 5999 of 12143 tokens" in msg
+        assert "(reused 6144)" in msg
+        assert "req-old" in msg
+        assert "shares the first 8000 of 10000 comparable tokens" in msg
+        # Prompt content must not leak into INFO (decoded context is DEBUG).
+        assert "stored=..." not in msg
+
+    def test_small_reprefill_stays_silent_at_info(self, caplog):
+        sched = _make_scheduler()
+        stored = list(range(9000))
+        sched._cache_probe_seqs.append(("req-old", stored))
+        # Only ~1900 tokens re-prefilled: below the INFO threshold.
+        prompt = list(range(9000)) + [7] * 100
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._log_prefix_divergence(_request(prompt, cached_tokens=7200))
+
+        assert caplog.text == ""
+
+    def test_unrelated_prompt_stays_silent_at_info(self, caplog):
+        """Shared prefix below one block means the stored cache was never
+        relevant to this prompt: a plain cold prefill logs nothing."""
+        sched = _make_scheduler()
+        sched._cache_probe_seqs.append(("req-old", list(range(9000))))
+        prompt = [500000 + i for i in range(9000)]
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._log_prefix_divergence(_request(prompt, cached_tokens=0))
+
+        assert caplog.text == ""
+
+    def test_cache_loss_signature_logged(self, caplog):
+        """Stored sequence covers the whole prompt but nothing was served:
+        the INFO line must expose the reused=0 vs shared=full mismatch."""
+        sched = _make_scheduler()
+        stored = list(range(12000))
+        sched._cache_probe_seqs.append(("req-old", stored))
+        prompt = list(range(12000))
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._log_prefix_divergence(_request(prompt, cached_tokens=0))
+
+        msg = caplog.text
+        assert "re-prefills 12000 of 12000 tokens (reused 0)" in msg
+        assert "shares the first 12000 of 12000 comparable tokens" in msg
+
     def test_noop_without_stored_sequences(self, caplog):
         sched = _make_scheduler()
         with caplog.at_level(logging.DEBUG, logger="omlx.scheduler"):

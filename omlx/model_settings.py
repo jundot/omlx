@@ -8,14 +8,18 @@ flags, and metadata.
 import copy
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
+    MODEL_SPECIFIC_PROFILE_FIELDS,
+    UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
+    slugify_profile_api_name,
     validate_profile_name,
     utcnow,
 )
@@ -24,6 +28,57 @@ logger = logging.getLogger(__name__)
 
 # Current settings file format version
 SETTINGS_VERSION = 1
+
+# The Lightning MTP runtime clamps deeper requests to this global ceiling.
+# Keep API validation and runtime normalization on the same contract.
+MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
+
+
+def vlm_mtp_processor_conflicts(data: dict) -> list:
+    """Names of settings that need per-request logits processors and
+    therefore cannot combine with ``vlm_mtp_enabled``.
+
+    The vlm_mtp decode path bypasses mlx-lm BatchGenerator, where logits
+    processors are applied; with any of these set, every request would fall
+    back to BatchGenerator and the toggle would never engage (#2399).
+    Neutral values (repetition 1.0, presence 0.0) build no processor and do
+    not conflict.
+
+    ``thinking_budget_enabled`` is intentionally absent: the vlm_mtp path
+    applies ``ThinkingBudgetProcessor`` at verify time via
+    ``MTPProcessingSampler`` (see omlx/speculative/processing_sampler.py),
+    so a thinking-budget default no longer forces the BatchGenerator
+    fallback.
+    """
+    conflicts = []
+    rep = data.get("repetition_penalty")
+    if rep is not None and rep != 1.0:
+        conflicts.append("repetition_penalty")
+    pres = data.get("presence_penalty")
+    if pres is not None and pres != 0.0:
+        conflicts.append("presence_penalty")
+    if data.get("guided_grammar_enabled"):
+        conflicts.append("guided_grammar_enabled")
+    return conflicts
+
+
+def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
+    """Clear ``vlm_mtp_enabled`` from ``data`` when it conflicts with
+    processor-backed settings; returns ``(data, conflict_names)``.
+
+    The sampling / grammar side wins because those settings shape output
+    content while vlm_mtp only affects speed. Used for settings dicts that
+    predate the exclusivity rule (persisted files, profile merges) so
+    ``ModelSettings.__post_init__`` does not reject the whole blob.
+    """
+    if not data.get("vlm_mtp_enabled"):
+        return data, []
+    conflicts = vlm_mtp_processor_conflicts(data)
+    if not conflicts:
+        return data, []
+    resolved = dict(data)
+    resolved["vlm_mtp_enabled"] = False
+    return resolved, conflicts
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -48,7 +103,8 @@ class ModelSettings:
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
         model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
-        index_cache_freq: IndexCache: every Nth layer keeps indexer (DSA models only).
+        index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
+            only; GLM-5.2 uses its native checkpoint schedule).
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
@@ -58,6 +114,34 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
+            ANE/GPU prompt processing.
+        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
+            through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
+            projection block padded to the compiled ANE shape (zero disables).
+        qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
+            across the ANE instances.
+        qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
+            into each dual-ANE/CPU hidden-channel branch.
+        qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
+        qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
+        qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
+        qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
+            outputs assigned across the ANE instances.
+        qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
+            with the CPU. Requires a separately preprocessed FP16 checkpoint.
+        qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
+            projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
+            down projection assigned to the CPU.
+        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
+            z+qkv projection outputs assigned to the CPU after the ANE prefix.
+        qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
+            (zero lets Accelerate choose).
+        qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
+            shared-resource scheduling attributes for manually sharded CPU work.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -74,10 +158,12 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window (None = dflash default 1024).
+        dflash_draft_window_size: Draft model sliding-attention window
+            (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
         dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (None = dflash default 64).
+            (default 0, disabling sink tokens).
+        dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
@@ -86,10 +172,13 @@ class ModelSettings:
             for multi-row decode batches whose cache positions are aligned. Unaligned
             continuous batches fall back to standard decoding automatically. Compatible
             model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive with
-            dflash_enabled and turboquant_kv_enabled.
+            dflash_enabled.
         vlm_mtp_enabled: Enable VLM MTP speculative decoding via an external assistant
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
-            "gemma4_assistant" model.
+            "gemma4_assistant" model. Mutually exclusive with processor-backed
+            settings (guided grammar, thinking budget, repetition/presence
+            penalties); requests carrying such per-request parameters fall back
+            to BatchGenerator so the constraints stay enforced (#2399).
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
@@ -111,27 +200,69 @@ class ModelSettings:
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None  # Keys that cannot be overridden by API requests
+    forced_ct_kwargs: Optional[list[str]] = (
+        None  # Keys that cannot be overridden by API requests
+    )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
-    model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
-    model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
-    index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
-    enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
-    preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    model_type_override: Optional[str] = (
+        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+    )
+    model_alias: Optional[str] = (
+        None  # API-visible name (alternative to directory name)
+    )
+    index_cache_freq: Optional[int] = (
+        None  # IndexCache: every Nth layer keeps indexer (DeepSeek DSA only)
+    )
+    enable_thinking: Optional[bool] = (
+        None  # Explicit toggle for thinking/reasoning mode (None = auto)
+    )
+    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
+    # through mmap. The runtime may force this on when resident loading cannot
+    # fit under the configured model-memory ceiling but mmap loading can.
+    qwen4_ple_ssd_offload: bool = False
+    preserve_thinking: Optional[bool] = (
+        None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
-    reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    reasoning_parser: Optional[str] = (
+        None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    )
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
-    turboquant_skip_last: bool = True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    turboquant_skip_last: bool = (
+        True  # Skip last KVCache layer (prevents corruption on sensitive models)
+    )
+
+    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Off by default because the fixed-shape ANE models add load-time/runtime
+    # cache memory and rely on undocumented AppleNeuralEngine interfaces.
+    qwen35_ane_prefill_enabled: bool = False
+    qwen35_ane_prefill_sequence_length: int = 2048
+    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
+    qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_fused_down: bool = False
+    qwen35_ane_prefill_max_layers: int = 64
+    qwen35_ane_prefill_dual_ane: bool = True
+    qwen35_ane_prefill_gdn: bool = True
+    qwen35_ane_prefill_gdn_fraction: float = 0.50
+    qwen35_ane_prefill_gdn_max_layers: int = 48
+    qwen35_ane_prefill_cpu_enabled: bool = False
+    qwen35_ane_prefill_cpu_fraction: float = 0.135
+    qwen35_ane_prefill_cpu_down_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
+    qwen35_ane_prefill_cpu_threads: int = 8
+    qwen35_ane_prefill_cpu_shared_resource: bool = True
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
-    specprefill_draft_model: Optional[str] = None  # Path to draft model (must share tokenizer)
+    specprefill_draft_model: Optional[str] = (
+        None  # Path to draft model (must share tokenizer)
+    )
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
@@ -142,39 +273,60 @@ class ModelSettings:
     dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
     dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    dflash_max_ctx: Optional[int] = (
+        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
+    )
     # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
     # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
     dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = 4  # Matches dflash balanced profile default
-    dflash_in_memory_cache_max_bytes: int = 8 * 1024 * 1024 * 1024  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = False  # Requires in-memory cache and an omlx paged SSD cache dir
+    dflash_in_memory_cache_max_entries: int = (
+        4  # Matches dflash balanced profile default
+    )
+    dflash_in_memory_cache_max_bytes: int = (
+        8 * 1024 * 1024 * 1024
+    )  # 8 GiB (balanced profile default)
+    dflash_ssd_cache: bool = (
+        False  # Requires in-memory cache and an omlx paged SSD cache dir
+    )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
-    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
-    # agentic workloads where acceptance drops on the default sliding window.
+    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
+    # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = None
+    dflash_draft_sink_size: Optional[int] = 0
+    dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
     # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash and turboquant.
+    # with dflash.
     mtp_enabled: bool = False
+    # Maximum chained MTP draft tokens per verify cycle (speculative depth).
+    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
+    # An adaptive controller picks 1..max per sequence from rolling
+    # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
+    mtp_num_draft_tokens: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
     # Mutually exclusive with all other speculative paths because the wrapper
-    # bypasses mlx-lm BatchGenerator at decode time.
+    # bypasses mlx-lm BatchGenerator at decode time. Also exclusive with
+    # processor-backed settings (guided grammar, thinking budget, penalties)
+    # — see vlm_mtp_processor_conflicts().
     vlm_mtp_enabled: bool = False
-    vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
-    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
+    vlm_mtp_draft_model: Optional[str] = (
+        None  # Path / model id of the assistant drafter
+    )
+    vlm_mtp_draft_block_size: Optional[int] = (
+        None  # Tokens per draft round (None = mlx-vlm default)
+    )
 
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
+    is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
@@ -187,19 +339,15 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
-        # Native MTP is mutually exclusive with DFlash (also speculative) and
-        # TurboQuant KV (patches the same attention path). Reject combos at
-        # construction time so the conflict surfaces in the admin UI / API
-        # rather than at model load.
+        # Native MTP is mutually exclusive with DFlash (also speculative).
+        # Reject the combo at construction time so the conflict surfaces in
+        # the admin UI / API rather than at model load. TurboQuant KV is
+        # compatible: its attention patch routes MTP's decode-shaped
+        # multi-row verify through the quantized decode kernels.
         if self.mtp_enabled and self.dflash_enabled:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "
                 "speculative-decoding path per model"
-            )
-        if self.mtp_enabled and self.turboquant_kv_enabled:
-            raise ValueError(
-                "mtp_enabled and turboquant_kv_enabled cannot both be True; "
-                "TurboQuant patches the attention path that MTP relies on"
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
@@ -217,6 +365,21 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+            # Grammar / penalty defaults materialize as per-request logits
+            # processors, which the vlm_mtp decode path cannot apply —
+            # every request would fall back to BatchGenerator and the
+            # toggle would silently never engage (#2399). Reject the combo
+            # at construction time like the speculative-path conflicts
+            # above. Thinking budget is exempt: it is applied at verify
+            # time via MTPProcessingSampler.
+            processor_conflicts = vlm_mtp_processor_conflicts(self.to_dict())
+            if processor_conflicts:
+                raise ValueError(
+                    "vlm_mtp_enabled cannot be combined with "
+                    f"{', '.join(processor_conflicts)}; these settings "
+                    "require per-request logits processors, which the "
+                    "vlm_mtp decode path does not apply"
+                )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.
@@ -310,6 +473,20 @@ class ModelSettingsManager:
             self._settings = {}
 
             for model_id, model_data in models_data.items():
+                # Settings saved before the vlm_mtp exclusivity rule may
+                # combine vlm_mtp_enabled with processor-backed settings;
+                # __post_init__ would raise and the except below would drop
+                # the model's entire settings blob. Keep the content-shaping
+                # settings and turn vlm_mtp off instead.
+                model_data, conflicts = resolve_vlm_mtp_conflicts(model_data)
+                if conflicts:
+                    logger.warning(
+                        "Model '%s': vlm_mtp_enabled disabled on load; it "
+                        "cannot be combined with %s. Unset those settings "
+                        "to re-enable vlm_mtp.",
+                        model_id,
+                        ", ".join(conflicts),
+                    )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
                 except Exception as e:
@@ -336,20 +513,27 @@ class ModelSettingsManager:
             "models": {
                 model_id: settings.to_dict()
                 for model_id, settings in self._settings.items()
-            }
+            },
         }
 
+        # Write to temp file first, then rename for atomicity. The pid in
+        # the temp name keeps concurrent processes from sharing a temp path
+        # and renaming each other's partial writes into place.
+        temp_file = self.settings_file.with_name(
+            f"{self.settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            # Write to temp file first, then rename for atomicity
-            temp_file = self.settings_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
             logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def get_settings(self, model_id: str) -> ModelSettings:
@@ -368,6 +552,33 @@ class ModelSettingsManager:
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
+
+    def get_settings_for_request(
+        self,
+        model_id: str,
+        resolved_model_id: Optional[str] = None,
+    ) -> ModelSettings:
+        """Get settings for an API-requested model name.
+
+        Exposed profile model IDs return the base model's settings merged
+        with the profile's universal (request-time) overrides. Engine-
+        construction fields are handled separately by
+        get_exposed_profile_runtime_settings_for_request(), which may trigger
+        a transient engine variant reload without mutating persisted settings.
+        Any other name falls back to the settings of the already-resolved
+        physical model.
+        """
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                profile_match = self._find_exposed_profile_locked(candidate)
+                if profile_match is not None:
+                    base_model_id, profile = profile_match
+                    return self._settings_with_profile_locked(base_model_id, profile)
+
+        return self.get_settings(resolved_model_id or model_id)
 
     def set_settings(self, model_id: str, settings: ModelSettings) -> None:
         """Set settings for a specific model.
@@ -474,12 +685,45 @@ class ModelSettingsManager:
                     f"Profiles file version {version} differs from current {PROFILES_VERSION}"
                 )
             self._profiles = data.get("profiles", {}) or {}
-            # Migration: strip ttl_seconds from existing profile settings
+            # Migration: strip ttl_seconds from existing profile settings and
+            # add api_name for exposed-model IDs without changing internal keys.
+            changed = False
             for model_id, profiles in self._profiles.items():
+                model_changed = False
+                used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
                     if settings and "ttl_seconds" in settings:
                         del settings["ttl_seconds"]
+                        changed = True
+                        model_changed = True
+                    current_api_name = profile.get("api_name")
+                    if current_api_name:
+                        try:
+                            validate_profile_name(current_api_name)
+                            base_api_name = current_api_name
+                        except Exception:
+                            base_api_name = slugify_profile_api_name(
+                                profile.get("display_name") or name,
+                                fallback="profile",
+                            )
+                    else:
+                        base_api_name = slugify_profile_api_name(
+                            profile.get("display_name") or name,
+                            fallback="profile",
+                        )
+                    api_name = self._dedupe_profile_api_name(
+                        base_api_name,
+                        used_api_names,
+                    )
+                    if current_api_name != api_name:
+                        profile["api_name"] = api_name
+                        changed = True
+                        model_changed = True
+                if model_changed:
+                    logger.info(f"Migrated profile api names for model '{model_id}'")
+            if changed:
+                self._save_profiles()
         except Exception as e:
             logger.error(f"Failed to load profiles file: {e}")
             self._profiles = {}
@@ -487,22 +731,284 @@ class ModelSettingsManager:
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
         data = {"version": PROFILES_VERSION, "profiles": self._profiles}
-        temp_file = self.profiles_file.with_suffix(".tmp")
+        temp_file = self.profiles_file.with_name(
+            f"{self.profiles_file.name}.{os.getpid()}.tmp"
+        )
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.profiles_file)
         except Exception as e:
             logger.error(f"Failed to save profiles file: {e}")
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
+            temp_file.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _dedupe_profile_api_name(base: str, used: set[str]) -> str:
+        validate_profile_name(base)
+        candidate = base
+        index = 2
+        while candidate in used:
+            suffix = f"-{index}"
+            root = base[: 32 - len(suffix)].rstrip("-_") or "profile"
+            candidate = f"{root}{suffix}"
+            index += 1
+        used.add(candidate)
+        return candidate
+
+    @staticmethod
+    def _profile_api_name(profile: Dict[str, Any]) -> str:
+        api_name = profile.get("api_name") or profile["name"]
+        validate_profile_name(api_name)
+        return api_name
+
+    def _allocate_profile_api_name_locked(
+        self,
+        profiles: Dict[str, Dict[str, Any]],
+        value: str | None,
+        *,
+        display_name: str | None,
+        internal_name: str,
+        exclude_name: str | None = None,
+    ) -> str:
+        if value:
+            validate_profile_name(value)
+            base = value
+        else:
+            base = slugify_profile_api_name(
+                display_name or internal_name,
+                fallback="profile",
+            )
+        used = {
+            self._profile_api_name(profile)
+            for name, profile in profiles.items()
+            if name != exclude_name
+        }
+        return self._dedupe_profile_api_name(base, used)
+
+    def _profile_model_id(self, model_id: str, api_name: str) -> str:
+        return f"{model_id}:{api_name}"
+
+    def _display_profile_model_id_locked(
+        self, model_id: str, profile: Dict[str, Any]
+    ) -> str:
+        """Advertised form of an exposed profile's model ID.
+
+        Uses the base model's alias when set, mirroring how /v1/models
+        lists the base model itself. The directory-name form remains
+        accepted for requests, exactly like the base model's directory
+        name.
+        """
+        base = self._settings.get(model_id)
+        display_base = base.model_alias if base and base.model_alias else model_id
+        return self._profile_model_id(display_base, self._profile_api_name(profile))
+
+    def _find_exposed_profile_locked(
+        self, model_id: str
+    ) -> Optional[tuple[str, Dict[str, Any]]]:
+        for base_model_id, profiles in self._profiles.items():
+            base = self._settings.get(base_model_id)
+            alias = base.model_alias if base else None
+            for profile in profiles.values():
+                if not profile.get("expose_as_model"):
+                    continue
+                api_name = self._profile_api_name(profile)
+                if model_id == self._profile_model_id(base_model_id, api_name):
+                    return base_model_id, profile
+                if alias and model_id == self._profile_model_id(alias, api_name):
+                    return base_model_id, profile
+        return None
+
+    def _settings_with_profile_locked(
+        self, model_id: str, profile: Dict[str, Any]
+    ) -> ModelSettings:
+        base = self._settings.get(model_id)
+        merged = base.to_dict() if base is not None else {}
+        # Request-time settings still use only universal fields. Engine-
+        # construction fields are handled separately by
+        # get_exposed_profile_runtime_settings_for_request(), which can
+        # trigger an engine variant reload without persisting base settings.
+        merged.update(filter_universal_fields(profile.get("settings", {}) or {}))
+        # A profile overriding penalties / grammar / thinking budget on a
+        # vlm_mtp base model would make __post_init__ raise on this
+        # request-time merge; drop vlm_mtp for the merged view instead.
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
+        return ModelSettings.from_dict(merged)
+
+    def _runtime_settings_with_profile_locked(
+        self, model_id: str, profile: Dict[str, Any]
+    ) -> ModelSettings:
+        base = self._settings.get(model_id)
+        merged = base.to_dict() if base is not None else {}
+        merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
+        merged, _ = resolve_vlm_mtp_conflicts(merged)
+        return ModelSettings.from_dict(merged)
+
+    def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
+        """Return the base model for an exposed profile model ID, if any."""
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                match = self._find_exposed_profile_locked(candidate)
+                if match is not None:
+                    return match[0]
+            return None
+
+    def get_exposed_profile_runtime_settings_for_request(
+        self,
+        model_id: str,
+    ) -> Optional[tuple[str, ModelSettings]]:
+        """Return full runtime settings for an exposed profile request.
+
+        Unlike ``get_settings_for_request()``, this includes model-specific
+        engine-construction fields. It is used only for transient engine
+        loading and never mutates the base model's persisted settings.
+        """
+        with self._lock:
+            candidates = [model_id]
+            if "/" in model_id:
+                candidates.append(model_id.split("/", 1)[1])
+            for candidate in candidates:
+                match = self._find_exposed_profile_locked(candidate)
+                if match is not None:
+                    base_model_id, profile = match
+                    return (
+                        base_model_id,
+                        self._runtime_settings_with_profile_locked(
+                            base_model_id, profile
+                        ),
+                    )
+            return None
+
+    def get_exposed_profile_model_ids(
+        self,
+        *,
+        exclude_model_id: str | None = None,
+        exclude_profile_name: str | None = None,
+    ) -> set[str]:
+        """Return every request ID accepted by exposed profiles."""
+        with self._lock:
+            model_ids: set[str] = set()
+            for base_model_id, profiles in self._profiles.items():
+                base = self._settings.get(base_model_id)
+                alias = base.model_alias if base else None
+                for profile in profiles.values():
+                    if not profile.get("expose_as_model"):
+                        continue
+                    if (
+                        exclude_model_id == base_model_id
+                        and exclude_profile_name == profile["name"]
+                    ):
+                        continue
+                    api_name = self._profile_api_name(profile)
+                    model_ids.add(self._profile_model_id(base_model_id, api_name))
+                    if alias:
+                        model_ids.add(self._profile_model_id(alias, api_name))
+            return model_ids
+
+    def _profile_request_ids_locked(
+        self,
+        model_id: str,
+        profile: Dict[str, Any],
+    ) -> set[str]:
+        base = self._settings.get(model_id)
+        base_ids = {model_id}
+        if base and base.model_alias:
+            base_ids.add(base.model_alias)
+        api_name = self._profile_api_name(profile)
+        return {self._profile_model_id(base_id, api_name) for base_id in base_ids}
+
+    def _validate_exposed_profile_ids_available_locked(
+        self,
+        model_id: str,
+        profile: Dict[str, Any],
+        *,
+        exclude_profile_name: str | None = None,
+        reserved_model_ids: set[str] | None = None,
+    ) -> None:
+        if not profile.get("expose_as_model"):
+            return
+        candidate_ids = self._profile_request_ids_locked(model_id, profile)
+
+        if reserved_model_ids:
+            for candidate_id in candidate_ids:
+                if candidate_id != model_id and candidate_id in reserved_model_ids:
+                    raise ValueError(
+                        f"Exposed profile model ID '{candidate_id}' conflicts "
+                        "with a model directory name"
+                    )
+
+        for mid, settings in self._settings.items():
+            if settings.model_alias and settings.model_alias in candidate_ids:
+                raise ValueError(
+                    f"Exposed profile model ID '{settings.model_alias}' "
+                    f"conflicts with model alias for '{mid}'"
+                )
+
+        existing_ids: set[str] = set()
+        for base_model_id, profiles in self._profiles.items():
+            for other in profiles.values():
+                if not other.get("expose_as_model"):
+                    continue
+                if base_model_id == model_id and other["name"] == exclude_profile_name:
+                    continue
+                existing_ids.update(
+                    self._profile_request_ids_locked(base_model_id, other)
+                )
+        conflict = candidate_ids & existing_ids
+        if conflict:
+            conflict_id = sorted(conflict)[0]
+            raise ValueError(f"Exposed profile model ID '{conflict_id}' already exists")
+
+    def list_exposed_profile_models(self) -> list[dict]:
+        """Return profile records promoted to independently visible model IDs."""
+        with self._lock:
+            exposed = []
+            for base_model_id, profiles in self._profiles.items():
+                for profile in profiles.values():
+                    if not profile.get("expose_as_model"):
+                        continue
+                    item = dict(profile)
+                    item["model_id"] = self._display_profile_model_id_locked(
+                        base_model_id, profile
+                    )
+                    item["source_model_id"] = base_model_id
+                    item["settings"] = self._settings_with_profile_locked(
+                        base_model_id, item
+                    ).to_dict()
+                    exposed.append(item)
+            return exposed
+
+    @staticmethod
+    def _has_engine_fields(profile: Dict[str, Any]) -> bool:
+        """True when the profile overrides any engine-construction field.
+
+        Those fields are ignored by the request-time sampling overlay but are
+        used for transient engine variant reloads on exposed-profile requests.
+        UIs use this flag to indicate that a profile changes load-time state.
+        """
+        settings = profile.get("settings", {}) or {}
+        return any(
+            k in MODEL_SPECIFIC_PROFILE_FIELDS and v is not None
+            for k, v in settings.items()
+        )
 
     def list_profiles(self, model_id: str) -> list[dict]:
         """Return all profiles for ``model_id`` as serializable dicts."""
         with self._lock:
             per_model = self._profiles.get(model_id, {})
-            return [dict(p) for p in per_model.values()]
+            return [
+                {
+                    **p,
+                    "model_id": self._display_profile_model_id_locked(model_id, p),
+                    "has_engine_fields": self._has_engine_fields(p),
+                }
+                for p in per_model.values()
+            ]
 
     def get_profile(self, model_id: str, name: str) -> Optional[dict]:
         with self._lock:
@@ -516,6 +1022,9 @@ class ModelSettingsManager:
         description: Optional[str],
         settings: Dict[str, Any],
         source_template: Optional[str] = None,
+        expose_as_model: bool = False,
+        api_name: Optional[str] = None,
+        reserved_model_ids: Optional[set[str]] = None,
     ) -> dict:
         """Create a new profile. Raises if name is invalid or already exists."""
         validate_profile_name(name)
@@ -523,17 +1032,33 @@ class ModelSettingsManager:
         with self._lock:
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
-                raise ValueError(f"Profile '{name}' already exists for model '{model_id}'")
+                raise ValueError(
+                    f"Profile '{name}' already exists for model '{model_id}'"
+                )
             now = utcnow().isoformat()
-            per_model[name] = {
+            profile_api_name = self._allocate_profile_api_name_locked(
+                per_model,
+                api_name,
+                display_name=display_name,
+                internal_name=name,
+            )
+            profile_record = {
                 "name": name,
                 "display_name": display_name or name,
+                "api_name": profile_api_name,
                 "description": description,
                 "created_at": now,
                 "updated_at": now,
                 "settings": filtered,
                 "source_template": source_template,
+                "expose_as_model": bool(expose_as_model),
             }
+            self._validate_exposed_profile_ids_available_locked(
+                model_id,
+                profile_record,
+                reserved_model_ids=reserved_model_ids,
+            )
+            per_model[name] = profile_record
             self._save_profiles()
             return dict(per_model[name])
 
@@ -547,6 +1072,9 @@ class ModelSettingsManager:
         description: Optional[str] = None,
         settings: Optional[Dict[str, Any]] = None,
         source_template: Optional[str] = None,
+        expose_as_model: Optional[bool] = None,
+        api_name: Optional[str] = None,
+        reserved_model_ids: Optional[set[str]] = None,
     ) -> Optional[dict]:
         """Update a profile's metadata/settings. Returns updated dict or None if not found."""
         with self._lock:
@@ -567,13 +1095,29 @@ class ModelSettingsManager:
                 rename_mode = True
             if display_name is not None:
                 profile["display_name"] = display_name
+            if api_name is not None:
+                profile["api_name"] = self._allocate_profile_api_name_locked(
+                    per_model,
+                    api_name,
+                    display_name=profile.get("display_name"),
+                    internal_name=target_name,
+                    exclude_name=name,
+                )
             if description is not None:
                 profile["description"] = description
             if settings is not None:
                 profile["settings"] = filter_profile_fields(settings)
             if source_template is not None:
                 profile["source_template"] = source_template or None
+            if expose_as_model is not None:
+                profile["expose_as_model"] = bool(expose_as_model)
             profile["updated_at"] = utcnow().isoformat()
+            self._validate_exposed_profile_ids_available_locked(
+                model_id,
+                profile,
+                exclude_profile_name=name,
+                reserved_model_ids=reserved_model_ids,
+            )
 
             # Snapshot for rollback on write failure
             profiles_snapshot = copy.deepcopy(self._profiles)
@@ -646,12 +1190,23 @@ class ModelSettingsManager:
             current = self._settings.get(model_id)
             if current is None:
                 current = ModelSettings()
-            merged = current.to_dict()
-            for k, v in profile_settings.items():
-                merged[k] = v
+            # Universal fields: the profile is authoritative — absent keys
+            # reset to ModelSettings defaults. Model-specific fields keep
+            # additive overlay so preset/template chips (materialized as
+            # universal-only profiles) never disturb engine settings.
+            merged = {
+                k: v
+                for k, v in current.to_dict().items()
+                if k not in UNIVERSAL_FIELDS_SET
+            }
+            merged.update(filter_profile_fields(profile_settings))
             merged["active_profile_name"] = name
             if settings_sanitizer is not None:
                 settings_sanitizer(merged)
+            # Keep persistent profile application consistent with request-time
+            # profile overlays: output-shaping settings win over the speed-only
+            # VLM MTP toggle when the merged settings need logits processors.
+            merged, _ = resolve_vlm_mtp_conflicts(merged)
             new_settings = ModelSettings.from_dict(merged)
             self._settings[model_id] = new_settings
             try:
@@ -693,13 +1248,18 @@ class ModelSettingsManager:
     def _save_templates(self) -> None:
         """Must be called while holding the lock."""
         data = {"version": TEMPLATES_VERSION, "templates": self._templates}
+        temp_file = self.templates_file.with_name(
+            f"{self.templates_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            temp_file = self.templates_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(self.templates_file)
         except Exception as e:
             logger.error(f"Failed to save templates file: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
 
     def list_templates(self) -> list[dict]:
@@ -805,3 +1365,80 @@ class ModelSettingsManager:
             del self._templates[name]
             self._save_templates()
             return True
+
+
+def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
+    """Chat-template keys a request is not allowed to override."""
+    if settings is None:
+        return set()
+    return set(settings.forced_ct_kwargs or [])
+
+
+def merge_chat_template_request_kwargs(
+    settings: "ModelSettings | None",
+    request_ct_kwargs: "dict[str, Any] | None" = None,
+) -> "dict[str, Any]":
+    """Merge model/profile defaults with per-request chat-template kwargs.
+
+    Precedence, lowest to highest:
+      1. ``settings.chat_template_kwargs``
+      2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
+      3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+    """
+    merged: dict[str, Any] = {}
+    forced_keys = forced_ct_keys(settings)
+
+    if settings is not None:
+        if settings.chat_template_kwargs:
+            merged.update(settings.chat_template_kwargs)
+        # Dedicated toggles take precedence over chat_template_kwargs.
+        if settings.enable_thinking is not None:
+            merged["enable_thinking"] = settings.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if settings.preserve_thinking is not None:
+            merged["preserve_thinking"] = settings.preserve_thinking
+
+    if request_ct_kwargs:
+        for key, value in request_ct_kwargs.items():
+            if key not in forced_keys:
+                merged[key] = value
+
+    return merged
+
+
+def merge_chat_template_kwargs(
+    settings: "ModelSettings | None",
+    request_ct_kwargs: "dict[str, Any] | None" = None,
+    *,
+    thinking_budget: "int | None" = None,
+    preserve_thinking_default: "bool | None" = None,
+) -> "dict[str, Any]":
+    """Resolve the effective chat_template_kwargs for prompt rendering.
+
+    Precedence, lowest to highest:
+      1. ``settings.chat_template_kwargs``
+      2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
+      3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+      4. thinking budget activation when ``enable_thinking`` is still unset
+      5. the model's preserve-thinking default when it is supported and unset
+    """
+    merged = merge_chat_template_request_kwargs(settings, request_ct_kwargs)
+
+    if (
+        thinking_budget is None
+        and settings is not None
+        and settings.thinking_budget_enabled
+        and settings.thinking_budget_tokens
+    ):
+        thinking_budget = settings.thinking_budget_tokens
+    if thinking_budget is not None and "enable_thinking" not in merged:
+        merged["enable_thinking"] = True
+
+    if (
+        preserve_thinking_default is True
+        and merged.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged
+    ):
+        merged["preserve_thinking"] = True
+
+    return merged

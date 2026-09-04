@@ -11,6 +11,7 @@ Supports:
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
+import gc
 import json
 import logging
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -115,6 +117,7 @@ class MLXRerankerModel:
         self._doc_embed_token_id: int | None = None
         self._query_embed_token_id: int | None = None
         self._jina_projector = None
+        self._is_jina_v35 = False
         self._prefix_tokens: list[int] | None = None
         self._suffix_tokens: list[int] | None = None
         self._is_compiled = False
@@ -133,6 +136,48 @@ class MLXRerankerModel:
             return architectures[0] if architectures else None
         except (json.JSONDecodeError, IOError):
             return None
+
+    def _detect_jina_v35(self) -> bool:
+        """Detect and validate the config features required by Jina v3.5."""
+        config_path = Path(self.model_name) / "config.json"
+        try:
+            config = json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError) as error:
+            raise ValueError(
+                f"Could not read Jina reranker config: {config_path}"
+            ) from error
+
+        layer_types = config.get("layer_types")
+        if layer_types is None:
+            return False
+        if not isinstance(layer_types, list) or not layer_types:
+            raise ValueError("Jina layer_types must be a non-empty list when present.")
+
+        num_hidden_layers = config.get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+            raise ValueError("Jina layer_types require a positive num_hidden_layers.")
+        if len(layer_types) != num_hidden_layers:
+            raise ValueError(
+                f"len(layer_types)={len(layer_types)} != "
+                f"num_hidden_layers={num_hidden_layers}"
+            )
+
+        supported_types = {"full_attention", "sliding_attention"}
+        unsupported_types = sorted(set(layer_types) - supported_types)
+        if unsupported_types:
+            raise ValueError(
+                f"Unsupported Jina attention layer types: {unsupported_types}"
+            )
+
+        if "sliding_attention" in layer_types:
+            sliding_window = config.get("sliding_window")
+            if not isinstance(sliding_window, int) or sliding_window <= 0:
+                raise ValueError(
+                    "Jina sliding_attention layers require a positive "
+                    "sliding_window."
+                )
+
+        return True
 
     def _load_xlm_roberta(self) -> Tuple[Any, Any]:
         """Load XLMRoberta model using omlx native implementation."""
@@ -205,8 +250,8 @@ class MLXRerankerModel:
         """Normalize a rerank input into the mlx-embeddings VL item format.
 
         Accepts either a bare string (text) or a dict with 'text' and/or
-        'image' keys. Image values are strings (URL / base64 data URI / local
-        path) and get loaded via omlx's shared image loader.
+        'image' keys. Request-facing image strings must be base64 data URIs and
+        get loaded via omlx's shared image loader.
         """
         if isinstance(item, str):
             return {"text": item}
@@ -220,7 +265,7 @@ class MLXRerankerModel:
         image_ref = item.get("image")
         if image_ref:
             if isinstance(image_ref, str):
-                result["image"] = load_image(image_ref)
+                result["image"] = load_image(image_ref, field="image")
             else:
                 # Already a PIL image or similar — pass through
                 result["image"] = image_ref
@@ -261,9 +306,10 @@ class MLXRerankerModel:
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -297,25 +343,7 @@ class MLXRerankerModel:
             )
 
         # Pre-compute prefix and suffix tokens for the prompt template.
-        # Use apply_chat_template() for portability across tokenizer formats,
-        # then split on a sentinel to extract prefix/suffix boundaries.
-        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
-        messages = [
-            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
-            {"role": "user", "content": _SENTINEL},
-        ]
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        parts = template_str.split(_SENTINEL)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Chat template produced unexpected format; "
-                f"could not split on sentinel. Template: {template_str!r}"
-            )
-        prefix = parts[0]
-        # Append <think> block for models that use thinking-then-answering format
-        suffix = parts[1] + "<think>\n\n</think>\n\n"
+        prefix, suffix = self._extract_causal_lm_affixes(tokenizer)
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
@@ -329,6 +357,126 @@ class MLXRerankerModel:
 
         return model, tokenizer
 
+    def _extract_causal_lm_affixes(self, tokenizer: Any) -> Tuple[str, str]:
+        """Extract the static prompt prefix/suffix around the rerank content.
+
+        Handles two chat template shapes:
+
+        1. Standard chat template (system/user roles): render with a sentinel
+           as the user content and split around it.
+        2. Reranker-native template (Qwen/Qwen3-Reranker ships one as
+           chat_template.jinja since its 2026-04 sentence-transformers
+           update, and MLX conversions made after that inherit it): the
+           template only understands system/query/document roles and silently
+           drops user messages, so the sentinel never appears in the output.
+           Render with per-slot sentinels instead and split around the
+           combined "<Instruct>/<Query>/<Document>" block — the exact content
+           that _rerank_causal_lm reconstructs at scoring time.
+        """
+        # Fail fast with a clear error when the tokenizer has no chat template
+        # at all — rendering would only produce an opaque downstream failure.
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is None:
+            raise ValueError(
+                f"Tokenizer for {self.model_name} has no chat template; "
+                f"cannot derive the CausalLM reranker prompt prefix/suffix."
+            )
+
+        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
+        messages = [
+            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+            {"role": "user", "content": _SENTINEL},
+        ]
+        standard_rendered = ""
+        standard_error: Exception | None = None
+        try:
+            standard_rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            standard_error = e
+            logger.warning(
+                f"system/user chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+
+        parts = standard_rendered.split(_SENTINEL)
+        if len(parts) == 2:
+            suffix = parts[1]
+            # Append <think> block for models that use the
+            # thinking-then-answering format, unless the template already
+            # emitted a think prefill of its own.
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            return parts[0], suffix
+
+        native_affixes, native_rendered, native_error = (
+            self._extract_reranker_native_affixes(tokenizer)
+        )
+        if native_affixes is not None:
+            logger.info(
+                "Using reranker-native chat template (query/document roles) "
+                f"for {self.model_name}"
+            )
+            return native_affixes
+
+        raise ValueError(
+            f"Could not extract CausalLM reranker prompt affixes for "
+            f"{self.model_name}. "
+            f"Standard system/user attempt: {standard_rendered!r} "
+            f"(error: {standard_error!r}). "
+            f"Reranker-native query/document attempt: {native_rendered!r} "
+            f"(error: {native_error!r})."
+        ) from (standard_error or native_error)
+
+    def _extract_reranker_native_affixes(
+        self, tokenizer: Any
+    ) -> "Tuple[Tuple[str, str] | None, str, Exception | None]":
+        """Extract affixes from a reranker-native chat template, if present.
+
+        Returns (affixes, rendered, error). Affixes is None when the template
+        raises or does not render the expected "<Instruct>/<Query>/<Document>"
+        content block; the rendered string and the exception (if any) are
+        returned for diagnostics.
+        """
+        instruct_sentinel = "<<__INSTRUCT_SENTINEL__>>"
+        query_sentinel = "<<__QUERY_SENTINEL__>>"
+        document_sentinel = "<<__DOCUMENT_SENTINEL__>>"
+        # The native template maps the system role to the <Instruct> slot; its
+        # judge system prompt is hardcoded inside the template itself.
+        messages = [
+            {"role": "system", "content": instruct_sentinel},
+            {"role": "query", "content": query_sentinel},
+            {"role": "document", "content": document_sentinel},
+        ]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"reranker-native chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+            return None, "", e
+
+        # Intentionally strict, byte-exact match against the content block the
+        # upstream Qwen/Qwen3-Reranker template renders. _rerank_causal_lm
+        # reconstructs this exact block at scoring time, so tolerating
+        # formatting drift here would silently produce prompts that differ
+        # from what the template intends; failing detection loudly is safer.
+        content_block = (
+            f"<Instruct>: {instruct_sentinel}\n"
+            f"<Query>: {query_sentinel}\n"
+            f"<Document>: {document_sentinel}"
+        )
+        parts = rendered.split(content_block)
+        if len(parts) != 2:
+            return None, rendered, None
+
+        # The native template already emits the trailing <think> block, so the
+        # suffix is used as-is.
+        return (parts[0], parts[1]), rendered, None
+
     def _load_jina_reranker(self) -> Tuple[Any, Any]:
         """
         Load a Jina v3 reranker model using mlx-lm.
@@ -336,9 +484,18 @@ class MLXRerankerModel:
         Jina v3 reranker uses special-token hidden states + projector + cosine
         similarity for listwise scoring.
         """
-        from mlx_lm import load as mlx_lm_load
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
-        from ..utils.model_loading import maybe_load_custom_quantization
+        self._is_jina_v35 = self._detect_jina_v35()
+
+        # Jina v3.5 declares per-layer sliding/full attention, which the pinned
+        # mlx-lm Qwen3 loader otherwise silently ignores. Jina v3 has neither
+        # layer_types nor sliding-window attention and keeps its stock path.
+        if self._is_jina_v35 and apply_qwen3_sliding_window_patch():
+            logger.info("Qwen3 sliding-window patch applied for %s", self.model_name)
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -377,7 +534,8 @@ class MLXRerankerModel:
 
         logger.info(
             f"Jina reranker tokens: embed_token={doc_embed_token_id}, "
-            f"rerank_token={query_embed_token_id}"
+            f"rerank_token={query_embed_token_id}, "
+            f"scoring={'v3.5' if self._is_jina_v35 else 'v3'}"
         )
 
         return model, tokenizer
@@ -467,37 +625,51 @@ class MLXRerankerModel:
         # raises "TypeError: data type 'bfloat16' not understood".
         weights = mx.load(str(projector_path))
 
-        required_keys = ("linear1.weight", "linear2.weight")
-        missing_keys = [key for key in required_keys if key not in weights]
-        if missing_keys:
+        # v3 ships two named nn.Linear submodules ("linear1"/"linear2").
+        # v3.5 exports the same fc1 -> ReLU -> fc2 stack from an nn.Sequential
+        # container, so the keys are auto-named by list index instead
+        # ("projector.0"/"projector.2", index 1 is ReLU). Confirmed against
+        # upstream's own remap in _load_projector:
+        # https://huggingface.co/jinaai/jina-reranker-v3.5-mlx/blob/3dd4ac901ccdcac85abe3815df0a0aaaf44e4a21/modeling.py
+        key_schemes = (
+            ("linear1.weight", "linear2.weight"),
+            ("projector.0.weight", "projector.2.weight"),
+        )
+        first_key = second_key = None
+        for scheme in key_schemes:
+            if all(key in weights for key in scheme):
+                first_key, second_key = scheme
+                break
+
+        if first_key is None:
             raise ValueError(
-                f"Jina projector is malformed: missing keys {missing_keys} in "
-                f"{projector_path}. "
+                "Jina projector is malformed: none of the expected key schemes "
+                f"{key_schemes} were fully present in {projector_path}. "
                 f"Available keys: {sorted(weights.keys())}"
             )
 
-        linear1_weight = weights["linear1.weight"]
-        linear2_weight = weights["linear2.weight"]
+        linear1_weight = weights[first_key]
+        linear2_weight = weights[second_key]
 
         if len(linear1_weight.shape) != 2 or len(linear2_weight.shape) != 2:
             raise ValueError(
                 "Jina projector weights must be 2D matrices: "
-                f"linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         if linear1_weight.shape != (512, 1024) or linear2_weight.shape != (512, 512):
             raise ValueError(
                 "Unexpected Jina projector shapes. Expected "
-                "linear1.weight=(512, 1024) and linear2.weight=(512, 512), "
-                f"got linear1.weight={linear1_weight.shape}, "
-                f"linear2.weight={linear2_weight.shape}."
+                f"{first_key}=(512, 1024) and {second_key}=(512, 512), "
+                f"got {first_key}={linear1_weight.shape}, "
+                f"{second_key}={linear2_weight.shape}."
             )
 
         def _project(x):
             if x.shape[-1] != linear1_weight.shape[1]:
                 raise ValueError(
-                    "Jina projector input dim mismatch for linear1: "
+                    "Jina projector input dim mismatch for first layer: "
                     f"input={x.shape[-1]}, expected={linear1_weight.shape[1]}."
                 )
             hidden = x @ mx.transpose(linear1_weight)
@@ -529,10 +701,11 @@ class MLXRerankerModel:
             self._sanitize_jina_text(instruction) if instruction is not None else None
         )
 
+        early_query_anchor = "<|rerank_token|>" if self._is_jina_v35 else ""
         user_content = (
             f"I will provide you with {len(sanitized_docs)} passages, each indicated "
             f"by a numerical identifier. Rank the passages based on their relevance "
-            f"to query: {sanitized_query}\n"
+            f"to query: {sanitized_query}{early_query_anchor}\n"
         )
         if sanitized_instruction:
             user_content += f"<instruct>\n{sanitized_instruction}\n</instruct>\n"
@@ -604,6 +777,19 @@ class MLXRerankerModel:
         denom = mx.maximum(doc_norms * query_norm, eps)
         numer = mx.sum(doc_vecs * query_vec, axis=-1)
         return numer / denom
+
+    def _fuse_query_vectors(self, query_vecs: list, weights: list[float]) -> mx.array:
+        """Weighted-average fusion of per-chunk query vectors.
+
+        Weight is each chunk's block_weight (max normalized cosine score) -
+        chunks where the model found a strong match count more toward the
+        final fused query representation. Mirrors the reference
+        jina-reranker-v3.5-mlx rerank()'s weighted average over per-block
+        query embeddings.
+        """
+        stacked = mx.stack(query_vecs, axis=0)
+        weight_array = mx.array(weights, dtype=stacked.dtype).reshape(-1, 1)
+        return (stacked * weight_array).sum(axis=0) / weight_array.sum()
 
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
@@ -731,6 +917,32 @@ class MLXRerankerModel:
             logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_seq_logits = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, projector, and compiled reranker resources."""
+        self._compiled_seq_logits = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._num_labels = None
+        self._is_causal_lm = False
+        self._is_jina_reranker = False
+        self._is_vl_reranker = False
+        self._token_true_id = None
+        self._token_false_id = None
+        self._doc_embed_token_id = None
+        self._query_embed_token_id = None
+        self._jina_projector = None
+        self._is_jina_v35 = False
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        gc.collect()
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
@@ -893,11 +1105,12 @@ class MLXRerankerModel:
         max_length: int = 8192,
     ) -> RerankOutput:
         """
-        Rerank using Jina v3 listwise embedding-based scoring.
+        Rerank using the config-selected Jina v3 or v3.5 scoring strategy.
 
-        Builds multi-document prompts, extracts hidden states at special token
-        positions, applies the projector, and computes query-document cosine
-        similarities. Uses deterministic greedy chunking under max_length.
+        Jina v3 uses one late query token and scores each chunk independently.
+        Jina v3.5 uses dual query tokens, reads the late position, and fuses
+        per-chunk query vectors before final scoring. Both use deterministic
+        greedy chunking under max_length.
         """
         tokenizer = self.processor
         doc_embed_token_id = self._doc_embed_token_id
@@ -973,6 +1186,13 @@ class MLXRerankerModel:
         scores = [0.0] * len(documents)
         total_tokens = 0
         start = 0
+        # Accumulated across all chunks for the block-fusion pass below: each
+        # chunk's query vector + weight, and every doc vector in original
+        # document order (via all_doc_indices, since chunks are variable-size).
+        chunk_query_vecs: list[mx.array] = []
+        chunk_weights: list[float] = []
+        all_doc_indices: list[int] = []
+        all_doc_vecs: list[mx.array] = []
         while start < len(sanitized_docs):
             chunk_doc_indices: list[int] = []
             chunk_docs: list[str] = []
@@ -1017,9 +1237,13 @@ class MLXRerankerModel:
                 for pos, token_id in enumerate(chunk_input_ids)
                 if token_id == query_embed_token_id
             ]
-            if not query_positions:
+            expected_query_positions = 2 if self._is_jina_v35 else 1
+            if len(query_positions) != expected_query_positions:
+                scoring_version = "v3.5" if self._is_jina_v35 else "v3"
                 raise ValueError(
-                    "Jina prompt does not contain '<|rerank_token|>' in tokenized input."
+                    f"Jina {scoring_version} prompt must contain "
+                    f"{expected_query_positions} '<|rerank_token|>' position(s); "
+                    f"found {len(query_positions)} in tokenized input."
                 )
 
             doc_positions = [
@@ -1034,20 +1258,47 @@ class MLXRerankerModel:
                 )
 
             selected_doc_positions = doc_positions[: len(chunk_docs)]
-            query_hidden = hidden_states[0, query_positions[0], :]
+            # v3 reads its only query position. v3.5 dual matching reads the
+            # late position; the early position is an attention anchor.
+            query_position = query_positions[-1]
+            query_hidden = hidden_states[0, query_position, :]
             doc_hidden = hidden_states[0, selected_doc_positions, :]
 
             query_vec = projector(query_hidden)
             doc_vecs = projector(doc_hidden)
-            similarities = self._cosine_similarity(query_vec, doc_vecs)
-            mx.eval(similarities)
+            if self._is_jina_v35:
+                # v3.5 reference scoring upcasts projector output before
+                # cosine and fusion math. Preserve v3's original dtype path.
+                query_vec = query_vec.astype(mx.float32)
+                doc_vecs = doc_vecs.astype(mx.float32)
+            cos_scores = self._cosine_similarity(query_vec, doc_vecs)
+            mx.eval(cos_scores)
 
-            chunk_scores = similarities.tolist()
-            for original_idx, score in zip(chunk_doc_indices, chunk_scores):
-                scores[original_idx] = float(score)
+            if self._is_jina_v35:
+                block_weight = float(((1.0 + cos_scores) / 2.0).max())
+                chunk_query_vecs.append(query_vec)
+                chunk_weights.append(block_weight)
+                all_doc_indices.extend(chunk_doc_indices)
+                all_doc_vecs.append(doc_vecs)
+            else:
+                for original_idx, score in zip(chunk_doc_indices, cos_scores.tolist()):
+                    scores[original_idx] = float(score)
 
             total_tokens += len(chunk_input_ids)
             start = cursor
+
+        if self._is_jina_v35:
+            fused_query_vec = self._fuse_query_vectors(chunk_query_vecs, chunk_weights)
+            stacked_doc_vecs = mx.concatenate(all_doc_vecs, axis=0)
+            final_similarities = self._cosine_similarity(
+                fused_query_vec, stacked_doc_vecs
+            )
+            mx.eval(final_similarities)
+
+            for original_idx, score in zip(
+                all_doc_indices, final_similarities.tolist()
+            ):
+                scores[original_idx] = float(score)
 
         # Sort by score descending
         indexed_scores = list(enumerate(scores))

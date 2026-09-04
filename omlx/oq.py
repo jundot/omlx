@@ -4,33 +4,40 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8 (base
-bits differ, same predicate). Fractional levels keep the lower level's base
-bits and add a mandatory boost for routed expert down_proj (Super Weights
-protection; see _LEVEL_EXPERT_DOWN_BOOST) plus a higher bpw budget.
+Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
+(base bits differ, same predicate). Fractional levels keep the lower level's
+base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
+import hashlib
 import json
 import logging
 import re
 import shutil
+import struct as _struct
 import tempfile
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
+
+import numpy as np
 
 try:
     import mlx.core as mx
     import mlx.nn as nn
-    from mlx.utils import tree_flatten
+    from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.models.base import create_attention_mask
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
-from omlx.model_discovery import _has_vision_subconfig
+from omlx.model_discovery import (
+    MLX_LM_TEXT_ONLY_MODEL_TYPES,
+    VLM_NATIVE_TEXT_MODEL_TYPES,
+    _has_vision_subconfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +47,47 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
-_MAX_MODEL_RAM_FRACTION = 0.8
+_GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+_GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+
+_QWEN4_EXP_NGRAM_GROUP_SIZE = 32
+_QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
+    r"\.ple\.ple_embedding\.ngram_embedding\."
+    r"(?:shard_\d+|shards\.\d+)$"
+)
+
+
+def _is_qwen4_exp_config(config: dict) -> bool:
+    """Return whether *config* selects the Qwen4-Exp/Flash-Next family."""
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    return any(
+        str(model_type or "").lower().startswith("qwen4_exp")
+        for model_type in (config.get("model_type"), text_config.get("model_type"))
+    )
+
+
+def _configure_qwen4_exp_quantization_runtime(
+    model_path: str | Path,
+    config: dict,
+    *,
+    preserve_mtp: bool,
+) -> bool:
+    """Register Qwen4 and bind its mmap PLE/MTP state for quantization."""
+    if not _is_qwen4_exp_config(config):
+        return False
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+
+    configure_qwen4_exp_runtime(
+        model_path,
+        mode="mmap",
+        mtp_enabled=bool(preserve_mtp),
+    )
+    return True
+
+
+_MAX_MODEL_RAM_FRACTION = 0.75
 
 # Auto-built proxy for sensitivity measurement when the source model
 # exceeds available RAM. Uniform 4-bit affine quant — same shape as a
@@ -72,21 +119,25 @@ _LEVEL_PROTECTION: dict[float, str] = {
     8: "full",
 }
 
-# Fractional levels: mandatory protection for routed expert down_proj
-# (Super Weights), expressed as bits above the level's base bits.
-# 2.5 -> 3-bit, 2.7 -> 4-bit, 3.5 -> 4-bit.
-_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {2.5: 1, 2.7: 2, 3.5: 1}
+# Fractional levels that reserve a blanket Super Weights floor.
+# 3.5 -> routed expert down_proj 4-bit.
+_LEVEL_EXPERT_DOWN_BOOST: dict[float, int] = {3.5: 1}
 
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
-    2.7: (3.35, 3.45),
+    2.7: (3.25, 3.35),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
     4: (4.6, 4.7),
     5: (5.5, 5.7),
     6: (6.5, 6.7),
 }
+
+_ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7}
+_VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
+
+_NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
 
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
@@ -115,7 +166,173 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
-@dataclass
+def _is_vlm_load(config: dict) -> bool:
+    """VLM routing predicate for oQ's model-load helpers.
+
+    Mirrors the VLM decision in :func:`_build_model_sanitizer`, but for the
+    sensitivity / imatrix / proxy load paths: route a checkpoint through
+    mlx-vlm only when it carries a vision sub-config *and* its model_type is
+    not one mlx-lm serves text-only (e.g. ``mimo_v2``). Without the text-only
+    exclusion these paths send a text-only-supported multimodal base -- which
+    still ships a ``vision_config`` -- to mlx-vlm, where ``get_model_and_args``
+    cannot resolve the model_type and falls through to the
+    ``mlx_vlm.speculative.drafters.<type>`` lookup and fails.
+    """
+    model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
+        _has_vision_subconfig(config)
+        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    )
+
+
+def _calibration_model_settings(
+    config: dict,
+    *,
+    has_mtp_heads: bool,
+    has_mtp_weights: bool,
+):
+    """Build the temporary serving settings used by calibration loads."""
+    mtp_enabled = bool(has_mtp_heads and has_mtp_weights)
+    if not mtp_enabled and not _is_qwen4_exp_config(config):
+        return None
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mtp_enabled=mtp_enabled,
+        mtp_num_draft_tokens=1,
+        # Calibration executes Qwen4 PLE, but only as sparse row gathers.
+        # Force the existing SSD mmap path even when a compact proxy falls
+        # below serving's automatic offload threshold.
+        qwen4_ple_ssd_offload=_is_qwen4_exp_config(config),
+    )
+
+
+def _uses_quantized_source_sensitivity(config: dict) -> bool:
+    """Return whether source sensitivity must perturb quantized modules."""
+    quantization_config = config.get("quantization_config") or {}
+    if not isinstance(quantization_config, dict):
+        return False
+    quant_method = str(quantization_config.get("quant_method", "")).lower()
+    if quant_method == "mxfp8":
+        return True
+    return quant_method == "fp8" and (
+        _is_deepseek_v4_config(config)
+        or config.get("model_type") == "bailing_hybrid"
+    )
+
+
+def _is_minimax_m3_config(config: dict) -> bool:
+    """Return whether a config resolves to the MiniMax M3 model family."""
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if config.get("model_type") in ("minimax_m3", "minimax_m3_vl"):
+        return True
+    if text_model_type in ("minimax_m3", "minimax_m3_vl"):
+        return True
+    architectures = list(config.get("architectures") or [])
+    if isinstance(text_config, dict):
+        architectures.extend(text_config.get("architectures") or [])
+    return any(str(arch).startswith("MiniMaxM3") for arch in architectures)
+
+
+def _uses_minimax_mxfp8_scale_inv_source(config: dict) -> bool:
+    """Return whether MiniMax's U8 scale-inverse layout is native MXFP8."""
+    if not _is_minimax_m3_config(config):
+        return False
+    quantization_configs = [config.get("quantization_config")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        quantization_configs.append(text_config.get("quantization_config"))
+    return any(
+        isinstance(quant_config, dict)
+        and str(quant_config.get("quant_method", "")).lower() == "mxfp8"
+        for quant_config in quantization_configs
+    )
+
+
+def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bool:
+    """Force an unpacked MiniMax shared expert for mixed-bit oQ outputs.
+
+    The packed MiniMax layout stores the always-on shared expert as the final
+    row of the routed SwitchLinear bank, which makes a per-module Q8 floor
+    impossible. Preserve the default packed layout when the whole bank is Q8.
+    """
+    if not _is_minimax_m3_config(config):
+        return False
+    if int(_LEVEL_BITS.get(oq_level, oq_level)) >= 8:
+        return False
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    if int(text_config.get("n_shared_experts") or 0) <= 0:
+        return False
+
+    text_config = dict(text_config)
+    text_config["pack_shared_expert"] = False
+    config["text_config"] = text_config
+    return True
+
+
+def _normalize_sensitivity_map_override(
+    config: dict,
+    sensitivity_map_override: dict[int | str, float] | None,
+) -> dict[int, float] | None:
+    """Validate an explicit positive layer-priority map.
+
+    Missing layers intentionally receive score zero. Keeping only selected,
+    positive layers also prevents the percentile threshold in the predicate
+    from treating a zero-filled map as if every layer were sensitive.
+    """
+    if sensitivity_map_override is None:
+        return None
+    if not isinstance(sensitivity_map_override, dict) or not sensitivity_map_override:
+        raise ValueError("sensitivity_map_override must be a non-empty dict")
+
+    text_config = config.get("text_config")
+    num_layers = int(
+        config.get("num_hidden_layers")
+        or (
+            text_config.get("num_hidden_layers", 0)
+            if isinstance(text_config, dict)
+            else 0
+        )
+        or 0
+    )
+    if num_layers <= 0:
+        raise ValueError(
+            "sensitivity_map_override requires num_hidden_layers in config"
+        )
+
+    normalized = {}
+    for raw_idx, raw_score in sensitivity_map_override.items():
+        if isinstance(raw_idx, bool):
+            raise ValueError("sensitivity layer indices must be integers")
+        try:
+            layer_idx = int(raw_idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid sensitivity layer index: {raw_idx!r}") from exc
+        if isinstance(raw_idx, float) and not raw_idx.is_integer():
+            raise ValueError(f"invalid sensitivity layer index: {raw_idx!r}")
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise ValueError(
+                f"sensitivity layer index {layer_idx} is outside [0, {num_layers})"
+            )
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid sensitivity score for layer {layer_idx}: {raw_score!r}"
+            ) from exc
+        if not np.isfinite(score) or score <= 0:
+            raise ValueError(
+                f"sensitivity score for layer {layer_idx} must be finite and > 0"
+            )
+        normalized[layer_idx] = score
+    return dict(sorted(normalized.items()))
+
+
 @dataclass
 class QuantPlan:
     """Byte-budgeted mixed-precision plan for a single quantization run."""
@@ -126,6 +343,74 @@ class QuantPlan:
     hard_cap_bpw: float
 
 
+@dataclass
+class OQImatrixEntry:
+    """Activation-energy statistics for one quantized weight tensor."""
+
+    in_sum2: np.ndarray
+    counts: np.ndarray
+
+
+@dataclass
+class OQImatrixData:
+    """Loaded oQe imatrix cache and the metadata used to validate it."""
+
+    entries: dict[str, OQImatrixEntry]
+    metadata: dict[str, Any]
+    path: str
+    reused: bool = False
+
+
+def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for GLM DSA indexer projections.
+
+    The GLM sparse-attention indexer decides which tokens survive top-k
+    selection. Its three projections are tiny relative to the full MoE model,
+    so spending mixed-precision budget below Q8 buys negligible size savings
+    while making the saved checkpoint incompatible with the fused Q8 loader.
+    Keep backbone and preserved-MTP indexers on the same explicit format.
+    """
+    text_config = config.get("text_config")
+    text_model_type = (
+        text_config.get("model_type") if isinstance(text_config, dict) else None
+    )
+    if config.get("model_type") not in ("glm_moe_dsa", "glm5_next") and (
+        text_model_type != "glm5_next_text"
+    ):
+        return None
+    path = _normalize_quant_path(path)
+    if ".self_attn.indexer." not in path:
+        return None
+    if not path.endswith(tuple(f".{name}" for name in _GLM_INDEXER_PROJECTIONS)):
+        return None
+    return dict(_GLM_INDEXER_Q8)
+
+
+def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
+    """Return whether *path* is one Qwen4-Exp PLE embedding shard.
+
+    The source checkpoint spells shards as ``shard_N`` while the model
+    sanitizer maps them to the runtime module path ``shards.N``. Match both
+    forms so proxy construction and final streaming quantization use the same
+    policy.
+    """
+    if not _is_qwen4_exp_config(config):
+        return False
+    return _QWEN4_EXP_NGRAM_SHARD_RE.search(_normalize_quant_path(path)) is not None
+
+
+def _is_token_embedding_tensor(path: str) -> bool:
+    """Return whether a weight is indexed by token id rather than activations."""
+    return path.lower().endswith(
+        (
+            ".embed_tokens.weight",
+            ".tok_embeddings.weight",
+            ".word_embeddings.weight",
+            ".wte.weight",
+        )
+    )
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> Union[bool, dict]:
@@ -133,10 +418,12 @@ def universal_quant_predicate(
 
     Protection levels vary by oQ level:
         oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ2.5/oQ2.7/oQ3.5: fractional levels — lower level's base bits,
-            routed expert down_proj protected above base per
+        oQ2.5/oQ2.7: base 2-bit + routed layer boosts selected by layer
+            sensitivity; routed w2/down_proj first, then w1/w3 as paired
+            layer-wide boosts while staying under the bpw cap
+        oQ3.5: base 3-bit with routed expert down_proj protected above base per
             _LEVEL_EXPERT_DOWN_BOOST (Super Weights protection)
-        oQ3: base 2-bit + full protection → ~3.3 bpw
+        oQ3: base 3-bit + full protection → ~3.5 bpw
         oQ4-oQ6: base N-bit + full protection
         oQ7: base 8-bit + full protection
         oQ8: near-uniform 8-bit (router fp16 only) → ~8.0 bpw
@@ -158,6 +445,10 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    glm_indexer_override = _glm_indexer_q8_override(path, config)
+    if glm_indexer_override is not None:
+        return glm_indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -196,6 +487,13 @@ def universal_quant_predicate(
     if "shared_expert_gate" in path and "gate_proj" not in path:
         return {"bits": 8, "group_size": 64, "mode": "affine"}
 
+    # Shared experts run for every token and must keep their precision floor
+    # even when the byte-budgeted plan is active. Keeping this before the
+    # budget-plan fast path also lets native MXFP8 shared weights be recognized
+    # as fixed source-precision passthrough tensors.
+    if "shared_expert" in path and not path.endswith("shared_expert_gate"):
+        return bits(8)
+
     if _is_vision_tensor(path):
         return False
 
@@ -221,6 +519,15 @@ def universal_quant_predicate(
         return bits(8)
     if "linear_attn.out_proj" in path_l:
         return bits(5)
+
+    # Inkling short-conv weights (k/v/attn/mlp_sconv.conv.weight; the
+    # .weight suffix is stripped by _normalize_quant_path) are tiny
+    # depthwise causal convs on nn.Conv1d modules, which have no
+    # to_quantized() — a quantized emission here would make mlx-vlm's
+    # load-time class_predicate try to quantize a Conv1d and fail. Keep
+    # them at source precision like the conv1d rule above.
+    if path_l.endswith("sconv.conv"):
+        return False
 
     boost_map = config.get("_oq_boost_map") or {}
     if path in boost_map:
@@ -277,9 +584,6 @@ def universal_quant_predicate(
         if not is_moe:
             return bits(5)
 
-    if "shared_expert" in path and not path.endswith("shared_expert_gate"):
-        return bits(8)
-
     if num_experts >= 512 and hidden_size >= 4096:
         if "gate_proj" in path and "shared_expert" not in path:
             return bits(4)
@@ -299,6 +603,16 @@ def universal_quant_predicate(
             layer_idx < num_layers // 8 or layer_idx >= 7 * num_layers // 8
         )
 
+    # Inkling stacks Q/K/V/R at load when their formats are compatible.
+    # Attention is under 1% of this fine-grained MoE model, and existing
+    # Inkling oQe checkpoints already keep every trunk Q/K/V/R projection at
+    # Q8. Preserve that floor for the fused trunk and MTP layouts: the small
+    # size cost protects both target logits and draft acceptance.
+    if config.get("model_type") in ("inkling", "inkling_mm_model") and (
+        "qkvr_proj" in path
+    ):
+        return bits(8)
+
     if any(p in path for p in ("v_proj", "v_a_proj", "v_b_proj")):
         if sensitive:
             return bits(6)
@@ -313,8 +627,8 @@ def universal_quant_predicate(
         if is_routed_expert:
             down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
             if down_boost:
-                # Fractional levels protect routed expert down_proj above
-                # the base bits (Super Weights protection).
+                # Mandatory fractional levels protect routed expert down_proj
+                # above the base bits (Super Weights protection).
                 return bits(base_bits + down_boost)
             return True
         if sensitive:
@@ -345,6 +659,11 @@ def _is_vision_tensor(name: str) -> bool:
         for p in (
             "visual.",
             "vision_",
+            # DeepSeek-OCR / Unlimited-OCR SAM encoder. Kept full precision like
+            # the rest of the vision tower: its neck/net_2/net_3 are nn.Conv2d,
+            # which mlx cannot quantize at all, so quantizing them yields
+            # unloadable .scales/.biases the model has no slot for.
+            "sam_model",
             "patch_embed",
             "pos_embed",
             "image_newline",
@@ -461,6 +780,29 @@ def _estimate_effective_bpw(
     return total_bits / max(total_params, 1)
 
 
+def _structural_quant_overrides(
+    named_shapes: dict[str, tuple], config: dict, oq_level: int
+) -> dict[str, dict]:
+    """Layouts fixed by a model invariant rather than the bit allocator.
+
+    Qwen4-Exp PLE rows are 160 elements wide.  The writer always uses group
+    size 32 for them, but pricing them at the default group size 64 makes the
+    planner classify the table as an unquantizable 16-bpw tensor.  Since PLE
+    is about 51B parameters, that false cost can exhaust the entire budget and
+    suppress every protection boost even though the writer emits Q4/group32.
+    """
+    base_bits = _base_bits_for_level(oq_level)
+    return {
+        path: {
+            "bits": base_bits,
+            "group_size": _QWEN4_EXP_NGRAM_GROUP_SIZE,
+            "mode": "affine",
+        }
+        for path in named_shapes
+        if _is_qwen4_exp_ngram_embedding_tensor(path, config)
+    }
+
+
 def _collect_named_weight_shapes_from_model(model) -> dict[str, tuple]:
     """Collect quantizable weight shapes from the in-memory model."""
     named_shapes = {}
@@ -499,6 +841,19 @@ def _is_routed_expert(path: str) -> bool:
     return False
 
 
+def _routed_expert_projection(path: str) -> str | None:
+    """Return the routed expert projection family for a module/tensor path."""
+    if not _is_routed_expert(path):
+        return None
+    if any(p in path for p in ("down_proj", ".w2", "mlp.fc2", ".fc2")):
+        return "down"
+    if any(p in path for p in ("gate_proj", ".w1", "mlp.fc1", ".fc1")):
+        return "gate"
+    if any(p in path for p in ("up_proj", ".w3")):
+        return "up"
+    return None
+
+
 _MANDATORY_BOOST_PATTERNS = {
     "lm_head": {"bits": 8, "group_size": 64, "mode": "affine"},
     "embeddings": {"bits": 8, "group_size": 64, "mode": "affine"},
@@ -523,6 +878,103 @@ def _sensitivity_tier(layer_score: float, max_score: float) -> int:
     return 1
 
 
+def _apply_routed_layer_boosts(
+    named_shapes: dict[str, tuple],
+    config: dict,
+    oq_level: float,
+    boost_map: dict[str, dict],
+    fixed_overrides: dict[str, dict],
+    base_bits: int,
+    base_group_size: int,
+    base_mode: str,
+    total_bits_f: float,
+    total_params: int,
+    current_bpw: float,
+    target_bpw: float,
+    hard_cap_bpw: float,
+) -> tuple[float, float]:
+    """Boost routed expert modules by layer while staying MLX-loader portable.
+
+    MLX's QuantizedSwitchLinear stores one bit-width per fused expert projection,
+    not per expert. For oQ2.5/oQ2.7 we therefore rank layers by sensitivity
+    and boost whole routed projection modules: down/w2 first, then gate+up as
+    a pair.
+    """
+    if oq_level not in _ROUTED_LAYER_BOOST_LEVELS or base_bits >= 3:
+        return total_bits_f, current_bpw
+
+    from collections import defaultdict
+
+    layer_scores = config.get("_oq_sensitivity_map") or {}
+    grouped: dict[tuple[int, str], list[tuple[str, tuple]]] = defaultdict(list)
+    for path, shape in named_shapes.items():
+        if path in fixed_overrides:
+            continue
+        projection = _routed_expert_projection(path)
+        if projection is None:
+            continue
+        layer_idx = _extract_layer_index(path)
+        if layer_idx < 0:
+            continue
+        phase = "down" if projection == "down" else "gate_up"
+        grouped[(layer_idx, phase)].append((path, shape))
+
+    def group_score(layer_idx: int) -> float:
+        return float(layer_scores.get(str(layer_idx), 0.0))
+
+    def try_boost_group(items: list[tuple[str, tuple]]) -> bool:
+        nonlocal total_bits_f, current_bpw
+        delta = 0
+        updates = []
+        cand_bits = 3
+        cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cand_mode = _mode_for_bits(cand_bits)
+        for path, shape in items:
+            cur = boost_map.get(path)
+            cur_bits = int(cur["bits"]) if cur else base_bits
+            if cur_bits >= cand_bits:
+                continue
+            cur_gs = (
+                int(cur.get("group_size", base_group_size)) if cur else base_group_size
+            )
+            cur_mode = cur.get("mode", base_mode) if cur else base_mode
+            old_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
+            new_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
+            item_delta = 8 * (new_cost - old_cost)
+            if item_delta <= 0:
+                continue
+            delta += item_delta
+            updates.append(path)
+        if not updates:
+            return False
+        next_bpw = (total_bits_f + delta) / total_params
+        if next_bpw > hard_cap_bpw:
+            return False
+        for path in updates:
+            boost_map[path] = {
+                "bits": cand_bits,
+                "group_size": cand_gs,
+                "mode": cand_mode,
+            }
+        total_bits_f += delta
+        current_bpw = next_bpw
+        return True
+
+    for phase in ("down", "gate_up"):
+        candidates = [
+            (layer_idx, items)
+            for (layer_idx, group_phase), items in grouped.items()
+            if group_phase == phase
+        ]
+        candidates.sort(key=lambda item: (-group_score(item[0]), item[0]))
+        for _layer_idx, items in candidates:
+            if current_bpw >= target_bpw:
+                break
+            try_boost_group(items)
+
+    return total_bits_f, current_bpw
+
+
 def _build_quant_plan(
     named_shapes: dict[str, tuple],
     config: dict,
@@ -537,7 +989,8 @@ def _build_quant_plan(
     1. Mandatory pre-allocation: consensus-critical tensors (lm_head → 8-bit)
     2. Data-driven: all non-expert tensors compete equally, ranked by
        layer sensitivity score. Higher sensitivity → more bits.
-    3. Routed experts always stay at base bits (93-98% of params).
+    3. Routed experts stay at base bits except explicit fractional floors and
+       the oQ2.5/oQ2.7 fallback routed-layer boost.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
@@ -549,6 +1002,16 @@ def _build_quant_plan(
     base_group_size = _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE)
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
+
+    # GLM DSA indexers are a format invariant, not an optional sensitivity
+    # boost. Seed them before pricing the plan and never let the bpw cap drop
+    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    for path in named_shapes:
+        if path in fixed_overrides:
+            continue
+        override = _glm_indexer_q8_override(path, config)
+        if override is not None:
+            boost_map[path] = override
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
@@ -568,7 +1031,7 @@ def _build_quant_plan(
         base_bits,
         base_group_size,
         base_mode,
-        overrides=fixed_overrides,
+        overrides={**fixed_overrides, **boost_map},
     )
     total_bits_f = current_bpw * total_params
 
@@ -602,8 +1065,8 @@ def _build_quant_plan(
                     current_bpw = next_bpw
                 break
 
-    # Fractional levels (oQ2.5 / oQ2.7 / oQ3.5): mandatory expert down_proj
-    # boost above base bits (Super Weights protection).
+    # Fractional levels with a blanket Super Weights floor: mandatory expert
+    # down_proj boost above base bits.
     _down_boost = _LEVEL_EXPERT_DOWN_BOOST.get(oq_level)
     if _down_boost:
         for path, shape in named_shapes.items():
@@ -614,7 +1077,7 @@ def _build_quant_plan(
             if not any(p in path for p in ("down_proj", "w2")):
                 continue
             cand_bits = base_bits + _down_boost
-            if cand_bits not in (2, 3, 4, 5, 6, 8):
+            if cand_bits not in _VALID_QUANT_BITS:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
@@ -684,8 +1147,16 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            continue
-        layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+            # MTP-head tensors carry no ``layers.<n>`` index but should
+            # compete like any other non-expert tensor (the stated contract
+            # is backbone-equal treatment for the head's internal block);
+            # score 0 seeds them at the bottom tier and the under-target
+            # fallback lifts them with the rest.
+            if not _is_mtp_tensor(path):
+                continue
+            layer_score = 0.0
+        else:
+            layer_score = float(layer_scores.get(str(layer_idx), 0.0))
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
@@ -703,12 +1174,11 @@ def _build_quant_plan(
             continue
         candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
 
-    _VALID_BITS = (2, 3, 4, 5, 6, 8)
     for _score, path, shape, cur_bits, cur_cost, max_target in sorted(
         candidates, key=lambda x: x[0], reverse=True
     ):
         for cand_bits in range(max_target, cur_bits, -1):
-            if cand_bits not in _VALID_BITS or cand_bits <= cur_bits:
+            if cand_bits not in _VALID_QUANT_BITS or cand_bits <= cur_bits:
                 continue
             cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
             cand_mode = _mode_for_bits(cand_bits)
@@ -777,12 +1247,37 @@ def _build_quant_plan(
             if current_bpw >= target_bpw:
                 break
 
+    if current_bpw < target_bpw:
+        total_bits_f, current_bpw = _apply_routed_layer_boosts(
+            named_shapes,
+            config,
+            oq_level,
+            boost_map,
+            fixed_overrides,
+            base_bits,
+            base_group_size,
+            base_mode,
+            total_bits_f,
+            total_params,
+            current_bpw,
+            target_bpw,
+            hard_cap_bpw,
+        )
+
     if boost_map:
         from collections import Counter
 
         bits_dist = Counter(v["bits"] for v in boost_map.values())
+        route_dist = Counter()
         layer_bits = {}
         for k, v in boost_map.items():
+            projection = _routed_expert_projection(k)
+            if projection is not None:
+                route_dist[f"{projection}:{v['bits']}bit"] += 1
+            elif _is_routed_expert(k):
+                route_dist[f"routed_other:{v['bits']}bit"] += 1
+            else:
+                route_dist[f"non_expert:{v['bits']}bit"] += 1
             idx = _extract_layer_index(k)
             label = f"L{idx}" if idx >= 0 else k.split(".")[-1]
             if label not in layer_bits:
@@ -794,7 +1289,13 @@ def _build_quant_plan(
         )
         top_layers = sorted(layer_bits.items(), key=lambda x: -x[1])[:8]
         top_str = ", ".join(f"{l}={b}b" for l, b in top_layers)
-        logger.info(f"  plan detail: {bits_summary} | top: {top_str}")
+        route_summary = ", ".join(
+            f"{name}×{count}" for name, count in sorted(route_dist.items())
+        )
+        logger.info(
+            f"  plan detail: {bits_summary} | routes: {route_summary} | "
+            f"top: {top_str}"
+        )
 
     return QuantPlan(
         boost_map=boost_map,
@@ -809,6 +1310,7 @@ def resolve_output_name(
     oq_level: int,
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
+    enhanced: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -819,6 +1321,7 @@ def resolve_output_name(
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
+        "Qwen3.5-122B-A10B" + 4 + enhanced -> "Qwen3.5-122B-A10B-oQ4e"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
@@ -834,12 +1337,638 @@ def resolve_output_name(
             break
         base = new
     level_str = f"{oq_level:g}"
-    suffix = f"-oQ{level_str}"
+    suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_mtp:
         suffix += "-mtp"
     return f"{base}{suffix}"
+
+
+# ── Gemma 4 assistant MTP combine ───────────────────────────────────────
+
+GEMMA4_ASSISTANT_MTP_PREFIX = "language_model.mtp."
+GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
+MTPLX_SIDECAR_SHARD = "mtp.safetensors"
+MTPLX_RUNTIME_FILE = "mtplx_runtime.json"
+
+# MTPLX forge calibrates the contract per model; oMLX's Lightning MTP
+# runtime implements exactly one execution convention, so anything else is
+# rejected fail-closed at import time. Missing fields mean the MTPLX
+# documented defaults (mtplx.mtp_patch.MTPContract), which is how
+# pre-calibration exports (mtplx 0.1.0-preview) ship.
+_MTPLX_CONTRACT_DEFAULTS = {
+    "base_hidden_variant": "post_norm",
+    "hidden_variant": "post_norm",
+    "concat_order": "embedding_hidden",
+    "mtp_position_mode": "cache",
+}
+
+_MTPLX_CONTRACT_ALLOWLIST = {
+    "arch_id": ("qwen3-next-mtp",),
+    "base_hidden_variant": ("post_norm",),
+    "hidden_variant": ("post_norm",),
+    "concat_order": ("embedding_hidden",),
+    "mtp_position_mode": ("local", "cache"),
+}
+
+
+def validate_gemma4_assistant_pair(
+    base_config: dict, assistant_config: dict
+) -> None:
+    """Validate that a gemma4_assistant checkpoint can be merged into a base.
+
+    Raises ValueError with an operator-readable message on any mismatch so
+    the combine option fails at task submission, not after a full
+    quantization run.
+    """
+    if base_config.get("model_type") != "gemma4":
+        raise ValueError(
+            "Assistant MTP combine requires a gemma4 base model, got "
+            f"model_type={base_config.get('model_type')!r}"
+        )
+    if assistant_config.get("model_type") != "gemma4_assistant":
+        raise ValueError(
+            "Assistant model must have model_type 'gemma4_assistant', got "
+            f"{assistant_config.get('model_type')!r}"
+        )
+    asst_layers = int(
+        (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
+    )
+    if asst_layers <= 0:
+        raise ValueError(
+            "Assistant model config declares no text_config.num_hidden_layers"
+        )
+    base_hidden = (base_config.get("text_config") or {}).get("hidden_size")
+    backbone_hidden = assistant_config.get("backbone_hidden_size")
+    if base_hidden and backbone_hidden and base_hidden != backbone_hidden:
+        raise ValueError(
+            "Assistant model does not match the base model: "
+            f"backbone_hidden_size={backbone_hidden} but the base "
+            f"hidden_size={base_hidden}. Use the assistant checkpoint "
+            "released for this exact model size."
+        )
+
+
+def combine_gemma4_assistant_mtp(
+    output_path: Union[str, Path],
+    assistant_path: Union[str, Path],
+) -> None:
+    """Merge a gemma4_assistant checkpoint into a quantized output directory.
+
+    Writes the assistant weights as one extra shard under
+    ``language_model.mtp.*`` (kept at their shipped dtype, bf16), merges the
+    safetensors index, and embeds the assistant config at
+    ``text_config.mtp_assistant_config`` plus ``mtp_num_hidden_layers`` so
+    the gemma4 Lightning MTP runtime patch detects and attaches the head at
+    load time. The base weights and quantization config are untouched.
+    """
+    output = Path(output_path)
+    assistant = Path(assistant_path)
+
+    with open(output / "config.json") as f:
+        config = json.load(f)
+    with open(assistant / "config.json") as f:
+        assistant_config = json.load(f)
+    validate_gemma4_assistant_pair(config, assistant_config)
+
+    # Assistant checkpoints ship as a single file today, but read through
+    # the index when present so sharded re-exports keep working.
+    index_path = assistant / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shards = sorted(p.name for p in assistant.glob("*.safetensors"))
+    if not shards:
+        raise ValueError(f"No safetensors found in assistant model: {assistant}")
+
+    weights: dict = {}
+    for shard in shards:
+        weights.update(mx.load(str(assistant / shard)))
+    mtp_weights = {GEMMA4_ASSISTANT_MTP_PREFIX + k: v for k, v in weights.items()}
+
+    mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+
+    text_config = config.setdefault("text_config", {})
+    text_config["mtp_num_hidden_layers"] = int(
+        (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
+    )
+    text_config["mtp_assistant_config"] = assistant_config
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Merged gemma4 assistant MTP head into %s "
+        "(%d tensors, %.2f GB, source=%s)",
+        output.name,
+        len(mtp_weights),
+        mtp_size / 1e9,
+        assistant.name,
+    )
+
+
+# ── Native MTP head donor combine (Qwen3.5/3.6) ─────────────────────────
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically replace a JSON file (tmp write + rename)."""
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+    ) as tmp:
+        json.dump(payload, tmp, indent=2)
+        tmp.flush()
+        temp_name = tmp.name
+    Path(temp_name).replace(path)
+
+
+def _write_mtp_shard_and_merge_index(
+    output: Path,
+    mtp_weights: dict,
+    *,
+    write_shard: bool = True,
+) -> int:
+    """Write mtp weights as one extra shard and merge the safetensors index.
+
+    Shared by the gemma4 assistant combine and native MTP imports (the shard
+    was renamed into place already when ``write_shard`` is False). The index
+    merge is a no-op when the output has no ``model.safetensors.index.json``.
+    Returns the tensor byte size.
+    """
+    if write_shard:
+        mx.save_safetensors(
+            str(output / GEMMA4_ASSISTANT_MTP_SHARD),
+            mtp_weights,
+            metadata={"format": "mlx"},
+        )
+    mtp_size = sum(v.nbytes for v in mtp_weights.values())
+
+    out_index_path = output / "model.safetensors.index.json"
+    if out_index_path.exists():
+        with open(out_index_path) as f:
+            index = json.load(f)
+        weight_map = index.setdefault("weight_map", {})
+        for key in mtp_weights:
+            weight_map[key] = GEMMA4_ASSISTANT_MTP_SHARD
+        metadata = index.get("metadata") or {}
+        metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
+        index["metadata"] = metadata
+        _atomic_write_json(out_index_path, index)
+    return mtp_size
+
+
+def _synthesize_mtp_quant_entries(
+    donor_quant: dict,
+    mtp_key_shards: dict,
+    *,
+    recipient_prefix: str,
+) -> dict:
+    """Build per-layer quant entries for modules with explicit ``.scales``."""
+    if not isinstance(donor_quant, dict):
+        return {}
+    donor_global = {
+        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
+    }
+    quant_entries: dict = {}
+    for key in mtp_key_shards:
+        if not key.endswith(".scales"):
+            continue
+        base = key[: -len(".scales")]
+        bare_module = _strip_mtp_key_prefix(base)
+        if bare_module is None:
+            continue
+        candidates = (
+            base,
+            bare_module,
+            "language_model." + bare_module,
+            "model." + bare_module,
+            "model.language_model." + bare_module,
+        )
+        spec = None
+        for candidate in candidates:
+            value = donor_quant.get(candidate)
+            if isinstance(value, dict):
+                spec = value
+                break
+        if spec is None:
+            if not donor_global:
+                raise ValueError(
+                    "Donor MTP head is quantized but its config declares no "
+                    "global quantization parameters"
+                )
+            spec = donor_global
+        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    return quant_entries
+
+
+def _resolve_mtplx_sidecar(model_path: Path, config: dict) -> Optional[Path]:
+    """Resolve the MTPLX side-car weights file, or None.
+
+    Follows MTPLX's own resolution order: the config-declared
+    ``mlx_lm_extra_tensors.mtp_file`` first, then the conventional
+    locations (``mtplx.artifacts.expected_mtp_file``).
+    """
+    candidates: list[str] = []
+    extra = config.get("mlx_lm_extra_tensors")
+    if isinstance(extra, dict) and extra.get("mtp_file"):
+        candidates.append(str(extra["mtp_file"]))
+    candidates += [
+        MTPLX_SIDECAR_SHARD,
+        "mtp/weights.safetensors",
+        GEMMA4_ASSISTANT_MTP_SHARD,
+    ]
+    for rel in candidates:
+        path = model_path / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
+    """Fail-closed check that the export's contract matches oMLX's runtime.
+
+    The contract comes from ``mtplx_runtime.json`` (Forge always writes it),
+    with ``config.json -> mtplx_mtp_contract`` as the base layer and the
+    MTPLX documented defaults filling anything omitted.
+    """
+    runtime_path = model_path / MTPLX_RUNTIME_FILE
+    if not runtime_path.exists():
+        raise ValueError(f"Missing required runtime contract: {runtime_path}")
+    with open(runtime_path) as f:
+        runtime = json.load(f)
+
+    checks: dict = dict(_MTPLX_CONTRACT_DEFAULTS)
+    for layer in (config.get("mtplx_mtp_contract"), runtime.get("mtp_contract")):
+        if isinstance(layer, dict):
+            checks.update({k: layer[k] for k in _MTPLX_CONTRACT_DEFAULTS if k in layer})
+    checks["arch_id"] = runtime.get("arch_id")
+
+    for field, allowed in _MTPLX_CONTRACT_ALLOWLIST.items():
+        if checks.get(field) not in allowed:
+            raise ValueError(
+                f"Unsupported MTPLX contract {field}={checks.get(field)!r}; "
+                f"oMLX's MTP runtime supports {' / '.join(allowed)}"
+            )
+
+
+def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
+    """Import an MTPLX side-car head into the model's checkpoint index.
+
+    Fail-closed on unsupported runtime contracts. Normalizes the side-car
+    onto a ``model-mtp.safetensors`` shard (zero-copy rename when the tensor
+    keys already match the checkpoint's naming, remapped copy otherwise) so
+    the stock mlx-lm/mlx-vlm weight globs and the index-based MTP detection
+    see the head with no load-time special casing. mlx_lm only ever opens
+    ``model*.safetensors``, which is why pointing the index at the original
+    side-car name is not enough. Idempotent: re-running is a no-op.
+    """
+    output = Path(model_path)
+    with open(output / "config.json") as f:
+        config = json.load(f)
+
+    sidecar = _resolve_mtplx_sidecar(output, config)
+    if sidecar is None:
+        raise ValueError(f"No MTPLX side-car weights found in {output}")
+    _validate_mtplx_runtime_contract(output, config)
+
+    audit = config.get("mtplx_mtp_payload_audit")
+    if isinstance(audit, dict) and not bool(audit.get("passed", True)):
+        raise ValueError("mtplx_mtp_payload_audit.passed is false")
+
+    output_keys = _shard_key_map(output)
+    recipient_prefix = (
+        "language_model."
+        if any(k.startswith("language_model.") for k in output_keys)
+        else ""
+    )
+
+    sidecar_weights = mx.load(str(sidecar))
+    mtp_weights = {}
+    for key, value in sidecar_weights.items():
+        bare = _strip_mtp_key_prefix(key)
+        if bare is not None:
+            mtp_weights[recipient_prefix + bare] = value
+    if not mtp_weights:
+        raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
+
+    # Idempotency: the index (not the header fallback of _shard_key_map,
+    # which would see the not-yet-imported side-car itself) is what the MTP
+    # weight detection reads, so it is the import-completed marker.
+    index_path = output / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            indexed = json.load(f).get("weight_map") or {}
+        if all(key in indexed for key in mtp_weights):
+            logger.info("MTPLX side-car already imported into %s", output.name)
+            return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
+
+    shard_path = output / GEMMA4_ASSISTANT_MTP_SHARD
+    if set(mtp_weights) == set(sidecar_weights):
+        merge_mode = "rename"
+        if sidecar != shard_path:
+            sidecar.replace(shard_path)
+        mtp_size = _write_mtp_shard_and_merge_index(
+            output, mtp_weights, write_shard=False
+        )
+    else:
+        # VLM-shaped checkpoints need the language_model. prefix on disk.
+        # Materialize before touching files: the loaded arrays lazily
+        # reference the side-car file.
+        merge_mode = "remap"
+        mx.eval(*mtp_weights.values())
+        mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+        if sidecar.parent == output:
+            # Keep the consumed side-car out of mlx-vlm's *.safetensors
+            # glob; sub-directory side-cars are invisible to it already.
+            sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))
+
+    donor_quant = (
+        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
+    )
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
+        recipient_prefix=recipient_prefix,
+    )
+    if quant_entries:
+        for section in ("quantization", "quantization_config"):
+            section_cfg = config.get(section)
+            if isinstance(section_cfg, dict):
+                section_cfg.update(quant_entries)
+
+    scope = _mtp_text_scope(config)
+    scope["mtp_num_hidden_layers"] = max(_mtp_declared_layers(config), 1)
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Imported MTPLX side-car into %s (%s, %d tensors, %.2f GB)",
+        output.name,
+        merge_mode,
+        len(mtp_weights),
+        mtp_size / 1e9,
+    )
+    return {"merge_mode": merge_mode, "mtp_tensors": len(mtp_weights)}
+
+
+def _file_sha256(path: Path) -> str:
+    """Chunked sha256 of a file (tokenizer.json can be tens of MB)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mtp_family_token(config: dict) -> Optional[str]:
+    """Qwen family token ("qwen3_5" / "qwen3_6") for a config, else None."""
+    model_type = config.get("model_type") or (config.get("text_config") or {}).get(
+        "model_type"
+    )
+    if not isinstance(model_type, str):
+        return None
+    for token in ("qwen3_6", "qwen3_5"):
+        if model_type.startswith(token):
+            return token
+    return None
+
+
+def _mtp_text_scope(config: dict) -> dict:
+    """The dict holding the text-model geometry (text_config for VLM wrappers)."""
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and "num_hidden_layers" in text_config:
+        return text_config
+    return config
+
+
+_MTP_GEOMETRY_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "intermediate_size",
+    "num_experts",
+    "moe_intermediate_size",
+    "shared_expert_intermediate_size",
+    "rms_norm_eps",
+    "rope_theta",
+)
+
+
+def _mtp_geometry(config: dict) -> dict:
+    """Geometry fields the MTP head build depends on (absent fields kept as
+    None so a dense donor cannot pair with a MoE recipient and vice versa)."""
+    scope = _mtp_text_scope(config)
+    geometry = {field: scope.get(field) for field in _MTP_GEOMETRY_FIELDS}
+    if geometry["rope_theta"] is None:
+        # VLM-wrapper configs nest it at text_config.rope_parameters.rope_theta.
+        rope_params = scope.get("rope_parameters")
+        if isinstance(rope_params, dict):
+            geometry["rope_theta"] = rope_params.get("rope_theta")
+    return geometry
+
+
+def _mtp_declared_layers(config: dict) -> int:
+    """Declared mtp_num_hidden_layers (top level or text_config)."""
+    top = int(config.get("mtp_num_hidden_layers", 0) or 0)
+    text = int((config.get("text_config") or {}).get("mtp_num_hidden_layers", 0) or 0)
+    return max(top, text)
+
+
+def _shard_key_map(model_dir: Path) -> dict:
+    """Map tensor key -> shard filename without loading tensor data.
+
+    Index-first; falls back to reading only the safetensors JSON headers.
+    """
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            return dict(json.load(f).get("weight_map") or {})
+    key_map: dict = {}
+    for shard in sorted(model_dir.glob("*.safetensors")):
+        with open(shard, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(header_len))
+        for key in header:
+            if key != "__metadata__":
+                key_map[key] = shard.name
+    return key_map
+
+
+def _strip_mtp_key_prefix(key: str) -> Optional[str]:
+    """Normalize an mtp tensor key to its bare ``mtp.<rest>`` form."""
+    from omlx.utils.model_loading import _MTP_WEIGHT_PREFIXES
+
+    for prefix in _MTP_WEIGHT_PREFIXES:
+        if key.startswith(prefix):
+            return "mtp." + key[len(prefix) :]
+    return None
+
+
+def validate_mtp_donor_pair(
+    recipient_path: Union[str, Path],
+    donor_path: Union[str, Path],
+) -> None:
+    """Validate that a native MTP head can be grafted donor -> recipient.
+
+    The qwen MTP head has no embedding of its own: it reuses the
+    recipient's embed_tokens/lm_head and its decoder layer is built from
+    the recipient's config, so the tokenizer bytes and every geometry
+    field must match exactly (realistic pairing: a fine-tune without a
+    head + its base model). Raises ValueError with an operator-readable
+    message so the combine fails at task submission, not after a full
+    quantization run.
+    """
+    from omlx.utils.model_loading import _checkpoint_has_mtp_weights
+
+    recipient = Path(recipient_path)
+    donor = Path(donor_path)
+    with open(recipient / "config.json") as f:
+        recipient_config = json.load(f)
+    with open(donor / "config.json") as f:
+        donor_config = json.load(f)
+
+    recipient_family = _mtp_family_token(recipient_config)
+    if recipient_family is None:
+        raise ValueError(
+            "MTP head combine supports Qwen3.5/Qwen3.6 recipients, got "
+            f"model_type={recipient_config.get('model_type')!r}"
+        )
+    donor_family = _mtp_family_token(donor_config)
+    if donor_family != recipient_family:
+        raise ValueError(
+            "Donor model family "
+            f"({donor_family or donor_config.get('model_type')!r}) does not "
+            f"match the recipient ({recipient_family})"
+        )
+    if _mtp_declared_layers(donor_config) <= 0 or not _checkpoint_has_mtp_weights(
+        donor
+    ):
+        raise ValueError(
+            "Donor model has no MTP head (mtp_num_hidden_layers missing or "
+            "mtp.* weights stripped)"
+        )
+    donor_geometry = _mtp_geometry(donor_config)
+    recipient_geometry = _mtp_geometry(recipient_config)
+    for field in _MTP_GEOMETRY_FIELDS:
+        if donor_geometry[field] != recipient_geometry[field]:
+            raise ValueError(
+                f"Donor/recipient geometry mismatch: {field} "
+                f"{donor_geometry[field]} != {recipient_geometry[field]}"
+            )
+    for tok_path in (recipient / "tokenizer.json", donor / "tokenizer.json"):
+        if not tok_path.exists():
+            raise ValueError(
+                "Cannot verify tokenizer identity: tokenizer.json missing "
+                f"in {tok_path.parent}"
+            )
+    if _file_sha256(recipient / "tokenizer.json") != _file_sha256(
+        donor / "tokenizer.json"
+    ):
+        raise ValueError(
+            "Donor and recipient tokenizers differ; the MTP head reuses the "
+            "recipient's embedding and lm_head, so tokenizers must be "
+            "byte-identical"
+        )
+
+
+def combine_mtp_donor(
+    output_path: Union[str, Path],
+    donor_path: Union[str, Path],
+) -> None:
+    """Graft a native Qwen3.5/3.6 MTP head from a donor checkpoint.
+
+    Donor mtp.* tensors are written as one extra shard at their shipped
+    dtype: bf16 heads stay bf16 and pre-quantized heads pass through
+    packed, with explicit per-layer entries synthesized into the output's
+    quantization config (the donor's global bits may differ from the
+    recipient's). The norm +1 convention is left untouched on purpose —
+    the qwen sanitize decides the shift per-key by tensor mean and
+    norm_repair anchors the outliers, so raw-HF and MLX-convention donors
+    both load correctly.
+    """
+    output = Path(output_path)
+    donor = Path(donor_path)
+
+    validate_mtp_donor_pair(output, donor)
+
+    with open(output / "config.json") as f:
+        config = json.load(f)
+    with open(donor / "config.json") as f:
+        donor_config = json.load(f)
+
+    donor_key_map = _shard_key_map(donor)
+    mtp_key_shards = {
+        key: shard
+        for key, shard in donor_key_map.items()
+        if _strip_mtp_key_prefix(key) is not None
+    }
+    if not mtp_key_shards:
+        raise ValueError(f"No mtp.* tensors found in donor model: {donor}")
+
+    output_keys = _shard_key_map(output)
+    recipient_prefix = (
+        "language_model."
+        if any(k.startswith("language_model.") for k in output_keys)
+        else ""
+    )
+
+    # Load only the donor shards that contain mtp keys, one shard at a
+    # time, dropping non-mtp tensors immediately (peak memory = 1 shard).
+    mtp_weights: dict = {}
+    for shard in sorted(set(mtp_key_shards.values())):
+        shard_weights = mx.load(str(donor / shard))
+        for key, value in shard_weights.items():
+            bare = _strip_mtp_key_prefix(key)
+            if bare is not None:
+                mtp_weights[recipient_prefix + bare] = value
+        del shard_weights
+
+    mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+
+    # Pre-quantized donor: every module shipping a .scales sibling needs an
+    # explicit per-layer entry under the recipient's key naming, otherwise
+    # mlx-lm's class_predicate applies the recipient's *global* bits to the
+    # donor-packed arrays and the strict load fails on shape mismatch.
+    donor_quant = donor_config.get("quantization") or {}
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        mtp_key_shards,
+        recipient_prefix=recipient_prefix,
+    )
+
+    if quant_entries:
+        for section in ("quantization", "quantization_config"):
+            section_cfg = config.get(section)
+            if isinstance(section_cfg, dict):
+                section_cfg.update(quant_entries)
+
+    # The combine runs after _normalize_mtp_in_config zeroed the gate;
+    # re-declare it where the recipient keeps its num_hidden_layers.
+    scope = _mtp_text_scope(config)
+    scope["mtp_num_hidden_layers"] = _mtp_declared_layers(donor_config)
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Grafted donor MTP head into %s (%d tensors, %.2f GB, source=%s)",
+        output.name,
+        len(mtp_weights),
+        mtp_size / 1e9,
+        donor.name,
+    )
+
+
+def combine_mtp_into_output(
+    output_path: Union[str, Path],
+    donor_path: Union[str, Path],
+) -> None:
+    """Merge an MTP head into a quantized output, routed on donor type."""
+    donor = Path(donor_path)
+    with open(donor / "config.json") as f:
+        donor_config = json.load(f)
+    if donor_config.get("model_type") == "gemma4_assistant":
+        combine_gemma4_assistant_mtp(output_path, donor_path)
+    else:
+        combine_mtp_donor(output_path, donor_path)
 
 
 # ── Auto-discovery streaming sanitizer ──────────────────────────────────
@@ -849,42 +1978,98 @@ class _TrackedTensor:
     """Fake tensor proxy that records shape, dtype, lineage, and transforms
     applied during a sanitize() dry run. Holds no GPU data."""
 
-    __slots__ = ("shape", "ndim", "dtype", "sources", "transform", "axis")
+    __slots__ = (
+        "shape",
+        "ndim",
+        "dtype",
+        "sources",
+        "transform",
+        "axis",
+        "recipe",
+        "expr",
+    )
 
-    def __init__(self, shape, dtype, sources=None, transform="passthrough", axis=None):
+    def __init__(
+        self,
+        shape,
+        dtype,
+        sources=None,
+        transform="passthrough",
+        axis=None,
+        recipe=None,
+        expr=None,
+    ):
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
         self.sources = sources or []
         self.transform = transform
         self.axis = axis
+        self.recipe = list(recipe or [])
+        if expr is None and transform == "passthrough" and len(self.sources) == 1:
+            expr = ("source", self.sources[0])
+        self.expr = expr
 
     def _clone(self, shape=None, dtype=None, transform=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape, dtype=dtype)
+        new_transform = transform if transform is not None else self.transform
         return _TrackedTensor(
             shape if shape is not None else self.shape,
             dtype if dtype is not None else self.dtype,
             list(self.sources),
-            transform if transform is not None else self.transform,
+            new_transform,
+            recipe=list(self.recipe),
+            expr=self.expr if new_transform == self.transform else None,
         )
 
-    # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
+    def _unreplayable(self, shape=None, dtype=None, extra_sources=()):
+        """A tensor whose lineage the replay engine cannot reproduce.
+
+        Sticky by construction: it carries no recipe and no expr, and
+        :meth:`_clone` / :meth:`_with_recipe` funnel back here, so a later
+        replayable op cannot launder the plan into looking sound. Discovery
+        then rejects it and the caller falls back to eager sanitize.
+        """
+        sources = list(self.sources)
+        sources.extend(s for s in extra_sources if s not in sources)
+        return _TrackedTensor(
+            shape if shape is not None else self.shape,
+            dtype if dtype is not None else self.dtype,
+            sources,
+            "nested_unreplayable",
+        )
+
+    def _binary(self, other, transform):
+        """Record an elementwise op against ``other``.
+
+        When ``other`` is another tracked tensor the result depends on two
+        live sources, which the replay engine cannot express: it applies a
+        list of single-source unary ops. Recording only this side would
+        silently drop the operand -- a scale multiply would vanish and the
+        plan would ship unscaled weights -- so poison instead.
+        """
+        if isinstance(other, _TrackedTensor):
+            return self._unreplayable(extra_sources=other.sources)
+        return self._clone(transform=transform)
+
     def __add__(self, other):
-        return self._clone(transform="add")
+        return self._binary(other, "add")
 
     def __radd__(self, other):
         return self.__add__(other)
 
     def __sub__(self, other):
-        return self._clone(transform="sub")
+        return self._binary(other, "sub")
 
     def __mul__(self, other):
-        return self._clone(transform="mul")
+        return self._binary(other, "mul")
 
     def __rmul__(self, other):
         return self.__mul__(other)
 
     def __truediv__(self, other):
-        return self._clone(transform="div")
+        return self._binary(other, "div")
 
     @staticmethod
     def _slice_length(dim, sl):
@@ -905,27 +2090,116 @@ class _TrackedTensor:
             return 1
         return None
 
+    @staticmethod
+    def _expand_index(idx, rank):
+        if not isinstance(idx, tuple):
+            return idx
+        if Ellipsis not in idx:
+            return idx
+        explicit = sum(1 for p in idx if p is not Ellipsis and p is not None)
+        pad = max(0, rank - explicit)
+        expanded: list = []
+        seen = False
+        for part in idx:
+            if part is Ellipsis:
+                if seen:
+                    raise ValueError("only one Ellipsis allowed in index")
+                seen = True
+                expanded.extend([slice(None)] * pad)
+            else:
+                expanded.append(part)
+        return tuple(expanded)
+
+    def _with_recipe(self, shape, transform, op, axis=None):
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
+        expr = self.as_expr()
+        if expr is not None:
+            expr = self._wrap_expr_op(expr, op)
+        return _TrackedTensor(
+            shape,
+            self.dtype,
+            list(self.sources),
+            transform,
+            axis=axis,
+            recipe=list(self.recipe) + [op],
+            expr=expr,
+        )
+
+    @staticmethod
+    def _wrap_expr_op(expr, op):
+        kind = op[0]
+        if kind == "reshape":
+            return ("reshape", op[1], expr)
+        if kind == "slice":
+            return ("slice", op[1], expr)
+        if kind == "transpose":
+            return ("transpose", op[1], expr)
+        if kind == "moveaxis":
+            return ("moveaxis", op[1], op[2], expr)
+        if kind == "astype":
+            return ("astype", op[1], expr)
+        if kind == "expand_dims":
+            return ("expand_dims", op[1], expr)
+        return None
+
+    def as_expr(self):
+        if self.expr is not None:
+            return self.expr
+        if self.recipe and len(self.sources) == 1:
+            expr = ("source", self.sources[0])
+            for op in self.recipe:
+                expr = self._wrap_expr_op(expr, op)
+                if expr is None:
+                    return None
+            return expr
+        if self.transform == "passthrough" and len(self.sources) == 1:
+            return ("source", self.sources[0])
+        if self.transform == "stack":
+            axis = self.axis if self.axis is not None else 0
+            return ("stack", axis, [("source", src) for src in self.sources])
+        if self.transform == "concatenate":
+            axis = self.axis if self.axis is not None else 0
+            return ("concatenate", axis, [("source", src) for src in self.sources])
+        return None
+
+    @staticmethod
+    def _normalize_expand_axes(axis, ndim):
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        out_ndim = ndim + len(axes)
+        normalized = []
+        for ax in axes:
+            ax = ax + out_ndim if ax < 0 else ax
+            if ax < 0 or ax >= out_ndim:
+                raise ValueError(f"axis {ax} is out of bounds for expand_dims")
+            normalized.append(ax)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("repeated axis in expand_dims")
+        return tuple(sorted(normalized))
+
+    def expand_dims(self, axis):
+        axes = self._normalize_expand_axes(axis, self.ndim)
+        axis_set = set(axes)
+        src_i = 0
+        new_shape = []
+        for i in range(self.ndim + len(axes)):
+            if i in axis_set:
+                new_shape.append(1)
+            else:
+                new_shape.append(self.shape[src_i])
+                src_i += 1
+        stored_axis = axes[0] if len(axes) == 1 else axes
+        return self._with_recipe(
+            tuple(new_shape),
+            "expand_dims",
+            ("expand_dims", axes),
+            axis=stored_axis,
+        )
+
     def __getitem__(self, idx):
         new_shape = list(self.shape)
+        idx = self._expand_index(idx, len(new_shape))
         if isinstance(idx, tuple):
-            if Ellipsis in idx:
-                # Expand Ellipsis to explicit slice(None) for the missing axes
-                # so the tuple-handling branch below (incl. half-split detection)
-                # works for sanitize patterns like gate_up[..., :mid, :].
-                rank = len(new_shape)
-                explicit = sum(1 for p in idx if p is not Ellipsis and p is not None)
-                pad = max(0, rank - explicit)
-                expanded: list = []
-                seen = False
-                for part in idx:
-                    if part is Ellipsis:
-                        if seen:
-                            raise ValueError("only one Ellipsis allowed in index")
-                        seen = True
-                        expanded.extend([slice(None)] * pad)
-                    else:
-                        expanded.append(part)
-                idx = tuple(expanded)
             result_shape = []
             axis = 0
             split_info = None
@@ -957,8 +2231,9 @@ class _TrackedTensor:
                     list(self.sources),
                     f"split_{idx_n}_{total}",
                     axis=ax,
+                    recipe=list(self.recipe) + [("slice", idx)],
                 )
-            return _TrackedTensor(result_shape, self.dtype, list(self.sources), "slice")
+            return self._with_recipe(result_shape, "slice", ("slice", idx))
         if isinstance(idx, slice):
             dim = new_shape[0] if new_shape else 0
             length = self._slice_length(dim, idx) if dim > 0 else 0
@@ -970,17 +2245,16 @@ class _TrackedTensor:
                     list(self.sources),
                     f"split_{half}_2",
                     axis=0,
+                    recipe=list(self.recipe) + [("slice", idx)],
                 )
             result = list(new_shape)
             if result:
                 result[0] = length
-            return _TrackedTensor(result, self.dtype, list(self.sources), "slice")
+            return self._with_recipe(result, "slice", ("slice", idx))
         # int or other
         if new_shape:
-            return _TrackedTensor(
-                new_shape[1:], self.dtype, list(self.sources), "slice"
-            )
-        return self._clone(transform="slice")
+            return self._with_recipe(new_shape[1:], "slice", ("slice", idx))
+        return self._with_recipe(self.shape, "slice", ("slice", idx))
 
     def reshape(self, *new_shape):
         if len(new_shape) == 1 and isinstance(new_shape[0], (tuple, list)):
@@ -1001,12 +2275,27 @@ class _TrackedTensor:
                 known_prod *= d
         if unknown_idx >= 0 and known_prod > 0:
             resolved[unknown_idx] = total // known_prod
+        shape = tuple(resolved)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=shape)
         return _TrackedTensor(
-            tuple(resolved), self.dtype, list(self.sources), "reshape"
+            shape,
+            self.dtype,
+            list(self.sources),
+            "reshape",
+            recipe=list(self.recipe) + [("reshape", shape)],
         )
 
     def astype(self, dtype):
-        return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(dtype=dtype)
+        return _TrackedTensor(
+            self.shape,
+            dtype,
+            list(self.sources),
+            "astype",
+            recipe=list(self.recipe) + [("astype", dtype)],
+        )
 
     def moveaxis(self, src_ax, dst_ax):
         src_ax = src_ax % self.ndim if src_ax < 0 else src_ax
@@ -1014,8 +2303,27 @@ class _TrackedTensor:
         dims = list(range(self.ndim))
         dims.insert(dst_ax, dims.pop(src_ax))
         new_shape = tuple(self.shape[d] for d in dims)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
+        op = ("moveaxis", src_ax, dst_ax)
+        if len(self.sources) > 1:
+            expr = self.as_expr()
+            expr = self._wrap_expr_op(expr, op) if expr is not None else None
+            if expr is None:
+                return self._unreplayable(shape=new_shape)
+            return _TrackedTensor(
+                new_shape,
+                self.dtype,
+                list(self.sources),
+                "expr",
+                expr=expr,
+            )
         return _TrackedTensor(
-            new_shape, self.dtype, list(self.sources), f"moveaxis_{src_ax}_{dst_ax}"
+            new_shape,
+            self.dtype,
+            list(self.sources),
+            f"moveaxis_{src_ax}_{dst_ax}",
+            recipe=list(self.recipe) + [op],
         )
 
     def transpose(self, *axes):
@@ -1027,17 +2335,32 @@ class _TrackedTensor:
             axes_list = list(axes)
         axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
         new_shape = tuple(self.shape[a] for a in axes_list)
+        if self.transform == "nested_unreplayable":
+            return self._unreplayable(shape=new_shape)
         return _TrackedTensor(
             new_shape,
             self.dtype,
             list(self.sources),
             "transpose_" + "_".join(str(a) for a in axes_list),
+            recipe=list(self.recipe) + [("transpose", tuple(axes_list))],
         )
+
+    def swapaxes(self, axis1, axis2):
+        axes_list = list(range(self.ndim))
+        axis1 = axis1 % self.ndim if axis1 < 0 else axis1
+        axis2 = axis2 % self.ndim if axis2 < 0 else axis2
+        axes_list[axis1], axes_list[axis2] = axes_list[axis2], axes_list[axis1]
+        return self.transpose(axes_list)
 
     @property
     def T(self):
+        axes = tuple(reversed(range(self.ndim)))
         return _TrackedTensor(
-            tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose"
+            tuple(reversed(self.shape)),
+            self.dtype,
+            list(self.sources),
+            "transpose",
+            recipe=list(self.recipe) + [("transpose", axes)],
         )
 
     @property
@@ -1053,7 +2376,17 @@ _FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E5M2", "I8"))
 
 def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     """Block-scaled dequant of a single FP8/I8 weight+scale pair to BF16."""
-    if s_dtype == "F8_E8M0":
+    # MXFP8 checkpoints (e.g. MiniMax-M3) save the e8m0 shared exponents
+    # with safetensors dtype U8: fp8 weight, one scale byte per 32 columns.
+    # Those bytes are exponents, not linear scales. Float-typed scales
+    # (DeepSeek block-128 weight_scale_inv) stay linear.
+    e8m0 = s_dtype == "F8_E8M0" or (
+        s_dtype in ("U8", "UINT8")
+        and w_dtype in ("F8_E4M3", "F8_E5M2")
+        and scale_raw.ndim == 2
+        and weight_raw.shape[-1] == scale_raw.shape[-1] * 32
+    )
+    if e8m0:
         scale = mx.power(mx.array(2.0), scale_raw.astype(mx.float32) - 127.0)
     else:
         scale = scale_raw
@@ -1067,16 +2400,27 @@ def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     sm, sn = scale.shape
     if sm == 0 or sn == 0:
         raise ValueError(f"degenerate scale shape {scale.shape}")
-    if m % sm != 0 or n % sn != 0:
+
+    def _infer_block(dim: int, blocks: int) -> int | None:
+        if dim % blocks == 0:
+            return dim // blocks
+        for block in (128, 64, 32, 256, 16, 8):
+            if (dim + block - 1) // block == blocks:
+                return block
+        return None
+
+    bs_row = _infer_block(m, sm)
+    bs_col = _infer_block(n, sn)
+    if bs_row is None or bs_col is None:
         raise ValueError(
             f"weight shape ({m},{n}) not divisible by scale shape ({sm},{sn})"
         )
-    bs_row = m // sm
-    bs_col = n // sn
 
     if bs_row > 1:
-        pad_bottom = (-m) % bs_row
-        pad_side = (-n) % bs_col
+        target_m = sm * bs_row
+        target_n = sn * bs_col
+        pad_bottom = max(0, target_m - m)
+        pad_side = max(0, target_n - n)
         if pad_bottom or pad_side:
             weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
         weight = weight.reshape(sm, bs_row, sn, bs_col)
@@ -1129,18 +2473,48 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "synchronize": mx.synchronize,
         "moveaxis": mx.moveaxis,
         "transpose": mx.transpose,
+        "swapaxes": getattr(mx, "swapaxes", None),
+        "expand_dims": mx.expand_dims,
+        "contiguous": getattr(mx, "contiguous", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
+        "issubdtype": mx.issubdtype,
     }
+
+    def _is_plain_source(tensor):
+        return (
+            isinstance(tensor, _TrackedTensor)
+            and tensor.transform == "passthrough"
+            and not tensor.recipe
+            and len(tensor.sources) == 1
+        )
 
     def _fake_stack(tensors, axis=0):
         if tensors and isinstance(tensors[0], _TrackedTensor):
             n = len(tensors)
             base = list(tensors[0].shape)
+            axis = axis + len(base) + 1 if axis < 0 else axis
             new_shape = base[:axis] + [n] + base[axis:]
             all_src = []
             for t in tensors:
                 all_src.extend(t.sources)
+            if not all(_is_plain_source(t) for t in tensors):
+                exprs = [t.as_expr() for t in tensors]
+                if any(expr is None for expr in exprs):
+                    return _TrackedTensor(
+                        new_shape,
+                        tensors[0].dtype,
+                        all_src,
+                        "nested_unreplayable",
+                    )
+                return _TrackedTensor(
+                    new_shape,
+                    tensors[0].dtype,
+                    all_src,
+                    "expr",
+                    axis=axis,
+                    expr=("stack", axis, exprs),
+                )
             return _TrackedTensor(
                 new_shape, tensors[0].dtype, all_src, "stack", axis=axis
             )
@@ -1152,7 +2526,25 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for t in tensors:
                 all_src.extend(t.sources)
             base = list(tensors[0].shape)
+            axis = axis + len(base) if axis < 0 else axis
             base[axis] = sum(t.shape[axis] for t in tensors)
+            if not all(_is_plain_source(t) for t in tensors):
+                exprs = [t.as_expr() for t in tensors]
+                if any(expr is None for expr in exprs):
+                    return _TrackedTensor(
+                        base,
+                        tensors[0].dtype,
+                        all_src,
+                        "nested_unreplayable",
+                    )
+                return _TrackedTensor(
+                    base,
+                    tensors[0].dtype,
+                    all_src,
+                    "expr",
+                    axis=axis,
+                    expr=("concatenate", axis, exprs),
+                )
             return _TrackedTensor(
                 base, tensors[0].dtype, all_src, "concatenate", axis=axis
             )
@@ -1167,6 +2559,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 for i in range(n):
                     sh = list(tensor.shape)
                     sh[axis] = sz
+                    if tensor.transform == "nested_unreplayable":
+                        parts.append(tensor._unreplayable(shape=sh))
+                        continue
                     parts.append(
                         _TrackedTensor(
                             sh,
@@ -1184,6 +2579,10 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for i, idx in enumerate(idxs):
                 sh = list(tensor.shape)
                 sh[axis] = idx - prev
+                if tensor.transform == "nested_unreplayable":
+                    parts.append(tensor._unreplayable(shape=sh))
+                    prev = idx
+                    continue
                 parts.append(
                     _TrackedTensor(
                         sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis
@@ -1195,35 +2594,55 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
-            src_ax = src_ax % tensor.ndim if src_ax < 0 else src_ax
-            dst_ax = dst_ax % tensor.ndim if dst_ax < 0 else dst_ax
-            dims = list(range(tensor.ndim))
-            dims.insert(dst_ax, dims.pop(src_ax))
-            new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(
-                new_shape,
-                tensor.dtype,
-                list(tensor.sources),
-                f"moveaxis_{src_ax}_{dst_ax}",
-            )
+            return tensor.moveaxis(src_ax, dst_ax)
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
         if isinstance(tensor, _TrackedTensor):
             if axes is None:
                 axes = list(reversed(range(tensor.ndim)))
-            axes = [a % tensor.ndim if a < 0 else a for a in axes]
-            new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(
-                new_shape,
-                tensor.dtype,
-                list(tensor.sources),
-                "transpose_" + "_".join(str(a) for a in axes),
-            )
+            return tensor.transpose(tuple(axes))
         return _orig["transpose"](tensor, axes=axes)
+
+    def _fake_swapaxes(tensor, axis1, axis2):
+        if isinstance(tensor, _TrackedTensor):
+            return tensor.swapaxes(axis1, axis2)
+        return _orig["swapaxes"](tensor, axis1, axis2)
+
+    def _fake_expand_dims(tensor, axis, **kwargs):
+        if isinstance(tensor, _TrackedTensor):
+            return tensor.expand_dims(axis)
+        return _orig["expand_dims"](tensor, axis=axis, **kwargs)
+
+    def _fake_contiguous(tensor, *args, **kwargs):
+        if isinstance(tensor, _TrackedTensor):
+            return tensor
+        return _orig["contiguous"](tensor, *args, **kwargs)
 
     def _noop(*a, **kw):
         pass
+
+    def _fake_issubdtype(dtype, category):
+        if isinstance(dtype, str):
+            dtype = {
+                "BF16": mx.bfloat16,
+                "F16": mx.float16,
+                "F32": mx.float32,
+                "F64": mx.float32,
+                "F8_E4M3": mx.float16,
+                "F8_E5M2": mx.float16,
+                "F8_E8M0": mx.uint8,
+                "I8": mx.int8,
+                "I16": mx.int16,
+                "I32": mx.int32,
+                "I64": mx.int64,
+                "U8": mx.uint8,
+                "U16": mx.uint16,
+                "U32": mx.uint32,
+                "U64": mx.uint64,
+                "BOOL": mx.bool_,
+            }.get(dtype.upper(), dtype)
+        return _orig["issubdtype"](dtype, category)
 
     mx.stack = _fake_stack
     mx.concatenate = _fake_concatenate
@@ -1233,12 +2652,19 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
+    mx.expand_dims = _fake_expand_dims
+    mx.issubdtype = _fake_issubdtype
+    if _orig["swapaxes"] is not None:
+        mx.swapaxes = _fake_swapaxes
+    if _orig["contiguous"] is not None:
+        mx.contiguous = _fake_contiguous
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
-            return _TrackedTensor(
-                x.shape, dtype or x.dtype, list(x.sources), "from_fp8"
-            )
+            # No replay op decodes fp8, and constructing a fresh tracked
+            # tensor here would reset the accumulated recipe, so anything
+            # recorded before this point would silently vanish.
+            return x._unreplayable(dtype=dtype or x.dtype)
         return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
 
     def _fake_pad(x, pad_width, **kw):
@@ -1254,7 +2680,9 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                     new_shape.append(d + lo + hi)
                 else:
                     new_shape.append(d)
-            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+            # Same reasoning as _fake_from_fp8: no replay op pads, and a
+            # fresh tensor here would drop the recipe recorded so far.
+            return x._unreplayable(shape=new_shape)
         return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
 
     if _orig["from_fp8"] is not None:
@@ -1266,7 +2694,8 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         result = sanitize_fn(tracked)
     finally:
         for name, fn in _orig.items():
-            setattr(mx, name, fn)
+            if fn is not None:
+                setattr(mx, name, fn)
 
     # Extract plan
     _REPLAYABLE_PREFIXES = (
@@ -1279,8 +2708,11 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "transpose_",
         "moveaxis_",
         "split_",
+        "slice",
         "reshape",
         "astype",
+        "expand_dims",
+        "expr",
     )
     plan = {}
     for k, v in result.items():
@@ -1296,8 +2728,27 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "transform": t,
                 "shape": v.shape,
                 "axis": v.axis,
+                "recipe": list(v.recipe),
             }
-            if t in ("reshape", "astype"):
+            if t not in ("stack", "concatenate", "expr") and len(v.sources) != 1:
+                raise ValueError(
+                    f"single-source transform {t!r} has {len(v.sources)} sources "
+                    f"for {k!r} — falling back to eager sanitize"
+                )
+            if v.transform == "expr":
+                if v.expr is None:
+                    raise ValueError(
+                        f"missing replay expression for {k!r} — "
+                        "falling back to eager sanitize"
+                    )
+                plan[k]["expr"] = v.expr
+            if v.recipe:
+                if len(v.sources) != 1:
+                    raise ValueError(
+                        f"recipe with non-trivial sources for {k!r} — "
+                        "falling back to eager sanitize"
+                    )
+            elif t in ("reshape", "astype"):
                 # Only the LAST transform is tracked, so replay is sound
                 # only when nothing else touched the tensor: an astype must
                 # keep the source shape and a reshape must keep the source
@@ -1390,7 +2841,12 @@ class _DiscoveredPlan:
             return None
         transform = info["transform"]
         sources = info["sources"]
+        recipe = info.get("recipe") or []
         if not sources:
+            return None
+        if recipe and not (
+            transform == "reshape" and len(recipe) == 1 and recipe[0][0] == "reshape"
+        ):
             return None
         if transform not in ("passthrough", "stack") and not (
             transform == "reshape" and len(sources) == 1
@@ -1452,6 +2908,9 @@ class _DiscoveredPlan:
 
     def _materialize_source(self, src_key):
         """Load a single source tensor from the lazy index."""
+        virtual = getattr(self._lazy, "_virtual", None)
+        if virtual and src_key in virtual:
+            return self._lazy.materialize_virtual(src_key)
         if hasattr(self._lazy, "_fp8_pairs") and src_key in self._lazy._fp8_pairs:
             return self._lazy._dequant_one(src_key)
         meta = self._lazy._index.get(src_key)
@@ -1474,6 +2933,88 @@ class _DiscoveredPlan:
         mx.eval(arr)
         return arr
 
+    @staticmethod
+    def _apply_recipe(arr, recipe):
+        for op in recipe:
+            kind = op[0]
+            if kind == "reshape":
+                arr = mx.reshape(arr, op[1])
+            elif kind == "slice":
+                arr = arr[op[1]]
+            elif kind == "transpose":
+                arr = mx.transpose(arr, axes=op[1])
+            elif kind == "moveaxis":
+                arr = mx.moveaxis(arr, op[1], op[2])
+            elif kind == "astype":
+                arr = arr.astype(op[1])
+            elif kind == "expand_dims":
+                arr = mx.expand_dims(arr, axis=op[1])
+            else:
+                raise ValueError(f"unsupported replay recipe op: {kind}")
+            mx.eval(arr)
+        return arr
+
+    def _materialize_expr(self, expr):
+        kind = expr[0]
+
+        if kind == "source":
+            return self._materialize_source(expr[1])
+
+        if kind == "stack":
+            axis = expr[1]
+            children = expr[2]
+            chunk = self._STACK_CHUNK
+            partials = []
+            for base in range(0, len(children), chunk):
+                piece = [
+                    self._materialize_expr(c) for c in children[base : base + chunk]
+                ]
+                stk = mx.stack(piece, axis=axis)
+                mx.eval(stk)
+                del piece
+                mx.clear_cache()
+                partials.append(stk)
+            if len(partials) == 1:
+                return partials[0]
+            result = mx.concatenate(partials, axis=axis)
+            mx.eval(result)
+            del partials
+            mx.clear_cache()
+            return result
+
+        child_kinds = {"reshape", "slice", "transpose", "expand_dims", "astype"}
+        if kind in child_kinds:
+            arr = self._materialize_expr(expr[2])
+            if kind == "reshape":
+                result = mx.reshape(arr, expr[1])
+            elif kind == "slice":
+                result = arr[expr[1]]
+            elif kind == "transpose":
+                result = mx.transpose(arr, axes=expr[1])
+            elif kind == "expand_dims":
+                result = mx.expand_dims(arr, axis=expr[1])
+            else:
+                result = arr.astype(expr[1])
+            mx.eval(result)
+            return result
+
+        if kind == "moveaxis":
+            arr = self._materialize_expr(expr[3])
+            result = mx.moveaxis(arr, expr[1], expr[2])
+            mx.eval(result)
+            return result
+
+        if kind == "concatenate":
+            axis = expr[1]
+            parts = [self._materialize_expr(c) for c in expr[2]]
+            result = mx.concatenate(parts, axis=axis)
+            mx.eval(result)
+            del parts
+            mx.clear_cache()
+            return result
+
+        raise ValueError(f"unsupported replay expression op: {kind}")
+
     def pop(self, key, *default):
         if key not in self._plan:
             if default:
@@ -1483,9 +3024,17 @@ class _DiscoveredPlan:
         info = self._plan.pop(key)
         transform = info["transform"]
         sources = info["sources"]
+        recipe = info.get("recipe") or []
 
         if transform == "literal":
             return info["value"]
+
+        if transform == "expr":
+            return self._materialize_expr(info["expr"])
+
+        if recipe and len(sources) == 1:
+            arr = self._materialize_source(sources[0])
+            return self._apply_recipe(arr, recipe)
 
         if transform == "passthrough" and len(sources) == 1:
             arr = self._materialize_source(sources[0])
@@ -1583,21 +3132,73 @@ class _DiscoveredPlan:
         )
 
 
+def _is_qat_unquantized_config(qc) -> bool:
+    """Return True if qc is a QAT training config with full-precision weights.
+
+    Gemma 4 QAT configs carry quant_type (e.g. "q4_0") recording the training
+    regime but store weights in bfloat16 — no quant_method means no actual
+    weight quantization has been applied.
+    """
+    return (
+        isinstance(qc, dict)
+        and qc.get("quant_type") == "q4_0"
+        and "quant_method" not in qc
+    )
+
+
 def validate_quantizable(config: dict) -> bool:
     """Check if a model config indicates it can be quantized.
 
     Models with 'quantization' key (mlx-lm quantized) are excluded.
     Models with 'quantization_config' are excluded UNLESS they are native FP8
-    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format.
+    or MXFP8 (e.g. MiniMax, DeepSeek) source models whose floating-point
+    weights can be reconstructed from their block scales, or QAT-trained models
+    (e.g. Google Gemma 4 QAT variants) whose
+    quantization_config records training-time settings but whose weights are
+    stored in full precision (bfloat16/float16).
     """
     if "quantization" in config:
         return False
     if "quantization_config" in config:
         qc = config["quantization_config"]
-        if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
-            return True
+        if isinstance(qc, dict):
+            quant_method = str(qc.get("quant_method", "")).lower()
+            # Native FP8/MXFP8 sources retain floating-point weight semantics.
+            # _LazyTensorIndex reconstructs them from weight+scale pairs before
+            # applying the requested oQ/oQe format.
+            if quant_method in _NATIVE_FLOAT8_QUANT_METHODS:
+                return True
+            # compressed-tensors float-quantized (e.g. Laguna FP8) is the same
+            # situation with a different container: fp8 weights + block scales
+            # that the lazy index dequantizes on the fly.
+            if quant_method == "compressed-tensors":
+                group = qc.get("config_groups", {}).get("group_0", {})
+                fmt = qc.get("format") or group.get("format")
+                if fmt == "float-quantized":
+                    return True
+            # QAT models record training-time quant_type but weights are fp16/bf16
+            if _is_qat_unquantized_config(qc):
+                return True
         return False
     return True
+
+
+def _sensitivity_lm_config_override(config: dict) -> dict | None:
+    """Return a model_config override for mlx_lm.load when the model has a
+    QAT quantization_config that mlx-lm cannot process (missing quant_method).
+
+    mlx-lm does ``quantization_config["quant_method"]`` without a fallback, so
+    QAT configs (e.g. Google Gemma 4 QAT) raise KeyError and abort the load.
+    Passing ``{"quantization_config": None}`` via model_config causes
+    config.update() to replace the offending key before that branch runs.
+    """
+    for qc in (
+        config.get("quantization_config"),
+        config.get("text_config", {}).get("quantization_config"),
+    ):
+        if _is_qat_unquantized_config(qc):
+            return {"quantization_config": None}
+    return None
 
 
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
@@ -1654,8 +3255,56 @@ def estimate_bpw_and_size(
     # checkpoints with dtypes mx.load rejects (F8_E8M0 block scales) still
     # estimate. The logical view hides .scale companions and reports
     # pre-quantized weights at their unpacked logical shape.
-    idx = _LazyTensorIndex(weight_files)
+    idx = _LazyTensorIndex(
+        weight_files,
+        allow_mxfp8_scale_inv_passthrough=(
+            _uses_minimax_mxfp8_scale_inv_source(config)
+        ),
+        config=config,
+    )
     logical = idx.logical_metadata()
+
+    # Price on post-sanitize names when a streaming sanitize plan is
+    # discoverable — the quantization loop itself decides on those names.
+    # Some checkpoints store quantizable tensors under source names the
+    # predicate cannot see (inkling's ``experts.w13_weight`` has no
+    # ``.weight`` suffix and fuses gate+up), which priced ~97% of the
+    # model as fp16 passthrough (15.8 bpw for a 4-bit run). Falls back to
+    # the raw header names when discovery is unavailable.
+    plan_view = None
+    try:
+        _sanitize_fn = _build_model_sanitizer(
+            config,
+            model_path=source,
+            preserve_mtp=preserve_mtp,
+        )
+        if _sanitize_fn is not None:
+            _plan = _discover_sanitize_plan(_sanitize_fn, idx)
+            if _plan:
+                plan_view = _DiscoveredPlan(_plan, idx)
+    except Exception as e:
+        logger.debug("bpw estimate: sanitize-plan discovery unavailable: %s", e)
+
+    if plan_view is not None:
+        planned_logical = {}
+        for out_name, info in plan_view._plan.items():
+            if info.get("transform") == "literal":
+                continue
+            shape = tuple(info.get("shape") or ())
+            dtype = info.get("dtype")
+            sources = info.get("sources") or []
+            if dtype is None and len(sources) == 1:
+                src_meta = logical.get(sources[0])
+                if src_meta is not None:
+                    dtype = src_meta[1]
+            planned_logical[out_name] = (shape, dtype)
+        if planned_logical:
+            logical = planned_logical
+
+    def _source_quant_info(name):
+        if plan_view is not None:
+            return plan_view.source_quant_info(name)
+        return idx.source_quant_info(name)
 
     named_shapes = {}
     for name, (shape, _dtype) in logical.items():
@@ -1674,7 +3323,7 @@ def estimate_bpw_and_size(
     fixed_overrides = {}
     _pre_boost_config = {**config, "_oq_boost_map": {}}
     for _path in named_shapes:
-        _info = idx.source_quant_info(f"{_path}.weight")
+        _info = _source_quant_info(f"{_path}.weight")
         if _info is None:
             continue
         _floor_bits, _, _ = _get_predicate_bits(
@@ -1702,13 +3351,17 @@ def estimate_bpw_and_size(
                 pos_sens[str(i)] = 0.01
         config["_oq_sensitivity_map"] = pos_sens
 
+        plan_fixed_overrides = {
+            **fixed_overrides,
+            **_structural_quant_overrides(named_shapes, config, oq_level),
+        }
         plan = _build_quant_plan(
             named_shapes,
             config,
             oq_level,
             target_bpw=_level_targets[0],
             hard_cap_bpw=_level_targets[1],
-            fixed_overrides=fixed_overrides,
+            fixed_overrides=plan_fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
     else:
@@ -1740,7 +3393,7 @@ def estimate_bpw_and_size(
             continue
 
         total_params += n_elements
-        src_info = idx.source_quant_info(name)
+        src_info = _source_quant_info(name)
         if src_info is not None and bits >= src_info["bits"]:
             # Passthrough: packed weight at source bits plus one e8m0
             # uint8 scale byte per group.
@@ -1790,12 +3443,6 @@ def estimate_bpw_and_size(
             total_output_bytes = int(effective_bpw * total_params / 8)
 
     source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
-    num_shards = len(list(source.glob("*.safetensors")))
-    max_shard_size = max(
-        (sf.stat().st_size for sf in source.glob("*.safetensors")),
-        default=0,
-    )
-
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -1831,6 +3478,273 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**3:.1f} GB"
 
 
+def _emit_progress(
+    callback,
+    phase: str,
+    pct: float,
+    detail: str = "",
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """Emit progress while preserving the older two-argument callback API."""
+    if callback is None:
+        return
+    try:
+        callback(phase, pct, detail, meta or {})
+    except TypeError:
+        callback(phase, pct)
+
+
+def _system_available_memory_bytes() -> int:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return 0
+
+
+def _metal_available_memory_bytes() -> int:
+    try:
+        info = mx.device_info()
+        max_working_set = int(info.get("max_recommended_working_set_size", 0) or 0)
+    except Exception:
+        max_working_set = 0
+    if max_working_set <= 0:
+        return 0
+    try:
+        active = int(mx.get_active_memory()) + int(mx.get_cache_memory())
+    except Exception:
+        active = 0
+    return max(0, max_working_set - active)
+
+
+def _checkpoint_storage_bytes(weight_files) -> int:
+    """Return the complete on-disk size of checkpoint weight shards.
+
+    Calibration loads native quantization metadata such as FP8 block scales
+    alongside the visible model weights.  Using the logical tensor index size
+    undercounts those hidden scale tensors, so memory admission must use the
+    complete safetensors storage footprint instead.
+    """
+    total = 0
+    for path in weight_files:
+        try:
+            total += int(Path(path).stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def _calibration_resident_checkpoint_bytes(
+    model_path: str | Path,
+    config: dict,
+) -> int:
+    """Estimate checkpoint bytes touched by calibration model forwards.
+
+    Ordinary architectures retain the historical complete-file accounting.
+    Qwen4-Exp calibration reads PLE rows through SSD mmap and its manual text
+    layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
+    Safetensors headers and every other tensor remain charged to the model.
+    """
+    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
+    if not _is_qwen4_exp_config(config):
+        return checkpoint_bytes
+
+    deferred_bytes = 0
+    for path in weight_files:
+        try:
+            with path.open("rb") as file:
+                raw_size = file.read(8)
+                if len(raw_size) != 8:
+                    continue
+                header_size = _struct.unpack("<Q", raw_size)[0]
+                header = json.loads(file.read(header_size))
+        except (OSError, ValueError, _struct.error):
+            # Failure to classify a file stays conservative: charge it all.
+            continue
+        for tensor_name, metadata in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            if not (
+                _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                or _is_vision_tensor(tensor_name)
+                or tensor_name.endswith("lm_head.weight")
+            ):
+                continue
+            try:
+                start, end = metadata["data_offsets"]
+                deferred_bytes += max(0, int(end) - int(start))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return max(0, checkpoint_bytes - deferred_bytes)
+
+
+def _calibration_memory_budget(
+    checkpoint_bytes: int = 0,
+    *,
+    fallback_system_bytes: int = 0,
+) -> dict[str, int | bool]:
+    """Return the live memory budget for full-model calibration forwards.
+
+    Apple Silicon uses unified memory, but Metal exposes a recommended working
+    set that can be smaller than physical RAM. The safe capacity is therefore
+    the smaller positive value of live system memory and remaining Metal
+    working-set memory. A proportional 25% reserve scales down to 16/32 GiB
+    machines without imposing a fixed reserve that would reject every model.
+    """
+    system_available = _system_available_memory_bytes()
+    metal_available = _metal_available_memory_bytes()
+    candidates = [value for value in (system_available, metal_available) if value > 0]
+    capacity = min(candidates) if candidates else max(0, int(fallback_system_bytes))
+    model_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+    checkpoint_bytes = max(0, int(checkpoint_bytes))
+    return {
+        "system_available_bytes": int(system_available),
+        "metal_available_bytes": int(metal_available),
+        "capacity_bytes": int(capacity),
+        "model_limit_bytes": int(model_limit),
+        "reserve_bytes": max(0, int(capacity) - int(model_limit)),
+        "checkpoint_bytes": checkpoint_bytes,
+        "requires_proxy": checkpoint_bytes > model_limit,
+    }
+
+
+def _nested_config_int(config: dict, keys: tuple[str, ...], default: int = 0) -> int:
+    text_config = config.get("text_config", {})
+    for source in (config, text_config if isinstance(text_config, dict) else {}):
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return int(default)
+
+
+def _oqe_calibration_batch_plan(
+    config: dict,
+    *,
+    requested_samples: int,
+    seq_length: int,
+    model_bytes: int = 0,
+) -> dict[str, Any]:
+    """Choose an oQe calibration micro-batch from live memory and model shape."""
+    hidden_size = _nested_config_int(
+        config,
+        ("hidden_size", "model_dim", "n_embd", "d_model"),
+        default=4096,
+    )
+    num_experts = _nested_config_int(
+        config,
+        ("num_local_experts", "num_experts", "n_routed_experts"),
+        default=0,
+    )
+    top_k = _nested_config_int(
+        config,
+        ("top_k_experts", "num_experts_per_tok", "moe_top_k", "top_k"),
+        default=1,
+    )
+    route_factor = max(1, top_k if num_experts > 0 else 1)
+    sample_bytes = max(1, int(seq_length) * max(1, hidden_size) * 4 * route_factor)
+
+    # Gemma 4 E2B/E4B keeps two additional activation families alive during
+    # its layer walk: the projected per-layer inputs and the K/V tensors that
+    # the tail layers reuse.  The generic hidden-state estimate misses both
+    # and can choose a micro-batch that exhausts unified memory once oQe uses
+    # the real Gemma 4 forward contract.  Account for the persistent bf16/fp16
+    # state here without changing batch sizing for dense 26B/31B variants.
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    model_type = str(
+        text_config.get("model_type") or config.get("model_type") or ""
+    ).lower()
+    num_hidden_layers = _nested_config_int(
+        config, ("num_hidden_layers", "n_layers", "num_layers"), default=0
+    )
+    num_kv_shared_layers = _nested_config_int(
+        config, ("num_kv_shared_layers",), default=0
+    )
+    per_layer_input_size = _nested_config_int(
+        config, ("hidden_size_per_layer_input",), default=0
+    )
+    gemma4_state_bytes = 0
+    if model_type.startswith("gemma4") and (
+        num_kv_shared_layers > 0 or per_layer_input_size > 0
+    ):
+        persistent_width = max(0, num_hidden_layers) * max(0, per_layer_input_size)
+        non_shared_layers = max(0, num_hidden_layers - num_kv_shared_layers)
+        num_kv_heads = _nested_config_int(config, ("num_key_value_heads",), default=1)
+        head_dim = _nested_config_int(config, ("head_dim",), default=0)
+        global_head_dim = _nested_config_int(
+            config, ("global_head_dim",), default=head_dim
+        )
+        layer_types = text_config.get("layer_types")
+        if not isinstance(layer_types, list):
+            layer_types = config.get("layer_types")
+        if isinstance(layer_types, list) and len(layer_types) >= non_shared_layers:
+            kv_head_dims = sum(
+                global_head_dim if layer_type == "full_attention" else head_dim
+                for layer_type in layer_types[:non_shared_layers]
+            )
+        else:
+            kv_head_dims = non_shared_layers * max(head_dim, global_head_dim)
+        # Two tensors (K and V), each with num_kv_heads heads. Gemma 4 keeps
+        # these and per-layer inputs in its model dtype during calibration.
+        persistent_width += 2 * max(1, num_kv_heads) * max(0, kv_head_dims)
+        gemma4_state_bytes = max(1, int(seq_length)) * max(0, persistent_width) * 2
+        sample_bytes += gemma4_state_bytes
+
+    system_available = _system_available_memory_bytes()
+    metal_available = _metal_available_memory_bytes()
+    live_available = (
+        min(b for b in (system_available, metal_available) if b > 0)
+        if system_available > 0 or metal_available > 0
+        else 0
+    )
+    model_bytes = max(0, int(model_bytes))
+    remaining_available = max(0, live_available - model_bytes)
+
+    if live_available > 0:
+        # Cap activation materialization even on very large-memory machines:
+        # MoE capture creates large temporary NumPy arrays per module.
+        # The model is loaded lazily, so live availability still includes its
+        # future resident weights here.  Subtract the checkpoint footprint
+        # before choosing a micro-batch and allow the result to fall to one.
+        capture_budget = min(768 * 1024**2, remaining_available // 100)
+    else:
+        capture_budget = 256 * 1024**2
+
+    micro_batch_size = max(
+        1, min(int(requested_samples), capture_budget // sample_bytes)
+    )
+    hard_cap = 16 if num_experts > 0 else 32
+    micro_batch_size = max(1, min(micro_batch_size, hard_cap))
+    return {
+        "micro_batch_size": int(micro_batch_size),
+        "estimated_sample_bytes": int(sample_bytes),
+        "capture_budget_bytes": int(capture_budget),
+        "system_available_bytes": int(system_available),
+        "metal_available_bytes": int(metal_available),
+        "live_available_bytes": int(live_available),
+        "model_bytes": int(model_bytes),
+        "remaining_available_bytes": int(remaining_available),
+        "fits_one_sample": bool(
+            live_available <= 0 or remaining_available >= sample_bytes
+        ),
+        "hidden_size": int(hidden_size),
+        "num_experts": int(num_experts),
+        "top_k": int(top_k),
+        "gemma4_state_bytes": int(gemma4_state_bytes),
+        "num_hidden_layers": int(num_hidden_layers),
+        "num_kv_shared_layers": int(num_kv_shared_layers),
+        "per_layer_input_size": int(per_layer_input_size),
+    }
+
+
 _MAX_SHARD_BYTES = 5_000_000_000
 
 _SKIP_QUANT_PATTERNS = (
@@ -1861,6 +3775,21 @@ def _is_mtp_tensor(name: str) -> bool:
     return name.startswith("mtp.") or ".mtp." in name
 
 
+def _source_has_nextn_tensors(keys, config: dict) -> bool:
+    """True iff the checkpoint stores its MTP head as extra decoder layers.
+
+    DeepSeek-V3-style checkpoints (GLM-5.2 among them) keep the MTP layers
+    as ``model.layers.<num_hidden_layers + i>.*`` rather than ``mtp.*``;
+    the model patch's sanitize remaps them, so for preservation purposes
+    they count as MTP tensors even though ``_is_mtp_tensor`` (which sees
+    post-sanitize names) doesn't match them.
+    """
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
+
+    prefixes = _nextn_weight_prefixes_from_config(config)
+    return any(k.startswith(prefixes) for k in keys)
+
+
 def _normalize_mtp_in_config(config: dict) -> None:
     """Zero out MTP layer counts in the output config (in place).
 
@@ -1878,6 +3807,49 @@ def _normalize_mtp_in_config(config: dict) -> None:
         for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
             if key in text_cfg and text_cfg[key]:
                 text_cfg[key] = 0
+    # Inkling nests the declaration under a top-level mtp_config block.
+    if isinstance(config.get("mtp_config"), dict):
+        config.pop("mtp_config", None)
+    # DeepSeek-V4-Flash-0731 uses these fields as the embedded-DSpark
+    # discriminator. Leaving them behind after mtp.* tensors are stripped
+    # would make the shared Lightning MTP toggle select a missing drafter.
+    for key in (
+        "dspark_block_size",
+        "dspark_noise_token_id",
+        "dspark_target_layer_ids",
+        "dspark_markov_rank",
+        "n_mtp_layers",
+    ):
+        config.pop(key, None)
+
+
+def _normalize_text_only_in_config(config: dict) -> None:
+    """Drop multimodal metadata from a text-only output config (in place).
+
+    Same rationale as :func:`_normalize_mtp_in_config`: a text-only
+    conversion strips the vision / audio / speech tensors, so the output
+    config must not keep advertising modalities whose weights are gone.
+
+    Covers several spellings because families differ. Most VLMs nest a
+    ``vision_config``, while MiMo V2.5 instead carries a top-level
+    ``vision_model_type`` and ``processor_config``, which earlier revisions
+    of this list did not remove.
+    """
+    for key in (
+        "vision_config",
+        "vision_model_type",
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "audio_config",
+        "audio_token_id",
+        "boa_token_id",
+        "eoa_token_id",
+        "eoa_token_index",
+        "processor_config",
+    ):
+        config.pop(key, None)
 
 
 def _should_quantize_tensor(name: str, shape: tuple) -> bool:
@@ -1915,7 +3887,13 @@ def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     return w_mx
 
 
-def _build_model_sanitizer(config: dict, text_only: bool = False):
+def _build_model_sanitizer(
+    config: dict,
+    text_only: bool = False,
+    *,
+    model_path: str | Path | None = None,
+    preserve_mtp: bool = False,
+):
     """Build a sanitize function from the model class.
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
@@ -1930,12 +3908,80 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
         or None if the model class can't be loaded.
     """
     architectures = config.get("architectures", [])
+    # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
+    # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
+    # like baidu/Unlimited-OCR (UnlimitedOCRForCausalLM) and DeepSeek-OCR
+    # (DeepseekOCR2ForCausalLM) carry a vision_config but a ForCausalLM arch, so
+    # the arch-only heuristic dropped them to the mlx-lm sanitize path (which
+    # can't resolve their model_type) and shipped unsanitized vision weights.
+    model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    mlx_lm_text_only = model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
     is_vlm = (
-        any("ForConditionalGeneration" in a for a in architectures) and not text_only
-    )
+        any("ForConditionalGeneration" in a for a in architectures)
+        or _has_vision_subconfig(config)
+        or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
+    ) and not (text_only or mlx_lm_text_only)
+
+    # Serving normally registers oMLX's vendored Qwen4 implementation before
+    # mlx-vlm class lookup. Quantization does not pass through that loader.
+    # Without this setup the lookup fails, sanitize is skipped, and the raw
+    # packed MoE tensors (which lack a ``.weight`` suffix) remain BF16.
+    if _is_qwen4_exp_config(config):
+        try:
+            if model_path is not None:
+                _configure_qwen4_exp_quantization_runtime(
+                    model_path,
+                    config,
+                    preserve_mtp=preserve_mtp,
+                )
+            else:
+                from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+                    apply_mlx_vlm_qwen4_exp_compat_patch,
+                )
+
+                apply_mlx_vlm_qwen4_exp_compat_patch()
+        except Exception as patch_err:
+            logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
         try:
+            try:
+                model_type = config.get("model_type")
+                text_config = config.get("text_config")
+                text_model_type = (
+                    text_config.get("model_type")
+                    if isinstance(text_config, dict)
+                    else None
+                )
+                if model_type in ("minimax_m3", "minimax_m3_vl") or (
+                    text_model_type in ("minimax_m3", "minimax_m3_vl")
+                ):
+                    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+                        apply_mlx_vlm_minimax_m3_compat_patch,
+                    )
+
+                    apply_mlx_vlm_minimax_m3_compat_patch()
+                if model_type in ("inkling", "inkling_mm_model"):
+                    from omlx.patches.mlx_vlm_inkling_compat import (
+                        apply_mlx_vlm_inkling_compat_patch,
+                    )
+
+                    apply_mlx_vlm_inkling_compat_patch()
+                if model_type == "muse_glimmer":
+                    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+                        apply_mlx_vlm_muse_glimmer_compat_patch,
+                    )
+
+                    apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type == "glm5_next":
+                    from omlx.patches.mlx_vlm_glm5_next_compat import (
+                        apply_mlx_vlm_glm5_next_compat_patch,
+                    )
+
+                    apply_mlx_vlm_glm5_next_compat_patch()
+            except Exception as patch_err:
+                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
+
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
             # Apply mlx-vlm MTP sanitize patch so qwen3_5/qwen3_5_moe Model
@@ -1989,7 +4035,34 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
 
             def _vlm_sanitize(weights):
                 class _Proxy:
+                    # The audio-presence guard differs by arch: gemma4 checks
+                    # ``self.audio_tower``; gemma4_unified checks
+                    # ``self.embed_audio``. Expose BOTH (sentinel iff the source
+                    # config carries audio) so sanitize keeps the audio modality
+                    # for either. Missing ``embed_audio`` made gemma4_unified's
+                    # sanitize raise AttributeError, silently dropping the whole
+                    # sanitize pass → oQ shipped raw ``model.``-prefixed keys
+                    # that omlx could not load.
                     audio_tower = _AUDIO_SENTINEL
+                    embed_audio = _AUDIO_SENTINEL
+
+                    # Runtime mmap models intentionally discard checkpoint PLE
+                    # weights because DiskBackedShardedEmbedding reads them
+                    # directly. The streaming quantizer still needs those
+                    # tensors in the sanitize plan so it can write the compact
+                    # affine PLE artifact.
+                    _omlx_preserve_qwen4_ple_for_quantization = True
+
+                    # Some sanitizes call sibling instance methods (inkling's
+                    # ``self._map_llm_layer`` / ``self._map_experts``) or read
+                    # class attributes (``self._ATTN``). Resolve anything the
+                    # proxy itself lacks from the model class, binding
+                    # functions so ``self`` stays the proxy.
+                    def __getattr__(self, name):
+                        attr = getattr(model_module.Model, name)
+                        if callable(attr):
+                            return attr.__get__(self, type(self))
+                        return attr
 
                 proxy = _Proxy()
                 proxy.config = model_config
@@ -1999,12 +4072,60 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 # discovery works without instantiating the full model.
                 _lm_proxy = type("_LMProxy", (), {})()
                 _lm_proxy.args = text_config
+                if model_type == "glm5_next":
+                    attention_proxy = type("_AttentionProxy", (), {"embed_q": None})
+                    layer_proxy = type(
+                        "_LayerProxy",
+                        (),
+                        {"self_attn": attention_proxy()},
+                    )
+                    _lm_proxy.model = type(
+                        "_ModelProxy",
+                        (),
+                        {
+                            "layers": [
+                                layer_proxy()
+                                for _ in range(text_config.num_hidden_layers)
+                            ]
+                        },
+                    )()
+                    _lm_proxy.sanitize = lambda weights: model_module.LanguageModel.sanitize(
+                        _lm_proxy, weights
+                    )
+                    _vision_proxy = type("_VisionProxy", (), {})()
+                    _vision_proxy.sanitize = (
+                        lambda weights: model_module.VisionModel.sanitize(weights)
+                    )
+                    proxy.vision_model = _vision_proxy
                 proxy.language_model = _lm_proxy
-                w = model_module.Model.sanitize(proxy, weights)
+                # Model.sanitize is an instance method (self, weights) for most
+                # VLMs, but a @staticmethod (weights) for the DeepSeek-OCR family
+                # (deepseekocr / unlimited_ocr). Dispatch on the arg count so the
+                # proxy is only passed when sanitize actually takes a self.
+                _san = model_module.Model.sanitize
+                _san_argc = getattr(getattr(_san, "__code__", None), "co_argcount", 2)
+                if _san_argc >= 2:
+                    w = _san(proxy, weights)
+                else:
+                    w = _san(weights)
 
-                w = sanitize_weights(model_module.VisionModel, w, vision_config)
-                w = sanitize_weights(model_module.LanguageModel, w, text_config)
+                # Not every model package re-exports its tower classes
+                # (inkling's __init__ has no VisionModel); a missing class
+                # simply has no per-tower sanitize to run.
+                vision_cls = getattr(model_module, "VisionModel", None)
+                if vision_cls is not None and model_type != "glm5_next":
+                    w = sanitize_weights(vision_cls, w, vision_config)
+                language_cls = getattr(model_module, "LanguageModel", None)
+                if language_cls is not None and model_type != "glm5_next":
+                    w = sanitize_weights(language_cls, w, text_config)
                 return w
+
+            if model_type == "glm5_next":
+                from mlx_vlm.models.glm5_next.language import (
+                    glm5_next_cast_predicate,
+                )
+
+                _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
@@ -2018,6 +4139,14 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
     try:
         from mlx_lm.utils import _get_classes
 
+        if config.get("model_type") == "glm_moe_dsa":
+            try:
+                from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
+
+                apply_glm_moe_dsa_patch()
+            except Exception as patch_err:
+                logger.debug(f"glm_moe_dsa patch not applied: {patch_err}")
+
         # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
         # ``_get_classes(config)`` for deepseek_v4* model types succeeds.
@@ -2029,6 +4158,47 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 apply_deepseek_v4_patch()
             except Exception as patch_err:
                 logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+
+        # Laguna is likewise vendored into ``sys.modules`` by its pre-load
+        # patch; register it so sanitizer/proxy builds resolve the class.
+        if config.get("model_type") == "laguna":
+            try:
+                from omlx.patches.laguna import apply_laguna_patch
+
+                apply_laguna_patch()
+            except Exception as patch_err:
+                logger.debug(f"laguna patch not applied: {patch_err}")
+
+        # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
+        # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
+        # schema. Sanitizer/proxy discovery consumes this in-memory config
+        # directly (without ``mlx_lm.utils.load_config``), so register the
+        # model and normalize the schema before ``ModelArgs.from_dict``.
+        if config.get("model_type") == "hy_v3":
+            try:
+                from omlx.patches.hy_v3 import apply_hy_v3_patch
+                from omlx.utils.model_loading import normalize_hy_v3_rope_config
+
+                normalize_hy_v3_rope_config(config)
+                apply_hy_v3_patch()
+            except Exception as patch_err:
+                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+
+        if config.get("model_type") == "mimo_v2":
+            try:
+                from omlx.patches.mimo_v2 import apply_mimo_v2_patch
+
+                apply_mimo_v2_patch()
+            except Exception as patch_err:
+                logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+
+        if config.get("model_type") == "bailing_hybrid":
+            try:
+                from omlx.patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+                apply_bailing_hybrid_patch()
+            except Exception as patch_err:
+                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -2087,6 +4257,76 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
     return None
 
 
+_SIDECAR_PATTERNS = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "generation_config.json",
+    "chat_template.json",
+    "chat_template.jinja",
+    "added_tokens.json",
+    "merges.txt",
+    "vocab.json",
+)
+
+# Processor configs describe image / audio preprocessing. A text-only
+# conversion has no vision or audio weights, so copying these advertises an
+# input the artifact cannot accept.
+_MULTIMODAL_SIDECAR_PATTERNS = (
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+
+def _holds_chat_template(path: Path) -> bool:
+    """Whether a processor config carries a chat template inline.
+
+    Current Transformers writes chat templates to their own file, but older
+    processor repos keep one under a ``chat_template`` key inside
+    ``processor_config.json`` / ``preprocessor_config.json``, and Transformers
+    still honours it on load. Such a file has to be kept even for a text-only
+    output, because dropping it would silently take the model's chat template
+    with it.
+
+    An unreadable or non-JSON file counts as carrying one: preserving a file
+    we cannot parse is the cheaper mistake.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return True
+        return data.get("chat_template") is not None
+    except (OSError, ValueError):
+        return True
+
+
+def _copy_model_sidecars(
+    source: Path, output: Path, *, text_only: bool = False
+) -> None:
+    """Copy tokenizer/processor sidecar files needed to load the output.
+
+    ``text_only`` skips the multimodal processor configs, matching the
+    modality metadata that :func:`_normalize_text_only_in_config` drops from
+    the output config. A processor config that carries an inline chat
+    template is kept regardless, since that template is not modality
+    metadata and may be the only copy.
+    """
+    for pattern in _SIDECAR_PATTERNS:
+        for src_file in source.glob(pattern):
+            shutil.copy2(src_file, output / src_file.name)
+
+    for pattern in _MULTIMODAL_SIDECAR_PATTERNS:
+        for src_file in source.glob(pattern):
+            if text_only and not _holds_chat_template(src_file):
+                continue
+            shutil.copy2(src_file, output / src_file.name)
+
+    for py_file in source.glob("*.py"):
+        shutil.copy2(py_file, output / py_file.name)
+
+
 def _build_non_quantizable_set(config: dict) -> set:
     """Find module paths with 2D weights that lack to_quantized() support.
 
@@ -2129,18 +4369,21 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     Qwen3.5-27B accepted 0/157 cycles). PR 990 protects ``mtp.fc`` for
     Qwen3.5/3.6; PR 15's DeepSeek-V4 ``MTPBlock`` exposes the same
     semantics under different names (``e_proj`` + ``h_proj`` for the
-    embedding/hidden fusion; ``hc_head.*`` for the final projection).
-    All of these stay in full precision; the MTP block's internal
-    DeepseekV4Block (attn/ffn) gets the same quantization as the
-    backbone's other layers.
+    embedding/hidden fusion; ``hc_head.*`` for the final projection);
+    GLM-5.2's ``GlmMTPBlock`` calls it ``eh_proj``. All of these stay in
+    full precision; the MTP block's internal decoder block (attn/ffn)
+    gets the same quantization as the backbone's other layers.
     """
     if not (name.startswith("mtp.") or ".mtp." in name):
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
-    # DeepSeek-V4 MTPBlock fusion projections
-    if name.endswith(".e_proj.weight") or name.endswith(".h_proj.weight"):
+    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections. Embedded DSpark
+    # combines target-layer taps through main_proj instead of e_proj/h_proj.
+    if name.endswith(
+        (".e_proj.weight", ".h_proj.weight", ".eh_proj.weight", ".main_proj.weight")
+    ):
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
@@ -2151,6 +4394,11 @@ def _is_mtp_protected_tensor(name: str) -> bool:
         or name.endswith(".hc_head_base")
         or name.endswith(".hc_head_scale")
     ):
+        return True
+    # DSpark's rank-R Markov transition is added directly to draft logits;
+    # quantizing it can change every proposal distribution. The confidence
+    # head is tiny and precision-sensitive, so neither is worth compressing.
+    if ".markov_head." in name or ".confidence_head." in name:
         return True
     return False
 
@@ -2169,6 +4417,14 @@ def _get_predicate_bits(
 
     base_bits = _base_bits_for_level(oq_level)
 
+    # Qwen4-Exp's PLE rows are 160 elements wide, so the default group size
+    # 64 leaves the 100 GB N-gram table unquantized. Keep the table uniform at
+    # the selected oQ level and use the group-32 layout published by existing
+    # Qwen4-Exp quantizations. Embeddings have no input-channel imatrix entry;
+    # the streaming loop deliberately applies ordinary affine quantization.
+    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config):
+        return base_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
+
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
         return None, None, None
@@ -2176,8 +4432,33 @@ def _get_predicate_bits(
         bits = result.get("bits", base_bits)
         gs = result.get("group_size", group_size)
         mode = result.get("mode", _mode_for_bits(bits))
+        if _is_mtp_tensor(tensor_name):
+            raised = _mtp_bits_override(bits)
+            if raised != bits:
+                # Floor lift re-derives mode and group size; unchanged bits
+                # keep the predicate's choice (e.g. mxfp8 head projections).
+                bits, mode = raised, _mode_for_bits(raised)
+                gs = _gs_for_mode(raised, group_size)
         return bits, gs, mode
-    return base_bits, _gs_for_mode(base_bits, group_size), _mode_for_bits(base_bits)
+    bits = base_bits
+    if _is_mtp_tensor(tensor_name):
+        bits = _mtp_bits_override(bits)
+    return bits, _gs_for_mode(bits, group_size), _mode_for_bits(bits)
+
+
+# Minimum bits for quantized MTP-head tensors. Sub-4-bit oQ levels drag the
+# head down with the trunk (DeepSeek-V4 oQ2.5e stored its head's routed
+# experts and attention at 2-bit gs64), but the head only shapes drafts —
+# every emitted token is trunk-verified — so its footprint (~2 GB on
+# DeepSeek-V4-Flash, ~15 MB on Qwen3.6) buys draft acceptance directly and
+# costs almost nothing relative to the model.
+_MTP_MIN_BITS = 4
+
+
+def _mtp_bits_override(bits: int) -> int:
+    if bits and bits < _MTP_MIN_BITS:
+        return _MTP_MIN_BITS
+    return bits
 
 
 def _mode_for_bits(bits: int) -> str:
@@ -2191,7 +4472,6 @@ def _gs_for_mode(bits: int, default_gs: int) -> int:
 
 
 # --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
-import struct as _struct
 import numpy as _np
 
 
@@ -2211,6 +4491,15 @@ def _metal_max_buffer_bytes() -> int:
 _METAL_MAX_BUFFER = _metal_max_buffer_bytes()
 _QUANTIZE_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 4)
 _LOAD_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 2)
+
+
+class _VirtualTensor(NamedTuple):
+    """A logical tensor produced on demand from hidden on-disk sources."""
+
+    shape: tuple
+    dtype: str
+    materialize: Callable
+    hides: tuple
 
 
 class _LazyTensorIndex:
@@ -2233,7 +4522,14 @@ class _LazyTensorIndex:
         "F8_E8M0": 1,
     }
 
-    def __init__(self, weight_files):
+    def __init__(
+        self,
+        weight_files,
+        *,
+        allow_mxfp8_scale_inv_passthrough: bool = False,
+        config: dict | None = None,
+    ):
+        self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -2254,7 +4550,89 @@ class _LazyTensorIndex:
         self._fp8_pairs = {}
         self._fp8_scale_keys = set()
         self._src_quant = {}
+        # Virtual tensors: logical keys computed on demand from one or more
+        # on-disk tensors, for layouts the model's sanitize would otherwise
+        # have to restructure (see patches/virtual_tensors.py). ``_hidden``
+        # holds the source keys they consume; those leave the logical view.
+        self._virtual: dict[str, _VirtualTensor] = {}
+        self._hidden = set()
+        # Eager replacements written back by a caller (e.g. an eager
+        # sanitize). Always present so the view methods need no guards.
+        self._overrides: dict = {}
         self._discover_fp8_pairs()
+        self._register_virtual_tensors(config)
+
+    def _register_virtual_tensors(self, config):
+        """Let model-specific registrars declare virtual tensors.
+
+        Deliberately not guarded: a registrar that recognises this checkpoint
+        but cannot make sense of its geometry must abort the run rather than
+        leave the original layout in place, which would quantize silently
+        wrong weights.
+        """
+        if not config:
+            return
+        from .patches.virtual_tensors import register_virtual_tensors
+
+        register_virtual_tensors(self, config)
+
+    def register_virtual(self, key, shape, dtype, materializer, *, hides=()):
+        """Declare ``key`` as produced on demand by ``materializer``.
+
+        ``shape``/``dtype`` describe the logical tensor as sanitize and the
+        quantization planner should see it (safetensors dtype spelling, e.g.
+        ``"BF16"``). ``hides`` lists the on-disk keys it is derived from; they
+        stay readable via :meth:`load_source` but disappear from the logical
+        view so sanitize never sees the pre-restructure layout.
+        """
+        self._virtual[key] = _VirtualTensor(
+            tuple(shape), dtype, materializer, tuple(hides)
+        )
+        self._hidden.update(hides)
+
+    def materialize_virtual(self, key):
+        """Produce a virtual tensor's value."""
+        return self._virtual[key].materialize()
+
+    def _forget_virtual(self, key) -> None:
+        """Drop a virtual tensor, and un-hide sources nothing else claims.
+
+        Removal has to undo the hiding too, or a deleted virtual key would
+        leave its sources permanently invisible: they would be readable via
+        :meth:`load_source` but absent from every enumeration.
+        """
+        entry = self._virtual.pop(key, None)
+        if entry is None:
+            return
+        still_hidden = set()
+        for other in self._virtual.values():
+            still_hidden.update(other.hides)
+        for src in entry.hides:
+            if src not in still_hidden:
+                self._hidden.discard(src)
+
+    def source_shape(self, key):
+        """On-disk shape of ``key``, or None when absent.
+
+        Reads the safetensors header only — visibility and pairing are
+        ignored, so registrars can inspect keys they are about to hide.
+        """
+        meta = self._index.get(key)
+        return None if meta is None else meta[4]
+
+    def source_dtype(self, key):
+        """Safetensors dtype spelling for ``key``, or None when absent.
+
+        Model-specific virtual-tensor registrars use this alongside
+        :meth:`source_shape` to distinguish packed storage from an already
+        materialized floating-point checkpoint without reading tensor data.
+        """
+        meta = self._index.get(key)
+        return None if meta is None else meta[5]
+
+    def load_source(self, key):
+        """Load an on-disk tensor verbatim, bypassing fp8 pairing."""
+        return self._load_raw(key)
 
     def _discover_fp8_pairs(self):
         seen = set()
@@ -2270,6 +4648,17 @@ class _LazyTensorIndex:
                     seen.add(wk)
             elif k.endswith(".scale"):
                 wk = k[: -len(".scale")] + ".weight"
+                if (
+                    wk in self._index
+                    and wk not in seen
+                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                ):
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
+            elif k.endswith(".weight_scale"):
+                # compressed-tensors float-quantized (e.g. Laguna FP8):
+                # X.weight (F8_E4M3) + X.weight_scale (f32 block scales).
+                wk = k[: -len("_scale")]
                 if (
                     wk in self._index
                     and wk not in seen
@@ -2297,9 +4686,31 @@ class _LazyTensorIndex:
         """
         w_shape, w_dtype = self._index[wk][4], self._index[wk][5]
         s_shape, s_dtype = self._index[sk][4], self._index[sk][5]
-        if len(w_shape) != 2 or len(s_shape) != 2 or not sk.endswith(".scale"):
+        if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
+        # MiniMax MXFP8 checkpoints store E8M0 exponent bytes under the
+        # ``weight_scale_inv`` suffix even though the model sanitizer passes
+        # them directly to MLX as ``.scales``. Enable this only from an
+        # explicit MiniMax+MXFP8 config so ordinary vLLM scale-inverse FP8
+        # checkpoints retain the conservative dequantize/requantize path.
+        if (
+            self._allow_mxfp8_scale_inv_passthrough
+            and sk.endswith(".weight_scale_inv")
+            and w_dtype == "F8_E4M3"
+            and s_dtype == "U8"
+            and cols % 32 == 0
+            and cols % 4 == 0
+            and tuple(s_shape) == (rows, cols // 32)
+        ):
+            return {
+                "kind": "minimax_mxfp8",
+                "bits": 8,
+                "group_size": 32,
+                "mode": "mxfp8",
+            }
+        if not sk.endswith(".scale"):
+            return None
         # FP4-packed experts (DeepSeek V4): int8 bytes carry 2 fp4 values
         # each, e8m0 scale per 32 logical values -> 16 bytes per group.
         if (
@@ -2385,13 +4796,13 @@ class _LazyTensorIndex:
         return self._src_quant.get(key)
 
     def _is_visible(self, k):
-        return k not in self._fp8_scale_keys
+        return k not in self._fp8_scale_keys and k not in self._hidden
 
     def logical_metadata(self):
         """Metadata for plan discovery: FP8 weights report as BF16, scale keys hidden."""
         result = {}
         for k, meta in self._index.items():
-            if k in self._fp8_scale_keys:
+            if not self._is_visible(k):
                 continue
             shape, dtype = meta[4], meta[5]
             if k in self._fp8_pairs:
@@ -2401,39 +4812,50 @@ class _LazyTensorIndex:
                     # FP4-packed bytes: logical width is 2 values per byte.
                     shape = (shape[0], shape[1] * 2)
             result[k] = (shape, dtype)
+        for k, entry in self._virtual.items():
+            result[k] = (entry.shape, entry.dtype)
         return result
 
+    def __iter__(self):
+        """The logical key set: visible on-disk keys, then virtual, then
+        overrides, each name yielded once.
+
+        The single statement of that rule. ``keys``, ``__len__`` and
+        ``items`` all derive from it so a new logical-key source cannot be
+        added to some enumerations and forgotten in others.
+        """
+        seen = set()
+        for k in self._index:
+            if self._is_visible(k):
+                seen.add(k)
+                yield k
+        for k in self._virtual:
+            if k not in seen:
+                seen.add(k)
+                yield k
+        for k in self._overrides:
+            if k not in seen:
+                yield k
+
     def keys(self):
-        base = [k for k in self._index if self._is_visible(k)]
-        if hasattr(self, "_overrides"):
-            base.extend(self._overrides.keys())
-        return base
+        return list(self)
 
     def __len__(self):
-        n = sum(1 for k in self._index if self._is_visible(k))
-        if hasattr(self, "_overrides"):
-            n += len(self._overrides)
-        return n
+        return sum(1 for _ in self)
 
     def __contains__(self, k):
         if k in self._index and self._is_visible(k):
             return True
-        return hasattr(self, "_overrides") and k in self._overrides
-
-    def __iter__(self):
-        for k in self._index:
-            if self._is_visible(k):
-                yield k
-        if hasattr(self, "_overrides"):
-            for k in self._overrides:
-                if k not in self._index:
-                    yield k
+        return k in self._virtual or k in self._overrides
 
     def nbytes(self):
+        # Bytes we will actually read off disk. Hidden keys still count —
+        # they back virtual tensors and are read on demand — while scale
+        # keys stay excluded because they fold into their weight.
         return sum(
             e - s
             for k, (_, _, s, e, _, _) in self._index.items()
-            if self._is_visible(k)
+            if k not in self._fp8_scale_keys
         )
 
     def _load_raw(self, key):
@@ -2442,8 +4864,10 @@ class _LazyTensorIndex:
         return lt[:]
 
     def __getitem__(self, key):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides[key]
+        if key in self._virtual:
+            return self.materialize_virtual(key)
         if key not in self._index:
             raise KeyError(key)
         if key in self._fp8_pairs:
@@ -2451,14 +4875,11 @@ class _LazyTensorIndex:
         return self._load_raw(key)
 
     def items(self):
-        for k in list(self._index.keys()):
-            if not self._is_visible(k):
-                continue
+        # Snapshot the key set: consumers (eager sanitize) mutate while
+        # iterating, and materializing is what makes this worth streaming.
+        for k in list(self):
             yield k, self[k]
             mx.clear_cache()
-        if hasattr(self, "_overrides"):
-            for k, v in self._overrides.items():
-                yield k, v
 
     def get(self, key, default=None):
         if key in self:
@@ -2466,22 +4887,21 @@ class _LazyTensorIndex:
         return default
 
     def __setitem__(self, key, value):
-        if not hasattr(self, "_overrides"):
-            self._overrides = {}
         self._overrides[key] = value
         self._index.pop(key, None)
         self._fp8_pairs.pop(key, None)
         self._src_quant.pop(key, None)
+        self._forget_virtual(key)
 
     def __delitem__(self, key):
         if key in self._fp8_pairs:
             sk = self._fp8_pairs.pop(key)
             self._fp8_scale_keys.discard(sk)
             self._index.pop(sk, None)
+        self._forget_virtual(key)
         self._index.pop(key, None)
         self._src_quant.pop(key, None)
-        if hasattr(self, "_overrides"):
-            self._overrides.pop(key, None)
+        self._overrides.pop(key, None)
 
     def update(self, other):
         if hasattr(other, "items"):
@@ -2492,8 +4912,12 @@ class _LazyTensorIndex:
                 self[k] = v
 
     def pop(self, key, *default):
-        if hasattr(self, "_overrides") and key in self._overrides:
+        if key in self._overrides:
             return self._overrides.pop(key)
+        if key in self._virtual:
+            result = self.materialize_virtual(key)
+            self._forget_virtual(key)
+            return result
         if key not in self._index:
             if default:
                 return default[0]
@@ -2638,6 +5062,41 @@ def _tensor_shape_nbytes(shape, bytes_per_element: int) -> int:
     return n * bytes_per_element
 
 
+def _logical_footprint_bytes(index) -> int:
+    """Bytes in the dequantized logical view exposed by ``index``.
+
+    The lazy index's logical view already reports every tensor at its
+    post-dequantization shape and dtype: native fp8 weights as bf16, packed
+    fp4 experts at two values per stored byte, virtual tensors at the shape
+    they will be produced in, and folded-away scale companions not at all.
+    This is the resident calibration footprint for sources whose model
+    sanitizer materializes that view. Sources calibrated as quantized modules
+    remain packed and are handled by :func:`_calibration_footprint_bytes`.
+    """
+    if not hasattr(index, "logical_metadata"):
+        return 0
+    total = 0
+    for shape, dtype in index.logical_metadata().values():
+        total += _tensor_shape_nbytes(
+            shape, _LazyTensorIndex._DTYPE_BYTES.get(dtype, 2)
+        )
+    return total
+
+
+def _calibration_footprint_bytes(index, storage_bytes: int, config: dict) -> int:
+    """Estimate resident model bytes for the selected calibration load path.
+
+    MiMo-style native FP8 sources are dequantized by model sanitize, so their
+    logical BF16 view determines admission. MiniMax MXFP8 and DeepSeek V4 FP4
+    sources take the quantized-source sensitivity path and remain packed in
+    quantized modules; pricing those as BF16 would force an unnecessary proxy.
+    """
+    storage_bytes = max(0, int(storage_bytes))
+    if _uses_quantized_source_sensitivity(config):
+        return storage_bytes
+    return max(storage_bytes, _logical_footprint_bytes(index))
+
+
 def _progress_total_bytes(all_weights, source: Path) -> int:
     """Conservative denominator for streaming quantization progress.
 
@@ -2681,7 +5140,441 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     return max(1, *candidates)
 
 
-def _row_chunks(t, max_elems):
+def _imatrix_metadata_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".json")
+
+
+def _source_imatrix_signature(
+    source: Path,
+    config: dict,
+    *,
+    num_samples: int,
+    seq_length: int,
+    calib_dataset: str,
+) -> dict[str, Any]:
+    """Build a cheap invalidation signature for an oQe imatrix cache."""
+    stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
+    cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
+    h = hashlib.sha256(cfg_bytes)
+    for sf in sorted(source.glob("*.safetensors")):
+        st = sf.stat()
+        h.update(sf.name.encode("utf-8"))
+        h.update(str(st.st_size).encode("ascii"))
+        h.update(str(int(st.st_mtime_ns)).encode("ascii"))
+    calib_hash = ""
+    if calib_dataset == _OQE_CALIB_DATASET:
+        data_path = Path(__file__).parent / "oqe_calibration_data.json"
+    elif calib_dataset in ("code_multilingual", "code", "multilingual"):
+        data_path = Path(__file__).parent / "oq_calibration_data.json"
+    else:
+        data_path = None
+    if data_path is not None and data_path.exists():
+        ch = hashlib.sha256()
+        with open(data_path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                ch.update(block)
+        calib_hash = ch.hexdigest()
+    signature = {
+        "format": _OQE_IMATRIX_FORMAT,
+        "model_name": source.name,
+        "source_hash": h.hexdigest(),
+        "calib_dataset": calib_dataset,
+        "calib_data_hash": calib_hash,
+        "num_samples": int(num_samples),
+        "seq_length": int(seq_length),
+    }
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    model_type = str(
+        text_config.get("model_type") or config.get("model_type") or ""
+    ).lower()
+    if model_type.startswith("gemma4") and (
+        _nested_config_int(config, ("num_kv_shared_layers",), default=0) > 0
+        or _nested_config_int(config, ("hidden_size_per_layer_input",), default=0) > 0
+    ):
+        # Invalidate caches produced by the old independent-block walk, which
+        # captured only q_proj in the shared-KV tail of E2B/E4B.
+        signature["layer_walk"] = "gemma4_shared_kv_v1"
+    elif str(config.get("model_type", "")).lower() == "glm5_next":
+        # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
+        # capture. Older caches completed without either and must not be reused.
+        signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
+    return signature
+
+
+def _save_oqe_imatrix(
+    path: Path,
+    entries: dict[str, OQImatrixEntry],
+    metadata: dict[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {}
+    for name, entry in sorted(entries.items()):
+        arrays[f"{name}.in_sum2"] = np.asarray(entry.in_sum2, dtype=np.float32)
+        arrays[f"{name}.counts"] = np.asarray(entry.counts, dtype=np.int64)
+    np.savez_compressed(path, **arrays)
+    _imatrix_metadata_path(path).write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_oqe_imatrix(path: Path) -> OQImatrixData:
+    metadata_path = _imatrix_metadata_path(path)
+    metadata = {}
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    entries: dict[str, OQImatrixEntry] = {}
+    with np.load(path, allow_pickle=False) as data:
+        names = {
+            key[: -len(".in_sum2")] for key in data.files if key.endswith(".in_sum2")
+        }
+        for name in names:
+            counts_key = f"{name}.counts"
+            if counts_key not in data.files:
+                continue
+            entries[name] = OQImatrixEntry(
+                in_sum2=np.asarray(data[f"{name}.in_sum2"], dtype=np.float32),
+                counts=np.asarray(data[counts_key], dtype=np.int64),
+            )
+    return OQImatrixData(entries=entries, metadata=metadata, path=str(path))
+
+
+def _oqe_cache_matches(cache: OQImatrixData, expected: dict[str, Any]) -> bool:
+    return all(cache.metadata.get(k) == v for k, v in expected.items())
+
+
+def _oqe_cache_has_required_expert_coverage(
+    cache: OQImatrixData,
+) -> bool:
+    collection = cache.metadata.get("collection")
+    require_expert_counts = bool(cache.metadata.get("requires_expert_counts", False))
+    if isinstance(collection, dict):
+        require_expert_counts = bool(
+            collection.get("requires_expert_counts", require_expert_counts)
+        )
+    if not require_expert_counts:
+        return True
+    coverage = cache.metadata.get("expert_coverage")
+    if not isinstance(coverage, dict):
+        if isinstance(collection, dict):
+            coverage = collection.get("coverage")
+    return isinstance(coverage, dict) and bool(coverage.get("has_expert_counts", False))
+
+
+def _normalised_imatrix_values(entry: OQImatrixEntry) -> np.ndarray:
+    sums = np.asarray(entry.in_sum2, dtype=np.float32)
+    counts = np.asarray(entry.counts, dtype=np.float32)
+    if counts.ndim == 0:
+        count = float(counts.item())
+        return sums / count if count > 0 else np.ones_like(sums, dtype=np.float32)
+    if counts.size == 1:
+        count = float(counts.reshape(-1)[0])
+        return sums / count if count > 0 else np.ones_like(sums, dtype=np.float32)
+    flat = sums.reshape(counts.size, -1)
+    denom = counts.reshape(-1, 1)
+    values = np.divide(
+        flat,
+        np.maximum(denom, 1.0),
+        out=np.ones_like(flat, dtype=np.float32),
+        where=denom > 0,
+    )
+    return values.reshape(sums.shape)
+
+
+def _imatrix_expert_coverage_stats(
+    entries: dict[str, OQImatrixEntry],
+) -> dict[str, Any]:
+    """Summarise expert coverage across collected SwitchLinear entries."""
+    expert_counts = []
+    expert_modules = 0
+    for entry in entries.values():
+        counts = np.asarray(entry.counts, dtype=np.int64).reshape(-1)
+        if counts.size <= 1:
+            continue
+        expert_modules += 1
+        expert_counts.append(counts)
+
+    if not expert_counts:
+        return {
+            "has_expert_counts": False,
+            "expert_modules": 0,
+            "total_experts": 0,
+            "active_experts": 0,
+            "zero_count_experts": 0,
+            "active_ratio": 1.0,
+            "min_count": 0,
+            "p05_count": 0.0,
+            "p10_count": 0.0,
+            "median_count": 0.0,
+            "max_count": 0,
+            "min_required_count": _OQE_MIN_EXPERT_COUNT,
+            "required_percentile": _OQE_MIN_EXPERT_COUNT_PERCENTILE,
+        }
+
+    counts = np.concatenate(expert_counts)
+    total = int(counts.size)
+    zero = int((counts <= 0).sum())
+    return {
+        "has_expert_counts": True,
+        "expert_modules": int(expert_modules),
+        "total_experts": total,
+        "active_experts": total - zero,
+        "zero_count_experts": zero,
+        "active_ratio": float((total - zero) / max(total, 1)),
+        "min_count": int(counts.min()) if total else 0,
+        "p05_count": float(np.percentile(counts, 5)) if total else 0.0,
+        "p10_count": float(np.percentile(counts, 10)) if total else 0.0,
+        "median_count": float(np.percentile(counts, 50)) if total else 0.0,
+        "max_count": int(counts.max()) if total else 0,
+        "min_required_count": _OQE_MIN_EXPERT_COUNT,
+        "required_percentile": _OQE_MIN_EXPERT_COUNT_PERCENTILE,
+    }
+
+
+def _config_expects_moe_expert_counts(config: dict) -> bool:
+    """Return True when the model config describes routed MoE experts."""
+    configs = [config]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        configs.append(text_config)
+    ffn_config = config.get("ffn_config")
+    if isinstance(ffn_config, dict):
+        configs.append(ffn_config)
+
+    for cfg in configs:
+        for key in (
+            "n_routed_experts",
+            "num_experts",
+            "num_local_experts",
+            "moe_num_experts",
+        ):
+            try:
+                if int(cfg.get(key) or 0) > 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _imatrix_requires_expert_counts(config: dict, switch_capture_modules: int) -> bool:
+    return switch_capture_modules > 0 and _config_expects_moe_expert_counts(config)
+
+
+def _imatrix_expert_coverage_sufficient(
+    stats: dict[str, Any],
+    *,
+    require_expert_counts: bool = False,
+) -> bool:
+    if not stats.get("has_expert_counts", False):
+        return not require_expert_counts
+    required_key = f"p{_OQE_MIN_EXPERT_COUNT_PERCENTILE:02d}_count"
+    return (
+        int(stats.get("zero_count_experts", 0)) == 0
+        and float(stats.get(required_key, 0.0)) >= _OQE_MIN_EXPERT_COUNT
+    )
+
+
+def _lookup_imatrix_importance(
+    imatrix: OQImatrixData | None,
+    tensor_name: str,
+    shape: tuple[int, ...],
+    *,
+    config: dict | None = None,
+    strict: bool,
+    report: dict[str, Any] | None,
+):
+    if imatrix is None or not tensor_name.endswith(".weight"):
+        return None
+    if config is not None and _is_qwen4_exp_ngram_embedding_tensor(
+        tensor_name, config
+    ):
+        # The collector measures Linear/SwitchLinear input channels, not
+        # embedding rows. Do not turn the intentionally uniform PLE policy
+        # into a missing-entry error under imatrix_strict.
+        return None
+    if _is_token_embedding_tensor(tensor_name):
+        # Embedding columns are gathered by token id, not consumed as input
+        # activation channels, so a Linear-style imatrix entry cannot exist.
+        return None
+
+    base = tensor_name[: -len(".weight")]
+    entry = imatrix.entries.get(base)
+    if entry is None and config is not None:
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type") if isinstance(text_config, dict) else None
+        )
+        if (
+            config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
+        ) and base.endswith(".self_attn.indexer.weights_proj"):
+            # The GLM-5.3 indexer feeds the same hidden-state input to wk and
+            # weights_proj. Short calibration sequences bypass sparse scoring
+            # after wk, before weights_proj is called, so its wrapper cannot
+            # collect a separate entry. Reuse the mathematically identical wk
+            # input-channel statistics instead of weakening strict coverage.
+            wk_base = base[: -len("weights_proj")] + "wk"
+            entry = imatrix.entries.get(wk_base)
+    if entry is None:
+        if report is not None:
+            report["missing"].append(base)
+        if strict:
+            raise RuntimeError(f"oQe imatrix missing entry for {base}")
+        return None
+
+    values = _normalised_imatrix_values(entry)
+    in_dim = int(shape[-1])
+    if values.ndim == 1 and values.shape[0] == in_dim:
+        if report is not None:
+            report["applied"].append(base)
+        return mx.array(values)
+
+    if values.ndim == 2 and values.shape[-1] == in_dim:
+        if len(shape) >= 3 and int(shape[0]) == int(values.shape[0]):
+            if report is not None:
+                report["applied"].append(base)
+                zero_count = int((np.asarray(entry.counts) <= 0).sum())
+                report["zero_count_experts"] += zero_count
+            return mx.array(values)
+
+    if report is not None:
+        report["mismatched"].append(
+            {
+                "tensor": base,
+                "weight_shape": list(shape),
+                "imatrix_shape": list(values.shape),
+            }
+        )
+    if strict:
+        raise RuntimeError(
+            f"oQe imatrix shape mismatch for {base}: "
+            f"weight={shape}, imatrix={values.shape}"
+        )
+    return None
+
+
+def _affine_minmax_params(grouped, bits: int):
+    n_bins = mx.array((1 << bits) - 1, mx.float32)
+    eps = mx.array(1e-7, mx.float32)
+    zero = mx.array(0.0, mx.float32)
+    w_max = mx.max(grouped, axis=-1, keepdims=True).astype(mx.float32)
+    w_min = mx.min(grouped, axis=-1, keepdims=True).astype(mx.float32)
+    mask = mx.abs(w_min) > mx.abs(w_max)
+    scales = mx.maximum((w_max - w_min) / n_bins, eps)
+    scales = mx.where(mask, scales, -scales)
+    edge = mx.where(mask, w_min, w_max)
+    q0 = mx.round(edge / scales)
+    scales = mx.where(q0 != zero, edge / q0, scales)
+    biases = mx.where(q0 == zero, zero, edge)
+    return scales, biases
+
+
+def _pack_affine_codes(w, scales, biases, group_size: int, bits: int):
+    orig = tuple(w.shape)
+    grouped = w.reshape(-1, orig[-1] // group_size, group_size)
+    n_bins = mx.array((1 << bits) - 1, mx.float32)
+    codes = mx.clip(mx.round((grouped - biases) / scales), 0, n_bins).astype(mx.uint32)
+
+    el_per_int = 32 // bits
+    if bits in (2, 4, 8):
+        shifts = mx.power(
+            mx.array(2, mx.uint32),
+            mx.arange(0, 32, bits, dtype=mx.uint32),
+        )
+        packed = codes.reshape(codes.shape[0], -1, el_per_int)
+        packed = mx.sum(packed * shifts, axis=2)
+    else:
+        bits_arange = mx.arange(bits, dtype=mx.uint32)
+        bit_values = mx.bitwise_and(mx.right_shift(codes[..., None], bits_arange), 1)
+        bit_values = bit_values.reshape(codes.shape[0], -1, 32)
+        shifts = mx.arange(32, dtype=mx.uint32)
+        packed = mx.sum(mx.left_shift(bit_values, shifts), axis=-1)
+
+    packed_shape = (*orig[:-1], orig[-1] * bits // 32)
+    return packed.reshape(packed_shape)
+
+
+def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
+    """Quantize with a small imatrix-weighted clipping search.
+
+    The output layout intentionally matches ``mx.quantize(..., mode="affine")``.
+    """
+    orig = tuple(w.shape)
+    grouped = w.reshape(-1, orig[-1] // group_size, group_size)
+    grouped_f = grouped.astype(mx.float32)
+
+    imp = importance
+    if not isinstance(imp, mx.array):
+        imp = mx.array(imp)
+    if tuple(imp.shape) == (orig[-1],):
+        imp = mx.broadcast_to(imp, orig)
+    elif len(orig) >= 3 and tuple(imp.shape) == (orig[0], orig[-1]):
+        imp = mx.broadcast_to(imp[:, None, :], orig)
+    else:
+        imp = mx.broadcast_to(imp, orig)
+    imp = imp.reshape(grouped.shape).astype(mx.float32)
+    imp = mx.maximum(imp, mx.array(1e-8, mx.float32))
+
+    base_scales, base_biases = _affine_minmax_params(grouped_f, bits)
+    best_scales = base_scales
+    best_biases = base_biases
+    best_codes = mx.clip(
+        mx.round((grouped_f - base_biases) / base_scales),
+        0,
+        mx.array((1 << bits) - 1, mx.float32),
+    )
+    best_err = mx.sum(
+        imp * (grouped_f - (best_codes * base_scales + base_biases)) ** 2,
+        axis=-1,
+        keepdims=True,
+    )
+
+    n_bins = mx.array((1 << bits) - 1, mx.float32)
+    eps = mx.array(1e-7, mx.float32)
+    w_min = mx.min(grouped_f, axis=-1, keepdims=True)
+    w_max = mx.max(grouped_f, axis=-1, keepdims=True)
+    for edge, opposite, sign in ((w_max, w_min, -1.0), (w_min, w_max, 1.0)):
+        raw = mx.maximum(mx.abs(edge - opposite) / n_bins, eps) * sign
+        q0 = mx.round(edge / raw)
+        scale0 = mx.where(q0 != 0, edge / q0, raw)
+        bias0 = mx.where(q0 == 0, mx.array(0.0, mx.float32), edge)
+        for factor in (0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25):
+            scales = scale0 * mx.array(factor, mx.float32)
+            biases = bias0
+            codes = mx.clip(mx.round((grouped_f - biases) / scales), 0, n_bins)
+            recon = codes * scales + biases
+            err = mx.sum(imp * (grouped_f - recon) ** 2, axis=-1, keepdims=True)
+            take = err < best_err
+            best_err = mx.where(take, err, best_err)
+            best_scales = mx.where(take, scales, best_scales)
+            best_biases = mx.where(take, biases, best_biases)
+
+    packed = _pack_affine_codes(
+        grouped_f.reshape(orig), best_scales, best_biases, group_size, bits
+    )
+    scale_shape = (*orig[:-1], orig[-1] // group_size)
+    scales = best_scales.reshape(scale_shape).astype(w.dtype)
+    biases = best_biases.reshape(scale_shape).astype(w.dtype)
+    mx.eval(packed, scales, biases)
+    return packed, scales, biases
+
+
+def _importance_is_uniform(importance) -> bool:
+    try:
+        imp = importance if isinstance(importance, mx.array) else mx.array(importance)
+        if imp.size == 0:
+            return True
+        lo = mx.min(imp.astype(mx.float32))
+        hi = mx.max(imp.astype(mx.float32))
+        mx.eval(lo, hi)
+        return abs(float(hi.item()) - float(lo.item())) <= 1e-8
+    except Exception:
+        return False
+
+
+def _row_chunks_with_bounds(t, max_elems):
     rows = t.shape[0]
     if rows == 0:
         return
@@ -2694,12 +5587,55 @@ def _row_chunks(t, max_elems):
         else:
             chunk = t[r0:r1]
             mx.eval(chunk)
+        yield r0, r1, chunk
+
+
+def _row_chunks(t, max_elems):
+    for _, _, chunk in _row_chunks_with_bounds(t, max_elems):
         yield chunk
 
 
-def _quantize_chunked(w, group_size, bits, mode):
+def _quantize_chunked(w, group_size, bits, mode, importance=None):
     _MLX_MAX_ELEMS = 1 << 30
     max_elems = max(group_size, min(_QUANTIZE_CHUNK_BYTES // 2, _MLX_MAX_ELEMS))
+    if importance is not None and _importance_is_uniform(importance):
+        importance = None
+    if importance is not None and mode == "affine":
+        if not isinstance(w, _LazyTensor) and w.size <= max_elems:
+            return _weighted_affine_quantize(w, group_size, bits, importance)
+        orig = tuple(w.shape)
+        qws, scs, bis = [], [], []
+        for r0, r1, chunk in _row_chunks_with_bounds(w, max_elems):
+            mx.eval(chunk)
+            imp = importance
+            if isinstance(importance, mx.array) and importance.ndim > 1:
+                if importance.shape[0] == orig[0]:
+                    imp = importance[r0:r1]
+            cqw, csc, cbi = _weighted_affine_quantize(
+                chunk,
+                group_size,
+                bits,
+                imp,
+            )
+            mx.eval(cqw, csc, cbi)
+            qws.append(cqw)
+            scs.append(csc)
+            bis.append(cbi)
+            mx.synchronize()
+            mx.clear_cache()
+        qw = mx.concatenate(qws, axis=0)
+        scales = mx.concatenate(scs, axis=0)
+        biases = mx.concatenate(bis, axis=0)
+        mx.eval(qw, scales, biases)
+        flat_rows = 1
+        for d in orig[:-1]:
+            flat_rows *= d
+        if qw.shape[0] == flat_rows and len(orig) > 2:
+            qw = qw.reshape(*orig[:-1], -1)
+            scales = scales.reshape(*orig[:-1], -1)
+            biases = biases.reshape(*orig[:-1], -1)
+        return qw, scales, biases
+
     if not isinstance(w, _LazyTensor) and w.size <= max_elems:
         qw, scales, *rest = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
         return qw, scales, (rest[0] if rest else None)
@@ -2750,6 +5686,13 @@ def quantize_oq_streaming(
     preserve_mtp: bool = False,
     auto_proxy_sensitivity: bool = True,
     trust_remote_code: bool = False,
+    enhanced: bool = False,
+    imatrix_cache_path: str = "",
+    imatrix_reuse_cache: bool = True,
+    imatrix_strict: bool = False,
+    imatrix_num_samples: int = 128,
+    imatrix_seq_length: int = 512,
+    sensitivity_map_override: dict[int | str, float] | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -2759,7 +5702,7 @@ def quantize_oq_streaming(
     Args:
         model_path: Path to source model directory.
         output_path: Path for output (must not exist).
-        oq_level: Quantization level (2, 3, 4, 6, or 8).
+        oq_level: Quantization level from OQ_LEVELS.
         group_size: Default quantization group size.
         progress_callback: Optional fn(phase_name, progress_pct) for updates.
         text_only: Skip vision encoder weights for VLM models.
@@ -2768,21 +5711,35 @@ def quantize_oq_streaming(
             faster prefill on M1/M2 Apple Silicon (native fp16 support), but
             is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            the Native MTP toggle works after quantization. Stashes mtp.*
+            the Lightning MTP toggle works after quantization. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
             strip them) and re-merges. When False (default), mtp.* tensors
             are stripped *and* the output config's mtp_num_hidden_layers /
             num_nextn_predict_layers are normalized to 0 to keep the
             quantized model self-consistent.
-        auto_proxy_sensitivity: When True (default) and the source model
-            exceeds available RAM, automatically build a temporary uniform
-            4-bit proxy on disk and run sensitivity measurement on it,
+        auto_proxy_sensitivity: When True (default) and the source checkpoint
+            exceeds 75% of live system/Metal calibration capacity,
+            automatically build a temporary uniform 4-bit proxy on disk and
+            run sensitivity measurement on it,
             preserving oQ's data-driven mixed-precision allocation. When
             False, the quantization aborts on RAM-exceeding models with a
             RuntimeError so callers always get a real sensitivity-driven
             output. Ignored if sensitivity_model_path is set explicitly.
-        trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads and
-            conversion when a checkpoint requires custom model code.
+        trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads when a
+            checkpoint requires custom model code.
+        enhanced: Enable oQe imatrix-weighted quantization. When False, the
+            existing oQ streaming path is unchanged.
+        imatrix_cache_path: oQe native imatrix cache path. Required when
+            enhanced is True; the admin manager supplies an automatic path.
+        imatrix_reuse_cache: Reuse a compatible imatrix cache if present.
+        imatrix_strict: Fail on missing or mismatched imatrix entries instead
+            of falling back to standard oQ quantization for those tensors.
+        imatrix_num_samples: Calibration sample count for imatrix collection.
+        imatrix_seq_length: Calibration sequence length for imatrix collection.
+        sensitivity_map_override: Optional explicit positive layer-priority
+            scores. When supplied, skips cached/measured sensitivity and the
+            sensitivity proxy path. Missing layers receive score zero. This
+            does not skip oQe imatrix calibration when enhanced is True.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -2797,26 +5754,77 @@ def quantize_oq_streaming(
     if output.exists():
         raise ValueError(f"Output directory already exists: {output_path}")
 
-    cb = progress_callback or (lambda phase, pct: None)
+    _progress_last_log = {"time": 0.0, "pct": -100.0, "detail": ""}
+
+    def cb(
+        phase: str,
+        pct: float,
+        detail: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        _emit_progress(progress_callback, phase, pct, detail, meta)
+        now = _time.monotonic()
+        should_log = (
+            pct >= 100.0
+            or pct - float(_progress_last_log["pct"]) >= 2.0
+            or now - float(_progress_last_log["time"]) >= 10.0
+            or (detail and detail != _progress_last_log["detail"])
+        )
+        if should_log:
+            message = detail or phase
+            logger.info("oQ%s progress %.1f%%: %s", f"{oq_level:g}", pct, message)
+            _progress_last_log.update({"time": now, "pct": pct, "detail": detail})
 
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    normalized_model_type = str(config.get("model_type", "")).lower().replace(
+        "-", "_"
+    )
+    if (
+        normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
+        and _has_vision_subconfig(config)
+        and not text_only
+    ):
+        logger.warning(
+            "oQ only supports the %s text backbone; enabling text-only output",
+            config.get("model_type"),
+        )
+        text_only = True
     _validate_oq_dtype_for_model(config, dtype)
+    static_sensitivity_map = _normalize_sensitivity_map_override(
+        config, sensitivity_map_override
+    )
+    if _configure_minimax_shared_expert_layout(config, oq_level):
+        logger.info(
+            "oQ%s: MiniMax M3 shared expert will remain separate for mixed-bit "
+            "quantization",
+            f"{oq_level:g}",
+        )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
     output.mkdir(parents=True, exist_ok=True)
 
-    cb("loading", 5.0)
+    cb("loading", 5.0, "Reading model config")
 
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
-    cb("loading", 8.0)
+    cb("loading", 8.0, "Indexing source weights")
 
-    all_weights = _LazyTensorIndex(weight_files)
-    if preserve_mtp and not any(_is_mtp_tensor(k) for k in all_weights.keys()):
+    all_weights = _LazyTensorIndex(
+        weight_files,
+        allow_mxfp8_scale_inv_passthrough=(
+            _uses_minimax_mxfp8_scale_inv_source(config)
+        ),
+        config=config,
+    )
+    if (
+        preserve_mtp
+        and not any(_is_mtp_tensor(k) for k in all_weights.keys())
+        and not _source_has_nextn_tensors(all_weights.keys(), config)
+    ):
         logger.warning(
             "Preserve MTP requested for %s, but no mtp.* tensors were found "
             "in the checkpoint; disabling MTP preservation",
@@ -2832,19 +5840,173 @@ def quantize_oq_streaming(
     sensitivity_map_path = Path(model_path, "oq_sensitivity_map.json")
     from omlx.settings import get_system_memory as _get_system_memory
 
-    _model_bytes = all_weights.nbytes()
+    # Size admission for the representation used by the calibration loader:
+    # dequantized logical weights for ordinary native-FP8 sources, or packed
+    # storage for sources measured through quantized modules.
+    _calibration_bytes = _calibration_footprint_bytes(
+        all_weights,
+        _checkpoint_storage_bytes(weight_files),
+        config,
+    )
     _system_ram = _get_system_memory()
-    _model_exceeds_ram = _model_bytes > int(_system_ram * _MAX_MODEL_RAM_FRACTION)
-    if _model_exceeds_ram:
+    _calibration_budget = _calibration_memory_budget(
+        _calibration_bytes,
+        fallback_system_bytes=_system_ram,
+    )
+    _model_requires_proxy = bool(_calibration_budget["requires_proxy"])
+    if _model_requires_proxy and static_sensitivity_map is None:
         logger.info(
-            f"oQ{oq_level:g}: model size ({_model_bytes / 1e9:.1f} GB) exceeds "
-            f"80% of system RAM ({_system_ram / 1e9:.1f} GB), "
-            "OOM-prone paths will be skipped"
+            f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
+            f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
+            "capacity "
+            f"({_format_size(int(_calibration_budget['capacity_bytes']))}; "
+            f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
+            "system available="
+            f"{_format_size(int(_calibration_budget['system_available_bytes']))}, "
+            "Metal available="
+            f"{_format_size(int(_calibration_budget['metal_available_bytes']))}). "
+            "Full-model calibration will use a proxy."
+        )
+    elif _model_requires_proxy:
+        logger.info(
+            "oQ%s: static sensitivity override supplied; skipping the "
+            "full-model sensitivity proxy",
+            f"{oq_level:g}",
         )
 
-    cb("loading", 12.0)
+    # Memory-safe calibration proxy, shared between oQe imatrix collection and
+    # auto-proxy sensitivity so an over-budget run builds it at most once.
+    # Built lazily (an imatrix cache hit never pays for it) and deleted as
+    # soon as the last calibration pass is done.
+    _ram_safe_proxy_dir: Path | None = None
 
-    if sensitivity_map_path.exists():
+    def _ensure_ram_safe_proxy() -> Path:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is None:
+            logger.warning(
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
+                "exceeds the "
+                f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                "full-model calibration limit. Building a uniform "
+                f"{_PROXY_QUANT_BITS}-bit proxy on disk for the calibration "
+                "passes."
+            )
+            candidate = _build_proxy_for_sensitivity(
+                model_path,
+                config=config,
+                dtype=dtype,
+                working_dir=str(output.parent),
+                trust_remote_code=trust_remote_code,
+                preserve_mtp=preserve_mtp,
+            )
+            proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
+            proxy_resident_bytes = _calibration_resident_checkpoint_bytes(
+                candidate,
+                config,
+            )
+            prebuild_capacity = int(_calibration_budget["capacity_bytes"])
+            prebuild_limit = int(_calibration_budget["model_limit_bytes"])
+            if prebuild_capacity > 0 and proxy_resident_bytes > prebuild_limit:
+                shutil.rmtree(candidate, ignore_errors=True)
+                raise RuntimeError(
+                    "calibration proxy is still too large for the pre-build live "
+                    f"memory budget (proxy={_format_size(proxy_bytes)}, "
+                    f"resident={_format_size(proxy_resident_bytes)}, "
+                    f"limit={_format_size(prebuild_limit)}, "
+                    f"capacity={_format_size(prebuild_capacity)})"
+                )
+            _ram_safe_proxy_dir = candidate
+            logger.info(
+                f"oQ{oq_level:g}: calibration proxy size "
+                f"{_format_size(proxy_bytes)} on disk, resident calibration "
+                f"footprint {_format_size(proxy_resident_bytes)} within "
+                f"{_format_size(prebuild_limit)} pre-build live memory limit"
+            )
+        return _ram_safe_proxy_dir
+
+    def _cleanup_ram_safe_proxy() -> None:
+        nonlocal _ram_safe_proxy_dir
+        if _ram_safe_proxy_dir is not None and _ram_safe_proxy_dir.exists():
+            shutil.rmtree(_ram_safe_proxy_dir, ignore_errors=True)
+            logger.info(
+                f"oQ{oq_level:g}: cleaned up calibration proxy at "
+                f"{_ram_safe_proxy_dir}"
+            )
+        _ram_safe_proxy_dir = None
+
+    cb("loading", 12.0, "Preparing quantization inputs")
+
+    imatrix_data: OQImatrixData | None = None
+    imatrix_report: dict[str, Any] | None = None
+    if enhanced:
+        if imatrix_num_samples < 1:
+            raise ValueError("imatrix_num_samples must be >= 1")
+        if imatrix_seq_length < 1:
+            raise ValueError("imatrix_seq_length must be >= 1")
+        if not imatrix_cache_path:
+            imatrix_cache_path = str(
+                output.parent
+                / ".oqe_imatrix"
+                / (
+                    f"{source.name}-oQe-s{int(imatrix_num_samples)}"
+                    f"-l{int(imatrix_seq_length)}.npz"
+                )
+            )
+        cb("imatrix", 13.0, "Preparing oQe imatrix calibration")
+
+        def _imatrix_load_path() -> str:
+            cb(
+                "imatrix",
+                13.0,
+                "Building RAM-safe proxy for imatrix calibration",
+            )
+            return str(_ensure_ram_safe_proxy())
+
+        try:
+            imatrix_data = _load_or_collect_imatrix(
+                model_path,
+                config,
+                cache_path=imatrix_cache_path,
+                reuse_cache=imatrix_reuse_cache,
+                num_samples=int(imatrix_num_samples),
+                seq_length=int(imatrix_seq_length),
+                strict=imatrix_strict,
+                trust_remote_code=trust_remote_code,
+                progress_callback=cb,
+                progress_start=13.0,
+                progress_end=18.0,
+                load_path_factory=(
+                    _imatrix_load_path if _model_requires_proxy else None
+                ),
+            )
+        except BaseException:
+            _cleanup_ram_safe_proxy()
+            raise
+        cb("imatrix", 18.0, "oQe imatrix calibration ready")
+        imatrix_report = {
+            "enabled": True,
+            "cache_path": imatrix_data.path,
+            "cache_reused": imatrix_data.reused,
+            "entry_count": len(imatrix_data.entries),
+            "calib_dataset": imatrix_data.metadata.get(
+                "calib_dataset", _OQE_CALIB_DATASET
+            ),
+            "collection": imatrix_data.metadata.get("collection", {}),
+            "expert_coverage": imatrix_data.metadata.get("expert_coverage", {}),
+            "applied": [],
+            "missing": [],
+            "mismatched": [],
+            "zero_count_experts": 0,
+        }
+
+    if static_sensitivity_map is not None:
+        sensitivity_map = static_sensitivity_map
+        logger.info(
+            "oQ%s: static sensitivity override applied to layers %s",
+            f"{oq_level:g}",
+            ",".join(str(idx) for idx in sensitivity_map),
+        )
+    elif sensitivity_map_path.exists():
         sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
         logger.info(f"{sensitivity_map_path} found, skipping measuring.")
     else:
@@ -2864,19 +6026,12 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-        elif (
-            not _model_exceeds_ram
-            and str(config.get("model_type", "")).startswith("deepseek_v4")
-            and isinstance(config.get("quantization_config"), dict)
-            and config["quantization_config"].get("quant_method") == "fp8"
-        ):
-            # Native-fp8 source (e.g. DeepSeek-V4-Flash): the checkpoint
-            # loads as a quantized model (mxfp4 experts / mxfp8 attention),
-            # so the raw qdq measurement would only perturb the few float
-            # Linears. Measure on the source itself with the re-quantization
-            # perturbation instead.
+        elif not _model_requires_proxy and _uses_quantized_source_sensitivity(config):
+            # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
+            # measurement only perturbs float Linears, so measure on the source
+            # itself with the re-quantization perturbation instead.
             logger.info(
-                f"oQ{oq_level:g}: pre-quantized fp8 source, measuring "
+                f"oQ{oq_level:g}: pre-quantized FP8/MXFP8 source, measuring "
                 "sensitivity on source"
             )
             sensitivity_map = _measure_sensitivity_from_quantized_model(
@@ -2887,24 +6042,20 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-        elif _model_exceeds_ram and auto_proxy_sensitivity:
+        elif _model_requires_proxy and auto_proxy_sensitivity:
             logger.warning(
-                f"oQ{oq_level:g}: model size ({_model_bytes/1e9:.1f} GB) exceeds "
-                f"{int(_MAX_MODEL_RAM_FRACTION*100)}% of system RAM "
-                f"({_system_ram/1e9:.1f} GB). Auto-building a uniform "
+                f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
+                "exceeds the "
+                f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                "full-model calibration limit. Auto-building a uniform "
                 f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
-            _proxy_dir: Path | None = None
             try:
-                _proxy_dir = _build_proxy_for_sensitivity(
-                    model_path,
-                    dtype=dtype,
-                    working_dir=str(output.parent),
-                    trust_remote_code=trust_remote_code,
-                )
+                _proxy_dir = _ensure_ram_safe_proxy()
                 logger.info(
-                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, measuring sensitivity"
+                    f"oQ{oq_level:g}: proxy ready at {_proxy_dir}, "
+                    "measuring sensitivity"
                 )
                 sensitivity_map = _measure_sensitivity_from_quantized_model(
                     str(_proxy_dir),
@@ -2922,13 +6073,11 @@ def quantize_oq_streaming(
                     "full-fp16 sensitivity measurement."
                 ) from e
             finally:
-                if _proxy_dir is not None and _proxy_dir.exists():
-                    shutil.rmtree(_proxy_dir, ignore_errors=True)
-                    logger.info(f"oQ{oq_level:g}: cleaned up proxy at {_proxy_dir}")
-        elif _model_exceeds_ram:
+                _cleanup_ram_safe_proxy()
+        elif _model_requires_proxy:
             raise RuntimeError(
-                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION*100)}% "
-                "of system RAM and auto_proxy_sensitivity is disabled. "
+                f"oQ{oq_level:g}: model exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% "
+                "of live calibration memory and auto_proxy_sensitivity is disabled. "
                 "Enable auto_proxy_sensitivity, pass sensitivity_model_path "
                 "with a pre-quantized version of this model, or run on a "
                 "machine with enough RAM."
@@ -2951,6 +6100,7 @@ def quantize_oq_streaming(
     # error here so the rest of quantize_oq_streaming never runs without a
     # data-driven sensitivity map.
     if not sensitivity_map:
+        _cleanup_ram_safe_proxy()
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
             "Check the preceding log lines for the root cause (model load, "
@@ -2958,10 +6108,24 @@ def quantize_oq_streaming(
             "pass an explicit sensitivity_model_path."
         )
 
-    cb("loading", 15.0)
+    # Calibration passes are done — drop the RAM-safe proxy (built when the
+    # source exceeds live calibration capacity; a cached sensitivity map plus
+    # an imatrix cache hit means it was never built at all).
+    _cleanup_ram_safe_proxy()
+
+    cb(
+        "loading",
+        19.0 if enhanced else 15.0,
+        "Preparing quantization plan",
+    )
 
     # --- Sanitize-plan discovery ------------------------------------------
-    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
+    sanitize_fn = _build_model_sanitizer(
+        config,
+        text_only=text_only,
+        model_path=source,
+        preserve_mtp=preserve_mtp,
+    )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     # When preserve_mtp is True, the patched sanitize functions
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
@@ -2976,13 +6140,15 @@ def quantize_oq_streaming(
                 f"{len(all_weights)} output tensors"
             )
         except Exception as e:
-            if _model_exceeds_ram:
+            if _model_requires_proxy:
                 raise RuntimeError(
                     f"oQ{oq_level:g}: streaming sanitize-plan discovery "
                     f"failed ({e}) and the eager fallback is unsafe with "
-                    f"model size {_model_bytes / 1e9:.1f} GB exceeding "
-                    f"{int(_MAX_MODEL_RAM_FRACTION * 100)}% of system RAM "
-                    f"({_system_ram / 1e9:.1f} GB). Run on a machine with "
+                    f"calibration footprint {_format_size(_calibration_bytes)} "
+                    "exceeding "
+                    "the "
+                    f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
+                    "full-model calibration limit. Run on a machine with "
                     "enough RAM, or extend _TrackedTensor to cover the "
                     "indexing pattern the sanitize uses."
                 ) from e
@@ -3046,13 +6212,17 @@ def quantize_oq_streaming(
     if _level_targets is not None:
         _t = target_bpw if target_bpw is not None else _level_targets[0]
         _c = hard_cap_bpw if hard_cap_bpw is not None else _level_targets[1]
+        plan_fixed_overrides = {
+            **fixed_overrides,
+            **_structural_quant_overrides(named_shapes, config, oq_level),
+        }
         plan = _build_quant_plan(
             named_shapes,
             config,
             oq_level,
             target_bpw=_t,
             hard_cap_bpw=_c,
-            fixed_overrides=fixed_overrides,
+            fixed_overrides=plan_fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
         logger.info(
@@ -3062,10 +6232,9 @@ def quantize_oq_streaming(
     else:
         config["_oq_boost_map"] = {}
 
-    cb("loading", 20.0)
+    cb("loading", 20.0, "Starting tensor quantization")
 
     tensor_names = list(all_weights.keys())
-    total_tensors = len(tensor_names)
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
@@ -3075,11 +6244,13 @@ def quantize_oq_streaming(
     quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
     per_layer_config = {}
     start_time = _time.monotonic()
+    last_quant_display_pct = -1
+    last_quant_emit_time = 0.0
 
     total_bytes = _progress_total_bytes(all_weights, source)
     processed_bytes = 0
 
-    for i, tensor_name in enumerate(tensor_names):
+    for tensor_name in tensor_names:
         # Pre-quantized source tensor at or below the target precision:
         # emit the packed mxfp4/mxfp8 form unchanged (no dequant-requant).
         handled_packed = False
@@ -3148,7 +6319,23 @@ def quantize_oq_streaming(
                         and w_mx.dtype != target_dtype
                     ):
                         w_mx = w_mx.astype(target_dtype)
-                    qw, scales, biases = _quantize_chunked(w_mx, gs, bits, qmode)
+                    importance = None
+                    if imatrix_data is not None and qmode == "affine":
+                        importance = _lookup_imatrix_importance(
+                            imatrix_data,
+                            tensor_name,
+                            tuple(shape),
+                            config=config,
+                            strict=imatrix_strict,
+                            report=imatrix_report,
+                        )
+                    qw, scales, biases = _quantize_chunked(
+                        w_mx,
+                        gs,
+                        bits,
+                        qmode,
+                        importance=importance,
+                    )
 
                     base = tensor_name
                     if base.endswith(".weight"):
@@ -3194,18 +6381,39 @@ def quantize_oq_streaming(
         processed_bytes += tensor_bytes
         elapsed = _time.monotonic() - start_time
         frac = min(max(processed_bytes / max(total_bytes, 1), 0.0), 1.0)
-        pct = 15.0 + frac * 75.0
+        pct = 20.0 + frac * 70.0
         display_pct = min(100, max(0, int(frac * 100)))
-        if elapsed > 1.0 and frac > 0.01:
-            eta_secs = max(0.0, elapsed / frac * (1.0 - frac))
-            mins = int(eta_secs // 60)
-            secs = int(eta_secs % 60)
-            cb(
-                f"quantizing_eta|{display_pct}|100|{mins}:{secs:02d}",
-                pct,
-            )
-        else:
-            cb(f"quantizing_eta|{display_pct}|100|", pct)
+        if (
+            display_pct != last_quant_display_pct
+            or elapsed - last_quant_emit_time >= 2.0
+            or frac >= 1.0
+        ):
+            last_quant_display_pct = display_pct
+            last_quant_emit_time = elapsed
+            if elapsed > 1.0 and frac > 0.01:
+                eta_secs = max(0.0, elapsed / frac * (1.0 - frac))
+                mins = int(eta_secs // 60)
+                secs = int(eta_secs % 60)
+                cb(
+                    f"quantizing_eta|{display_pct}|100|{mins}:{secs:02d}",
+                    pct,
+                    (
+                        f"Quantized {display_pct}% of tensor bytes; "
+                        f"ETA {mins}:{secs:02d}"
+                    ),
+                    {
+                        "processed_bytes": processed_bytes,
+                        "total_bytes": total_bytes,
+                        "eta_seconds": int(eta_secs),
+                    },
+                )
+            else:
+                cb(
+                    f"quantizing_eta|{display_pct}|100|",
+                    pct,
+                    f"Quantized {display_pct}% of tensor bytes",
+                    {"processed_bytes": processed_bytes, "total_bytes": total_bytes},
+                )
 
     del all_weights
     mx.synchronize()
@@ -3237,7 +6445,7 @@ def quantize_oq_streaming(
                     if v == old_name:
                         weight_map[k] = new_name
 
-    cb("saving", 92.0)
+    cb("saving", 92.0, "Writing model metadata")
 
     if total_shards > 1:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
@@ -3257,19 +6465,7 @@ def quantize_oq_streaming(
     ):
         output_config.pop(temp_key, None)
     if text_only:
-        for key in (
-            "vision_config",
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "vision_end_token_id",
-            "audio_config",
-            "audio_token_id",
-            "boa_token_id",
-            "eoa_token_id",
-            "eoa_token_index",
-        ):
-            output_config.pop(key, None)
+        _normalize_text_only_in_config(output_config)
     if not preserve_mtp:
         # Default path: zero out MTP layer counts so the quantized model
         # doesn't claim to have an MTP head while its weights have been
@@ -3313,36 +6509,55 @@ def quantize_oq_streaming(
     output_config["quantization_config"] = quant_info
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
+    if imatrix_report is not None:
+        for key in ("applied", "missing"):
+            imatrix_report[key] = sorted(set(imatrix_report[key]))
+        with open(output / "oq_imatrix_report.json", "w") as f:
+            json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
-    for pattern in (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",
-        "generation_config.json",
-        "chat_template.json",
-        "chat_template.jinja",
-        "preprocessor_config.json",
-        "processor_config.json",
-        "added_tokens.json",
-        "merges.txt",
-        "vocab.json",
-    ):
-        for src_file in source.glob(pattern):
-            shutil.copy2(src_file, output / src_file.name)
+    _copy_model_sidecars(source, output, text_only=text_only)
 
-    for py_file in source.glob("*.py"):
-        shutil.copy2(py_file, output / py_file.name)
-
-    cb("saving", 100.0)
+    cb("saving", 100.0, "Quantized model saved")
     logger.info(
-        f"oQ{oq_level:g} streaming: completed -> {output_path} "
-        f"({total_shards} shards)"
+        f"oQ{oq_level:g} streaming: completed -> {output_path} ({total_shards} shards)"
     )
 
 
 _SENS_NUM_SAMPLES = 128
 _SENS_SEQ_LENGTH = 256
+# Calibration subsampling uses a fixed key so repeated quants of the same
+# source select the same samples (#2293). Keyed draws leave the global RNG
+# stream untouched.
+_CALIB_SAMPLE_SEED = 0
+_OQE_CALIB_DATASET = "oqe_code_multilingual"
+_OQE_IMATRIX_FORMAT = "omlx-oqe-imatrix-cache"
+_OQE_MAX_SAMPLE_MULTIPLIER = 8
+_OQE_MAX_ADAPTIVE_SAMPLES = 1024
+_OQE_MIN_EXPERT_COUNT = 16
+_OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+_OQE_MULTI_LINEAR_CLASSES = {"MultiLinear", "QuantizedMultiLinear"}
+_OQ_CODE_MULTILINGUAL_KEYS = (
+    "code",
+    "en",
+    "ko",
+    "zh",
+    "ja",
+    "tool_calling",
+    "reasoning",
+)
+_OQE_CODE_MULTILINGUAL_KEYS = (
+    "tool_calling",
+    "chat",
+    "mixed",
+    "reasoning",
+    "code",
+    "en",
+    "ko",
+    "zh",
+    "ja",
+    "bartowski",
+)
 
 
 CALIB_DATASETS = {
@@ -3352,6 +6567,7 @@ CALIB_DATASETS = {
     "code": "Code (StarCoder)",
     "multilingual": "Multilingual (CulturaX)",
     "code_multilingual": "Code + Multilingual + Reasoning",
+    _OQE_CALIB_DATASET: "oQe Balanced Code + Multilingual + Tool/Reasoning",
 }
 
 
@@ -3376,14 +6592,30 @@ def _load_calibration_data(
     Returns:
         MLX array of shape (num_samples, seq_length) or None on failure.
     """
-    if dataset in ("code_multilingual", "code", "multilingual"):
+    if dataset == _OQE_CALIB_DATASET:
+        # oQe (enhanced=True) requests this built-in corpus by name. If the data
+        # file is not present in the installed package, the generic handler below
+        # would swallow the error and silently calibrate the imatrix on a smaller,
+        # different corpus, producing a subtly worse enhanced model with no signal
+        # to the caller. Fail loudly instead: a missing built-in data file is a
+        # broken installation the user cannot fix by retrying. See package-data in
+        # pyproject.toml, which must ship oqe_calibration_data.json.
+        oqe_path = Path(__file__).parent / "oqe_calibration_data.json"
+        if not oqe_path.exists():
+            raise FileNotFoundError(
+                f"oQe calibration corpus not found at {oqe_path}. This file ships "
+                "with omlx but is missing from the current installation, so "
+                "enhanced quantization cannot calibrate correctly. Reinstall omlx "
+                "from a distribution that includes oqe_calibration_data.json."
+            )
+    if dataset in ("code_multilingual", "code", "multilingual", _OQE_CALIB_DATASET):
         try:
             return _load_builtin_calibration(
                 tokenizer, dataset, num_samples, seq_length
             )
         except Exception as e:
             logger.warning(
-                f"Built-in calibration failed: {e}, " "falling back to mlx-lm default"
+                f"Built-in calibration failed: {e}, falling back to mlx-lm default"
             )
 
     if dataset == "default":
@@ -3413,19 +6645,28 @@ def _load_calibration_data(
 def _load_builtin_calibration(
     tokenizer, dataset: str, num_samples: int, seq_length: int
 ):
-    """Load from built-in oq_calibration_data.json (shipped with package)."""
+    """Load from built-in calibration JSON files shipped with the package."""
     import mlx.core as mx
 
-    data_path = Path(__file__).parent / "oq_calibration_data.json"
+    data_file = (
+        "oqe_calibration_data.json"
+        if dataset == _OQE_CALIB_DATASET
+        else "oq_calibration_data.json"
+    )
+    data_path = Path(__file__).parent / data_file
     if not data_path.exists():
         raise FileNotFoundError(f"Built-in calibration data not found: {data_path}")
 
     with open(data_path, encoding="utf-8") as f:
         all_data = json.load(f)
 
-    if dataset == "code_multilingual":
+    if dataset == _OQE_CALIB_DATASET:
         texts = []
-        for key in ("code", "en", "ko", "zh", "ja", "tool_calling", "reasoning"):
+        for key in _OQE_CODE_MULTILINGUAL_KEYS:
+            texts.extend(all_data.get(key, []))
+    elif dataset == "code_multilingual":
+        texts = []
+        for key in _OQ_CODE_MULTILINGUAL_KEYS:
             texts.extend(all_data.get(key, []))
     elif dataset == "code":
         texts = all_data.get("code", []) + all_data.get("en", [])
@@ -3442,9 +6683,7 @@ def _load_builtin_calibration(
         raise ValueError("No calibration text available")
 
     total_kb = sum(len(t) for t in texts) // 1024
-    logger.info(
-        f"Built-in calibration: {len(texts)} texts, " f"{total_kb} KB ({dataset})"
-    )
+    logger.info(f"Built-in calibration: {len(texts)} texts, {total_kb} KB ({dataset})")
 
     all_ids = []
     for text in texts:
@@ -3463,7 +6702,9 @@ def _load_builtin_calibration(
     tokens = tokens[:usable].reshape(-1, seq_length)
 
     if num_samples > 0 and tokens.shape[0] > num_samples:
-        indices = mx.random.permutation(tokens.shape[0])[:num_samples]
+        indices = mx.random.permutation(
+            tokens.shape[0], key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(f"Calibration: {tokens.shape[0]} samples x {seq_length} tokens")
@@ -3559,12 +6800,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
 
     n_available = tokens.shape[0]
     if num_samples > 0 and n_available > num_samples:
-        indices = mx.random.permutation(n_available)[:num_samples]
+        indices = mx.random.permutation(
+            n_available, key=mx.random.key(_CALIB_SAMPLE_SEED)
+        )[:num_samples]
         tokens = tokens[indices]
 
     logger.info(
-        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens "
-        f"from {dataset}"
+        f"Calibration: {tokens.shape[0]} samples × {seq_length} tokens from {dataset}"
     )
     return tokens
 
@@ -3581,10 +6823,20 @@ def _find_model_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
+    elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
+        embed_fn = model.model.word_embeddings
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
             embed_fn = lm.embed_tokens
+            # Inkling applies an embed-side RMSNorm (use_embed_norm)
+            # inside InklingModel.embed(); raw embed_tokens would feed
+            # layer 0 un-normalized activations to calibration.
+            if callable(getattr(lm, "embed", None)) and (
+                getattr(lm, "embed_norm", None) is not None
+            ):
+                embed_fn = lm.embed
             layers = lm.layers
     elif hasattr(model, "embed_tokens"):
         embed_fn = model.embed_tokens
@@ -3596,8 +6848,320 @@ def _find_model_layers(model):
     return embed_fn, layers
 
 
-def _forward_layer(block, inputs, mask, position_ids):
-    """Forward pass through a transformer layer with flexible signature."""
+_GEMMA4_LAYER_STATE_KIND = "gemma4_shared_kv"
+_QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
+_GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
+
+
+def _find_layer_model(model, layers):
+    """Return the module that owns ``layers`` and the layer-level helpers."""
+    # Check the deepest language module first. VLM wrappers may expose a
+    # delegated ``layers`` property while keeping the Gemma 4 text config and
+    # layer-walk helpers only on ``language_model.model``.
+    candidates = []
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        language_core = getattr(language_model, "model", None)
+        if language_core is not None:
+            candidates.append(language_core)
+        candidates.append(language_model)
+    model_core = getattr(model, "model", None)
+    if model_core is not None:
+        candidates.append(model_core)
+    candidates.append(model)
+
+    seen = set()
+    for candidate in candidates:
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if getattr(candidate, "layers", None) is layers:
+            return candidate
+    return None
+
+
+def _object_config_int(config, key: str, default: int = 0) -> int:
+    if isinstance(config, dict):
+        value = config.get(key, default)
+    else:
+        value = getattr(config, key, default)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
+    """Build the stateful E2B/E4B layer-walk inputs.
+
+    Gemma 4 E2B/E4B cannot be calibrated by invoking each decoder block as an
+    independent transformer layer. They project a token-derived input for
+    every layer and their tail layers consume K/V tensors produced by earlier
+    blocks. Mirror the native Gemma 4 model loop so imatrix collection and
+    sensitivity measurement see the same activations as inference.
+    """
+    layer_model = _find_layer_model(model, layers)
+    if layer_model is None:
+        return None
+
+    layer_config = getattr(layer_model, "config", None)
+    if layer_config is None:
+        return None
+    if isinstance(layer_config, dict):
+        model_type = str(layer_config.get("model_type", "")).lower()
+    else:
+        model_type = str(getattr(layer_config, "model_type", "")).lower()
+    num_kv_shared_layers = _object_config_int(layer_config, "num_kv_shared_layers")
+    per_layer_input_size = _object_config_int(
+        layer_config, "hidden_size_per_layer_input"
+    )
+    if not model_type.startswith("gemma4") or (
+        num_kv_shared_layers <= 0 and per_layer_input_size <= 0
+    ):
+        return None
+
+    num_layers = len(layers)
+    if not 0 <= num_kv_shared_layers <= num_layers:
+        raise RuntimeError(
+            "Gemma 4 calibration has an invalid shared-KV layout: "
+            f"layers={num_layers}, shared={num_kv_shared_layers}"
+        )
+
+    raw_inputs = inputs
+    embed_scale = getattr(layer_model, "embed_scale", 1.0)
+    inputs = raw_inputs * embed_scale
+
+    if per_layer_input_size > 0:
+        get_per_layer_inputs = getattr(layer_model, "get_per_layer_inputs", None)
+        project_per_layer_inputs = getattr(
+            layer_model, "project_per_layer_inputs", None
+        )
+        if callable(get_per_layer_inputs) and callable(project_per_layer_inputs):
+            per_layer_inputs = get_per_layer_inputs(calib_data)
+            per_layer_inputs = project_per_layer_inputs(inputs, per_layer_inputs)
+        else:
+            get_per_layer_inputs = getattr(layer_model, "_get_per_layer_inputs", None)
+            project_per_layer_inputs = getattr(
+                layer_model, "_project_per_layer_inputs", None
+            )
+            if not callable(get_per_layer_inputs) or not callable(
+                project_per_layer_inputs
+            ):
+                raise RuntimeError(
+                    "Gemma 4 calibration cannot build per-layer inputs for "
+                    f"{type(layer_model).__name__}"
+                )
+            per_layer_inputs = get_per_layer_inputs(calib_data, raw_inputs)
+            per_layer_inputs = project_per_layer_inputs(inputs, per_layer_inputs)
+
+        if (
+            getattr(per_layer_inputs, "ndim", 0) != 4
+            or int(per_layer_inputs.shape[2]) != num_layers
+        ):
+            raise RuntimeError(
+                "Gemma 4 calibration produced invalid per-layer inputs: "
+                f"shape={getattr(per_layer_inputs, 'shape', None)}, "
+                f"layers={num_layers}"
+            )
+        per_layer_inputs = [
+            per_layer_inputs[:, :, layer_idx, :] for layer_idx in range(num_layers)
+        ]
+    else:
+        per_layer_inputs = [None] * num_layers
+
+    make_masks = getattr(layer_model, "_make_masks", None)
+    if not callable(make_masks):
+        raise RuntimeError(
+            "Gemma 4 calibration cannot build the model attention-mask schedule"
+        )
+    layer_masks = list(make_masks(inputs, [None] * num_layers))
+    if len(layer_masks) != num_layers:
+        raise RuntimeError(
+            "Gemma 4 calibration produced an invalid mask schedule: "
+            f"masks={len(layer_masks)}, layers={num_layers}"
+        )
+
+    previous_kvs = list(getattr(layer_model, "previous_kvs", range(num_layers)))
+    if len(previous_kvs) != num_layers or any(
+        not 0 <= int(previous_idx) <= layer_idx
+        for layer_idx, previous_idx in enumerate(previous_kvs)
+    ):
+        raise RuntimeError("Gemma 4 calibration produced an invalid shared-KV schedule")
+
+    state = {
+        "kind": _GEMMA4_LAYER_STATE_KIND,
+        "per_layer_inputs": per_layer_inputs,
+        "previous_kvs": previous_kvs,
+        "intermediates": [(None, None)] * num_layers,
+    }
+    return inputs, layer_masks, state
+
+
+def _prepare_qwen4_exp_layer_inputs(model, layers, calib_data, inputs):
+    """Build Qwen4-Exp's hyper-connection layer-walk inputs.
+
+    Qwen4 decoder blocks do not use the generic Transformer signature. The
+    trunk tiles token embeddings across ``hc_count`` residual streams and each
+    block receives the original token ids before mask/cache/position state.
+    Replaying a block with the generic calibration call silently skips every
+    layer, leaving an installed oQe collector with zero captured entries.
+    """
+    layer_model = _find_layer_model(model, layers)
+    if layer_model is None:
+        return None
+    args = getattr(layer_model, "args", None)
+    model_type = str(getattr(args, "model_type", "")).lower()
+    if not model_type.startswith("qwen4_exp"):
+        return None
+
+    hc_count = _object_config_int(args, "hc_count")
+    hidden_size = _object_config_int(args, "hidden_size")
+    if hc_count <= 0 or hidden_size <= 0:
+        raise RuntimeError(
+            "Qwen4-Exp calibration requires positive hc_count and hidden_size"
+        )
+    expected_width = hc_count * hidden_size
+    if int(inputs.shape[-1]) == hidden_size:
+        inputs = mx.tile(inputs, (1, 1, hc_count))
+    elif int(inputs.shape[-1]) != expected_width:
+        raise RuntimeError(
+            "Qwen4-Exp calibration received an invalid hidden width: "
+            f"{int(inputs.shape[-1])} (expected {hidden_size} or {expected_width})"
+        )
+
+    seq_len = int(calib_data.shape[1])
+    full_attention_mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
+    full_attention_mask = full_attention_mask.astype(inputs.dtype)
+    layer_masks = [
+        None if bool(getattr(layer, "is_linear", False)) else full_attention_mask
+        for layer in layers
+    ]
+    position_ids = mx.broadcast_to(
+        mx.arange(seq_len, dtype=mx.int32)[None],
+        (int(calib_data.shape[0]), seq_len),
+    )
+    state = {
+        "kind": _QWEN4_EXP_LAYER_STATE_KIND,
+        "input_ids": calib_data,
+        "position_ids": position_ids,
+    }
+    return inputs, layer_masks, state
+
+
+def _forward_gemma4_layer_result(block, inputs, mask, state, layer_idx: int):
+    if not 0 <= int(layer_idx) < len(state["previous_kvs"]):
+        raise RuntimeError(f"Invalid Gemma 4 calibration layer index: {layer_idx}")
+    previous_idx = int(state["previous_kvs"][layer_idx])
+    shared_kv, offset = state["intermediates"][previous_idx]
+    try:
+        result = block(
+            inputs,
+            mask,
+            None,
+            per_layer_input=state["per_layer_inputs"][layer_idx],
+            shared_kv=shared_kv,
+            offset=offset,
+        )
+    except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+        raise RuntimeError(
+            f"Gemma 4 calibration forward failed at layer {layer_idx}: {e}"
+        ) from e
+    if not isinstance(result, tuple) or len(result) < 3:
+        raise RuntimeError(
+            "Gemma 4 calibration expected a (hidden, shared_kv, offset) result "
+            f"at layer {layer_idx}, got {type(result).__name__}"
+        )
+    return result[0], (result[1], result[2])
+
+
+def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None:
+    if not isinstance(state, dict):
+        return
+    if state.get("kind") == _GEMMA4_LAYER_STATE_KIND:
+        if not isinstance(aux, tuple) or len(aux) != 2:
+            raise RuntimeError(
+                f"Gemma 4 calibration layer {layer_idx} returned invalid state"
+            )
+        state["intermediates"][layer_idx] = aux
+    elif state.get("kind") == "glm_moe_dsa":
+        state["prev_topk_indices"] = aux if aux is not None else fallback
+
+
+def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
+    """Forward pass through a transformer layer, returning output and aux."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _GEMMA4_LAYER_STATE_KIND
+    ):
+        if layer_idx is None:
+            raise RuntimeError("Gemma 4 calibration requires a layer index")
+        return _forward_gemma4_layer_result(
+            block, inputs, mask, position_ids, int(layer_idx)
+        )
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _QWEN4_EXP_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(
+                inputs,
+                position_ids["input_ids"],
+                mask=mask,
+                cache=None,
+                position_ids=position_ids["position_ids"],
+            )
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"Qwen4-Exp calibration forward failed{suffix}: {e}"
+            ) from e
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else None
+        return result, None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _GLM5_NEXT_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(inputs, mask=mask, cache=None)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            suffix = f" at layer {layer_idx}" if layer_idx is not None else ""
+            raise RuntimeError(
+                f"GLM-5.3 calibration forward failed{suffix}: {e}"
+            ) from e
+        if isinstance(result, tuple):
+            return result[0], result[1] if len(result) > 1 else None
+        return result, None
+    if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
+        try:
+            result = block(
+                inputs,
+                mask,
+                None,
+                position_ids.get("prev_topk_indices"),
+            )
+            if isinstance(result, tuple):
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            logger.debug(
+                f"_forward_layer: GLM MoE DSA signature failed for "
+                f"{type(block).__name__}: {e}"
+            )
+            return None, None
+    if isinstance(position_ids, dict) and position_ids.get("kind") == "inkling":
+        try:
+            result = block(inputs)
+            if isinstance(result, tuple):
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            logger.debug(
+                f"_forward_layer: inkling signature failed for "
+                f"{type(block).__name__}: {e}"
+            )
+            return None, None
+
     last_exc = None
     for call_args in [
         (inputs, mask, None, position_ids),
@@ -3609,8 +7173,8 @@ def _forward_layer(block, inputs, mask, position_ids):
         try:
             result = block(*call_args)
             if isinstance(result, tuple):
-                result = result[0]
-            return result
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
             last_exc = e
             continue
@@ -3619,20 +7183,31 @@ def _forward_layer(block, inputs, mask, position_ids):
             f"_forward_layer: all signatures failed for "
             f"{type(block).__name__}: {last_exc}"
         )
-    return None
+    return None, None
+
+
+def _forward_layer(block, inputs, mask, position_ids):
+    """Forward pass through a transformer layer with flexible signature."""
+    return _forward_layer_result(block, inputs, mask, position_ids)[0]
 
 
 def _layer_masks_for_model(model, layers, inputs):
     """Build the per-layer mask schedule used by the original model."""
     if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") for layer in layers
+        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
+        for layer in layers
     ):
         try:
             from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
             cache = model.make_cache()
-            fa_idx = getattr(getattr(model, "model", model), "fa_idx", 0)
-            ssm_idx = getattr(getattr(model, "model", model), "ssm_idx", 0)
+            model_core = getattr(model, "model", model)
+            fa_idx = getattr(
+                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
+            )
+            ssm_idx = getattr(
+                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
+            )
             fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
             ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
             try:
@@ -3652,8 +7227,15 @@ def _layer_masks_for_model(model, layers, inputs):
                 # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
                 # (S, S) causal mask.  During calibration there is no padding,
                 # so None is the correct mask for SSM layers.
+                def _is_ssm_layer(layer):
+                    if hasattr(layer, "is_linear"):
+                        return bool(layer.is_linear)
+                    if hasattr(layer, "is_global"):
+                        return not bool(layer.is_global)
+                    return False
+
                 return [
-                    ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+                    ssm_mask if _is_ssm_layer(layer) else fa_mask
                     for layer in layers
                 ]
         except (ImportError, AttributeError):
@@ -3713,7 +7295,41 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
     argument (hash expert routing indexes tid2eid with them). Everything
     else keeps the generic 3D inputs + causal masks + position ids.
     """
-    if str(getattr(model, "model_type", "")).startswith("deepseek_v4"):
+    model_type = str(
+        getattr(model, "model_type", "")
+        or getattr(getattr(model, "args", None), "model_type", "")
+        or getattr(
+            getattr(getattr(model, "model", None), "args", None),
+            "model_type",
+            "",
+        )
+    )
+    gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
+    if gemma4_inputs is not None:
+        return gemma4_inputs
+    qwen4_exp_inputs = _prepare_qwen4_exp_layer_inputs(
+        model, layers, calib_data, inputs
+    )
+    if qwen4_exp_inputs is not None:
+        return qwen4_exp_inputs
+    if model_type == "glm5_next":
+        language_model = getattr(model, "language_model", None)
+        args = getattr(language_model, "args", None)
+        hc_mult = _object_config_int(args, "hc_mult")
+        if hc_mult <= 0:
+            raise RuntimeError("GLM-5.3 calibration requires a positive hc_mult")
+        hidden = mx.broadcast_to(
+            inputs[:, :, None, :],
+            (inputs.shape[0], inputs.shape[1], hc_mult, inputs.shape[2]),
+        )
+        hidden = mx.contiguous(hidden)
+        attention_mask = create_attention_mask(inputs, None, return_array=True)
+        masks = [
+            None if bool(getattr(layer, "is_linear", False)) else attention_mask
+            for layer in layers
+        ]
+        return hidden, masks, {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
+    if model_type.startswith("deepseek_v4"):
         args = model.args
         h = mx.broadcast_to(
             inputs[:, :, None, :],
@@ -3727,9 +7343,966 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
             return_array=True,
         )
         return h, [mask] * len(layers), calib_data
+    if model_type == "glm_moe_dsa":
+        mask = create_attention_mask(inputs, None, return_array=True)
+        state = {"kind": "glm_moe_dsa", "prev_topk_indices": None}
+        return inputs, [mask] * len(layers), state
+    if model_type in ("inkling", "inkling_mm_model"):
+        # Inkling decoder layers build their own banded causal/sliding
+        # masks internally (banded_additive_mask) and take
+        # (x, cache=None, conv_mask=None). Calibration walks cache-less
+        # single sequences, so both stay None; without this branch the
+        # generic signature probe only lands on ``(inputs,)`` after four
+        # caught exceptions per layer.
+        return inputs, [None] * len(layers), {"kind": "inkling"}
     masks = _layer_masks_for_model(model, layers, inputs)
     position_ids = mx.arange(calib_data.shape[1])[None, :]
     return inputs, masks, position_ids
+
+
+class _ImatrixCaptureWrapper(nn.Module):
+    """Temporary module wrapper used only during oQe calibration."""
+
+    def __init__(self, module, name: str, collector: "OQImatrixCollector"):
+        super().__init__()
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_collector", collector)
+
+    def __getattr__(self, key: str):
+        try:
+            return super().__getattr__(key)
+        except AttributeError as exc:
+            try:
+                module = object.__getattribute__(self, "_module")
+            except AttributeError:
+                raise exc
+            return getattr(module, key)
+
+    def __call__(self, *args, **kwargs):
+        if args:
+            if (
+                type(self._module).__name__ in _OQE_SWITCH_LINEAR_CLASSES
+                and len(args) >= 2
+            ):
+                self._collector.collect_switch(
+                    self._name, self._module, args[0], args[1]
+                )
+            elif type(self._module).__name__ in _OQE_MULTI_LINEAR_CLASSES:
+                transpose = kwargs.get("transpose", args[1] if len(args) >= 2 else True)
+                self._collector.collect_multi(
+                    self._name, self._module, args[0], transpose=transpose
+                )
+            else:
+                self._collector.collect_dense(self._name, self._module, args[0])
+        result = self._module(*args, **kwargs)
+        if args and self._name.endswith(".self_attn.q_b_proj"):
+            self._collector.collect_glm5_next_embed_q(self._name, result)
+        return result
+
+
+class OQImatrixCollector:
+    """Collect input activation energy for oQe weighted quantization."""
+
+    def __init__(self):
+        self.entries: dict[str, OQImatrixEntry] = {}
+        self._original_modules: dict[str, Any] = {}
+        self._saved_attributes: list[tuple[Any, str, Any]] = []
+        self.capture_module_classes: dict[str, int] = {}
+        self.switch_capture_modules = 0
+
+    @staticmethod
+    def _is_capture_module(module) -> bool:
+        cls = type(module).__name__
+        if cls in _OQE_SWITCH_LINEAR_CLASSES:
+            return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        if cls in _OQE_MULTI_LINEAR_CLASSES:
+            return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 3
+        # QuantizedLinear capture lets imatrix collection run against
+        # already-quantized checkpoints (e.g. deriving a recalibrated MTP
+        # head from an oQ8 model when the bf16 source is gone).
+        return (
+            cls in ("Linear", "QuantizedLinear")
+            and hasattr(module, "weight")
+            and getattr(module.weight, "ndim", 0) == 2
+        )
+
+    @staticmethod
+    def _module_in_dim(module) -> int:
+        w = module.weight
+        bits = getattr(module, "bits", None)
+        if bits and w.dtype == mx.uint32:
+            return int(w.shape[-1] * 32 // int(bits))
+        return int(w.shape[-1])
+
+    def install(self, model) -> int:
+        replacements = []
+        for name, module in model.named_modules():
+            if type(module).__name__ == "Glm5NextLinearAttention" and bool(
+                getattr(module, "fuse_in", False)
+            ):
+                # The fused KDA input projection reads six Linear weights
+                # directly, bypassing their calls and therefore the capture
+                # wrappers. Calibration temporarily takes the equivalent
+                # unfused path so every input-channel statistic is observed.
+                self._saved_attributes.append((module, "fuse_in", module.fuse_in))
+                module.fuse_in = False
+            if not name or not self._is_capture_module(module):
+                continue
+            cls = type(module).__name__
+            self.capture_module_classes[cls] = (
+                self.capture_module_classes.get(cls, 0) + 1
+            )
+            if cls in _OQE_SWITCH_LINEAR_CLASSES:
+                self.switch_capture_modules += 1
+            self._original_modules[name] = module
+            replacements.append((name, _ImatrixCaptureWrapper(module, name, self)))
+        if replacements:
+            model.update_modules(tree_unflatten(replacements), strict=False)
+        return len(replacements)
+
+    def restore(self, model) -> None:
+        if self._original_modules:
+            model.update_modules(
+                tree_unflatten(list(self._original_modules.items())),
+                strict=False,
+            )
+            self._original_modules.clear()
+        for module, attribute, value in self._saved_attributes:
+            setattr(module, attribute, value)
+        self._saved_attributes.clear()
+
+    def _ensure_entry(self, name: str, sums_shape, counts_shape) -> OQImatrixEntry:
+        entry = self.entries.get(name)
+        if entry is None:
+            entry = OQImatrixEntry(
+                in_sum2=np.zeros(sums_shape, dtype=np.float32),
+                counts=np.zeros(counts_shape, dtype=np.int64),
+            )
+            self.entries[name] = entry
+        return entry
+
+    def collect_dense(self, name: str, module, x) -> None:
+        try:
+            in_dim = self._module_in_dim(module)
+            if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
+                return
+            mx.eval(x)
+            x_np = np.asarray(x.astype(mx.float32)).reshape(-1, in_dim)
+            if x_np.shape[0] == 0:
+                return
+            entry = self._ensure_entry(name, (in_dim,), (1,))
+            entry.in_sum2 += np.square(x_np, dtype=np.float32).sum(axis=0)
+            entry.counts[0] += x_np.shape[0]
+        except Exception as e:
+            logger.debug("oQe imatrix dense capture skipped for %s: %s", name, e)
+
+    def collect_multi(self, name: str, module, x, *, transpose: bool = True) -> None:
+        """Capture per-head input energy for MLA MultiLinear weights."""
+        try:
+            if not transpose:
+                # The same MLA projection may be used in reverse. Quantization
+                # groups the stored weight's last dimension, whose matching
+                # activation is observed by the normal transpose=True call.
+                return
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            bits = getattr(module, "bits", None)
+            in_dim = (
+                int(weight.shape[-1] * 32 // int(bits))
+                if bits and weight.dtype == mx.uint32
+                else int(weight.shape[-1])
+            )
+            if not getattr(x, "shape", ()) or int(x.shape[-1]) != in_dim:
+                return
+            mx.eval(x)
+            x_np = np.asarray(x.astype(mx.float32))
+            if x_np.ndim >= 2 and x_np.shape[-2] in (1, n_heads):
+                per_head = np.moveaxis(x_np, -2, 0).reshape(x_np.shape[-2], -1, in_dim)
+                if per_head.shape[0] == 1 and n_heads > 1:
+                    per_head = np.repeat(per_head, n_heads, axis=0)
+            else:
+                shared = x_np.reshape(-1, in_dim)
+                per_head = np.repeat(shared[None], n_heads, axis=0)
+            entry = self._ensure_entry(name, (n_heads, in_dim), (n_heads,))
+            entry.in_sum2 += np.square(per_head, dtype=np.float32).sum(axis=1)
+            entry.counts += per_head.shape[1]
+        except Exception as e:
+            logger.debug("oQe imatrix multi capture skipped for %s: %s", name, e)
+
+    def collect_glm5_next_embed_q(self, q_b_name: str, q) -> None:
+        """Capture the GLM-5.3 embed_q input from q_b_proj's exact output.
+
+        Short calibration sequences take the algebraically equivalent reverse
+        embed_q path, whose activation width does not match the stored weight's
+        quantization axis. Long sparse-attention requests use the forward path
+        on q_b_proj's reshaped output, so collect that tensor directly without
+        forcing calibration past the production indexer's short-prefix bypass.
+        """
+        embed_name = q_b_name[: -len("q_b_proj")] + "embed_q"
+        module = self._original_modules.get(embed_name)
+        if module is None or type(module).__name__ not in _OQE_MULTI_LINEAR_CLASSES:
+            return
+        try:
+            weight = module.weight
+            n_heads = int(weight.shape[0])
+            in_dim = self._module_in_dim(module)
+            if not getattr(q, "shape", ()) or int(q.shape[-1]) != n_heads * in_dim:
+                return
+            shaped_q = q.reshape(*q.shape[:-1], n_heads, in_dim)
+            self.collect_multi(embed_name, module, shaped_q)
+        except Exception as e:
+            logger.debug(
+                "oQe GLM-5.3 embed_q capture skipped for %s: %s", embed_name, e
+            )
+
+    @staticmethod
+    def _accumulate_switch(
+        entry: OQImatrixEntry,
+        idx_flat: np.ndarray,
+        x_np: np.ndarray,
+        n_experts: int,
+        token_ids: np.ndarray | None = None,
+    ) -> None:
+        entry.counts += np.bincount(idx_flat, minlength=n_experts)[:n_experts]
+        x_sq = np.square(x_np, dtype=np.float32)
+        if token_ids is None:
+            source_rows = np.arange(idx_flat.shape[0], dtype=np.int64)
+        else:
+            source_rows = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+            if source_rows.shape[0] != idx_flat.shape[0]:
+                return
+
+        order = np.argsort(idx_flat, kind="stable")
+        idx_sorted = idx_flat[order]
+        boundaries = np.flatnonzero(np.diff(idx_sorted)) + 1
+        starts = np.concatenate(([0], boundaries))
+        ends = np.concatenate((boundaries, [idx_sorted.shape[0]]))
+
+        for start, end in zip(starts, ends):
+            expert = int(idx_sorted[start])
+            rows = source_rows[order[start:end]]
+            entry.in_sum2[expert] += x_sq[rows].sum(axis=0)
+
+    def collect_switch(self, name: str, module, x, indices) -> None:
+        try:
+            weight_shape = getattr(module.weight, "shape", ())
+            n_experts = int(getattr(module, "num_experts", weight_shape[0]))
+            in_dim = int(getattr(module, "input_dims", weight_shape[-1]))
+            if getattr(x, "shape", ()) and int(x.shape[-1]) != in_dim:
+                return
+            mx.eval(x, indices)
+            x_np = np.asarray(x.astype(mx.float32)).reshape(-1, in_dim)
+            idx_np = np.asarray(indices).astype(np.int64)
+            if idx_np.size == 0 or x_np.shape[0] == 0:
+                return
+            if idx_np.ndim == 1:
+                idx_flat = idx_np.reshape(-1)
+                if x_np.shape[0] != idx_flat.shape[0]:
+                    return
+                x_source = x_np
+                token_ids = None
+            else:
+                idx_2d = idx_np.reshape(-1, idx_np.shape[-1])
+                if x_np.shape[0] == idx_2d.shape[0]:
+                    idx_flat = idx_2d.reshape(-1)
+                    token_ids = np.repeat(
+                        np.arange(idx_2d.shape[0], dtype=np.int64),
+                        idx_2d.shape[1],
+                    )
+                    x_source = x_np
+                elif x_np.shape[0] == idx_2d.size:
+                    idx_flat = idx_2d.reshape(-1)
+                    x_source = x_np
+                    token_ids = None
+                else:
+                    return
+            valid = (idx_flat >= 0) & (idx_flat < n_experts)
+            if not np.any(valid):
+                return
+            idx_flat = idx_flat[valid]
+            if token_ids is None:
+                x_source = x_source[valid]
+            else:
+                token_ids = token_ids[valid]
+            entry = self._ensure_entry(name, (n_experts, in_dim), (n_experts,))
+            self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
+        except Exception as e:
+            logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
+
+
+def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
+    """Capture the untied GLM-5.3 output head without materializing logits."""
+    if str(getattr(model, "model_type", "")) != "glm5_next":
+        return False
+
+    language_model = getattr(model, "language_model", None)
+    core = getattr(language_model, "model", None)
+    norm = getattr(core, "norm", None)
+    if language_model is None or core is None or norm is None:
+        return False
+
+    name = "language_model.lm_head"
+    module = collector._original_modules.get(name)
+    if module is None:
+        # Tied checkpoints project through embed_tokens and have no lm_head.
+        return False
+
+    if getattr(hidden, "ndim", 0) == 4:
+        hidden = hidden.mean(axis=2)
+    collector.collect_dense(name, module, norm(hidden))
+    return name in collector.entries
+
+
+def _collect_mtp_head_imatrix(
+    model,
+    batch,
+    hidden,
+    dspark_hiddens=None,
+) -> bool:
+    """Run the MTP head over a calibration micro-batch.
+
+    The trunk-layer walk never invokes the head, so without this pass every
+    ``mtp.*`` linear lands in the imatrix "missing" list and gets quantized
+    without calibration — measurably hurting draft acceptance. Mirrors the
+    decode-time contract: fuse the trunk's post-norm hidden at position t
+    with the embedding of token t+1 (the head's own input RMSNorms make the
+    residual pre/post-norm difference negligible for activation statistics).
+    """
+    inner = getattr(model, "language_model", None) or model
+    mtp = getattr(inner, "mtp", None)
+    if mtp is None:
+        get_mtp_module = getattr(inner, "get_mtp_module", None)
+        if callable(get_mtp_module):
+            mtp = get_mtp_module()
+    if mtp is None:
+        mtp = getattr(model, "mtp", None)
+    if mtp is None:
+        return False
+    try:
+        dspark_calibration = getattr(inner, "dspark_calibration_forward", None)
+        if (
+            getattr(inner, "_omlx_dspark_decode_enabled", False)
+            and callable(dspark_calibration)
+            and dspark_hiddens
+        ):
+            target_hidden = mx.concatenate(dspark_hiddens, axis=-1)
+            out = dspark_calibration(target_hidden, batch)
+            mx.eval(out)
+            return True
+        if type(mtp).__name__ == "Qwen4ExpMTPModule":
+            core = getattr(inner, "model", None) or inner
+            embed = getattr(core, "embed_tokens", None)
+            if embed is None:
+                return False
+            make_cache = getattr(inner, "make_mtp_cache", None)
+            mtp_cache = (
+                make_cache()
+                if callable(make_cache)
+                else [None for _ in getattr(mtp, "layers", ())]
+            )
+            out = mtp(hidden[:, :-1, :], batch[:, 1:], embed, mtp_cache)
+            if isinstance(out, tuple):
+                mx.eval(*out)
+            else:
+                mx.eval(out)
+            return True
+        if isinstance(mtp, (list, tuple)):
+            # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
+            # trunk hidden; Model.mtp_forward wires mask/cache/embedding.
+            out = inner.mtp_forward(
+                hidden[:, :-1],
+                batch[:, 1:],
+                inner.make_mtp_cache(),
+            )
+            mx.eval(out)
+            return True
+        core = getattr(inner, "model", None) or inner
+        norm = getattr(core, "norm", None)
+        embed = getattr(core, "embed_tokens", None)
+        if norm is None or embed is None:
+            return False
+        # The head's attention reads cache.offset unconditionally on the
+        # mlx-vlm classes — give it a fresh cache per micro-batch.
+        make_cache = getattr(inner, "make_mtp_cache", None)
+        if callable(make_cache):
+            mtp_cache = make_cache()
+        else:
+            from mlx_lm.models.cache import KVCache
+
+            mtp_cache = [KVCache() for _ in mtp.layers]
+        h = norm(hidden[:, :-1, :])
+        out = mtp(h, batch[:, 1:], embed, mtp_cache)
+        mx.eval(out)
+        return True
+    except Exception as e:
+        logger.warning("oQe imatrix MTP head pass skipped: %s", e)
+        return False
+
+
+def _collect_imatrix_from_model(
+    model,
+    tokenizer,
+    config,
+    *,
+    calib_dataset: str,
+    num_samples: int,
+    seq_length: int,
+    progress_callback=None,
+    progress_start: float = 13.0,
+    progress_end: float = 18.0,
+    model_bytes: int = 0,
+) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    adaptive_max_samples = max(
+        int(num_samples),
+        min(
+            int(num_samples) * _OQE_MAX_SAMPLE_MULTIPLIER,
+            _OQE_MAX_ADAPTIVE_SAMPLES,
+        ),
+    )
+    calib_data = _load_calibration_data(
+        tokenizer,
+        dataset=calib_dataset,
+        num_samples=adaptive_max_samples,
+        seq_length=seq_length,
+    )
+    if calib_data is None:
+        return {}, {
+            "dataset": calib_dataset,
+            "processed_samples": 0,
+            "failure_stage": "dataset",
+            "failure_reason": "calibration dataset produced no usable samples",
+        }
+
+    embed_fn, layers = _find_model_layers(model)
+    if embed_fn is None or layers is None:
+        return {}, {
+            "dataset": calib_dataset,
+            "processed_samples": 0,
+            "model_class": f"{type(model).__module__}.{type(model).__name__}",
+            "failure_stage": "layer_discovery",
+            "failure_reason": "no embedding function or decoder layers found",
+        }
+
+    layer_model = _find_layer_model(model, layers)
+    layer_args = getattr(layer_model, "args", None)
+    layer_config = getattr(layer_model, "config", None)
+    layer_model_type = str(
+        getattr(layer_args, "model_type", "")
+        or getattr(layer_config, "model_type", "")
+        or getattr(model, "model_type", "")
+        or ""
+    )
+    layer_count = len(layers)
+
+    collector = OQImatrixCollector()
+    installed = collector.install(model)
+    if installed == 0:
+        return {}, {
+            "dataset": calib_dataset,
+            "installed_modules": 0,
+            "processed_samples": 0,
+            "model_class": f"{type(model).__module__}.{type(model).__name__}",
+            "layer_model_class": (
+                f"{type(layer_model).__module__}.{type(layer_model).__name__}"
+                if layer_model is not None
+                else None
+            ),
+            "layer_model_type": layer_model_type,
+            "layer_count": layer_count,
+            "failure_stage": "collector_install",
+            "failure_reason": "no supported capture modules found",
+        }
+
+    available_samples = int(calib_data.shape[0])
+    max_samples = min(available_samples, adaptive_max_samples)
+    step_samples = max(1, int(num_samples))
+    batch_plan = _oqe_calibration_batch_plan(
+        config,
+        requested_samples=step_samples,
+        seq_length=seq_length,
+        model_bytes=model_bytes,
+    )
+    if not batch_plan["fits_one_sample"]:
+        collector.restore(model)
+        raise RuntimeError(
+            "oQe imatrix: insufficient calibration memory after model load "
+            f"(available={_format_size(int(batch_plan['live_available_bytes']))}, "
+            f"model={_format_size(int(batch_plan['model_bytes']))}, "
+            f"one sample={_format_size(int(batch_plan['estimated_sample_bytes']))})"
+        )
+    micro_batch_size = int(batch_plan["micro_batch_size"])
+    processed_samples = 0
+    micro_batches = 0
+    layer_state_kind = None
+    successful_layer_forwards = 0
+    skipped_layer_forwards = 0
+    mtp_head_forwards = 0
+    rounds: list[dict[str, Any]] = []
+    require_expert_counts = _imatrix_requires_expert_counts(
+        config, collector.switch_capture_modules
+    )
+    coverage = _imatrix_expert_coverage_stats(collector.entries)
+    logger.info(
+        "oQe imatrix: adaptive max=%d, step=%d, micro-batch=%d "
+        "(available=%s, model=%s, remaining=%s, capture budget=%s)",
+        max_samples,
+        step_samples,
+        micro_batch_size,
+        _format_size(int(batch_plan["live_available_bytes"])),
+        _format_size(int(batch_plan["model_bytes"])),
+        _format_size(int(batch_plan["remaining_available_bytes"])),
+        _format_size(int(batch_plan["capture_budget_bytes"])),
+    )
+    try:
+        while processed_samples < max_samples:
+            next_samples = min(processed_samples + step_samples, max_samples)
+            while processed_samples < next_samples:
+                micro_next = min(processed_samples + micro_batch_size, next_samples)
+                batch = calib_data[processed_samples:micro_next]
+                if int(batch.shape[0]) == 0:
+                    break
+
+                inputs = embed_fn(batch)
+                inputs, layer_masks, position_ids = _prepare_layer_inputs(
+                    model, layers, batch, inputs
+                )
+                if isinstance(position_ids, dict):
+                    layer_state_kind = position_ids.get("kind")
+                elif layer_state_kind is None:
+                    layer_state_kind = "generic"
+
+                inner = getattr(model, "language_model", None) or model
+                args = getattr(inner, "args", None)
+                dspark_target_ids = set(
+                    getattr(args, "dspark_target_layer_ids", ()) or ()
+                )
+                dspark_hiddens = []
+
+                for layer_idx, block in enumerate(layers):
+                    layer_mask = (
+                        layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
+                    )
+                    prev_aux = (
+                        position_ids.get("prev_topk_indices")
+                        if isinstance(position_ids, dict)
+                        and position_ids.get("kind") == "glm_moe_dsa"
+                        else None
+                    )
+                    out, aux = _forward_layer_result(
+                        block,
+                        inputs,
+                        layer_mask,
+                        position_ids,
+                        layer_idx=layer_idx,
+                    )
+                    if out is None:
+                        skipped_layer_forwards += 1
+                        continue
+                    successful_layer_forwards += 1
+                    mx.eval(out)
+                    inputs = out
+                    # DSpark config uses one-based completed layer depths,
+                    # matching the runtime target-tap path.
+                    if layer_idx + 1 in dspark_target_ids:
+                        tapped = out.mean(axis=2) if out.ndim == 4 else out
+                        dspark_hiddens.append(tapped)
+                    _commit_layer_forward_aux(
+                        position_ids, layer_idx, aux, fallback=prev_aux
+                    )
+                    mx.synchronize()
+                    mx.clear_cache()
+
+                _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+
+                # MTP-head pass: the layer walk above leaves ``inputs`` as
+                # the final-layer hidden states; feed them (post-norm) plus
+                # the shifted token ids through the head so its linears
+                # contribute imatrix entries too.
+                if _collect_mtp_head_imatrix(
+                    model,
+                    batch,
+                    inputs,
+                    dspark_hiddens=dspark_hiddens,
+                ):
+                    mtp_head_forwards += 1
+                    mx.synchronize()
+                    mx.clear_cache()
+
+                processed_samples = micro_next
+                micro_batches += 1
+                coverage = _imatrix_expert_coverage_stats(collector.entries)
+                coverage_sufficient = _imatrix_expert_coverage_sufficient(
+                    coverage, require_expert_counts=require_expert_counts
+                )
+                collection_sufficient = (
+                    processed_samples >= int(num_samples) and coverage_sufficient
+                )
+                frac = min(max(processed_samples / max(max_samples, 1), 0.0), 1.0)
+                pct = progress_start + frac * (progress_end - progress_start)
+                detail = (
+                    f"oQe imatrix {processed_samples}/{max_samples} samples "
+                    f"(micro-batch {int(batch.shape[0])}, "
+                    f"zero experts {coverage.get('zero_count_experts', 0)})"
+                )
+                _emit_progress(
+                    progress_callback,
+                    "imatrix",
+                    pct,
+                    detail,
+                    {
+                        "processed_samples": processed_samples,
+                        "max_samples": max_samples,
+                        "requested_samples": int(num_samples),
+                        "micro_batch_size": micro_batch_size,
+                        "micro_batches": micro_batches,
+                        "coverage_sufficient": coverage_sufficient,
+                        "collection_sufficient": collection_sufficient,
+                        "requires_expert_counts": require_expert_counts,
+                        "coverage": coverage,
+                    },
+                )
+                logger.info(
+                    "oQe imatrix: %d/%d samples, zero experts=%d, "
+                    "p05=%.1f, expert_coverage=%s, sufficient=%s",
+                    processed_samples,
+                    max_samples,
+                    int(coverage.get("zero_count_experts", 0)),
+                    float(coverage.get("p05_count", 0.0)),
+                    coverage_sufficient,
+                    collection_sufficient,
+                )
+                if collection_sufficient:
+                    break
+                mx.synchronize()
+                mx.clear_cache()
+
+            if int(processed_samples) == 0:
+                break
+            coverage = _imatrix_expert_coverage_stats(collector.entries)
+            coverage_sufficient = _imatrix_expert_coverage_sufficient(
+                coverage, require_expert_counts=require_expert_counts
+            )
+            collection_sufficient = (
+                processed_samples >= int(num_samples) and coverage_sufficient
+            )
+            rounds.append(
+                {
+                    "processed_samples": processed_samples,
+                    "coverage_sufficient": coverage_sufficient,
+                    "collection_sufficient": collection_sufficient,
+                    "coverage": coverage,
+                }
+            )
+            if collection_sufficient:
+                break
+            mx.synchronize()
+            mx.clear_cache()
+    finally:
+        collector.restore(model)
+
+    coverage_sufficient = _imatrix_expert_coverage_sufficient(
+        coverage, require_expert_counts=require_expert_counts
+    )
+    collection_sufficient = (
+        processed_samples >= int(num_samples) and coverage_sufficient
+    )
+    if require_expert_counts and not coverage.get("has_expert_counts", False):
+        logger.warning(
+            "oQe imatrix: model config expects routed experts, but no expert "
+            "activation counts were captured"
+        )
+
+    metadata = {
+        "dataset": calib_dataset,
+        "requested_samples": int(num_samples),
+        "seq_length": int(seq_length),
+        "adaptive": True,
+        "adaptive_step_samples": step_samples,
+        "adaptive_max_samples": max_samples,
+        "available_samples": available_samples,
+        "micro_batch_size": micro_batch_size,
+        "micro_batches": micro_batches,
+        "batch_plan": batch_plan,
+        "processed_samples": processed_samples,
+        "model_class": f"{type(model).__module__}.{type(model).__name__}",
+        "layer_model_class": (
+            f"{type(layer_model).__module__}.{type(layer_model).__name__}"
+            if layer_model is not None
+            else None
+        ),
+        "layer_model_type": layer_model_type,
+        "layer_count": layer_count,
+        "layer_state_kind": layer_state_kind,
+        "successful_layer_forwards": successful_layer_forwards,
+        "skipped_layer_forwards": skipped_layer_forwards,
+        "mtp_head_forwards": mtp_head_forwards,
+        "installed_modules": installed,
+        "capture_module_classes": dict(
+            sorted(collector.capture_module_classes.items())
+        ),
+        "switch_capture_modules": int(collector.switch_capture_modules),
+        "requires_expert_counts": require_expert_counts,
+        "coverage_sufficient": coverage_sufficient,
+        "collection_sufficient": collection_sufficient,
+        "coverage": coverage,
+        "rounds": rounds,
+    }
+    if not collector.entries:
+        metadata["failure_stage"] = "layer_forward"
+        if successful_layer_forwards == 0:
+            metadata["failure_reason"] = (
+                "no decoder layer forward completed successfully"
+            )
+        else:
+            metadata["failure_stage"] = "capture"
+            metadata["failure_reason"] = (
+                f"{installed} hooks were installed and "
+                f"{successful_layer_forwards} layer forwards completed, "
+                "but no hook captured a compatible activation"
+            )
+    return collector.entries, metadata
+
+
+def _collect_imatrix(
+    model_path: str,
+    config: dict,
+    *,
+    calib_dataset: str = _OQE_CALIB_DATASET,
+    num_samples: int = 128,
+    seq_length: int = 512,
+    trust_remote_code: bool = False,
+    progress_callback=None,
+    progress_start: float = 13.0,
+    progress_end: float = 18.0,
+) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
+    from omlx.utils.model_loading import (
+        _checkpoint_has_mtp_weights,
+        _has_mtp_heads,
+        maybe_apply_pre_load_patches,
+    )
+
+    is_vlm = _is_vlm_load(config)
+    has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
+    has_mtp_heads = _has_mtp_heads(config)
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
+
+    restore_mtp_active = None
+    if has_mtp_heads and has_mtp_weights:
+        # Attach the MTP head on the temporary calibration model so the
+        # head-forward pass in _collect_imatrix_from_model can exercise its
+        # linears (they'd otherwise land in the imatrix "missing" list).
+        try:
+            from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+
+            if is_vlm:
+                from omlx.patches.mlx_vlm_mtp import (
+                    apply_mlx_vlm_mtp_patch,
+                    apply_mlx_vlm_mtp_runtime_patch,
+                )
+
+                apply_mlx_vlm_mtp_patch()
+                apply_mlx_vlm_mtp_runtime_patch()
+            prev_active = is_mtp_active()
+            set_mtp_active(True)
+
+            def _restore_mtp_active():
+                set_mtp_active(prev_active)
+
+            restore_mtp_active = _restore_mtp_active
+        except Exception as e:
+            logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
+
+    try:
+        if is_vlm:
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            # Calibration proxies deliberately retain SSD-mapped tensors that
+            # are consumed by model-specific mmap modules rather than owned as
+            # normal MLX parameters (Qwen4 PLE shards are the primary case).
+            # mlx-vlm exposes ``strict`` specifically for this final weight
+            # load; pass it directly instead of monkeypatching Module globally.
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+                strict=False,
+            )
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+            tokenizer = load_tokenizer(Path(model_path))
+        else:
+            from omlx.utils.model_loading import lm_load_compat as lm_load
+
+            model, tokenizer = lm_load(
+                model_path,
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+                model_config=_sensitivity_lm_config_override(config),
+            )
+    except Exception as e:
+        logger.error("oQe imatrix: model load failed (%s)", e)
+        raise RuntimeError(f"oQe imatrix model load failed: {e}") from e
+    finally:
+        if restore_mtp_active is not None:
+            restore_mtp_active()
+
+    try:
+        model_bytes = _calibration_resident_checkpoint_bytes(model_path, config)
+        return _collect_imatrix_from_model(
+            model,
+            tokenizer,
+            config,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+            model_bytes=model_bytes,
+        )
+    finally:
+        del model, tokenizer
+        mx.synchronize()
+        mx.clear_cache()
+
+
+def _oqe_cache_missing_mtp_entries(
+    cache: OQImatrixData, config: dict, model_path: str
+) -> bool:
+    """True when the model declares MTP heads but the cache predates the
+    MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
+    the head gets calibrated quantization instead of landing in "missing"."""
+    try:
+        from omlx.utils.model_loading import (
+            _checkpoint_has_mtp_weights,
+            _has_mtp_heads,
+        )
+
+        if not _has_mtp_heads(config) or not _checkpoint_has_mtp_weights(model_path):
+            return False
+    except Exception:
+        return False
+    return not any(
+        ".mtp." in key or key.startswith("mtp.") for key in cache.entries
+    )
+
+
+def _load_or_collect_imatrix(
+    model_path: str,
+    config: dict,
+    *,
+    cache_path: str,
+    reuse_cache: bool,
+    num_samples: int,
+    seq_length: int,
+    strict: bool,
+    trust_remote_code: bool,
+    calib_dataset: str = _OQE_CALIB_DATASET,
+    progress_callback=None,
+    progress_start: float = 13.0,
+    progress_end: float = 18.0,
+    load_path_factory: Callable[[], str] | None = None,
+) -> OQImatrixData:
+    source = Path(model_path)
+    path = Path(cache_path)
+    expected = _source_imatrix_signature(
+        source,
+        config,
+        num_samples=num_samples,
+        seq_length=seq_length,
+        calib_dataset=calib_dataset,
+    )
+    if reuse_cache and path.exists():
+        cache = _load_oqe_imatrix(path)
+        if _oqe_cache_matches(cache, expected):
+            if _oqe_cache_missing_mtp_entries(cache, config, model_path):
+                logger.info(
+                    "oQe imatrix: cache predates MTP-head collection "
+                    "(no mtp.* entries), recollecting %s",
+                    path,
+                )
+            elif _oqe_cache_has_required_expert_coverage(cache):
+                cache.reused = True
+                logger.info("oQe imatrix: using cache %s", path)
+                _emit_progress(
+                    progress_callback,
+                    "imatrix",
+                    progress_end,
+                    f"Using oQe imatrix cache ({len(cache.entries)} entries)",
+                    {"cache_path": str(path), "entry_count": len(cache.entries)},
+                )
+                return cache
+            logger.info(
+                "oQe imatrix: cache missing required expert coverage, "
+                "recollecting %s",
+                path,
+            )
+        else:
+            logger.info("oQe imatrix: cache metadata mismatch, recollecting %s", path)
+
+    logger.info(
+        "oQe imatrix: collecting %d samples x %d tokens from %s",
+        num_samples,
+        seq_length,
+        calib_dataset,
+    )
+    # ``load_path_factory`` swaps in an alternate checkpoint for the
+    # calibration forwards (a memory-safe quantized proxy of the source when
+    # the source exceeds live calibration capacity). Resolved only on a cache
+    # miss so a reusable cache never pays the proxy build. The cache signature stays
+    # keyed to the source checkpoint either way.
+    load_path = model_path
+    if load_path_factory is not None:
+        load_path = load_path_factory()
+    entries, collection_metadata = _collect_imatrix(
+        load_path,
+        config,
+        calib_dataset=calib_dataset,
+        num_samples=num_samples,
+        seq_length=seq_length,
+        trust_remote_code=trust_remote_code,
+        progress_callback=progress_callback,
+        progress_start=progress_start,
+        progress_end=progress_end,
+    )
+    if not entries:
+        stage = str(collection_metadata.get("failure_stage", "unknown"))
+        reason = str(
+            collection_metadata.get(
+                "failure_reason", "collector returned no captured activations"
+            )
+        )
+        raise RuntimeError(
+            "oQe imatrix collection produced no entries "
+            f"(stage={stage}: {reason})"
+        )
+    metadata = {
+        **expected,
+        "entry_count": len(entries),
+        "collection": collection_metadata,
+        "expert_coverage": collection_metadata.get("coverage", {}),
+        "requires_expert_counts": bool(
+            collection_metadata.get("requires_expert_counts", False)
+        ),
+        "processed_samples": int(collection_metadata.get("processed_samples", 0)),
+    }
+    _save_oqe_imatrix(path, entries, metadata)
+    logger.info("oQe imatrix: wrote cache %s (%d entries)", path, len(entries))
+    return OQImatrixData(
+        entries=entries,
+        metadata=metadata,
+        path=str(path),
+        reused=False,
+    )
 
 
 def _measure_sensitivity_from_model(
@@ -3770,14 +8343,34 @@ def _measure_sensitivity_from_model(
 
     for layer_idx, block in enumerate(layers):
         layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
-        out_float = _forward_layer(block, inputs, layer_mask, position_ids)
+        prev_aux = (
+            position_ids.get("prev_topk_indices")
+            if isinstance(position_ids, dict)
+            and position_ids.get("kind") == "glm_moe_dsa"
+            else None
+        )
+        out_float, baseline_aux = _forward_layer_result(
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
+        )
         if out_float is None:
             continue
 
         saved = _temporary_quantize_block(
             block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
         )
-        out_quant = _forward_layer(block, inputs, layer_mask, position_ids)
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
+            position_ids["prev_topk_indices"] = prev_aux
+        out_quant, _ = _forward_layer_result(
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
+        )
         if out_quant is not None:
             raw_mse = ((out_float - out_quant) ** 2).mean()
             out_magnitude = (out_float**2).mean()
@@ -3787,6 +8380,11 @@ def _measure_sensitivity_from_model(
 
         _restore_saved_weights(block, saved)
 
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
+            position_ids["prev_topk_indices"] = baseline_aux
+        _commit_layer_forward_aux(
+            position_ids, layer_idx, baseline_aux, fallback=prev_aux
+        )
         inputs = out_float
         mx.synchronize()
         mx.clear_cache()
@@ -3817,29 +8415,34 @@ def _measure_sensitivity(
         maybe_apply_pre_load_patches,
     )
 
-    # Treat any model with a vision sub-config (vision_config / vit_config /
-    # mm_vision_tower) as a VLM for the MTP attach decision. The classifier
-    # in model_discovery._has_vision_subconfig owns the canonical predicate.
-    is_vlm = _has_vision_subconfig(config)
+    # Route the MTP attach / load decision via _is_vlm_load: a vision
+    # sub-config (vision_config / vit_config / mm_vision_tower) means VLM,
+    # except for model types mlx-lm serves text-only (e.g. mimo_v2), which
+    # ship a vision_config but must load through the patched mlx-lm class.
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
+    has_mtp_heads = _has_mtp_heads(config)
 
     # Reuse the centralised pre-load dispatch so every current and future
     # patch (MTP sanitize, DeepSeek V4, nested-visual, load_config, …) is
     # applied exactly as in the production load path.
-    maybe_apply_pre_load_patches(model_path, for_vlm=is_vlm)
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
 
-    # maybe_apply_pre_load_patches leaves mtp_active False, which is correct
-    # for the text path: the patched qwen35_model.sanitize self-consistently
-    # strips mtp.* when no head is attached. The VLM path needs both patches.
-    # apply_mlx_vlm_mtp_patch fixes Model.sanitize so language_model.mtp.*
-    # weights survive the load with the correct keys (stock mlx-vlm sanitize
-    # strips them, which is what made the strict load fail with "Missing N
-    # parameters" and the measurement silently return {}). The runtime patch
-    # then attaches the MTP head so the checkpoint matches the model. Both
-    # are idempotent. Sensitivity only reads backbone decoder layers, so this
-    # is load-only.
+    # The central dispatch receives an explicit MTP calibration setting so
+    # model-specific constructors such as Qwen4's root-owned MTP head are
+    # enabled before load. The VLM patch below also covers the generic
+    # qwen3_5 classes whose MTP module is attached by the shared runtime.
+    # Sensitivity only reads backbone decoder layers, so this is load-only.
     restore_mtp_active = None
-    if is_vlm and _has_mtp_heads(config) and has_mtp_weights:
+    if is_vlm and has_mtp_heads and has_mtp_weights:
         try:
             from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
             from omlx.patches.mlx_vlm_mtp import (
@@ -3859,21 +8462,26 @@ def _measure_sensitivity(
         if is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
+            # Sensitivity uses the same proxy representation as imatrix
+            # calibration. Allow intentionally unowned mmap/shared-KV tensors
+            # through mlx-vlm's supported load option.
             model = vlm_load_model(
                 Path(model_path),
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                strict=False,
             )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
         else:
-            from mlx_lm import load as lm_load
+            from omlx.utils.model_loading import lm_load_compat as lm_load
 
             model, tokenizer = lm_load(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                model_config=_sensitivity_lm_config_override(config),
             )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
@@ -3900,6 +8508,7 @@ def _measure_sensitivity(
 
 
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
+_AFFINE_GROUP_SIZES = (32, 64, 128)
 
 
 def _perturb_bits_for(bits: int):
@@ -3908,18 +8517,41 @@ def _perturb_bits_for(bits: int):
     return max(lower) if lower else None
 
 
+def _affine_perturb_group_size(group_size: int, in_dim: int):
+    """Group size for an affine perturbation re-quant of a row of ``in_dim``.
+
+    The sensitivity perturbation always re-quantizes with ``mode="affine"``,
+    and affine kernels only implement group sizes 32/64/128. The source
+    module's own group size is therefore not always reusable: nvfp4 modules
+    carry ``group_size=16``, which mx.quantize rejects. Keep the module's size
+    whenever affine supports it, so affine/mxfp4/mxfp8 sources perturb exactly
+    as before; otherwise take the supported size closest to it (smallest on a
+    tie) that still divides the row. Returns None when none divides it, in
+    which case the module cannot be perturbed and is skipped.
+    """
+    usable = [g for g in _AFFINE_GROUP_SIZES if in_dim % g == 0]
+    if not usable:
+        return None
+    if group_size in usable:
+        return group_size
+    return min(usable, key=lambda g: (abs(g - group_size), g))
+
+
 def _build_proxy_for_sensitivity(
     model_path: str,
     *,
+    config: dict | None = None,
     dtype: str,
     working_dir: str | None = None,
     trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
 ) -> Path:
-    """Build a temporary uniform 4-bit proxy for sensitivity measurement.
+    """Build a temporary uniform 4-bit proxy for calibration passes.
 
-    Used when the source model exceeds available RAM and full-fp16
-    sensitivity measurement is not feasible. The proxy keeps oQ data-driven;
-    without it, quantize_oq_streaming aborts the run with a RuntimeError.
+    Used when the source model exceeds the live calibration budget and
+    full-fp16 sensitivity measurement / oQe imatrix collection is not feasible. The
+    proxy keeps oQ data-driven; without it, quantize_oq_streaming aborts
+    the run with a RuntimeError.
 
     ``working_dir`` controls where the proxy is written. Defaults to the
     system temp dir when None, but callers should pass the parent of the
@@ -3928,46 +8560,249 @@ def _build_proxy_for_sensitivity(
     Linux ``/tmp`` being tmpfs (RAM-backed), which would defeat the whole
     point of the OOM-driven proxy.
 
+    ``preserve_mtp`` keeps the MTP head in the proxy so the imatrix head
+    pass can exercise its linears; sensitivity-only proxies leave it off.
+
     The caller is responsible for deleting the returned directory.
     """
-    try:
-        from omlx.patches.mlx_lm_mtp import (
-            apply_mlx_lm_mtp_patch,
-            is_mtp_active,
-            set_mtp_active,
-        )
+    # Reserve a unique temp name and let the streaming writer create it.
+    proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
+    shutil.rmtree(proxy_dir)
+    _build_streaming_proxy_for_sensitivity(
+        model_path,
+        proxy_dir,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        preserve_mtp=preserve_mtp,
+    )
+    return proxy_dir
 
-        _have_lm_patch = apply_mlx_lm_mtp_patch()
-    except Exception:
-        _have_lm_patch = False
-        is_mtp_active = None
-        set_mtp_active = None
 
-    prev_active = is_mtp_active() if _have_lm_patch else False
-    try:
-        if _have_lm_patch:
-            set_mtp_active(True)
+def _build_streaming_proxy_for_sensitivity(
+    model_path: str,
+    output_path: Path,
+    *,
+    dtype: str,
+    trust_remote_code: bool = False,
+    preserve_mtp: bool = False,
+) -> None:
+    """Build a loadable 4-bit sensitivity proxy without loading the source.
 
-        from mlx_lm import convert
+    This is the RAM-safe counterpart to ``mlx_lm.convert(..., quantize=True)``.
+    It uses the same header-only tensor index, streaming sanitize discovery,
+    FP8 dequantization, and chunked quantization path as oQ itself, but skips
+    sensitivity measurement and dynamic boost planning. The proxy is only used
+    to rank layer sensitivity, so a compact uniform-ish 4-bit model is enough.
+    """
+    del trust_remote_code  # Kept for API symmetry; model code comes from config.
 
-        # mlx-lm's convert() refuses to write into a pre-existing directory,
-        # so reserve a unique temp name and let convert() create it.
-        proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
-        shutil.rmtree(proxy_dir)
-        convert(
-            hf_path=model_path,
-            mlx_path=str(proxy_dir),
-            quantize=True,
-            q_bits=_PROXY_QUANT_BITS,
-            q_group_size=_PROXY_QUANT_GROUP_SIZE,
-            q_mode="affine",
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
-        )
-        return proxy_dir
-    finally:
-        if _have_lm_patch:
-            set_mtp_active(prev_active)
+    source = Path(model_path)
+    output = Path(output_path)
+    if output.exists():
+        raise ValueError(f"Proxy output directory already exists: {output}")
+
+    with open(source / "config.json") as f:
+        config = json.load(f)
+    _validate_oq_dtype_for_model(config, dtype)
+    target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
+
+    weight_files = sorted(source.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(f"No .safetensors files found in {model_path}")
+
+    all_weights = _LazyTensorIndex(weight_files, config=config)
+    sanitize_fn = _build_model_sanitizer(
+        config,
+        text_only=False,
+        model_path=source,
+        preserve_mtp=preserve_mtp,
+    )
+    cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
+    if sanitize_fn is not None:
+        try:
+            plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+            all_weights = _DiscoveredPlan(plan, all_weights)
+            logger.info(
+                "oQ proxy: discovered streaming sanitize plan, "
+                f"{len(all_weights)} output tensors"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "oQ proxy: streaming sanitize-plan discovery failed "
+                f"({e}). Extend _TrackedTensor for this sanitize pattern "
+                "or provide sensitivity_model_path explicitly."
+            ) from e
+
+    config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
+    config["_oq_use_budget_plan"] = False
+    config["_oq_boost_map"] = {}
+
+    output.mkdir(parents=True, exist_ok=False)
+
+    out_shard_data = {}
+    out_shard_idx = 0
+    weight_map = {}
+    per_layer_config = {}
+    tensor_names = list(all_weights.keys())
+    base_bits = _PROXY_QUANT_BITS
+    base_gs = _PROXY_QUANT_GROUP_SIZE
+    base_mode = "affine"
+    quantization_config = {
+        "group_size": base_gs,
+        "bits": base_bits,
+        "mode": base_mode,
+    }
+
+    def _flush_shard() -> None:
+        nonlocal out_shard_data, out_shard_idx
+        if not out_shard_data:
+            return
+        shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
+        shard_path = output / shard_name
+        mx.save_safetensors(str(shard_path), out_shard_data, metadata={"format": "mlx"})
+        for key in out_shard_data:
+            weight_map[key] = shard_name
+        out_shard_idx += 1
+        out_shard_data = {}
+        mx.synchronize()
+        mx.clear_cache()
+
+    for tensor_name in tensor_names:
+        handled_packed = False
+        if hasattr(all_weights, "pop_packed") and not _is_mtp_tensor(tensor_name):
+            src_info = all_weights.source_quant_info(tensor_name)
+            if src_info is not None and _should_quantize_tensor(
+                tensor_name, all_weights.plan_shape(tensor_name)
+            ):
+                pred = universal_quant_predicate(
+                    tensor_name, None, config, _PROXY_QUANT_BITS
+                )
+                if pred is not False and base_bits >= src_info["bits"]:
+                    qw, scales = all_weights.pop_packed(tensor_name)
+                    base = tensor_name[: -len(".weight")]
+                    out_shard_data[f"{base}.weight"] = qw
+                    out_shard_data[f"{base}.scales"] = scales
+                    per_layer_config[base] = {
+                        "bits": src_info["bits"],
+                        "group_size": src_info["group_size"],
+                        "mode": src_info["mode"],
+                    }
+                    del qw, scales
+                    handled_packed = True
+
+        if not handled_packed:
+            w_mx = all_weights.pop(tensor_name)
+            if isinstance(w_mx, _LazyTensor):
+                w_mx = w_mx[:]
+            shape = w_mx.shape
+
+            if _is_mtp_tensor(tensor_name) and not preserve_mtp:
+                del w_mx
+                continue
+
+            if _should_quantize_tensor(tensor_name, shape):
+                pred = universal_quant_predicate(
+                    tensor_name, None, config, _PROXY_QUANT_BITS
+                )
+                tensor_gs = (
+                    _QWEN4_EXP_NGRAM_GROUP_SIZE
+                    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                    else base_gs
+                )
+                if (
+                    pred is not False
+                    and len(shape) >= 2
+                    and shape[-1] % tensor_gs == 0
+                ):
+                    if (
+                        mx.issubdtype(w_mx.dtype, mx.floating)
+                        and w_mx.dtype != target_dtype
+                    ):
+                        w_mx = w_mx.astype(target_dtype)
+                    qw, scales, biases = _quantize_chunked(
+                        w_mx, tensor_gs, base_bits, base_mode
+                    )
+                    base = (
+                        tensor_name[:-7]
+                        if tensor_name.endswith(".weight")
+                        else tensor_name
+                    )
+                    out_shard_data[f"{base}.weight"] = qw
+                    out_shard_data[f"{base}.scales"] = scales
+                    if biases is not None:
+                        out_shard_data[f"{base}.biases"] = biases
+                    if tensor_gs != base_gs:
+                        per_layer_config[base] = {
+                            "bits": base_bits,
+                            "group_size": tensor_gs,
+                            "mode": base_mode,
+                        }
+                    del qw, scales, biases
+                else:
+                    if cast_predicate is None or cast_predicate(tensor_name):
+                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                    out_shard_data[tensor_name] = w_mx
+            else:
+                if cast_predicate is None or cast_predicate(tensor_name):
+                    w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                out_shard_data[tensor_name] = w_mx
+
+            del w_mx
+
+        if sum(v.nbytes for v in out_shard_data.values()) >= _MAX_SHARD_BYTES:
+            _flush_shard()
+
+    del all_weights
+    mx.synchronize()
+    mx.clear_cache()
+    _flush_shard()
+
+    total_shards = out_shard_idx
+    if total_shards == 1:
+        only = output / "model-00001-of-PLACEHOLDER.safetensors"
+        final = output / "model.safetensors"
+        only.rename(final)
+        for key in list(weight_map):
+            weight_map[key] = "model.safetensors"
+    elif total_shards > 1:
+        for i in range(total_shards):
+            old_name = f"model-{i + 1:05d}-of-PLACEHOLDER.safetensors"
+            new_name = f"model-{i + 1:05d}-of-{total_shards:05d}.safetensors"
+            old_path = output / old_name
+            new_path = output / new_name
+            if old_path.exists():
+                old_path.rename(new_path)
+                for key, value in list(weight_map.items()):
+                    if value == old_name:
+                        weight_map[key] = new_name
+
+        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        index = {
+            "metadata": {"total_size": total_size},
+            "weight_map": dict(sorted(weight_map.items())),
+        }
+        with open(output / "model.safetensors.index.json", "w") as f:
+            json.dump(index, f, indent=2)
+
+    output_config = dict(config)
+    for temp_key in (
+        "_oq_sensitivity_map",
+        "_oq_boost_map",
+        "_oq_use_budget_plan",
+        "_oq_non_quantizable",
+    ):
+        output_config.pop(temp_key, None)
+    if not preserve_mtp:
+        _normalize_mtp_in_config(output_config)
+    quant_info = dict(quantization_config)
+    for key, val in per_layer_config.items():
+        quant_info[key] = val
+    output_config["quantization"] = quant_info
+    output_config["quantization_config"] = quant_info
+    with open(output / "config.json", "w") as f:
+        json.dump(output_config, f, indent=2, ensure_ascii=False)
+
+    _copy_model_sidecars(source, output)
 
 
 def _measure_sensitivity_from_quantized_model(
@@ -3986,50 +8821,118 @@ def _measure_sensitivity_from_quantized_model(
     bits. The relative MSE ranking matches fp16 qdq-MSE with ~90% top-10
     overlap.
     """
-    from mlx_lm import load as lm_load
-
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+    from omlx.utils.model_loading import (
+        _checkpoint_has_mtp_weights,
+        _has_mtp_heads,
+        lm_load_compat as lm_load,
+        maybe_apply_pre_load_patches,
+    )
 
     # Reuse the centralised pre-load dispatch (DeepSeek V4 base patch,
     # load_model replacement for F8_E8M0 checkpoints, MTP sanitize, ...)
     # so the quantized source/proxy loads exactly as in production.
     # Idempotent; harmless for plain mlx-lm proxies.
-    maybe_apply_pre_load_patches(model_path, for_vlm=False)
+    is_vlm = _is_vlm_load(config)
+    has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
+    has_mtp_heads = _has_mtp_heads(config)
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
+    patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
+    if calibration_settings is not None:
+        patch_kwargs["model_settings"] = calibration_settings
+    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
 
-    # Mirror the main quantize path's MTP patch sequence so an
-    # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
-    # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
-    # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
-    # ``mtp.*`` weights present in the proxy.
+    restore_mtp_active = None
     try:
-        from omlx.patches.mlx_lm_mtp import (
-            apply_mlx_lm_mtp_patch,
-            is_mtp_active,
-            set_mtp_active,
-        )
+        if is_vlm:
+            if has_mtp_heads and has_mtp_weights:
+                try:
+                    from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+                    from omlx.patches.mlx_vlm_mtp import (
+                        apply_mlx_vlm_mtp_patch,
+                        apply_mlx_vlm_mtp_runtime_patch,
+                    )
 
-        _have_lm_patch = apply_mlx_lm_mtp_patch()
-    except Exception:
-        _have_lm_patch = False
-        is_mtp_active = None
-        set_mtp_active = None
+                    apply_mlx_vlm_mtp_patch()
+                    apply_mlx_vlm_mtp_runtime_patch()
+                    prev_active = is_mtp_active()
+                    set_mtp_active(True)
+                    restore_mtp_active = lambda: set_mtp_active(
+                        prev_active
+                    )  # noqa: E731
+                except Exception as e:
+                    logger.debug(
+                        "mlx-vlm MTP runtime patch skipped for proxy sensitivity: "
+                        f"{e}"
+                    )
 
-    prev_active = is_mtp_active() if _have_lm_patch else False
-    try:
-        if _have_lm_patch:
-            set_mtp_active(True)
-        try:
+            from mlx_lm.tokenizer_utils import load as load_tokenizer
+            from mlx_vlm.utils import load_model as vlm_load_model
+
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+                # Quantized calibration proxies may retain model-specific
+                # tensors consumed directly by mmap modules rather than
+                # represented as ordinary MLX parameters (Qwen4 PLE shards).
+                # Match the imatrix and non-proxy sensitivity load paths.
+                strict=False,
+            )
+            tokenizer = load_tokenizer(Path(model_path))
+        else:
+            # Mirror the main quantize path's MTP patch sequence so an
+            # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
+            # preserve_mtp=True) loads cleanly. Without set_mtp_active(True) the
+            # mlx-lm __init__ skips ``self.mtp`` and the load rejects the
+            # ``mtp.*`` weights present in the proxy.
+            try:
+                from omlx.patches.mlx_lm_mtp import (
+                    apply_mlx_lm_mtp_patch,
+                    is_mtp_active,
+                    set_mtp_active,
+                )
+
+                apply_mlx_lm_mtp_patch()
+                # apply() is idempotent and returns whether it changed live
+                # classes, not whether the patch is available. A prior oQe
+                # phase commonly installed it already.
+                have_lm_patch = True
+            except Exception:
+                have_lm_patch = False
+                is_mtp_active = None
+                set_mtp_active = None
+
+            if have_lm_patch:
+                prev_active = is_mtp_active()
+                set_mtp_active(True)
+                restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
+
             model, tokenizer = lm_load(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
             )
-        except Exception as e:
-            logger.error(f"Sensitivity proxy load failed ({e})")
-            return {}
+    except Exception as e:
+        logger.error(f"Sensitivity proxy load failed ({e})")
+        return {}
     finally:
-        if _have_lm_patch:
-            set_mtp_active(prev_active)
+        if restore_mtp_active is not None:
+            restore_mtp_active()
+
+    if config.get("model_type") == "glm_moe_dsa":
+        capped_samples = min(num_samples, 16)
+        capped_seq = min(seq_length, 128)
+        if capped_samples != num_samples or capped_seq != seq_length:
+            logger.info(
+                "GLM MoE DSA proxy sensitivity: capping calibration to "
+                f"{capped_samples} samples x {capped_seq} tokens"
+            )
+        num_samples = capped_samples
+        seq_length = capped_seq
 
     calib_data = _load_calibration_data(
         tokenizer,
@@ -4058,7 +8961,19 @@ def _measure_sensitivity_from_quantized_model(
 
     for layer_idx, block in enumerate(layers):
         layer_mask = layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
-        out_baseline = _forward_layer(block, inputs, layer_mask, position_ids)
+        prev_aux = (
+            position_ids.get("prev_topk_indices")
+            if isinstance(position_ids, dict)
+            and position_ids.get("kind") == "glm_moe_dsa"
+            else None
+        )
+        out_baseline, baseline_aux = _forward_layer_result(
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
+        )
         if out_baseline is None:
             continue
         # Materialize the baseline before mutating module weights below.
@@ -4088,15 +9003,28 @@ def _measure_sensitivity_from_quantized_model(
                 bits=bits,
                 mode=mode,
             )
-            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode)
+            # Affine kernels only ship group sizes 32/64/128, so the module's
+            # own size cannot always be reused for the perturbation re-quant.
+            perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
+            if perturb_gs is None:
+                logger.debug(
+                    f"Sensitivity perturbation skipped for {p}: no affine group "
+                    f"size divides an input dim of {w_float.shape[-1]}"
+                )
+                continue
+            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode, gs)
             qw, sc, *rest = mx.quantize(
-                w_float, group_size=gs, bits=perturb_bits, mode="affine"
+                w_float, group_size=perturb_gs, bits=perturb_bits, mode="affine"
             )
             m.weight = qw
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
             m.mode = "affine"
+            # The perturbed forward reads group_size off the module, so it has
+            # to track the re-quantized layout; the restore below puts the
+            # source module's own size back.
+            m.group_size = perturb_gs
             # Force re-quant materialization so the next forward sees the
             # perturbed weights instead of the lazy reference to the originals.
             if m.biases is not None:
@@ -4104,12 +9032,20 @@ def _measure_sensitivity_from_quantized_model(
             else:
                 mx.eval(m.weight, m.scales)
 
-        out_perturbed = _forward_layer(block, inputs, layer_mask, position_ids)
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
+            position_ids["prev_topk_indices"] = prev_aux
+        out_perturbed, _ = _forward_layer_result(
+            block,
+            inputs,
+            layer_mask,
+            position_ids,
+            layer_idx=layer_idx,
+        )
 
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
         )
-        for p, (w, s, b, orig_bits, orig_mode) in saved.items():
+        for p, (w, s, b, orig_bits, orig_mode, orig_gs) in saved.items():
             if p in modules_by_path:
                 mod = modules_by_path[p]
                 mod.weight = w
@@ -4120,6 +9056,7 @@ def _measure_sensitivity_from_quantized_model(
                     del mod.biases
                 mod.bits = orig_bits
                 mod.mode = orig_mode
+                mod.group_size = orig_gs
 
         if out_perturbed is not None:
             # Cast to float32 first: float16 squared differences overflow
@@ -4132,6 +9069,11 @@ def _measure_sensitivity_from_quantized_model(
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
 
+        if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
+            position_ids["prev_topk_indices"] = baseline_aux
+        _commit_layer_forward_aux(
+            position_ids, layer_idx, baseline_aux, fallback=prev_aux
+        )
         inputs = out_baseline
         mx.eval(inputs)
         mx.synchronize()

@@ -28,6 +28,7 @@ class PrefillProgressTracker:
     def __init__(self) -> None:
         self._progress: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._last_activity_ts = 0.0
 
     def update(
         self,
@@ -46,6 +47,7 @@ class PrefillProgressTracker:
         """
         now = time.monotonic()
         with self._lock:
+            self._last_activity_ts = now
             if processed >= total:
                 self._progress.pop(request_id, None)
             else:
@@ -81,7 +83,21 @@ class PrefillProgressTracker:
     def remove(self, request_id: str) -> None:
         """Explicitly remove a request (e.g. on abort or finish)."""
         with self._lock:
-            self._progress.pop(request_id, None)
+            if self._progress.pop(request_id, None) is not None:
+                self._last_activity_ts = time.monotonic()
+
+    def recently_active(self, within_s: float) -> bool:
+        """True while any prefill is live, or within ``within_s`` of the
+        last prefill activity (update, completion, or abort).
+
+        A prefill that just ended counts as recent activity on purpose:
+        timings sampled right after it are still contention-shaped.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._progress:
+                return True
+            return (now - self._last_activity_ts) < within_s
 
     def get_model_progress(self, model_id: str) -> List[Dict[str, Any]]:
         """Return list of prefilling requests for a given model."""
@@ -119,9 +135,10 @@ class PrefillProgressTracker:
             return results
 
     def clear(self) -> None:
-        """Remove all entries."""
+        """Remove all entries and forget the last activity timestamp."""
         with self._lock:
             self._progress.clear()
+            self._last_activity_ts = 0.0
 
 
 # Module-level singleton, lazily created.

@@ -324,10 +324,10 @@ struct ActiveProfileBanner: View {
         .padding(.vertical, isSlim ? 10 : 12)
         .background(bannerBackground)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(bannerBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
     }
@@ -470,7 +470,6 @@ struct SaveAsPopover: View {
                                      comment: "Scope label for per-model profiles")),
                 ]
             )
-            .frame(width: 140)
             TextInput(text: $name,
                       placeholder: String(localized: "profile.save_as.name.placeholder",
                                           defaultValue: "profile-name",
@@ -492,10 +491,10 @@ struct SaveAsPopover: View {
         .padding(12)
         .background(theme.groupBg)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
         .onAppear { nameFocused = true }
@@ -528,6 +527,20 @@ struct ProfileDetailCard: View {
     var onUpdateFromWorking: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
     var onClosePreview: (() -> Void)? = nil
+    /// Server `expose_as_model` state for this profile. Only meaningful
+    /// when `onToggleExpose` is wired (model-scope profiles).
+    var exposeAsModel: Bool = false
+    /// Derived API model ID (`<base-model>:<profile-name>`) shown next to
+    /// the toggle while exposure is on.
+    var exposedModelId: String? = nil
+    /// Server-derived `has_engine_fields` — true when the profile carries
+    /// engine-construction overrides, which the exposed-model overlay
+    /// ignores. Shows a warning under the toggle while exposure is on.
+    var hasEngineFields: Bool = false
+    /// Non-nil renders the "Expose as model" toggle; the callback receives
+    /// the requested state. Pass nil for templates, presets, and the
+    /// defaults card.
+    var onToggleExpose: ((Bool) -> Void)? = nil
 
     @Environment(\.omlxTheme) private var theme
 
@@ -545,6 +558,7 @@ struct ProfileDetailCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
+            exposeRow
             sections
         }
         .padding(compact ? 12 : 14)
@@ -674,8 +688,8 @@ struct ProfileDetailCard: View {
                                                                             defaultValue: "Profile",
                                                                             comment: "Fallback scope label in the profile detail subtitle when scope is unknown")
         return String(localized: "profile.detail.subtitle.named",
-                      defaultValue: "\(scopeLabel) profile · \(count) setting\(count == 1 ? "" : "s")",
-                      comment: "Profile detail card subtitle for a named profile; placeholders are scope label and a setting count with pluralization")
+                      defaultValue: "\(scopeLabel) profile · settings: \(count)",
+                      comment: "Profile detail card subtitle for a named profile; placeholders are scope label and setting count")
     }
 
     @ViewBuilder
@@ -887,8 +901,8 @@ struct ProfileDetailCard: View {
             }
             if let on = s["mtp_enabled"].flatMap({ boolOf($0) }) {
                 flagChip(label: String(localized: "profile.detail.acceleration.mtp",
-                                       defaultValue: "Native MTP",
-                                       comment: "Acceleration chip: native multi-token prediction"),
+                                       defaultValue: "Lightning MTP",
+                                       comment: "Acceleration chip: built-in MTP head multi-token prediction"),
                          on: on)
             }
             if let on = s["vlm_mtp_enabled"].flatMap({ boolOf($0) }) {
@@ -929,16 +943,16 @@ struct ProfileDetailCard: View {
             if let count = nonEmptyKwargCount(s["chat_template_kwargs"]) {
                 flagChip(
                     label: String(localized: "profile.detail.templates.chat_template",
-                                  defaultValue: "Chat template · \(count) override\(count == 1 ? "" : "s")",
-                                  comment: "Templates chip describing chat-template kwarg override count; placeholder is the count with pluralization"),
+                                  defaultValue: "Chat template · overrides: \(count)",
+                                  comment: "Templates chip describing chat-template kwarg override count; placeholder is the count"),
                     on: true
                 )
             }
             if let count = nonEmptyKwargCount(s["forced_ct_kwargs"]) {
                 flagChip(
                     label: String(localized: "profile.detail.templates.forced_ct",
-                                  defaultValue: "Forced CT · \(count) key\(count == 1 ? "" : "s")",
-                                  comment: "Templates chip describing forced chat-template key count; placeholder is the count with pluralization"),
+                                  defaultValue: "Forced CT · keys: \(count)",
+                                  comment: "Templates chip describing forced chat-template key count; placeholder is the count"),
                     on: true
                 )
             }
@@ -1032,6 +1046,52 @@ struct ProfileDetailCard: View {
             return dict.isEmpty ? nil : dict.count
         }
         return nil
+    }
+
+    /// "Expose as model" toggle — mirrors the web dashboard's checkbox on
+    /// per-model profiles. While on, the profile serves as its own model
+    /// ID on /v1/models, overlaying its settings on the base model.
+    @ViewBuilder
+    private var exposeRow: some View {
+        if let onToggleExpose {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Toggle(isOn: Binding(
+                        get: { exposeAsModel },
+                        set: { onToggleExpose($0) }
+                    )) {
+                        Text(String(localized: "profile.detail.expose_as_model",
+                                    defaultValue: "Expose as model",
+                                    comment: "Toggle on the profile detail card that publishes the profile as its own model ID"))
+                            .font(.omlxText(11.5, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    .toggleStyle(.switch)
+                    // Same switch size as `RowSwitch` so every switch in the
+                    // app reads as one control.
+                    .controlSize(.small)
+                    if exposeAsModel, let exposedModelId {
+                        Text(exposedModelId)
+                            .font(.omlxMono(11))
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .help(String(localized: "profile.detail.expose_as_model.help",
+                             defaultValue: "Serve this profile as its own model ID on /v1/models, sharing the base model's engine",
+                             comment: "Tooltip on the expose-as-model toggle"))
+                if exposeAsModel && hasEngineFields {
+                    Text(String(localized: "profile.detail.expose_as_model.engine_fields_hint",
+                                defaultValue: "Engine-level settings in this profile only take effect when it is applied to the base model — they don't change the exposed model.",
+                                comment: "Warning under the expose-as-model toggle when the profile carries engine-construction settings"))
+                        .font(.omlxText(10.5))
+                        .foregroundStyle(theme.amberDot)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 
     @ViewBuilder

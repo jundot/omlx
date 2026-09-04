@@ -78,6 +78,32 @@ class TestDetectAudioModelType:
         })
         assert detect_model_type(tmp_path) == "audio_stt"
 
+    def test_kokoro_config_without_model_type_returns_audio_tts(self, tmp_path):
+        """Kokoro MLX exports keep the original config (no HF model_type).
+
+        mlx-community/Kokoro-82M-bf16 ships the upstream Kokoro config —
+        top-level istftnet/plbert/vocab sections and no model_type or
+        architectures — plus weights named kokoro-v1_0.safetensors. Without
+        TTS classification it falls through to the LLM engine, whose loader
+        only matches model*.safetensors and fails with "No safetensors
+        found".
+        """
+        _write_config(tmp_path, {
+            "istftnet": {"upsample_rates": [10, 6], "gen_istft_n_fft": 20},
+            "plbert": {"hidden_size": 768, "num_attention_heads": 12},
+            "vocab": {";": 1, ":": 2, ",": 3},
+            "n_token": 178,
+        })
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_partial_kokoro_config_defaults_to_llm(self, tmp_path):
+        """A vocab table alone (tokenizer-style config) must not become TTS."""
+        _write_config(tmp_path, {
+            "vocab": {"a": 1, "b": 2},
+            "istftnet": {"upsample_rates": [10, 6]},
+        })
+        assert detect_model_type(tmp_path) == "llm"
+
     def test_nemo_asr_config_without_tokenizer_defaults_to_llm(self, tmp_path):
         """Partial NeMo-like configs should not be classified as STT."""
         _write_config(tmp_path, {
@@ -302,6 +328,20 @@ class TestDiscoverModelsIncludesAudio:
         models = discover_models(tmp_path)
         assert models["parakeet-tdt-0.6b-v3"].model_type == "audio_stt"
         assert models["parakeet-tdt-0.6b-v3"].engine_type == "audio_stt"
+
+    def test_discover_kokoro_model_without_model_type(self, tmp_path):
+        """Kokoro-style original config is discovered as audio_tts."""
+        tts_dir = tmp_path / "Kokoro-82M-bf16"
+        _make_model(tts_dir, {
+            "istftnet": {"upsample_rates": [10, 6], "gen_istft_n_fft": 20},
+            "plbert": {"hidden_size": 768, "num_attention_heads": 12},
+            "vocab": {";": 1, ":": 2, ",": 3},
+            "n_token": 178,
+        })
+
+        models = discover_models(tmp_path)
+        assert models["Kokoro-82M-bf16"].model_type == "audio_tts"
+        assert models["Kokoro-82M-bf16"].engine_type == "audio_tts"
 
     def test_discover_tts_model(self, tmp_path):
         """TTS model included in discover_models results."""

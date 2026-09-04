@@ -4,43 +4,29 @@ import SwiftUI
 
 struct Segmented<Value: Hashable>: View {
     @Binding var selection: Value
+    let titleKey: LocalizedStringKey = ""
     let options: [(value: Value, label: String)]
+    /// Optional SF Symbol per option, matched by index. When present the
+    /// segment renders `Label(label, systemImage:)` instead of plain text.
+    var icons: [String]? = nil
 
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(options.indices, id: \.self) { i in
-                let opt = options[i]
-                let isSelected = opt.value == selection
-                Button {
-                    selection = opt.value
-                } label: {
+        Picker(titleKey, selection: $selection) {
+            ForEach(Array(options.enumerated()), id: \.element.value) { index, opt in
+                if let icons, index < icons.count {
+                    Label(opt.label, systemImage: icons[index])
+                        .labelStyle(.titleAndIcon)
+                        .tag(opt.value)
+                } else {
                     Text(opt.label)
-                        .font(.omlxText(11.5, weight: .medium))
-                        .foregroundStyle(isSelected ? theme.text : theme.textSecondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .frame(maxWidth: .infinity)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(isSelected ? theme.controlBg : Color.clear)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                        .strokeBorder(
-                                            isSelected ? theme.inputBorder : Color.clear,
-                                            lineWidth: 0.5
-                                        )
-                                )
-                        )
-                        .contentShape(Rectangle())
+                        .tag(opt.value)
                 }
-                .buttonStyle(.plain)
             }
         }
-        .padding(2)
-        .background(theme.inputBg)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .pickerStyle(.segmented)
+        .labelsHidden()
     }
 }
 

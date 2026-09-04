@@ -34,7 +34,6 @@ from omlx.admin.accuracy_benchmark import (
     _send_event as acc_send_event,
 )
 
-
 # --- Test helpers -----------------------------------------------------------
 
 
@@ -139,6 +138,28 @@ class TestBenchmarkSSEReplay:
 
         assert events[-1]["type"] == "upload_done"
         assert elapsed < 0.5, "stream blocked after terminal event"
+
+    @pytest.mark.asyncio
+    async def test_upload_skipped_is_also_terminal(self):
+        """External-endpoint runs end on upload_skipped, never upload_done.
+
+        Before upload_skipped joined the terminal set, a subscriber to an
+        external run waited for an upload_done that was never coming and hung
+        until the client timed out.
+        """
+        run = _bench_run()
+        await bench_send_event(run, {"type": "progress", "n": 1})
+        await bench_send_event(
+            run, {"type": "upload_skipped", "reason": "external_endpoint"}
+        )
+
+        start = asyncio.get_event_loop().time()
+        events = await _drain(run, timeout=5.0)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert events[-1]["type"] == "upload_skipped"
+        assert run.terminal is True
+        assert elapsed < 0.5, "stream blocked after upload_skipped"
 
     @pytest.mark.asyncio
     async def test_error_is_also_terminal(self):
@@ -314,7 +335,12 @@ class TestActiveBenchEndpoint:
     def test_returns_not_running_when_idle(self, bench_client):
         r = bench_client.get("/admin/api/bench/active")
         assert r.status_code == 200
-        assert r.json() == {"running": False, "bench_id": None, "model_id": None}
+        assert r.json() == {
+            "running": False,
+            "bench_id": None,
+            "model_id": None,
+            "context_profile": None,
+        }
 
     def test_returns_running_run_payload(self, bench_client):
         run = BenchmarkRun(
@@ -330,7 +356,9 @@ class TestActiveBenchEndpoint:
             "running": True,
             "bench_id": "bench-abc",
             "model_id": "model-x",
+            "context_profile": "code_python",
             "force_lm_engine": False,
+            "external": False,
         }
 
 
@@ -348,10 +376,13 @@ class TestConcurrentStartRejection:
         existing.status = "running"
         _benchmark_runs[existing.bench_id] = existing
 
-        r = bench_client.post("/admin/api/bench/start", json={
-            "model_id": "model-x",
-            "prompt_lengths": [1024],
-        })
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={
+                "model_id": "model-x",
+                "prompt_lengths": [1024],
+            },
+        )
         assert r.status_code == 409
         body = r.json()
         assert "already running" in body["detail"].lower()
@@ -378,8 +409,11 @@ class TestConcurrentStartRejection:
 
         monkeypatch.setattr(bench_module, "run_benchmark", _noop)
 
-        r = bench_client.post("/admin/api/bench/start", json={
-            "model_id": "model-x",
-            "prompt_lengths": [1024],
-        })
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={
+                "model_id": "model-x",
+                "prompt_lengths": [1024],
+            },
+        )
         assert r.status_code == 200, r.text

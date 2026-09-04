@@ -46,6 +46,7 @@ PR_HEAD_SHA = "5c10538136b9038b9626c134612b08afc18d697a"
 PR_URL = "https://github.com/ml-explore/mlx-lm/pull/1192"
 
 _APPLIED = False
+_POOLING_APPLIED = False
 
 
 def _inject_cache_extras() -> None:
@@ -129,6 +130,59 @@ def _register_model_type_aliases() -> None:
         sys.modules.setdefault("mlx_lm.models.deepseek_v4_mtp", base_module)
 
 
+def _probe_native_indexer_kernels() -> None:
+    """One-time startup probe for the native indexer kernels.
+
+    The per-chunk gate in ``Indexer.__call__`` only warns the first time a
+    native-eligible chunk actually hits the fallback, which can be minutes
+    into a long prefill. Surface availability (and the rebuild fix) once at
+    patch time instead.
+    """
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        have = glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
+            "dsa_topk_indices"
+        )
+    except Exception:
+        have = False
+    if have:
+        logger.info(
+            "deepseek_v4: native indexer kernels available "
+            "(dsa_indexer_scores/dsa_topk_indices)"
+        )
+    else:
+        logger.warning(
+            "deepseek_v4: native indexer kernels dsa_indexer_scores/"
+            "dsa_topk_indices unavailable (glm_moe_dsa extension not built); "
+            "the indexer will use the MLX fallback and long-context prefill "
+            "will be several times slower. Rebuild with "
+            "OMLX_WITH_CUSTOM_KERNEL=1."
+        )
+
+
+def apply_pooling_cache_support() -> bool:
+    """Install the model-neutral PoolingCache runtime and oMLX handlers."""
+    global _POOLING_APPLIED
+    if _POOLING_APPLIED:
+        return False
+
+    try:
+        import mlx_lm  # noqa: F401
+    except ImportError:
+        logger.debug("mlx-lm not importable — pooling cache support skipped")
+        return False
+
+    _inject_cache_extras()
+
+    from .generate_patch import apply_generate_patch
+
+    apply_generate_patch()
+    _register_cache_handlers()
+    _POOLING_APPLIED = True
+    return True
+
+
 def apply_deepseek_v4_patch() -> bool:
     """Apply the DeepSeek V4 patch to mlx-lm. Idempotent.
 
@@ -148,9 +202,9 @@ def apply_deepseek_v4_patch() -> bool:
         return False
 
     # Order matters:
-    # 1. Inject PoolingCache / BatchPoolingCache so the deepseek_v4 module
-    #    can ``from .cache import PoolingCache`` at exec time.
-    _inject_cache_extras()
+    # 1. Inject PoolingCache / BatchPoolingCache and install their batch/cache
+    #    integration. GLM-5.3 also consumes this model-neutral subset.
+    apply_pooling_cache_support()
 
     # 2. Register hyper_connection BEFORE deepseek_v4 (deepseek_v4 imports
     #    HyperConnection / HyperHead / hc_expand from it).
@@ -165,12 +219,7 @@ def apply_deepseek_v4_patch() -> bool:
 
     apply_utils_patch()
 
-    # 5. Patch generate._make_cache (PoolingCache → BatchPoolingCache).
-    from .generate_patch import apply_generate_patch
-
-    apply_generate_patch()
-
-    # 6. Wrap tokenizer_utils.AutoTokenizer (deepseek_v4 fallback for
+    # 5. Wrap tokenizer_utils.AutoTokenizer (deepseek_v4 fallback for
     #    transformers releases that pre-date PR 45643 / 2026-05-02).
     from .tokenizer_patch import apply_load_patch, apply_tokenizer_patch
 
@@ -181,8 +230,14 @@ def apply_deepseek_v4_patch() -> bool:
     #    minimal and lacks tool grammar.
     apply_load_patch()
 
-    # 8. Register omlx-side cache handlers.
-    _register_cache_handlers()
+    # 6. One-time native indexer kernel probe (INFO/WARNING only).
+    _probe_native_indexer_kernels()
+
+    # 7. sanitize() stacks the expert biases, so sharded_load's weight-index
+    #     gate would reject a local checkpoint the normal loader handles fine.
+    from omlx.patches.mlx_lm_sharded_load import install_local_sharded_load_fallback
+
+    install_local_sharded_load_fallback()
 
     _APPLIED = True
     logger.info("DeepSeek V4 patch applied (PR 1192 head %s)", PR_HEAD_SHA[:8])
@@ -193,4 +248,10 @@ def is_applied() -> bool:
     return _APPLIED
 
 
-__all__ = ["apply_deepseek_v4_patch", "is_applied", "PR_HEAD_SHA", "PR_URL"]
+__all__ = [
+    "PR_HEAD_SHA",
+    "PR_URL",
+    "apply_deepseek_v4_patch",
+    "apply_pooling_cache_support",
+    "is_applied",
+]

@@ -213,6 +213,10 @@ def is_mlx_available() -> bool:
 
 def get_mlx_version() -> str:
     """Get MLX version string."""
+    if HAS_MLX:
+        core_version = getattr(mx, "__version__", None)
+        if core_version:
+            return str(core_version)
     try:
         import mlx
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from omlx.eval.datasets import deterministic_sample, stratified_sample
@@ -253,6 +255,30 @@ class TestHumanEval:
         passed, error = _execute_with_tests(code, test, "add")
         assert passed is False
 
+    def test_close_only_thinking_draft_does_not_pollute_answer(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": "def add(a, b):\n    ",
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        response = (
+            "I should draft an implementation.\n"
+            "def draft(a, b):\n"
+            "    this is not valid Python\n"
+            "</think>\n"
+            "def add(a, b):\n"
+            "    return a + b"
+        )
+
+        visible = benchmark._strip_think_tags(response)
+        code = benchmark.extract_answer(visible, item)
+
+        assert code == "def add(a, b):\n    return a + b"
+        assert benchmark.check_answer(code, item) is True
+
 
 # --- Think Tag Stripping Tests ---
 
@@ -266,6 +292,12 @@ class TestStripThinkTags:
     def test_strip_empty_think(self):
         from omlx.eval.base import BaseBenchmark
         assert BaseBenchmark._strip_think_tags("<think></think>B") == "B"
+
+    def test_strip_think_block_with_open_tag_in_prompt(self):
+        from omlx.eval.base import BaseBenchmark
+
+        text = "reasoning draft\n</think>\nfinal answer"
+        assert BaseBenchmark._strip_think_tags(text) == "final answer"
 
     def test_no_think_tags(self):
         from omlx.eval.base import BaseBenchmark
@@ -401,6 +433,176 @@ def _registered_benchmark_names():
 async def test_load_sample_per_benchmark(name):
     """Each registered benchmark loads a 10-row sample without crashing."""
     from omlx.eval import BENCHMARKS
-    items = await BENCHMARKS[name]().load_dataset(sample_size=10)
+    bench = BENCHMARKS[name]()
+    items = await bench.load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"
+    # Recorded before sampling; the omlx.ai upload renders "n of total".
+    assert bench.dataset_total is not None, f"{name} did not set dataset_total"
+    assert bench.dataset_total >= len(items)
+
+
+class TestEvalSingleSampling:
+    """_eval_single fills benchmark-neutral sampling defaults but lets a
+    caller-supplied sampling_kwargs (the "model_settings" profile) override
+    temperature/penalties; max_tokens stays benchmark-controlled regardless."""
+
+    async def _captured_chat_kwargs(self, sampling_kwargs):
+        bench = MMLUBenchmark()
+        captured = {}
+
+        async def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(text="A")
+
+        engine = MagicMock()
+        engine.chat = fake_chat
+        engine.model_type = "llm"
+        item = {
+            "question": "What is 2+2?",
+            "choices": ["1", "2", "3", "4"],
+            "answer": 3,
+            "subject": "math",
+        }
+        await bench._eval_single(
+            engine, item, 0, sampling_kwargs=sampling_kwargs, enable_thinking=False
+        )
+        return captured
+
+    async def test_defaults_to_greedy_when_empty(self):
+        kwargs = await self._captured_chat_kwargs({})
+        assert kwargs["temperature"] == 0.0
+        assert kwargs["presence_penalty"] == 0.0
+        assert kwargs["repetition_penalty"] == 1.0
+
+    async def test_caller_sampling_overrides_defaults(self):
+        kwargs = await self._captured_chat_kwargs(
+            {"temperature": 0.7, "presence_penalty": 0.3, "repetition_penalty": 1.1}
+        )
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["presence_penalty"] == 0.3
+        assert kwargs["repetition_penalty"] == 1.1
+
+    async def test_max_tokens_always_benchmark_controlled(self):
+        kwargs = await self._captured_chat_kwargs({"max_tokens": 5})
+        assert kwargs["max_tokens"] != 5
+
+
+class TestExternalEvalDiagnostics:
+    @staticmethod
+    def _item():
+        return {
+            "question": "Which option is correct?",
+            "choices": ["one", "two", "three", "four"],
+            "answer": "A",
+            "subject": "test",
+        }
+
+    async def _run(self, output):
+        from unittest.mock import AsyncMock
+
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        engine = MagicMock(is_external_api=True, model_type=None)
+        engine.chat = AsyncMock(return_value=output)
+        result = await CMMLUBenchmark().run(engine, [self._item()], batch_size=1)
+        return result, engine
+
+    @pytest.mark.parametrize(
+        ("text", "external_status", "expected_status", "correct"),
+        [
+            ("A", "ok", "correct", True),
+            ("B", "ok", "wrong", False),
+            ("no option", "ok", "parse_error", False),
+            ("", "timeout", "timeout", False),
+        ],
+    )
+    async def test_external_outcomes_are_classified(
+        self, text, external_status, expected_status, correct
+    ):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text=text,
+            external_status=external_status,
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="timed out" if external_status == "timeout" else "",
+        )
+        result, _ = await self._run(output)
+        question = result.question_results[0]
+
+        assert question.status == expected_status
+        assert question.correct is correct
+        assert question.prompt_tokens == 11
+        assert question.completion_tokens == 2
+
+    async def test_external_output_does_not_trigger_local_thinking_retry(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text="<think>hidden</think>A",
+            external_status="ok",
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="",
+        )
+        result, engine = await self._run(output)
+
+        assert result.thinking_used is False
+        assert engine.chat.await_count == 1
+
+    def test_missing_extracted_answer_is_parse_error(self):
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        benchmark = CMMLUBenchmark()
+        benchmark.extract_answer = MagicMock(return_value=None)
+
+        predicted, correct, status = benchmark._classify_response(
+            "unparseable", self._item(), {"status": "ok"}
+        )
+
+        assert predicted == ""
+        assert correct is False
+        assert status == "parse_error"
+
+
+@pytest.mark.parametrize(
+    "benchmark_name",
+    ["humaneval", "livecodebench", "mbpp"],
+)
+async def test_code_benchmark_custom_runners_accept_diagnostic_result(
+    benchmark_name, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omlx.eval.humaneval import HumanEvalBenchmark
+    from omlx.eval.livecodebench import LiveCodeBenchBenchmark
+    from omlx.eval.mbpp import MBPPBenchmark
+
+    benchmark_classes = {
+        "humaneval": HumanEvalBenchmark,
+        "livecodebench": LiveCodeBenchBenchmark,
+        "mbpp": MBPPBenchmark,
+    }
+    benchmark = benchmark_classes[benchmark_name]()
+    monkeypatch.setattr(
+        benchmark,
+        "format_prompt",
+        lambda item: [{"role": "user", "content": "write code"}],
+    )
+    monkeypatch.setattr(benchmark, "extract_answer", lambda response, item: "code")
+    monkeypatch.setattr(benchmark, "check_answer", lambda predicted, item: True)
+    engine = MagicMock(is_external_api=False, model_type=None)
+    engine.chat = AsyncMock(return_value=MagicMock(text="code"))
+
+    result = await benchmark.run(engine, [{"id": "one"}], batch_size=1)
+
+    assert result.correct_count == 1
+    assert result.question_results[0].status is None

@@ -7,12 +7,15 @@ enabling larger effective cache sizes than GPU memory allows.
 """
 
 import errno
+import gc
 import json
 import logging
+import os
 import queue
 import shutil
 import threading
 import time
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,9 +26,11 @@ from omlx.cache.paged_ssd_cache import (
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
     SharedHotCacheBudget,
+    _block_turboquant_bits,
     _cache_compat_signature,
     _extract_tensor_bytes,
     _restore_tensor_from_bytes,
+    _signature_turboquant_bits,
     _write_safetensors_no_mx,
     parse_size,
 )
@@ -39,6 +44,20 @@ def _has_mlx() -> bool:
         return True
     except ImportError:
         return False
+
+
+@pytest.fixture
+def cyclic_gc_disabled():
+    """Disable cyclic GC while preserving normal reference counting."""
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.collect()
+        if was_enabled:
+            gc.enable()
 
 
 class TestParseSize:
@@ -498,6 +517,31 @@ class TestPagedSSDCacheManager:
         result = manager.delete_block(b"nonexistent_hash_by")
         assert result is False
 
+    def test_forget_block_tracks_file_as_incompatible(self, tmp_path: Path):
+        """Forgetting a compatible block keeps it visible to global eviction."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        block_hash = b"\x01" * 32
+        metadata = PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=tmp_path / "ssd_cache" / "0" / "dummy.safetensors",
+            file_size=1234,
+            token_count=1,
+            created_at=1.0,
+            last_access=1.0,
+            num_layers=1,
+            model_name="test-model",
+        )
+        manager._index.add(metadata)
+
+        assert manager.forget_block(block_hash) is True
+        assert not manager._index.contains(block_hash)
+        assert manager._incompatible_index.contains(block_hash)
+        assert manager._tracked_ssd_size() == metadata.file_size
+
     def test_clear(self, tmp_path: Path):
         """Test clearing all cache."""
         manager = PagedSSDCacheManager(
@@ -606,6 +650,65 @@ class TestPagedSSDCacheManager:
         assert freed == 0
 
 
+class TestNStateReferenceCycles:
+    """Regression tests for n-state helper closure retention."""
+
+    def test_reconstruct_releases_arrays_without_cyclic_gc(self, cyclic_gc_disabled):
+        """The read helper must not retain its per-call arrays dictionary."""
+
+        class Sentinel:
+            pass
+
+        sentinel = Sentinel()
+        sentinel_ref = weakref.ref(sentinel)
+        arrays = {"layer_0_state_0": sentinel}
+        metadata = {"layer_0_state_count": "1"}
+        manager = object.__new__(PagedSSDCacheManager)
+
+        reconstructed = manager._reconstruct_cache_data(
+            arrays,
+            metadata,
+            num_layers=1,
+            layer_cache_types=["ArraysCache"],
+        )
+        assert reconstructed is not None
+
+        del reconstructed
+        del arrays
+        del sentinel
+
+        assert sentinel_ref() is None
+
+    def test_save_releases_arrays_without_cyclic_gc(
+        self, tmp_path: Path, cyclic_gc_disabled
+    ):
+        """The write helper must not retain serialized MLX arrays."""
+        mx = pytest.importorskip("mlx.core")
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**2,
+        )
+
+        try:
+            payload = mx.zeros((1, 1, 1, 1))
+            payload_ref = weakref.ref(payload)
+            cache_data = [("__nstate__", "ArraysCache", [payload])]
+
+            assert manager.save_block(
+                block_hash=b"nstate_cycle_release",
+                cache_data=cache_data,
+                token_count=1,
+                layer_cache_types=["ArraysCache"],
+            )
+
+            del cache_data
+            del payload
+
+            assert payload_ref() is None
+        finally:
+            manager.close()
+
+
 class TestPagedSSDCacheManagerWithMLX:
     """Tests for PagedSSDCacheManager that require MLX.
 
@@ -693,6 +796,39 @@ class TestPagedSSDCacheManagerWithMLX:
         assert loaded_meta["block_size"] == 64
         assert loaded_meta["cache_signature"]
         assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
+
+    def test_save_canonicalizes_buffered_rotating_metadata(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Transient MTP rotating wrappers should not persist in new metadata."""
+        mx = mock_mlx
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        block_hash = b"buffered_rotating_hash"
+        cache_data = [
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))),
+            (mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64))),
+        ]
+
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache", "BufferedRotatingKVCache"],
+            layer_meta_states=[(64,), ("0", "1024", "2048", "64", "1984", "64")],
+        )
+
+        _, loaded_meta = manager.load_block_with_metadata(block_hash)
+
+        assert loaded_meta is not None
+        assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
+        signature = json.loads(loaded_meta["cache_signature"])
+        assert signature["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
 
     def test_get_block_metadata(self, tmp_path: Path, mock_mlx):
         """Test getting block metadata without loading data."""
@@ -1001,6 +1137,98 @@ class TestPagedSSDCacheManagerWithMLX:
         assert manager.has_block(h1)
         assert manager.has_block(h2)
 
+    def _write_corrupt_json_fixture_block(
+        self,
+        cache_dir: Path,
+        mx,
+        block_hash: bytes,
+        *,
+        corrupt_field: str,
+    ) -> Path:
+        """Drop a versioned block whose type metadata JSON is corrupt."""
+        from omlx.cache.paged_ssd_cache import _CACHE_FORMAT_VERSION
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        block_hash_hex = block_hash.hex()
+        sub_dir = cache_dir / block_hash_hex[0]
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        file_path = sub_dir / f"{block_hash_hex}.safetensors"
+
+        metadata = {
+            "omlx_cache_format_version": _CACHE_FORMAT_VERSION,
+            "block_hash": block_hash_hex,
+            "token_count": "32",
+            "num_layers": "1",
+            "model_name": "m",
+            "block_size": "256",
+            "layer_cache_types": json.dumps(["KVCache"]),
+            "layer_meta_states": json.dumps([[]]),
+            "created_at": "0",
+        }
+        # Simulate a torn write: the field exists but is not valid JSON.
+        metadata[corrupt_field] = '["KVCache"'
+
+        mx.save_safetensors(
+            str(file_path),
+            {
+                "layer_0_keys": mx.zeros((1, 8, 32, 64)),
+                "layer_0_values": mx.zeros((1, 8, 32, 64)),
+            },
+            metadata=metadata,
+        )
+        return file_path
+
+    def test_scan_rejects_corrupt_layer_cache_types_json(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """A block whose layer_cache_types JSON is present but unparseable is
+        corruption, not a legacy block: indexing it with the field silently
+        dropped makes reconstruction guess layer types for its tensors.
+        The scan must skip the block so the hash misses and the chain
+        re-stores it on the next request."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        corrupt_hash = b"\x70" + b"\x00" * 31
+        healthy_hash = b"\x71" + b"\x00" * 31
+        corrupt_path = self._write_corrupt_json_fixture_block(
+            cache_dir, mx, corrupt_hash, corrupt_field="layer_cache_types"
+        )
+        self._write_versioned_fixture_block(
+            cache_dir, mx, healthy_hash, num_layers=1, model_name="m"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert not manager.has_block(corrupt_hash)
+        assert manager.has_block(healthy_hash)
+        # Scan-time skips stay non-destructive (shared cache directories).
+        assert corrupt_path.exists()
+
+    def test_scan_rejects_corrupt_layer_meta_states_json(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Same rule for layer_meta_states: present-but-unparseable means the
+        block would be served without per-layer meta (offsets, TQ bits) and
+        downstream reconstruction would have to guess them."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        corrupt_hash = b"\x72" + b"\x00" * 31
+        self._write_corrupt_json_fixture_block(
+            cache_dir, mx, corrupt_hash, corrupt_field="layer_meta_states"
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+        )
+
+        assert not manager.has_block(corrupt_hash)
+
     def test_scan_logs_skipped_incompatible_count(
         self, tmp_path: Path, mock_mlx, caplog
     ):
@@ -1033,6 +1261,127 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    def test_model_switch_enforces_shared_ssd_limit_on_new_save(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Incompatible old-model blocks count against the shared SSD budget."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        old_hash = b"\x80" + b"\x00" * 31
+        old_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            old_hash,
+            num_layers=1,
+            model_name="old-model",
+        )
+        old_size = old_path.stat().st_size
+        max_size = old_size + old_size // 2
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert not manager.has_block(old_hash)
+            assert old_path.exists()
+            assert manager._incompatible_index.total_size == old_size
+
+            new_hash = b"\x81" + b"\x00" * 31
+            cache_data = [(mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))]
+
+            assert manager.save_block(
+                block_hash=new_hash,
+                cache_data=cache_data,
+                token_count=32,
+                model_name="new-model",
+                layer_cache_types=["KVCache"],
+            )
+
+            assert manager.has_block(new_hash)
+            assert not old_path.exists()
+            assert manager._incompatible_index.total_size == 0
+            assert manager._tracked_ssd_size() <= max_size
+        finally:
+            manager.close()
+
+    def test_scan_cleans_oldest_incompatible_blocks_when_over_limit(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Startup cleanup converges an already-over-limit shared cache dir."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        paths = []
+        for i in range(3):
+            path = self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x90 + i]) + b"\x00" * 31,
+                num_layers=1,
+                model_name="old-model",
+            )
+            os.utime(path, (100 + i, 100 + i))
+            paths.append(path)
+
+        sizes = [path.stat().st_size for path in paths]
+        max_size = sum(sizes) - sizes[0] + 1
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=max_size,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert not paths[0].exists()
+            assert paths[1].exists()
+            assert paths[2].exists()
+            assert manager._tracked_ssd_size() <= max_size
+        finally:
+            manager.close()
+
+    def test_clear_removes_incompatible_scanned_files(self, tmp_path: Path, mock_mlx):
+        """Global clear deletes compatible and incompatible tracked files."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        other_hash = b"\xa0" + b"\x00" * 31
+        match_hash = b"\xa1" + b"\x00" * 31
+        other_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            other_hash,
+            num_layers=1,
+            model_name="old-model",
+        )
+        match_path = self._write_versioned_fixture_block(
+            cache_dir,
+            mx,
+            match_hash,
+            num_layers=1,
+            model_name="new-model",
+        )
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="new-model",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            assert manager.clear() == 2
+            assert not other_path.exists()
+            assert not match_path.exists()
+            assert manager._tracked_ssd_count() == 0
+        finally:
+            manager.close()
 
 
 class TestPagedSSDCacheManagerCacheList:
@@ -1348,6 +1697,62 @@ class TestAsyncWriteAndTimeoutLoad:
         assert metadata["token_count"] == 16
         assert metadata["model_name"] == "test-model"
         assert metadata["layer_cache_types"] == ["KVCache"]
+
+    def test_pending_write_read_promotes_to_hot_cache(self, tmp_path, mx):
+        """Promotion must not depend on the SSD writer winning a race."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "pending_promotion",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            writer_entered.set()
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        block_hash = b"pending_promote_hash"
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))]
+
+        try:
+            assert manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                layer_meta_states=[(16,)],
+                hot_cache_write_back=False,
+            )
+            assert writer_entered.wait(timeout=5)
+            assert manager.get_stats().hot_cache_entries == 0
+
+            loaded_data, metadata = manager.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=True,
+            )
+
+            assert loaded_data is not None
+            assert metadata is not None
+            assert manager.get_stats().hot_cache_entries == 1
+            assert manager.get_stats().hot_cache_promotions == 1
+
+            release_writer.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with manager._pending_write_hashes_lock:
+                    if block_hash not in manager._pending_write_hashes:
+                        break
+                time.sleep(0.01)
+            with manager._hot_cache_lock:
+                assert manager._hot_cache[block_hash]["dirty"] is False
+        finally:
+            release_writer.set()
+            manager.close()
 
     def test_load_error_returns_none(self, ssd_cache, mx):
         """Verify that a corrupted file returns None and cleans up index."""
@@ -1697,6 +2102,61 @@ class TestAsyncBackgroundWrite:
         assert mx.allclose(t1, loaded_arrays["tensor_a"]).item()
         assert mx.allclose(t2, loaded_arrays["tensor_b"]).item()
 
+    def test_write_safetensors_no_mx_fsyncs_before_close(self, mx, tmp_path):
+        """The file must be durable on disk before any caller renames it
+        into place -- otherwise a crash between close() and the rename can
+        leave the renamed file pointing at data that was only ever in the
+        OS page cache, reading back as truncated/zero-filled garbage."""
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        t1 = mx.ones((4,), dtype=mx.float32)
+        mx.eval(t1)
+        tensors_raw = {"tensor_a": _extract_tensor_bytes(t1)}
+        out_path = str(tmp_path / "test.safetensors")
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _write_safetensors_no_mx(out_path, tensors_raw)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_fsyncs_the_directory(self, tmp_path):
+        """F1: renaming a file into place doesn't guarantee the directory
+        entry itself survives a crash until the containing directory is
+        fsynced too."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        target = tmp_path / "sub" / "file.txt"
+        target.parent.mkdir()
+        target.write_text("data")
+
+        import omlx.cache.paged_ssd_cache as ssd_mod
+
+        calls = []
+        real_fsync = ssd_mod.os.fsync
+
+        def spy_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        with patch.object(ssd_mod.os, "fsync", spy_fsync):
+            _fsync_parent_dir(target)
+
+        assert len(calls) == 1
+
+    def test_fsync_parent_dir_tolerates_missing_directory(self, tmp_path):
+        """Must not raise if the directory vanished (e.g. concurrent
+        eviction) -- this is best-effort durability, not correctness."""
+        from omlx.cache.paged_ssd_cache import _fsync_parent_dir
+
+        _fsync_parent_dir(str(tmp_path / "does-not-exist" / "file.txt"))
+
     def test_write_safetensors_bfloat16_roundtrip(self, mx, tmp_path):
         """Verify bfloat16 safetensors file is loadable by mx.load."""
         original = mx.random.normal((8, 16, 32)).astype(mx.bfloat16)
@@ -1920,6 +2380,29 @@ class TestEffectiveMaxSize:
         assert stats["utilization"] <= 1.0
         assert stats["max_size"] < stats["configured_max_size"]
 
+    def test_effective_max_size_uses_tracked_cache_not_filesystem_total(
+        self, tmp_path: Path
+    ):
+        """Disk pressure depends on tracked cache bytes plus free space."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=100 * 1024**3,
+        )
+        manager._index._total_size = 50 * 1024**3
+        manager._incompatible_index._total_size = 10 * 1024**3
+
+        mock_usage = self._make_disk_usage(
+            total=200 * 1024**3,
+            used=190 * 1024**3,
+            free=10 * 1024**3,
+        )
+        with patch("shutil.disk_usage", return_value=mock_usage):
+            effective = manager._get_effective_max_size()
+
+        expected = int(70 * 1024**3 * 0.99)
+        assert effective == expected
+        assert effective < manager.configured_max_size
+
     def test_stats_includes_effective_and_configured(self, tmp_path: Path):
         """Stats should include both effective and configured max sizes."""
         manager = PagedSSDCacheManager(
@@ -2082,6 +2565,128 @@ class TestPreloadMatchedBlocks:
             assert manager2._hot_cache_get(h) is not None
 
         manager2.close()
+
+    def test_preload_mx_load_runs_serially_on_caller_thread(self, tmp_path, mx):
+        """Preload must not run mx.load() in worker threads -- a prior
+        ThreadPoolExecutor-based version caused deadlocks contesting Metal
+        GPU resources with the calling (inference) thread, the same failure
+        mode load_block's own discipline comment already documents. Every
+        mx.load() call during preload must happen on the calling thread,
+        one at a time."""
+        import threading
+
+        from omlx.cache import paged_ssd_cache as ssd_mod
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        caller_thread = threading.current_thread()
+        seen_threads = []
+        concurrent_calls = {"active": 0, "max_active": 0}
+        original_load = ssd_mod.mx.load
+
+        def spy_load(*args, **kwargs):
+            seen_threads.append(threading.current_thread())
+            concurrent_calls["active"] += 1
+            concurrent_calls["max_active"] = max(
+                concurrent_calls["max_active"], concurrent_calls["active"]
+            )
+            try:
+                return original_load(*args, **kwargs)
+            finally:
+                concurrent_calls["active"] -= 1
+
+        with patch.object(ssd_mod.mx, "load", spy_load):
+            loaded = manager2.preload_matched_blocks(hashes)
+
+        assert loaded == 4
+        assert len(seen_threads) == 4
+        assert all(t is caller_thread for t in seen_threads)
+        assert concurrent_calls["max_active"] == 1
+
+        manager2.close()
+
+    def test_load_promotion_failure_counts_and_warns(self, tmp_path, mx, caplog):
+        """A failed promotion is surfaced in stats and a throttled warning."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        try:
+            with (
+                patch.object(
+                    manager2, "_hot_cache_put", side_effect=RuntimeError("boom")
+                ),
+                caplog.at_level(logging.WARNING),
+            ):
+                assert manager2.load_block(hashes[0]) is not None
+
+            stats = manager2.get_stats()
+            assert stats.hot_cache_promotions == 0
+            assert stats.hot_cache_promotion_failures == 1
+            assert manager2._hot_cache_get(hashes[0]) is None
+            assert "Hot cache promotion failed" in caplog.text
+        finally:
+            manager2.close()
+
+    def test_pending_promotion_failure_counts(self, tmp_path, mx):
+        """Pending-buffer promotion failures are counted, disabled tier is not."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        try:
+            entry = {"tensors_raw": {}, "block_metadata": None}
+            with patch.object(
+                manager, "_hot_cache_put", side_effect=RuntimeError("boom")
+            ):
+                assert (
+                    manager._promote_pending_write_to_hot_cache(b"hash", entry)
+                    is False
+                )
+            assert manager.get_stats().hot_cache_promotion_failures == 1
+        finally:
+            manager.close()
+
+        disabled = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache_disabled",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=0,
+        )
+        try:
+            entry = {"tensors_raw": {}, "block_metadata": None}
+            assert disabled._promote_pending_write_to_hot_cache(b"hash", entry) is False
+            assert disabled.get_stats().hot_cache_promotion_failures == 0
+        finally:
+            disabled.close()
+
+    def test_preload_excludes_failed_promotions(self, tmp_path, mx):
+        """Blocks whose promotion fails are not counted as preloaded."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        try:
+            with patch.object(
+                manager2, "_promote_to_hot_cache", return_value=False
+            ) as promote:
+                loaded = manager2.preload_matched_blocks(hashes)
+            assert promote.call_count == 4
+            assert loaded == 0
+            assert manager2.get_stats_dict()["preload_blocks_loaded"] == 0
+        finally:
+            manager2.close()
 
     def test_clean_promoted_block_eviction_skips_ssd_write(self, tmp_path, mx):
         """Blocks loaded from SSD are clean and should not be re-written."""
@@ -2563,6 +3168,14 @@ class TestComputeMaxPendingWrites:
         cap = _compute_max_pending_writes()
         assert 1 <= cap <= 256
 
+    def test_non_positive_kv_estimate_uses_conservative_default(self):
+        """A zero per-token estimate must not make blocks look one byte wide."""
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        assert _compute_max_pending_writes(kv_bytes_per_token=0) == (
+            _compute_max_pending_writes(kv_bytes_per_token=200_000)
+        )
+
     def test_manager_picks_up_per_instance_cap(self, tmp_path):
         """The PagedSSDCacheManager must recompute the cap from its
         constructor args, not just inherit the module-level constant.
@@ -2605,6 +3218,27 @@ class TestComputeMaxPendingWrites:
         mgr_small.close()
         mgr_large.close()
 
+    def test_manager_normalizes_non_positive_kv_estimate(self, tmp_path):
+        """The manager must enforce the same safe fallback as the formula."""
+        from omlx.cache.paged_ssd_cache import (
+            PagedSSDCacheManager,
+            _compute_max_pending_writes,
+        )
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "zero-kv",
+            max_size_bytes=1 << 30,
+            expected_block_size_tokens=1024,
+            expected_kv_bytes_per_token=0,
+        )
+
+        assert mgr._expected_kv_bytes_per_token == 200_000
+        assert mgr._max_pending_writes == _compute_max_pending_writes(
+            block_size_tokens=1024,
+            kv_bytes_per_token=200_000,
+        )
+        mgr.close()
+
 
 class TestSchedulerPlumbsBlockSizeToSSDCache:
     """The Scheduler construction path must plumb its final
@@ -2620,11 +3254,20 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
       > construction path still does not pass them.
     """
 
-    def _make_scheduler(self, tmp_path, block_size_tokens, model_layers):
+    def _make_scheduler(
+        self,
+        tmp_path,
+        block_size_tokens,
+        model_layers,
+        kv_cache_layers=None,
+        rotating_cache_layers=0,
+    ):
         """Build a Scheduler with paged SSD cache enabled at the given
         block size and a model whose config exposes ``model_layers``
         layers (so the memory monitor produces a real per-token KV
-        estimate rather than its default)."""
+        estimate rather than its default). When ``kv_cache_layers`` is
+        provided, the remaining layers use fixed recurrent or rotating
+        state, as selected by ``rotating_cache_layers``."""
         from unittest.mock import MagicMock
 
         from omlx.scheduler import Scheduler, SchedulerConfig
@@ -2640,6 +3283,18 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         model = MagicMock()
         model.layers = []
         model.config = _Config()
+        if kv_cache_layers is not None:
+            from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+            fixed_cache_layers = model_layers - kv_cache_layers - rotating_cache_layers
+            if fixed_cache_layers < 0:
+                raise ValueError("cache layer counts exceed model_layers")
+
+            model.make_cache = lambda: [
+                *[KVCache() for _ in range(kv_cache_layers)],
+                *[RotatingKVCache(max_size=512) for _ in range(rotating_cache_layers)],
+                *[ArraysCache(size=2) for _ in range(fixed_cache_layers)],
+            ]
 
         tokenizer = MagicMock()
         tokenizer.eos_token_id = 2
@@ -2742,6 +3397,53 @@ class TestSchedulerPlumbsBlockSizeToSSDCache:
         )
         assert mgr._max_pending_writes == expected_cap
         assert mgr._write_queue.maxsize == mgr._max_pending_writes
+
+        mgr.close()
+
+    def test_hybrid_model_uses_kv_layers_for_ssd_estimate(self, tmp_path):
+        """The SSD queue estimate must ignore fixed-state hybrid layers."""
+        sched = self._make_scheduler(
+            tmp_path / "hybrid",
+            block_size_tokens=1024,
+            model_layers=64,
+            kv_cache_layers=16,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+        expected = 16 * 8 * 192 * 2 * 2
+        assert mgr._expected_kv_bytes_per_token == expected
+
+        mgr.close()
+
+    @pytest.mark.parametrize(
+        ("kv_cache_layers", "rotating_cache_layers"),
+        [(0, 0), (0, 40)],
+        ids=("arrays_only", "rotating_only"),
+    )
+    def test_zero_token_kv_layout_uses_safe_ssd_default(
+        self, tmp_path, kv_cache_layers, rotating_cache_layers
+    ):
+        """Zero per-token KV must not expand the SSD writer queue to 256."""
+        sched = self._make_scheduler(
+            tmp_path,
+            block_size_tokens=1024,
+            model_layers=40,
+            kv_cache_layers=kv_cache_layers,
+            rotating_cache_layers=rotating_cache_layers,
+        )
+
+        mgr = sched.paged_ssd_cache_manager
+        assert sched.memory_monitor.estimate_block_memory(1) == 0
+        assert mgr._expected_kv_bytes_per_token == 200_000
+
+        from omlx.cache.paged_ssd_cache import _compute_max_pending_writes
+
+        expected_cap = _compute_max_pending_writes(
+            block_size_tokens=mgr._expected_block_size_tokens,
+            kv_bytes_per_token=200_000,
+        )
+        assert mgr._max_pending_writes == expected_cap
+        assert mgr._write_queue.maxsize == expected_cap
 
         mgr.close()
 
@@ -3218,9 +3920,7 @@ class TestLayerSignatureSweep:
         assert dropped == 0
         assert mgr._index.get(b"aa" * 10) is not None
 
-    def test_sweep_canonicalizes_prefill_ready_rotating_cache(
-        self, tmp_path: Path
-    ):
+    def test_sweep_canonicalizes_prefill_ready_rotating_cache(self, tmp_path: Path):
         expected = ["KVCache", "RotatingKVCache", "KVCache"]
         stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
         mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
@@ -3237,6 +3937,24 @@ class TestLayerSignatureSweep:
 
         assert dropped == 0
         assert mgr._index.get(b"ac" * 10) is not None
+
+    def test_sweep_drops_legacy_buffered_rotating_cache(self, tmp_path: Path):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "BufferedRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"af" * 10,
+                model_name="test-model",
+                layer_cache_types=stored,
+                num_layers=3,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 1
+        assert mgr._index.get(b"af" * 10) is None
 
     def test_startup_compat_canonicalizes_sized_arrays_cache(self, tmp_path: Path):
         expected = ["ArraysCache", "ArraysCache", "KVCache"]
@@ -3359,9 +4077,9 @@ class TestLayerSignatureSweep:
         dropped = mgr.invalidate_stale_layer_signature()
 
         assert dropped == 1
-        assert mgr._index.get(b"bb" * 10) is not None, (
-            "model-B block must not be touched by model-A's sweep"
-        )
+        assert (
+            mgr._index.get(b"bb" * 10) is not None
+        ), "model-B block must not be touched by model-A's sweep"
         assert mgr._index.get(b"cc" * 10) is None
 
     def test_sweep_skips_legacy_unnamed_blocks(self, tmp_path: Path):
@@ -3464,3 +4182,319 @@ class TestLayerSignatureSweep:
         # Same call signature — already set, returns False, flag stays.
         assert mgr.adopt_layer_signature_if_unset(["ArraysCache", "KVCache"]) is False
         assert mgr._signature_sweep_completed is True
+
+
+class TestTurboquantBitsSignature:
+    """#2045: the cache signature must key the TurboQuant bit depth.
+
+    TurboQuant packed state width is ceil(head_dim * bits / 32), so blocks
+    written at different bit depths are shape-incompatible. Without the
+    bits field in the signature, 4-bit and 6-bit blocks for the same model
+    coexist and crash ``_concat_state_batch`` when their requests are
+    batched together.
+    """
+
+    TURBO = ["ArraysCache", "TurboQuantKVCache", "TurboQuantKVCache", "KVCache"]
+
+    def _make_meta(
+        self,
+        *,
+        block_hash: bytes,
+        layer_cache_types: list[str] | None,
+        turboquant_kv_bits: float | None = None,
+        cache_signature: str | None = None,
+        model_name: str = "test-model",
+        num_layers: int = 4,
+        block_size: int = 2048,
+    ) -> PagedSSDBlockMetadata:
+        now = time.time()
+        if cache_signature is None:
+            cache_signature = _cache_compat_signature(
+                model_name=model_name,
+                num_layers=num_layers,
+                block_size=block_size,
+                layer_cache_types=layer_cache_types,
+                turboquant_kv_bits=turboquant_kv_bits,
+            )
+        return PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=Path("/tmp/never-touched.safetensors"),
+            file_size=1024,
+            token_count=block_size,
+            created_at=now,
+            last_access=now,
+            num_layers=num_layers,
+            model_name=model_name,
+            block_size=block_size,
+            layer_cache_types=layer_cache_types,
+            cache_signature=cache_signature,
+        )
+
+    def _make_manager(
+        self,
+        tmp_path: Path,
+        *,
+        layer_cache_types: list[str] | None = None,
+        turboquant_kv_bits: float | None = None,
+    ) -> PagedSSDCacheManager:
+        # Expectations are set through set_expected_layer_signature — the
+        # same call the scheduler's refresh makes — so these tests exercise
+        # the path production actually runs.
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1 << 30,
+            expected_model_name="test-model",
+            expected_num_layers=4,
+            expected_block_size=2048,
+        )
+        if layer_cache_types is not None:
+            manager.set_expected_layer_signature(
+                layer_cache_types, turboquant_kv_bits=turboquant_kv_bits
+            )
+        return manager
+
+    def test_signature_unchanged_when_bits_none(self):
+        # Non-TurboQuant signatures must stay byte-identical to the previous
+        # format so existing caches of non-TurboQuant models keep validating.
+        old_format = json.dumps(
+            {
+                "model_name": "m",
+                "num_layers": 4,
+                "block_size": 2048,
+                "layer_cache_types": ["KVCache"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert (
+            _cache_compat_signature(
+                model_name="m",
+                num_layers=4,
+                block_size=2048,
+                layer_cache_types=["KVCache"],
+            )
+            == old_format
+        )
+
+    def test_signature_includes_bits_when_set(self):
+        sig = _cache_compat_signature(
+            model_name="m",
+            num_layers=4,
+            block_size=2048,
+            layer_cache_types=self.TURBO,
+            turboquant_kv_bits=6,
+        )
+        assert json.loads(sig)["turboquant_kv_bits"] == 6.0
+
+    def test_signature_bits_helper_tolerates_non_dict_json(self):
+        # A corrupted signature that parses as a JSON scalar/list must read
+        # as "no recorded depth", not raise — an AttributeError here would
+        # abort the stale-signature sweep and leave mixed-width blocks live.
+        assert _signature_turboquant_bits("123") is None
+        assert _signature_turboquant_bits("[1, 2]") is None
+        assert _signature_turboquant_bits("null") is None
+        assert _signature_turboquant_bits("{not json") is None
+        assert _signature_turboquant_bits("") is None
+
+    def test_block_bits_read_from_meta_state(self):
+        # TurboQuant meta_state is (offset, bits, seed, ...) — the same tuple
+        # the restore path reads.
+        assert (
+            _block_turboquant_bits(self.TURBO, [(), (256, 4.0, 0), (256, 4.0, 0), ()])
+            == 4.0
+        )
+        # Batch-form class name counts too.
+        assert (
+            _block_turboquant_bits(["BatchTurboQuantKVCache"], [(256, 6.0, 0)]) == 6.0
+        )
+        # Non-TurboQuant layouts and absent meta yield None.
+        assert _block_turboquant_bits(["KVCache"], [(256,)]) is None
+        assert _block_turboquant_bits(self.TURBO, None) is None
+        assert _block_turboquant_bits(self.TURBO, [(), (), (), ()]) is None
+
+    def test_compat_rejects_other_or_unproven_bit_depth(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, layer_cache_types=self.TURBO, turboquant_kv_bits=6
+        )
+
+        matching = self._make_meta(
+            block_hash=b"01" * 10, layer_cache_types=self.TURBO, turboquant_kv_bits=6
+        )
+        other_depth = self._make_meta(
+            block_hash=b"02" * 10, layer_cache_types=self.TURBO, turboquant_kv_bits=4
+        )
+        # 0.4.x-era block: TurboQuant layout but no bits field recorded.
+        legacy = self._make_meta(block_hash=b"03" * 10, layer_cache_types=self.TURBO)
+        no_signature = self._make_meta(
+            block_hash=b"04" * 10, layer_cache_types=self.TURBO, cache_signature=""
+        )
+
+        assert mgr._is_compatible_block(matching) is True
+        assert mgr._is_compatible_block(other_depth) is False
+        assert mgr._is_compatible_block(legacy) is False
+        assert mgr._is_compatible_block(no_signature) is False
+
+    def test_compat_unchanged_when_bits_not_expected(self, tmp_path: Path):
+        # TurboQuant disabled: legacy and signature-less blocks keep loading
+        # exactly as before (zero behavioral change).
+        mgr = self._make_manager(tmp_path, layer_cache_types=self.TURBO)
+
+        legacy = self._make_meta(block_hash=b"05" * 10, layer_cache_types=self.TURBO)
+        no_signature = self._make_meta(
+            block_hash=b"06" * 10, layer_cache_types=self.TURBO, cache_signature=""
+        )
+
+        assert mgr._is_compatible_block(legacy) is True
+        assert mgr._is_compatible_block(no_signature) is True
+
+    def test_sweep_drops_other_bit_depth(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, layer_cache_types=self.TURBO, turboquant_kv_bits=6
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"11" * 10,
+                layer_cache_types=self.TURBO,
+                turboquant_kv_bits=4,
+            )
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"12" * 10,
+                layer_cache_types=self.TURBO,
+                turboquant_kv_bits=6,
+            )
+        )
+        mgr._index.add(
+            self._make_meta(block_hash=b"13" * 10, layer_cache_types=self.TURBO)
+        )
+        # Same-model block with no layout metadata at all: with a depth
+        # expected it can no more prove its width than its layout.
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"14" * 10, layer_cache_types=None, cache_signature=""
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 3
+        assert mgr._index.get(b"11" * 10) is None  # 4-bit under 6-bit expectation
+        assert mgr._index.get(b"12" * 10) is not None  # matching depth survives
+        assert mgr._index.get(b"13" * 10) is None  # unproven depth
+        assert mgr._index.get(b"14" * 10) is None  # no metadata, depth expected
+
+    def test_sweep_keeps_legacy_blocks_when_bits_not_expected(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path, layer_cache_types=self.TURBO)
+        mgr._index.add(
+            self._make_meta(block_hash=b"15" * 10, layer_cache_types=self.TURBO)
+        )
+        # No layout metadata, no depth expectation: skip rather than guess
+        # (pre-existing behavior preserved).
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"16" * 10, layer_cache_types=None, cache_signature=""
+            )
+        )
+
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"15" * 10) is not None
+        assert mgr._index.get(b"16" * 10) is not None
+
+    def test_batch_and_single_turboquant_names_compare_equal(self, tmp_path: Path):
+        # The save path records whichever class name it extracted; the
+        # predicted layout always says "TurboQuantKVCache". Batch-form
+        # blocks persist the same packed per-request state and must not be
+        # swept (that would cold-start the cache every restart).
+        batch_form = [
+            "ArraysCache",
+            "BatchTurboQuantKVCache",
+            "BatchTurboQuantKVCache",
+            "KVCache",
+        ]
+        mgr = self._make_manager(
+            tmp_path, layer_cache_types=self.TURBO, turboquant_kv_bits=6
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"21" * 10,
+                layer_cache_types=batch_form,
+                turboquant_kv_bits=6,
+            )
+        )
+
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"21" * 10) is not None
+        assert (
+            mgr._is_compatible_block(
+                self._make_meta(
+                    block_hash=b"22" * 10,
+                    layer_cache_types=batch_form,
+                    turboquant_kv_bits=6,
+                )
+            )
+            is True
+        )
+
+    def test_bits_change_alone_triggers_sweep(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, layer_cache_types=self.TURBO, turboquant_kv_bits=4
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(self.TURBO, turboquant_kv_bits=6)
+
+        assert changed is True
+        assert mgr._expected_turboquant_kv_bits == 6.0
+        assert mgr._signature_sweep_completed is False
+
+    def test_same_bits_and_types_is_noop(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path, layer_cache_types=self.TURBO, turboquant_kv_bits=6
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(self.TURBO, turboquant_kv_bits=6)
+
+        assert changed is False
+        assert mgr._signature_sweep_completed is True
+
+    @pytest.mark.skipif(not _has_mlx(), reason="requires MLX")
+    def test_save_path_stamps_block_bits_in_signature(self, tmp_path: Path):
+        # Drive the REAL save path: the persisted signature must record the
+        # depth from the block's own TurboQuant meta_state (observation),
+        # not just the manager's expectation.
+        import mlx.core as mx
+
+        mgr = self._make_manager(
+            tmp_path,
+            layer_cache_types=["TurboQuantKVCache", "KVCache"],
+            turboquant_kv_bits=6,
+        )
+        try:
+            keys = mx.zeros((1, 2, 8, 4), dtype=mx.float16)
+            values = mx.zeros((1, 2, 8, 4), dtype=mx.float16)
+            saved = mgr.save_block(
+                block_hash=b"77" * 16,
+                cache_data=[(keys, values), (keys, values)],
+                token_count=8,
+                model_name="test-model",
+                layer_cache_types=["TurboQuantKVCache", "KVCache"],
+                layer_meta_states=[(8, 6.0, 0), (8,)],
+            )
+            assert saved is True
+            # Wait for the background writer to flush the file to disk.
+            file_path = mgr._get_file_path(b"77" * 16)
+            for _ in range(50):
+                if file_path.exists():
+                    break
+                time.sleep(0.1)
+            assert file_path.exists(), "background writer never produced the file"
+
+            files = list((tmp_path / "ssd_cache").rglob("*.safetensors"))
+            assert len(files) == 1
+            _, metadata = mx.load(str(files[0]), return_metadata=True)
+            payload = json.loads(metadata["cache_signature"])
+            assert payload["turboquant_kv_bits"] == 6.0
+        finally:
+            mgr.close()

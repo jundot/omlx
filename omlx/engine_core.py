@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
 import os
 import time
@@ -34,27 +35,37 @@ from typing import (
 
 import mlx.core as mx
 
-from .exceptions import PrefillMemoryExceededError
+from .exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    describe_ceiling_binding,
+)
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig
-from .utils.compile_cache import (
-    clear_thread_compile_cache,
-    compile_cache_clear_available,
-)
+from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
+from .utils.hardware import format_bytes
+from .utils.metal_sync import clear_thread_streams
 
 logger = logging.getLogger(__name__)
 
 
 def _raise_request_output_error(output: RequestOutput) -> None:
-    if output.error_code == "prefill_memory_exceeded":
+    if output.error_code in ("prefill_memory_exceeded", "prefill_memory_aborted"):
         metadata = output.error_metadata or {}
         request_id = metadata.get("request_id")
         estimated_bytes = metadata.get("estimated_bytes")
         limit_bytes = metadata.get("limit_bytes")
-        raise PrefillMemoryExceededError(
+        # Both are memory-guard outcomes and share the HTTP 400 mapping; the
+        # aborted subclass only changes the wording (admitted then killed
+        # mid-prefill vs rejected before it started).
+        error_type = (
+            PrefillMemoryAbortedError
+            if output.error_code == "prefill_memory_aborted"
+            else PrefillMemoryExceededError
+        )
+        raise error_type(
             message=output.error or "Prefill memory exceeded",
             request_id=str(request_id) if request_id is not None else output.request_id,
             estimated_bytes=(
@@ -67,15 +78,21 @@ def _raise_request_output_error(output: RequestOutput) -> None:
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
-# Fallback only: used when the MLX compile-cache clear symbol is unavailable
-# (see omlx/utils/compile_cache.py). In that case a per-engine MLX worker
-# thread cannot exit safely (its thread_local ~CompilerCache would free
-# @mx.compile graphs' Python objects without the GIL -> crash), so close()
-# keeps the executor + stream alive here for the process lifetime instead of
-# shutting the thread down. With the clear symbol present (the normal path)
-# these stay empty and the worker threads shut down normally.
-_immortal_mlx_executors: list = []
-_immortal_mlx_streams: list = []
+
+def _final_engine_thread_reclaim(stream: Any) -> None:
+    """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
+    gc.collect()
+    _sync_and_clear_cache(stream)
+    gc.collect()
+    clear_thread_streams()
+
+
+def _final_global_mlx_thread_reclaim() -> None:
+    """Reclaim MLX state before the process-wide worker thread exits."""
+    gc.collect()
+    _sync_and_clear_cache()
+    gc.collect()
+    clear_thread_streams()
 
 
 def _init_mlx_thread() -> None:
@@ -124,6 +141,34 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
             initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
+
+
+def shutdown_mlx_executor() -> None:
+    """Shut down the global MLX worker after clearing its thread-local streams."""
+    global _global_mlx_executor
+    executor = _global_mlx_executor
+    if executor is None:
+        return
+
+    try:
+        future = executor.submit(_final_global_mlx_thread_reclaim)
+    except RuntimeError:
+        # An embedding application may have shut the executor down directly.
+        future = None
+
+    if future is not None:
+        try:
+            future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            fatal_exit(
+                "Global MLX executor teardown timed out after "
+                f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s"
+            )
+        except Exception as exc:
+            fatal_exit(f"Global MLX executor teardown failed: {exc!r}")
+
+    executor.shutdown(wait=False)
+    _global_mlx_executor = None
 
 
 @dataclass
@@ -234,6 +279,13 @@ class EngineCore:
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
         self._finished_events: Dict[str, asyncio.Event] = {}
+        # Finish timestamps for orphan-collector reaping (#1154).
+        # Normally a consumer drains and removes its own collector, but if the
+        # client disconnects mid-stream the SSE generator chain is abandoned and
+        # its cleanup finally only runs at GC time, so the collector lingers and
+        # the dashboard keeps showing the request as "Generating".
+        self._finished_at: Dict[str, float] = {}
+        self._last_reap = 0.0
 
         # Engine state
         self._running = False
@@ -242,6 +294,11 @@ class EngineCore:
         self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+
+        # Drop transient aliases after ownership moves to the engine/scheduler
+        # graph, so close()/deep_reset() can make that graph unreachable.
+        model = None
+        tokenizer = None
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -351,6 +408,12 @@ class EngineCore:
 
         while self._running:
             try:
+                # Sweep collectors orphaned by client disconnects (throttled).
+                now = time.monotonic()
+                if now - self._last_reap >= 1.0:
+                    self._last_reap = now
+                    self._reap_orphaned_collectors(now)
+
                 if self.scheduler.has_requests():
                     step_outputs = await loop.run_in_executor(
                         self._mlx_executor, self._step_burst
@@ -363,7 +426,6 @@ class EngineCore:
                     # thread-safe and per-token streaming intact.
                     collectors = self._output_collectors
                     states = self._stream_states
-                    events = self._finished_events
                     eviction_request = None
                     distributed = False
 
@@ -397,11 +459,11 @@ class EngineCore:
                                         state.mark_sent(req_output.completion_tokens)
 
                             if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
-                                # Note: cleanup is handled by stream_outputs() finally block
-                                # _delayed_cleanup() was causing double cleanup race condition
+                                self._mark_request_finished(rid)
+                                # Cleanup normally happens in the consumer
+                                # (stream_outputs()/generate()); collectors left
+                                # behind by a disconnected client are swept by
+                                # _reap_orphaned_collectors() via _finished_at.
 
                     if distributed:
                         # Always yield to prevent event loop starvation.
@@ -470,7 +532,9 @@ class EngineCore:
 
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -485,9 +549,7 @@ class EngineCore:
                                 error=str(e),
                             )
                         )
-                    event = self._finished_events.get(rid)
-                    if event:
-                        event.set()
+                    self._mark_request_finished(rid)
                 await asyncio.sleep(0.1)
 
     async def add_request(
@@ -506,6 +568,10 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        skip_cache_store: bool = False,
+        benchmark_trace: bool = False,
+        benchmark_ane_sequence_length: int = 0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -536,6 +602,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -543,6 +610,9 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=skip_cache_store,
+            benchmark_trace=benchmark_trace,
+            benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -584,6 +654,21 @@ class EngineCore:
                 self._mlx_executor, self.scheduler.add_request, request
             )
         except BaseException:
+            # If the caller is cancelled here (e.g. the client disconnected
+            # before the SSE stream began) — or the insert fails — the request
+            # never reaches stream_outputs()/generate()'s try/finally, so
+            # nothing would mark it finished or clean it up. The collector
+            # created above would then linger forever as a phantom the reaper
+            # cannot see (it was never stamped _finished_at), and the dashboard
+            # would show it as "Generating" indefinitely (#1154).
+            # Drop the tracking and abort any partial scheduler insert (the
+            # deferred abort is idempotent and harmless if it never landed).
+            try:
+                self.scheduler.abort_request(request_id)
+            except Exception as abort_exc:  # noqa: BLE001
+                logger.debug(
+                    f"Abort of partial insert for {request_id} failed: {abort_exc}"
+                )
             self._cleanup_request(request_id)
             raise
         self._wake_engine_loop()
@@ -626,45 +711,102 @@ class EngineCore:
                     error="Request aborted",
                 )
             )
-        event = self._finished_events.get(request_id)
-        if event is not None:
-            event.set()
+        self._mark_request_finished(request_id)
         self._wake_engine_loop()
 
         return result
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine.
 
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
-        the consumer (stream_outputs/generate).
+        the consumer (stream_outputs/generate). Without an explicit reason,
+        preserve the memory-pressure error used by the process enforcer.
         """
         from .utils.proc_memory import get_phys_footprint
 
-        request_ids = list(self._output_collectors.keys())
+        # Only abort requests not already finished or pending abort. The
+        # enforcer calls this once per poll (1s) while pressure persists; a
+        # deferred abort can take many seconds to drain (it executes at the
+        # next step()/chunk boundary), so without this filter the same
+        # request is re-aborted every poll: duplicate [Error: ...] frames
+        # reach streaming clients and the returned count reports stale
+        # aborts as fresh progress, hiding a stuck scheduler from the
+        # enforcer's escalation logic.
+        pending_aborts: set[str] = set()
+        sched_for_filter = self.scheduler
+        if sched_for_filter is not None:
+            pending_aborts = set(
+                getattr(sched_for_filter, "_pending_abort_ids", None) or ()
+            )
+        request_ids = [
+            rid
+            for rid in self._output_collectors
+            if rid not in self._finished_at and rid not in pending_aborts
+        ]
         ceiling = 0
+        watermark = 0
         sched = self.scheduler
-        if sched is not None:
+        if reason is None and sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
-        usage = get_phys_footprint()
+            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
+        usage = get_phys_footprint() if reason is None else 0
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+        # Name the component ceiling that actually produced this abort. A
+        # generic "loosen memory_guard_tier" leaves users who are already on
+        # `aggressive` with nothing to try (#2362); the ladder points at the
+        # constraint that is really binding, or falls back to the same
+        # generic advice when the enforcer has not propagated a breakdown.
+        binding = "effective"
+        advice = ""
+        if reason is None:
+            binding, advice = describe_ceiling_binding(
+                static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
+                dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
+                metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
+                tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
+                current=usage,
+                fmt=format_bytes,
+                tail="reduce context length",
+            )
+            advice = f"{advice}."
+        ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                if ceiling > 0:
+                # Name the watermark that actually tripped; printing only the
+                # ceiling reads as "usage below limit yet aborted" (#2321).
+                if reason is not None:
+                    error_msg = reason
+                elif watermark > 0 and ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"(usage {usage_gb:.1f} GB, abort threshold "
+                        f"(hard watermark) {watermark_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
+                    )
+                elif ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
                     )
                 else:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 collector.put(
                     RequestOutput(
@@ -673,17 +815,85 @@ class EngineCore:
                         finish_reason="error",
                         new_text=f"\n\n[Error: {error_msg}]",
                         error=error_msg,
+                        # Without a code this surfaced as a bare RuntimeError:
+                        # the JSON keepalive wrapper never saw a memory error,
+                        # so the response generator died mid-body and the
+                        # client got a truncated read plus a 500 traceback
+                        # instead of the same actionable 400 the pre-flight
+                        # guard returns.
+                        error_code=error_code or "prefill_memory_aborted",
+                        error_metadata={
+                            "request_id": rid,
+                            # Only the limit is reported: the exception's
+                            # estimated_bytes means "predicted peak", and this
+                            # abort fires on measured usage, which the message
+                            # already states.
+                            "limit_bytes": (
+                                watermark or ceiling or None
+                                if reason is None
+                                else None
+                            ),
+                        },
                     )
                 )
-            event = self._finished_events.get(rid)
-            if event is not None:
-                event.set()
+            self._mark_request_finished(rid)
         if request_ids:
-            logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
-            )
+            if reason is None:
+                logger.warning(
+                    f"Aborted {len(request_ids)} requests due to memory pressure"
+                )
+            else:
+                logger.warning("Aborted %d requests: %s", len(request_ids), reason)
             self._wake_engine_loop()
         return len(request_ids)
+
+    def _mark_request_finished(self, request_id: str) -> None:
+        """Signal the consumer a request finished and stamp the finish time.
+
+        The timestamp lets _reap_orphaned_collectors() drop collectors whose
+        consumer never cleaned up (e.g. the client disconnected mid-stream and
+        the SSE generator chain was abandoned rather than closed).
+        """
+        self._finished_at.setdefault(request_id, time.monotonic())
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
+    def _reap_orphaned_collectors(self, now: float, grace: float = 5.0) -> int:
+        """Drop tracking for finished requests whose consumer never cleaned up.
+
+        stream_outputs()/generate() normally remove their own collector via
+        _cleanup_request() once the final output is drained. But when a client
+        disconnects mid-stream the SSE generator chain is abandoned instead of
+        closed, so that finally block only runs at non-deterministic GC time —
+        the collector lingers in _output_collectors and the request shows as
+        "Generating" forever on the dashboard (#1154).
+
+        This sweep removes the dict tracking for any request finished more than
+        ``grace`` seconds ago. It is intentionally pop-only and never calls
+        ``collector.clear()``: stream_outputs()/generate() hold their own
+        reference to the collector object, so dropping the dict entry cannot
+        truncate a slow-but-live consumer's output — only an over-eager clear()
+        could (which is what made the earlier _delayed_cleanup() approach race).
+        The grace period guarantees a live consumer (which drains in the same
+        event-loop turn the request finishes) has already self-cleaned.
+        """
+        if not self._finished_at:
+            return 0
+        stale = [rid for rid, ts in self._finished_at.items() if now - ts >= grace]
+        for rid in stale:
+            # pop-only — see docstring; never clear() the collector object.
+            self._output_collectors.pop(rid, None)
+            self._stream_states.pop(rid, None)
+            self._finished_events.pop(rid, None)
+            self._finished_at.pop(rid, None)
+        if stale:
+            logger.debug(
+                "Reaped %d orphaned output collector(s) after disconnect: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
 
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking.
@@ -697,6 +907,7 @@ class EngineCore:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+        self._finished_at.pop(request_id, None)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """
@@ -797,6 +1008,15 @@ class EngineCore:
         if event is None:
             raise RuntimeError(f"No event for request {request_id}")
 
+        # Capture the collector reference BEFORE awaiting, mirroring
+        # stream_outputs(): the orphan reaper is pop-only and may drop the dict
+        # entry once the request is finished, but a held reference still drains.
+        # Re-fetching after the await would race the reaper if this coroutine is
+        # starved past the grace window under heavy load (#1154).
+        collector = self._output_collectors.get(request_id)
+        if collector is None:
+            raise RuntimeError(f"No collector for request {request_id}")
+
         try:
             # Wait for the request to finish
             await event.wait()
@@ -808,17 +1028,15 @@ class EngineCore:
             self._cleanup_request(request_id)
             raise
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
-
-        # Drain all outputs and get the last one
+        # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -830,6 +1048,7 @@ class EngineCore:
         if final_output.error:
             _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(
@@ -969,6 +1188,10 @@ class EngineCore:
                     exc_info=True,
                 )
 
+        # Drop the last bound-method reference from the teardown loop before
+        # the final GC/reclaim pass below.
+        fn = None
+
         # Guarantee the SSD cache manager is released even if shutdown() did not
         # reach its own close() above. The manager's writer thread holds a strong
         # reference to it, so an unclosed manager leaks until restart.
@@ -983,50 +1206,65 @@ class EngineCore:
                     exc_info=True,
                 )
             self.scheduler.paged_ssd_cache_manager = None
+        manager = None
 
-        if self._mlx_executor is not None:
-            # MLX's @mx.compile cache is a C++ thread_local CompilerCache. If
-            # this worker thread exits with a non-empty cache, ~CompilerCache
-            # frees the cached graphs' Python objects from a thread-exit handler
-            # WITHOUT the GIL -> "PyThreadState_Get: GIL is released" crash for
-            # models with module-scope @mx.compile graphs (DeepSeek V4 unload,
-            # ml-explore/mlx #3280). Clear the cache ON this worker thread (GIL
-            # held) before the thread is torn down so the destructor runs on an
-            # empty cache, then request shutdown without waiting indefinitely.
-            # See utils/compile_cache.py.
-            if compile_cache_clear_available():
-                try:
-                    self._mlx_executor.submit(clear_thread_compile_cache).result(
-                        timeout=FATAL_TEARDOWN_TIMEOUT_S
-                    )
-                except concurrent.futures.TimeoutError:
-                    fatal_exit(
-                        f"Engine teardown timed out after "
-                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while clearing "
-                        f"MLX compile cache for engine {self._engine_id}"
-                    )
-                except RuntimeError:
-                    pass
-                self._mlx_executor.shutdown(wait=False)
-            else:
-                # Fallback: the clear symbol is unavailable, so do NOT exit the
-                # worker thread (that would run the unsafe destructor). Keep it
-                # alive for the process lifetime via the module-global registry.
-                _immortal_mlx_executors.append(self._mlx_executor)
-                _immortal_mlx_streams.append(self._mlx_stream)
-            self._mlx_executor = None
-
-        # Clear output collectors
+        # Clear output collectors before dropping model/scheduler references so
+        # any request-side caches they retain are eligible for the final reclaim.
         for collector in self._output_collectors.values():
             collector.clear()
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
+        self._finished_at.clear()
 
-        # Release model and tokenizer references for GC
+        release_model_resources = getattr(self.model, "release_resources", None)
+        if callable(release_model_resources):
+            try:
+                release_model_resources()
+            except Exception:
+                logger.warning(
+                    "Engine %s: model resource release failed during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+        release_model_resources = None
+
+        # Release model, tokenizer, and scheduler references before the final
+        # MLX reclaim. The reclaim must run on this engine's worker thread and
+        # stream; clearing on the global executor cannot reliably return this
+        # thread/stream-local Metal memory to MLX.
         self.model = None
         self.tokenizer = None
         self.scheduler = None
+
+        if self._mlx_executor is not None:
+            try:
+                reclaim_future = self._mlx_executor.submit(
+                    _final_engine_thread_reclaim, self._mlx_stream
+                )
+            except RuntimeError:
+                reclaim_future = None
+
+            if reclaim_future is not None:
+                try:
+                    reclaim_future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+                except concurrent.futures.TimeoutError:
+                    fatal_exit(
+                        f"Engine teardown timed out after "
+                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
+                        f"MLX memory for engine {self._engine_id}"
+                    )
+                except Exception as exc:
+                    fatal_exit(
+                        f"Engine {self._engine_id}: final MLX reclaim failed: "
+                        f"{exc!r}"
+                    )
+
+            # MLX 0.32.2 makes compiled AttachedData destruction GIL-safe, and
+            # _final_engine_thread_reclaim clears the worker's per-thread stream
+            # registry before ThreadPoolExecutor lets that worker exit.
+            self._mlx_executor.shutdown(wait=False)
+            self._mlx_executor = None
 
         logger.debug(f"Engine {self._engine_id} closed")
 
@@ -1062,6 +1300,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # Drop wrapper-local aliases after EngineCore takes ownership.
+        model = None
+        tokenizer = None
 
     @property
     def _mlx_executor(self):
@@ -1112,12 +1353,17 @@ class AsyncEngineCore:
             return False
         return await engine.abort_request(request_id)
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         engine = getattr(self, "engine", None)
         if engine is None:
             return 0
-        return await engine.abort_all_requests()
+        return await engine.abort_all_requests(reason=reason, error_code=error_code)
 
     async def stream_outputs(
         self,

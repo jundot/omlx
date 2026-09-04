@@ -12,6 +12,7 @@ These tests pin the wiring so a future refactor cannot silently revert it.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
@@ -718,3 +719,404 @@ def test_exception_during_descent_is_swallowed():
     # Monitor exists but dims stayed None — estimator returns 0 / guard skips.
     assert sched.memory_monitor is not None
     assert sched.memory_monitor._num_layers is None
+
+
+def test_scheduler_init_populates_rotating_specs():
+    """Hybrid make_cache classification reaches the monitor: full layers
+    counted strictly, rotating layers grouped by window."""
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    model = MagicMock()
+    model.layers = []
+    model.config = _ModelConfig()
+    model.make_cache = lambda: (
+        [KVCache() for _ in range(5)]
+        + [RotatingKVCache(max_size=1024) for _ in range(27)]
+    )
+
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    config = SchedulerConfig(
+        max_num_seqs=8, prefill_step_size=2048, paged_cache_block_size=0
+    )
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+    assert monitor._num_kv_cache_layers == 5
+    assert monitor._rotating_layer_specs == ((27, 1024),)
+    # No ArraysCache layers: the fixed-state probe stays unarmed.
+    assert scheduler._fixed_state_measure_armed is False
+
+
+def test_admission_estimate_is_the_single_formula():
+    """Every preflight path prices current + kv_exact + transient."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    floor = min(max(1, scheduler._prefill_min_chunk_tokens), 32767)
+    pre_chunk_kv_len = 32767 - floor
+    assert est.floor_chunk == floor
+    assert est.kv_len == pre_chunk_kv_len
+    assert est.kv_exact == int(
+        scheduler.memory_monitor.estimate_resident_kv_bytes(
+            32768, chunk_tokens=floor
+        )
+    )
+    assert est.transient == int(
+        scheduler._admission_transient_bound(floor, pre_chunk_kv_len)
+    )
+    assert est.estimated == est.kv_exact + est.transient
+
+
+def test_admission_charges_full_step_under_speed_priority():
+    """Speed priority prices the full prefill_step_size chunk instead of the
+    throttle floor, so admission only accepts what completes at full speed."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est_context = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+
+    scheduler._prefill_speed_priority = True
+    with patches[0], patches[1]:
+        est_speed = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+
+    assert est_context is not None and est_speed is not None
+    assert est_context.floor_chunk == min(
+        max(1, scheduler._prefill_min_chunk_tokens), 32768
+    )
+    assert est_speed.floor_chunk == scheduler.config.prefill_step_size
+    assert est_speed.kv_exact == int(
+        scheduler.memory_monitor.estimate_resident_kv_bytes(
+            32768, chunk_tokens=scheduler.config.prefill_step_size
+        )
+    )
+    assert est_speed.transient == int(
+        scheduler._admission_transient_bound(
+            scheduler.config.prefill_step_size,
+            32767 - scheduler.config.prefill_step_size,
+        )
+    )
+    # The full-step charge is strictly more conservative.
+    assert est_speed.estimated > est_context.estimated
+
+    # Prompts shorter than the step are charged at their own size.
+    with patches[0], patches[1]:
+        est_small = scheduler._admission_estimate(
+            num_prompt_tokens=1024, cached_tokens=0, current=0
+        )
+    assert est_small is not None
+    assert est_small.floor_chunk == 1023
+
+
+def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
+    monkeypatch,
+):
+    """Issue #2521: V4's local + pooled sparse cache must not be priced as
+    43 full-context K/V layers followed by a dense 200K SDPA."""
+    from mlx_lm.models.cache import RotatingKVCache
+
+    import omlx.memory_monitor as memory_monitor
+    from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+    from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
+
+    monkeypatch.setattr(
+        memory_monitor,
+        "native_indexer_eligible",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(wsdpa, "_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
+    monkeypatch.setattr(wsdpa, "_broken", False)
+    monkeypatch.setattr(wsdpa, "_ready", False)
+    monkeypatch.setattr(wsdpa, "_topk_ready", False)
+
+    config = _ModelConfig(
+        num_hidden_layers=43,
+        num_key_value_heads=1,
+        num_attention_heads=64,
+        head_dim=512,
+    )
+    config.model_type = "deepseek_v4"
+    config.sliding_window = 128
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.index_topk = 512
+    config.compress_ratios = [0, 0] + [4, 128] * 20 + [4]
+
+    model = MagicMock()
+    model.layers = []
+    model.config = config
+    del model.dtype
+    model.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            weight=mx.zeros((1,), dtype=mx.bfloat16),
+        )
+    )
+    model.make_cache = lambda: [RotatingKVCache(max_size=128) for _ in range(43)]
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=8,
+            prefill_step_size=2048,
+            paged_cache_block_size=0,
+        ),
+    )
+    scheduler._prefill_speed_priority = True
+
+    monitor = scheduler.memory_monitor
+    assert monitor is not None
+    gib = 1024**3
+    current = int(156.05 * gib)
+    limit = int(235.96 * gib)
+    cold_admission = scheduler._admission_estimate(
+        num_prompt_tokens=200_000,
+        cached_tokens=0,
+        current=current,
+    )
+    assert cold_admission is not None
+    assert cold_admission.estimated < limit
+
+    cold_fallback = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    monkeypatch.setattr(wsdpa, "_ready", True)
+    monkeypatch.setattr(wsdpa, "_topk_ready", True)
+    active = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    monkeypatch.setattr(wsdpa, "_broken", True)
+    failed_fallback = monitor.estimate_chunk_transient_bytes(2048, 66_000)
+    assert active < cold_fallback
+    assert failed_fallback == cold_fallback
+    monkeypatch.setattr(wsdpa, "_broken", False)
+
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=200_000,
+        cached_tokens=0,
+        current=current,
+    )
+    assert est is not None
+    assert est.estimated < limit
+    assert est.kv_exact < 2 * gib
+    assert est.transient < 20 * gib
+
+    old_kv = 200_000 * 43 * 512 * 2 * 2 + 43 * (128 + 2048 - 1) * 512 * 2 * 2
+    old_sdpa = estimate_unfused_sdpa_call_bytes(64, 2048, 202_047, 512, 2)
+    old_chunk_kv = 2048 * 43 * 512 * 2 * 2
+    old_peak = old_kv + (old_sdpa + old_chunk_kv) * 1.3
+    assert old_peak / gib == pytest.approx(81.25, abs=0.02)
+    assert current + old_peak > limit
+
+
+def test_preflight_charges_observed_max_transient():
+    """A session's observed max chunk transient converts a would-be
+    mid-prefill abort into an upfront 400."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    # Keep the safety cap out of the way so the hard limit drives.
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = int(est.estimated) + 1
+
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits
+
+    scheduler._prefill_transient_tracker._dense_history.observed_max_bytes = (
+        est.transient + 2 * 1024**3
+    )
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_admission_compares_against_hard_watermark():
+    """The enforcer kills at the watermark, so admission must not admit
+    into the watermark..hard-limit band."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est is not None
+
+    # Watermark unset: falls back to the hard limit, request fits.
+    scheduler._memory_hard_limit_bytes = int(est.estimated) + 1
+    scheduler._memory_hard_watermark_bytes = 0
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+    # Watermark below the estimate: the same request is now an upfront 400.
+    scheduler._memory_hard_watermark_bytes = int(est.estimated) - 1
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError) as ei:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+    assert ei.value.limit_bytes == int(est.estimated) - 1
+
+    # Watermark above the estimate: admitted again.
+    scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def _qwen4_prefill_profile():
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    return make_prefill_memory_profile(
+        SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        ),
+        compute_dtype_size=2,
+    )
+
+
+def _attach_qwen4_profile(scheduler: Scheduler) -> None:
+    profile = _qwen4_prefill_profile()
+    scheduler.memory_monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        compute_dtype_size=2,
+        prefill_memory_profile=profile,
+    )
+
+
+def test_qwen4_text_admission_uses_gathered_transient():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    assert gathered.kv_exact == dense.kv_exact
+    assert gathered.transient * 4 < dense.transient
+    assert scheduler._qwen4_text_gathered_pricing(True) is True
+    assert scheduler._qwen4_text_gathered_pricing(False) is False
+
+
+def test_qwen4_preflight_doors_use_gathered_for_text_only():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    cap = (dense.estimated + gathered.estimated) // 2
+    scheduler._memory_hard_limit_bytes = cap
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=233_472, text_only=False
+            )
+        scheduler.preflight_or_raise(num_prompt_tokens=233_472, text_only=True)
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=233_472, text_only=True
+            )
+            is None
+        )
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=233_472, text_only=False
+            )
+            is not None
+        )
+
+
+def test_qwen4_image_request_preflight_stays_dense():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    scheduler._memory_hard_limit_bytes = (dense.estimated + gathered.estimated) // 2
+    scheduler._memory_abort_limit_bytes = 10**18
+    request = _make_request(233_472)
+    request.vlm_inputs_embeds = object()
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        rejection = scheduler._preflight_memory_check(request)
+    assert rejection is not None

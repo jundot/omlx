@@ -13,12 +13,20 @@ the exception into HTTP 400. We exercise the contract by:
 - Confirming the exception type propagates.
 """
 
-from unittest.mock import MagicMock
+import concurrent.futures
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
+
+_TINY_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 # ---------------------------------------------------------------------------
 # Scheduler.preflight_or_raise / _preflight_memory_check_tokens
@@ -145,8 +153,6 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
 
 @pytest.mark.asyncio
 async def test_batched_engine_preflight_runs_eviction_before_final_check():
-    from types import SimpleNamespace
-
     from omlx.engine.batched import BatchedEngine
 
     scheduler = MagicMock()
@@ -175,12 +181,97 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypatch):
+    """A rejection caused by finished-request residue must be re-measured.
+
+    The second estimate represents the scheduler state after its normal async
+    remove and deferred Metal clear. It now fits, so no idle model should be
+    evicted and the route must not return a false HTTP 400.
+    """
+    from omlx.engine.batched import BatchedEngine
+
+    scheduler = MagicMock()
+    transient_rejection = SimpleNamespace(request_id="req-cleanup")
+    scheduler.preflight_eviction_request.side_effect = [
+        transient_rejection,
+        transient_rejection,
+        None,
+    ]
+    scheduler.has_pending_route_preflight_cleanup.side_effect = [True, False]
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("omlx.engine.base.asyncio.sleep", _no_sleep)
+    evict = AsyncMock(return_value=True)
+    engine = BatchedEngine(
+        model_name="test-model",
+        prefill_eviction_callback=evict,
+    )
+
+    await engine._preflight_or_raise_with_eviction(
+        scheduler,
+        num_prompt_tokens=60_000,
+        request_id="req-next",
+    )
+
+    assert scheduler.preflight_eviction_request.call_count == 3
+    assert scheduler.has_pending_route_preflight_cleanup.call_count == 2
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=60_000,
+        request_id="req-next",
+        text_only=True,
+    )
+    evict.assert_not_awaited()
+
+
+def test_scheduler_route_preflight_cleanup_signal():
+    scheduler = _make_scheduler()
+    assert scheduler.has_pending_route_preflight_cleanup() is False
+
+    future = concurrent.futures.Future()
+    scheduler._pending_async_removes.append((1, "req-old", future))
+    assert scheduler.has_pending_route_preflight_cleanup() is True
+
+    scheduler._pending_async_removes.clear()
+    scheduler._deferred_clear_at = scheduler._step_counter + 1
+    assert scheduler.has_pending_route_preflight_cleanup() is True
+
+    scheduler._deferred_clear_at = None
+    assert scheduler.has_pending_route_preflight_cleanup() is False
+
+
+def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch):
+    scheduler = _make_scheduler()
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    request = MagicMock()
+    request._extracted_cache = object()
+    request.prompt_cache = object()
+    scheduler.requests["req-old"] = request
+    scheduler._pending_async_removes.append((1, "req-old", future))
+    scheduler.uid_to_request_id[1] = "req-old"
+    scheduler.request_id_to_uid["req-old"] = 1
+    monkeypatch.setattr(scheduler, "_remove_uid_from_active_batch", MagicMock())
+
+    assert scheduler._drain_pending_async_removes() is True
+
+    assert request._extracted_cache is None
+    assert request.prompt_cache is None
+    assert scheduler._deferred_clear_at == (
+        scheduler._step_counter + scheduler._DEFERRED_CLEAR_DELAY
+    )
 
 
 @pytest.mark.asyncio
@@ -275,7 +366,7 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                 {"type": "text", "text": "hello"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,..."},
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
                 {"type": "image", "source": {}},
                 {"type": "text", "text": "world"},
@@ -313,7 +404,7 @@ async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
             "role": "user",
             "content": [
                 {"type": "text", "text": "compare these:"},
-                {"type": "image_url", "image_url": {"url": "data:..."}},
+                {"type": "image_url", "image_url": {"url": _TINY_PNG_DATA_URI}},
                 {"type": "image", "source": {}},
             ],
         }
@@ -578,6 +669,7 @@ async def test_engine_core_add_request_cleans_up_on_scheduler_raise(
     core._output_collectors = {}
     core._stream_states = {}
     core._finished_events = {}
+    core._finished_at = {}
 
     class _Cfg:
         stream_interval = 1
@@ -711,9 +803,11 @@ class TestRejectionMessageNamesBindingCeiling:
         ``_preflight_memory_check`` so we can inspect the message it
         returns."""
         # Peak chosen larger than any ceiling tested below so the
-        # rejection branch fires deterministically.
+        # rejection branch fires deterministically. Admission charges the
+        # exact resident KV plus the floor-chunk transient bound; drive the
+        # rejection through the KV term.
         sched.memory_monitor = MagicMock()
-        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = 512 * 1024**3
+        sched.memory_monitor.estimate_resident_kv_bytes.return_value = 512 * 1024**3
 
         import omlx.scheduler as scheduler_mod
 

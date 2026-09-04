@@ -171,7 +171,7 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         XCTAssertEqual(diff.normalizedModelDir, "/Volumes/SSD/models")
     }
 
-    func testApplyConfigKeepsWildcardBindButUsesLoopbackEndpoint() {
+    func testApplyConfigKeepsIPv4WildcardButUsesLoopbackEndpoint() {
         let cfg = AppConfig(
             bindAddress: "0.0.0.0",
             port: 8080,
@@ -188,5 +188,64 @@ final class ServerScreenVMStorageDiffTests: XCTestCase {
         XCTAssertEqual(vm.host, "0.0.0.0")
         XCTAssertEqual(vm.appliedBindAddress, "0.0.0.0")
         XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
+    }
+
+    func testApplyConfigDualStackWildcardUsesLoopbackEndpoint() {
+        let cfg = AppConfig(
+            bindAddress: "::",
+            port: 8080,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            modelDirs: ["/Users/Fido/.omlx/models"],
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertEqual(vm.host, "::")
+        XCTAssertEqual(vm.appliedBindAddress, "::")
+        // :: is a dual-stack wildcard: it accepts IPv4 and IPv6, but the app's
+        // own client connects over loopback.
+        XCTAssertEqual(vm.effectiveHost, "127.0.0.1")
+    }
+
+    func testApplyConfigSeedsAutoStartWhenServerIsOffline() {
+        let cfg = AppConfig(
+            bindAddress: "127.0.0.1",
+            port: 8080,
+            autoStartOnLaunch: false,
+            apiKey: nil,
+            basePath: "/Users/Fido/.omlx",
+            modelDir: "/Users/Fido/.omlx/models",
+            modelDirs: ["/Users/Fido/.omlx/models"],
+            hfEndpoint: ""
+        )
+        let vm = ServerScreenVM()
+
+        vm.applyConfig(cfg)
+
+        XCTAssertFalse(vm.autoStartOnLaunch)
+    }
+
+    func testAudioUploadSizeValidation() {
+        for valid in ["1B", "100MB", "1.5GB", "1024"] {
+            XCTAssertTrue(ServerScreenVM.isValidAudioUploadSize(valid), valid)
+        }
+        for invalid in ["", "0MB", "-1MB", "100 MB", "infMB", "bogus"] {
+            XCTAssertFalse(ServerScreenVM.isValidAudioUploadSize(invalid), invalid)
+        }
+    }
+
+    func testAudioUploadChangeEnablesApply() {
+        let services = makeServices(basePath: "/Users/Fido/.omlx",
+                                    modelDir: "/Users/Fido/.omlx/models")
+        let vm = ServerScreenVM()
+        vm.basePathText = "/Users/Fido/.omlx"
+        vm.modelDirTexts = ["/Users/Fido/.omlx/models"]
+        vm.maxAudioUploadSizeText = "250MB"
+
+        XCTAssertTrue(vm.hasPendingServerChanges(services: services))
     }
 }

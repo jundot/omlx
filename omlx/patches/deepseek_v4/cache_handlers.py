@@ -36,11 +36,13 @@ class PoolingCacheHandler(CacheTypeHandler):
         return False
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
-        buf_kv, buf_gate, pooled = cache_obj.state
+        buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate = cache_obj.state
         return {
             "buf_kv": buf_kv,
             "buf_gate": buf_gate,
             "pooled": pooled,
+            "prev_win_kv": prev_win_kv,
+            "prev_win_gate": prev_win_gate,
             "cache_type": self.cache_type.value,
         }
 
@@ -85,20 +87,24 @@ class PoolingCacheHandler(CacheTypeHandler):
             state.get("buf_kv"),
             state.get("buf_gate"),
             state.get("pooled"),
+            state.get("prev_win_kv"),
+            state.get("prev_win_gate"),
         )
         return cache
 
     def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
-        # PoolingCache.state = (buf_kv, buf_gate, pooled).
+        # PoolingCache.state also carries the previous raw overlap window.
         # buf_kv / buf_gate are remainder windows of shape (B, ratio, D);
         # pooled is the accumulated compressed sequence (B, P, D). The
         # quantization at ``ratio`` makes per-token slicing unsafe — keep
-        # all three elements non-sliceable so omlx core takes the
+        # all five elements non-sliceable so omlx core takes the
         # last-block-only / boundary-snapshot path.
         return (
             CacheStateAxisInfo(name="buf_kv", sequence_axis=1, sliceable=False),
             CacheStateAxisInfo(name="buf_gate", sequence_axis=1, sliceable=False),
             CacheStateAxisInfo(name="pooled", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="prev_win_kv", sequence_axis=1, sliceable=False),
+            CacheStateAxisInfo(name="prev_win_gate", sequence_axis=1, sliceable=False),
         )
 
     def deserialize_state(
@@ -106,10 +112,10 @@ class PoolingCacheHandler(CacheTypeHandler):
         elements: tuple[Any, ...],
         meta_state: Any | None = None,
     ) -> Any:
-        """Reconstruct PoolingCache from a 3-tuple state directly.
+        """Reconstruct PoolingCache from its persisted N-tuple state.
 
         omlx core dispatches handlers via ``deserialize_state`` instead of
-        the legacy keys/values dict so 3-tuple state survives without
+        the legacy keys/values dict so the 5-tuple state survives without
         getting truncated by the default 2-tuple mapping.
         """
         if not isinstance(elements, (list, tuple)):
@@ -125,19 +131,30 @@ class PoolingCacheHandler(CacheTypeHandler):
             pooled = None
         elif len(elements) == 3:
             buf_kv, buf_gate, pooled = elements
+            prev_win_kv = prev_win_gate = None
+        elif len(elements) == 5:
+            buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate = elements
         else:
             logger.error(
-                "PoolingCache deserialize: expected 2 or 3 elements, got %d",
+                "PoolingCache deserialize: expected 2, 3, or 5 elements, got %d",
                 len(elements),
             )
             return None
+        if len(elements) == 2:
+            prev_win_kv = prev_win_gate = None
         return self.reconstruct_cache(
-            {"buf_kv": buf_kv, "buf_gate": buf_gate, "pooled": pooled},
+            {
+                "buf_kv": buf_kv,
+                "buf_gate": buf_gate,
+                "pooled": pooled,
+                "prev_win_kv": prev_win_kv,
+                "prev_win_gate": prev_win_gate,
+            },
             meta_state,
         )
 
     def _get_state_keys(self) -> tuple[str, ...]:
-        return ("buf_kv", "buf_gate", "pooled")
+        return ("buf_kv", "buf_gate", "pooled", "prev_win_kv", "prev_win_gate")
 
     def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ("ratio",)

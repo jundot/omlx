@@ -7,18 +7,18 @@ Two pieces:
    snapshots ``(conv_state, ssm_state)`` after the confirmed prefix of an
    MTP draft+verify forward, then restores it when the draft is rejected.
 
-2. A one-update undo log on ``RotatingKVCache`` / ``BatchRotatingKVCache``:
+2. A verify-block undo log on ``RotatingKVCache`` / ``BatchRotatingKVCache``:
    a rotated rotating cache is not trimmable (the slot of the evicted token
-   has been overwritten), so an MTP draft rejection could not roll back the
-   2-token verify write and the rejected token stayed in the cache as a
-   phantom, progressively corrupting output (hit on DeepSeek-V4-Flash,
-   sliding_window=128). The S==2 verify update always takes the
+   has been overwritten), so an MTP draft rejection could not discard the
+   rejected positions exactly and phantom tokens progressively corrupted
+   output (hit on DeepSeek-V4-Flash, sliding_window=128). A multi-token verify
+   update takes the
    ``_update_concat`` path, which only rebinds ``keys``/``values`` (no
    in-place setitem), so stashing the pre-update attribute references plus
-   the update's inputs gives an exact undo; ``trim(1)`` then replays the
-   confirmed token. Stashing is armed only around the MTP backbone forward
-   (``batch_generator._call_backbone``) so non-MTP flows keep stock
-   trim semantics.
+   the update's inputs gives an exact undo. ``trim(rejected)`` then restores
+   the snapshot and replays the confirmed/accepted prefix. Stashing is armed
+   only around MTP-managed backbone forwards (``batch_generator._call_backbone``)
+   so non-MTP flows keep stock trim semantics.
 """
 
 from __future__ import annotations
@@ -51,6 +51,36 @@ def _is_undo_armed() -> bool:
     return getattr(armed, "value", False)
 
 
+def _is_decode_consistent_armed() -> bool:
+    try:
+        from omlx.patches.deepseek_v4.decode_consistency import is_armed
+
+        return is_armed()
+    except Exception:
+        return False
+
+
+def stage_functional_rotating_update(self, keys, values) -> None:
+    """Stage undo for a rotating-cache update that only rebinds arrays.
+
+    DeepSeek's decode-consistent verify builds its physical-ring snapshots
+    from the pre-update cache and then rebinds the cache to the final one.
+    The old array wrappers are never mutated, so retaining their references
+    is sufficient and avoids the defensive full-cache copy used for setitem.
+    """
+    if not _is_undo_armed():
+        self._mtp_undo = None
+        return
+    fields = ("keys", "values", "offset", "_idx")
+    fields += tuple(
+        field
+        for field in ("_offset", "rotated", "left_padding")
+        if hasattr(self, field)
+    )
+    snap = {field: getattr(self, field) for field in fields}
+    self._mtp_undo = (snap, keys, values, True)
+
+
 def _wrap_rotating(cls, fields) -> None:
     """Wrap update_and_fetch / is_trimmable / trim with the MTP undo log."""
     if getattr(cls, "_omlx_mtp_undo_attached", False):
@@ -63,10 +93,27 @@ def _wrap_rotating(cls, fields) -> None:
     orig_trim = cls.trim
 
     def update_and_fetch(self, keys, values):
-        # Only armed verify-sized updates are undoable: S == 1 uses the
-        # in-place ring write (setitem invalidates reference snapshots) and
-        # prompt chunks have no rollback consumer.
-        if keys.shape[2] == 2 and _is_undo_armed():
+        # DSpark's decode-consistent verify advances the cache with several
+        # M=1 updates; a depth-k Lightning verify uses one update containing the
+        # confirmed token plus every draft token (currently up to M=9 for
+        # depth-8 drafting). Preserve one pre-block snapshot for both forms
+        # so rejection can restore exactly. Undo is scoped by _call_backbone;
+        # record every non-empty armed update instead of duplicating the
+        # supported draft-depth limit here.
+        steps = keys.shape[2]
+        armed = _is_undo_armed()
+        existing = getattr(self, "_mtp_undo", None)
+        decode_consistent = steps == 1 or _is_decode_consistent_armed()
+        chained = decode_consistent and armed and existing is not None and existing[3]
+        if chained:
+            snap, old_keys, old_values, _ = existing
+            self._mtp_undo = (
+                snap,
+                mx.concatenate([old_keys, keys], axis=2),
+                mx.concatenate([old_values, values], axis=2),
+                True,
+            )
+        elif armed and steps >= 1:
             snap = {}
             for f in fields:
                 v = getattr(self, f)
@@ -75,7 +122,7 @@ def _wrap_rotating(cls, fields) -> None:
                     # so a plain reference would see the post-update value.
                     v = v + 0
                 snap[f] = v
-            self._mtp_undo = (snap, keys, values)
+            self._mtp_undo = (snap, keys, values, decode_consistent)
         else:
             self._mtp_undo = None
         return orig_update(self, keys, values)
@@ -93,15 +140,24 @@ def _wrap_rotating(cls, fields) -> None:
         self._mtp_undo = None
         if undo is None:
             return 0
-        snap, keys, values = undo
+        snap, keys, values, decode_consistent = undo
         k = keys.shape[2] - n
         if k < 0:
             return 0
         for f, v in snap.items():
             setattr(self, f, v)
         if k > 0:
-            # Replay the confirmed prefix as a normal decode-sized update.
-            orig_update(self, keys[..., :k, :], values[..., :k, :])
+            # A decode-consistent verify must also leave the committed cache
+            # in the same physical ring layout as k ordinary M=1 updates.
+            if decode_consistent:
+                for idx in range(k):
+                    orig_update(
+                        self,
+                        keys[..., idx : idx + 1, :],
+                        values[..., idx : idx + 1, :],
+                    )
+            else:
+                orig_update(self, keys[..., :k, :], values[..., :k, :])
             self._mtp_undo = None
         return n
 

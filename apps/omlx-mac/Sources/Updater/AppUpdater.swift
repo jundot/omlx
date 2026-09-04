@@ -1,11 +1,11 @@
-// In-place auto-updater — direct port of the PyObjC menubar's updater.
+// In-place auto-updater.
 //
 // Flow: download .dmg → hdiutil attach → copy the inner oMLX.app next to
 // the running bundle as `.oMLX-update.app` → hdiutil detach → on
-// confirmation, spawn a detached bash script that waits for our PID to
-// exit, swaps the staged bundle into place, strips the quarantine xattr,
-// and `open`s the new bundle. No EdDSA signature check — Apple's
-// notarization stapled to the DMG is the trust boundary.
+// confirmation, register a one-shot launchd worker that waits for our PID
+// to exit, atomically swaps the staged bundle into place, strips the
+// quarantine xattr, and `open`s the new bundle. No EdDSA signature check —
+// Apple's notarization stapled to the DMG is the trust boundary.
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk. A staged copy that's already on disk gets
@@ -20,6 +20,8 @@ final class AppUpdater {
         case notWritable(String)
         case downloadFailed(String)
         case mountFailed(String)
+        case unmountFailed(String)
+        case cleanupFailed(String)
         case appNotFoundInVolume
         case stageFailed(String)
         case cancelled
@@ -30,6 +32,8 @@ final class AppUpdater {
                 return "Cannot write to \(path). Move oMLX.app to a writable location and try again."
             case .downloadFailed(let m): return "Download failed: \(m)"
             case .mountFailed(let m): return "Could not mount DMG: \(m)"
+            case .unmountFailed(let m): return "Could not unmount DMG: \(m)"
+            case .cleanupFailed(let m): return "Could not clean up update files: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
             case .cancelled: return "Update cancelled"
@@ -45,7 +49,8 @@ final class AppUpdater {
         case ready
     }
 
-    static let stagedAppName = ".oMLX-update.app"
+    static let stagedAppName = UpdateInstaller.stagedAppName
+    private static var swapScheduled = false
 
     private let dmgURL: URL
     private let version: String
@@ -85,6 +90,11 @@ final class AppUpdater {
     static func cleanupStaged() {
         let app = appBundleURL()
         let staged = app.deletingLastPathComponent().appendingPathComponent(stagedAppName)
+        UpdateInstaller.cleanupLaunchAgents(
+            in: AppConfig.appSupportURL().appendingPathComponent(
+                UpdateInstaller.jobsDirectoryName
+            )
+        )
         try? FileManager.default.removeItem(at: staged)
     }
 
@@ -118,7 +128,12 @@ final class AppUpdater {
             onError(.downloadFailed("Could not create temp dir: \(error.localizedDescription)"))
             return
         }
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        var temporaryDirectoryNeedsCleanup = true
+        defer {
+            if temporaryDirectoryNeedsCleanup {
+                try? FileManager.default.removeItem(at: tmpDir)
+            }
+        }
 
         let dmgPath = tmpDir.appendingPathComponent("oMLX-\(version).dmg")
 
@@ -144,7 +159,12 @@ final class AppUpdater {
             onError(.mountFailed(error.localizedDescription)); return
         }
 
-        defer { _ = try? unmountDMG(at: mountPoint) }
+        var mountedDMGNeedsCleanup = true
+        defer {
+            if mountedDMGNeedsCleanup {
+                try? unmountDMG(at: mountPoint)
+            }
+        }
 
         if cancelled { return }
         onProgress(.staging)
@@ -159,8 +179,40 @@ final class AppUpdater {
         }
 
         if cancelled { return }
-        onProgress(.ready)
-        onReady()
+        do {
+            try Self.finishStagedUpdate(
+                detach: {
+                    try unmountDMG(at: mountPoint)
+                    mountedDMGNeedsCleanup = false
+                },
+                removeTemporaryFiles: {
+                    try FileManager.default.removeItem(at: tmpDir)
+                    temporaryDirectoryNeedsCleanup = false
+                },
+                notifyReady: {
+                    onProgress(.ready)
+                    onReady()
+                }
+            )
+        } catch let err as UpdateError {
+            onError(err)
+        } catch {
+            onError(.cleanupFailed(error.localizedDescription))
+        }
+    }
+
+    /// Releases every resource owned by a staged update before notifying the
+    /// controller. `notifyReady` may synchronously terminate the process, so
+    /// moving either cleanup step after it would leak the mounted image and
+    /// its downloaded backing file.
+    static func finishStagedUpdate(
+        detach: () throws -> Void,
+        removeTemporaryFiles: () throws -> Void,
+        notifyReady: () -> Void
+    ) throws {
+        try detach()
+        try removeTemporaryFiles()
+        notifyReady()
     }
 
     // MARK: - Download
@@ -307,13 +359,16 @@ final class AppUpdater {
         throw UpdateError.mountFailed("Could not parse hdiutil output")
     }
 
-    @discardableResult
-    private func unmountDMG(at mountPoint: URL) throws -> Bool {
+    private func unmountDMG(at mountPoint: URL) throws {
         let result = try runProcess(
             "/usr/bin/hdiutil",
             args: ["detach", mountPoint.path, "-force"]
         )
-        return result.status == 0
+        guard result.status == 0 else {
+            throw UpdateError.unmountFailed(
+                result.stderr.isEmpty ? result.stdout : result.stderr
+            )
+        }
     }
 
     // MARK: - Stage
@@ -347,7 +402,7 @@ final class AppUpdater {
 
     // MARK: - Swap + relaunch (called from outside, right before terminate)
 
-    /// Spawns a detached bash script that:
+    /// Registers a one-shot launchd worker that:
     ///   1. waits for our PID to exit
     ///   2. replaces the running .app with the staged one
     ///   3. strips com.apple.quarantine
@@ -355,35 +410,29 @@ final class AppUpdater {
     /// Must be called immediately before `NSApp.terminate(nil)`.
     @discardableResult
     static func performSwapAndRelaunch() -> Bool {
+        if swapScheduled { return true }
+
         let app = appBundleURL()
         let staged = app.deletingLastPathComponent().appendingPathComponent(stagedAppName)
         guard FileManager.default.fileExists(atPath: staged.path) else { return false }
 
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let appPath = app.path.replacingOccurrences(of: "\"", with: "\\\"")
-        let stagedPath = staged.path.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = """
-        #!/bin/bash
-        while kill -0 \(pid) 2>/dev/null; do
-            sleep 0.2
-        done
-        sleep 0.5
-        rm -rf "\(appPath)"
-        mv "\(stagedPath)" "\(appPath)"
-        xattr -rd com.apple.quarantine "\(appPath)" 2>/dev/null
-        open "\(appPath)"
-        """
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["-c", script]
-        // Detach: orphan into a new session so the script outlives our process.
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        guard let executable = Bundle.main.executableURL else {
+            NSLog("oMLX: failed to locate executable for updater worker")
+            return false
+        }
         do {
-            try process.run()
+            try UpdateInstaller.submitWorker(
+                parentPID: ProcessInfo.processInfo.processIdentifier,
+                liveApp: app,
+                stagedApp: staged,
+                executable: executable,
+                jobsDirectory: AppConfig.appSupportURL().appendingPathComponent(
+                    UpdateInstaller.jobsDirectoryName
+                )
+            )
+            swapScheduled = true
         } catch {
-            NSLog("oMLX: failed to spawn swap script: %@", error.localizedDescription)
+            NSLog("oMLX: failed to start updater worker: %@", error.localizedDescription)
             return false
         }
         return true

@@ -383,8 +383,26 @@ class TestPrefixCacheNTupleSubState:
             }
         ]
 
+        # A1 fix: is_last_block alone no longer justifies using live state
+        # for non-sliceable sub-caches -- a matching boundary snapshot is
+        # required (docs/qwen35-hardening-and-optimization.md A1). This test
+        # is about the CacheList slicing/marker path itself, not about
+        # boundary-snapshot sourcing, so provide a snapshot mirroring the
+        # live state to keep exercising that path.
+        snapshot_cache_data = [
+            {
+                "state": [
+                    (rot_keys, rot_values),
+                    (buf_kv, buf_gate, pooled),
+                ],
+            }
+        ]
         block_slices = prefix_cache._extract_block_tensor_slice(
-            cache_data, start_idx=0, end_idx=16, is_last_block=True
+            cache_data,
+            start_idx=0,
+            end_idx=16,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
         )
         assert block_slices is not None
         assert len(block_slices) == 1
@@ -508,17 +526,23 @@ class TestPrefixCacheNTupleSubState:
         store.shutdown()
 
     def test_pooling_cache_handler_axis_info(self):
-        """PoolingCacheHandler exposes 3-element axis_info, all non-sliceable."""
+        """PoolingCacheHandler exposes all persisted state as non-sliceable."""
         from omlx.patches.deepseek_v4.cache_handlers import PoolingCacheHandler
 
         info = PoolingCacheHandler().get_state_axis_info()
-        assert len(info) == 3
-        assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
+        assert len(info) == 5
+        assert [i.name for i in info] == [
+            "buf_kv",
+            "buf_gate",
+            "pooled",
+            "prev_win_kv",
+            "prev_win_gate",
+        ]
         assert all(i.sequence_axis == 1 for i in info)
         assert all(i.sliceable is False for i in info)
 
-    def test_pooling_cache_deserialize_3tuple_round_trip(self):
-        """PoolingCacheHandler.deserialize_state preserves all 3 elements."""
+    def test_pooling_cache_deserialize_state_round_trip(self):
+        """PoolingCacheHandler preserves overlap state and reads legacy state."""
         import mlx.core as mx
 
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -537,18 +561,32 @@ class TestPrefixCacheNTupleSubState:
         buf_kv = mx.zeros((1, ratio, 8))
         buf_gate = mx.zeros((1, ratio, 8))
         pooled = mx.arange(1 * 12 * 8, dtype=mx.float32).reshape(1, 12, 8)
-        mx.eval(buf_kv, buf_gate, pooled)
-        original.state = (None, None, pooled)  # remainder buffers empty
+        prev_win_kv = mx.ones((1, 1, ratio, 8))
+        prev_win_gate = mx.full((1, 1, ratio, 8), 2.0)
+        mx.eval(buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate)
+        original.state = (
+            None,
+            None,
+            pooled,
+            prev_win_kv,
+            prev_win_gate,
+        )
 
         h = PoolingCacheHandler()
         elements = h.serialize_state(original)
-        assert len(elements) == 3
+        assert len(elements) == 5
         restored = h.deserialize_state(elements, meta_state=ratio)
         assert restored is not None
         assert restored.ratio == ratio
-        # The pooled tensor must round-trip byte-equal — V4 fix verification.
-        rest_kv, rest_gate, rest_pool = restored.state
+        rest_kv, rest_gate, rest_pool, rest_prev_kv, rest_prev_gate = restored.state
         assert mx.max(mx.abs(rest_pool - pooled)).item() == 0.0
+        assert mx.max(mx.abs(rest_prev_kv - prev_win_kv)).item() == 0.0
+        assert mx.max(mx.abs(rest_prev_gate - prev_win_gate)).item() == 0.0
+
+        legacy = h.deserialize_state((None, None, pooled), meta_state=ratio)
+        assert legacy is not None
+        assert legacy.prev_win_kv is None
+        assert legacy.prev_win_gate is None
 
     def test_pooling_cache_deserialize_legacy_2tuple_input(self):
         """Tolerates length-2 input (e.g. coming from a legacy V2 polyfill)
@@ -575,13 +613,8 @@ class TestPrefixCacheNTupleSubState:
         assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
         assert all(i.sliceable is False for i in info)
 
-    def test_extract_cache_states_preserves_pooling_cache_3tuple(self):
-        """scheduler._extract_cache_states preserves PoolingCache's 3-tuple
-        state without dropping the third element. This is the topmost entry
-        point on the prefill → store_cache path; if state[2] survives here
-        and the downstream serializers (paged_ssd, boundary_snapshot,
-        prefix_cache) preserve it, V4 multi-session corruption is fully
-        prevented."""
+    def test_extract_cache_states_preserves_pooling_cache_state(self):
+        """Scheduler extraction preserves pooled and overlap state tensors."""
         import mlx.core as mx
 
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -593,8 +626,10 @@ class TestPrefixCacheNTupleSubState:
         # Build a PoolingCache with a populated pooled tensor.
         cache = PoolingCache(ratio=4)
         pooled = mx.arange(1 * 8 * 16, dtype=mx.float32).reshape(1, 8, 16)
-        mx.eval(pooled)
-        cache.state = (None, None, pooled)
+        prev_win_kv = mx.ones((1, 1, 4, 16))
+        prev_win_gate = mx.full((1, 1, 4, 16), 2.0)
+        mx.eval(pooled, prev_win_kv, prev_win_gate)
+        cache.state = (None, None, pooled, prev_win_kv, prev_win_gate)
 
         # Drive _extract_cache_states with a single-layer raw cache list.
         # We use Scheduler.__new__ to avoid full init (no engine needed).
@@ -603,10 +638,11 @@ class TestPrefixCacheNTupleSubState:
         assert extracted is not None
         assert len(extracted) == 1
         layer_state = extracted[0]
-        # State must be a 3-tuple — third element preserved.
         assert isinstance(layer_state["state"], tuple)
-        assert len(layer_state["state"]) == 3
+        assert len(layer_state["state"]) == 5
         assert mx.max(mx.abs(layer_state["state"][2] - pooled)).item() == 0.0
+        assert mx.max(mx.abs(layer_state["state"][3] - prev_win_kv)).item() == 0.0
+        assert mx.max(mx.abs(layer_state["state"][4] - prev_win_gate)).item() == 0.0
 
     def test_cache_list_legacy_two_tuple_unchanged(self):
         """CacheList with all 2-tuple sub_states (legacy) round-trips

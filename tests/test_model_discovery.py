@@ -2,6 +2,8 @@
 """Tests for model discovery functionality."""
 
 import json
+import logging
+import struct
 from pathlib import Path
 
 import pytest
@@ -9,16 +11,104 @@ import pytest
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
+    _is_helper_checkpoint,
     _is_unsupported_model,
     _read_model_context_length,
+    _register_model,
     _resolve_hf_cache_entry,
+    _vision_weight_bytes,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
     estimate_model_size,
+    estimate_text_only_model_size,
     format_size,
+    is_helper_config_model_type,
+    is_helper_model_config,
     model_directory_access_error,
 )
+
+
+def _write_safetensors(path, tensors):
+    """Write a minimal valid safetensors file: name -> (dtype, shape)."""
+    dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4, "U32": 4}
+    header = {}
+    offset = 0
+    for name, (dtype, shape) in tensors.items():
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        nbytes = numel * dtype_bytes[dtype]
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+    blob = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        f.write(b"\x00" * offset)
+
+
+class TestIsHelperConfigModelType:
+    """Tests for helper (dFlash / Assistant / Draft) model_type detection."""
+
+    @pytest.mark.parametrize(
+        "config_model_type",
+        ["gemma4_assistant", "qwen3_5_mtp", "foo_mtp", "bar_assistant", "QWEN3_5_MTP"],
+    )
+    def test_helper_types(self, config_model_type):
+        assert is_helper_config_model_type(config_model_type) is True
+
+    @pytest.mark.parametrize(
+        "config_model_type",
+        ["qwen3", "gemma4_text", "gemma4", "llama", "qwen2_5_vl", "", None, 123],
+    )
+    def test_non_helper_types(self, config_model_type):
+        assert is_helper_config_model_type(config_model_type) is False
+
+
+class TestIsHelperModelConfig:
+    """Tests for full-config drafter detection (model_type / architecture / config-block)."""
+
+    def test_dflash_draft_via_architecture(self):
+        # DFlash drafts declare a plain qwen3 model_type but a DFlashDraftModel arch.
+        config = {"model_type": "qwen3", "architectures": ["DFlashDraftModel"]}
+        assert is_helper_model_config(config) is True
+
+    def test_dflash_draft_via_config_block(self):
+        config = {"model_type": "qwen3", "dflash_config": {"block_size": 16}}
+        assert is_helper_model_config(config) is True
+
+    def test_assistant_via_model_type(self):
+        config = {
+            "model_type": "gemma4_assistant",
+            "architectures": ["Gemma4Assistant"],
+        }
+        assert is_helper_model_config(config) is True
+
+    def test_mtp_via_model_type(self):
+        config = {"model_type": "qwen3_5_mtp"}
+        assert is_helper_model_config(config) is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]},
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForConditionalGeneration"],
+            },
+            {"model_type": "llama"},
+            {},
+            {"architectures": None},
+            {"model_type": 123, "architectures": 123},
+        ],
+    )
+    def test_non_helper_configs(self, config):
+        assert is_helper_model_config(config) is False
 
 
 class TestDetectModelType:
@@ -131,6 +221,38 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_qwen2_causal_lm_embedding(self, tmp_path):
+        """Qwen2ForCausalLM with an embedding-named dir is an embedding (#686).
+
+        jina-code-embeddings ships a Qwen2ForCausalLM architecture without
+        lm_head weights, so it must classify as an embedding model rather than
+        a chat LLM.
+        """
+        embed_dir = tmp_path / "jina-code-embeddings-1.5b"
+        embed_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (embed_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(embed_dir) == "embedding"
+
+    def test_qwen2_causal_lm_without_embedding_name_is_llm(self, tmp_path):
+        """Qwen2ForCausalLM without an embedding-named dir stays an LLM (#686).
+
+        Regression guard: adding Qwen2ForCausalLM to the embedding-arch set must
+        not reclassify ordinary Qwen2/Qwen2.5 chat models, which is gated by the
+        _is_causal_lm_embedding directory-name heuristic.
+        """
+        llm_dir = tmp_path / "Qwen2.5-7B-Instruct"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
     def test_detect_lfm2_text_model_is_llm(self, tmp_path):
         """LFM2 text checkpoints share model_type with non-text variants."""
         llm_dir = tmp_path / "LFM2-1.2B"
@@ -227,6 +349,41 @@ class TestDetectModelType:
         config = {
             "model_type": "cohere2_moe",
             "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_unlimited_ocr_as_vlm(self, tmp_path):
+        """baidu/Unlimited-OCR is served by mlx-vlm (dashed model_type)."""
+        config = {
+            "model_type": "unlimited-ocr",
+            "architectures": ["UnlimitedOCRForCausalLM"],
+            "vision_config": {"model_type": "vision"},
+            "language_config": {"model_type": "deepseek_v2"},
+            "projector_config": {"model_type": "mlp_projector"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_inkling_as_vlm(self, tmp_path):
+        """Inkling Small (thinkingmachines) is served by mlx-vlm."""
+        config = {
+            "model_type": "inkling_mm_model",
+            "architectures": ["InklingForConditionalGeneration"],
+            "vision_config": {"patch_size": 40},
+            "audio_config": {"n_mel_bins": 80},
+            "text_config": {"hidden_size": 4096},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_muse_glimmer_as_vlm(self, tmp_path):
+        """Meta Muse Glimmer 30B is served by mlx-vlm."""
+        config = {
+            "model_type": "muse_glimmer",
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "vision_config": {"model_type": "muse_glimmer_vision"},
+            "text_config": {"model_type": "muse_glimmer_text"},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
@@ -346,6 +503,49 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_qwen3_5_moe_with_empty_vision_stub_as_llm(self, tmp_path):
+        """Vision-stripped quant keeping an empty ``vision_config: {}`` stub is LLM (#2385)."""
+        config = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": {"hidden_size": 4096},
+            "vision_config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_with_empty_vision_stub_as_llm(self, tmp_path):
+        """Dense qwen3_5 is not in VLM_MODEL_TYPES — an empty stub must not trip the catch-all."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+            "vision_config": {},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_stripped_as_llm(self, tmp_path):
+        """Vision-stripped dense qwen3_5 (no vision keys at all) stays LLM."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_dense_qwen3_5_with_real_vision_as_vlm(self, tmp_path):
+        """Unified dense qwen3_5 with a populated vision_config classifies as VLM."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {"hidden_size": 1024},
+            "vision_config": {"depth": 24, "hidden_size": 1152},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
@@ -623,6 +823,321 @@ class TestDiscoverModels:
         assert "llama-3b" in models
         assert models["llama-3b"].model_type == "llm"
         assert models["llama-3b"].engine_type == "batched"
+
+    def test_register_model_skips_duplicate_id(self, tmp_path, caplog):
+        """Collision guard: a second model with an already-registered model_id is
+        skipped (first registration kept), not silently overwritten, and the
+        collision is logged naming both the kept and the skipped path."""
+        # A real, registerable model dir — without the guard this WOULD overwrite.
+        second = tmp_path / "dup"
+        second.mkdir()
+        (second / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (second / "model.safetensors").write_bytes(b"0" * 1000)
+
+        original = DiscoveredModel(
+            model_id="dup",
+            model_path="/first/dup",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=123,
+        )
+        models = {"dup": original}
+        with caplog.at_level(logging.WARNING):
+            _register_model(models, second, "dup")
+
+        # Guard kept the first registration rather than overwriting it.
+        assert models["dup"] is original
+        assert models["dup"].model_path == "/first/dup"
+        # ...and surfaced the collision, naming both the kept and the skipped path.
+        assert "Duplicate model_id 'dup'" in caplog.text
+        assert "/first/dup" in caplog.text
+        assert str(second) in caplog.text
+
+    def test_discover_skips_incomplete_download_with_index(self, tmp_path, caplog):
+        """A partially downloaded sharded model (index present, shard missing)
+        is excluded from discovery, with a warning naming the missing shard."""
+        model_dir = tmp_path / "big-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'big-model'" in caplog.text
+        assert "model-00002-of-00002.safetensors" in caplog.text
+
+    def test_discover_skips_incomplete_download_without_index(self, tmp_path, caplog):
+        """Interrupted before the index file itself landed (upstream issue 459's
+        actual on-disk shape): only the shard filename numbering promises 14
+        shards; one is on disk."""
+        model_dir = tmp_path / "big-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model-00004-of-00014.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'big-model'" in caplog.text
+        assert "13 weight shard(s)" in caplog.text
+
+    def test_discover_complete_sharded_model_with_index(self, tmp_path, caplog):
+        """All shards referenced by the index are on disk — registers normally,
+        and an extra safetensors file the index does not reference (e.g. an oQ
+        model-mtp.safetensors) does not confuse the check."""
+        model_dir = tmp_path / "sharded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-mtp.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "sharded" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_missing_indexed_auxiliary_sidecar_registers(
+        self, tmp_path, caplog
+    ):
+        """A complete core shard set remains discoverable when an indexed
+        non-shard sidecar was intentionally omitted by mlx-lm's HF filter
+        (#2742, mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit)."""
+        model_dir = tmp_path / "optiq-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+                "vision.a": "optiq/optiq_vision.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert "optiq-model" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_auxiliary_only_index_still_checks_numbered_files(
+        self, tmp_path, caplog
+    ):
+        """An index without numbered references still falls back to the
+        filenames on disk, so an actual numbered shard gap remains hidden."""
+        model_dir = tmp_path / "gapped-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "vision.a": "optiq/optiq_vision.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'gapped-model'" in caplog.text
+        assert "model-00002-of-00002.safetensors" in caplog.text
+
+    def test_discover_stale_index_complete_other_shards_registers(
+        self, tmp_path, caplog
+    ):
+        """A repo shipping an index left over from a DIFFERENT sharding (none
+        of its referenced files exist) over a complete on-disk shard set is
+        stale-index, not incomplete-download: register, warn (real case:
+        mlx-community/Qwen3-Embedding-8B-mxfp8, 4-shard index over 2 shards)."""
+        model_dir = tmp_path / "stale-index"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                f"layer.{i}": f"model-0000{i}-of-00004.safetensors"
+                for i in range(1, 5)
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert "stale-index" in models
+        assert "stale" in caplog.text
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_stale_index_no_weights_skips(self, tmp_path, caplog):
+        """config.json + index landed first, zero shards on disk (interrupted
+        before the first shard finished): still skipped as incomplete."""
+        model_dir = tmp_path / "no-weights"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "model-00001-of-00002.safetensors",
+                "layer.b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'no-weights'" in caplog.text
+
+    def test_discover_stale_index_partial_other_shards_skips(
+        self, tmp_path, caplog
+    ):
+        """Stale index AND the differently-numbered on-disk set has its own
+        gap: skip, reporting against the shards actually present."""
+        model_dir = tmp_path / "stale-partial"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                f"layer.{i}": f"model-0000{i}-of-00004.safetensors"
+                for i in range(1, 5)
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert models == {}
+        assert "incomplete model 'stale-partial'" in caplog.text
+        assert "model-00002-of-00002.safetensors" in caplog.text
+
+    def test_discover_complete_sharded_model_without_index(self, tmp_path, caplog):
+        """A full 1..N shard set with no index file registers normally."""
+        model_dir = tmp_path / "sharded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        for i in (1, 2, 3):
+            (model_dir / f"model-0000{i}-of-00003.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "sharded" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_index_with_subpath_weight_map_values(self, tmp_path):
+        """weight_map values are resolved against the model directory (the HF
+        index convention), so ./-prefixed or subfolder entries are not
+        misreported as missing."""
+        model_dir = tmp_path / "subpath"
+        model_dir.mkdir()
+        (model_dir / "weights").mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        index = {
+            "weight_map": {
+                "layer.a": "./model-00001-of-00002.safetensors",
+                "layer.b": "weights/model-00002-of-00002.safetensors",
+            }
+        }
+        (model_dir / "model.safetensors.index.json").write_text(json.dumps(index))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "weights" / "model-00002-of-00002.safetensors").write_bytes(
+            b"0" * 1000
+        )
+
+        models = discover_models(tmp_path)
+        assert "subpath" in models
+
+    def test_discover_corrupt_index_falls_back_to_shard_numbering(
+        self, tmp_path, caplog
+    ):
+        """An unreadable index (here non-UTF-8 bytes, the UnicodeDecodeError
+        trap) must not crash discovery into the generic 'Failed to discover'
+        path: the filename-numbering fallback still separates a complete set
+        from a gapped one."""
+        ok = tmp_path / "ok-model"
+        ok.mkdir()
+        (ok / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (ok / "model.safetensors.index.json").write_bytes(b"\x80\x81 not json")
+        (ok / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (ok / "model-00002-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        gapped = tmp_path / "gapped-model"
+        gapped.mkdir()
+        (gapped / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (gapped / "model.safetensors.index.json").write_bytes(b"\x80\x81 not json")
+        (gapped / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+
+        assert "ok-model" in models
+        assert "gapped-model" not in models
+        assert "incomplete model 'gapped-model'" in caplog.text
+        assert "Failed to discover" not in caplog.text
+
+    def test_discover_zero_based_shard_numbering_registers(self, tmp_path, caplog):
+        """A complete 0-based shard set (non-HF numbering variant) is not a
+        false positive."""
+        model_dir = tmp_path / "zero-based"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        for i in (0, 1, 2):
+            (model_dir / f"model-0000{i}-of-00003.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert "zero-based" in models
+        assert "incomplete model" not in caplog.text
+
+    def test_discover_duplicate_padding_cannot_mask_a_gap(self, tmp_path, caplog):
+        """Two spellings of the same shard index don't add up to a complete
+        set: distinct indices are counted, not filenames."""
+        model_dir = tmp_path / "padded"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model-0001-of-00002.safetensors").write_bytes(b"0" * 1000)
+
+        with caplog.at_level(logging.WARNING):
+            models = discover_models(tmp_path)
+        assert models == {}
+        assert "incomplete model 'padded'" in caplog.text
+
+    def test_discover_subdirectory_weights_not_flagged(self, tmp_path):
+        """Weights living only in a subdirectory (estimate_model_size's
+        **/*.safetensors fallback layout) make no top-level shard promises and
+        register normally."""
+        model_dir = tmp_path / "nested"
+        model_dir.mkdir()
+        (model_dir / "weights").mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "weights" / "part.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert "nested" in models
 
     def test_discover_model_dir_is_itself_a_model(self, tmp_path):
         """Test that pointing directly at a model directory works."""
@@ -1380,6 +1895,17 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_hf_cache_bad_helper_schema_is_skipped(self, tmp_path):
+        """A malformed helper-looking schema must not abort HF cache discovery."""
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "acme", "BadSchema")
+        (snapshot / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": 123})
+        )
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert models == {}
+
     def test_hf_cache_mlx_metadata_is_discovered(self, tmp_path):
         """HF cache entries with safetensors format=mlx metadata are discovered."""
         np = pytest.importorskip("numpy")
@@ -1397,6 +1923,86 @@ class TestHfCacheDiscovery:
         assert len(models) == 1
         assert "acme--PlainModel" in models
         assert models["acme--PlainModel"].source_repo_id == "acme/PlainModel"
+
+    def test_hf_cache_dflash_draft_is_discovered(self, tmp_path):
+        """HF cache DFlash draft checkpoints are discovered despite pt-format
+        safetensors and a repo name with no 'mlx' token (#1643)."""
+        np = pytest.importorskip("numpy")
+        safetensors_numpy = pytest.importorskip("safetensors.numpy")
+
+        entry, snapshot = self._make_hf_cache_entry(
+            tmp_path, "z-lab", "Qwen3.6-27B-DFlash"
+        )
+        (snapshot / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3",
+                    "architectures": ["DFlashDraftModel"],
+                    "dflash_config": {},
+                }
+            )
+        )
+        # pt-format safetensors (NOT mlx) so only the DFlash architecture — not
+        # safetensors metadata or the repo name — can qualify this entry.
+        safetensors_numpy.save_file(
+            {"weight": np.zeros((1,), dtype=np.float32)},
+            snapshot / "model.safetensors",
+            metadata={"format": "pt"},
+        )
+
+        models = discover_models(tmp_path)
+        assert "z-lab--Qwen3.6-27B-DFlash" in models
+        # The shared DiscoveredModel construction path must flag the draft as
+        # a helper so it lands in the draft picker, not the chat-model list.
+        assert models["z-lab--Qwen3.6-27B-DFlash"].is_helper is True
+
+    def test_is_helper_checkpoint_on_disk_edge_cases(self, tmp_path):
+        """The on-disk wrapper qualifies a drafter config and never raises on
+        unreadable entries (it runs outside discover_models' per-model guard).
+
+        Marker-family coverage lives in TestIsHelperModelConfig; this pins
+        only the wrapper's own file-handling behavior.
+        """
+        draft = tmp_path / "draft"
+        draft.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["DFlashDraftModel"]})
+        )
+        assert _is_helper_checkpoint(draft) is True
+
+        # plain (non-draft) model config stays excluded
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "config.json").write_text(
+            json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]})
+        )
+        assert _is_helper_checkpoint(plain) is False
+
+        # no config.json at all
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert _is_helper_checkpoint(empty) is False
+
+        # malformed JSON must not raise
+        bad_json = tmp_path / "bad-json"
+        bad_json.mkdir()
+        (bad_json / "config.json").write_text("{not json")
+        assert _is_helper_checkpoint(bad_json) is False
+
+        # non-UTF-8 bytes must not raise: UnicodeDecodeError is a ValueError,
+        # not a JSONDecodeError, and an escape here aborts the whole scan
+        bad_bytes = tmp_path / "bad-bytes"
+        bad_bytes.mkdir()
+        (bad_bytes / "config.json").write_bytes(b'\xff\xfe{"a": 1}')
+        assert _is_helper_checkpoint(bad_bytes) is False
+
+        # valid JSON with an unexpected schema must not raise either
+        bad_schema = tmp_path / "bad-schema"
+        bad_schema.mkdir()
+        (bad_schema / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": 123})
+        )
+        assert _is_helper_checkpoint(bad_schema) is False
 
     def test_mixed_flat_and_hf_cache(self, tmp_path):
         """Mix of flat models and HF cache entries."""
@@ -1425,3 +2031,71 @@ class TestHfCacheDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 1
         assert "mlx-community--Qwen3-8B-4bit" in models
+
+
+class TestTextOnlySizeEstimation:
+    """Language-only size estimate for VLM-shaped checkpoints (#2385).
+
+    Serving such a checkpoint via the text engine (force_lm or a
+    model_type_override) drops the vision tower, so admission by the full
+    file size over-charges by the vision weights."""
+
+    _TENSORS = {
+        "language_model.layers.0.w": ("F16", [1000, 256]),  # 512000 bytes
+        "model.visual.blocks.0.w": ("F16", [100, 256]),  # 51200 bytes
+        "vision_tower.patch.w": ("F16", [10, 256]),  # 5120 bytes
+    }
+
+    def test_vision_weight_bytes_from_headers(self, tmp_path):
+        _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)
+        assert _vision_weight_bytes(tmp_path) == 51200 + 5120
+
+    def test_text_only_estimate_subtracts_vision(self, tmp_path):
+        _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)
+        full = estimate_model_size(tmp_path)
+        text_only = estimate_text_only_model_size(tmp_path)
+        assert text_only == full - int((51200 + 5120) * 1.05)
+        assert 0 < text_only < full
+
+    def test_no_vision_weights_returns_zero(self, tmp_path):
+        _write_safetensors(
+            tmp_path / "model.safetensors",
+            {"language_model.layers.0.w": ("F16", [1000, 256])},
+        )
+        assert estimate_text_only_model_size(tmp_path) == 0
+
+    def test_corrupt_shard_returns_zero(self, tmp_path):
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1024)
+        assert estimate_text_only_model_size(tmp_path) == 0
+
+    def test_discovery_populates_text_only_size_for_vlm(self, tmp_path):
+        model = tmp_path / "qwen-vlm"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5_moe",
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "vision_config": {"depth": 2, "hidden_size": 64},
+                    "text_config": {"hidden_size": 64},
+                }
+            )
+        )
+        _write_safetensors(model / "model.safetensors", self._TENSORS)
+
+        models = discover_models(tmp_path)
+        entry = models["qwen-vlm"]
+        assert entry.model_type == "vlm"
+        assert 0 < entry.text_only_size < entry.estimated_size
+
+    def test_discovery_skips_text_only_size_for_llm(self, tmp_path):
+        model = tmp_path / "plain-llm"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        _write_safetensors(
+            model / "model.safetensors",
+            {"model.layers.0.w": ("F16", [1000, 256])},
+        )
+
+        models = discover_models(tmp_path)
+        assert models["plain-llm"].text_only_size == 0

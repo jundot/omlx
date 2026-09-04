@@ -19,7 +19,7 @@ struct CodeChip: View {
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                Image(systemName: copied ? "checkmark" : "document.on.document")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(copied ? theme.successText : theme.textSecondary)
                     .animation(.easeOut(duration: 0.12), value: copied)
@@ -47,19 +47,16 @@ struct CodeChip: View {
 
 struct CopyIconButton: View {
     let value: String
+    var helpText = String(localized: "common.copy_model_id",
+                          defaultValue: "Copy model ID",
+                          comment: "Tooltip and accessibility label for a button that copies a model identifier")
 
     @Environment(\.omlxTheme) private var theme
     @State private var copied = false
 
-    private var helpText: String {
-        String(localized: "common.copy_model_id",
-               defaultValue: "Copy model ID",
-               comment: "Tooltip and accessibility label for a button that copies a model identifier")
-    }
-
     var body: some View {
         Button(action: copy) {
-            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+            Image(systemName: copied ? "checkmark" : "document.on.document")
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(copied ? theme.successText : theme.textSecondary)
                 .frame(width: 22, height: 22)

@@ -18,8 +18,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.engine_core import AsyncEngineCore, EngineConfig, EngineCore
-from omlx.exceptions import PrefillMemoryExceededError
+from omlx.engine_core import (
+    AsyncEngineCore,
+    EngineConfig,
+    EngineCore,
+    _raise_request_output_error,
+)
+from omlx.exceptions import PrefillMemoryAbortedError, PrefillMemoryExceededError
+from omlx.output_collector import RequestOutputCollector
 from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig, SchedulerOutput
 
@@ -354,6 +360,39 @@ class TestEngineCoreAddRequest:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_add_request_cleans_up_if_scheduler_insert_fails(
+        self, mock_model, mock_tokenizer
+    ):
+        """If the scheduler insert fails/cancels after the collector is created,
+        add_request must drop the tracking (and abort) so no phantom collector
+        leaks that the reaper can't see — it was never stamped finished
+        (#1154). BaseException in the guard also covers the real
+        trigger: CancelledError when a client disconnects before streaming."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.add_request = MagicMock(
+                    side_effect=RuntimeError("insert boom")
+                )
+                engine.scheduler.abort_request = MagicMock(return_value=True)
+
+                with pytest.raises(RuntimeError):
+                    await engine.add_request(prompt="Hello")
+
+                # No phantom tracking left behind for any request.
+                assert engine._output_collectors == {}
+                assert engine._stream_states == {}
+                assert engine._finished_events == {}
+                assert engine._finished_at == {}
+                # The partial scheduler insert was aborted (idempotent).
+                engine.scheduler.abort_request.assert_called_once()
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_add_request_with_default_sampling_params(
         self, mock_model, mock_tokenizer
     ):
@@ -634,36 +673,6 @@ class TestEngineCoreClose:
 
             future.result.assert_called_once_with(timeout=60.0)
             assert "Engine teardown timed out after 60s" in fatal.call_args.args[0]
-
-    def test_close_fatal_exits_when_compile_cache_clear_times_out(
-        self, mock_model, mock_tokenizer
-    ):
-        """A stuck MLX compile-cache clear is also fatal."""
-        with patch("omlx.engine_core.get_registry") as mock_registry:
-            mock_registry.return_value.acquire.return_value = True
-
-            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
-            engine._mlx_executor.shutdown(wait=False)
-
-            ok_future = MagicMock()
-            ok_future.result.return_value = None
-            timeout_future = MagicMock()
-            timeout_future.result.side_effect = concurrent.futures.TimeoutError
-            executor = MagicMock()
-            executor.submit.side_effect = [ok_future, ok_future, timeout_future]
-            engine._mlx_executor = executor
-
-            with (
-                patch(
-                    "omlx.engine_core.compile_cache_clear_available", return_value=True
-                ),
-                patch("omlx.engine_core.fatal_exit", side_effect=SystemExit) as fatal,
-                pytest.raises(SystemExit),
-            ):
-                engine.close()
-
-            timeout_future.result.assert_called_once_with(timeout=60.0)
-            assert "MLX compile cache" in fatal.call_args.args[0]
 
 
 class TestEngineCoreGetCacheStats:
@@ -1163,6 +1172,136 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_abort_all_requests_skips_requests_already_aborted(
+        self, mock_model, mock_tokenizer
+    ):
+        """Repeated bulk aborts do not report progress or duplicate errors."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                request_id = await engine.add_request(prompt="Hello")
+
+                first_count = await engine.abort_all_requests()
+                second_count = await engine.abort_all_requests()
+
+                assert (first_count, second_count) == (1, 0)
+                collector = engine._output_collectors[request_id]
+                output = collector.get_nowait()
+                assert output is not None
+                assert output.new_text.count("[Error:") == 1
+                assert collector.get_nowait() is None
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_uses_explicit_unload_reason(
+        self, mock_model, mock_tokenizer
+    ):
+        """Manual unload must not report a fake memory-pressure failure."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                request_id = await engine.add_request(prompt="Hello")
+
+                count = await engine.abort_all_requests(
+                    reason="Request aborted because the model is being unloaded",
+                    error_code="model_unloading",
+                )
+
+                assert count == 1
+                output = engine._output_collectors[request_id].get_nowait()
+                assert output.error == (
+                    "Request aborted because the model is being unloaded"
+                )
+                assert output.error_code == "model_unloading"
+                assert output.error_metadata == {
+                    "request_id": request_id,
+                    "limit_bytes": None,
+                }
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_names_tripped_watermark(
+        self, mock_model, mock_tokenizer
+    ):
+        """The abort message names the hard watermark that tripped, not just
+        the ceiling above it (issue #2321)."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                engine.scheduler._memory_hard_limit_bytes = 30 * 1024**3
+                engine.scheduler._memory_hard_watermark_bytes = int(
+                    30 * 1024**3 * 0.95
+                )
+
+                rid = await engine.add_request(prompt="Hello")
+                await engine.abort_all_requests()
+
+                collector = engine._output_collectors.get(rid)
+                assert collector is not None
+                output = collector.get_nowait()
+                assert "abort threshold (hard watermark) 28.5 GB" in output.error
+                assert "ceiling 30.0 GB" in output.error
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_names_binding_ceiling(
+        self, mock_model, mock_tokenizer
+    ):
+        """A user already on the most permissive tier needs to know which
+        ceiling aborted them; generic "loosen memory_guard_tier" advice
+        leaves them with nothing to turn (#2362)."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                sched = engine.scheduler
+                sched._memory_hard_limit_bytes = 30 * 1024**3
+                sched._memory_hard_watermark_bytes = int(30 * 1024**3 * 0.95)
+                # Metal cap is the smallest of the three: only the kernel
+                # sysctl can move this abort.
+                sched._memory_static_ceiling_bytes = 120 * 1024**3
+                sched._memory_dynamic_ceiling_bytes = 64 * 1024**3
+                sched._memory_metal_cap_bytes = 30 * 1024**3
+                sched._memory_guard_tier = "aggressive"
+
+                rid = await engine.add_request(prompt="Hello")
+                await engine.abort_all_requests()
+
+                collector = engine._output_collectors.get(rid)
+                assert collector is not None
+                output = collector.get_nowait()
+                assert "metal_cap ceiling 30.0 GB" in output.error
+                assert "iogpu.wired_limit_mb" in output.error
+                assert "lower memory_guard_tier" not in output.error
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_abort_all_requests_empty(self, mock_model, mock_tokenizer):
         """Test abort_all_requests() with no active requests returns 0."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
@@ -1208,6 +1347,23 @@ class TestEngineCoreAbortAllRequests:
 
 class TestGlobalMLXExecutor:
     """Tests for the global MLX executor singleton (issue #85)."""
+
+    def test_shutdown_reclaims_on_worker_before_executor_exit(self):
+        import omlx.engine_core as engine_core
+
+        executor = MagicMock()
+        future = MagicMock()
+        executor.submit.return_value = future
+
+        with patch.object(engine_core, "_global_mlx_executor", executor):
+            engine_core.shutdown_mlx_executor()
+            assert engine_core._global_mlx_executor is None
+
+        executor.submit.assert_called_once_with(
+            engine_core._final_global_mlx_thread_reclaim
+        )
+        future.result.assert_called_once_with(timeout=60.0)
+        executor.shutdown.assert_called_once_with(wait=False)
 
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""
@@ -1581,3 +1737,197 @@ class TestStepBurst:
             assert len(outs) == 1
         finally:
             engine.close()
+
+
+class TestOrphanedCollectorReaping:
+    """Reaping of output collectors orphaned by a client disconnect (#1154).
+
+    When a client disconnects mid-stream the SSE generator chain is abandoned
+    rather than closed, so stream_outputs()'s cleanup finally only runs at GC
+    time and the collector lingers in _output_collectors — the dashboard then
+    shows the request as "Generating" indefinitely. _reap_orphaned_collectors()
+    drops such orphans after a grace period.
+    """
+
+    def test_reaps_only_stale_finished_collectors(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                now = 1000.0
+
+                # orphan: finished long ago, consumer never cleaned up.
+                orphan = RequestOutputCollector()
+                orphan.put(
+                    RequestOutput(
+                        request_id="orphan",
+                        finished=True,
+                        finish_reason="abort",
+                        new_text="partial",
+                    )
+                )
+                engine._output_collectors["orphan"] = orphan
+                engine._finished_events["orphan"] = asyncio.Event()
+                engine._finished_at["orphan"] = now - 100.0
+
+                # fresh: just finished, still within grace (consumer may drain).
+                engine._output_collectors["fresh"] = RequestOutputCollector()
+                engine._finished_events["fresh"] = asyncio.Event()
+                engine._finished_at["fresh"] = now - 1.0
+
+                # active: still generating, never marked finished.
+                engine._output_collectors["active"] = RequestOutputCollector()
+                engine._finished_events["active"] = asyncio.Event()
+
+                reaped = engine._reap_orphaned_collectors(now=now, grace=5.0)
+
+                assert reaped == 1
+                # stale orphan dropped from every tracking dict
+                assert "orphan" not in engine._output_collectors
+                assert "orphan" not in engine._finished_events
+                assert "orphan" not in engine._finished_at
+                # within-grace and still-active requests are retained
+                assert "fresh" in engine._output_collectors
+                assert "active" in engine._output_collectors
+                # pop-only: a consumer still holding the orphan reference keeps
+                # its buffered output — the reaper must NOT clear() it.
+                assert orphan.output is not None
+                assert orphan.output.new_text == "partial"
+            finally:
+                engine.close()
+
+    def test_mark_request_finished_stamps_once_and_signals(
+        self, mock_model, mock_tokenizer
+    ):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                event = asyncio.Event()
+                engine._finished_events["r1"] = event
+
+                engine._mark_request_finished("r1")
+                assert event.is_set()
+                assert "r1" in engine._finished_at
+                first = engine._finished_at["r1"]
+
+                # setdefault semantics: a repeated signal must not reset the
+                # grace clock (otherwise an orphan could never age out).
+                engine._mark_request_finished("r1")
+                assert engine._finished_at["r1"] == first
+            finally:
+                engine.close()
+
+    def test_cleanup_request_removes_finished_stamp(self, mock_model, mock_tokenizer):
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                engine._output_collectors["r1"] = RequestOutputCollector()
+                engine._finished_events["r1"] = asyncio.Event()
+                engine._finished_at["r1"] = 123.0
+
+                engine._cleanup_request("r1")
+
+                # normal consumer cleanup also clears the finish stamp so the
+                # reaper never revisits a request the consumer already handled.
+                assert "r1" not in engine._finished_at
+                assert "r1" not in engine._output_collectors
+            finally:
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_generate_drains_via_held_reference_if_reaped(
+        self, mock_model, mock_tokenizer
+    ):
+        """generate() captures the collector BEFORE awaiting, so the pop-only
+        reaper removing the dict entry once the request finishes cannot lose a
+        completed result when generate() is slow to resume under load (#1154).
+        Without the early capture, the post-await re-fetch would return None and
+        raise — the streaming path was already safe; this extends it to generate().
+        """
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+
+                task = asyncio.create_task(
+                    engine.generate(
+                        prompt="Hello",
+                        sampling_params=SamplingParams(max_tokens=5),
+                    )
+                )
+                # Let generate() add the request and capture the collector
+                # reference (it captures before awaiting the finished event).
+                await asyncio.sleep(0.05)
+                request_id = list(engine._output_collectors.keys())[0]
+                collector = engine._output_collectors[request_id]
+
+                # Deliver the completed result, then simulate the reaper popping
+                # the dict entry BEFORE generate() resumes to drain it.
+                collector.put(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="stop",
+                        new_text="done",
+                    )
+                )
+                engine._output_collectors.pop(request_id)
+                engine._finished_events[request_id].set()
+
+                result = await task
+                assert result is not None
+                assert result.new_text == "done"
+            finally:
+                await engine.stop()
+                engine.close()
+
+
+class TestMemoryAbortErrorSurface:
+    """The mid-prefill memory abort must surface like the pre-flight guard.
+
+    The enforcer's abort output used to carry only ``error``, so
+    ``_raise_request_output_error`` fell through to a bare RuntimeError.
+    Nothing upstream recognized it as a memory rejection: the JSON keepalive
+    wrapper (which already handles PrefillMemoryExceededError) let it escape,
+    the response generator died mid-body, and the client saw a truncated read
+    plus a 500 traceback instead of the actionable 400 the pre-flight path
+    returns for the same condition.
+    """
+
+    def _abort_output(self, **overrides):
+        payload = dict(
+            request_id="req-abort",
+            finished=True,
+            finish_reason="error",
+            error=(
+                "Request aborted: process memory limit exceeded (usage 4.4 GB, "
+                "abort threshold (hard watermark) 4.1 GB, dynamic ceiling 4.3 GB)."
+            ),
+            error_code="prefill_memory_aborted",
+            error_metadata={"request_id": "req-abort", "limit_bytes": 4_100_000_000},
+        )
+        payload.update(overrides)
+        return RequestOutput(**payload)
+
+    def test_abort_code_raises_typed_error(self):
+        with pytest.raises(PrefillMemoryAbortedError) as exc:
+            _raise_request_output_error(self._abort_output())
+        assert exc.value.request_id == "req-abort"
+        assert exc.value.limit_bytes == 4_100_000_000
+
+    def test_abort_error_keeps_the_400_mapping(self):
+        """Subclassing is what routes it to the existing handler / keepalive
+        catch, so the relationship is part of the contract, not an accident."""
+        with pytest.raises(PrefillMemoryExceededError):
+            _raise_request_output_error(self._abort_output())
+
+    def test_uncoded_error_still_raises_runtime_error(self):
+        with pytest.raises(RuntimeError) as exc:
+            _raise_request_output_error(
+                self._abort_output(error_code=None, error_metadata=None)
+            )
+        assert not isinstance(exc.value, PrefillMemoryExceededError)

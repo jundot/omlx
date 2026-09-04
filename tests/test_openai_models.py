@@ -530,6 +530,32 @@ class TestChatCompletionRequest:
         )
         assert req.guided_grammar == 'root ::= "YES"'
 
+    def test_reasoning_effort_accepted(self):
+        req = ChatCompletionRequest(
+            model="Qwen3.8-27B",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort="xhigh",
+        )
+
+        assert req.reasoning_effort == "xhigh"
+
+    def test_reasoning_effort_accepts_numbers(self):
+        """Numeric effort (Inkling 0.1-0.99) must survive validation as-is."""
+        req_float = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=0.9,
+        )
+        assert req_float.reasoning_effort == 0.9
+        assert isinstance(req_float.reasoning_effort, float)
+
+        req_int = ChatCompletionRequest(
+            model="Inkling-Small",
+            messages=[Message(role="user", content="Hello")],
+            reasoning_effort=1,
+        )
+        assert req_int.reasoning_effort == 1
+
 
 class TestChatCompletionResponse:
     """Tests for ChatCompletionResponse model."""
@@ -689,6 +715,43 @@ class TestChatCompletionChunk:
 
 class TestCompletionModels:
     """Tests for text completion models."""
+
+    def test_repetition_context_size_defaults_to_none(self):
+        """The penalty window rides along only when a client sends it."""
+        chat = ChatCompletionRequest.model_validate(
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        completion = CompletionRequest(model="m", prompt="hello")
+        assert chat.repetition_context_size is None
+        assert completion.repetition_context_size is None
+
+    def test_repetition_context_size_is_kept_and_validated(self):
+        chat = ChatCompletionRequest.model_validate(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "repetition_context_size": 128,
+            }
+        )
+        assert chat.repetition_context_size == 128
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "repetition_context_size": 0,
+                }
+            )
+
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate(
+                {
+                    "model": "m",
+                    "prompt": "hello",
+                    "repetition_context_size": 0,
+                }
+            )
 
     def test_completion_request(self):
         """Test creating completion request."""

@@ -7,7 +7,10 @@ import sys
 
 import pytest
 
-from omlx.utils.proc_memory import get_phys_footprint
+from omlx.utils.proc_memory import (
+    get_lifetime_max_phys_footprint,
+    get_phys_footprint,
+)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin-only API")
@@ -56,3 +59,28 @@ class TestGetPhysFootprintFallback:
         monkeypatch.setattr("omlx.utils.proc_memory._proc_pid_rusage", None)
         assert get_phys_footprint() == 0
         assert get_phys_footprint(pid=12345) == 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin-only API")
+class TestLifetimeMaxPhysFootprintDarwin:
+    def test_returns_positive_for_current_process(self):
+        assert get_lifetime_max_phys_footprint() > 0
+
+    def test_is_at_least_current_footprint(self):
+        # It is a high-water mark, so it can never sit below the live value.
+        assert get_lifetime_max_phys_footprint() >= get_phys_footprint()
+
+    def test_invalid_pid_returns_zero(self):
+        assert get_lifetime_max_phys_footprint(pid=0) == 0
+
+    def test_nonexistent_pid_returns_zero(self):
+        assert get_lifetime_max_phys_footprint(pid=999999) == 0
+
+    def test_returns_int(self):
+        assert isinstance(get_lifetime_max_phys_footprint(), int)
+
+
+class TestLifetimeMaxPhysFootprintFallback:
+    def test_returns_zero_when_libproc_unavailable(self, monkeypatch):
+        monkeypatch.setattr("omlx.utils.proc_memory._proc_pid_rusage", None)
+        assert get_lifetime_max_phys_footprint() == 0

@@ -28,6 +28,14 @@
                         class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
                         {{ t('navbar.dropdown.accuracy') }}
                     </button>
+                    <button
+                        @click="setBenchTab('context')"
+                        :class="benchTab === 'context'
+                            ? 'bg-neutral-900 text-white'
+                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                        {{ t('navbar.dropdown.context') }}
+                    </button>
                 </div>
 
                 <!-- Throughput tab -->
@@ -42,7 +50,7 @@
                             </div>
                             <a x-show="benchDeviceInfo?.owner_hash"
                                x-cloak
-                               :href="'https://omlx.ai/my/' + benchDeviceInfo.owner_hash"
+                               :href="'https://omlx.ai/my/' + benchDeviceInfo?.owner_hash"
                                target="_blank"
                                class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-900 transition-all">
                                 <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
@@ -93,13 +101,28 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.model') }}</label>
                                 <select x-model="benchModelId"
-                                        :disabled="benchRunning"
+                                        :disabled="benchRunning || benchExternalEnabled"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
                                         <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
                                     </template>
                                 </select>
+                            </div>
+
+                            <!-- Context Profile -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.context_profile') }}</label>
+                                <select x-model="benchContextProfile"
+                                        :disabled="benchRunning"
+                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                    <option value="code_python">{{ t('bench.config.context.code_python') }}</option>
+                                    <option value="code_mixed">{{ t('bench.config.context.code_mixed') }}</option>
+                                    <option value="novel_ko">{{ t('bench.config.context.novel_ko') }}</option>
+                                    <option value="novel_en">{{ t('bench.config.context.novel_en') }}</option>
+                                    <option value="novel_ja">{{ t('bench.config.context.novel_ja') }}</option>
+                                </select>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.context_hint') }}</p>
                             </div>
 
                             <!-- Single Request Config -->
@@ -117,6 +140,16 @@
                                     </template>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('bench.config.generation_hint') }}</p>
+                                <label class="inline-flex items-start gap-2 cursor-pointer mt-3">
+                                    <input type="checkbox"
+                                           x-model="benchAlignPromptToAne"
+                                           :disabled="benchRunning"
+                                           class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                    <span>
+                                        <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.ane_aligned_prompt') }}</span>
+                                        <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.ane_aligned_prompt_hint') }}</span>
+                                    </span>
+                                </label>
                             </div>
 
                             <!-- Batch Config -->
@@ -149,17 +182,59 @@
                                        class="w-4 h-4 text-neutral-400 transition-transform"
                                        :class="benchAdvancedOptionsOpen && 'rotate-180'"></i>
                                 </button>
-                                <div x-show="benchAdvancedOptionsOpen" x-collapse x-cloak class="mt-3">
+                                <div x-show="benchAdvancedOptionsOpen" x-cloak class="mt-3 space-y-3">
                                     <label class="inline-flex items-start gap-2 cursor-pointer">
                                         <input type="checkbox"
                                                x-model="benchForceLmEngine"
-                                               :disabled="benchRunning"
+                                               :disabled="benchRunning || benchExternalEnabled"
                                                class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                         <span>
                                             <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.force_lm_engine') }}</span>
                                             <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.force_lm_engine_hint') }}</span>
                                         </span>
                                     </label>
+                                    <!-- External OpenAI-compatible endpoint -->
+                                    <div>
+                                        <label class="inline-flex items-start gap-2 cursor-pointer">
+                                            <input type="checkbox"
+                                                   x-model="benchExternalEnabled"
+                                                   :disabled="benchRunning"
+                                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
+                                            <span>
+                                                <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.external') }}</span>
+                                                <span class="block text-xs text-neutral-400 mt-1">{{ t('bench.config.external_hint') }}</span>
+                                            </span>
+                                        </label>
+                                        <div x-show="benchExternalEnabled" x-cloak class="mt-3 space-y-3 pl-6">
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_base_url') }}</label>
+                                                <input type="url"
+                                                       x-model="externalBaseUrl"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       placeholder="https://api.openai.com/v1"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_api_key') }}</label>
+                                                <input type="password"
+                                                       autocomplete="off"
+                                                       x-model="externalApiKey"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-600 mb-1">{{ t('bench.config.external_model') }}</label>
+                                                <input type="text"
+                                                       x-model="externalModel"
+                                                       @change="saveExternalEndpoint()"
+                                                       :disabled="benchRunning"
+                                                       placeholder="gpt-4o-mini"
+                                                       class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
 
@@ -167,7 +242,7 @@
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
                                         @click="startBenchmark()"
-                                        :disabled="!benchModelId || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
+                                        :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
                                         :title="benchOtherActive ? 'Another throughput benchmark is already running in this server.' : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
@@ -237,13 +312,13 @@
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <template x-for="r in benchSingleResults" :key="r.pp">
+                                    <template x-for="r in benchSingleResults" :key="benchRequestedPp(r)">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
-                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 font-medium text-neutral-900" x-text="benchSingleTestLabel(r)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.ttft_ms, 1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.tpot_ms, 2)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.processing_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.gen_tps, 1, ' tok/s')"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
@@ -261,7 +336,7 @@
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.results.batch.section_label') }}</span>
                             </div>
-                            <span class="text-xs text-neutral-400">{{ t('bench.results.batch.subtitle') }}</span>
+                            <span class="text-xs text-neutral-400" x-text="benchBatchPromptSummary()"></span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-sm">
@@ -278,23 +353,23 @@
                                 </thead>
                                 <tbody>
                                     <!-- 1x baseline from single request -->
-                                    <tr x-show="benchSingleResults.some(r => r.pp === 1024)" class="border-b border-neutral-100 bg-neutral-50/50">
+                                    <tr x-show="benchFindSingle(1024)" class="border-b border-neutral-100 bg-neutral-50/50">
                                         <td class="px-4 py-3 font-medium text-neutral-500">{{ t('bench.results.batch.baseline') }}</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchSingleResults.find(r => r.pp === 1024)?.ttft_ms?.toFixed(1) || '-'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchSingleResults.find(r => r.pp === 1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFindSingle(1024)?.ttft_ms?.toFixed(1) || '-'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
                                     </tr>
                                     <template x-for="r in benchBatchResults" :key="r.batch_size">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.tg_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r).toFixed(2) + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.pp_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(r.pp_tps / r.batch_size).toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.avg_ttft_ms.toFixed(1)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.tg_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) !== null && benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r) !== null ? benchGetSpeedup(r).toFixed(2) + 'x' : 'N/A'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.pp_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFmtNum(benchPpPerReq(r), 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.avg_ttft_ms, 1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                         </tr>
                                     </template>
@@ -314,7 +389,7 @@
                             </div>
                             <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="benchShowText && 'rotate-180'"></i>
                         </button>
-                        <div x-show="benchShowText" x-collapse x-cloak>
+                        <div x-show="benchShowText" x-cloak>
                             <div class="px-4 py-3 flex justify-end border-b border-neutral-200">
                                 <button @click="benchCopyText()"
                                         class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1.5">
@@ -347,6 +422,13 @@
                             </div>
                         </div>
                         <div class="px-6 py-4 space-y-2">
+                            <div x-show="benchUploadFlags.length" x-cloak class="flex flex-wrap items-center gap-2 pb-2">
+                                <span class="text-xs text-neutral-500" x-text="t('bench.upload.flags_label')"></span>
+                                <template x-for="f in benchUploadFlags" :key="f.key">
+                                    <span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium"
+                                          x-text="f.label"></span>
+                                </template>
+                            </div>
                             <template x-for="r in benchUploadResults" :key="r.context_length">
                                 <div class="flex items-center justify-between py-2 border-b border-neutral-100 last:border-0">
                                     <span class="text-sm font-medium text-neutral-700" x-text="'pp' + r.context_length"></span>
@@ -394,7 +476,7 @@
                         </div>
                     </div>
 
-                    <!-- Community Benchmark Upload Skipped (experimental features) -->
+                    <!-- Community Benchmark Upload Skipped (external endpoint) -->
                     <div x-show="benchUploadSkipped" x-cloak
                          class="bg-amber-50 rounded-2xl border border-amber-200 overflow-hidden mb-6">
                         <div class="flex items-center gap-3 px-6 py-4 border-b border-amber-200">
@@ -403,12 +485,8 @@
                                   x-text="t('bench.upload_skipped.title')"></span>
                         </div>
                         <div class="px-6 py-4 space-y-2">
-                            <p class="text-sm text-amber-600" x-text="t('bench.upload_skipped.reason')"></p>
-                            <ul class="text-sm text-amber-600 list-disc list-inside">
-                                <template x-for="f in (benchUploadSkipped?.features || [])" :key="f">
-                                    <li x-text="t('bench.upload_skipped.features.' + f)"></li>
-                                </template>
-                            </ul>
+                            <p class="text-sm text-amber-600"
+                               x-text="t('bench.upload_skipped.reason_external')"></p>
                         </div>
                     </div>
 
@@ -422,7 +500,7 @@
                             </div>
                             <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="benchShowMetrics && 'rotate-180'"></i>
                         </button>
-                        <div x-show="benchShowMetrics" x-collapse x-cloak class="px-6 py-4">
+                        <div x-show="benchShowMetrics" x-cloak class="px-6 py-4">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                                 <div class="space-y-3">
                                     <div>
@@ -485,4 +563,5 @@
 
                 <!-- Accuracy tab -->
                 {% include "dashboard/_bench_accuracy.html" %}
+                {% include "dashboard/_bench_context.html" %}
             </div>

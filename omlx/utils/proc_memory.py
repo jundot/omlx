@@ -116,3 +116,27 @@ def get_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_phys_footprint
+
+
+def get_lifetime_max_phys_footprint(pid: int | None = None) -> int:
+    """Return the highest phys_footprint the process has ever reached, in bytes.
+
+    This is a high-water mark since process start, so it does not fall when
+    memory is released. Callers measuring a single episode must snapshot it
+    before and after and treat an unchanged value as "this episode did not set
+    a new maximum" rather than as the episode's peak.
+
+    Args:
+        pid: Process ID to query. Defaults to current process.
+
+    Returns:
+        Bytes. Returns 0 on non-Darwin platforms or if the libproc call fails.
+    """
+    if _proc_pid_rusage is None:
+        return 0
+    info = _RusageInfoV4()
+    target_pid = pid if pid is not None else os.getpid()
+    rc = _proc_pid_rusage(target_pid, _RUSAGE_INFO_V4, ctypes.byref(info))
+    if rc != 0:
+        return 0
+    return info.ri_lifetime_max_phys_footprint

@@ -3,6 +3,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 import omlx.utils.psutil_compat as psutil_compat
 
 
@@ -54,3 +56,27 @@ Pages wired down:                         40.
     assert first.available == (10 + 30) * 4096
     assert second.available == first.available
     mock_check_output.assert_called_once()
+
+
+def test_vm_stats_include_compressed_and_speculative(monkeypatch):
+    # These sit past the four stable counters, so they are only reported when
+    # the kernel actually filled that far into the struct.
+    stats = psutil_compat.get_macos_vm_stats()
+    if stats is None:
+        pytest.skip("host_statistics64 unavailable")
+    assert {"free", "active", "inactive", "wired"} <= set(stats)
+    for key in ("speculative", "compressed"):
+        if key in stats:
+            assert stats[key] >= 0
+
+
+def test_vm_stats_omits_tail_counters_on_short_reply(monkeypatch):
+    monkeypatch.setattr(psutil_compat, "_VM_COMPRESSOR_INDEX", 10**6)
+    monkeypatch.setattr(psutil_compat, "_VM_SPECULATIVE_INDEX", 10**6)
+    stats = psutil_compat.get_macos_vm_stats()
+    if stats is None:
+        pytest.skip("host_statistics64 unavailable")
+    assert "compressed" not in stats
+    assert "speculative" not in stats
+    # The stable four must still be there — _build_svmem depends on them.
+    assert {"free", "active", "inactive", "wired"} <= set(stats)

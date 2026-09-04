@@ -7,6 +7,7 @@ requiring actual MCP server connections.
 """
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -171,6 +172,54 @@ class TestMCPClientStatus:
         assert status.error == "Connection failed"
 
 
+class TestMCPClientSDKFieldCompatibility:
+    """Tests for MCP SDK 1.x and 2.x field names."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("protocol_attr", "server_attr", "schema_attr"),
+        [
+            ("protocol_version", "server_info", "input_schema"),
+            ("protocolVersion", "serverInfo", "inputSchema"),
+        ],
+    )
+    async def test_session_metadata_and_tools_support_both_field_styles(
+        self,
+        protocol_attr: str,
+        server_attr: str,
+        schema_attr: str,
+    ):
+        config = MCPServerConfig(
+            name="compat-test",
+            transport=MCPTransport.STDIO,
+            command="python",
+        )
+        client = MCPClient(config)
+        client._session = AsyncMock()
+        client._session.initialize.return_value = SimpleNamespace(
+            **{
+                protocol_attr: "2025-11-25",
+                server_attr: SimpleNamespace(name="test-server"),
+            }
+        )
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        }
+        tool = SimpleNamespace(
+            name="echo",
+            description="Echo a value",
+            **{schema_attr: schema},
+        )
+        client._session.list_tools.return_value = SimpleNamespace(tools=[tool])
+
+        await client._initialize_session()
+        await client._discover_tools()
+
+        client._session.initialize.assert_awaited_once()
+        assert client.tools[0].input_schema == schema
+
+
 class TestMCPClientConnect:
     """Tests for MCPClient.connect()."""
 
@@ -285,6 +334,74 @@ class TestMCPClientConnect:
 
         assert result is True
         assert streamable_http_client.state == MCPServerState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_connect_streamable_http_uses_sdk_v2_stream_pair(
+        self, streamable_http_client: MCPClient
+    ):
+        """The MCP 2.x transport yields only the read/write stream pair."""
+        pytest.importorskip("mcp")
+        read_stream = MagicMock()
+        write_stream = MagicMock()
+        http_client = MagicMock()
+        transport = MagicMock()
+        session = MagicMock()
+        transport.__aenter__.return_value = (read_stream, write_stream)
+
+        with (
+            patch("httpx.AsyncClient", return_value=http_client),
+            patch(
+                "mcp.client.streamable_http.streamable_http_client",
+                return_value=transport,
+            ) as mock_transport,
+            patch("mcp.ClientSession", return_value=session) as mock_session,
+        ):
+            await streamable_http_client._connect_streamable_http()
+
+        http_client.__aenter__.assert_awaited_once_with()
+        mock_transport.assert_called_once_with(
+            url="http://localhost:3000/mcp", http_client=http_client
+        )
+        transport.__aenter__.assert_awaited_once_with()
+        mock_session.assert_called_once_with(read_stream, write_stream)
+        session.__aenter__.assert_awaited_once_with()
+
+        await streamable_http_client._cleanup_resources()
+        session.__aexit__.assert_awaited_once_with(None, None, None)
+        transport.__aexit__.assert_awaited_once_with(None, None, None)
+        http_client.__aexit__.assert_awaited_once_with(None, None, None)
+
+    @pytest.mark.asyncio
+    async def test_connect_stdio_passes_cwd_to_sdk(self):
+        """cwd from the server config reaches StdioServerParameters (#1111).
+
+        Runs the real _connect_stdio with only the SDK's stdio_client and
+        ClientSession mocked, so the real StdioServerParameters also proves
+        the pinned SDK accepts the field.
+        """
+        mcp = pytest.importorskip("mcp")
+        config = MCPServerConfig(
+            name="cwd-test",
+            transport=MCPTransport.STDIO,
+            command="python",
+            args=["-m", "mcp_server"],
+            cwd="/tmp/mcp-workdir",
+        )
+        client = MCPClient(config)
+
+        fake_ctx = MagicMock()
+        fake_ctx.__aenter__.return_value = (MagicMock(), MagicMock())
+        with patch(
+            "mcp.client.stdio.stdio_client", return_value=fake_ctx
+        ) as mock_stdio, patch("mcp.ClientSession", return_value=MagicMock()):
+            await client._connect_stdio()
+
+        server_params = mock_stdio.call_args.args[0]
+        assert isinstance(server_params, mcp.StdioServerParameters)
+        assert server_params.cwd == "/tmp/mcp-workdir"
+        # Existing fields keep flowing through unchanged.
+        assert server_params.command == "python"
+        assert server_params.args == ["-m", "mcp_server"]
 
     @pytest.mark.asyncio
     async def test_connect_failure(self, stdio_client: MCPClient):
@@ -528,9 +645,10 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_success(self, connected_client: MCPClient):
         """Test successful tool call."""
-        mock_result = MagicMock()
-        mock_result.content = [MagicMock(text="Tool output")]
-        mock_result.isError = False
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(text="Tool output")],
+            isError=False,
+        )
         connected_client._session.call_tool.return_value = mock_result
 
         result = await connected_client.call_tool("get_data", {"id": 123})
@@ -556,9 +674,7 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_uses_config_timeout(self, connected_client: MCPClient):
         """Test tool call uses config timeout when not specified."""
-        mock_result = MagicMock()
-        mock_result.content = []
-        mock_result.isError = False
+        mock_result = SimpleNamespace(content=[], isError=False)
         connected_client._session.call_tool.return_value = mock_result
 
         await connected_client.call_tool("tool", {})
@@ -579,12 +695,13 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_multiple_content_items(self, connected_client: MCPClient):
         """Test tool call with multiple content items."""
-        mock_result = MagicMock()
-        mock_result.content = [
-            MagicMock(text="Line 1"),
-            MagicMock(text="Line 2"),
-        ]
-        mock_result.isError = False
+        mock_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(text="Line 1"),
+                SimpleNamespace(text="Line 2"),
+            ],
+            isError=False,
+        )
         connected_client._session.call_tool.return_value = mock_result
 
         result = await connected_client.call_tool("multi_tool", {})
@@ -595,12 +712,10 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_data_content(self, connected_client: MCPClient):
         """Test tool call with data content."""
-        mock_result = MagicMock()
-        mock_item = MagicMock(spec=["data"])
-        mock_item.data = {"key": "value"}
-        del mock_item.text  # Remove text attribute
-        mock_result.content = [mock_item]
-        mock_result.isError = False
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(data={"key": "value"})],
+            isError=False,
+        )
         connected_client._session.call_tool.return_value = mock_result
 
         result = await connected_client.call_tool("data_tool", {})
@@ -610,10 +725,11 @@ class TestMCPClientCallTool:
     @pytest.mark.asyncio
     async def test_call_tool_structured_content(self, connected_client: MCPClient):
         """Test tool call with structuredContent fallback."""
-        mock_result = MagicMock(spec=[])
-        mock_result.content = []
-        mock_result.structuredContent = {"results": ["Result 1", "Result 2"]}
-        mock_result.isError = False
+        mock_result = SimpleNamespace(
+            content=[],
+            structuredContent={"results": ["Result 1", "Result 2"]},
+            isError=False,
+        )
         connected_client._session.call_tool.return_value = mock_result
 
         result = await connected_client.call_tool("web_search", {"query": "test"})
@@ -623,6 +739,21 @@ class TestMCPClientCallTool:
         connected_client._session.call_tool.assert_called_with(
             "web_search", {"query": "test"}
         )
+
+    @pytest.mark.asyncio
+    async def test_call_tool_snake_case_result(self, connected_client: MCPClient):
+        """Test SDK 2.x error and structured content fields."""
+        mock_result = SimpleNamespace(
+            content=[],
+            structured_content={"answer": 42},
+            is_error=True,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("calculate", {"value": 42})
+
+        assert result.is_error is True
+        assert result.content == {"answer": 42}
 
 
 class TestMCPClientRefreshTools:
@@ -656,14 +787,12 @@ class TestMCPClientRefreshTools:
         client._state = MCPServerState.CONNECTED
         client._session = AsyncMock()
 
-        # Create a proper mock tool object with correct attributes
-        mock_tool = MagicMock()
-        mock_tool.name = "new_tool"  # Set name explicitly, not as MagicMock
-        mock_tool.description = "New"
-        mock_tool.inputSchema = {}
-
-        mock_result = MagicMock()
-        mock_result.tools = [mock_tool]
+        mock_tool = SimpleNamespace(
+            name="new_tool",
+            description="New",
+            inputSchema={},
+        )
+        mock_result = SimpleNamespace(tools=[mock_tool])
         client._session.list_tools.return_value = mock_result
 
         await client.refresh_tools()

@@ -17,6 +17,8 @@ class EmbeddingInputItem(BaseModel):
     """Structured input item for multimodal embeddings."""
 
     text: Optional[str] = None
+    # Image values are request-facing and must be inline data URIs. Remote URLs
+    # and filesystem paths are rejected before processor-specific preparation.
     image: Optional[str] = None
 
     model_config = {"extra": "forbid"}

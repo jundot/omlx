@@ -28,8 +28,10 @@ class FakeStreamingCore:
 
     def __init__(self):
         self.aborted_request_id = None
+        self.add_request_kwargs = None
 
     async def add_request(self, **kwargs):
+        self.add_request_kwargs = kwargs
         return "request-1"
 
     async def stream_outputs(self, request_id):
@@ -294,6 +296,32 @@ class TestBatchedEngineInitialization:
 
         assert engine.model_type is None
 
+    @pytest.mark.asyncio
+    async def test_stop_clears_wrapper_teardown_references(self):
+        """stop() releases wrapper-side native helper references."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        inner_engine = MagicMock()
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock()
+        engine._engine.engine = inner_engine
+        engine._model = object()
+        engine._tokenizer = object()
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
+        engine._loaded = True
+
+        await engine.stop()
+
+        assert engine._engine is None
+        assert engine._model is None
+        assert engine._tokenizer is None
+        assert engine._grammar_compiler is None
+        assert engine._grammar_compiler_init_attempted is False
+        assert engine._loaded is False
+        inner_engine.close.assert_called_once()
+
 
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
@@ -316,6 +344,22 @@ class TestBatchedEngineStreamingCleanup:
         await stream.aclose()
 
         assert fake_engine.aborted_request_id == "request-1"
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_tools_to_request(self):
+        from omlx.engine.batched import BatchedEngine
+
+        tools = [{"type": "function", "function": {"name": "weather"}}]
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", tools=tools)
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["tools"] == tools
 
 
 class TestBatchedEngineApplyChatTemplate:
@@ -525,6 +569,14 @@ class TestBatchedEngineStats:
 
 class TestBatchedEngineModelType:
     """Tests for BatchedEngine.model_type property."""
+
+    def test_model_type_none_before_init(self):
+        """Partially constructed engines have no model type yet."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+
+        assert engine.model_type is None
 
     def test_model_type_from_config(self):
         """Test model_type from model.config."""
@@ -781,3 +833,158 @@ class TestApplyChatTemplatePartialMode:
         # continue_final_message=True (not add_generation_prompt=True).
         assert count_kwargs["continue_final_message"] is True
         assert count_kwargs["add_generation_prompt"] is False
+
+
+class TestBatchedEngineSpecPrefillForwarding:
+    """Non-streaming path must forward SpecPrefill overrides (issue #2274).
+
+    The synchronous generate()/chat() methods previously dropped SpecPrefill
+    kwargs, so a configured keep_pct silently fell back to the engine default.
+    """
+
+    @staticmethod
+    def _fake_output():
+        return SimpleNamespace(
+            output_text="hi",
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    def test_pop_specprefill_kwargs_extracts_and_pops(self):
+        from omlx.engine.batched import BatchedEngine
+
+        kwargs = {
+            "specprefill_keep_pct": 0.25,
+            "specprefill_threshold": 100,
+            "specprefill_system_end": 12,
+            "specprefill": True,
+            "temperature": 0.7,
+        }
+        extracted = BatchedEngine._pop_specprefill_kwargs(kwargs)
+
+        assert extracted == {
+            "specprefill_keep_pct": 0.25,
+            "specprefill_threshold": 100,
+            "specprefill_system_end": 12,
+            "specprefill": True,
+        }
+        # Popped out of the original dict; unrelated kwargs are untouched.
+        assert kwargs == {"temperature": 0.7}
+
+    def test_pop_specprefill_kwargs_ignores_none_values(self):
+        from omlx.engine.batched import BatchedEngine
+
+        kwargs = {"specprefill_keep_pct": None, "specprefill": None}
+        assert BatchedEngine._pop_specprefill_kwargs(kwargs) == {}
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_specprefill_kwargs(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate(
+            "a prompt",
+            specprefill_keep_pct=0.25,
+            specprefill_threshold=100,
+        )
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["specprefill_keep_pct"] == 0.25
+        assert call_kwargs["specprefill_threshold"] == 100
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_tools(self):
+        from omlx.engine.batched import BatchedEngine
+
+        tools = [{"type": "function", "function": {"name": "weather"}}]
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", tools=tools)
+
+        assert engine._engine.generate.call_args.kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_generate_omits_specprefill_when_absent(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt")
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert "specprefill_keep_pct" not in call_kwargs
+        assert "specprefill_threshold" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_chat_injects_specprefill_system_end(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=True)
+        engine._preprocess_messages = lambda m: m
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        # Full (system+user) prompt renders longer than the non-system prompt,
+        # so system_end = full_tokens - non_system_tokens = 10 - 4 = 6.
+        def fake_template(msgs, *args, **kwargs):
+            has_system = any(m["role"] == "system" for m in msgs)
+            return "SYS_AND_USER" if has_system else "USER_ONLY"
+
+        engine._apply_chat_template = fake_template
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.side_effect = lambda text: (
+            [0] * 10 if "SYS" in text else [0] * 4
+        )
+
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hello"},
+        ]
+        await engine.chat(messages)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["specprefill_system_end"] == 6
+
+    @pytest.mark.asyncio
+    async def test_chat_skips_system_end_when_specprefill_disabled(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._apply_chat_template = lambda msgs, *a, **k: "PROMPT"
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.side_effect = lambda text: [0] * 8
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        await engine.chat(messages)
+
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert "specprefill_system_end" not in call_kwargs

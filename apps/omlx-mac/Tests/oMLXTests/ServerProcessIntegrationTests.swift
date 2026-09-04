@@ -1,4 +1,5 @@
-// Integration smoke test for ServerProcess. Exercises a real spawn +
+// AutoRestartBudgetTests below are hermetic unit tests and always run.
+// The ServerProcess integration smoke test exercises a real spawn +
 // graceful shutdown end-to-end. Skipped by default so regular
 // `xcodebuild test` runs stay hermetic and fast — opt in via
 // `OMLX_INTEGRATION=1`.
@@ -32,6 +33,42 @@
 import Darwin
 import XCTest
 @testable import oMLX
+
+final class AutoRestartBudgetTests: XCTestCase {
+    func testStableHealthResetsConsumedAttempts() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var budget = AutoRestartBudget(maxAttempts: 3, stableThreshold: 60)
+
+        XCTAssertEqual(budget.consumeRestart(at: start), 1)
+        budget.recordHealthy(at: start.addingTimeInterval(5))
+        budget.recordHealthy(at: start.addingTimeInterval(64))
+        XCTAssertEqual(budget.attempts, 1)
+
+        budget.recordHealthy(at: start.addingTimeInterval(65))
+        XCTAssertEqual(budget.attempts, 0)
+        XCTAssertEqual(budget.consumeRestart(at: start.addingTimeInterval(66)), 1)
+    }
+
+    func testCrashAfterStableIntervalResetsWithoutAnotherHealthTick() {
+        let start = Date(timeIntervalSince1970: 2_000)
+        var budget = AutoRestartBudget(maxAttempts: 3, stableThreshold: 60)
+
+        XCTAssertEqual(budget.consumeRestart(at: start), 1)
+        budget.recordHealthy(at: start.addingTimeInterval(5))
+
+        XCTAssertEqual(budget.consumeRestart(at: start.addingTimeInterval(65)), 1)
+    }
+
+    func testConsecutiveCrashesStillStopAtMaximum() {
+        let start = Date(timeIntervalSince1970: 3_000)
+        var budget = AutoRestartBudget(maxAttempts: 3, stableThreshold: 60)
+
+        XCTAssertEqual(budget.consumeRestart(at: start), 1)
+        XCTAssertEqual(budget.consumeRestart(at: start.addingTimeInterval(1)), 2)
+        XCTAssertEqual(budget.consumeRestart(at: start.addingTimeInterval(2)), 3)
+        XCTAssertNil(budget.consumeRestart(at: start.addingTimeInterval(3)))
+    }
+}
 
 @MainActor
 final class ServerProcessIntegrationTests: XCTestCase {

@@ -13,8 +13,15 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _clear_teardown_references,
+    _run_scheduler_preflight_with_cleanup_retry,
+    _warn_scheduler_unreachable_once,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,19 +87,17 @@ class BatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
     ) -> None:
-        eviction_request = scheduler.preflight_eviction_request(
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-        )
-        if eviction_request is not None and self._prefill_eviction_callback is not None:
-            logger.info(
-                "Running preflight LRU eviction for request %s",
-                eviction_request.request_id,
-            )
-            await self._prefill_eviction_callback(eviction_request)
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_prompt_tokens,
-            request_id=request_id,
+            eviction_callback=self._prefill_eviction_callback,
+            executor=getattr(
+                getattr(getattr(self, "_engine", None), "engine", None),
+                "_mlx_executor",
+                None,
+            ),
+            text_only=True,
         )
 
     @property
@@ -108,7 +113,7 @@ class BatchedEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         """Get the model type from config (e.g., 'gpt_oss', 'llama', 'qwen2')."""
-        if self._model is None:
+        if getattr(self, "_model", None) is None:
             return None
         # Try different ways to access model_type
         try:
@@ -227,11 +232,10 @@ class BatchedEngine(BaseEngine):
 
         import asyncio
 
-        from mlx_lm import load
-
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
+            lm_load_compat,
             maybe_apply_pre_load_patches,
             maybe_load_custom_quantization,
         )
@@ -263,7 +267,7 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
-            return load(
+            return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
@@ -288,6 +292,39 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
+        # Supported MoE gate+up regroup: concatenate the routed experts'
+        # gate and up projections so decode runs 2 gather_qmm launches per
+        # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
+        # executor because it rewrites weights in place.
+        if (
+            getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_gate_up import (
+                    apply_qwen35_moe_gate_up_fusion,
+                )
+
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    apply_qwen35_moe_gate_up_fusion,
+                    self._model,
+                )
+            except Exception:
+                logger.debug("MoE gate+up fusion not applied", exc_info=True)
+
+        # Qwen MoE decode router: fuse the top-k select + renormalize chain
+        # into one launch (the composed argpartition chain is ~2 ms/token on
+        # the 256-expert 35B-A3B).
+        try:
+            from ..patches.qwen35_moe_router import (
+                apply_qwen35_moe_router_patch,
+            )
+
+            apply_qwen35_moe_router_patch()
+        except Exception:
+            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
@@ -300,15 +337,229 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
+        # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
+        # below their context window. The route is memory-aware: it defers to
+        # the faster unfused fallback whenever the scheduler-provided guard
+        # headroom fits its O(L^2) transient (#2204). Installed after
+        # TurboQuant so it is the outer wrapper and only grabs non-quantized
+        # 256 prefill; all other cases (incl. TurboQuant caches, other head
+        # dims, decode, short prefill) fall through to the prior SDPA
+        # unchanged. Passthrough-safe to install unconditionally — the route
+        # is strictly gated. Disable via
+        # model_settings.sdpa256_prefill_enabled = False.
+        if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
+            try:
+                from ..patches.sdpa256_attention import (
+                    apply_sdpa256_attention_patch,
+                )
+
+                apply_sdpa256_attention_patch()
+            except Exception:
+                logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
+        # Strictly shape-gated; decode, quantized-cache paths, and unsupported
+        # models fall through to the previous SDPA implementation.
+        if (
+            getattr(self._model_settings, "fa256_steel_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_fa256_attention import (
+                    apply_qwen35_fa256_attention_patch,
+                )
+
+                apply_qwen35_fa256_attention_patch()
+            except Exception:
+                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+
+        # Qwen3.5/3.6 q4 prefill linears -> native qmm tile tuned for long
+        # batches. Strictly gated in the patch; decode and unsupported linears
+        # fall through.
+        if (
+            getattr(self._model_settings, "qwen35_q4_mlp_prefill_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_q4_mlp import (
+                    apply_qwen35_q4_lm_prefill_linear_patch,
+                    apply_qwen35_q4_mlp_patch,
+                    apply_qwen35_q4_prefill_linear_patch,
+                )
+
+                apply_qwen35_q4_mlp_patch()
+                apply_qwen35_q4_prefill_linear_patch()
+                apply_qwen35_q4_lm_prefill_linear_patch()
+            except Exception:
+                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+
+        ane_prefill_sequence_length = 0
+        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+            try:
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fraction",
+                            0.53,
+                        ),
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fraction",
+                                0.53,
+                            )
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+                if ane_count or getattr(
+                    self._model, "_omlx_ane_gdn_prefill_count", 0
+                ):
+                    ane_prefill_sequence_length = requested_ane_sequence_length
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
+
+        # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
+        # SwitchGLU. Strictly gated; decode and unsupported MoE variants fall
+        # through to stock mlx-lm.
+        if (
+            getattr(self._model_settings, "qwen35_moe_weighted_sum_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_moe_weighted_sum import (
+                    apply_qwen35_moe_weighted_sum_patch,
+                )
+
+                apply_qwen35_moe_weighted_sum_patch()
+            except Exception:
+                logger.debug(
+                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                )
+
+        if (
+            getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_ragged_decode import (
+                    apply_qwen35_ragged_decode_patch,
+                )
+
+                apply_qwen35_ragged_decode_patch()
+            except Exception:
+                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = (
-            self._model_name
-        )  # Ensure cache isolation per model
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -327,6 +578,15 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        if ane_prefill_sequence_length:
+            from ..patches.qwen35_ane_prefill import (
+                configure_qwen35_ane_prefill_scheduler,
+            )
+
+            configure_qwen35_ane_prefill_scheduler(
+                scheduler,
+                ane_prefill_sequence_length,
+            )
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
@@ -365,7 +625,7 @@ class BatchedEngine(BaseEngine):
                                 specprefill_draft,
                                 trust_remote_code=self._trust_remote_code,
                             )
-                            draft_model, _ = load(
+                            draft_model, _ = lm_load_compat(
                                 specprefill_draft,
                                 tokenizer_config=draft_tokenizer_config,
                                 trust_remote_code=self._trust_remote_code,
@@ -408,9 +668,16 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
-        self._engine = None
-        self._model = None
-        self._tokenizer = None
+        _clear_teardown_references(
+            self,
+            none_attrs=(
+                "_engine",
+                "_model",
+                "_tokenizer",
+                "_grammar_compiler",
+            ),
+            false_attrs=("_grammar_compiler_init_attempted",),
+        )
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -458,7 +725,12 @@ class BatchedEngine(BaseEngine):
                 template_kwargs.update(chat_template_kwargs)
 
             try:
-                return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+                return apply_chat_template_with_reasoning_effort_fallback(
+                    self._tokenizer,
+                    messages,
+                    template_kwargs,
+                    is_harmony=self.model_type == "gpt_oss",
+                )
             except TypeError:
                 # Tokenizer doesn't support some kwargs, remove them and retry
                 if chat_template_kwargs:
@@ -505,9 +777,69 @@ class BatchedEngine(BaseEngine):
         )
         return len(self._tokenizer.encode(prompt))
 
+    @staticmethod
+    def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+
+        The engine's ``add_request`` accepts these as dedicated arguments, so
+        they must be forwarded explicitly rather than left in ``**kwargs``.
+        Shared by ``generate`` and ``stream_generate`` so both request paths
+        honour SpecPrefill overrides identically.
+        """
+        specprefill_kwargs: dict[str, Any] = {}
+        for key in (
+            "specprefill",
+            "specprefill_keep_pct",
+            "specprefill_threshold",
+            "specprefill_system_end",
+        ):
+            if kwargs.get(key) is not None:
+                specprefill_kwargs[key] = kwargs.pop(key)
+        return specprefill_kwargs
+
+    def _inject_specprefill_system_end(
+        self,
+        messages: list[dict[str, Any]],
+        prompt: str,
+        template_tools: Any,
+        ct_kwargs: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Compute the system-prompt token boundary and add it to ``kwargs``.
+
+        SpecPrefill protects the system-prompt region from token dropping. The
+        boundary is derived by subtracting the non-system prompt token count
+        from the full prompt token count (system-only messages usually can't be
+        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
+        non-streaming path protects the system prompt identically. No-op unless
+        the model has SpecPrefill enabled and the request has a system prompt.
+        """
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
+        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+            return
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) < len(messages) and non_system:
+            try:
+                non_system_prompt = self._apply_chat_template(
+                    non_system, template_tools, chat_template_kwargs=ct_kwargs
+                )
+                full_tokens = len(self._tokenizer.encode(prompt))
+                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                system_end = full_tokens - non_system_tokens
+                if system_end > 0:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
     async def generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -522,7 +854,7 @@ class BatchedEngine(BaseEngine):
         Generate a complete response (non-streaming).
 
         Args:
-            prompt: Input text
+            prompt: Input text or token IDs
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
@@ -550,6 +882,7 @@ class BatchedEngine(BaseEngine):
             xtc_probability=kwargs.get("xtc_probability", 0.0),
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -558,9 +891,16 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        # SpecPrefill: forward per-request overrides to the engine, mirroring
+        # stream_generate so the non-streaming path is not silently ignored.
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
+            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -572,11 +912,12 @@ class BatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            first_token_at=output.first_token_at,
         )
 
     async def stream_generate(
         self,
-        prompt: str,
+        prompt: str | list[int],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -591,7 +932,7 @@ class BatchedEngine(BaseEngine):
         Stream generation token by token.
 
         Args:
-            prompt: Input text
+            prompt: Input text or token IDs
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
@@ -619,6 +960,7 @@ class BatchedEngine(BaseEngine):
             xtc_probability=kwargs.get("xtc_probability", 0.0),
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -628,26 +970,19 @@ class BatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = {}
-        if kwargs.get("specprefill") is not None:
-            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
-        if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
-                "specprefill_keep_pct"
-            )
-        if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
-                "specprefill_threshold"
-            )
-        if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
-                "specprefill_system_end"
-            )
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
+            benchmark_ane_sequence_length=int(
+                kwargs.get("benchmark_ane_sequence_length", 0) or 0
+            ),
             **specprefill_kwargs,
         )
 
@@ -672,6 +1007,24 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    generated_at=getattr(output, "generated_at", None),
+                    generated_until=getattr(output, "generated_until", None),
+                    benchmark_prefill_chunks=(
+                        list(chunks)
+                        if (chunks := getattr(output, "benchmark_prefill_chunks", []))
+                        else []
+                    ),
+                    benchmark_requested_steps=(
+                        list(steps)
+                        if (steps := getattr(output, "benchmark_requested_steps", []))
+                        else []
+                    ),
+                    benchmark_boundary_enabled=bool(
+                        getattr(output, "benchmark_boundary_enabled", False)
+                    ),
+                    benchmark_cache_block_size=int(
+                        getattr(output, "benchmark_cache_block_size", 0) or 0
+                    ),
                 )
         except GeneratorExit:
             # Client disconnected
@@ -740,6 +1093,11 @@ class BatchedEngine(BaseEngine):
             is_partial=partial,
         )
 
+        # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
+        )
+
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -749,6 +1107,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         )
 
@@ -891,30 +1250,10 @@ class BatchedEngine(BaseEngine):
             is_partial=partial,
         )
 
-        # SpecPrefill: compute system prompt token count for protection.
-        # Can't template system-only messages (most templates require user),
-        # so compute by subtracting non-system from full prompt tokens.
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
+        # SpecPrefill: protect the system-prompt region from token dropping.
+        self._inject_specprefill_system_end(
+            messages, prompt, template_tools, ct_kwargs, kwargs
         )
-        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [
-                m for m in messages if m.get("role") not in ("system", "developer")
-            ]
-            if len(non_system) < len(messages) and non_system:
-                try:
-                    non_system_prompt = self._apply_chat_template(
-                        non_system, template_tools, chat_template_kwargs=ct_kwargs
-                    )
-                    full_tokens = len(self._tokenizer.encode(prompt))
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
-                        kwargs["specprefill_system_end"] = system_end
-                except Exception as e:
-                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -925,6 +1264,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            tools=tools,
             **kwargs,
         ):
             yield output
@@ -957,8 +1297,16 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         if self._engine and self._engine.engine:
-            return await self._engine.engine.abort_all_requests()
+            return await self._engine.engine.abort_all_requests(
+                reason=reason,
+                error_code=error_code,
+            )
         return 0

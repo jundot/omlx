@@ -170,6 +170,15 @@ def apply_minimax_m3_sparse_attention_patch() -> bool:
     positions against storage key positions and can mask valid current-row keys.
     """
     try:
+        from .mlx_vlm_minimax_m3_compat import (
+            apply_mlx_vlm_minimax_m3_compat_patch,
+        )
+
+        apply_mlx_vlm_minimax_m3_compat_patch()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("minimax_m3_sparse_attention: compat patch failed: %s", e)
+
+    try:
         from mlx_vlm.models.minimax_m3_vl import language as minimax_language
     except ImportError:
         logger.debug("minimax_m3_sparse_attention: mlx-vlm MiniMax M3 not available")

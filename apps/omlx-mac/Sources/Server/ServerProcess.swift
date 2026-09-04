@@ -28,6 +28,43 @@
 import Foundation
 import Darwin
 
+struct AutoRestartBudget {
+    let maxAttempts: Int
+    let stableThreshold: TimeInterval
+
+    private(set) var attempts = 0
+    private(set) var healthySince: Date?
+
+    mutating func recordHealthy(at date: Date) {
+        if healthySince == nil {
+            healthySince = date
+        }
+        if attempts > 0,
+           let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+            healthySince = date
+        }
+    }
+
+    mutating func consumeRestart(at date: Date) -> Int? {
+        if let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+        }
+        healthySince = nil
+
+        guard attempts < maxAttempts else { return nil }
+        attempts += 1
+        return attempts
+    }
+
+    mutating func reset() {
+        attempts = 0
+        healthySince = nil
+    }
+}
+
 // @unchecked Sendable: state mutations either happen on the main thread
 // (start, stop, force restart, callbacks dispatched via main) or inside
 // the @MainActor health-check Task. Process termination handler bounces
@@ -105,8 +142,6 @@ final class ServerProcess: @unchecked Sendable {
     private let healthCheckInterval: TimeInterval = 5
     private let maxHealthFailures = 3
     private let auxiliaryHealthFreshness: TimeInterval = 15
-    private let maxAutoRestarts   = 3
-    private let stableThreshold: TimeInterval = 60   // seconds before counter resets
     private let stopGraceSeconds: TimeInterval = 10
 
     // State
@@ -116,8 +151,10 @@ final class ServerProcess: @unchecked Sendable {
     private var logHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var consecutiveFailures = 0
-    private var autoRestartCount    = 0
-    private var lastHealthyAt: Date?
+    private var autoRestartBudget = AutoRestartBudget(
+        maxAttempts: 3,
+        stableThreshold: 60
+    )
     private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
     private let logURL: URL
@@ -226,7 +263,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         process = nil
         closeLog()
-        autoRestartCount = 0
+        autoRestartBudget.reset()
         consecutiveFailures = 0
         lastAuxiliaryHealthyAt = nil
         expectingExit = false
@@ -241,7 +278,7 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
         lastAuxiliaryHealthyAt = date
-        lastHealthyAt = date
+        autoRestartBudget.recordHealthy(at: date)
         consecutiveFailures = 0
         switch state {
         case .starting:
@@ -332,24 +369,22 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     private func tryAutoRestart(reason: String) {
-        // Reset counter if last healthy was > stableThreshold ago.
-        if let last = lastHealthyAt,
-           Date().timeIntervalSince(last) >= stableThreshold {
-            autoRestartCount = 0
-        }
-
-        if autoRestartCount >= maxAutoRestarts {
-            update(.failed(message: "\(reason). Auto-restart failed after \(maxAutoRestarts) attempts."))
+        guard let attempt = autoRestartBudget.consumeRestart(at: Date()) else {
+            update(.failed(
+                message: "\(reason). Auto-restart failed after " +
+                         "\(autoRestartBudget.maxAttempts) attempts."
+            ))
             return
         }
 
-        autoRestartCount += 1
         consecutiveFailures = 0
         lastAuxiliaryHealthyAt = nil
-        let attempt = autoRestartCount
         let backoff = TimeInterval(5 * (1 << (attempt - 1)))   // 5, 10, 20s
 
-        NSLog("oMLX: auto-restart \(attempt)/\(maxAutoRestarts) in \(Int(backoff))s — \(reason)")
+        NSLog(
+            "oMLX: auto-restart \(attempt)/\(autoRestartBudget.maxAttempts) " +
+            "in \(Int(backoff))s — \(reason)"
+        )
         update(.starting)
 
         Task { @MainActor [weak self] in
@@ -425,7 +460,7 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     private func markHealthy(pid: Int32, at date: Date) {
         consecutiveFailures = 0
-        lastHealthyAt = date
+        autoRestartBudget.recordHealthy(at: date)
         switch state {
         case .starting, .unresponsive:
             update(.running(pid: pid))

@@ -28,25 +28,47 @@ final class ModelsScreenSortingTests: XCTestCase {
         XCTAssertEqual(ids, ["qwen", "Qwen", "QWEN"])
     }
 
-    private func makeModel(_ id: String) -> ModelDTO {
+    func testSortModelsByNameUsesDisplayNameWhenPresent() {
+        let models = [
+            makeModel("llama", displayName: "Meta/llama"),
+            makeModel("Qwen", displayName: "deepsweet/Qwen"),
+            makeModel("gemma", displayName: "Google/gemma"),
+        ]
+
+        let ids = sortModelsByName(models).map(\.id)
+
+        XCTAssertEqual(ids, ["Qwen", "gemma", "llama"])
+    }
+
+    private func makeModel(_ id: String, displayName: String? = nil) -> ModelDTO {
         ModelDTO(
             id: id,
+            displayName: displayName,
             modelPath: nil,
             loaded: false,
             isLoading: false,
             estimatedSize: 0,
             estimatedSizeFormatted: nil,
+            actualSize: nil,
+            actualSizeFormatted: nil,
             pinned: nil,
             isDefault: nil,
+            isFavorite: nil,
             engineType: nil,
             modelType: nil,
             configModelType: nil,
+            modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,
             dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            qwen4PleSsdOffloadSupported: nil,
+            qwen4PleSsdOffloadForced: nil,
+            qwen4PleResidentBytes: nil,
+            qwen4PleMmapBytes: nil,
+            virtual: nil,
             settings: nil
         )
     }

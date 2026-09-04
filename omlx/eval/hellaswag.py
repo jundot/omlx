@@ -43,6 +43,7 @@ class HellaSwagBenchmark(BaseBenchmark):
 
         logger.info(f"HellaSwag: loaded {len(normalized)} questions")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

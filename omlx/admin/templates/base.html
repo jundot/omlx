@@ -42,6 +42,17 @@
     </script>
 
     <script>
+        // Apply Enhanced Readability immediately so non-chat pages (dashboard,
+        // status) honor the saved toggle on first paint. The chat page also
+        // syncs this in Alpine (setEnhancedReadability).
+        (function() {
+            if (localStorage.getItem('omlx-enhanced-readability') === 'on') {
+                document.documentElement.setAttribute('data-enhanced-readability', '');
+            }
+        })();
+    </script>
+
+    <script>
         // i18n locale strings
         window._t = {{ locale_json | safe }};
         window.t = function(key) { return window._t[key] !== undefined ? window._t[key] : key; };
@@ -55,19 +66,24 @@
             display: inline-block;
         }
 
-        /* Language-specific font stack */
+        /* Global UI tokens */
         :root {
+            --focus-ring-color: #171717;
             {% if current_lang == 'ko' %}
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh' %}
-            --font-sans: 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            --font-sans: 'PingFang SC', 'SF Pro Text', 'Noto Sans SC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh-TW' %}
-            --font-sans: 'Noto Sans TC', 'Inter', system-ui, sans-serif;
+            --font-sans: 'PingFang TC', 'SF Pro Text', 'Noto Sans TC', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'ja' %}
             --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
             {% else %}
             --font-sans: 'Inter', system-ui, sans-serif;
             {% endif %}
+        }
+
+        [data-theme="dark"] {
+            --focus-ring-color: #efefef;
         }
 
         body {
@@ -98,6 +114,25 @@
             box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
         }
 
+        /* Clear keyboard focus indicator (complements the enhanced-readability
+           contrast boost). Visible on :focus-visible only, so mouse users see
+           no extra chrome while keyboard users always see where focus is. */
+        :focus-visible {
+            outline: 2px solid var(--focus-ring-color) !important;
+            outline-offset: 2px;
+        }
+
+        /* Respect "Reduce Motion" (accessibility): collapse CSS transitions
+           and animations so the UI does not animate for users who ask for it. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
+
         /* Benchmark tooltip (fixed position, outside overflow containers) */
         .bench-tip-fixed {
             position: fixed;
@@ -118,6 +153,76 @@
     </style>
 
     {% block head %}{% endblock %}
+
+    <!-- Enhanced Readability: global overrides. Loaded AFTER the head block so it
+         wins over theme variable declarations defined inside that block (cascade fix). -->
+    <style>
+        [data-enhanced-readability] {
+            --text-secondary: var(--text-primary) !important;
+            --text-tertiary: var(--text-primary) !important;
+            --text-muted: var(--text-primary) !important;
+            --text-danger: #d92d20 !important;
+        }
+        [data-theme="dark"][data-enhanced-readability] {
+            --text-danger: #ef5b54 !important;
+        }
+        /* Gray helper text -> primary (keep red). Selector weight (0,3,0) beats
+           dashboard.css dark-mode !important (0,2,0). */
+        [data-enhanced-readability][data-theme] .text-neutral-100,
+        [data-enhanced-readability][data-theme] .text-neutral-200,
+        [data-enhanced-readability][data-theme] .text-neutral-300,
+        [data-enhanced-readability][data-theme] .text-neutral-400,
+        [data-enhanced-readability][data-theme] .text-neutral-500,
+        [data-enhanced-readability][data-theme] .text-neutral-600,
+        [data-enhanced-readability][data-theme] .text-neutral-700,
+        [data-enhanced-readability][data-theme] .text-neutral-800,
+        [data-enhanced-readability][data-theme] .text-muted,
+        [data-enhanced-readability][data-theme] .text-fg-tertiary,
+        [data-enhanced-readability][data-theme] .text-fg-secondary,
+        [data-enhanced-readability][data-theme] .text-fg-muted {
+            color: var(--text-primary) !important;
+        }
+        [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
+        /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
+           excluded (its font-size stays untouched, preserving 1.21em scaling).
+           Tailwind arbitrary-value classes MUST use the escaped form
+           (.text-\[10px\]) to match the compiled selector. */
+        [data-enhanced-readability] .text-\[9px\],
+        [data-enhanced-readability] .text-\[10px\],
+        [data-enhanced-readability] .text-\[11px\],
+        [data-enhanced-readability] .svg-allow-warning,
+        [data-enhanced-readability] .code-copy-btn,
+        [data-enhanced-readability] .svg-render-btn,
+        [data-enhanced-readability] .model-card-content pre code,
+        [data-enhanced-readability] *[style*="font-size: 10px"],
+        [data-enhanced-readability] *[style*="font-size: 11px"],
+        [data-enhanced-readability] *[style*="font-size:10px"],
+        [data-enhanced-readability] *[style*="font-size:11px"] {
+            font-size: 12px !important;
+        }
+        /* Inline gray vars (e.g. style="color: var(--text-tertiary)") -> primary */
+        [data-enhanced-readability] [style*="--text-tertiary"],
+        [data-enhanced-readability] [style*="--text-secondary"],
+        [data-enhanced-readability] [style*="--text-muted"] {
+            color: var(--text-primary) !important;
+        }
+        /* Hardcoded gray hex inline colors -> primary (reds/greens excluded) */
+        [data-enhanced-readability] [style*="color: #3f3f46"],
+        [data-enhanced-readability] [style*="color: #475569"],
+        [data-enhanced-readability] [style*="color: #52525b"],
+        [data-enhanced-readability] [style*="color: #71717a"],
+        [data-enhanced-readability] [style*="color: #a1a1aa"],
+        [data-enhanced-readability] [style*="color: #d4d4d8"],
+        [data-enhanced-readability] [style*="color: #e5e5e5"],
+        [data-enhanced-readability] [style*="color: #efefef"],
+        [data-enhanced-readability] [style*="color: #252529"],
+        [data-enhanced-readability] [style*="color: #18181b"],
+        [data-enhanced-readability] [style*="color: #1d1d20"],
+        [data-enhanced-readability] [style*="color: #2d2d32"] {
+            color: var(--text-primary) !important;
+        }
+    </style>
+
 </head>
 <body class="font-sans bg-white text-neutral-900 antialiased selection:bg-neutral-900 selection:text-white">
     {% block content %}{% endblock %}

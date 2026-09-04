@@ -18,6 +18,9 @@ from .type_handlers import (
     KVCacheHandler,
     MiniMaxM3BatchKVCacheHandler,
     MiniMaxM3KVCacheHandler,
+    Qwen4BatchQSAKVCacheHandler,
+    Qwen4QSAKVCacheHandler,
+    Qwen4QSAQuantizedKVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -45,6 +48,11 @@ class CacheTypeRegistry:
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
+        # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
+        # during speculative decode. The live tensor/state representation is
+        # still rotating-cache compatible and must route through the rotating
+        # handler for prefix-cache storage and reconstruction.
+        "BufferedRotatingKVCache": CacheType.ROTATING_KVCACHE,
         # omlx subclass that overrides size() to clamp by actual buffer
         # length (defined in omlx/cache/_rotating_subclass.py). Cache
         # restore serializes type(cache).__name__, so the registry must
@@ -68,6 +76,9 @@ class CacheTypeRegistry:
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
         "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
         "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
+        "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
+        "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
+        "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
     }
 
     # Default handler instance
@@ -139,6 +150,13 @@ class CacheTypeRegistry:
             CacheType.ROTATING_KVCACHE,
             CacheType.BATCH_ROTATING_KVCACHE,
         )
+
+    @classmethod
+    def is_arrays_family(cls, class_name: str) -> bool:
+        """Check whether a class name belongs to the ArraysCache family."""
+        if class_name == "SizedArraysCache":
+            return True
+        return cls._class_name_map.get(class_name) == CacheType.ARRAYS_CACHE
 
     @classmethod
     def detect_cache_type(cls, cache_obj: Any) -> CacheType:
@@ -251,6 +269,9 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(CacheListHandler())
     CacheTypeRegistry.register(MiniMaxM3KVCacheHandler())
     CacheTypeRegistry.register(MiniMaxM3BatchKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
 
 
 # Initialize handlers when module is imported

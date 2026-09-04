@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+*.dylib
+*.metallib
 
 # Distribution / packaging
 .Python
@@ -121,3 +123,9 @@ docs/native_app_architecture.md
 uv.lock
 # generated TurboQuant memory report (machine-specific)
 tq_batch_memory.md
+
+# Local working notes and session tooling — never part of a PR
+.audit/
+.claude/
+issues.md
+clusterPlan.md

@@ -13,6 +13,10 @@
 //                            (live from /api/oq/estimate, debounced at
 //                            300 ms to match the JS dashboard).
 //
+//   Enhanced quantization — oQe imatrix calibration controls: enable it,
+//                            reuse or select the cache path, and require
+//                            complete imatrix coverage.
+//
 //   Advanced settings     — collapsible block with text-only toggle (VLM
 //                            only), preserve-MTP toggle (only when the
 //                            source model exposes MTP heads), and the
@@ -41,8 +45,8 @@ import SwiftUI
 import Security
 
 struct QuantizationScreen: View {
-    @EnvironmentObject private var services: AppServices
-    @StateObject private var vm = QuantizationScreenVM()
+    @Environment(AppServices.self) private var services
+    @State private var vm = QuantizationScreenVM()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -64,6 +68,7 @@ struct QuantizationScreen: View {
                 selectedModelPath: $vm.selectedModelPath,
                 sensitivityModelPath: $vm.sensitivityModelPath,
                 oqLevel: $vm.oqLevel,
+                enhanced: vm.enhanced,
                 isStarting: vm.isStarting,
                 modelsLoaded: vm.modelsLoaded,
                 onStart: { vm.startQuantization(client: services.client) }
@@ -77,6 +82,14 @@ struct QuantizationScreen: View {
                 )
             }
 
+            EnhancedQuantizationSection(
+                enabled: $vm.enhanced,
+                reuseCache: $vm.imatrixReuseCache,
+                cachePath: $vm.imatrixCachePath,
+                strictCoverage: $vm.imatrixStrict
+            )
+            .padding(.bottom, 12)
+
             AdvancedSection(
                 isOpen: $vm.advancedOpen,
                 selectedIsVLM: vm.selectedIsVLM,
@@ -85,11 +98,16 @@ struct QuantizationScreen: View {
                 preserveMtp: $vm.preserveMtp,
                 dtype: $vm.dtype
             )
+            .padding(.bottom, 12)
 
             MessageBanner(error: vm.lastError, success: vm.lastSuccess)
 
             if vm.modelsLoaded && vm.models.isEmpty {
-                EmptyModelsBanner()
+                HintLine(text: String(localized: "quant.empty_models",
+                                      defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
+                                      comment: "Banner shown when no full-precision models are available to quantize"))
+                    .padding(.horizontal, 14)
+                    .padding(.top, 6)
             }
 
             QueueSection(
@@ -135,6 +153,7 @@ private struct SourceModelSection: View {
     @Binding var selectedModelPath: String
     @Binding var sensitivityModelPath: String
     @Binding var oqLevel: Double
+    let enhanced: Bool
     let isStarting: Bool
     let modelsLoaded: Bool
     let onStart: () -> Void
@@ -146,8 +165,8 @@ private struct SourceModelSection: View {
                    comment: "Section heading for the source-model picker on the Quantization screen"),
             subtitle: modelsLoaded
                 ? String(localized: "quant.source.subtitle.available",
-                         defaultValue: "\(models.count) full-precision model\(models.count == 1 ? "" : "s") available",
-                         comment: "Subtitle for Source Model section. Placeholders: model count, plural suffix")
+                         defaultValue: "Full-precision models available: \(models.count)",
+                         comment: "Subtitle for Source Model section. Placeholder is the full-precision model count")
                 : String(localized: "quant.source.subtitle.loading",
                          defaultValue: "Loading…",
                          comment: "Subtitle while the source model list is loading")
@@ -164,7 +183,7 @@ private struct SourceModelSection: View {
             ) {
                 Popup(
                     selection: $selectedModelPath,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -180,7 +199,7 @@ private struct SourceModelSection: View {
                 ) {
                     Popup(
                         selection: $sensitivityModelPath,
-                        width: 320,
+                        width: .controlWide,
                         options: sensitivityOptions
                     )
                 }
@@ -194,8 +213,8 @@ private struct SourceModelSection: View {
                                  comment: "Row sublabel explaining the oQ level tradeoff")) {
                 Popup(
                     selection: $oqLevel,
-                    width: 120,
-                    options: Self.levelOptions
+                    width: .controlCompact,
+                    options: levelOptions
                 )
             }
 
@@ -233,7 +252,7 @@ private struct SourceModelSection: View {
                                               defaultValue: "Select a model…",
                                               comment: "Placeholder option in the source-model dropdown"))]
         opts += models.map { m in
-            PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
+            PopupOption(value: m.path, label: "\(m.sourceRepoId ?? m.name) (\(m.sizeFormatted))")
         }
         return opts
     }
@@ -244,21 +263,21 @@ private struct SourceModelSection: View {
                                               defaultValue: "None (use source model)",
                                               comment: "Sentinel option meaning no sensitivity-model override"))]
         opts += sensitivityCandidates.map { m in
-            PopupOption(value: m.path, label: "\(m.name) (\(m.sizeFormatted))")
+            PopupOption(value: m.path, label: "\(m.sourceRepoId ?? m.name) (\(m.sizeFormatted))")
         }
         return opts
     }
 
-    // 2 / 3 / 3.5 / 4 / 5 / 6 / 8 — mirrors the HTML <option>s.
-    static let levelOptions: [PopupOption<Double>] = [
-        PopupOption(value: 2,   label: "oQ2"),
-        PopupOption(value: 3,   label: "oQ3"),
-        PopupOption(value: 3.5, label: "oQ3.5"),
-        PopupOption(value: 4,   label: "oQ4"),
-        PopupOption(value: 5,   label: "oQ5"),
-        PopupOption(value: 6,   label: "oQ6"),
-        PopupOption(value: 8,   label: "oQ8"),
-    ]
+    // Mirrors the HTML <option>s. oQe keeps the same bit levels, but makes
+    // the output variant explicit in the picker, as the web UI does.
+    private var levelOptions: [PopupOption<Double>] {
+        Self.levelValues.map { level in
+            let number = level.rounded() == level ? String(Int(level)) : String(level)
+            return PopupOption(value: level, label: "oQ\(number)\(enhanced ? "e" : "")")
+        }
+    }
+
+    private static let levelValues: [Double] = [2, 2.5, 2.7, 2.8, 3, 3.5, 4, 5, 6, 8]
 }
 
 // MARK: - Estimate strip
@@ -293,7 +312,7 @@ private struct EstimateStrip: View {
                              defaultValue: "Output size: ~\(outputSizeText)",
                              comment: "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string"))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }
@@ -358,7 +377,7 @@ private struct AdvancedSection: View {
                                              defaultValue: "Exclude vision encoder weights (~2-3% smaller, text-only output)",
                                              comment: "Toggle row sublabel: text-only quantization effect")
                         ) {
-                            Toggle("", isOn: $textOnly).labelsHidden().toggleStyle(.switch)
+                            RowSwitch(isOn: $textOnly)
                         }
                     }
 
@@ -374,9 +393,7 @@ private struct AdvancedSection: View {
                                      defaultValue: "Unavailable — source model has no MTP heads",
                                      comment: "Toggle row sublabel when MTP isn't supported by the chosen source")
                     ) {
-                        Toggle("", isOn: $preserveMtp)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
+                        RowSwitch(isOn: $preserveMtp)
                             .disabled(!selectedHasMTP)
                     }
 
@@ -393,7 +410,6 @@ private struct AdvancedSection: View {
                             ("bfloat16", "bfloat16"),
                             ("float16",  "float16"),
                         ])
-                        .frame(width: 180)
                     }
                 }
             }
@@ -401,26 +417,83 @@ private struct AdvancedSection: View {
     }
 }
 
-private struct EmptyModelsBanner: View {
-    @Environment(\.omlxTheme) private var theme
+// MARK: - Enhanced quantization (oQe)
+
+/// Controls the optional imatrix calibration pass used by oQe. The server
+/// generates a cache path when this field is left blank, so an empty value is
+/// intentionally sent rather than replaced with a client-specific path.
+private struct EnhancedQuantizationSection: View {
+    @Binding var enabled: Bool
+    @Binding var reuseCache: Bool
+    @Binding var cachePath: String
+    @Binding var strictCoverage: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 11))
-                .foregroundStyle(theme.textTertiary)
-            Text(String(localized: "quant.empty_models",
-                        defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
-                        comment: "Banner shown when no full-precision models are available to quantize"))
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-            Spacer(minLength: 0)
+        SectionHeader(
+            String(localized: "quant.enhanced.title",
+                   defaultValue: "Enhanced quantization (oQe)",
+                   comment: "Section title for the optional oQe imatrix-calibration controls"),
+            subtitle: String(localized: "quant.enhanced.subtitle",
+                             defaultValue: "Use imatrix calibration to weight affine quantization by activation importance.",
+                             comment: "Section subtitle explaining oQe imatrix calibration")
+        )
+
+        ListGroup {
+            Row(
+                label: String(localized: "quant.enhanced.enable.label",
+                              defaultValue: "Enable oQe",
+                              comment: "Toggle label that enables enhanced oQe quantization"),
+                sublabel: String(localized: "quant.enhanced.enable.sub",
+                                 defaultValue: "Collect activation importance and use it to reduce affine quantization error.",
+                                 comment: "Toggle sublabel explaining what enabling oQe does"),
+                isLast: !enabled
+            ) {
+                RowSwitch(isOn: $enabled)
+            }
+
+            if enabled {
+                Row(
+                    label: String(localized: "quant.enhanced.reuse.label",
+                                  defaultValue: "Reuse imatrix cache",
+                                  comment: "Toggle label for reusing a compatible oQe imatrix cache"),
+                    sublabel: String(localized: "quant.enhanced.reuse.sub",
+                                     defaultValue: "Use a compatible cached imatrix when available; otherwise collect a new one.",
+                                     comment: "Toggle sublabel for the oQe imatrix cache reuse option")
+                ) {
+                    RowSwitch(isOn: $reuseCache)
+                }
+
+                Row(
+                    label: String(localized: "quant.enhanced.cache_path.label",
+                                  defaultValue: "Imatrix cache path",
+                                  comment: "Label for the optional oQe imatrix cache path input"),
+                    sublabel: String(localized: "quant.enhanced.cache_path.sub",
+                                     defaultValue: "Leave empty to use an automatic cache location.",
+                                     comment: "Sublabel for the optional oQe imatrix cache path input")
+                ) {
+                    TextInput(
+                        text: $cachePath,
+                        placeholder: String(localized: "quant.enhanced.cache_path.placeholder",
+                                            defaultValue: "Automatic",
+                                            comment: "Placeholder for an automatically selected oQe imatrix cache path"),
+                        mono: true,
+                        width: .controlWide
+                    )
+                }
+
+                Row(
+                    label: String(localized: "quant.enhanced.strict.label",
+                                  defaultValue: "Strict imatrix coverage",
+                                  comment: "Toggle label for requiring imatrix entries for every quantized tensor"),
+                    sublabel: String(localized: "quant.enhanced.strict.sub",
+                                     defaultValue: "Fail when a quantized tensor has no matching imatrix entry instead of falling back to standard oQ.",
+                                     comment: "Toggle sublabel for strict oQe imatrix coverage"),
+                    isLast: true
+                ) {
+                    RowSwitch(isOn: $strictCoverage)
+                }
+            }
         }
-        .padding(10)
-        .background(theme.codeBg)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 18)
-        .padding(.top, 6)
     }
 }
 
@@ -442,8 +515,8 @@ private struct QueueSection: View {
                                   defaultValue: "Queue",
                                   comment: "Section heading for the quantization task queue"),
                           subtitle: String(localized: "quant.queue.subtitle",
-                                           defaultValue: "\(tasks.count) task\(tasks.count == 1 ? "" : "s")",
-                                           comment: "Subtitle for the Queue section. Placeholders: count, plural suffix"))
+                                           defaultValue: "Tasks: \(tasks.count)",
+                                           comment: "Subtitle for the Queue section. Placeholder is the task count"))
 
             ListGroup {
                 ForEach(Array(tasks.enumerated()), id: \.element.id) { idx, task in
@@ -516,7 +589,7 @@ private struct QueueRow: View {
                                comment: "Tooltip on the X button for a terminal quant task"))
             }
             if task.isActive {
-                ProgressBar(progress: max(0, min(task.progress / 100, 1)))
+                ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     if !task.phase.isEmpty {
                         Text(task.phase)
@@ -603,28 +676,6 @@ private struct StatusChip: View {
     }
 }
 
-private struct ProgressBar: View {
-    let progress: Double
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(theme.codeBg)
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(LinearGradient(
-                        colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)],
-                        startPoint: .leading, endPoint: .trailing
-                    ))
-                    .frame(width: geo.size.width * progress)
-                    .animation(.easeOut(duration: 0.4), value: progress)
-            }
-        }
-        .frame(height: 4)
-    }
-}
-
 // MARK: - Upload tasks
 
 // Renders the HF upload queue. Mirrors `QueueSection` for visual parity but
@@ -649,7 +700,7 @@ private struct UploadTasksSection: View {
                        defaultValue: "Uploads",
                        comment: "Section heading for the HF upload task list"),
                 subtitle: String(localized: "quant.uploads.subtitle",
-                                 defaultValue: "\(activeCount) active / \(completedCount) completed",
+                                 defaultValue: "Active: \(activeCount) / completed: \(completedCount)",
                                  comment: "Subtitle for Uploads section. Placeholders: active count, completed count")
             )
 
@@ -718,7 +769,7 @@ private struct UploadRow: View {
                                comment: "Tooltip on the X button for a terminal upload task"))
             }
             if task.isActive {
-                ProgressBar(progress: max(0, min(task.progress / 100, 1)))
+                ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     Text(task.repoId)
                         .font(.omlxMono(11))
@@ -795,7 +846,7 @@ private struct UploadStatusChip: View {
 // repo name entered. Body submission closes the sheet via uploadTarget=nil.
 private struct UploadModalView: View {
     let task: OQTaskDTO
-    @ObservedObject var vm: QuantizationScreenVM
+    @Bindable var vm: QuantizationScreenVM
     let client: OMLXClient
 
     @Environment(\.omlxTheme) private var theme
@@ -901,7 +952,7 @@ private struct UploadModalView: View {
                             placeholder: "hf_…",
                             isSecure: true,
                             mono: true,
-                            width: 220
+                            width: .controlMedium
                         )
                         Button {
                             Task { await vm.validateUploadToken(client: client) }
@@ -938,7 +989,7 @@ private struct UploadModalView: View {
                     ) {
                         Popup(
                             selection: $vm.uploadNamespace,
-                            width: 220,
+                            width: .controlMedium,
                             options: namespaceOptions
                         )
                     }
@@ -991,7 +1042,7 @@ private struct UploadModalView: View {
                             text: $repoName,
                             placeholder: "model-id",
                             mono: true,
-                            width: 240
+                            width: .controlMedium
                         )
                     }
                 }
@@ -1005,7 +1056,7 @@ private struct UploadModalView: View {
                                      comment: "Toggle row sublabel explaining the private flag"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $isPrivate).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $isPrivate)
                 }
             }
         }
@@ -1029,7 +1080,7 @@ private struct UploadModalView: View {
                 ) {
                     Popup(
                         selection: $readmeSourcePath,
-                        width: 260,
+                        width: .controlWide,
                         options: readmeOptions
                     )
                 }
@@ -1043,7 +1094,7 @@ private struct UploadModalView: View {
                                          comment: "Toggle row sublabel for the re-download notice"),
                         isLast: true
                     ) {
-                        Toggle("", isOn: $addRedownloadNotice).labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: $addRedownloadNotice)
                     }
                 } else {
                     // Trailing row stays flush even when the toggle is hidden.
@@ -1163,460 +1214,267 @@ private struct UploadModalView: View {
 // MARK: - About
 
 private struct AboutSection: View {
+    @State private var isOpen = false
+
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
-        SectionHeader(String(localized: "quant.about.title",
-                              defaultValue: "About oQ Quantization",
-                              comment: "Section heading for the static About card on the Quantization screen"))
-
-        ListGroup {
-            FreeRow(isLast: true) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(String(localized: "quant.about.headline",
-                                defaultValue: "oMLX Universal Dynamic Quantization",
-                                comment: "Headline inside the About oQ card"))
-                        .font(.omlxText(13, weight: .semibold))
-                        .foregroundStyle(theme.text)
-                    Text(String(localized: "quant.about.body1",
-                                defaultValue: "Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format. No custom loader required.",
-                                comment: "First body paragraph of the About oQ card"))
-                        .font(.omlxText(11.5))
-                        .foregroundStyle(theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(String(localized: "quant.about.body2",
-                                defaultValue: "oQ measures each layer's quantization sensitivity through calibration (relative MSE vs float16) and builds a byte-budgeted mixed-precision plan that allocates bits where the data says they matter most. Every model gets a unique bit allocation tuned to its architecture.",
-                                comment: "Second body paragraph of the About oQ card"))
-                        .font(.omlxText(11.5))
-                        .foregroundStyle(theme.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { isOpen.toggle() }
+            } label: {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(String(localized: "quant.about.title",
+                                    defaultValue: "About oQ Quantization",
+                                    comment: "Title of the collapsible About oQ Quantization card"))
+                            .font(.omlxText(13, weight: .semibold))
+                            .foregroundStyle(theme.text)
+                        Text(String(localized: "quant.about.subtitle",
+                                    defaultValue: "Compare standard oQ with oQe imatrix and how enhanced quantization works.",
+                                    comment: "Subtitle of the collapsible About oQ Quantization card"))
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    Spacer(minLength: 12)
+                    Image(systemName: isOpen ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(theme.textTertiary)
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isOpen {
+                Rectangle().fill(theme.rowSep).frame(height: 0.5)
+                aboutContent
+                    .padding(14)
             }
         }
+        .background(theme.groupBg)
+        .overlay {
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                .stroke(theme.rowSep, lineWidth: 0.5)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+        .padding(.horizontal, 14)
         .padding(.bottom, 18)
     }
-}
 
-// MARK: - View model
-
-@MainActor
-final class QuantizationScreenVM: ObservableObject {
-    // Form state
-    @Published var selectedModelPath: String = ""
-    @Published var sensitivityModelPath: String = ""
-    @Published var oqLevel: Double = 4
-    @Published var textOnly: Bool = false
-    @Published var preserveMtp: Bool = false
-    @Published var dtype: String = "bfloat16"
-    @Published var advancedOpen: Bool = false
-
-    // Server state
-    @Published private(set) var models: [OQModelInfo] = []
-    @Published private(set) var allModels: [OQModelInfo] = []
-    @Published private(set) var modelsLoaded: Bool = false
-    @Published private(set) var tasks: [OQTaskDTO] = []
-    @Published private(set) var estimate: OQEstimateResponse?
-
-    // Upload state — covers the sheet + the Upload Tasks section. The token
-    // is hydrated from Keychain on `start()` and re-written after a
-    // successful `validateHFUploadToken` round-trip. We hold it in plain
-    // memory while the screen is mounted so the sheet's SecureField stays
-    // bound; it never gets persisted anywhere except the Keychain.
-    @Published var uploadTasks: [HFUploadTaskDTO] = []
-    @Published var uploadTarget: OQTaskDTO?
-    @Published var uploadCandidateModels: [HFUploadModelInfo] = []
-    @Published var uploadToken: String = ""
-    @Published var uploadValidatedUsername: String?
-    @Published var uploadOrgs: [HFOrgInfo] = []
-    @Published var uploadNamespace: String = ""
-    @Published var isValidatingToken: Bool = false
-    @Published var lastUploadError: String?
-
-    // UI state
-    @Published private(set) var isStarting: Bool = false
-    @Published var lastError: String?
-    @Published var lastSuccess: String?
-
-    private weak var client: OMLXClient?
-    private var pollTask: Task<Void, Never>?
-    private var estimateDebounceTask: Task<Void, Never>?
-    private var successClearTask: Task<Void, Never>?
-
-    // Settings (no Codable persistence — form lives only while screen is open).
-    private static let groupSize = 64
-
-    // MARK: Derived
-
-    /// True iff the source model offers sensible sensitivity candidates
-    /// (same model family at lower precision, etc.). The HTML hides the
-    /// dropdown entirely when this is empty.
-    var sensitivityCandidates: [OQModelInfo] {
-        guard let source = models.first(where: { $0.path == selectedModelPath })
-        else { return [] }
-        let prefix = source.name.split(separator: "-").prefix(2).joined(separator: "-")
-        return allModels.filter { m in
-            m.path != selectedModelPath
-            && m.isQuantized
-            && m.name.hasPrefix(prefix)
-        }
-    }
-
-    var selectedIsVLM: Bool {
-        models.first(where: { $0.path == selectedModelPath })?.isVlm ?? false
-    }
-
-    var selectedHasMTP: Bool {
-        models.first(where: { $0.path == selectedModelPath })?.hasMtpHeads ?? false
-    }
-
-    /// Estimate strip — memory pill. Mirrors `oqEstimatedMemory` in JS:
-    /// if a sensitivity model is picked memory ≈ sens.size × 1.5 + 5 GB,
-    /// else the `memory_streaming_formatted` from the API, else the source
-    /// model's static `memory_streaming.peak_formatted`.
-    var memoryText: String {
-        if let est = estimate {
-            if !sensitivityModelPath.isEmpty,
-               let sens = allModels.first(where: { $0.path == sensitivityModelPath }) {
-                let bytes = Int64(Double(sens.size) * 1.5) + 5 * 1024 * 1024 * 1024
-                return formatBytes(bytes)
-            }
-            if let m = est.memoryStreamingFormatted, !m.isEmpty { return m }
-        }
-        return models.first(where: { $0.path == selectedModelPath })?
-            .memoryStreaming?.peakFormatted ?? ""
-    }
-
-    var bpwText: String {
-        guard let est = estimate else { return "" }
-        return String(format: "%.1f", est.effectiveBpw)
-    }
-
-    var outputSizeText: String {
-        estimate?.outputSizeFormatted ?? ""
-    }
-
-    // MARK: Lifecycle
-
-    func start(client: OMLXClient) async {
-        self.client = client
-        // Hydrate the HF token from Keychain. Silent on miss — the sheet
-        // shows an empty SecureField and the user can paste a new token.
-        if let stored = Keychain.read(), !stored.isEmpty {
-            self.uploadToken = stored
-        }
-        await loadModels()
-        await loadUploadCandidates()
-        await loadTasks()
-        await loadUploadTasks()
-        startPollingIfNeeded()
-    }
-
-    func stop() {
-        pollTask?.cancel(); pollTask = nil
-        estimateDebounceTask?.cancel(); estimateDebounceTask = nil
-        successClearTask?.cancel(); successClearTask = nil
-    }
-
-    // MARK: Loaders
-
-    private func loadModels() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listOQModels()
-            self.models = resp.models
-            self.allModels = resp.allModels
-            self.modelsLoaded = true
-        } catch {
-            self.modelsLoaded = true
-            self.lastError = String(localized: "quant.error.load_models",
-                                    defaultValue: "Failed to load models: \(error)",
-                                    comment: "Banner error message when listing OQ models fails. Placeholder is the underlying error")
-        }
-    }
-
-    private func loadTasks() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listOQTasks()
-            // If a task just transitioned from active → completed, refresh
-            // the model list (so the new quantized model shows up as a
-            // sensitivity candidate) and the upload candidate list (so the
-            // README picker can copy from it). No manual reload required.
-            let hadActive = self.tasks.contains(where: { $0.isActive })
-            let hasActiveNow = resp.tasks.contains(where: { $0.isActive })
-            self.tasks = resp.tasks
-            if hadActive && !hasActiveNow {
-                await loadModels()
-                await loadUploadCandidates()
-            }
-        } catch {
-            // Polling failure is expected during server restarts — don't
-            // clobber the user-facing banner with transient errors.
-        }
-    }
-
-    /// Loads local oQ models that can serve as a README source when the user
-    /// picks "Copy from <model>" in the upload sheet. Filtered to oQ output
-    /// (matching the HTML panel's `oq_models` slot) so the dropdown stays
-    /// short.
-    func loadUploadCandidates() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listHFUploadModels()
-            self.uploadCandidateModels = resp.oqModels
-        } catch {
-            // Soft-fail — the auto-generate path still works without
-            // candidates, so we don't block the sheet on this.
-        }
-    }
-
-    private func loadUploadTasks() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listHFUploadTasks()
-            self.uploadTasks = resp.tasks
-        } catch {
-            // Polling failure: stay quiet (same rationale as loadTasks).
-        }
-    }
-
-    // MARK: Polling
-
-    private func startPollingIfNeeded() {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let hasActive = await MainActor.run {
-                    self.tasks.contains(where: { $0.isActive })
-                    || self.uploadTasks.contains(where: { $0.isActive })
-                }
-                if hasActive {
-                    try? await Task.sleep(for: .seconds(2))
-                    if Task.isCancelled { return }
-                    await self.loadTasks()
-                    await self.loadUploadTasks()
-                } else {
-                    // Idle poll cadence — 6 s while no work is queued.
-                    try? await Task.sleep(for: .seconds(6))
-                    if Task.isCancelled { return }
-                    await self.loadTasks()
-                    await self.loadUploadTasks()
-                }
-            }
-        }
-    }
-
-    // MARK: Estimate (debounced)
-
-    /// Schedules a 300 ms debounced fetch — matches the JS dashboard. Each
-    /// call cancels the previous timer so rapid changes (typing in a select,
-    /// keyboard arrows) collapse to a single network round-trip.
-    func scheduleEstimateRefresh(client: OMLXClient) {
-        estimateDebounceTask?.cancel()
-        if selectedModelPath.isEmpty {
-            estimate = nil
-            return
-        }
-        let path = selectedModelPath
-        let level = oqLevel
-        let preserve = selectedHasMTP && preserveMtp
-        estimateDebounceTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
-            if Task.isCancelled { return }
-            do {
-                let est = try await client.estimateOQ(
-                    modelPath: path,
-                    oqLevel: level,
-                    preserveMtp: preserve
+    private var aboutContent: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(
+                    String(localized: "quant.about.intro_title",
+                        defaultValue: "oQ: oMLX Universal Dynamic Quantization",
+                        comment: "Large heading inside the expanded About oQ card")
                 )
-                await MainActor.run {
-                    guard let self else { return }
-                    // Drop the result if the user has moved on to a different
-                    // model since this request was kicked off.
-                    if self.selectedModelPath == path { self.estimate = est }
-                }
-            } catch {
-                // Silent — the strip will read "Calculating…" which is fine
-                // for a transient estimate failure.
-            }
-        }
-    }
-
-    // MARK: Actions
-
-    func startQuantization(client: OMLXClient) {
-        guard !selectedModelPath.isEmpty, !isStarting else { return }
-        isStarting = true
-        lastError = nil
-        lastSuccess = nil
-        let body = OQStartRequest(
-            modelPath: selectedModelPath,
-            oqLevel: oqLevel,
-            groupSize: Self.groupSize,
-            sensitivityModelPath: sensitivityModelPath,
-            textOnly: textOnly,
-            dtype: dtype,
-            preserveMtp: selectedHasMTP && preserveMtp
-        )
-        let displayName = models.first(where: { $0.path == selectedModelPath })?.name
-            ?? selectedModelPath
-        let levelLabel = (oqLevel.rounded() == oqLevel)
-            ? "oQ\(Int(oqLevel))" : "oQ\(oqLevel)"
-        Task { [weak self] in
-            defer { Task { @MainActor [weak self] in self?.isStarting = false } }
-            do {
-                let resp = try await client.startOQQuantization(body)
-                await MainActor.run {
-                    guard let self else { return }
-                    if resp.success {
-                        self.lastSuccess = String(localized: "quant.success.started",
-                                                  defaultValue: "Quantization started: \(displayName) → \(levelLabel)",
-                                                  comment: "Success banner after a quant job starts. Placeholders: source model name, target oQ level")
-                        self.scheduleSuccessClear()
-                    } else {
-                        self.lastError = String(localized: "quant.error.server_refused",
-                                                defaultValue: "Server refused the request",
-                                                comment: "Banner error when the server returned success=false for a quant start")
+                .font(.omlxText(16, weight: .bold))
+                .foregroundStyle(theme.text)
+                HStack(alignment: .top, spacing: 14) {
+                    Rectangle().fill(theme.rowSep).frame(width: 2)
+                    VStack(alignment: .leading, spacing: 6) {
+                        quote(
+                            String(localized: "quant.about.quote.exclusive",
+                                defaultValue: "Quantization should not be exclusive to any particular inference server.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
+                        quote(
+                            String(localized: "quant.about.quote.works_everywhere",
+                                defaultValue: "oQ produces standard mlx-lm models that work everywhere — oMLX, mlx-lm, LM Studio, and any app that supports MLX safetensors format.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
+                        quote(
+                            String(localized: "quant.about.quote.no_loader",
+                                defaultValue: "No custom loader required.",
+                                comment: "Quoted line inside the About oQ card")
+                        )
                     }
                 }
-                await self?.loadTasks()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "quant.error.start_failed",
-                                             defaultValue: "Failed to start: \(error)",
-                                             comment: "Banner error when starting a quant job throws. Placeholder is the underlying error")
-                }
+            }
+
+            section(
+                title: String(localized: "quant.about.mixed_precision.title",
+                    defaultValue: "oQ and oQe: MLX-native mixed precision",
+                    comment: "Section heading in the expanded About oQ card"),
+                body: String(localized: "quant.about.mixed_precision.body",
+                    defaultValue: "The quantizer streams tensors from safetensors, measures layer sensitivity, and writes a byte-budgeted mixed-precision checkpoint. Standard oQ focuses on layer-level sensitivity and model-aware protection rules. oQe keeps that same oQ plan and adds imatrix-weighted affine quantization.",
+                    comment: "Section body in the expanded About oQ card")
+            )
+
+            VStack(alignment: .leading, spacing: 12) {
+                heading(
+                    String(localized: "quant.about.standard.heading",
+                        defaultValue: "What standard oQ does",
+                        comment: "Heading for the standard-oQ feature list in the About oQ card")
+                )
+                feature(
+                    icon: "waveform.path.ecg",
+                    title: String(localized: "quant.about.standard.layer_sensitivity.title",
+                        defaultValue: "Layer sensitivity",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.layer_sensitivity.body",
+                        defaultValue: "is measured with calibration prompts by comparing quantized-layer output error against the float baseline.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+                feature(
+                    icon: "slider.horizontal.3",
+                    title: String(localized: "quant.about.standard.mixed_precision.title",
+                        defaultValue: "Mixed precision",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.mixed_precision.body",
+                        defaultValue: "allocates higher bits to sensitive layers and protected tensors while keeping the target bits-per-weight budget under a hard cap.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+                feature(
+                    icon: "point.bottomleft.forward.to.point.topright.scurvepath",
+                    title: String(localized: "quant.about.standard.architecture.title",
+                        defaultValue: "Architecture rules",
+                        comment: "Standard-oQ feature title in the About oQ card"),
+                    body: String(localized: "quant.about.standard.architecture.body",
+                        defaultValue: "keep MoE routers in fp16, protect shared experts and output-critical tensors, leave vision/audio encoders unquantized, and preserve SSM state tensors.",
+                        comment: "Standard-oQ feature body in the About oQ card")
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                section(
+                    title: String(localized: "quant.about.oqe.heading",
+                        defaultValue: "What oQe adds",
+                        comment: "Heading for the oQe addition section in the About oQ card"),
+                    body: String(localized: "quant.about.oqe.intro",
+                        defaultValue: "oQe uses the same oQ sensitivity planner, then adds an importance-matrix calibration step. This is explicitly borrowed from the llama.cpp imatrix idea: collect activation energy from representative prompts, then use that information so quantization spends less error on the input channels that matter most.",
+                        comment: "oQe section body in the About oQ card")
+                )
+                comparisonTable
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                heading(
+                    String(localized: "quant.about.oqe.how.heading",
+                        defaultValue: "How oQe imatrix works",
+                        comment: "Heading for the imatrix steps in the About oQ card")
+                )
+                step(1,
+                     title: String(localized: "quant.about.oqe.step.collect.title",
+                         defaultValue: "Collect activation energy.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.collect.body",
+                         defaultValue: "oQe runs calibration samples through the model and records average input activation squared, E[x^2], for each quantized Linear input channel.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(2,
+                     title: String(localized: "quant.about.oqe.step.experts.title",
+                         defaultValue: "Track experts separately.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.experts.body",
+                         defaultValue: "For MoE SwitchLinear layers, oQe records one importance vector per expert using the router-selected expert indices, so inactive or rarely active experts are visible in the coverage report.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(3,
+                     title: String(localized: "quant.about.oqe.step.adapt.title",
+                         defaultValue: "Adapt sample count.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.adapt.body",
+                         defaultValue: "Calibration starts from the requested sample count and can continue up to the adaptive maximum when MoE expert coverage is not sufficient.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                step(4,
+                     title: String(localized: "quant.about.oqe.step.weight.title",
+                         defaultValue: "Weight the quantization error.",
+                         comment: "oQe imatrix step title in the About oQ card"),
+                     body: String(localized: "quant.about.oqe.step.weight.body",
+                         defaultValue: "During affine quantization, oQe chooses scale/bias candidates by minimizing sum(importance * (weight - dequantized_weight)^2), not plain unweighted MSE.",
+                         comment: "oQe imatrix step body in the About oQ card"))
+                Text(
+                    String(localized: "quant.about.oqe.fallback",
+                        defaultValue: "If a tensor has no matching imatrix entry, the default behavior is to fall back to standard oQ for that tensor. Enable strict coverage to fail instead.",
+                        comment: "Footnote under the imatrix steps in the About oQ card")
+                )
+                .font(.omlxText(10.5))
+                .foregroundStyle(theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    func cancelTask(taskId: String, client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.cancelOQTask(taskId: taskId)
-                await self?.loadTasks()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "quant.error.cancel_failed",
-                                             defaultValue: "Cancel failed: \(error)",
-                                             comment: "Banner error when cancelling a quant task throws. Placeholder is the underlying error")
-                }
-            }
+    private var comparisonTable: some View {
+        let columns = Array(repeating: GridItem(.flexible(minimum: 72), alignment: .leading), count: 4)
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+            tableCell(String(localized: "quant.about.table.header.path", defaultValue: "Path", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.bits", defaultValue: "Bit allocation", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.affine", defaultValue: "Affine quantization", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell(String(localized: "quant.about.table.header.use", defaultValue: "Best use", comment: "Header cell in the oQ/oQe comparison table"), header: true)
+            tableCell("oQ", header: true)
+            tableCell(String(localized: "quant.about.table.oq.bits", defaultValue: "Layer-sensitivity mixed precision", comment: "oQ row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oq.affine", defaultValue: "Standard min/max affine per group", comment: "oQ row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oq.use", defaultValue: "Fast, deterministic conversion with strong baseline quality", comment: "oQ row cell in the comparison table"))
+            tableCell("oQe", header: true)
+            tableCell(String(localized: "quant.about.table.oqe.bits", defaultValue: "Same oQ plan", comment: "oQe row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oqe.affine", defaultValue: "imatrix-weighted clipping/search per group", comment: "oQe row cell in the comparison table"))
+            tableCell(String(localized: "quant.about.table.oqe.use", defaultValue: "Better low-bit retention, especially for MoE and activation-skewed layers", comment: "oQe row cell in the comparison table"))
+        }
+        .padding(.top, 2)
+    }
+
+    private func section(title: String, body: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            heading(title)
+            Text(body)
+                .font(.omlxText(11.5))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    func removeTask(taskId: String, client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.removeOQTask(taskId: taskId)
-                await self?.loadTasks()
-            } catch {
-                await MainActor.run {
-                    self?.lastError = String(localized: "quant.error.remove_failed",
-                                             defaultValue: "Remove failed: \(error)",
-                                             comment: "Banner error when removing a quant task throws. Placeholder is the underlying error")
-                }
-            }
+    private func heading(_ value: String) -> some View {
+        Text(value)
+            .font(.omlxText(13, weight: .semibold))
+            .foregroundStyle(theme.text)
+    }
+
+    private func quote(_ value: String) -> some View {
+        Text(value)
+            .font(.omlxText(11.5, weight: .semibold))
+            .italic()
+            .foregroundStyle(theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func feature(icon: String, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundStyle(theme.textTertiary)
+                .frame(width: 16)
+            inlineText(title: title, body: body)
         }
     }
 
-    private func scheduleSuccessClear() {
-        successClearTask?.cancel()
-        successClearTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
-            if Task.isCancelled { return }
-            await MainActor.run { self?.lastSuccess = nil }
+    private func step(_ number: Int, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.omlxText(10, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+                .frame(width: 20, height: 20)
+                .background(theme.rowSep)
+                .clipShape(Circle())
+            inlineText(title: title, body: body)
         }
     }
 
-    // MARK: Upload actions
-
-    /// Validates the current `uploadToken` against `/api/upload/validate-token`.
-    /// On success the token is persisted to the Keychain so the next session
-    /// skips this round-trip, and the namespace defaults to the returned
-    /// username (with orgs available via the Popup in the sheet).
-    func validateUploadToken(client: OMLXClient) async {
-        let token = uploadToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            lastUploadError = String(localized: "quant.upload.error.empty_token",
-                                     defaultValue: "Token is empty",
-                                     comment: "Validation error when the HF token field is empty before validation")
-            return
-        }
-        isValidatingToken = true
-        lastUploadError = nil
-        defer { isValidatingToken = false }
-        do {
-            let resp = try await client.validateHFUploadToken(hfToken: token)
-            self.uploadValidatedUsername = resp.username
-            self.uploadOrgs = resp.orgs
-            self.uploadNamespace = resp.username
-            Keychain.write(token)
-        } catch {
-            self.uploadValidatedUsername = nil
-            self.uploadOrgs = []
-            self.uploadNamespace = ""
-            self.lastUploadError = String(localized: "quant.upload.error.validate_failed",
-                                          defaultValue: "Validate failed: \(error.omlxDescription)",
-                                          comment: "Error message when HF token validation throws. Placeholder is the underlying error description")
-        }
+    private func inlineText(title: String, body: String) -> some View {
+        (Text(title).fontWeight(.semibold) + Text(" \(body)"))
+            .font(.omlxText(11.5))
+            .foregroundStyle(theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
-    /// Submits a configured upload job. The caller (the sheet) clears
-    /// `uploadTarget` on success; on failure we surface the message via
-    /// `lastUploadError` and leave the sheet open so the user can correct
-    /// the body and retry without losing their inputs.
-    func startUpload(body: HFUploadStartRequest, client: OMLXClient) async {
-        lastUploadError = nil
-        do {
-            let resp = try await client.startHFUpload(body)
-            if resp.success == false {
-                lastUploadError = String(localized: "quant.upload.error.server_refused",
-                                         defaultValue: "Server refused the request",
-                                         comment: "Error when the server returned success=false for an upload start")
-            }
-            await loadUploadTasks()
-            // Make sure the polling loop picks up the new active task even
-            // if nothing else was running before this submission.
-            startPollingIfNeeded()
-        } catch {
-            lastUploadError = String(localized: "quant.upload.error.start_failed",
-                                     defaultValue: "Upload failed: \(error.omlxDescription)",
-                                     comment: "Error when an upload start request throws. Placeholder is the underlying error description")
-        }
+    private func tableCell(_ value: String, header: Bool = false) -> some View {
+        Text(value)
+            .font(.omlxText(10.5, weight: header ? .semibold : .regular))
+            .foregroundStyle(header ? theme.text : theme.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
-
-    func cancelUpload(taskId: String, client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.cancelHFUploadTask(taskId: taskId)
-                await self?.loadUploadTasks()
-            } catch {
-                await MainActor.run {
-                    self?.lastUploadError = String(localized: "quant.upload.error.cancel_failed",
-                                                   defaultValue: "Cancel failed: \(error)",
-                                                   comment: "Error when cancelling an upload task throws. Placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
-    func removeUpload(taskId: String, client: OMLXClient) {
-        Task { [weak self] in
-            do {
-                _ = try await client.removeHFUploadTask(taskId: taskId)
-                await self?.loadUploadTasks()
-            } catch {
-                await MainActor.run {
-                    self?.lastUploadError = String(localized: "quant.upload.error.remove_failed",
-                                                   defaultValue: "Remove failed: \(error)",
-                                                   comment: "Error when removing an upload task throws. Placeholder is the underlying error")
-                }
-            }
-        }
-    }
-
 }
 
 // MARK: - Keychain helper

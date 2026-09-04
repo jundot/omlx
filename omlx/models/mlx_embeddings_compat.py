@@ -2,10 +2,51 @@
 """Compatibility patches for mlx-embeddings."""
 
 import logging
+from typing import Any
+
+from ..utils.image import load_image
 
 logger = logging.getLogger(__name__)
 
 _QWEN3_VL_PROCESSOR_PATCHED = False
+
+
+def _flatten_images(images: Any) -> list[Any]:
+    """Flatten the per-sample nested image batch transformers hands to processors.
+
+    Text-only items contribute empty slots, which must be dropped rather than
+    forwarded as zero-length arrays.
+    """
+    if isinstance(images, (list, tuple)):
+        flat: list[Any] = []
+        for item in images:
+            flat.extend(_flatten_images(item))
+        return flat
+    return [] if images is None else [images]
+
+
+def _build_contract_compliant_processor(base_cls):
+    """Restore the transformers image-processor contract on mlx-vlm's torch-free port.
+
+    transformers delegates image loading to ``image_processor.fetch_images`` and
+    passes visuals nested per sample. The upstream port overrides ``fetch_images``
+    with a non-recursive, file-path-only version, so a data URI reaches
+    ``_process_one`` as a numpy string array and a nested batch as a 4-D array,
+    both of which fail the ``C, H, W = image.shape`` unpack.
+    """
+
+    class ContractCompliantImageProcessor(base_cls):
+        def fetch_images(self, image_url_or_urls):
+            if isinstance(image_url_or_urls, (list, tuple)):
+                return [self.fetch_images(item) for item in image_url_or_urls]
+            if isinstance(image_url_or_urls, str):
+                return load_image(image_url_or_urls, field="image")
+            return image_url_or_urls
+
+        def __call__(self, images, **kwargs):
+            return super().__call__(_flatten_images(images), **kwargs)
+
+    return ContractCompliantImageProcessor
 
 
 def _ensure_qwen3_vl_mm_token_ids(processor):
@@ -41,6 +82,7 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
     original_auto_image_processor = getattr(
         qwen3_vl_processor, "AutoImageProcessor", None
     )
+    image_processor_cls = _build_contract_compliant_processor(Qwen3VLImageProcessor)
 
     class TorchFreeQwen3VLAutoImageProcessor:
         _omlx_original_auto_image_processor = original_auto_image_processor
@@ -52,7 +94,7 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
                 pretrained_model_name_or_path,
                 default_patch_size=16,
             )
-            return Qwen3VLImageProcessor(**image_kwargs)
+            return image_processor_cls(**image_kwargs)
 
     qwen3_vl_processor.AutoImageProcessor = TorchFreeQwen3VLAutoImageProcessor
 

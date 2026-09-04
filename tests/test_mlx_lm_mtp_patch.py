@@ -57,6 +57,116 @@ class TestCacheRollback:
         cache = ArraysCache(size=2)
         assert cache.rollback_state is None
 
+    def test_full_accept_clears_pooling_undo_chain(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _clear_rollback
+
+        pool = SimpleNamespace(_undo=object(), _undo_chain=True)
+        container = SimpleNamespace(caches=[SimpleNamespace(caches=[pool])])
+
+        _clear_rollback([container])
+
+        assert pool._undo is None
+        assert pool._undo_chain is False
+
+
+class TestMtpBoundaryCommit:
+    @staticmethod
+    def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
+        import mlx.core as mx
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        cache = SimpleNamespace(offset=emitted - 1)
+        model = SimpleNamespace(_omlx_mtp_commit_align=4)
+        if clamp is not None:
+            model.mtp_clamp_accept = lambda _cache, accepted, _drafts: min(
+                accepted, clamp
+            )
+
+        draft_ids = list(range(1, drafts + 1))
+        state = bg._MtpState(
+            uid=1,
+            chain=True,
+            depth=drafts,
+            mtp_cache=[],
+            next_main=mx.array([15], dtype=mx.uint32),
+            drafts=mx.array(draft_ids, dtype=mx.uint32),
+            draft_lps=[mx.zeros((32,)) for _ in draft_ids],
+        )
+
+        def logits_for(targets):
+            rows = []
+            for target in targets:
+                row = [-100.0] * 32
+                row[target] = 0.0
+                rows.append(row)
+            return mx.array([rows], dtype=mx.float32)
+
+        def fake_backbone(_model, inputs, _cache, **_kwargs):
+            width = int(inputs.shape[1])
+            cache.offset += width
+            targets = draft_ids + [20] if width > 1 else [21]
+            return (
+                logits_for(targets),
+                mx.zeros((1, width, 8), dtype=mx.float32),
+                None,
+            )
+
+        def fake_rollback(_model, _cache, accepted, num_drafts, _gdn_states):
+            cache.offset -= num_drafts - accepted
+            return True
+
+        def greedy(logprobs):
+            return mx.argmax(logprobs, axis=-1).astype(mx.uint32)
+
+        batch = SimpleNamespace(
+            model=model,
+            prompt_cache=[cache],
+            tokens=[list(range(emitted))],
+            samplers=[None],
+            fallback_sampler=greedy,
+            logits_processors=[],
+            _token_context=[],
+        )
+
+        monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
+        monkeypatch.setattr(bg, "_chain_next_drafts", lambda *args, **kwargs: None)
+        monkeypatch.setattr(bg, "_clear_rollback", lambda _cache: None)
+
+        bg._run_verify_cycle_chain(batch, state)
+        return batch, state, cache
+
+    @pytest.mark.parametrize(
+        ("drafts", "clamp", "boundary_source"),
+        [
+            (1, None, "bonus"),
+            (2, None, "draft"),
+            (3, 1, "verify"),
+            (4, None, "draft"),
+        ],
+    )
+    def test_boundary_emit_matches_backbone_offset(
+        self, monkeypatch, drafts, clamp, boundary_source
+    ):
+        batch, state, cache = self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=2,
+            drafts=drafts,
+            clamp=clamp,
+        )
+
+        distance = 4 - len(batch.tokens[0])
+        emitted_sources = []
+        for _ in range(distance):
+            token_id, _logprobs, source = state.queue.popleft()
+            batch.tokens[0].append(token_id)
+            emitted_sources.append(source)
+
+        assert emitted_sources[-1] == boundary_source
+        assert len(batch.tokens[0]) == 4
+        assert cache.offset == 4
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
@@ -309,11 +419,13 @@ class TestQwen35MtpNormShift:
 
     def test_oq_discovery_keeps_mtp_norm_shift_on_raw_hf_source(self):
         """oQ streaming-plan discovery runs sanitize on no-data _TrackedTensor
-        placeholders where the per-key magnitude can't be read. The helper
-        must record a conditional replay transform for MTP norms so the
-        materialization path can still decide from the real tensor value.
-        Otherwise full-precision Qwen3.6 sources with mixed MTP norm
-        conventions can be double-shifted or left unshifted."""
+        placeholders. On a raw-HF source (unsanitized conv1d present) every
+        Qwen3-Next RMSNorm gamma is zero-centered, so MTP-head norms record
+        the same unconditional +1 "add" transform as the backbone norms.
+        (The old conditional add_if_mean_lt_0_5 misclassified q_norm/k_norm
+        [raw mean ~0.75] and mtp.norm [raw ~1.27], costing ~14pp of draft
+        acceptance on Qwen3.6-27B.) Pre-converted sources — no unsanitized
+        conv1d — keep the per-key conditional for mixed-convention bundles."""
         import mlx.core as mx
 
         from omlx.oq import _discover_sanitize_plan
@@ -336,14 +448,10 @@ class TestQwen35MtpNormShift:
         }
         plan = _discover_sanitize_plan(m.sanitize, _FakeIdx(meta))
 
-        # Backbone still has a fixed +1 add from the raw-HF conv1d signal.
-        # MTP norms need per-key value checks at materialization time.
+        # Raw-HF source: backbone AND head norms all take the fixed +1 add.
         assert plan["model.layers.0.input_layernorm.weight"]["transform"] == "add"
-        assert (
-            plan["mtp.layers.0.input_layernorm.weight"]["transform"]
-            == "add_if_mean_lt_0_5"
-        )
-        assert plan["mtp.norm.weight"]["transform"] == "add_if_mean_lt_0_5"
+        assert plan["mtp.layers.0.input_layernorm.weight"]["transform"] == "add"
+        assert plan["mtp.norm.weight"]["transform"] == "add"
 
 
 class TestQwen35MoeSanitize:
@@ -458,6 +566,55 @@ class TestQwen35MoeSanitize:
         assert f"{pfx}.shared_expert.gate_proj.weight" in result
         # No bogus switch_mlp keys synthesized for the dense layer.
         assert f"{pfx}.switch_mlp.gate_proj.weight" not in result
+
+    def test_sanitize_backbone_per_expert_form(self, moe_model):
+        """Ornith / raw Qwen3.5 ship *backbone* MoE layers as per-expert
+        tensors. Sanitize must stack them into switch_mlp, leaving no orphan
+        ``experts.{N}.*`` keys behind."""
+        import mlx.core as mx
+
+        weights = {"language_model.model.embed_tokens.weight": mx.zeros((256, 64))}
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            for e in range(4):
+                weights[f"{pfx}.experts.{e}.gate_proj.weight"] = mx.zeros((128, 64))
+                weights[f"{pfx}.experts.{e}.up_proj.weight"] = mx.zeros((128, 64))
+                weights[f"{pfx}.experts.{e}.down_proj.weight"] = mx.zeros((64, 128))
+
+        result = moe_model.sanitize(weights)
+
+        for layer in range(2):
+            pfx = f"language_model.model.layers.{layer}.mlp"
+            # Per-expert weights stacked: leading dim == num_experts (4).
+            assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (4, 128, 64)
+            assert result[f"{pfx}.switch_mlp.up_proj.weight"].shape == (4, 128, 64)
+            assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (4, 64, 128)
+            # No orphan per-expert keys survive.
+            assert not any(f"{pfx}.experts." in k for k in result)
+
+    def test_sanitize_backbone_per_expert_quantized(self, moe_model):
+        """A per-expert *quantized* backbone carries ``.scales``/``.biases``
+        alongside ``.weight``. All three must be stacked, or the leftover
+        per-expert scales/biases trip 'Received N parameters not in model'."""
+        import mlx.core as mx
+
+        pfx = "language_model.model.layers.0.mlp"
+        weights = {"language_model.model.embed_tokens.weight": mx.zeros((256, 64))}
+        for e in range(4):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                weights[f"{pfx}.experts.{e}.{proj}.weight"] = mx.zeros((128, 16))
+                weights[f"{pfx}.experts.{e}.{proj}.scales"] = mx.zeros((128, 2))
+                weights[f"{pfx}.experts.{e}.{proj}.biases"] = mx.zeros((128, 2))
+
+        result = moe_model.sanitize(weights)
+
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight", "scales", "biases"):
+                key = f"{pfx}.switch_mlp.{proj}.{suffix}"
+                assert key in result, key
+                assert result[key].shape[0] == 4  # stacked over experts
+        # No orphan per-expert metadata survives.
+        assert not any(f"{pfx}.experts." in k for k in result)
 
 
 class TestDeepseekV4Model:
@@ -820,7 +977,13 @@ class TestBatchGeneratorDispatch:
             setattr(obj, attr, value)
             assert _batch_generator_allows_mtp_activation(obj) is False
 
-    def _make_bg_next_fake(self, *, size=1, next_size=None, active_state=None):
+    def _make_bg_next_fake(
+        self, *, size=1, next_size=None, active_state=None, queue_len=0
+    ):
+        from collections import deque
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
         class _FakeGenerationBatch:
             def __init__(self, size, next_size, active_state):
                 self.size = size
@@ -828,7 +991,13 @@ class TestBatchGeneratorDispatch:
                 self.next_calls = 0
                 self.extended_with = None
                 if active_state == "single":
-                    self._omlx_mtp_state = object()
+                    # A real state with a matching uid: the handoff-ready
+                    # predicate validates ownership and reads queue depth.
+                    self.uids = [1]
+                    self._omlx_mtp_state = batch_generator._MtpState(
+                        uid=1,
+                        queue=deque([(5, None, "draft")] * queue_len),
+                    )
                 elif active_state == "batch":
                     self._omlx_mtp_batch_state = object()
 
@@ -884,10 +1053,12 @@ class TestBatchGeneratorDispatch:
         )
         return bg, gen_batch, prompt_batch
 
-    def test_active_singleton_mtp_defers_late_join_extend(self):
+    def test_active_singleton_mtp_deep_queue_still_defers_late_join(self):
         from mlx_lm.generate import BatchGenerator
 
-        bg, gen_batch, prompt_batch = self._make_bg_next_fake(active_state="single")
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(
+            active_state="single", queue_len=2
+        )
 
         prompt_responses, generation_responses = BatchGenerator._next(bg)
 
@@ -896,6 +1067,28 @@ class TestBatchGeneratorDispatch:
         assert gen_batch.next_calls == 1
         assert gen_batch.extended_with is None
         assert prompt_batch.split_indices is None
+        assert bg.completion_batch_size == 4
+
+    @pytest.mark.parametrize("queue_len", [0, 1])
+    def test_active_singleton_mtp_drained_queue_admits_late_join_same_call(
+        self, queue_len
+    ):
+        # #2515: with pending work and a drained MTP queue the completion
+        # pin is skipped, so the late join is promoted in this very call.
+        from mlx_lm.generate import BatchGenerator
+
+        bg, gen_batch, prompt_batch = self._make_bg_next_fake(
+            active_state="single", queue_len=queue_len
+        )
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert generation_responses == ["generation"]
+        assert len(prompt_responses) == 1
+        assert gen_batch.extended_with is not None
+        assert gen_batch.extended_with.uids == [99]
+        assert prompt_batch.split_indices == [0]
+        assert prompt_batch.last_inputs == [[123]]
         assert bg.completion_batch_size == 4
 
     def test_active_rowwise_mtp_defers_late_join_even_when_batch_shrinks(self):
@@ -942,9 +1135,323 @@ class TestBatchGeneratorDispatch:
 
         assert batch_generator._generation_batch_has_active_mtp(_EmptyBatch()) is False
 
-    def test_rowwise_batch_eligibility_requires_safe_activation(self):
+    def test_handoff_ready_truth_table(self):
+        from collections import deque
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        def make(queue_len=1, **overrides):
+            batch = SimpleNamespace(
+                uids=[1],
+                _omlx_mtp_activation_safe=False,
+                _omlx_mtp_state=batch_generator._MtpState(
+                    uid=1, queue=deque([(5, None, "draft")] * queue_len)
+                ),
+            )
+            for key, value in overrides.items():
+                setattr(batch, key, value)
+            return batch
+
+        ready = batch_generator._singleton_mtp_handoff_ready
+        assert ready(None) is False
+        # Missing activation-safe stamp means no known pending work.
+        unstamped = make()
+        delattr(unstamped, "_omlx_mtp_activation_safe")
+        assert ready(unstamped) is False
+        assert ready(make(_omlx_mtp_activation_safe=True)) is False
+        # Row-wise batch state keeps the deferral.
+        assert ready(make(_omlx_mtp_batch_state=object())) is False
+        # Stale or absent singleton state keeps the pin.
+        assert ready(make(uids=[2])) is False
+        assert ready(make(_omlx_mtp_state=None)) is False
+        assert ready(make(queue_len=0)) is True
+        assert ready(make(queue_len=1)) is True
+        assert ready(make(queue_len=2)) is False
+
+    def test_patched_next_hands_off_before_mtp_cycle(self, monkeypatch):
+        from collections import deque
+
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        state = batch_generator._MtpState(uid=1, queue=deque([(5, None, "draft")]))
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_state=state,
+            _omlx_mtp_activation_safe=False,
+        )
+
+        calls = []
+
+        def fake_handoff(gen_batch, handoff_state):
+            assert handoff_state is state
+            calls.append("handoff")
+            del gen_batch._omlx_mtp_state
+            return True
+
+        monkeypatch.setattr(
+            batch_generator, "_is_mtp_batch_eligible", lambda _: False
+        )
+        monkeypatch.setattr(batch_generator, "_is_mtp_eligible", lambda _: True)
+        monkeypatch.setattr(
+            batch_generator, "_handoff_mtp_for_late_join", fake_handoff
+        )
+        monkeypatch.setattr(
+            batch_generator,
+            "_prepare_mtp_state_for_next",
+            lambda _: pytest.fail("MTP cycle ran despite a pending late join"),
+        )
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+        monkeypatch.setattr(
+            batch_generator,
+            "_mark_standard_multirow_decode",
+            lambda b: setattr(b, "uids", []),
+        )
+
+        assert GenerationBatch.next(batch) == []
+        assert calls == ["handoff"]
+
+    def test_patched_next_keeps_mtp_when_no_pending(self, monkeypatch):
+        from collections import deque
+
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        state = batch_generator._MtpState(uid=1, queue=deque([(5, None, "draft")]))
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_state=state,
+            _omlx_mtp_activation_safe=True,
+        )
+        sentinel = ["mtp-step"]
+
+        monkeypatch.setattr(
+            batch_generator, "_is_mtp_batch_eligible", lambda _: False
+        )
+        monkeypatch.setattr(batch_generator, "_is_mtp_eligible", lambda _: True)
+        monkeypatch.setattr(
+            batch_generator,
+            "_handoff_mtp_for_late_join",
+            lambda *_: pytest.fail("handoff fired without pending work"),
+        )
+        monkeypatch.setattr(
+            batch_generator, "_prepare_mtp_state_for_next", lambda _: state
+        )
+        monkeypatch.setattr(
+            batch_generator, "_mtp_next", lambda _b, _s: sentinel
+        )
+
+        assert GenerationBatch.next(batch) is sentinel
+
+    def test_patched_next_counts_parked_standard_tokens(self, monkeypatch):
+        from mlx_lm.generate import GenerationBatch
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        matcher_state = object()
+        batch = SimpleNamespace(
+            uids=[7],
+            _omlx_mtp_park_state=batch_generator._MtpParkState(
+                uid=7,
+                tokens_remaining=2,
+            ),
+            _step=lambda: ([42], [None]),
+            _num_tokens=[0],
+            max_tokens=[10],
+            state_machines=[
+                SimpleNamespace(
+                    match=lambda state, _token: (state, None, state)
+                )
+            ],
+            _matcher_states=[matcher_state],
+            Response=lambda **kwargs: kwargs,
+            extract_cache=lambda _idx: [],
+            tokens=[[]],
+        )
+        monkeypatch.setattr(
+            batch_generator, "_is_mtp_batch_eligible", lambda _: False
+        )
+        monkeypatch.setattr(batch_generator, "_is_mtp_eligible", lambda _: False)
+        monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
+
+        GenerationBatch.next(batch)
+        assert batch._omlx_mtp_park_state.tokens_remaining == 1
+        GenerationBatch.next(batch)
+        assert batch._omlx_mtp_park_state.tokens_remaining == 0
+
+    def _make_handoff_batch(self, monkeypatch, *, queue_entries, next_main=None):
+        """Fake singleton batch for _handoff_mtp_for_late_join tests.
+
+        The fake backbone records call input widths and returns logits whose
+        last-position argmax is token id 5, mirroring _make_reconcile_batch.
+        """
+        from collections import deque
+
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        vocab = 8
+        backbone_calls = []
+
+        class _FakeCache:
+            def __init__(self):
+                self.offset = 4
+                self.rollback_state = ("conv", "ssm")
+                self._mtp_draft_stash = object()
+
+        def fake_backbone(model, inputs, cache, n_confirmed=0):
+            backbone_calls.append(int(inputs.shape[1]))
+            arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
+            arr[0, -1, 5] = 10.0
+            return mx.array(arr), None, None
+
+        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
+
+        def greedy(lp_2d):
+            return mx.argmax(lp_2d, axis=-1).astype(mx.uint32)
+
+        state = batch_generator._MtpState(
+            uid=7, queue=deque(queue_entries), next_main=next_main
+        )
+        batch = SimpleNamespace(
+            model=object(),
+            uids=[7],
+            tokens=[[10, 11, 12, 13]],
+            samplers=[None],
+            fallback_sampler=greedy,
+            logits_processors=[],
+            _next_tokens=mx.array([999]),
+            _next_logprobs=[],
+            _token_context=[],
+            prompt_cache=[_FakeCache()],
+            _omlx_mtp_state=state,
+        )
+        return batch_generator, batch, state, backbone_calls
+
+    def test_late_join_handoff_queue_one_is_zero_cost_and_exact(self, monkeypatch):
+        import mlx.core as mx
+
+        lp = mx.zeros((8,))
+        bg, batch, state, backbone_calls = self._make_handoff_batch(
+            monkeypatch, queue_entries=[(42, lp, "draft")]
+        )
+        monkeypatch.setattr(
+            bg,
+            "_call_backbone",
+            lambda *_, **__: pytest.fail("queue==1 handoff must not run the backbone"),
+        )
+        old_cache = batch.prompt_cache[0]
+
+        assert bg._handoff_mtp_for_late_join(batch, state) is True
+        # The sole queued token (only one absent from the cache) is fed next.
+        assert batch._next_tokens.tolist() == [42]
+        assert batch._next_logprobs[0] is lp
+        assert batch.tokens[0] == [10, 11, 12, 13]
+        # Same cache object continues -- no rebuild, no re-prefill.
+        assert batch.prompt_cache[0] is old_cache
+        assert old_cache.rollback_state is None
+        assert old_cache._mtp_draft_stash is None
+        assert not hasattr(batch, "_omlx_mtp_state")
+        assert not hasattr(batch, "_omlx_mtp_park_state")
+        assert not hasattr(batch, "_omlx_mtp_tax_probe")
+
+    def test_late_join_handoff_queue_empty_feeds_next_main_without_parking(
+        self, monkeypatch
+    ):
+        import mlx.core as mx
+
+        bg, batch, state, backbone_calls = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+
+        assert bg._handoff_mtp_for_late_join(batch, state) is True
+        # Exactly one 1-token forward materializes next_main.
+        assert backbone_calls == [1]
+        assert batch._next_tokens.tolist() == [5]
+        assert batch.prompt_cache[0].rollback_state is None
+        assert batch.prompt_cache[0]._mtp_draft_stash is None
+        assert not hasattr(batch, "_omlx_mtp_state")
+        assert not hasattr(batch, "_omlx_mtp_park_state")
+        assert not hasattr(batch, "_omlx_mtp_tax_probe")
+
+    def test_late_join_handoff_declines_deep_queue(self, monkeypatch):
+        import mlx.core as mx
+
+        lp = mx.zeros((8,))
+        bg, batch, state, backbone_calls = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[(42, lp, "draft"), (43, lp, "bonus")],
+        )
+
+        assert bg._handoff_mtp_for_late_join(batch, state) is False
+        assert batch._omlx_mtp_state is state
+        assert batch._next_tokens.tolist() == [999]
+        assert backbone_calls == []
+
+    def test_late_join_handoff_failure_keeps_state(self, monkeypatch):
+        import mlx.core as mx
+
+        bg, batch, state, backbone_calls = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+
+        def broken_backbone(*_, **__):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(bg, "_call_backbone", broken_backbone)
+
+        assert bg._handoff_mtp_for_late_join(batch, state) is False
+        assert batch._omlx_mtp_state is state
+        assert batch._next_tokens.tolist() == [999]
+
+    def test_performance_park_starts_reentry_cooldown(self, monkeypatch):
+        import mlx.core as mx
+
+        bg, batch, state, backbone_calls = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+
+        assert bg._park_mtp_to_standard(batch, state) is True
+        assert backbone_calls == [1]
+        assert batch._omlx_mtp_park_state.uid == 7
+        assert batch._omlx_mtp_park_state.tokens_remaining == 128
+        assert batch._next_tokens.tolist() == [5]
+        assert not hasattr(batch, "_omlx_mtp_state")
+
+    def test_failed_reentry_probe_doubles_cooldown(self, monkeypatch):
+        import mlx.core as mx
+
+        bg, batch, state, _ = self._make_handoff_batch(
+            monkeypatch,
+            queue_entries=[],
+            next_main=mx.array([7], dtype=mx.uint32),
+        )
+        assert bg._park_mtp_to_standard(batch, state) is True
+
+        retry = bg._MtpState(
+            uid=7,
+            next_main=mx.array([7], dtype=mx.uint32),
+            reentry_probe=True,
+        )
+        batch._omlx_mtp_state = retry
+        assert bg._park_mtp_to_standard(batch, retry) is True
+        assert batch._omlx_mtp_park_state.tokens_remaining == 256
+
+    def test_rowwise_batch_eligibility_requires_safe_activation(self, monkeypatch):
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _MtpModel:
             def __init__(self):
@@ -976,9 +1483,51 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
-    def test_rowwise_batch_new_activation_requires_aligned_offsets(self):
+    def test_rowwise_batch_new_activation_is_opt_in(self, monkeypatch):
+        # Default (env unset): no NEW row-wise activation — standard batched
+        # decode measured faster at batch >= 2. Existing batch state still
+        # continues so a mid-flight batch is not torn down by a config flip.
         from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
         from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.delenv(batch_generator._ROWWISE_BATCH_MTP_ENV, raising=False)
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is False
+
+            batch._omlx_mtp_batch_state = batch_generator._MtpBatchState(
+                states={1: batch_generator._MtpState(uid=1)}
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_rowwise_batch_new_activation_allows_ragged_offsets(self, monkeypatch):
+        # Continuous batching admits rows at different times, so per-row
+        # cache offsets rarely align. Activation must not require alignment:
+        # each row is seeded from its own extract_cache view and steady-state
+        # row cycles diverge the offsets anyway (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
 
         class _Offset:
             def __init__(self, values):
@@ -1005,12 +1554,133 @@ class TestBatchGeneratorDispatch:
                 _omlx_mtp_activation_safe=True,
                 prompt_cache=[SimpleNamespace(offset=_Offset([8, 5]))],
             )
-            assert batch_generator._is_mtp_batch_eligible(batch) is False
-
-            batch.prompt_cache = [SimpleNamespace(offset=_Offset([8, 8]))]
             assert batch_generator._is_mtp_batch_eligible(batch) is True
         finally:
             set_mtp_active(prior_active)
+
+    def test_rowwise_batch_activation_allowed_after_standard_multirow_decode(
+        self, monkeypatch
+    ):
+        # The multirow-decode marker protects singleton re-initialization
+        # only. A batch's first decode step is always standard (MTP has not
+        # activated yet), so blocking batch activation on the marker would
+        # permanently lock every batch out of row-wise MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        monkeypatch.setenv(batch_generator._ROWWISE_BATCH_MTP_ENV, "1")
+
+        class _MtpModel:
+            def __init__(self):
+                self.mtp = object()
+                self._omlx_mtp_decode_enabled = True
+
+            def mtp_forward(self, *_):
+                pass
+
+        prior_active = is_mtp_active()
+        try:
+            set_mtp_active(True)
+            batch = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1, 2],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+                prompt_cache=[],
+            )
+            assert batch_generator._is_mtp_batch_eligible(batch) is True
+
+            singleton = SimpleNamespace(
+                model=_MtpModel(),
+                uids=[1],
+                logits_processors=[],
+                _omlx_mtp_activation_safe=True,
+                _omlx_mtp_saw_standard_multirow_decode=True,
+            )
+            assert batch_generator._is_mtp_eligible(singleton) is False
+        finally:
+            set_mtp_active(prior_active)
+
+    def test_singleton_recovery_clears_marker_when_cache_compact(self):
+        # A batch that shrinks back to one row with no residual left padding
+        # satisfies the singleton-init invariant again, so the multirow
+        # marker must lift and the surviving request regains MTP (#2150).
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        batch = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(batch)
+        assert batch._omlx_mtp_saw_standard_multirow_decode is False
+
+        # Residual padding: the invariant does not hold — keep the marker.
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([3]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        # Still multi-row: never clears.
+        multirow = SimpleNamespace(
+            uids=[1, 2],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[SimpleNamespace(left_padding=_Padding([0, 0]))],
+        )
+        batch_generator._maybe_clear_multirow_marker(multirow)
+        assert multirow._omlx_mtp_saw_standard_multirow_decode is True
+
+    def test_singleton_recovery_checks_cachelist_sub_caches(self):
+        # CacheList layers (GLM 5.2 / DeepSeek v3.2 lineage) keep left
+        # padding on their sub-caches, not on the container. The compactness
+        # check must recurse into ``.caches`` instead of skipping the layer,
+        # or the marker clears without verifying anything.
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class _Padding:
+            def __init__(self, values):
+                self._values = values
+
+            def tolist(self):
+                return list(self._values)
+
+        class _CacheList:
+            def __init__(self, *caches):
+                self.caches = caches
+
+        padded = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(SimpleNamespace(left_padding=_Padding([3])))
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(padded)
+        assert padded._omlx_mtp_saw_standard_multirow_decode is True
+
+        compact = SimpleNamespace(
+            uids=[1],
+            _omlx_mtp_saw_standard_multirow_decode=True,
+            prompt_cache=[
+                _CacheList(
+                    SimpleNamespace(left_padding=_Padding([0])),
+                    SimpleNamespace(left_padding=_Padding([0])),
+                )
+            ],
+        )
+        batch_generator._maybe_clear_multirow_marker(compact)
+        assert compact._omlx_mtp_saw_standard_multirow_decode is False
 
     def test_mtp_state_valid_requires_single_matching_uid(self):
         from omlx.patches.mlx_lm_mtp.batch_generator import (
@@ -1130,12 +1800,14 @@ class TestBatchGeneratorDispatch:
         class _FakeCache:
             def __init__(self):
                 self.offset = 0
+                self._mtp_undo = None
 
         def fake_rebuild(model):
             return [_FakeCache()]
 
         def fake_backbone(model, inputs, cache, n_confirmed=0):
             cache[0].offset = int(inputs.shape[1])
+            cache[0]._mtp_undo = object()
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
             return mx.array(arr), None, None
@@ -1187,6 +1859,7 @@ class TestBatchGeneratorDispatch:
         assert 42 not in batch.tokens[0]
         # cache rebuilt to contain exactly the streamed tokens
         assert batch.prompt_cache[0].offset == 4
+        assert batch.prompt_cache[0]._mtp_undo is None
 
     def test_reconcile_empty_queue_samples_from_logits(self, monkeypatch):
         bg, batch, state = self._make_reconcile_batch(
@@ -1252,9 +1925,12 @@ class TestModelSettingsMtp:
         with pytest.raises(ValueError, match="speculative-decoding"):
             ModelSettings(mtp_enabled=True, dflash_enabled=True)
 
-    def test_mutual_exclusion_with_turboquant(self):
-        with pytest.raises(ValueError, match="TurboQuant"):
-            ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+    def test_mtp_with_turboquant_allowed(self):
+        # TurboQuant's attention patch routes MTP's decode-shaped multi-row
+        # verify through the quantized decode kernels, so the combo is valid.
+        s = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert s.mtp_enabled is True
+        assert s.turboquant_kv_enabled is True
 
     def test_mtp_with_specprefill_allowed(self):
         # SpecPrefill targets a different code path (sparse prefill scoring),
@@ -1275,6 +1951,17 @@ class TestMtpCompatibilityHelpers:
 
     def test_has_mtp_heads_nextn_field(self):
         assert _has_mtp_heads({"num_nextn_predict_layers": 2}) is True
+
+    def test_has_mtp_heads_dspark_fields(self):
+        assert (
+            _has_mtp_heads(
+                {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                }
+            )
+            is True
+        )
 
     def test_has_mtp_heads_text_config_field(self):
         assert _has_mtp_heads({"text_config": {"mtp_num_hidden_layers": 1}}) is True
@@ -1298,6 +1985,15 @@ class TestMtpCompatibilityHelpers:
         assert (
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
         )
+
+    def test_is_mtp_compatible_gemma4_unified(self):
+        config = {
+            "text_config": {
+                "mtp_num_hidden_layers": 4,
+                "mtp_assistant_config": {"model_type": "gemma4_unified_assistant"},
+            }
+        }
+        assert _is_mtp_compatible(config, "gemma4_unified") is True
 
     def test_is_mtp_compatible_llama_rejected(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "llama") is False
@@ -1709,9 +2405,9 @@ class TestRestoreOrTrimAtomicity:
 
 class TestRotatingCacheMtpUndo:
     """A rotated RotatingKVCache cannot trim, so MTP draft rejection needs
-    the armed one-update undo log: restore the pre-verify references and
-    replay the confirmed token. Equivalence is checked against a reference
-    cache that never saw the rejected draft."""
+    the armed verify-block undo log: restore the pre-verify state and replay
+    the confirmed/accepted prefix. Equivalence is checked against a reference
+    cache that never saw the rejected positions."""
 
     @staticmethod
     def _fill(cache, n, dim=4, start=0):
@@ -1721,7 +2417,7 @@ class TestRotatingCacheMtpUndo:
             k = mx.full((1, 1, 1, dim), float(i))
             cache.update_and_fetch(k, k)
 
-    def _run_equivalence(self, make_cache):
+    def _run_equivalence(self, make_cache, num_drafts=1):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -1733,18 +2429,22 @@ class TestRotatingCacheMtpUndo:
         self._fill(cache, 12)
         self._fill(ref, 12)
 
-        confirmed = mx.full((1, 1, 1, 4), 100.0)
-        draft = mx.full((1, 1, 1, 4), 200.0)
-        both = mx.concatenate([confirmed, draft], axis=2)
+        verify_steps = num_drafts + 1
+        verify = mx.broadcast_to(
+            mx.arange(100, 100 + verify_steps, dtype=mx.float32).reshape(
+                1, 1, verify_steps, 1
+            ),
+            (1, 1, verify_steps, 4),
+        )
         cache_rollback.set_undo_armed(True)
         try:
-            cache.update_and_fetch(both, both)
+            cache.update_and_fetch(verify, verify)
         finally:
             cache_rollback.set_undo_armed(False)
         assert cache.is_trimmable()
-        assert cache.trim(1) == 1
+        assert cache.trim(num_drafts) == num_drafts
 
-        ref.update_and_fetch(confirmed, confirmed)
+        ref.update_and_fetch(verify[..., :1, :], verify[..., :1, :])
 
         nxt = mx.full((1, 1, 1, 4), 300.0)
         ck, cv = cache.update_and_fetch(nxt, nxt)
@@ -1752,6 +2452,7 @@ class TestRotatingCacheMtpUndo:
         mx.eval(ck, cv, rk, rv)
         assert mx.array_equal(ck, rk).item()
         assert mx.array_equal(cv, rv).item()
+        assert cache.meta_state == ref.meta_state
         c_off = cache.offset
         r_off = ref.offset
         if hasattr(c_off, "tolist"):
@@ -1768,6 +2469,18 @@ class TestRotatingCacheMtpUndo:
         from mlx_lm.models.cache import BatchRotatingKVCache
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]))
+
+    def test_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        # Depth-8 contains one confirmed token plus eight drafts. The old gate
+        # admitted at most eight positions, excluding this nine-position update.
+        self._run_equivalence(lambda: RotatingKVCache(max_size=8), num_drafts=8)
+
+    def test_batch_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import BatchRotatingKVCache
+
+        self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
@@ -1795,3 +2508,316 @@ class TestRotatingCacheMtpUndo:
         assert cache.is_trimmable()
         assert cache.trim(1) == 1
         assert cache.offset == 3
+
+
+class TestReversiblePerformancePark:
+    """Performance parking must be scoped and reversible for one sequence.
+
+    GenerationBatch objects are reused across requests through extend() merges,
+    so the cooldown is keyed by uid and must not leak to a later request.
+    """
+
+    def _fake_batch(self, uids):
+        model = SimpleNamespace(
+            mtp_forward=lambda *a, **k: None,
+            mtp=object(),
+            _omlx_mtp_decode_enabled=True,
+        )
+        return SimpleNamespace(
+            model=model,
+            uids=list(uids),
+            logits_processors=None,
+        )
+
+    def test_cooldown_blocks_then_releases_same_uid(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        assert batch_generator._mtp_common_eligible(gb)
+        park = batch_generator._MtpParkState(uid=7, tokens_remaining=2)
+        gb._omlx_mtp_park_state = park
+        assert not batch_generator._mtp_common_eligible(gb)
+        batch_generator._record_parked_standard_step(gb)
+        assert not batch_generator._mtp_common_eligible(gb)
+        batch_generator._record_parked_standard_step(gb)
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        assert batch_generator._mtp_common_eligible(gb)
+
+    def test_cooldown_does_not_leak_to_reused_batch(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(uid=7)
+        # The parked request finished; a new request reuses the batch object.
+        gb.uids = [8]
+        assert batch_generator._mtp_common_eligible(gb)
+        assert not hasattr(gb, "_omlx_mtp_park_state")
+
+    def test_failed_probe_uses_bounded_exponential_backoff(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        park = batch_generator._MtpParkState(uid=7)
+        expected = [256, 512, 1024, 2048, 4096, 4096]
+        actual = []
+        for _ in expected:
+            park.restart_after_failed_probe()
+            actual.append(park.tokens_remaining)
+        assert actual == expected
+
+    def test_active_probe_stays_eligible_during_prefill_contention(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+        gb._omlx_mtp_state = batch_generator._MtpState(
+            uid=7,
+            reentry_probe=True,
+        )
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: True)
+        assert batch_generator._mtp_common_eligible(gb)
+
+    def test_due_probe_still_requires_singleton_batch(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7, 8])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=1,
+        )
+        batch_generator._record_parked_standard_step(gb)
+        assert gb._omlx_mtp_park_state.tokens_remaining == 0
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        assert not batch_generator._mtp_common_eligible(gb)
+
+    def test_due_cooldown_marks_new_state_as_reentry_probe(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+        monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
+        monkeypatch.setattr(
+            batch_generator, "_set_singleton_mrope_delta", lambda _: None
+        )
+
+        def fake_post_init(batch):
+            batch._omlx_mtp_state = batch_generator._MtpState(uid=7)
+
+        monkeypatch.setattr(batch_generator, "_post_init_mtp", fake_post_init)
+
+        state = batch_generator._prepare_mtp_state_for_next(gb)
+        assert state is not None
+        assert state.reentry_probe is True
+
+    def test_existing_controller_accepts_winning_reentry_probe(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        controller = batch_generator._DepthController(3)
+        controller._warmup = []
+        controller.exit_streak = 0
+        state = batch_generator._MtpState(
+            uid=7,
+            controller=controller,
+            reentry_probe=True,
+        )
+        gb = self._fake_batch([7])
+        gb._omlx_mtp_park_state = batch_generator._MtpParkState(
+            uid=7,
+            tokens_remaining=0,
+        )
+
+        assert batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is False
+        assert not hasattr(gb, "_omlx_mtp_park_state")
+
+    def test_losing_reentry_probe_keeps_cooldown_state(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        controller = batch_generator._DepthController(3)
+        controller._warmup = []
+        controller.exit_streak = 1
+        state = batch_generator._MtpState(
+            uid=7,
+            controller=controller,
+            reentry_probe=True,
+        )
+        gb = self._fake_batch([7])
+        park = batch_generator._MtpParkState(uid=7, tokens_remaining=0)
+        gb._omlx_mtp_park_state = park
+
+        assert not batch_generator._maybe_finish_mtp_reentry_probe(
+            gb,
+            state,
+            was_warmup=False,
+        )
+        assert state.reentry_probe is True
+        assert gb._omlx_mtp_park_state is park
+
+    def test_tax_probe_discarded_when_batch_gains_rows(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        for _ in range(_STD_TAX_SKIP + 2):
+            _record_std_tax_sample(gb, 10.0)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        # Another request merges in mid-probe: multi-row step timings must
+        # not contaminate the singleton loop-tax ratio.
+        gb.uids = [7, 9]
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_prefill_tracker():
+    """Loop-tax probes consult the process-global prefill tracker; keep
+    every test in this module hermetic against activity left behind by
+    other suites (or by earlier tests here)."""
+    from omlx.prefill_progress import get_prefill_tracker
+
+    get_prefill_tracker().clear()
+    yield
+    get_prefill_tracker().clear()
+
+
+class TestLoopTaxHygiene:
+    """#2622: park probes must not latch contention-shaped timings.
+
+    A park that fires while another request is prefilling (any engine on
+    the shared GPU) measures a contention-inflated t0; if the std samples
+    then run after the contention ends, the t0/t_std ratio poisons
+    ``model._omlx_mtp_loop_tax`` and every later sequence exits MTP
+    against an inflated margin until restart.
+    """
+
+    def _fake_batch(self, uids):
+        return SimpleNamespace(model=SimpleNamespace(), uids=list(uids))
+
+    def _tracker(self):
+        from omlx.prefill_progress import get_prefill_tracker
+
+        return get_prefill_tracker()
+
+    def _drain_probe(self, gb, std_ms=10.0):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _record_std_tax_sample,
+        )
+
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES):
+            _record_std_tax_sample(gb, std_ms)
+
+    def test_probe_not_armed_while_prefill_live(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        self._tracker().update("r1", 10, 100, "modelA")
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_not_armed_right_after_prefill_end(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        tracker = self._tracker()
+        tracker.update("r1", 10, 100, "modelA")
+        tracker.update("r1", 100, 100, "modelA")  # completes, entry popped
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_discarded_when_prefill_ran_during_sampling(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES - 1):
+            _record_std_tax_sample(gb, 10.0)
+        # A prefill starts (and would end) inside the sampling window: the
+        # finalize step must throw the whole probe away.
+        self._tracker().update("r2", 10, 100, "modelB")
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+    def test_clean_probe_still_latches_with_timestamp(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        self._drain_probe(gb)
+        assert gb.model._omlx_mtp_loop_tax == pytest.approx(1.5)
+        assert hasattr(gb.model, "_omlx_mtp_loop_tax_ts")
+
+    def test_tax_log_level_by_threshold(self, caplog):
+        import logging
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        logger_name = "omlx.patches.mlx_lm_mtp.batch_generator"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            gb = self._fake_batch([7])
+            _arm_std_tax_probe(gb, 15.0, uid=7)
+            self._drain_probe(gb)  # tax 1.5 >= warn threshold
+            assert any(
+                "MTP loop tax measured" in r.message
+                and r.levelno == logging.INFO
+                for r in caplog.records
+            )
+            caplog.clear()
+            gb2 = self._fake_batch([8])
+            _arm_std_tax_probe(gb2, 11.0, uid=8)
+            self._drain_probe(gb2)  # tax 1.1 < warn threshold -> DEBUG only
+            assert not any(
+                "MTP loop tax measured" in r.message for r in caplog.records
+            )
+
+    def test_effective_loop_tax_decays_toward_default(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_DECAY_S,
+            _DepthController,
+            _effective_loop_tax,
+        )
+
+        model = SimpleNamespace()
+        assert _effective_loop_tax(model) is None
+        model._omlx_mtp_loop_tax = 1.5
+        # Legacy attribute without a timestamp passes through unchanged.
+        assert _effective_loop_tax(model) == pytest.approx(1.5)
+        model._omlx_mtp_loop_tax_ts = time.monotonic()
+        assert _effective_loop_tax(model) == pytest.approx(1.5, abs=0.01)
+        model._omlx_mtp_loop_tax_ts = time.monotonic() - 3 * _STD_TAX_DECAY_S
+        aged = _effective_loop_tax(model)
+        assert _DepthController.EXIT_MARGIN <= aged < 1.2
+
+    def test_recently_active_window(self):
+        tracker = self._tracker()
+        assert not tracker.recently_active(3.0)
+        tracker.update("r1", 10, 100, "m")
+        assert tracker.recently_active(3.0)
+        tracker.update("r1", 100, 100, "m")
+        assert tracker.recently_active(3.0)  # just-finished counts
+        tracker.clear()
+        assert not tracker.recently_active(3.0)

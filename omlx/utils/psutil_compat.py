@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 _HOST_VM_INFO64 = 4
 _HOST_INFO64_MAX_COUNT = 256
 _VM_STATS_MIN_COUNT = 4
+# Offsets into vm_statistics64_data_t past the stable first four. Cross-checked
+# against `vm_stat` output on Apple Silicon.
+_VM_SPECULATIVE_INDEX = 23
+_VM_COMPRESSOR_INDEX = 32
 _VM_PAGE_SIZE = 16384
 _SYSCTL = "/usr/sbin/sysctl"
 _VM_STAT = "/usr/bin/vm_stat"
@@ -101,6 +105,9 @@ def get_macos_vm_stats() -> dict[str, int] | None:
 
     The first four counters are stable across SDK versions. The oversized
     host_info64_t buffer avoids binding oMLX to an SDK-specific struct tail.
+    "speculative" and "compressed" sit further into the struct and are only
+    reported when the kernel filled that far, so callers must treat them as
+    optional.
     """
     if _libc is None or _MACH_HOST is None:
         return None
@@ -113,12 +120,17 @@ def get_macos_vm_stats() -> dict[str, int] | None:
         if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
             return None
         ps = _VM_PAGE_SIZE
-        return {
+        result = {
             "free": int(stats[0]) * ps,
             "active": int(stats[1]) * ps,
             "inactive": int(stats[2]) * ps,
             "wired": int(stats[3]) * ps,
         }
+        if count.value > _VM_SPECULATIVE_INDEX:
+            result["speculative"] = int(stats[_VM_SPECULATIVE_INDEX]) * ps
+        if count.value > _VM_COMPRESSOR_INDEX:
+            result["compressed"] = int(stats[_VM_COMPRESSOR_INDEX]) * ps
+        return result
     except Exception:  # noqa: BLE001
         return None
 

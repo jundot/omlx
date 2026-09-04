@@ -14,6 +14,7 @@ final class ProfileScopeTests: XCTestCase {
             name: "x", displayName: "X",
             description: nil, createdAt: nil, updatedAt: nil,
             sourceTemplate: nil, isBuiltin: isBuiltin,
+            exposeAsModel: nil, modelId: nil, hasEngineFields: nil,
             settings: nil
         )
     }

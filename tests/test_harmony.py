@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Harmony streaming parser (omlx.adapter.harmony)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -101,6 +102,39 @@ class TestToolCallParsing:
         _, stream_token, visible_token, _ = last
         assert stream_token is None
         assert visible_token is None
+
+    def test_get_tool_calls_channel_rules(self):
+        """Commentary always counts; analysis counts only with JSON arguments."""
+        parser = object.__new__(HarmonyStreamingParser)
+        parser._parser = SimpleNamespace(
+            messages=[
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="analysis-noise")],
+                ),
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
+                ),
+                SimpleNamespace(
+                    channel="commentary",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"ok.py"}')],
+                ),
+                SimpleNamespace(
+                    channel="final",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="final-noise")],
+                ),
+            ]
+        )
+
+        assert parser.get_tool_calls() == [
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
+        ]
 
 
 # ── Multi-message sequences ──────────────────────────────────────────
@@ -359,3 +393,88 @@ class TestParseToolCallsFromTokens:
         assert output_text == ""
         assert "thinking" in analysis_text
         assert tool_calls == []
+
+    def test_channel_rules_for_function_recipient(self, monkeypatch):
+        """Commentary and JSON-argument analysis recipients become tool calls."""
+        messages = [
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="analysis-noise")],
+            ),
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
+            ),
+            SimpleNamespace(
+                channel="commentary",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"ok.py"}')],
+            ),
+            SimpleNamespace(
+                channel="final",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="final-noise")],
+            ),
+            SimpleNamespace(
+                channel="other",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="other-noise")],
+            ),
+        ]
+
+        class FakeEncoding:
+            def encode(self, text, allowed_special="all"):
+                return [1, 2] if text == "<|start|>assistant" else [3]
+
+            def decode(self, token_ids):
+                return "decoded"
+
+            def parse_messages_from_completion_tokens(self, token_ids, role, strict):
+                return messages
+
+        monkeypatch.setattr(
+            "omlx.adapter.harmony.load_harmony_gpt_oss_encoding",
+            lambda: FakeEncoding(),
+        )
+
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens([99])
+
+        assert analysis_text == "analysis-noise"
+        assert output_text == "final-noise"
+        assert tool_calls == [
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
+        ]
+
+    def test_analysis_channel_tool_call_with_recipient(self, encoding):
+        """Analysis-channel tool calls with explicit recipients are honored (#2216)."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>Now need files.<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            '<|message|>{"filePath": "/tmp/x.py", "offset": 1}<|call|>',
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == [
+            {"name": "read", "arguments": '{"filePath": "/tmp/x.py", "offset": 1}'}
+        ]
+        assert "Now need files." in analysis_text
+        assert "filePath" not in analysis_text
+
+    def test_analysis_recipient_with_prose_stays_reasoning(self, encoding):
+        """Analysis messages addressed to a tool without JSON args stay reasoning."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>ok<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            "<|message|>maybe I should read the file<|call|>",
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == []
+        assert "maybe I should read the file" in analysis_text

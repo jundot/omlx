@@ -8,6 +8,7 @@ Handles conversion between Anthropic API format and internal oMLX format.
 import base64
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -444,6 +445,16 @@ def convert_anthropic_to_internal(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
+
     from .utils import _merge_consecutive_roles
 
     return _merge_consecutive_roles(processed_messages)
@@ -656,6 +667,16 @@ def convert_anthropic_to_internal_harmony(
             # Unknown format
             processed_messages.append({"role": role, "content": str(content)})
 
+    # Claude Code 2.1.154+ may carry system content inline in messages[]
+    # (see _normalize_in_messages_system); with consolidation off those
+    # blocks bypass _extract_system_text, so the budget markers are
+    # stripped here too before role merging.
+    for msg in processed_messages:
+        if msg.get("role") in ("system", "developer") and isinstance(
+            msg.get("content"), str
+        ):
+            msg["content"] = _strip_client_budget_markers(msg["content"])
+
     from .utils import _merge_consecutive_roles
 
     return _merge_consecutive_roles(processed_messages)
@@ -665,11 +686,30 @@ def convert_anthropic_to_internal_harmony(
 # contains randomly changing values, breaking prefix cache).
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 
+# Claude Code appends a `<total_tokens>N tokens left</total_tokens>` budget
+# marker to the end of the system prompt with a freshly decremented N on
+# every request, keeping the stale copies, so the prompt head both changes
+# and grows each call and no prefix past it can ever be reused (measured as
+# full ~60k-token re-prefills per turn). The marker is informational only —
+# nothing downstream parses it — so it is stripped wholesale, like the
+# billing header above.
+_TOTAL_TOKENS_MARKER_RE = re.compile(
+    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
+)
+
+
+def _strip_client_budget_markers(text: str) -> str:
+    """Remove Claude Code per-request token-budget markers from system text."""
+    if "<total_tokens>" not in text:
+        return text
+
+    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
+
 
 def _extract_system_text(system: str | list[SystemContent]) -> str:
     """Extract text from system field."""
     if isinstance(system, str):
-        return system
+        return _strip_client_budget_markers(system)
     elif isinstance(system, list):
         text_parts = []
         for block in system:
@@ -683,7 +723,7 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
             if text.startswith(_BILLING_HEADER_PREFIX):
                 continue
             text_parts.append(text)
-        return "\n".join(text_parts)
+        return _strip_client_budget_markers("\n".join(text_parts))
     return ""
 
 

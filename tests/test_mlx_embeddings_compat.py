@@ -6,6 +6,21 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+from PIL import Image
+
+from omlx.exceptions import InvalidRequestError
+from omlx.models.mlx_embeddings_compat import (
+    _build_contract_compliant_processor,
+    _flatten_images,
+)
+
+IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "58BAwAI/AL+26JNFgAAAABJRU5ErkJggg=="
+)
+
 
 def _install_fake_module(monkeypatch, name, module):
     monkeypatch.setitem(sys.modules, name, module)
@@ -73,7 +88,7 @@ def test_qwen3_vl_auto_image_processor_uses_mlx_vlm_torch_free_loader(monkeypatc
         Path(__file__).resolve().parents[1] / "omlx/models/mlx_embeddings_compat.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "mlx_embeddings_compat_under_test", module_path
+        "omlx.models.mlx_embeddings_compat_under_test", module_path
     )
     mlx_embeddings_compat = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mlx_embeddings_compat)
@@ -160,7 +175,7 @@ def test_qwen3_vl_build_processor_gets_multimodal_token_id_fields(monkeypatch):
         Path(__file__).resolve().parents[1] / "omlx/models/mlx_embeddings_compat.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "mlx_embeddings_compat_under_test_mm_ids", module_path
+        "omlx.models.mlx_embeddings_compat_under_test_mm_ids", module_path
     )
     mlx_embeddings_compat = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mlx_embeddings_compat)
@@ -174,3 +189,49 @@ def test_qwen3_vl_build_processor_gets_multimodal_token_id_fields(monkeypatch):
     assert processor.image_ids == [151655]
     assert processor.video_ids == [151656]
     assert processor.audio_ids == [None]
+
+
+def test_flatten_images_drops_empty_slots_of_a_nested_batch():
+    """transformers batches visuals per sample, so text-only items arrive as empty slots."""
+    assert _flatten_images([["a"], [], ["b", "c"]]) == ["a", "b", "c"]
+    assert _flatten_images([[None], []]) == []
+    assert _flatten_images([]) == []
+    assert _flatten_images(None) == []
+    assert _flatten_images("a") == ["a"]
+
+
+def test_contract_compliant_processor_loads_images_before_the_torch_free_port():
+    """A data URI must arrive as an image, since the port only knows file paths."""
+    seen = {}
+
+    class TorchFreeImageProcessor:
+        def __call__(self, images, **kwargs):
+            seen["images"] = images
+            seen["kwargs"] = kwargs
+            return {"pixel_values": images}
+
+    processor = _build_contract_compliant_processor(TorchFreeImageProcessor)()
+
+    fetched = processor.fetch_images([[IMAGE_DATA_URI], []])
+    assert isinstance(fetched[0][0], Image.Image)
+    assert fetched[1] == []
+
+    processor(fetched, do_rescale=True)
+    assert len(seen["images"]) == 1
+    assert isinstance(seen["images"][0], Image.Image)
+    assert seen["kwargs"] == {"do_rescale": True}
+
+
+def test_contract_compliant_processor_keeps_rejecting_non_data_uri_images():
+    """Loading stays on omlx's data-URI-only path, so paths and URLs are still refused."""
+
+    class TorchFreeImageProcessor:
+        def __call__(self, images, **kwargs):
+            return images
+
+    processor = _build_contract_compliant_processor(TorchFreeImageProcessor)()
+
+    with pytest.raises(InvalidRequestError):
+        processor.fetch_images(["/etc/passwd"])
+    with pytest.raises(InvalidRequestError):
+        processor.fetch_images(["https://example.com/cat.png"])

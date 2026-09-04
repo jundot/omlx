@@ -37,6 +37,20 @@ struct ProfileDTO: Codable, Equatable, Sendable, Identifiable {
     /// save/update/delete with a built-in name returns 400). UI should
     /// render the Edit/Delete affordances disabled when this is true.
     let isBuiltin: Bool?
+    /// Server-side `expose_as_model` — when true this per-model profile is
+    /// also published as an independent model ID on /v1/models, overlaying
+    /// its settings on the base model per request. Nil for templates and
+    /// for servers that predate the feature.
+    let exposeAsModel: Bool?
+    /// Derived API model ID (`<base-model>:<profile-name>`) the exposed
+    /// profile serves under. The server computes it from the profile name;
+    /// sent on per-model profile responses only.
+    let modelId: String?
+    /// Server-derived: true when the profile overrides engine-construction
+    /// fields, which the exposed-model overlay ignores. Drives the warning
+    /// under the expose toggle — the server owns the field classification,
+    /// so the client never mirrors the list.
+    let hasEngineFields: Bool?
     /// Free-form. We re-shape on apply via `applyProfile()`, not by reading
     /// every setting individually.
     let settings: [String: AnyCodable]?
@@ -59,12 +73,14 @@ struct CreateProfileRequest: Encodable, Sendable {
     let sourceTemplate: String?
     let settings: [String: AnyCodable]?
     let alsoSaveAsTemplate: Bool
+    let exposeAsModel: Bool
 
     enum CodingKeys: String, CodingKey {
         case name, displayName, description
         case sourceTemplate = "source_template"
         case settings
         case alsoSaveAsTemplate = "also_save_as_template"
+        case exposeAsModel = "expose_as_model"
     }
 
     init(
@@ -73,7 +89,8 @@ struct CreateProfileRequest: Encodable, Sendable {
         description: String? = nil,
         sourceTemplate: String? = nil,
         settings: [String: AnyCodable]? = nil,
-        alsoSaveAsTemplate: Bool = false
+        alsoSaveAsTemplate: Bool = false,
+        exposeAsModel: Bool = false
     ) {
         self.name = name
         self.displayName = displayName
@@ -81,6 +98,7 @@ struct CreateProfileRequest: Encodable, Sendable {
         self.sourceTemplate = sourceTemplate
         self.settings = settings
         self.alsoSaveAsTemplate = alsoSaveAsTemplate
+        self.exposeAsModel = exposeAsModel
     }
 }
 
@@ -104,6 +122,10 @@ struct UpdateProfileRequest: Encodable, Sendable {
     let settings: [String: AnyCodable]?
     let sourceTemplate: String?
     let alsoSaveAsTemplate: Bool
+    /// Nil is omitted from the body — the server treats an absent flag as
+    /// "don't touch", so settings-only updates never clobber exposure
+    /// state set elsewhere (e.g. the web dashboard).
+    let exposeAsModel: Bool?
 
     enum CodingKeys: String, CodingKey {
         case newName = "new_name"
@@ -112,6 +134,7 @@ struct UpdateProfileRequest: Encodable, Sendable {
         case settings
         case sourceTemplate = "source_template"
         case alsoSaveAsTemplate = "also_save_as_template"
+        case exposeAsModel = "expose_as_model"
     }
 
     init(
@@ -120,7 +143,8 @@ struct UpdateProfileRequest: Encodable, Sendable {
         description: String? = nil,
         settings: [String: AnyCodable]? = nil,
         sourceTemplate: String? = nil,
-        alsoSaveAsTemplate: Bool = false
+        alsoSaveAsTemplate: Bool = false,
+        exposeAsModel: Bool? = nil
     ) {
         self.newName = newName
         self.displayName = displayName
@@ -128,6 +152,7 @@ struct UpdateProfileRequest: Encodable, Sendable {
         self.settings = settings
         self.sourceTemplate = sourceTemplate
         self.alsoSaveAsTemplate = alsoSaveAsTemplate
+        self.exposeAsModel = exposeAsModel
     }
 }
 

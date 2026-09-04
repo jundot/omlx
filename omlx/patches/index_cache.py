@@ -7,7 +7,12 @@ tokens.  By reusing topk indices from a "Full" layer in subsequent
 "Shared" layers we skip the expensive Q*K attention + argpartition in
 the Indexer while keeping the indexer KV cache up to date.
 
-Supported model types: deepseek_v32, glm_moe_dsa
+Supported model types: deepseek_v32
+
+GLM-5.2 (``glm_moe_dsa``) has a native checkpoint-defined schedule where
+shared layers do not have indexer weights and must reuse the previous full
+layer's top-k. oMLX handles that with the GLM pre-load model patch instead
+of this post-load optimization.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from typing import Any, Optional
 
 try:
     import mlx.core as mx
+    from mlx_lm.models import base as mlx_lm_base
 
     HAS_MLX = True
 except ImportError:
@@ -25,7 +31,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Sentinel for supported model types
-_SUPPORTED_MODEL_TYPES = {"deepseek_v32", "glm_moe_dsa"}
+_SUPPORTED_MODEL_TYPES = {"deepseek_v32"}
 
 # Track whether the class-level patch has been applied
 _class_patch_applied = False
@@ -85,8 +91,12 @@ def _make_patched_attention_call(original_call):
     The patched version checks for _ic_is_full flag:
     - If absent or True: run the original indexer (Full layer)
     - If False: skip indexer, reuse cached topk_indices (Shared layer)
+
+    SDPA is resolved through the module on every call, never bound here. This
+    patch runs from apply_post_load_transforms, before the engine installs the
+    TurboQuant dispatcher, so a binding taken now would route TurboQuant caches
+    into the plain mlx-lm SDPA for the rest of the process (issue #2372).
     """
-    from mlx_lm.models.base import scaled_dot_product_attention
 
     def patched_call(
         self,
@@ -186,7 +196,7 @@ def _make_patched_attention_call(original_call):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
-        output = scaled_dot_product_attention(
+        output = mlx_lm_base.scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
         if L == 1:

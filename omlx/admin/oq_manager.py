@@ -7,6 +7,7 @@ as hf_downloader.py (DownloadTask / HFDownloader).
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import time
@@ -22,7 +23,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from ..model_discovery import _has_vision_subconfig
+from ..model_discovery import _decode_hf_cache_model_id, _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,8 @@ class QuantTask:
     status: QuantStatus = QuantStatus.PENDING
     progress: float = 0.0
     phase: str = ""
+    progress_detail: str = ""
+    progress_meta: dict = field(default_factory=dict)
     error: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
@@ -78,6 +81,13 @@ class QuantTask:
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
+    enhanced: bool = False
+    imatrix_cache_path: str = ""
+    imatrix_reuse_cache: bool = True
+    imatrix_strict: bool = False
+    imatrix_num_samples: int = 128
+    imatrix_seq_length: int = 512
+    mtp_assistant_model_path: str = ""
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -91,6 +101,8 @@ class QuantTask:
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "phase": self.phase,
+            "progress_detail": self.progress_detail,
+            "progress_meta": self.progress_meta,
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -98,6 +110,8 @@ class QuantTask:
             "source_size": self.source_size,
             "output_size": self.output_size,
             "dtype": self.dtype,
+            "enhanced": self.enhanced,
+            "imatrix_cache_path": self.imatrix_cache_path,
         }
 
 
@@ -118,6 +132,26 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1024**2:.1f} MB"
     else:
         return f"{size_bytes / 1024**3:.1f} GB"
+
+
+def _safetensors_size(path: Path) -> int:
+    """Return the source weight size supported by the streaming quantizer."""
+    return sum(file.stat().st_size for file in path.glob("*.safetensors"))
+
+
+def _source_model_names(source: Path) -> tuple[str, str]:
+    """Return the display name and path-safe output base for a source model."""
+    if source.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(source.parent.parent)
+        if decoded is not None:
+            _, source_repo_id = decoded
+            # Output base is the bare repo name from the canonical "org/repo"
+            # ID. The route-safe model_id keeps the double-dash org separator,
+            # which huggingface_hub rejects in repo_id ("Cannot have -- or ..
+            # in repo_id").
+            repo_name = source_repo_id.split("/", 1)[-1]
+            return source_repo_id, repo_name
+    return source.name, source.name
 
 
 class OQManager:
@@ -151,8 +185,12 @@ class OQManager:
         """Scan all model dirs. Returns (source_models, all_models)."""
 
         def _scan() -> tuple[list[dict], list[dict]]:
-            from ..oq import validate_quantizable, estimate_memory
-            from ..utils.model_loading import _checkpoint_has_mtp_weights
+            from ..model_discovery import _resolve_hf_cache_entry
+            from ..oq import estimate_memory, validate_quantizable
+            from ..utils.model_loading import (
+                _checkpoint_has_mtp_weights,
+                _has_mtp_heads,
+            )
 
             source_models = []
             all_models = []
@@ -166,42 +204,49 @@ class OQManager:
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
-                        candidates.append(subdir)
+                        candidates.append((subdir, subdir.name, None))
                     else:
-                        for child in sorted(subdir.iterdir()):
-                            if child.is_dir() and (child / "config.json").exists():
-                                candidates.append(child)
+                        # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
+                        hf_resolved = _resolve_hf_cache_entry(subdir)
+                        if hf_resolved is not None:
+                            candidates.append(
+                                (
+                                    hf_resolved.snapshot_path,
+                                    hf_resolved.model_id,
+                                    hf_resolved.source_repo_id,
+                                )
+                            )
+                        else:
+                            for child in sorted(subdir.iterdir()):
+                                if child.is_dir() and (child / "config.json").exists():
+                                    candidates.append((child, child.name, None))
 
-                    for path in candidates:
-                        if path.name in seen:
+                    for path, display_name, source_repo_id in candidates:
+                        if display_name in seen:
                             continue
-                        seen.add(path.name)
+                        seen.add(display_name)
                         try:
                             with open(path / "config.json") as f:
                                 config = json.load(f)
-                            size = sum(
-                                f.stat().st_size for f in path.glob("*.safetensors")
-                            )
-                            if size == 0:
-                                size = sum(f.stat().st_size for f in path.glob("*.bin"))
+                            size = _safetensors_size(path)
                             if size == 0:
                                 continue
+                            # Skip models without model_type — MLX needs it to
+                            # resolve the model class, so quantizing them would
+                            # produce an unloadable checkpoint.
+                            mt = config.get("model_type", "") or config.get(
+                                "text_config", {}
+                            ).get("model_type", "")
+                            if not mt:
+                                continue
                             tc = config.get("text_config", {})
-                            # has_mtp_heads: top-level OR text_config nested
-                            config_declares_mtp = (
-                                int(config.get("mtp_num_hidden_layers", 0) or 0) > 0
-                                or int(config.get("num_nextn_predict_layers", 0) or 0)
-                                > 0
-                                or int(tc.get("mtp_num_hidden_layers", 0) or 0) > 0
-                                or int(tc.get("num_nextn_predict_layers", 0) or 0) > 0
-                            )
-                            has_mtp = (
-                                config_declares_mtp
-                                and _checkpoint_has_mtp_weights(path)
-                            )
+                            has_mtp = _has_mtp_heads(
+                                config
+                            ) and _checkpoint_has_mtp_weights(path)
                             info = {
-                                "name": path.name,
+                                "name": display_name,
                                 "path": str(path),
+                                "source_repo_id": source_repo_id,
                                 "size": size,
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "")
@@ -212,6 +257,9 @@ class OQManager:
                                 # mm_vision_tower). Same predicate as model_discovery.
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
+                                "hidden_size": tc.get("hidden_size")
+                                or config.get("hidden_size")
+                                or 0,
                             }
                             all_models.append(info)
                             if validate_quantizable(config):
@@ -240,14 +288,26 @@ class OQManager:
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
         auto_proxy_sensitivity: bool = True,
+        enhanced: bool = False,
+        imatrix_cache_path: str = "",
+        imatrix_reuse_cache: bool = True,
+        imatrix_strict: bool = False,
+        imatrix_num_samples: int = 128,
+        imatrix_seq_length: int = 512,
+        mtp_assistant_model_path: str = "",
     ) -> QuantTask:
         """Start a quantization job.
 
         Args:
             model_path: Path to source model directory.
-            oq_level: oQ level (2, 3, 4, 6, or 8).
+            oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
+            mtp_assistant_model_path: Optional checkpoint whose MTP head is
+                merged into the output. A gemma4_assistant donor uses the
+                assistant merge; any other donor grafts its native
+                Qwen3.5/3.6 mtp.* head (same-geometry, same-tokenizer
+                pairs only). Validated at submission.
 
         Returns:
             The created QuantTask.
@@ -260,6 +320,8 @@ class OQManager:
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
             resolve_output_name,
+            validate_gemma4_assistant_pair,
+            validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
 
@@ -278,18 +340,54 @@ class OQManager:
             config = json.load(f)
         _validate_oq_dtype_for_model(config, dtype)
 
+        source_size = _safetensors_size(source)
+        if source_size == 0:
+            raise ValueError(f"No .safetensors files found in {model_path}")
+
+        model_name, output_base_name = _source_model_names(source)
+
         if preserve_mtp and not _checkpoint_has_mtp_weights(source):
             logger.warning(
                 "Preserve MTP requested for %s, but no mtp.* tensors were "
                 "found in the checkpoint; disabling MTP preservation",
-                source.name,
+                model_name,
             )
             preserve_mtp = False
 
-        model_name = source.name
+        if preserve_mtp and mtp_assistant_model_path:
+            raise ValueError(
+                "Choose either 'Preserve MTP weights' or 'Combine MTP head', "
+                "not both"
+            )
+        if mtp_assistant_model_path:
+            assistant = Path(mtp_assistant_model_path)
+            if not assistant.exists() or not (assistant / "config.json").exists():
+                raise ValueError(
+                    f"Assistant model not found: {mtp_assistant_model_path}"
+                )
+            with open(assistant / "config.json") as f:
+                assistant_config = json.load(f)
+            if assistant_config.get("model_type") == "gemma4_assistant":
+                validate_gemma4_assistant_pair(config, assistant_config)
+            else:
+                validate_mtp_donor_pair(source, assistant)
+                if _checkpoint_has_mtp_weights(source):
+                    logger.warning(
+                        "Recipient %s ships its own MTP head; it will be "
+                        "stripped and replaced by the donor head from %s",
+                        model_name,
+                        assistant.name,
+                    )
+
         output_name = resolve_output_name(
-            model_name, oq_level, dtype, preserve_mtp=preserve_mtp
+            output_base_name,
+            oq_level,
+            dtype,
+            preserve_mtp=preserve_mtp,
+            enhanced=enhanced,
         )
+        if mtp_assistant_model_path and not output_name.endswith("-mtp"):
+            output_name += "-mtp"
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -304,16 +402,30 @@ class OQManager:
                 task.model_path == model_path
                 and task.oq_level == oq_level
                 and task.dtype == dtype
+                and task.enhanced == enhanced
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
-                    f"Quantization for '{model_name}' at oQ{oq_level:g} "
+                    f"Quantization for '{model_name}' at oQ{oq_level:g}"
+                    f"{'e' if enhanced else ''} "
                     f"({dtype}) is already in progress"
                 )
 
-        source_size = sum(f.stat().st_size for f in source.glob("*.safetensors"))
-        if source_size == 0:
-            source_size = sum(f.stat().st_size for f in source.glob("*.bin"))
+        if enhanced:
+            if imatrix_num_samples < 1:
+                raise ValueError("imatrix_num_samples must be >= 1")
+            if imatrix_seq_length < 1:
+                raise ValueError("imatrix_seq_length must be >= 1")
+            if not imatrix_cache_path:
+                digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+                imatrix_cache_path = str(
+                    self._output_dir
+                    / ".oqe_imatrix"
+                    / (
+                        f"{output_base_name}-{digest}-s{int(imatrix_num_samples)}"
+                        f"-l{int(imatrix_seq_length)}.npz"
+                    )
+                )
 
         task_id = str(uuid.uuid4())
         task = QuantTask(
@@ -330,6 +442,13 @@ class OQManager:
             dtype=dtype,
             preserve_mtp=preserve_mtp,
             auto_proxy_sensitivity=auto_proxy_sensitivity,
+            enhanced=enhanced,
+            imatrix_cache_path=imatrix_cache_path,
+            imatrix_reuse_cache=imatrix_reuse_cache,
+            imatrix_strict=imatrix_strict,
+            imatrix_num_samples=imatrix_num_samples,
+            imatrix_seq_length=imatrix_seq_length,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         self._tasks[task_id] = task
 
@@ -338,7 +457,8 @@ class OQManager:
         )
 
         logger.info(
-            f"oQ quantization queued: {model_name} -> oQ{oq_level:g} "
+            f"oQ quantization queued: {model_name} -> "
+            f"oQ{oq_level:g}{'e' if enhanced else ''} "
             f"(task_id={task_id})"
         )
         return task
@@ -460,11 +580,26 @@ class OQManager:
                 task.phase = "Loading model..."
                 task.progress = 5.0
 
-                def _progress_cb(phase: str, pct: float) -> None:
+                def _progress_cb(
+                    phase: str,
+                    pct: float,
+                    detail: str = "",
+                    meta: dict | None = None,
+                ) -> None:
                     if task_id in self._cancelled:
                         raise _QuantCancelled(f"Task {task_id} cancelled")
-                    task.phase = self._phase_label(phase, task.oq_level)
+                    base_phase = phase.split("|", 1)[0]
+                    if base_phase.startswith("quantizing"):
+                        task.status = QuantStatus.QUANTIZING
+                    elif base_phase == "saving":
+                        task.status = QuantStatus.SAVING
+                    else:
+                        task.status = QuantStatus.LOADING
+                    task.phase = self._phase_label(phase, task.oq_level, task.enhanced)
+                    task.progress_detail = detail or ""
+                    task.progress_meta = meta or {}
                     task.progress = pct
+                    task._last_progress_callback_at = time.time()
 
                 # Start time-based progress estimation
                 self._progress_tasks[task_id] = asyncio.create_task(
@@ -487,7 +622,26 @@ class OQManager:
                     task.dtype,
                     task.preserve_mtp,
                     task.auto_proxy_sensitivity,
+                    enhanced=task.enhanced,
+                    imatrix_cache_path=task.imatrix_cache_path,
+                    imatrix_reuse_cache=task.imatrix_reuse_cache,
+                    imatrix_strict=task.imatrix_strict,
+                    imatrix_num_samples=task.imatrix_num_samples,
+                    imatrix_seq_length=task.imatrix_seq_length,
                 )
+
+                if task_id in self._cancelled:
+                    return
+
+                if task.mtp_assistant_model_path:
+                    from ..oq import combine_mtp_into_output
+
+                    _progress_cb("saving", 97.0, "Merging MTP head...")
+                    await asyncio.to_thread(
+                        combine_mtp_into_output,
+                        task.output_path,
+                        task.mtp_assistant_model_path,
+                    )
 
                 if task_id in self._cancelled:
                     return
@@ -496,6 +650,8 @@ class OQManager:
                 task.status = QuantStatus.COMPLETED
                 task.progress = 100.0
                 task.phase = "Completed"
+                task.progress_detail = ""
+                task.progress_meta = {}
                 task.completed_at = time.time()
                 task.output_size = _dir_size(Path(task.output_path))
 
@@ -551,9 +707,13 @@ class OQManager:
             while task_id not in self._cancelled and task.status in _ACTIVE_STATUSES:
                 await asyncio.sleep(2)
                 elapsed = time.time() - start
+                if time.time() - getattr(task, "_last_progress_callback_at", 0.0) < 5:
+                    continue
                 if task.status == QuantStatus.QUANTIZING:
+                    if self._has_explicit_quant_progress(task):
+                        continue
                     fraction = min(elapsed / estimated_total, 0.95)
-                    task.progress = 30.0 + fraction * 60.0
+                    task.progress = max(task.progress, 30.0 + fraction * 60.0)
                 elif task.status == QuantStatus.SAVING:
                     # During save, poll output dir size
                     output = Path(task.output_path)
@@ -563,16 +723,29 @@ class OQManager:
                         expected = task.source_size * task.oq_level / 16
                         if expected > 0:
                             save_frac = min(current / expected, 0.99)
-                            task.progress = 90.0 + save_frac * 10.0
+                            task.progress = max(task.progress, 90.0 + save_frac * 10.0)
         except asyncio.CancelledError:
             pass
 
     @staticmethod
-    def _phase_label(phase: str, oq_level: float) -> str:
+    def _has_explicit_quant_progress(task: QuantTask) -> bool:
+        """Return True once the quantizer emits byte-level progress."""
+        meta = task.progress_meta if isinstance(task.progress_meta, dict) else {}
+        try:
+            total_bytes = int(meta.get("total_bytes") or 0)
+            processed_bytes = int(meta.get("processed_bytes") or 0)
+        except (TypeError, ValueError):
+            return False
+        return total_bytes > 0 and processed_bytes >= 0
+
+    @staticmethod
+    def _phase_label(phase: str, oq_level: float, enhanced: bool = False) -> str:
         """Human-readable phase label."""
+        oq_label = f"oQ{oq_level:g}{'e' if enhanced else ''}"
         labels = {
             "loading": "Loading model...",
-            "quantizing": f"Quantizing to oQ{oq_level:g}...",
+            "imatrix": "Collecting oQe imatrix...",
+            "quantizing": f"Quantizing to {oq_label}...",
             "saving": "Saving quantized model...",
         }
         # Handle progress: "quantizing_eta|792|879|0:02"
@@ -586,7 +759,7 @@ class OQManager:
                 if current.isdigit() and total.isdigit()
                 else 0
             )
-            label = f"oQ{oq_level:g}: {pct}%"
+            label = f"{oq_label}: {pct}%"
             if eta:
                 label += f" ({eta} remaining)"
             return label

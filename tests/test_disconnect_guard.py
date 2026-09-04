@@ -9,9 +9,13 @@ Tests cover:
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
+
+import omlx.server as server
+from omlx.engine_pool import EngineEntry, EnginePool
 
 
 class TestDisconnectGuard:
@@ -121,3 +125,48 @@ class TestDisconnectGuard:
             await _run_with_disconnect_guard(
                 mock_request_connected, failing_generate(), poll_interval=0.1
             )
+
+    @pytest.mark.asyncio
+    async def test_stream_disconnect_releases_lease_after_pool_lock_clears(self):
+        """ASGI cancellation must not permanently pin the streamed model."""
+        pool = EnginePool()
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        pool._entries["model"] = EngineEntry(
+            model_id="model",
+            model_path="/models/model",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1,
+            engine=engine,
+            last_access=1.0,
+            in_use=1,
+        )
+        lease = server._LLMEngineLease(model_id="model")
+
+        async def blocked_stream():
+            await anyio.sleep_forever()
+            yield "unreachable"
+
+        async def consume_stream():
+            async for _ in server._release_after_stream(blocked_stream(), lease):
+                pass
+
+        await pool._lock.acquire()
+        try:
+            with patch.object(server, "get_engine_pool", return_value=pool):
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(consume_stream)
+                    await anyio.sleep(0.01)
+                    task_group.cancel_scope.cancel()
+
+            assert lease.released is True
+            assert pool._entries["model"].in_use == 1
+            assert len(pool._lease_release_tasks) == 1
+        finally:
+            pool._lock.release()
+
+        await pool._drain_lease_release_tasks()
+
+        assert pool._entries["model"].in_use == 0
+        assert pool._find_lru_victim() == "model"

@@ -8,15 +8,28 @@ This module provides OpenAI-compatible audio endpoints:
 - POST /v1/audio/process         - Speech-to-Speech / audio processing
 """
 
+import asyncio
 import base64
+import contextlib
+import io
+import json
 import logging
 import math
 import os
 import re
 import tempfile
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
@@ -27,7 +40,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Maximum upload size for audio files (100 MB).
+# Separate router for the realtime WebSocket: the main audio router is
+# mounted with an HTTP-only verify_api_key dependency that cannot resolve
+# in a websocket scope (and browsers cannot set an Authorization header on
+# WebSocket connections anyway). Auth happens in-band via the first
+# {"type": "start"} message instead.
+realtime_router = APIRouter()
+
+# Maximum upload size for audio files (100 MB). Used as the default when
+# server settings are not initialized.
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
 
 # Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
@@ -37,6 +58,18 @@ MAX_REF_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
 # improve TTFT while still letting the model process the full input at once.
 DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.2
 MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.01
+
+# Non-streaming TTS output formats and their Content-Type. wav is the native
+# engine output; the others are transcoded in memory by soundfile's bundled
+# libsndfile (lame/opus/flac), which the audio extra already ships via
+# mlx-audio -> librosa. aac is not offered (libsndfile has no aac encoder).
+_SPEECH_RESPONSE_FORMATS = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/ogg",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+}
 
 # Video container extensions that should be routed through ffmpeg decoding.
 # mlx-audio only recognises audio-specific extensions (m4a, aac, ogg, opus),
@@ -102,8 +135,26 @@ def _record_audio_request(model_id: str) -> None:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
+def _max_audio_upload_bytes() -> int:
+    """Return the configured audio upload limit, falling back to the default."""
+    try:
+        from omlx.settings import get_settings
+
+        return get_settings().server.max_audio_upload_bytes()
+    except RuntimeError:
+        return MAX_AUDIO_UPLOAD_BYTES
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Invalid max_audio_upload_size; using %s byte default: %s",
+            MAX_AUDIO_UPLOAD_BYTES,
+            exc,
+        )
+        return MAX_AUDIO_UPLOAD_BYTES
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
+    limit = _max_audio_upload_bytes()
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -111,12 +162,12 @@ async def _read_upload(file: UploadFile) -> bytes:
         if not chunk:
             break
         total += len(chunk)
-        if total > MAX_AUDIO_UPLOAD_BYTES:
+        if total > limit:
             raise HTTPException(
                 status_code=413,
                 detail=(
                     f"Audio file exceeds maximum allowed size "
-                    f"({MAX_AUDIO_UPLOAD_BYTES} bytes)"
+                    f"({limit} bytes)"
                 ),
             )
         chunks.append(chunk)
@@ -371,13 +422,64 @@ async def _stream_with_prefetched_chunk(
 # ---------------------------------------------------------------------------
 
 
+def _sse_event(payload: dict) -> str:
+    """Serialize one data-only SSE event, OpenAI transcription-stream style."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_transcription_events(
+    engine,
+    tmp_path: str,
+    model_id: str,
+    transcribe_kwargs: dict,
+) -> AsyncIterator[str]:
+    """Yield OpenAI-compatible transcript.text.* SSE events.
+
+    Owns the uploaded temp file: it is deleted when the stream finishes,
+    errors, or is cancelled by a client disconnect.
+    """
+    full_text: list[str] = []
+    prompt_tokens = 0
+    generation_tokens = 0
+    try:
+        async for chunk in engine.transcribe_stream(tmp_path, **transcribe_kwargs):
+            # Cumulative totals arrive on the chunks that know them
+            # (typically the final one); keep the max seen.
+            prompt_tokens = max(
+                prompt_tokens, int(chunk.get("prompt_tokens") or 0)
+            )
+            generation_tokens = max(
+                generation_tokens, int(chunk.get("generation_tokens") or 0)
+            )
+            delta = chunk.get("text") or ""
+            if not delta:
+                continue
+            full_text.append(delta)
+            yield _sse_event({"type": "transcript.text.delta", "delta": delta})
+
+        done: dict = {"type": "transcript.text.done", "text": "".join(full_text)}
+        if prompt_tokens or generation_tokens:
+            done["usage"] = {
+                "type": "tokens",
+                "input_tokens": prompt_tokens,
+                "output_tokens": generation_tokens,
+                "total_tokens": prompt_tokens + generation_tokens,
+            }
+        yield _sse_event(done)
+        _record_audio_request(model_id)
+    finally:
+        _cleanup_tempfile(tmp_path)
+
+
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
 async def create_transcription(
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
+    stream: bool = Form(False),
     max_tokens: Optional[int] = Form(None),
     word_timestamps: bool = Form(False),
 ):
@@ -385,6 +487,19 @@ async def create_transcription(
 
     Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
     compatibility but are not yet implemented — they are silently ignored.
+
+    ``stream=true`` switches the response to OpenAI's transcription SSE
+    format: ``transcript.text.delta`` events with incremental text followed
+    by a final ``transcript.text.done`` event with the full transcription
+    (#1066). Models whose mlx-audio backend lacks native streaming still
+    respond in SSE format, with the full text arriving in a single delta.
+
+    ``prompt`` follows the OpenAI spec: optional text to guide recognition
+    toward specific vocabulary, spellings, or style. Mapped onto the
+    backend's biasing hook — Qwen3-ASR receives it as trained context
+    injection (``system_prompt``, strong biasing), Whisper models as a
+    decoder-prefix soft prior (``initial_prompt``, ~224-token window).
+    Backends without a biasing hook ignore it; it never fails a request.
 
     ``max_tokens`` is an oMLX extension that raises the underlying model's
     output cap. Useful for long audio with models like VibeVoice-ASR whose
@@ -451,10 +566,32 @@ async def create_transcription(
                     pass
 
         transcribe_kwargs: dict = {"language": language}
+        if prompt is not None:
+            transcribe_kwargs["prompt"] = prompt
         if effective_max_tokens is not None:
             transcribe_kwargs["max_tokens"] = effective_max_tokens
         if word_timestamps:
             transcribe_kwargs["word_timestamps"] = True
+
+        if stream:
+            # Word timestamps only exist in the JSON segment response;
+            # SSE streaming emits plain text deltas (matching OpenAI, which
+            # also rejects timestamp granularity with stream=true).
+            transcribe_kwargs.pop("word_timestamps", None)
+            # The event generator owns tmp_path from here: its finally block
+            # deletes the file once the stream completes or errors — the
+            # route's finally must not remove it while chunks are pending.
+            events = _stream_transcription_events(
+                engine, tmp_path, resolved_model, transcribe_kwargs
+            )
+            tmp_path = None
+            first_event = await events.__anext__()
+            return StreamingResponse(
+                _stream_with_prefetched_chunk(first_event, events),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+
         result = await engine.transcribe(tmp_path, **transcribe_kwargs)
     except HTTPException:
         raise
@@ -480,6 +617,236 @@ async def create_transcription(
     )
 
 
+def _verify_ws_api_key(api_key: Optional[str]) -> bool:
+    """Verify an in-band API key with the same rules as verify_api_key.
+
+    WebSocket connections from browsers cannot carry an Authorization
+    header, so the key arrives inside the {"type": "start"} message.
+    """
+    from omlx.server import _server_state
+
+    if _server_state.api_key is None:
+        return True
+    gs = _server_state.global_settings
+    if gs is not None and gs.auth.skip_api_key_verification:
+        return True
+    if not api_key:
+        return False
+
+    from omlx.admin.auth import verify_any_api_key
+
+    sub_keys = gs.auth.sub_keys if gs is not None else []
+    return verify_any_api_key(api_key, _server_state.api_key, sub_keys)
+
+
+@realtime_router.websocket("/v1/audio/transcriptions/realtime")
+async def realtime_transcription(websocket: WebSocket) -> None:
+    """Push-based realtime transcription over WebSocket.
+
+    Protocol:
+      client → {"type": "start", "model": ..., "api_key": ..., "language"?: ...}
+      server → {"type": "ready"} or {"type": "error", "detail": ...}
+      client → binary frames: 16 kHz mono little-endian Int16 PCM
+      server → {"type": "transcript.delta", "delta": ...} as text commits
+      client → {"type": "stop"} (or closes the socket to abandon)
+      server → remaining deltas, then {"type": "transcript.done", "text": ...}
+    """
+    await websocket.accept()
+
+    async def _reject(detail: str, close_code: int = 1008) -> None:
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": detail})
+            await websocket.close(code=close_code)
+
+    try:
+        start = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except asyncio.TimeoutError:
+        await _reject("Handshake timeout")
+        return
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        await _reject("Invalid handshake message")
+        return
+
+    if not isinstance(start, dict) or start.get("type") != "start":
+        await _reject("First message must be a {'type': 'start'} object")
+        return
+    if not _verify_ws_api_key(start.get("api_key")):
+        await _reject("Invalid API key")
+        return
+    model_id = start.get("model")
+    if not model_id or not isinstance(model_id, str):
+        await _reject("Missing 'model' in start message")
+        return
+    language = start.get("language") or None
+
+    resolved_model = _resolve_model(model_id)
+    try:
+        pool = _get_engine_pool()
+    except HTTPException as exc:
+        await _reject(str(exc.detail))
+        return
+    try:
+        engine = await pool.get_engine(resolved_model)
+    except Exception as exc:
+        await _reject(f"Failed to load model '{model_id}': {exc}")
+        return
+
+    from ..engine.stt import STTEngine
+
+    if not isinstance(engine, STTEngine):
+        await _reject(
+            f"Model '{model_id}' is not a speech-to-text model. "
+            "Realtime transcription requires an audio_stt model."
+        )
+        return
+    if not engine.supports_realtime_stt():
+        await _reject(
+            f"Model '{model_id}' does not support realtime transcription. "
+            "Use POST /v1/audio/transcriptions with a complete audio file."
+        )
+        return
+    try:
+        session = await engine.create_realtime_session(language=language)
+    except RuntimeError as exc:
+        await _reject(str(exc))
+        return
+
+    stop_event = asyncio.Event()
+    client_gone = False
+
+    async def _receiver() -> None:
+        nonlocal client_gone
+        while not stop_event.is_set():
+            try:
+                message = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                client_gone = True
+                stop_event.set()
+                return
+            if message.get("type") == "websocket.disconnect":
+                client_gone = True
+                stop_event.set()
+                return
+            data = message.get("bytes")
+            if data:
+                session.feed_pcm16(data)
+                continue
+            text = message.get("text")
+            if text:
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("type") == "stop":
+                    stop_event.set()
+                    return
+
+    full_text: list[str] = []
+
+    async def _send_deltas(deltas: list[str]) -> None:
+        for delta in deltas:
+            full_text.append(delta)
+            await websocket.send_json({"type": "transcript.delta", "delta": delta})
+
+    receiver = asyncio.create_task(_receiver())
+    try:
+        await websocket.send_json({"type": "ready"})
+        while not stop_event.is_set():
+            deltas = await session.poll()
+            if deltas:
+                await _send_deltas(deltas)
+            else:
+                # No committed text this round — wait briefly for more audio
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop_event.wait(), timeout=0.1)
+        if not client_gone:
+            deltas = await session.close()
+            await _send_deltas(deltas)
+            await websocket.send_json(
+                {"type": "transcript.done", "text": "".join(full_text)}
+            )
+            await websocket.close(code=1000)
+        _record_audio_request(resolved_model)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.exception("Realtime transcription failed for %s", resolved_model)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            await websocket.close(code=1011)
+    finally:
+        receiver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver
+        await session.release()
+
+
+@router.get("/v1/audio/voices")
+async def list_model_voices(model: Optional[str] = None):
+    """List built-in speaker/voice names for a TTS model.
+
+    Reads static metadata only — a ``voices/`` directory (Kokoro-style)
+    or the speaker table in ``config.json`` (Qwen3-TTS CustomVoice's
+    ``talker_config.spk_id``) — so the model does not need to be loaded.
+    Returns ``{"model": ..., "voices": [...]}``; an empty list means the
+    model has no named speakers (e.g. voice-cloning base models).
+    """
+    if not model:
+        raise HTTPException(
+            status_code=400, detail="'model' query parameter is required"
+        )
+    pool = _get_engine_pool()
+    resolved = _resolve_model(model)
+    entry = pool.get_entry(resolved)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model '{resolved}' not found"
+        )
+
+    model_dir = Path(entry.model_path)
+    voices: list[str] = []
+    voices_dir = model_dir / "voices"
+    if voices_dir.is_dir():
+        voices = sorted({
+            f.stem
+            for f in voices_dir.iterdir()
+            if f.suffix in (".safetensors", ".pt")
+        })
+    else:
+        try:
+            config = json.loads((model_dir / "config.json").read_text())
+        except (OSError, ValueError):
+            config = {}
+        talker = config.get("talker_config") or {}
+        spk = talker.get("spk_id") or config.get("spk_id") or {}
+        if isinstance(spk, dict):
+            voices = sorted(spk.keys())
+    return {"model": resolved, "voices": voices}
+
+
+def _transcode_speech_output(wav_bytes: bytes, response_format: str) -> bytes:
+    """Transcode the engine's native WAV output to response_format in memory."""
+    if response_format == "pcm":
+        return wav_bytes_to_pcm_frames(wav_bytes)[3]
+
+    # Lazy import like the other optional audio deps: soundfile ships with
+    # the audio extra (mlx-audio -> librosa -> soundfile), and this module
+    # must stay importable without it (see server.py route registration).
+    import soundfile as sf
+
+    data, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    buf = io.BytesIO()
+    if response_format == "mp3":
+        sf.write(buf, data, sample_rate, format="MP3")
+    elif response_format == "opus":
+        sf.write(buf, data, sample_rate, format="OGG", subtype="OPUS")
+    else:
+        sf.write(buf, data, sample_rate, format="FLAC")
+    return buf.getvalue()
+
+
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
@@ -488,9 +855,18 @@ async def create_speech(request: AudioSpeechRequest):
 
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+    response_format = request.response_format or "wav"
+    if response_format not in _SPEECH_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format '{request.response_format}' is not supported; "
+                f"available formats: {', '.join(_SPEECH_RESPONSE_FORMATS)}"
+            ),
+        )
     streaming_interval = DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
     if request.stream:
-        if request.response_format not in (None, "wav"):
+        if response_format != "wav":
             raise HTTPException(
                 status_code=400,
                 detail="Streaming TTS currently only supports response_format='wav'",
@@ -568,7 +944,18 @@ async def create_speech(request: AudioSpeechRequest):
 
     _record_audio_request(resolved_model)
 
-    return Response(content=wav_bytes, media_type="audio/wav")
+    audio_out = wav_bytes
+    if response_format != "wav":
+        try:
+            audio_out = await asyncio.to_thread(
+                _transcode_speech_output, wav_bytes, response_format
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return Response(
+        content=audio_out, media_type=_SPEECH_RESPONSE_FORMATS[response_format]
+    )
 
 
 @router.post("/v1/audio/process")

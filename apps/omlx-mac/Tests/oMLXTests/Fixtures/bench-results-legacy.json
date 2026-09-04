@@ -1,0 +1,35 @@
+{
+  "bench_id": "b-legacy",
+  "status": "completed",
+  "error": null,
+  "results": [
+    {
+      "test_type": "single",
+      "pp": 1024,
+      "tg": 128,
+      "ttft_ms": 820.4,
+      "tpot_ms": 16.1,
+      "processing_tps": 1200.5,
+      "gen_tps": 62.3,
+      "e2e_latency_s": 2.88,
+      "total_throughput": 398.6,
+      "peak_memory_bytes": 44236247040
+    }
+  ],
+  "upload_state": {
+    "phase": "done",
+    "results": [
+      {
+        "context_length": 1024,
+        "id": "abc12345",
+        "url": "https://omlx.ai/benchmarks/abc12345"
+      }
+    ],
+    "total": 1,
+    "success_count": 1,
+    "failed_count": 0,
+    "owner_hash": "a1b2c3d4e5f6a7b8",
+    "skipped_reason": null,
+    "skipped_features": []
+  }
+}

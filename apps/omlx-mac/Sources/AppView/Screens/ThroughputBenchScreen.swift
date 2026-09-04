@@ -36,10 +36,10 @@ import AppKit
 import SwiftUI
 
 struct ThroughputBenchScreen: View {
-    @EnvironmentObject private var services: AppServices
+    @Environment(AppServices.self) private var services
     // VM is owned by AppServices so a running bench survives screen
     // unloads — see AppServices.throughputBench for the rationale.
-    @ObservedObject var vm: ThroughputBenchScreenVM
+    @Bindable var vm: ThroughputBenchScreenVM
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -62,11 +62,15 @@ struct ThroughputBenchScreen: View {
             ConfigurationSection(
                 models: vm.models,
                 selectedModelId: $vm.selectedModelId,
+                contextProfile: $vm.contextProfile,
+                warmupMode: $vm.warmupMode,
+                alignPromptToAne: $vm.alignPromptToAne,
                 promptLengths: $vm.promptLengths,
                 genLength: $vm.genLength,
                 batchSizes: $vm.batchSizes,
                 running: vm.running,
                 canRun: vm.canRun,
+                pendingFlags: vm.pendingFeatureFlags,
                 onRun: { vm.runBenchmark(client: services.client) },
                 onCancel: { vm.cancelBenchmark(client: services.client) }
             )
@@ -125,7 +129,7 @@ private struct DeviceChip: View {
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 2)
         .padding(.bottom, 8)
     }
@@ -156,13 +160,19 @@ private struct DeviceChip: View {
 private struct ConfigurationSection: View {
     let models: [ModelDTO]
     @Binding var selectedModelId: String
+    @Binding var contextProfile: BenchmarkContextProfile
+    @Binding var warmupMode: BenchmarkWarmupMode
+    @Binding var alignPromptToAne: Bool
     @Binding var promptLengths: Set<Int>
     @Binding var genLength: String
     @Binding var batchSizes: Set<Int>
     let running: Bool
     let canRun: Bool
+    let pendingFlags: [String]
     let onRun: () -> Void
     let onCancel: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         SectionHeader(
@@ -174,8 +184,8 @@ private struct ConfigurationSection: View {
                          defaultValue: "Loading models…",
                          comment: "Throughput Bench section subtitle while models are loading")
                 : String(localized: "bench.throughput.subtitle.model_count",
-                         defaultValue: "\(models.count) model\(models.count == 1 ? "" : "s") available",
-                         comment: "Throughput Bench section subtitle showing how many models are available; placeholder is the count with pluralization")
+                         defaultValue: "Models available: \(models.count)",
+                         comment: "Throughput Bench section subtitle showing how many models are available; placeholder is the count")
         )
 
         ListGroup {
@@ -187,23 +197,66 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Throughput Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.context_lengths.title",
-                                  defaultValue: "Context lengths",
-                                  comment: "Inline title above the prompt-length chip row"),
-                    sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
-                                     defaultValue: "Prompt tokens to feed for each single-request trial",
-                                     comment: "Sublabel under the prompt-length chip row"),
+            Row(label: String(localized: "bench.throughput.row.context.label",
+                              defaultValue: "Benchmark Context",
+                              comment: "Row label for the Throughput Bench context picker"),
+                sublabel: String(localized: "bench.throughput.row.context.sub",
+                                 defaultValue: "It only affects results when acceleration features such as MTP or DFlash are enabled.",
+                                 comment: "Sublabel under the Throughput Bench context picker")) {
+                Popup(
+                    selection: $contextProfile,
+                    width: .controlMedium,
+                    options: BenchmarkContextProfile.allCases.map {
+                        PopupOption(value: $0, label: $0.localizedLabel)
+                    }
+                )
+                .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.warmup.label",
+                              defaultValue: "Warm-up",
+                              comment: "Row label for the throughput benchmark warm-up mode"),
+                sublabel: String(localized: "bench.throughput.row.warmup.sub",
+                                 defaultValue: "The full block compiles and exercises the 2,048-token ANE prefill path before timing starts.",
+                                 comment: "Explanation of the throughput benchmark warm-up options")) {
+                Segmented(selection: $warmupMode, options: [
+                    (.quick, String(localized: "bench.throughput.warmup.quick",
+                                    defaultValue: "Quick · 32",
+                                    comment: "Short throughput benchmark warm-up option")),
+                    (.ane2048, String(localized: "bench.throughput.warmup.ane2048",
+                                     defaultValue: "Full · 2,048",
+                                     comment: "Full 2048-token ANE benchmark warm-up option")),
+                ])
+                .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.ane_alignment.label",
+                              defaultValue: "ANE-aligned prompts",
+                              comment: "Row label for aligned throughput benchmark prompts"),
+                sublabel: String(localized: "bench.throughput.row.ane_alignment.sub",
+                                 defaultValue: "Add one prompt token so PP4097 produces exactly 4,096 prefill rows. Aligned results remain local.",
+                                 comment: "Explanation of the ANE-aligned throughput benchmark option")) {
+                RowSwitch(isOn: $alignPromptToAne)
+                    .disabled(running)
+            }
+
+            Row(label: String(localized: "bench.throughput.row.context_lengths.title",
+                              defaultValue: "Context lengths",
+                              comment: "Inline title above the prompt-length chip row"),
+                sublabel: String(localized: "bench.throughput.row.context_lengths.sub",
+                                 defaultValue: "Prompt tokens to feed for each single-request trial",
+                                 comment: "Sublabel under the prompt-length chip row")) {
+                ChipGroup(
                     options: Self.promptLengthOptions,
                     selection: $promptLengths,
                     format: Self.formatPromptLength
                 )
+                .disabled(running)
             }
 
             Row(label: String(localized: "bench.throughput.row.gen_length.label",
@@ -216,22 +269,22 @@ private struct ConfigurationSection: View {
                     text: $genLength,
                     placeholder: "128",
                     mono: true,
-                    width: 110
+                    width: .controlCompact
                 )
             }
 
-            FreeRow {
-                ChipRow(
-                    title: String(localized: "bench.throughput.row.batch_sizes.title",
-                                  defaultValue: "Batch sizes",
-                                  comment: "Inline title above the batch-size chip row"),
-                    sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
-                                     defaultValue: "Concurrent requests per batch in the continuous-batching phase",
-                                     comment: "Sublabel under the batch-size chip row"),
+            Row(label: String(localized: "bench.throughput.row.batch_sizes.title",
+                              defaultValue: "Batch sizes",
+                              comment: "Inline title above the batch-size chip row"),
+                sublabel: String(localized: "bench.throughput.row.batch_sizes.sub",
+                                 defaultValue: "Concurrent requests per batch in the continuous-batching phase",
+                                 comment: "Sublabel under the batch-size chip row")) {
+                ChipGroup(
                     options: Self.batchSizeOptions,
                     selection: $batchSizes,
                     format: { "\($0)" }
                 )
+                .disabled(running)
             }
 
             Row(isLast: true) {
@@ -262,6 +315,16 @@ private struct ConfigurationSection: View {
                         .disabled(!canRun)
                     }
                 }
+
+                if !pendingFlags.isEmpty && !running {
+                    Text(String(localized: "bench.throughput.config.pending_flags",
+                                defaultValue: "This run will be tagged on the leaderboard: \(pendingFlags.joined(separator: ", "))",
+                                comment: "Inline note warning that acceleration features are on; placeholder is the comma-joined feature list"))
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
     }
@@ -291,36 +354,24 @@ private struct ConfigurationSection: View {
     }
 }
 
-// MARK: - Chip row
+// MARK: - Chip group
 
-private struct ChipRow: View {
-    let title: String
-    let sublabel: String
+/// Multi-select strip of toggle chips, used as a `Row` trailing. Styled to
+/// echo the segmented control — quiet fill, accent when selected — but with
+/// detached segments and gaps because multiple values can be active at once.
+private struct ChipGroup: View {
     let options: [Int]
     @Binding var selection: Set<Int>
     let format: (Int) -> String
 
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                Text(sublabel)
-                    .font(.omlxText(11.5))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            HStack(spacing: 6) {
-                ForEach(options, id: \.self) { value in
-                    Chip(
-                        label: format(value),
-                        isSelected: selection.contains(value),
-                        onTap: { toggle(value) }
-                    )
-                }
-                Spacer(minLength: 0)
+        HStack(spacing: 5) {
+            ForEach(options, id: \.self) { value in
+                Chip(
+                    label: format(value),
+                    isSelected: selection.contains(value),
+                    onTap: { toggle(value) }
+                )
             }
         }
     }
@@ -345,19 +396,16 @@ private struct Chip: View {
         Button(action: onTap) {
             Text(label)
                 .font(.omlxText(11.5, weight: .medium))
-                .foregroundStyle(isSelected ? theme.accentText : theme.textSecondary)
+                // Chips must never compress: under width pressure SwiftUI
+                // would otherwise wrap "128K" to "12/8K". The label column
+                // absorbs the squeeze instead.
+                .fixedSize()
+                .foregroundStyle(isSelected ? theme.accentText : theme.text)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(isSelected ? theme.accent : theme.controlBg)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? Color.clear : theme.inputBorder,
-                                    lineWidth: 0.5
-                                )
-                        )
+                        .fill(isSelected ? theme.accent : theme.hoverBg)
                 )
                 .contentShape(Rectangle())
         }
@@ -386,8 +434,8 @@ private struct LiveProgressCard: View {
                             .foregroundStyle(theme.textSecondary)
                     } else {
                         Text(String(localized: "bench.throughput.progress.running",
-                                    defaultValue: "Running… (\(resultCount) result\(resultCount == 1 ? "" : "s") so far)",
-                                    comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count with pluralization"))
+                                    defaultValue: "Running… results so far: \(resultCount)",
+                                    comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count"))
                             .font(.omlxText(12))
                             .foregroundStyle(theme.textSecondary)
                     }
@@ -440,8 +488,8 @@ private struct SingleResultsTable: View {
                    defaultValue: "Single Request Results",
                    comment: "Section header for the Throughput Bench single-request results table"),
             subtitle: String(localized: "bench.throughput.single.subtitle",
-                             defaultValue: "\(results.count) trial\(results.count == 1 ? "" : "s")",
-                             comment: "Subtitle for the single-request results table; placeholder is the count with pluralization")
+                             defaultValue: "Trials: \(results.count)",
+                             comment: "Subtitle for the single-request results table; placeholder is the count")
         )
 
         ListGroup {
@@ -663,9 +711,12 @@ private struct TextExportSection: View {
 /// run (omlx/admin/benchmark.py:_upload_to_omlx_ai); we just surface the
 /// state. Three modes:
 ///   • uploading: progress row + spinner
-///   • skipped:   amber banner explaining why (experimental features)
+///   • skipped:   amber banner (external-endpoint runs only — accelerated
+///                runs upload and are tagged instead)
 ///   • done:      per-context-length rows with link or error, plus a
 ///                summary footer showing the owner hash
+/// Acceleration flags active during the run are shown as chips above the
+/// rows in both the uploading and done phases.
 private struct UploadSection: View {
     let state: BenchUploadStateDTO
 
@@ -681,6 +732,7 @@ private struct UploadSection: View {
 
         switch state.phase {
         case "uploading":
+            FeatureFlagChips(flags: state.featureFlags ?? [])
             ListGroup {
                 FreeRow(isLast: true) {
                     HStack(spacing: 10) {
@@ -703,9 +755,10 @@ private struct UploadSection: View {
             }
 
         case "skipped":
-            SkippedBanner(reason: state.skippedReason, features: state.skippedFeatures)
+            SkippedBanner(reason: state.skippedReason)
 
         case "done":
+            FeatureFlagChips(flags: state.featureFlags ?? [])
             ListGroup {
                 let rows = state.results
                 ForEach(Array(rows.enumerated()), id: \.element.id) { idx, r in
@@ -732,6 +785,12 @@ private struct UploadSection: View {
                                         defaultValue: "Skipped",
                                         comment: "Community-leaderboard subtitle when the server skipped uploading")
         case "done":
+            let flagCount = state.featureFlags?.count ?? 0
+            if state.failedCount == 0 && flagCount > 0 {
+                return String(localized: "bench.throughput.upload.subtitle.done_flagged",
+                              defaultValue: "\(state.successCount) of \(state.total) submitted · \(flagCount) flags",
+                              comment: "Community-leaderboard subtitle when the run was tagged with acceleration flags; placeholders are success count, total, and flag count")
+            }
             if state.failedCount == 0 {
                 return String(localized: "bench.throughput.upload.subtitle.done_all",
                               defaultValue: "\(state.successCount) of \(state.total) submitted",
@@ -771,7 +830,7 @@ private struct UploadRow: View {
                 Spacer(minLength: 0)
             } else if let urlString = result.url, let url = URL(string: urlString) {
                 Image(systemName: result.duplicate == true
-                      ? "doc.on.doc"
+                      ? "document.on.document"
                       : "checkmark.circle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(result.duplicate == true ? theme.textTertiary : theme.greenDot)
@@ -840,15 +899,17 @@ private struct OwnerHashRow: View {
             }
             .buttonStyle(.omlx(.plain, size: .small))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }
 }
 
+/// Kept for the external-endpoint case, which still skips. Not reachable from
+/// this screen today (BenchStartRequest has no `external` field), but the
+/// server state exists and a silent EmptyView would be worse.
 private struct SkippedBanner: View {
     let reason: String?
-    let features: [String]
 
     @Environment(\.omlxTheme) private var theme
 
@@ -864,7 +925,7 @@ private struct SkippedBanner: View {
                             comment: "Banner heading shown when the server skipped uploading bench results"))
                     .font(.omlxText(12, weight: .semibold))
                     .foregroundStyle(theme.text)
-                Text(body(reason: reason, features: features))
+                Text(body(reason: reason))
                     .font(.omlxText(11))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -878,21 +939,88 @@ private struct SkippedBanner: View {
         .padding(.bottom, 10)
     }
 
-    private func body(reason: String?, features: [String]) -> String {
+    private func body(reason: String?) -> String {
         switch reason {
-        case "experimental_features":
-            let list = features.isEmpty
-                ? String(localized: "bench.throughput.upload.skipped.experimental_default",
-                         defaultValue: "experimental features",
-                         comment: "Fallback noun phrase listed in the skipped-upload reason when the server returned no feature names")
-                : features.joined(separator: ", ")
-            return String(localized: "bench.throughput.upload.skipped.experimental",
-                          defaultValue: "Results were not submitted because \(list) were active during the run. These features skew throughput and would pollute the leaderboard.",
-                          comment: "Skipped-upload reason when experimental features were active; placeholder is the comma-joined feature list")
+        case "external_endpoint":
+            return String(localized: "bench.throughput.upload.skipped.external",
+                          defaultValue: "External endpoint results are not submitted because they measure remote hardware.",
+                          comment: "Skipped-upload reason when the benchmark ran against an external endpoint")
         default:
             return String(localized: "bench.throughput.upload.skipped.default",
                           defaultValue: "The server skipped uploading these results.",
                           comment: "Fallback skipped-upload reason when the server didn't provide one")
+        }
+    }
+}
+
+/// Acceleration features active during the run, rendered verbatim from the
+/// server-supplied labels. Deliberately not localized: these are product names
+/// and a local label table would drift from the server's.
+private struct FeatureFlagChips: View {
+    let flags: [BenchFeatureFlagDTO]
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        if !flags.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(String(localized: "bench.throughput.upload.flags.title",
+                            defaultValue: "Acceleration flags",
+                            comment: "Heading above the acceleration-feature chips in the community upload block"))
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.textTertiary)
+                FlowRow(spacing: 6) {
+                    ForEach(flags) { flag in
+                        Text(flag.detail.map { "\(flag.label) · \($0)" } ?? flag.label)
+                            .font(.omlxMono(10.5))
+                            .foregroundStyle(theme.greenDot)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(theme.greenDot.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+/// Minimal wrapping HStack. SwiftUI has no first-party flow layout below
+/// macOS 13's Layout protocol usage, and the chip count here is small.
+private struct FlowRow: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: maxWidth == .infinity ? x : maxWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
         }
     }
 }
@@ -907,309 +1035,4 @@ private func format1(_ value: Double?) -> String {
 private func formatPeakMem(_ bytes: Int64?) -> String {
     guard let b = bytes, b > 0 else { return "—" }
     return formatBytes(b)
-}
-
-// MARK: - View model
-
-@MainActor
-final class ThroughputBenchScreenVM: ObservableObject {
-    // Form state — defaults mirror the HTML admin panel's pre-ticked options.
-    @Published var selectedModelId: String = ""
-    @Published var promptLengths: Set<Int> = [4096, 16384]
-    @Published var genLength: String = "128"
-    @Published var batchSizes: Set<Int> = [2, 4]
-    @Published var exportOpen: Bool = false
-
-    // Server state
-    @Published private(set) var models: [ModelDTO] = []
-    @Published private(set) var device: DeviceInfoDTO?
-    @Published private(set) var running: Bool = false
-    @Published private(set) var singleResults: [BenchResultDTO] = []
-    @Published private(set) var batchResults: [BenchResultDTO] = []
-    @Published private(set) var currentBenchId: String?
-    /// Server-side upload-to-leaderboard state, populated after the
-    /// bench completes. Phases: "idle" (not yet started, or no upload
-    /// because of experimental features detected later in the run) →
-    /// "uploading" → "done" | "skipped". The poll loop keeps running
-    /// past `status=completed` until this reaches a terminal phase so
-    /// the user sees the leaderboard URL light up without manually
-    /// refreshing.
-    @Published private(set) var uploadState: BenchUploadStateDTO?
-    @Published var lastError: String?
-
-    private weak var client: OMLXClient?
-    private var pollTask: Task<Void, Never>?
-    /// Counts poll iterations spent waiting for the upload phase to
-    /// terminate after the bench itself completes. Reset on each new
-    /// run; capped at 120 (i.e. 2 min at 1 Hz) so a wedged upload
-    /// doesn't hold the poll loop hostage forever.
-    private var postCompleteTicks: Int = 0
-
-    // MARK: Derived
-
-    var canRun: Bool {
-        !selectedModelId.isEmpty
-            && !running
-            && !promptLengths.isEmpty
-            && !batchSizes.isEmpty
-            && (Int(genLength) ?? 0) > 0
-    }
-
-    /// Synthetic 1× baseline for the Batch Results table: the first single
-    /// trial whose pp == 1024 (matches the JS admin panel's behaviour).
-    var batchBaseline: BenchResultDTO? {
-        singleResults.first(where: { $0.pp == 1024 })
-            ?? singleResults.first
-    }
-
-    /// Monospaced two-table dump used by the Text export card.
-    var exportText: String {
-        var lines: [String] = []
-        if !singleResults.isEmpty {
-            lines.append("# Single request results")
-            lines.append(
-                ["Test", "TTFT(ms)", "TPOT(ms)", "ppTPS", "tgTPS",
-                 "E2E(s)", "Throughput", "PeakMem"]
-                    .joined(separator: "\t")
-            )
-            for r in singleResults {
-                lines.append([
-                    "pp \(r.pp ?? 0) / tg \(r.tg ?? 0)",
-                    format1(r.ttftMs),
-                    format1(r.tpotMs),
-                    format1(r.processingTps),
-                    format1(r.genTps),
-                    format1(r.e2eLatencyS),
-                    format1(r.totalThroughput),
-                    formatPeakMem(r.peakMemoryBytes),
-                ].joined(separator: "\t"))
-            }
-            lines.append("")
-        }
-        if !batchResults.isEmpty {
-            lines.append("# Batch results")
-            lines.append(
-                ["Batch", "tgTPS", "ppTPS", "avgTTFT(ms)", "E2E(s)", "Speedup"]
-                    .joined(separator: "\t")
-            )
-            let baselineTps = batchBaseline?.genTps ?? 0
-            if let baseline = batchBaseline {
-                lines.append([
-                    "1x baseline",
-                    format1(baseline.genTps),
-                    format1(baseline.processingTps),
-                    format1(baseline.ttftMs),
-                    format1(baseline.e2eLatencyS),
-                    "1.00x",
-                ].joined(separator: "\t"))
-            }
-            for r in batchResults {
-                let speedup: String = {
-                    guard baselineTps > 0, let tg = r.tgTps else { return "—" }
-                    return String(format: "%.2fx", tg / baselineTps)
-                }()
-                lines.append([
-                    "\(r.batchSize ?? 0)x",
-                    format1(r.tgTps),
-                    format1(r.ppTps),
-                    format1(r.avgTtftMs),
-                    format1(r.e2eLatencyS),
-                    speedup,
-                ].joined(separator: "\t"))
-            }
-        }
-        return lines.isEmpty ? "No results yet." : lines.joined(separator: "\n")
-    }
-
-    // MARK: Lifecycle
-
-    /// Idempotent: called every time the screen appears. Refreshes the
-    /// model + device lists (cheap, ~ms) but never touches the
-    /// running-bench state, results table, or poll task. If the user
-    /// navigated away during a run, the same poll task is still alive
-    /// updating these `@Published` properties — coming back just
-    /// re-subscribes via SwiftUI's diffing.
-    func start(client: OMLXClient) async {
-        self.client = client
-        await loadModels()
-        await loadDevice()
-    }
-
-    /// Manually tear down the poll task. Not wired to the screen's
-    /// `.onDisappear` — the bench survives screen unloads. Kept around
-    /// for future "logout / disconnect" flows where the long-lived VM
-    /// needs to be reset.
-    func stop() {
-        pollTask?.cancel()
-        pollTask = nil
-    }
-
-    // MARK: Loaders
-
-    private func loadModels() async {
-        guard let client else { return }
-        do {
-            let resp = try await client.listModels()
-            self.models = resp.models
-        } catch {
-            // Surface so the user can recover; polling does not depend on this.
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    private func loadDevice() async {
-        guard let client else { return }
-        do {
-            self.device = try await client.getDeviceInfo()
-        } catch {
-            // Device chip is a "nice to have" — hide silently on failure
-            // so a missing /api/device-info doesn't block running the bench.
-            self.device = nil
-        }
-    }
-
-    // MARK: Actions
-
-    func runBenchmark(client: OMLXClient) {
-        guard canRun else { return }
-        let body = BenchStartRequest(
-            modelId: selectedModelId,
-            promptLengths: promptLengths.sorted(),
-            generationLength: Int(genLength) ?? 128,
-            batchSizes: batchSizes.sorted()
-        )
-        // Wipe the previous run's tables so a new run doesn't accumulate
-        // across unrelated configurations.
-        singleResults = []
-        batchResults = []
-        uploadState = nil
-        postCompleteTicks = 0
-        lastError = nil
-        running = true
-
-        Task { [weak self] in
-            do {
-                let resp = try await client.startThroughputBench(body)
-                await MainActor.run {
-                    guard let self else { return }
-                    self.currentBenchId = resp.benchId
-                    self.pollResults(client: client)
-                }
-            } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.running = false
-                    self.lastError = error.omlxDescription
-                }
-            }
-        }
-    }
-
-    func cancelBenchmark(client: OMLXClient) {
-        guard let benchId = currentBenchId else {
-            // Nothing to cancel server-side — flip the UI back regardless
-            // so we don't strand the screen in "Running…" forever.
-            running = false
-            return
-        }
-        Task { [weak self] in
-            do {
-                _ = try await client.cancelBench(benchId: benchId)
-            } catch {
-                await MainActor.run { self?.lastError = error.omlxDescription }
-            }
-            await MainActor.run {
-                self?.running = false
-                self?.pollTask?.cancel()
-                self?.pollTask = nil
-            }
-        }
-    }
-
-    // MARK: Polling
-
-    /// 1 Hz poll of GET /api/bench/{id}/results while running. Server
-    /// returns the full `results` array — we append-dedupe per call so
-    /// the in-progress tables don't flicker as new rows arrive.
-    private func pollResults(client: OMLXClient) {
-        pollTask?.cancel()
-        guard let benchId = currentBenchId else { return }
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                do {
-                    let resp = try await client.getBenchResults(benchId: benchId)
-                    await MainActor.run {
-                        self.absorb(results: resp.results)
-                        if let err = resp.error, !err.isEmpty {
-                            self.lastError = err
-                        }
-                        if let upload = resp.uploadState {
-                            self.uploadState = upload
-                        }
-                        let status = resp.status.lowercased()
-                        let terminal = (status == "completed"
-                                        || status == "failed"
-                                        || status == "cancelled")
-                        if terminal {
-                            self.running = false
-                        }
-                    }
-                    // Keep polling past `status=completed` until the upload
-                    // phase also terminates ("done" | "skipped"). The
-                    // backend writes upload state on the same BenchmarkRun
-                    // (benchmark.py:_upload_to_omlx_ai) and surfaces it
-                    // via /results, so this is just one more tick or two.
-                    // Cap with a 120 s safety net so a stuck upload
-                    // doesn't keep the poll alive forever.
-                    let (stillRunning, uploadDone, hitCap) = await MainActor.run {
-                        () -> (Bool, Bool, Bool) in
-                        let phase = self.uploadState?.phase ?? "idle"
-                        let isTerminal = (phase == "done" || phase == "skipped")
-                        self.postCompleteTicks += self.running ? 0 : 1
-                        return (self.running, isTerminal,
-                                self.postCompleteTicks >= 120)
-                    }
-                    if !stillRunning && (uploadDone || hitCap) {
-                        await MainActor.run { self.postCompleteTicks = 0 }
-                        return
-                    }
-                } catch {
-                    // Transient failures (server restart, dropped socket)
-                    // shouldn't kill the poll — log and try again.
-                    await MainActor.run {
-                        self.lastError = error.omlxDescription
-                    }
-                }
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-    }
-
-    /// Split the server's flat `results` array into single / batch buckets
-    /// and merge against what we already have. Dedupe key:
-    ///   • single  → "single::pp::tg"
-    ///   • batch   → "batch::batchSize"
-    /// Mirrors the JS panel: rows are unique per (testType, key).
-    private func absorb(results: [BenchResultDTO]) {
-        var singles: [BenchResultDTO] = []
-        var batches: [BenchResultDTO] = []
-        var seen = Set<String>()
-        for r in results {
-            switch r.testType {
-            case "single":
-                let key = "single::\(r.pp ?? 0)::\(r.tg ?? 0)"
-                if seen.insert(key).inserted { singles.append(r) }
-            case "batch":
-                let key = "batch::\(r.batchSize ?? 0)"
-                if seen.insert(key).inserted { batches.append(r) }
-            default:
-                continue
-            }
-        }
-        // Sort for stable presentation regardless of arrival order.
-        self.singleResults = singles.sorted { ($0.pp ?? 0, $0.tg ?? 0) < ($1.pp ?? 0, $1.tg ?? 0) }
-        self.batchResults = batches.sorted { ($0.batchSize ?? 0) < ($1.batchSize ?? 0) }
-    }
-
 }

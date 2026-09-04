@@ -17,6 +17,7 @@ import Foundation
 struct OQModelInfo: Codable, Equatable, Sendable, Identifiable {
     let path: String
     let name: String
+    let sourceRepoId: String?
     let size: Int64
     let sizeFormatted: String
     let modelType: String
@@ -67,6 +68,10 @@ struct OQStartRequest: Encodable, Sendable {
     let textOnly: Bool
     let dtype: String
     let preserveMtp: Bool
+    let enhanced: Bool
+    let imatrixCachePath: String
+    let imatrixReuseCache: Bool
+    let imatrixStrict: Bool
 }
 
 struct OQStartResponse: Decodable, Sendable {

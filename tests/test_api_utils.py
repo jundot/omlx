@@ -52,9 +52,35 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+from omlx.exceptions import InvalidRequestError
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
+            "reasoning_effort": "xhigh"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "xhigh")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
+
+    def test_numeric_effort_forwarded_unchanged(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(None, 0.9)
+
+        assert merged == {"reasoning_effort": 0.9}
+        assert isinstance(merged["reasoning_effort"], float)
 
 
 class TestCleanOutputText:
@@ -623,6 +649,16 @@ class TestUsesNativeReasoningContent:
         assert uses_native_reasoning_content(
             "qwen",
             preserve_thinking_default=True,
+        )
+
+    def test_detects_muse_glimmer(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="muse_glimmer",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="muse_glimmer",
         )
 
     def test_plain_model_is_not_native(self):
@@ -2178,6 +2214,47 @@ class TestPrepareSystemMessagesForTemplate:
                 )
             return "user:__OMLX_MID_SYSTEM_PROBE_USER__"
 
+    class ToolHistoryTokenizer(PreserveTokenizer):
+        chat_template = "tool-history-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            for index, message in enumerate(messages):
+                if message["role"] != "tool":
+                    continue
+                if index == 0 or messages[index - 1]["role"] != "assistant":
+                    raise ValueError("tool message must follow an assistant")
+                tool_call_id = message.get("tool_call_id")
+                tool_call_ids = {
+                    call.get("id") for call in messages[index - 1].get("tool_calls", [])
+                }
+                if tool_call_id not in tool_call_ids:
+                    raise ValueError("tool result must match a tool call")
+            return super().apply_chat_template(messages, **kwargs)
+
+    class UserOnlyMidSystemTokenizer(PreserveTokenizer):
+        chat_template = "user-only-mid-system"
+
+        def apply_chat_template(self, messages, **kwargs):
+            for index, message in enumerate(messages):
+                if (
+                    message["role"] == "system"
+                    and index > 0
+                    and messages[index - 1]["role"] != "user"
+                ):
+                    raise ValueError("mid-system message must follow a user")
+            return super().apply_chat_template(messages, **kwargs)
+
+    class ExplicitlyUnsupportedTokenizer(PreserveTokenizer):
+        _omlx_supports_mid_system_messages = False
+
+    class RelocatingTokenizer(ExplicitlyUnsupportedTokenizer):
+        @staticmethod
+        def _omlx_relocate_mid_system_messages(messages):
+            return [
+                {"role": "latest_reminder", "content": messages[1]["content"]},
+                messages[0],
+            ]
+
     def test_preserves_tail_system_when_template_keeps_position(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2191,6 +2268,56 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["user", "system"]
         assert result[1]["content"] == "Plan mode"
 
+    def test_explicit_capability_overrides_marker_order_false_positive(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ExplicitlyUnsupportedTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [message["role"] for message in result] == ["user"]
+        assert result[0]["content"].endswith("[System note]\nPlan mode\n[/System note]")
+
+    def test_model_specific_relocation_precedes_capability_fallback(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.RelocatingTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert result == [
+            {"role": "latest_reminder", "content": "Plan mode"},
+            {"role": "user", "content": "Hello"},
+        ]
+
+    def test_partial_mode_does_not_use_model_specific_relocation(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Plan mode"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.RelocatingTokenizer(),
+            is_partial=True,
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert result == [
+            {"role": "system", "content": "Plan mode"},
+            {"role": "user", "content": "Hello"},
+        ]
+
     def test_preserves_between_turn_system_when_template_keeps_position(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2203,6 +2330,87 @@ class TestPrepareSystemMessagesForTemplate:
         )
 
         assert [m["role"] for m in result] == ["user", "system", "assistant"]
+
+    def test_preserves_between_system_after_tool_when_exact_probe_passes(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.ToolHistoryTokenizer()
+        )
+
+        assert result == messages
+
+    def test_preserves_tail_system_after_tool_when_exact_probe_passes(self):
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.ToolHistoryTokenizer()
+        )
+
+        assert result == messages
+
+    def test_falls_back_when_template_rejects_system_after_tool(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+        messages = [
+            {"role": "user", "content": "Use the lookup tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "assistant", "content": "Done"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            tokenizer,
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [message["role"] for message in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        tokenizer.apply_chat_template(result)
 
     def test_merges_consecutive_tail_systems_in_place_when_preserved(self):
         messages = [
@@ -2369,6 +2577,44 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["system", "user"]
         assert result[0]["content"] == "Runtime tip"
 
+    def test_user_note_policy_merges_leading_system_messages(self):
+        """Multiple leading system messages must be merged even when a
+        mid-system message triggers the user_note_safe downgrade path.
+
+        Regression test for: Codex App Desktop sends ``instructions`` plus a
+        system/developer message in ``input``, producing two leading system
+        messages.  When a later mid-system message triggers
+        ``_downgrade_mid_system_to_user_notes``, the leading block was
+        preserved as-is (two separate system messages), causing strict
+        templates like Qwen3.6 to reject with
+        "System message must be at the beginning."
+        """
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "system", "content": "Be concise"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Remember this"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.ErrorTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        # All leading system messages must be merged into one
+        assert result[0]["role"] == "system"
+        assert "You are a helpful assistant" in result[0]["content"]
+        assert "Be concise" in result[0]["content"]
+        # No second system message at position 1 — strict templates
+        # (Qwen3.6) require a single system message at the beginning.
+        assert result[1]["role"] != "system", (
+            "Leading system messages were not merged — Qwen3.6-style "
+            "templates would reject this with "
+            "'System message must be at the beginning.'"
+        )
+
     def test_falls_back_for_unsupported_mid_system_placement(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2418,6 +2664,23 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert without_tools is False
         assert with_tools is True
+
+    def test_probe_cache_key_distinguishes_preceding_role(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        after_user = chat_template_preserves_mid_system(
+            tokenizer,
+            preceding_role="user",
+            placement="between",
+        )
+        after_tool = chat_template_preserves_mid_system(
+            tokenizer,
+            preceding_role="tool",
+            placement="between",
+        )
+
+        assert after_user is True
+        assert after_tool is False
 
 
 class TestMergeConsecutiveRoles:
@@ -2846,6 +3109,13 @@ class TestExtractMultimodalContent:
         assert len(parts) == 1
         assert parts[0]["type"] == "input_audio"
         assert parts[0]["input_audio"]["format"] == "wav"
+
+    @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
+    def test_video_input_is_rejected(self, part_type):
+        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+            _extract_multimodal_content_list(
+                [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
+            )
 
 
 # =============================================================================

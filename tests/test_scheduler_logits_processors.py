@@ -135,6 +135,195 @@ class TestChokepointNormalisation:
         )
 
 
+class _RecordingMatcher:
+    """xgrammar.GrammarMatcher stand-in with an explicit allow-set."""
+
+    def __init__(self, allowed=None):
+        self.allowed = allowed
+        self.accepted = []
+
+    def accept_token(self, token_id):
+        if self.allowed is not None and token_id not in self.allowed:
+            return False
+        self.accepted.append(token_id)
+        return True
+
+    def is_terminated(self):
+        return False
+
+
+def _bare_grammar_processor(*, pending, allowed=None, vocab_size=64):
+    """Build a GrammarConstraintProcessor via __new__, without xgrammar.
+
+    ``__init__`` is the only part of the class that imports xgrammar, and CI
+    does not install it (``.github/workflows/ci.yml`` installs ``.[mcp]``
+    only), so the row-advance tests fill the instance state directly.
+    Mirrors the ``__class__.__new__`` idiom of ``_bare_generation_batch``.
+    """
+    import numpy as np
+
+    from omlx.api.grammar import GrammarConstraintProcessor
+
+    proc = GrammarConstraintProcessor.__new__(GrammarConstraintProcessor)
+    proc._matcher = _RecordingMatcher(allowed)
+    proc._vocab_size = vocab_size
+    proc._bitmask = np.full((1, (vocab_size + 31) // 32), -1, dtype=np.int32)
+    proc._terminated = False
+    proc._pending = pending
+    return proc
+
+
+def _grammar_batch(logits_processors, next_tokens):
+    """Minimal GenerationBatch stand-in for the row-advance chokepoint."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        model=object(),
+        uids=list(range(len(logits_processors))),
+        logits_processors=logits_processors,
+        _next_tokens=next_tokens,
+    )
+
+
+class TestGrammarRowAdvance:
+    """Pin the accept point: top of the next step, once per sampled token.
+
+    Grammar rows used to be advanced immediately after the wrapped step
+    dispatched the sampled tokens, which forced ``mx.eval`` on them before
+    any of the host work that follows a step could overlap with the GPU.
+    ``_omlx_advance_grammar_rows`` moves the read to the top of the next
+    step, where the ids are needed anyway; these tests pin the placement and
+    the ``pending`` bookkeeping that makes it exact.
+    """
+
+    def test_sampled_token_is_accepted_at_the_next_step(self):
+        import mlx.core as mx
+
+        import omlx.scheduler as scheduler
+
+        proc = _bare_grammar_processor(pending=True)
+        batch = _grammar_batch([[proc]], mx.array([7], dtype=mx.uint32))
+
+        scheduler._omlx_advance_grammar_rows(batch)
+
+        assert proc._matcher.accepted == [7]
+        assert proc.pending is False
+
+    def test_priming_step_does_not_accept_the_prompt_token(self):
+        """``GenerationBatch.__init__`` steps once with the prompt's last
+        token in ``_next_tokens``; nothing was sampled yet, so the matcher
+        must not see it. The guard is the processor's own ``pending`` flag,
+        which ``extend()`` carries along with the row."""
+        import mlx.core as mx
+
+        import omlx.scheduler as scheduler
+
+        proc = _bare_grammar_processor(pending=False)
+        batch = _grammar_batch([[proc]], mx.array([7], dtype=mx.uint32))
+
+        scheduler._omlx_advance_grammar_rows(batch)
+
+        assert proc._matcher.accepted == []
+
+    def test_only_grammar_rows_are_read(self):
+        """A row without a grammar processor must not be touched, and a
+        batch with no pending grammar row must not force an eval at all."""
+        import mlx.core as mx
+
+        import omlx.scheduler as scheduler
+
+        def identity_processor(token_context, logits):
+            return logits
+
+        proc = _bare_grammar_processor(pending=True)
+        batch = _grammar_batch(
+            [[identity_processor], [proc]], mx.array([3, 9], dtype=mx.uint32)
+        )
+
+        scheduler._omlx_advance_grammar_rows(batch)
+
+        assert proc._matcher.accepted == [9]
+
+    def test_none_next_tokens_is_skipped(self):
+        """``filter([])`` leaves ``_next_tokens`` as None (mlx-lm)."""
+        import omlx.scheduler as scheduler
+
+        proc = _bare_grammar_processor(pending=True)
+        batch = _grammar_batch([[proc]], None)
+
+        scheduler._omlx_advance_grammar_rows(batch)
+
+        assert proc._matcher.accepted == []
+
+    def test_row_count_mismatch_is_skipped(self):
+        """Same defensive criterion as the row realignment: a token array
+        that disagrees with ``uids`` cannot be attributed to rows."""
+        import mlx.core as mx
+
+        import omlx.scheduler as scheduler
+
+        proc = _bare_grammar_processor(pending=True)
+        batch = _grammar_batch([[proc]], mx.array([1, 2], dtype=mx.uint32))
+
+        scheduler._omlx_advance_grammar_rows(batch)
+
+        assert proc._matcher.accepted == []
+
+    def test_advance_runs_before_the_wrapped_step(self, monkeypatch):
+        """The accept must happen while ``_next_tokens`` still holds the
+        previous samples — the original step promotes them to the model
+        input on its first line."""
+        import mlx.core as mx
+
+        import omlx.scheduler as scheduler
+
+        order = []
+
+        def fake_original_step(self):
+            order.append("step")
+            return "stepped"
+
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", fake_original_step
+        )
+
+        proc = _bare_grammar_processor(pending=True)
+        original_accept = proc.accept_token
+
+        def recording_accept(token_id):
+            order.append("accept")
+            original_accept(token_id)
+
+        proc.accept_token = recording_accept
+
+        batch = _grammar_batch([[proc]], mx.array([5], dtype=mx.uint32))
+        assert scheduler._patched_generation_batch_step(batch) == "stepped"
+
+        assert order == ["accept", "step"]
+        assert proc._matcher.accepted == [5]
+
+    def test_scheduler_source_orders_advance_between_realign_and_step(self):
+        """Source-level guard on the call order inside the patched step.
+
+        The advance reads ``logits_processors[e]`` as the row state for
+        ``uids[e]``, which only holds after the realignment; and it must run
+        before the original step, which consumes ``_next_tokens``.
+        """
+        from pathlib import Path
+
+        scheduler_src = (
+            Path(__file__).resolve().parents[1] / "omlx" / "scheduler.py"
+        ).read_text()
+        realign = scheduler_src.index("    _omlx_realign_generation_batch_rows(self)")
+        advance = scheduler_src.index("    _omlx_advance_grammar_rows(self)")
+        step = scheduler_src.index("return _original_generation_batch_step(self)")
+        assert realign < advance < step, (
+            "_omlx_advance_grammar_rows must run after the row realignment "
+            "(it indexes logits_processors by row) and before the wrapped "
+            "step (which promotes _next_tokens to the model input)."
+        )
+
+
 def _bare_generation_batch(uid, logits_processors):
     """Build a GenerationBatch via __new__ with plain-list state.
 

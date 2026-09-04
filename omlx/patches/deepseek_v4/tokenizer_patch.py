@@ -218,6 +218,13 @@ def apply_load_patch() -> bool:
         if wrapper._chat_template is None:
             wrapper._chat_template = _ct.apply_chat_template
             wrapper.has_chat_template = True
+        if wrapper._chat_template is _ct.apply_chat_template:
+            wrapper._omlx_supports_mid_system_messages = (
+                _ct.supports_mid_system_messages
+            )
+            wrapper._omlx_relocate_mid_system_messages = (
+                _ct.relocate_mid_system_messages
+            )
         if wrapper._tool_parser is None:
             wrapper._tool_parser = _tp.parse_tool_call
             wrapper._tool_call_start = _tp.tool_call_start

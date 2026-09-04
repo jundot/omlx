@@ -129,6 +129,26 @@ class TestValidateConfigServerLoading:
                 {"servers": {"fs": {"transport": "stdio", "command": "x", "bogus": 1}}}
             )
 
+    def test_cwd_accepted_for_stdio_server(self):
+        """``cwd`` is a common key in stdio entries ported from other MCP
+        hosts (Claude Desktop, LM Studio). Before the #1111 fix the unknown
+        kwarg raised TypeError, surfaced as "Invalid config for server ...",
+        and disabled MCP for the whole config; it must load and carry the
+        value through instead."""
+        cfg = validate_config(
+            {
+                "mcpServers": {
+                    "lightroom": {
+                        "transport": "stdio",
+                        "command": "node",
+                        "args": ["build/index.js"],
+                        "cwd": "/Users/me/mcp/lightroom",
+                    }
+                }
+            }
+        )
+        assert cfg.servers["lightroom"].cwd == "/Users/me/mcp/lightroom"
+
     def test_claude_desktop_mcpServers_format_accepted(self):  # noqa: N802
         """Upstream chose to accept Claude Desktop's ``mcpServers`` key
         as an alias for oMLX's ``servers``. Drop this and Claude users

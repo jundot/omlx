@@ -67,6 +67,7 @@
                                         <option value="ru">{{ t('settings.language.ru') }}</option>
                                         <option value="es">{{ t('settings.language.es') }}</option>
                                         <option value="fr">{{ t('settings.language.fr') }}</option>
+                                        <option value="pt-BR">{{ t('settings.language.pt-BR') }}</option>
                                     </select>
                                 </div>
                             </div>
@@ -295,6 +296,19 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.hide_helper_models') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.hide_helper_models_desc') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
+                                            :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.model.hide_helper_models ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">
@@ -516,6 +530,43 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <!-- Prioritize Decoding During Prefill -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div class="flex-1 min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.decode_fairness') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.decode_fairness_description') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
+                                            :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.scheduler.decode_fairness ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <!-- Prefill Priority -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_priority.label') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_priority.description') }}</p>
+                                    </div>
+                                    <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0">
+                                        <button type="button"
+                                                @click="globalSettings.scheduler.prefill_priority = 'context'"
+                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                class="px-3 py-1.5 text-xs font-medium transition-all flex items-center gap-1.5">
+                                            <i data-lucide="maximize-2" class="w-3.5 h-3.5"></i>
+                                            {{ t('settings.resource.prefill_priority.max_context') }}
+                                        </button>
+                                        <button type="button"
+                                                @click="globalSettings.scheduler.prefill_priority = 'speed'"
+                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200 flex items-center gap-1.5">
+                                            <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
+                                            {{ t('settings.resource.prefill_priority.speed') }}
+                                        </button>
+                                    </div>
+                                </div>
                                 <!-- Idle Timeout -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -680,6 +731,19 @@
                                     <input type="text" x-model="globalSettings.mcp.config_path" placeholder="{{ t('settings.mcp.config_placeholder') }}"
                                            class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.mcp.expose_tools') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.mcp.expose_tools_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.mcp.expose_tools = !globalSettings.mcp.expose_tools"
+                                            :class="globalSettings.mcp.expose_tools ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.mcp.expose_tools ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                             </div>
                         </div>
 
@@ -747,10 +811,33 @@
                                        :class="advancedOpen && 'rotate-180'"></i>
                                 </div>
                             </button>
-                            <div x-show="advancedOpen" x-collapse x-cloak>
+                            <div x-show="advancedOpen" x-cloak>
                                 <div class="border-t border-neutral-200">
-                                    <!-- Performance subsection -->
+                                    <!-- Distributed inference subsection -->
                                     <div class="px-6 py-3 bg-neutral-50">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="network" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.distributed_inference') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1 min-w-0">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.distributed_inference_enabled') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.distributed_inference_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="globalSettings.server.distributed_inference_enabled = !globalSettings.server.distributed_inference_enabled"
+                                                    :class="globalSettings.server.distributed_inference_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="globalSettings.server.distributed_inference_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Performance subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="zap" class="w-3.5 h-3.5 text-neutral-400"></i>
                                             <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
@@ -801,6 +888,105 @@
                                             <input type="number" x-model.number="globalSettings.cache.initial_cache_blocks"
                                                    min="1"
                                                    class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.hot_cache_write_through') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.hot_cache_write_through_hint') }}</p>
+                                            </div>
+                                            <button type="button" @click="globalSettings.cache.hot_cache_write_through = !globalSettings.cache.hot_cache_write_through"
+                                                    :class="globalSettings.cache.hot_cache_write_through ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="globalSettings.cache.hot_cache_write_through ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.ane_compile_cache') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.ane_compile_cache_hint') }}</p>
+                                            </div>
+                                            <button type="button" @click="globalSettings.cache.ane_compile_cache = !globalSettings.cache.ane_compile_cache"
+                                                    :class="globalSettings.cache.ane_compile_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="globalSettings.cache.ane_compile_cache ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <!-- GDN cache policy subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="database-zap" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.gdn_cache_policy') }}</span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-1.5">{{ t('settings.advanced.gdn_cache_policy_hint') }}</p>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.gdn_snapshot_storage') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gdn_snapshot_storage_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.cache.gdn_snapshot_storage"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <option value="auto">{{ t('settings.advanced.gdn_snapshot_storage_auto') }}</option>
+                                                <option value="ssd_sidecar">{{ t('settings.advanced.gdn_snapshot_storage_ssd') }}</option>
+                                                <option value="embedded">{{ t('settings.advanced.gdn_snapshot_storage_embedded') }}</option>
+                                            </select>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.gdn_pending_write_limit') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gdn_pending_write_limit_hint') }}</p>
+                                            </div>
+                                            <input type="text"
+                                                   x-model="globalSettings.cache.gdn_ssd_pending_max_size"
+                                                   :disabled="globalSettings.cache.gdn_snapshot_storage === 'embedded' || globalSettings.cache.hot_cache_only || !globalSettings.cache.enabled"
+                                                   placeholder="512MB"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs disabled:opacity-50 disabled:cursor-not-allowed">
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.gdn_sidecar_state_precision') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.gdn_sidecar_state_precision_hint') }}</p>
+                                                <p x-show="globalSettings.cache.gdn_sidecar_precision !== 'fp32'"
+                                                   x-cloak
+                                                   class="mt-2 flex items-start gap-1.5 text-xs font-medium text-red-600">
+                                                    <i data-lucide="triangle-alert" class="mt-0.5 h-3.5 w-3.5 shrink-0"></i>
+                                                    <span>{{ t('settings.advanced.gdn_sidecar_state_precision_warning') }}</span>
+                                                </p>
+                                            </div>
+                                            <select x-model="globalSettings.cache.gdn_sidecar_precision"
+                                                    :disabled="globalSettings.cache.gdn_snapshot_storage === 'embedded' || globalSettings.cache.hot_cache_only || !globalSettings.cache.enabled"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                                <option value="fp32">{{ t('settings.advanced.gdn_sidecar_state_precision_fp32') }}</option>
+                                                <option value="rht_int16">{{ t('settings.advanced.gdn_sidecar_state_precision_rht_int16') }}</option>
+                                                <option value="bf16">{{ t('settings.advanced.gdn_sidecar_state_precision_bf16') }}</option>
+                                                <option value="int8">{{ t('settings.advanced.gdn_sidecar_state_precision_int8') }}</option>
+                                                <option value="rht_int8">{{ t('settings.advanced.gdn_sidecar_state_precision_rht_int8') }}</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <!-- Uploads subsection -->
+                                    <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
+                                        <div class="flex items-center gap-2">
+                                            <i data-lucide="upload" class="w-3.5 h-3.5 text-neutral-400"></i>
+                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="divide-y divide-neutral-100">
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                            <div class="flex-1">
+                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.max_audio_upload_size') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.max_audio_upload_size_hint') }}</p>
+                                            </div>
+                                            <input type="text"
+                                                   x-model.trim="globalSettings.server.max_audio_upload_size"
+                                                   placeholder="100MB"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
                                         </div>
                                     </div>
 
@@ -1003,6 +1189,142 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
+                                </div>
+                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">DDGS · duckduckgo · brave · searxng</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.provider') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.provider_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.web_search_provider"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="ddgs">DDGS Total</option>
+                                        <option value="ddgs_custom">DDGS Custom</option>
+                                        <option value="duckduckgo">DuckDuckGo</option>
+                                        <option value="brave">Brave Search</option>
+                                        <option value="searxng">SearXNG</option>
+                                    </select>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'ddgs_custom'"
+                                     class="flex flex-col gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.ddgs_backends') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.ddgs_backends_hint') }}</p>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2">
+                                        <template x-for="backend in ddgsBackendList" :key="backend">
+                                            <label class="flex items-center gap-1.5 px-3 py-1.5 text-sm border rounded-lg cursor-pointer transition-colors"
+                                                   :class="ddgsBackendChecked(backend) ? 'border-neutral-900 bg-neutral-100 text-neutral-900' : 'border-neutral-200 text-neutral-500 hover:bg-neutral-50'">
+                                                <input type="checkbox" class="sr-only"
+                                                       :checked="ddgsBackendChecked(backend)"
+                                                       @change="toggleDdgsBackend(backend)">
+                                                <span x-text="backend"></span>
+                                            </label>
+                                        </template>
+                                    </div>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'brave'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.brave_api_key') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.brave_api_key_hint') }}</p>
+                                    </div>
+                                    <input type="password"
+                                           x-model="globalSettings.integrations.web_search_brave_api_key"
+                                           @change="saveIntegrationSettings()"
+                                           autocomplete="off"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'searxng'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.searxng_url') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.searxng_url_hint') }}</p>
+                                    </div>
+                                    <input type="url"
+                                           x-model="globalSettings.integrations.web_search_searxng_url"
+                                           @change="saveIntegrationSettings()"
+                                           placeholder="http://localhost:8888"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.max_results') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.max_results_hint') }}</p>
+                                    </div>
+                                    <input type="number"
+                                           min="1" max="10"
+                                           x-model.number="globalSettings.integrations.web_search_max_results"
+                                           @change="saveIntegrationSettings()"
+                                           class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_mode') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_mode_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.web_search_content_mode"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="snippet">{{ t('settings.integrations.websearch.content_mode_snippet') }}</option>
+                                        <option value="full">{{ t('settings.integrations.websearch.content_mode_full') }}</option>
+                                    </select>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_content_mode === 'full'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_truncate') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_truncate_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
+                                            :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.web_search_content_truncate ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_content_mode === 'full' && globalSettings.integrations.web_search_content_truncate"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.content_max_chars') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.content_max_chars_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number"
+                                               min="1000" step="1000"
+                                               x-model.number="globalSettings.integrations.web_search_content_max_chars"
+                                               @change="saveIntegrationSettings()"
+                                               class="w-28 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <span class="text-sm text-neutral-400">{{ t('settings.integrations.websearch.chars_suffix') }}</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div class="min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.test_label') }}</label>
+                                        <p x-show="webSearchTest.message"
+                                           :class="webSearchTest.ok ? 'text-emerald-600' : 'text-red-500'"
+                                           class="text-xs mt-0.5 break-words"
+                                           x-text="webSearchTest.message"></p>
+                                    </div>
+                                    <button type="button"
+                                            @click="testWebSearch()"
+                                            :disabled="webSearchTest.running"
+                                            class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">
+                                        <span x-show="!webSearchTest.running">{{ t('settings.integrations.websearch.test_button') }}</span>
+                                        <span x-show="webSearchTest.running">{{ t('settings.integrations.websearch.testing') }}</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1025,6 +1347,25 @@
                             </button>
                         </div>
                         <p class="text-sm text-neutral-500 mt-2">{{ t('settings.models.description') }}</p>
+                    </div>
+
+                    <!-- Search + reset sort toolbar -->
+                    <div x-show="!loadingModels && models.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-3 mb-4">
+                        <div class="relative flex-1">
+                            <i data-lucide="search" class="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                            <input type="text" x-model="modelSearch"
+                                   :placeholder="window.t('settings.models.search_placeholder')"
+                                   class="w-full pl-9 pr-9 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                            <button x-show="modelSearch" @click="modelSearch = ''"
+                                    class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                            </button>
+                        </div>
+                        <button @click="resetSort()" :disabled="isModelsSortDefault"
+                                class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                            <i data-lucide="arrow-up-down" class="w-3.5 h-3.5"></i>
+                            <span x-text="window.t('settings.models.reset_sort')"></span>
+                        </button>
                     </div>
 
                     <!-- Loading State -->
@@ -1070,6 +1411,10 @@
                                 {{ t('settings.models.table.pin') }}
                                 <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
                             </div>
+                            <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
+                                {{ t('settings.models.table.visible') }}
+                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                            </div>
                             <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
                                 <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
@@ -1079,19 +1424,47 @@
 
                         <!-- Table Body -->
                         <div class="divide-y divide-neutral-100">
+                            <div x-show="sortedModels.length === 0" class="px-6 py-10 text-center text-sm text-neutral-500"
+                                 x-text="window.t('settings.models.no_match')"></div>
                             <template x-for="model in sortedModels" :key="model.id">
                                 <div class="hover:bg-neutral-50 transition-colors">
                                     <!-- Main Row -->
                                     <div class="flex items-center gap-4 px-6 py-4">
                                         <!-- Model Name -->
                                         <div class="flex-1 min-w-0 flex items-center gap-3">
-                                            <div class="w-8 h-8 bg-neutral-100 rounded-lg flex items-center justify-center flex-shrink-0">
-                                                <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
-                                            </div>
-                                            <p class="text-sm font-medium text-neutral-900 break-all sm:truncate" x-text="model.id"></p>
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
+                                                    @blur="hideTip()"
+                                                    :class="model.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600'"
+                                                    class="hidden sm:flex w-8 h-8 items-center justify-center flex-shrink-0 rounded-lg hover:bg-neutral-100 transition-colors focus:outline-none">
+                                                    <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="model.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <div class="hidden sm:flex w-8 h-8 bg-neutral-100 rounded-lg items-center justify-center flex-shrink-0">
+                                                    <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
+                                                </div>
+                                            </template>
+                                            <p class="text-sm font-medium text-neutral-900 break-all sm:truncate"
+                                               :title="model.display_name || model.id"
+                                               x-text="model.display_name || model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
+                                            <span x-show="model.is_helper" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
+                                                  @mouseleave="hideTip()"
+                                                  x-text="window.t('settings.models.table.helper_badge')"></span>
+                                            <span x-show="model.is_hidden" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
+                                                  @mouseleave="hideTip()"
+                                                  x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
@@ -1162,6 +1535,10 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
+                                                    @mouseenter="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
@@ -1176,11 +1553,38 @@
                                             </template>
                                         </div>
 
+                                        <!-- Visibility Toggle (on = visible in /v1/models) -->
+                                        <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
+                                            <template x-if="!model.virtual">
+                                                <button
+                                                    @click="updateModelSetting(model.id, 'is_hidden', !model.is_hidden)"
+                                                    @mouseenter="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
+                                                    @blur="hideTip()"
+                                                    :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                >
+                                                    <span
+                                                        :class="!model.is_hidden ? 'translate-x-4' : 'translate-x-0'"
+                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                    ></span>
+                                                </button>
+                                            </template>
+                                            <template x-if="model.virtual">
+                                                <span class="text-xs text-neutral-300">—</span>
+                                            </template>
+                                        </div>
+
                                         <!-- Default Radio (only for LLM models) -->
                                         <div class="hidden sm:flex w-14 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual && (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type)">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_default', true)"
+                                                    @mouseenter="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @mouseleave="hideTip()"
+                                                    @focus="showTip($event.currentTarget, model.is_default ? window.t('settings.models.table.default_on_tooltip') : window.t('settings.models.table.default_off_tooltip'))"
+                                                    @blur="hideTip()"
                                                     :class="model.is_default
                                                         ? 'bg-black border-black'
                                                         : 'bg-white border-neutral-300 hover:border-neutral-400'"
@@ -1212,14 +1616,17 @@
                                     </div>
 
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && model.settings && (model.settings.active_profile_name || model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
-                                            <!-- 1. Profile pill (emerald) if active_profile_name -->
-                                            <template x-if="model.settings?.active_profile_name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                                    <i data-lucide="settings" class="w-3 h-3"></i>
-                                                    <span x-text="model.settings.active_profile_name"></span>
+                                            <!-- 1. API-exposed profile pills -->
+                                            <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                                      @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
+                                                      @mouseleave="hideTip()">
+                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                                          :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
+                                                    <span x-text="profile.api_name || profile.name"></span>
                                                 </span>
                                             </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->

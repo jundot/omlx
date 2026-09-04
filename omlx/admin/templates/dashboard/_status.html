@@ -315,6 +315,34 @@
                                             </template>
                                         </div>
                                     </template>
+                                    <!-- DFlash speculation sub-row (issue #2398) -->
+                                    <template x-if="m.dflash && (m.dflash.speculation || m.dflash.pairing_warning)">
+                                        <div class="mt-1.5 ml-5 space-y-1">
+                                            <template x-if="m.dflash.speculation && m.dflash.speculation.last">
+                                                <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-neutral-400">
+                                                    <span class="font-medium text-neutral-500">{{ t('status.active_models.dflash_label') }}</span>
+                                                    <span x-show="m.dflash.speculation.last.fallback_ar"
+                                                          x-text="window.t('status.active_models.dflash_fallback_ar') + (m.dflash.speculation.last.fallback_reason ? ' · ' + m.dflash.speculation.last.fallback_reason : '')"></span>
+                                                    <span x-show="!m.dflash.speculation.last.fallback_ar"
+                                                          x-text="window.t('status.active_models.dflash_draft_share') + ' ' + Math.round((m.dflash.speculation.last.acceptance_ratio || 0) * 100) + '%'"></span>
+                                                    <span x-show="!m.dflash.speculation.last.fallback_ar && m.dflash.speculation.last.accepted_draft_tokens_per_cycle != null"
+                                                          x-text="(m.dflash.speculation.last.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' + window.t('status.active_models.dflash_accepted_draft_per_cycle')"></span>
+                                                    <span x-show="!m.dflash.speculation.last.fallback_ar && m.dflash.speculation.last.tokens_per_cycle != null"
+                                                          x-text="(m.dflash.speculation.last.tokens_per_cycle || 0).toFixed(2) + ' ' + window.t('status.active_models.dflash_output_per_cycle')"></span>
+                                                    <span x-show="!m.dflash.speculation.last.fallback_ar"
+                                                          x-text="formatTokenCount(m.dflash.speculation.last.accepted_draft_tokens || 0) + ' ' + window.t('status.active_models.dflash_draft_tokens_last_request')"></span>
+                                                    <span x-show="m.dflash.speculation.totals && m.dflash.speculation.totals.requests > 1"
+                                                          x-text="formatDFlashSessionStats(m.dflash.speculation.totals)"></span>
+                                                </div>
+                                            </template>
+                                            <template x-if="m.dflash.pairing_warning">
+                                                <div class="flex items-center gap-1.5 text-[10px] text-amber-600">
+                                                    <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
+                                                    <span class="min-w-0" x-text="m.dflash.pairing_warning"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
                                     <!-- Waiting sub-rows -->
                                     <template x-if="m.waiting && m.waiting.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">
@@ -348,16 +376,16 @@
                         </div>
                     </div>
 
-                    <!-- Runtime Cache Observability -->
+                    <!-- Runtime Cache Observability / 运行时缓存可观测性 -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
                         <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3 min-w-0">
                                 <i data-lucide="database" class="w-4 h-4 text-neutral-500 shrink-0"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600 break-words">Runtime Cache Observability</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600 break-words">{{ t('status.runtime_cache.observability') }}</span>
                             </div>
                             <div class="flex flex-col gap-2 min-w-0">
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex flex-wrap items-center gap-2 min-w-0">
-                                    <span class="text-xs text-neutral-400 shrink-0">Memory</span>
+                                    <span class="text-xs text-neutral-400 shrink-0">{{ t('status.runtime_cache.tier_memory') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeHotCachePercent + '%'"></div>
@@ -368,11 +396,11 @@
                                         <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
                                                 @click="showClearHotCacheConfirm = true"
                                                 class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
-                                                title="Clear memory cache">
+                                                title="{{ t('status.runtime_cache.clear_memory_tooltip') }}">
                                             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                                         </button>
                                         <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
-                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <span class="text-xs text-red-600">{{ t('status.runtime_cache.clear_memory_confirm') }}</span>
                                             <button @click="clearHotCache()"
                                                     class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
                                                 {{ t('status.clear_yes') }}
@@ -385,7 +413,7 @@
                                     </div>
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2 min-w-0">
-                                    <span class="text-xs text-neutral-400 shrink-0">SSD</span>
+                                    <span class="text-xs text-neutral-400 shrink-0">{{ t('status.runtime_cache.tier_ssd') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track shrink-0">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
@@ -417,12 +445,12 @@
                         <div class="hidden lg:flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">Runtime Cache Observability</span>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.runtime_cache.observability') }}</span>
                             </div>
                             <div class="flex items-center gap-2">
                                 <!-- Memory gauge (only when hot cache is enabled AND models are loaded) -->
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="flex items-center gap-2">
-                                    <span class="text-xs text-neutral-400">Memory</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.runtime_cache.tier_memory') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeHotCachePercent + '%'"></div>
@@ -433,11 +461,11 @@
                                         <button x-show="!showClearHotCacheConfirm && (stats.runtime_cache?.hot_cache_entries || 0) > 0"
                                                 @click="showClearHotCacheConfirm = true"
                                                 class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-200 rounded-lg transition-all"
-                                                title="Clear memory cache">
+                                                title="{{ t('status.runtime_cache.clear_memory_tooltip') }}">
                                             <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                                         </button>
                                         <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
-                                            <span class="text-xs text-red-600">Clear memory cache?</span>
+                                            <span class="text-xs text-red-600">{{ t('status.runtime_cache.clear_memory_confirm') }}</span>
                                             <button @click="clearHotCache()"
                                                     class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
                                                 {{ t('status.clear_yes') }}
@@ -453,7 +481,7 @@
                                 <span x-show="stats.runtime_cache?.hot_cache_max_bytes > 0 && stats.runtime_cache?.models?.length > 0" class="text-neutral-300 text-xs select-none">|</span>
                                 <!-- SSD gauge (always visible) -->
                                 <div class="flex items-center gap-2">
-                                    <span class="text-xs text-neutral-400">SSD</span>
+                                    <span class="text-xs text-neutral-400">{{ t('status.runtime_cache.tier_ssd') }}</span>
                                     <div class="w-20 h-2 rounded-full overflow-hidden gauge-track">
                                         <div class="h-full bg-amber-400 rounded-full transition-all duration-500"
                                              :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
@@ -485,12 +513,12 @@
                         <div class="px-6 py-4 space-y-3">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                                 <div>
-                                    <div class="text-neutral-400 mb-1">Active base_path</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.active_base_path') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.base_path || '-' "></code>
                                 </div>
                                 <div>
-                                    <div class="text-neutral-400 mb-1">Effective ssd_cache_dir</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.effective_ssd_dir') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.ssd_cache_dir || '-' "></code>
                                 </div>
@@ -498,7 +526,7 @@
 
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                                 <div>
-                                    <div class="text-neutral-400 mb-1">response-state directory</div>
+                                    <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.response_state_dir') }}</div>
                                     <code class="block px-2 py-1 rounded bg-neutral-50 text-neutral-700 break-all"
                                           x-text="stats.runtime_cache?.response_state_dir || '-' "></code>
                                 </div>
@@ -510,22 +538,22 @@
                                  :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
                                  class="grid gap-3 border border-neutral-100 rounded-lg p-3">
                                 <div>
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Hit Rate</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_hit_rate') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
                                 </div>
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Hit Rate</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_hit_rate') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
                                 </div>
                                 <div>
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Prefix Evictions</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_evictions') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="(c.evictions || 0).toLocaleString()"></p>
                                 </div>
                                 <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                                    <p class="text-[11px] text-neutral-400 mb-0.5">Memory Evictions</p>
+                                    <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_evictions') }}</p>
                                     <p class="text-lg font-bold text-neutral-900"
                                        x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
                                 </div>
@@ -536,14 +564,14 @@
                                 <table class="min-w-full text-xs">
                                     <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
                                         <tr>
-                                            <th class="px-3 py-2 text-left">Model</th>
-                                            <th class="px-3 py-2 text-right">Block Size</th>
-                                            <th class="px-3 py-2 text-right">Indexed Blocks</th>
-                                            <th class="px-3 py-2 text-right">Sub-block Cache</th>
-                                            <th class="px-3 py-2 text-right">SSD Files</th>
-                                            <th class="px-3 py-2 text-right">SSD Size</th>
-                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Entries</th>
-                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">Memory Size</th>
+                                            <th class="px-3 py-2 text-left">{{ t('status.runtime_cache.col_model') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_block_size') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_indexed_blocks') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_subblock_cache') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_ssd_files') }}</th>
+                                            <th class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_ssd_size') }}</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_memory_entries') }}</th>
+                                            <th x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right">{{ t('status.runtime_cache.col_memory_size') }}</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-neutral-100 text-neutral-700">
@@ -573,7 +601,7 @@
                             </div>
 
                             <div class="text-[11px] text-neutral-500">
-                                Note: <span class="font-medium text-amber-600">Sub-block Cache</span> means requests below one full block (for example &lt;1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.
+                                {{ t('status.runtime_cache.subblock_note') }}
                             </div>
                         </div>
                     </div>
@@ -738,33 +766,6 @@
                                         <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
                                     </div>
                                 </div>
-                            </div>
-
-                            <!-- Context Scaling for Claude Code -->
-                            <div class="mt-4 pt-4 border-t border-neutral-100">
-                                <div class="flex flex-col sm:flex-row gap-4 sm:items-center">
-                                    <div class="flex items-center gap-3">
-                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('status.claude_code.context_scaling') }}</label>
-                                        <button type="button"
-                                                @click="globalSettings.claude_code.context_scaling_enabled = !globalSettings.claude_code.context_scaling_enabled; saveClaudeCodeSettings()"
-                                                :class="globalSettings.claude_code.context_scaling_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
-                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
-                                            <span :class="globalSettings.claude_code.context_scaling_enabled ? 'translate-x-5' : 'translate-x-0'"
-                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
-                                        </button>
-                                    </div>
-
-                                    <div class="flex items-center gap-2" x-show="globalSettings.claude_code.context_scaling_enabled" x-cloak>
-                                        <label class="text-xs font-bold uppercase tracking-wider text-neutral-500 whitespace-nowrap">{{ t('status.claude_code.target_context_size') }}</label>
-                                        <input type="number"
-                                               x-model.number="globalSettings.claude_code.target_context_size"
-                                               @change="saveClaudeCodeSettings()"
-                                               min="1024" step="1024"
-                                               class="w-32 px-3 py-1.5 text-sm border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
-                                        <span class="text-xs text-neutral-400">{{ t('status.claude_code.tokens_unit') }}</span>
-                                    </div>
-                                </div>
-                                <p class="mt-2 text-xs text-neutral-400 leading-relaxed">{{ t('status.claude_code.context_scaling_description') }}</p>
                             </div>
                         </div>
                     </div>

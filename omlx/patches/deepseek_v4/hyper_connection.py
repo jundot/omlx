@@ -5,6 +5,8 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+
 
 def _make_hc_sinkhorn_collapse_kernel():
     """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
@@ -233,7 +235,7 @@ class HyperConnection(nn.Module):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = decode_matmul(z, self.fn.T)
 
         use_ops = (
             self.training
@@ -280,6 +282,6 @@ class HyperHead(nn.Module):
     def __call__(self, x: mx.array):
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = decode_matmul(z, self.fn.T)
         pre = mx.sigmoid(mixes * self.scale + self.base) + self.hc_eps
         return (pre[..., None] * y).sum(axis=2).astype(x.dtype)

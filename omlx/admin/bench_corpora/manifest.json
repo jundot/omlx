@@ -1,0 +1,99 @@
+{
+  "format": 1,
+  "corpora": [
+    {
+      "file": "code_python.txt",
+      "bytes": 1500595,
+      "characters": 1499992,
+      "sha256": "59f6ec70e0b687ec49463dda575322348d7efe0d0770e69ff37b0e3ec6907aa1"
+    },
+    {
+      "file": "code_mixed.txt",
+      "bytes": 1602480,
+      "characters": 1601487,
+      "sha256": "ac3fbc6b16bf18cbc76fd022c1d9ff1b1c4484587815ea6a882b9c7731b2277a"
+    },
+    {
+      "file": "novel_ko.txt",
+      "bytes": 1521348,
+      "characters": 678539,
+      "sha256": "a21c8ce0871a3a3d1eb43034365376dee0a5aee72d39abbc21843f9b0baf61ce"
+    },
+    {
+      "file": "novel_en.txt",
+      "bytes": 1234292,
+      "characters": 1218726,
+      "sha256": "68407ec911039f97e7b4fd6898f8b325800f5ecbf3d92b2c27380acb04cb9595"
+    },
+    {
+      "file": "novel_ja.txt",
+      "bytes": 1445624,
+      "characters": 485054,
+      "sha256": "a22a3a20823a2a14a490a105da0008da59810fa45d0c8e67eebbeb8f395501f6"
+    }
+  ],
+  "representative_token_counts": {
+    "Qwen3.6": {
+      "code_python.txt": 340883,
+      "code_mixed.txt": 410409,
+      "novel_ko.txt": 441225,
+      "novel_en.txt": 311730,
+      "novel_ja.txt": 297031
+    },
+    "DeepSeek-V4": {
+      "code_python.txt": 338047,
+      "code_mixed.txt": 402092,
+      "novel_ko.txt": 504071,
+      "novel_en.txt": 309112,
+      "novel_ja.txt": 351506
+    }
+  },
+  "sources": {
+    "code_python": "oMLX production Python source snapshot",
+    "code_mixed": "oMLX Python, Swift, JavaScript/Jinja, C++/Metal source snapshot",
+    "novel_ko": {
+      "repository": "https://github.com/AKS-DHLAB/KNoTE",
+      "commit": "add4f9dd99db7e322018d9993c86aadd8e8f4335",
+      "works": [
+        "dataset/01_Yi In-jik_Tears of Blood (Hyeol-ui Nu).xml",
+        "dataset/02_Yi Hae-jo_The Iron World (Cheol-segye).xml",
+        "dataset/03_Yi Kwang-su_The Heartless (Mujeong - Short Story).xml",
+        "dataset/04_Yi Hae-jo_Blood of Flowers (Hwa-ui Hyeol).xml",
+        "dataset/05_Kim Myeong-sun_The Girl of Mystery (Uisim-ui Sonyeo).xml",
+        "dataset/06_Na Hye-seok_Kyung-hee.xml",
+        "dataset/07_Na Hye-seok_To the Revived Granddaughter.xml",
+        "dataset/08_Kim Dong-in_The Sorrows of the Weak.xml",
+        "dataset/09_Yi Ik-sang_The Straggler (Nagoja).xml",
+        "dataset/10_Hyun Jin-geon_A Poor Wife (Bincheo).xml",
+        "dataset/11_Na Hye-seok_Gyu-won.xml",
+        "dataset/12_Hyun Jin-geon_A Society That Drives You to Drink.xml",
+        "dataset/13_Choi Seo-hae_Nostalgia (Hyangsu).xml",
+        "dataset/14_Hyun Jin-geon_A Lucky Day (Unsu Joeun Nal).xml",
+        "dataset/15_Kim Dong-in_Potato (Gamja).xml",
+        "dataset/16_Hyun Jin-geon_Director B and the Love Letters.xml",
+        "dataset/17_Na Do-hyang_The Watermill (Mullebang-a).xml",
+        "dataset/18_Bang Jeong-hwan_For Our Friends.xml",
+        "dataset/19_Bang Jeong-hwan_The Eternal Shirt (Mannyeon Shirt).xml",
+        "dataset/20_Bang Jeong-hwan_The Gold Watch.xml",
+        "dataset/21_Kim Dong-in_Dr. K's Research.xml",
+        "dataset/22_Kim Nam-cheon_Water (Mul).xml",
+        "dataset/23_Chae Man-sik_Ready-made Life.xml",
+        "dataset/24_Kang Kyeong-ae_Salt (Sogeum).xml",
+        "dataset/25_Gye Yong-mook_Adada the Idiot (Baekchi Adada).xml",
+        "dataset/26_Kim Yu-jeong_The Camellias (Dongbaek-kkot).xml",
+        "dataset/27_Yi Sang_The Wings (Nalgae).xml",
+        "dataset/28_Yi Hyo-seok_When Buckwheat Flowers Bloom.xml",
+        "dataset/29_Chae Man-sik_Uncle Chi-suk.xml",
+        "dataset/30_Jeong In-taek_Melancholy (Uuljeung).xml",
+        "dataset/31_Kim Sa-ryang_The Man Met in the Detention Center.xml",
+        "dataset/32_Ji Ha-ryeon_The Journey (Dojeong).xml",
+        "dataset/33_Kang So-cheon_The Photo Studio that Takes Pictures of Dreams.xml"
+      ]
+    },
+    "novel_en": "https://raw.githubusercontent.com/jundot/omlx/34e9e985b753509e0172d31b99331419436e575f/omlx/admin/bench_corpus.txt",
+    "novel_ja": [
+      "https://www.aozora.gr.jp/cards/000148/files/773_ruby_5968.zip",
+      "https://www.aozora.gr.jp/cards/000148/files/789_ruby_5639.zip"
+    ]
+  }
+}

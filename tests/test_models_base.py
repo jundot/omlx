@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for omlx/models/base_model.py — pure-math helpers used by
-omlx/models/xlm_roberta.py (the reranker model). Pin the masking and
-normalization semantics so a refactor doesn't silently change
-embedding output.
+"""Tests for shared embedding and reranker model math helpers.
+
+Pin the masking and normalization semantics so a refactor does not silently
+change model output.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import mlx.core as mx
 from omlx.models.base_model import (
     BaseModelArgs,
     BaseModelOutput,
+    last_token_pool,
     mean_pooling,
     normalize_embeddings,
 )
@@ -118,6 +119,24 @@ class TestMeanPooling:
         mask = mx.array([[1.0, 1.0]])  # default float32
         pooled = mean_pooling(hs, mask)
         assert pooled.dtype == mx.float16
+
+
+class TestLastTokenPooling:
+    def test_compiled_mixed_padding_selects_last_real_token(self):
+        """Pooling stays traceable and handles padding side per batch row."""
+        hidden_states = mx.array(
+            [
+                [[1.0, 0.0], [0.0, 2.0], [99.0, 99.0]],
+                [[99.0, 99.0], [3.0, 0.0], [0.0, 4.0]],
+            ]
+        )
+        attention_mask = mx.array([[1, 1, 0], [0, 1, 1]], dtype=mx.int32)
+
+        compiled_pool = mx.compile(last_token_pool)
+        pooled = compiled_pool(hidden_states, attention_mask)
+        mx.eval(pooled)
+
+        assert pooled.tolist() == [[0.0, 2.0], [0.0, 4.0]]
 
 
 class TestNormalizeEmbeddings:

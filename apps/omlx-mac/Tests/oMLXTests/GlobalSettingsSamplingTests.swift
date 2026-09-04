@@ -121,6 +121,30 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertEqual(json["hot_cache_max_size"] as? String, "8GB")
     }
 
+    func testPatchDistinguishesIdleTimeoutOmittedNullAndValue() throws {
+        let omittedData = try encoder.encode(GlobalSettingsPatch())
+        let omitted = try JSONSerialization.jsonObject(
+            with: omittedData
+        ) as! [String: Any]
+        XCTAssertNil(omitted["idle_timeout_seconds"])
+
+        var disabledPatch = GlobalSettingsPatch()
+        disabledPatch.idleTimeoutSeconds = .null
+        let disabledData = try encoder.encode(disabledPatch)
+        let disabled = try JSONSerialization.jsonObject(
+            with: disabledData
+        ) as! [String: Any]
+        XCTAssertTrue(disabled["idle_timeout_seconds"] is NSNull)
+
+        var enabledPatch = GlobalSettingsPatch()
+        enabledPatch.idleTimeoutSeconds = .value(120)
+        let enabledData = try encoder.encode(enabledPatch)
+        let enabled = try JSONSerialization.jsonObject(
+            with: enabledData
+        ) as! [String: Any]
+        XCTAssertEqual(enabled["idle_timeout_seconds"] as? Int, 120)
+    }
+
     func testPatchEncodesSamplingFieldsAsSnakeCaseFlatKeys() throws {
         // The Python `GlobalSettingsRequest` accepts the sampling defaults
         // as flat `sampling_*` keys (omlx/admin/routes.py:229-234), not
@@ -176,5 +200,32 @@ final class GlobalSettingsSamplingTests: XCTestCase {
 
         XCTAssertTrue(str.contains("\"port\":9000"))
         XCTAssertFalse(str.contains("sampling_"))
+    }
+
+    func testServerDecodesAudioUploadSize() throws {
+        let json = """
+        {
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8080,
+                "log_level": "info",
+                "server_aliases": [],
+                "max_audio_upload_size": "500MB"
+            }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try decoder.decode(GlobalSettingsDTO.self, from: json)
+        XCTAssertEqual(dto.server.maxAudioUploadSize, "500MB")
+    }
+
+    func testPatchEncodesAudioUploadSizeAsFlatSnakeCaseKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.maxAudioUploadSize = "1GB"
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["max_audio_upload_size"] as? String, "1GB")
     }
 }

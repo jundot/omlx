@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.model_settings import (
+    ModelSettings,
+    ModelSettingsManager,
+    resolve_vlm_mtp_conflicts,
+)
 
 
 class TestModelSettings:
@@ -25,6 +29,7 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
@@ -35,6 +40,14 @@ class TestModelSettings:
         assert d["trust_remote_code"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
+
+    def test_is_favorite_roundtrip(self):
+        """Test is_favorite field survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(is_favorite=True)
+        d = original.to_dict()
+        assert d["is_favorite"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.is_favorite is True
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
@@ -244,6 +257,15 @@ class TestModelSettings:
         assert d["turboquant_skip_last"] is False
         restored = ModelSettings.from_dict(d)
         assert restored.turboquant_skip_last is False
+
+    def test_native_mtp_allows_turboquant(self):
+        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert settings.mtp_enabled is True
+        assert settings.turboquant_kv_enabled is True
+
+    def test_vlm_mtp_rejects_turboquant(self):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
+            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
 
     def test_vlm_mtp_draft_model_default(self):
         settings = ModelSettings()
@@ -569,6 +591,56 @@ class TestModelSettingsManager:
         restored = ModelSettings.from_dict(d)
         assert restored.forced_ct_kwargs == ["enable_thinking", "reasoning_effort"]
 
+    def test_merge_chat_template_request_kwargs_request_overrides_model(self):
+        """Request kwargs override model chat-template defaults."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            }
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False},
+        )
+
+        assert merged == {"enable_thinking": False, "custom_flag": "model"}
+
+    def test_merge_chat_template_request_kwargs_dedicated_overrides_raw(self):
+        """Dedicated model fields override model raw chat-template kwargs."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={"enable_thinking": False},
+            enable_thinking=True,
+        )
+
+        assert merge_chat_template_request_kwargs(settings) == {
+            "enable_thinking": True
+        }
+
+    def test_merge_chat_template_request_kwargs_respects_forced_keys(self):
+        """Forced keys block request-level chat-template overrides."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            },
+            forced_ct_kwargs=["enable_thinking"],
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False, "custom_flag": "request"},
+        )
+
+        assert merged == {"enable_thinking": True, "custom_flag": "request"}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading
@@ -592,3 +664,91 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestVlmMtpProcessorExclusivity:
+    """#2399: vlm_mtp_enabled is mutually exclusive with settings that
+    materialize as per-request logits processors."""
+
+    def test_neutral_values_do_not_conflict(self):
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+        )
+        assert settings.vlm_mtp_enabled is True
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("repetition_penalty", 1.2),
+            ("presence_penalty", 0.5),
+            ("guided_grammar_enabled", True),
+        ],
+    )
+    def test_conflicting_setting_raises(self, field, value):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
+            ModelSettings(vlm_mtp_enabled=True, **{field: value})
+
+    def test_thinking_budget_no_longer_conflicts(self):
+        """Thinking budget is applied on the vlm_mtp path at verify time
+        (MTPProcessingSampler), so the combo is allowed."""
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            thinking_budget_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is True
+        assert settings.thinking_budget_enabled is True
+
+    def test_conflicts_ignored_when_vlm_mtp_off(self):
+        settings = ModelSettings(
+            repetition_penalty=1.2,
+            thinking_budget_enabled=True,
+            guided_grammar_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is False
+
+    def test_resolve_helper_clears_vlm_mtp(self):
+        data, conflicts = resolve_vlm_mtp_conflicts(
+            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
+        )
+        assert data["vlm_mtp_enabled"] is False
+        assert conflicts == ["guided_grammar_enabled"]
+
+    def test_resolve_helper_no_conflict_passthrough(self):
+        original = {"vlm_mtp_enabled": True, "repetition_penalty": 1.0}
+        data, conflicts = resolve_vlm_mtp_conflicts(original)
+        assert data is original
+        assert conflicts == []
+
+    def test_load_migrates_legacy_conflict_preserving_settings(self):
+        """A pre-rule settings file combining vlm_mtp with a penalty must load
+        with vlm_mtp disabled and every other field intact, instead of the
+        whole blob being dropped by the load-time except."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {
+                            "legacy-model": {
+                                "vlm_mtp_enabled": True,
+                                "vlm_mtp_draft_model": "gemma-assistant",
+                                "repetition_penalty": 1.3,
+                                "max_context_window": 8192,
+                                "is_pinned": True,
+                            }
+                        },
+                    }
+                )
+            )
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            loaded = manager.get_settings("legacy-model")
+
+            assert loaded.vlm_mtp_enabled is False
+            assert loaded.repetition_penalty == 1.3
+            assert loaded.max_context_window == 8192
+            assert loaded.is_pinned is True
+            assert loaded.vlm_mtp_draft_model == "gemma-assistant"

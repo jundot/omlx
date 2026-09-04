@@ -15,7 +15,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
 </p>
 
@@ -60,7 +60,7 @@
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install jundot/omlx/omlx
 
 # 최신 버전으로 업그레이드
 brew update && brew upgrade omlx
@@ -72,6 +72,12 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+선택사항인 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널은 현재 HEAD 빌드가 필요합니다:
+
+```bash
+brew install jundot/omlx/omlx --HEAD --with-custom-kernel
+```
+
 ### 소스에서 설치
 
 ```bash
@@ -79,9 +85,27 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # 코어만
 pip install -e ".[mcp]"   # MCP (Model Context Protocol) 포함
+
+# GLM-5.2 / MiniMax M3 / Qwen3.5 네이티브 커스텀 커널
+# (해당 계열 모델을 서빙한다면 강력히 권장 -- 아래 노트 참고)
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+와 Apple Silicon (M1/M2/M3/M4)이 필요합니다.
+macOS 15.0+ (Sequoia), Python 3.11–3.13, Apple Silicon (M1/M2/M3/M4/M5)이 필요합니다.
+
+> **네이티브 커스텀 커널 관련 노트:** 일반 `pip install -e .` 는 커널을 빌드하지
+> 않으며, 해당 모델 계열은 아무런 경고 없이 훨씬 느린 일반 경로로 폴백합니다.
+> GLM-5.2의 경우 fused DSA 프리필이 커널을 쓸 때 약 30배 빠르고(M3 Ultra에서 845 vs
+> ~29 tok/s 측정), 폴백 경로는 메모리도 더 씁니다(#2137). 커널 빌드에는 Metal
+> 툴체인이 필요한데 Command Line Tools만으로는 제공되지 않습니다(`xcrun: error:
+> unable to find utility "metal"`): 전체 Xcode를 설치하거나, 커널이 미리 컴파일되어
+> 포함된 공식 DMG를 사용하세요. Homebrew에서는 `brew install jundot/omlx/omlx --HEAD
+> --with-custom-kernel` 로 빌드할 수 있지만 이 빌드에도 전체 Xcode가 필요합니다.
+> 설치 확인:
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## 빠른 시작
 
@@ -135,11 +159,23 @@ Apple Silicon에서 텍스트 LLM, 비전-언어 모델(VLM), OCR 모델, 임베
 
 ### 관리자 대시보드
 
-`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어, 러시아어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
+`/admin`에서 실시간 모니터링, 모델 관리, 채팅, 벤치마크, 모델별 설정을 위한 웹 UI를 제공합니다. 한국어, 영어, 일본어, 중국어, 프랑스어, 러시아어, 스페인어, 브라질 포르투갈어를 지원합니다. 모든 CDN 의존성이 번들되어 완전한 오프라인 운영이 가능합니다.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 관리자 대시보드" width="720">
 </p>
+
+### 실험적 멀티 Mac 추론
+
+소스 빌드에서는 다운로드한 하나의 언어 모델을 메모리 용량이 서로 다른 여러 Mac에
+나누어, Ring 또는 Thunderbolt RDMA/JACCL 위에서 MLX 파이프라인 랭크로 실행할 수
+있습니다. Cluster 대시보드가 읽기 전용 피어 탐색, 엄격한 SSH/런타임 검증, 바이트
+단위의 불균등 샤드 계획, 실측 기반 연산/링크 재분배, 여유 메모리를 고려한 실행
+튜닝, 활성화, 그리고 양쪽 Mac의 실시간 샤드/성능 맵을 담당합니다. Interactive,
+balanced, throughput 프로파일에서 coalesced 배칭, 프롬프트 캐시 어피니티, 회전 KV
+한도, Ring 연결 튜닝, 그리고 기능 게이트가 적용된 실험적 토큰 전용 출력 경로를
+설정할 수 있습니다. 설정 방법, 보안 경계, 현재 제약, 실제 하드웨어 검증 체크리스트는
+[Mac 간 분산 추론](docs/distributed-cluster.md)을 참조하세요.
 
 ### 비전-언어 모델
 
@@ -180,6 +216,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 - **모델 별칭**: 커스텀 API 표시 이름을 설정합니다. `/v1/models`에서 별칭을 반환하며, 요청 시 별칭과 디렉토리 이름 모두 사용 가능합니다.
 - **모델 타입 오버라이드**: 자동 감지와 관계없이 LLM 또는 VLM으로 수동 설정합니다.
+- **프로파일**: 모델별 설정을 이름이 지정된 번들로 저장하고 관리자 패널에서 전환합니다. 프로파일은 선택적으로 자체 모델로 노출할 수 있습니다: 그러면 `/v1/models`에 `<모델>:<프로파일>`(예: `qwen3-8b:thinking`)도 표시되며, 베이스 모델과 동일한 엔진에서 프로파일 설정을 요청마다 덮어써 동작합니다 — 추가 메모리나 재로드가 없습니다. 베이스 모델에 별칭이 있으면 노출되는 ID는 `<별칭>:<프로파일>` 형식으로 표시되고, 디렉토리 이름 형식도 베이스 모델과 마찬가지로 계속 작동합니다.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX 채팅 템플릿 파라미터" width="480">
@@ -187,7 +224,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 ### 내장 채팅
 
-관리자 패널에서 로드된 모델과 직접 채팅할 수 있습니다. 대화 기록, 모델 전환, 다크 모드, 추론 모델 출력, 그리고 VLM/OCR 모델용 이미지 업로드 를 지원합니다.
+관리자 패널에서 로드된 모델과 직접 채팅할 수 있습니다. 대화 기록, 모델 전환, 다크 모드, 추론 모델 출력, 그리고 VLM/OCR 모델용 이미지 업로드를 지원합니다.
 
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX 채팅" width="720">
@@ -220,7 +257,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 ### macOS 메뉴 바 앱
 
-네이티브 Swift / SwiftUI 메뉴 바 앱 (Electron이 아닙니다!). 터미널 없이 서버를 시작, 중지, 모니터링합니다. 서빙 통계 (재시작해도 유지됨), 크래시 시 자동 재시작, Sparkle 기반 자동 업데이트를 포함합니다.
+네이티브 Swift / SwiftUI 메뉴 바 앱 (Electron이 아닙니다!). 터미널 없이 서버를 시작, 중지, 모니터링합니다. 서빙 통계 (재시작해도 유지됨), 크래시 시 자동 재시작, 빌트인 자동 업데이트를 포함합니다.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX 메뉴 바 통계" width="400">
@@ -254,7 +291,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
-위에 나열되지 않은 모델도 채팅 템플릿이 `tools`를 허용하고 출력이 인식 가능한 `<tool_call>` XML 형식을 사용하면 작동할 수 있습니다. Tool calling이 포함된 스트리밍 요청은 모든 콘텐츠를 버퍼링한 후 완료 시 결과를 전송합니다.
+위에 나열되지 않은 모델도 채팅 템플릿이 `tools`를 허용하고 출력이 인식 가능한 `<tool_call>` XML 형식을 사용하면 작동할 수 있습니다. Tool calling이 포함된 스트리밍에서는 알려진 tool call 제어 마크업을 사용자에게 노출하지 않으면서 어시스턴트 텍스트를 점진적으로 전송합니다. 구조화된 tool call은 해당 턴의 생성이 끝난 뒤 파싱하여 전송합니다.
 
 ## 모델
 
@@ -287,11 +324,14 @@ omlx start
 omlx stop
 omlx restart
 
-# 로드된 모델의 메모리 제한
-omlx serve --model-dir ~/models --max-model-memory 32GB
+# 기본 설정으로 시작 (메모리 가드 티어 = balanced, 관리자 UI에서 관리)
+omlx serve --model-dir ~/models
 
-# 프로세스 수준 메모리 제한 (기본값: auto = RAM - 8GB)
-omlx serve --model-dir ~/models --max-process-memory 80%
+# 시작 시 메모리 가드 티어 선택
+omlx serve --model-dir ~/models --memory-guard safe
+
+# 메모리 가드 상한을 GB 단위로 직접 지정
+omlx serve --model-dir ~/models --memory-guard-gb 48
 
 # KV 블록용 SSD 캐시 활성화
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
@@ -304,6 +344,9 @@ omlx serve --model-dir ~/models --max-concurrent-requests 16
 
 # MCP 도구 사용
 omlx serve --model-dir ~/models --mcp-config mcp.json
+
+# HuggingFace 미러 엔드포인트 (접속이 제한된 지역용)
+omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 
 # API 키 인증
 omlx serve --model-dir ~/models --api-key your-secret-key
@@ -361,6 +404,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks 강제 재빌드 (그 외에는 fingerprint 로 캐시됨)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# 선택 GLM-5.2 / MiniMax M3 네이티브 커스텀 커널을 포함해 스테이징
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 첫 cold 빌드는 10–20분 소요됩니다 (venvstacks Python 레이어 어셈블리). 이후 빌드는 `packaging/_export/` 캐시를 재사용해 약 4분에 끝납니다. 레이어 구성은 [packaging/README.md](packaging/README.md), Swift 소스는 [apps/omlx-mac/](apps/omlx-mac/) 를 참조하세요.
@@ -385,3 +431,6 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 앱 번들을 위한 포터블 Python 환경 레이어링
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon에서의 블록 디퓨전 speculative decoding
+- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP의 verify-shape Metal 커널은 Youssof Altoukhi의 MTPLX를 기반으로 하며, depth-k 파이프라인도 여기서 영감을 받았습니다
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었습니다
+- [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다

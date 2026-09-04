@@ -19,12 +19,179 @@
 // failed). These tests exercise the helper directly — instantiating the
 // full controller in a unit test would require a live `NSStatusBar`.
 
+import AppKit
 import Foundation
 import XCTest
 @testable import oMLX
 
+private final class MenubarStatsRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activityRequestCount = 0
+    private var activityResponseStatusCode = 200
+    private var publicStatusResponseStatusCode = 200
+    private var updateNotificationCount = 0
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        activityRequestCount = 0
+        activityResponseStatusCode = 200
+        publicStatusResponseStatusCode = 200
+        updateNotificationCount = 0
+    }
+
+    func recordActivityRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        activityRequestCount += 1
+    }
+
+    func recordedActivityRequestCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return activityRequestCount
+    }
+
+    func setActivityResponseStatusCode(_ statusCode: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        activityResponseStatusCode = statusCode
+    }
+
+    func currentActivityResponseStatusCode() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return activityResponseStatusCode
+    }
+
+    func setPublicStatusResponseStatusCode(_ statusCode: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        publicStatusResponseStatusCode = statusCode
+    }
+
+    func currentPublicStatusResponseStatusCode() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return publicStatusResponseStatusCode
+    }
+
+    func recordUpdateNotification() {
+        lock.lock()
+        defer { lock.unlock() }
+        updateNotificationCount += 1
+    }
+
+    func recordedUpdateNotificationCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return updateNotificationCount
+    }
+}
+
+private final class MenubarStatsURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let requestRecorder = MenubarStatsRequestRecorder()
+
+    static func resetRequestRecorder() {
+        requestRecorder.reset()
+    }
+
+    static func recordedActivityRequestCount() -> Int {
+        requestRecorder.recordedActivityRequestCount()
+    }
+
+    static func setActivityResponseStatusCode(_ statusCode: Int) {
+        requestRecorder.setActivityResponseStatusCode(statusCode)
+    }
+
+    static func setPublicStatusResponseStatusCode(_ statusCode: Int) {
+        requestRecorder.setPublicStatusResponseStatusCode(statusCode)
+    }
+
+    static func recordUpdateNotification() {
+        requestRecorder.recordUpdateNotification()
+    }
+
+    static func recordedUpdateNotificationCount() -> Int {
+        requestRecorder.recordedUpdateNotificationCount()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let scope = components?.queryItems?.first(where: { $0.name == "scope" })?.value
+        let statusCode: Int
+        if url.path == "/api/status" {
+            statusCode = Self.requestRecorder.currentPublicStatusResponseStatusCode()
+        } else if url.path == "/admin/api/activity" {
+            Self.requestRecorder.recordActivityRequest()
+            statusCode = Self.requestRecorder.currentActivityResponseStatusCode()
+        } else {
+            statusCode = 200
+        }
+        let payload: String
+        switch (url.path, scope) {
+        case ("/api/status", _):
+            payload = #"{"total_prompt_tokens":99}"#
+        case ("/admin/api/activity", _):
+            payload = #"""
+            {
+              "active_models": {
+                "models": [
+                  {
+                    "id": "Laguna XS.2",
+                    "generating": [
+                      {
+                        "request_id": "generation-1",
+                        "generated_tokens": 128,
+                        "tokens_per_second": 42.1,
+                        "elapsed_seconds": 3.0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """#
+        case ("/admin/api/stats", "alltime"):
+            payload = #"{"total_requests":3}"#
+        default:
+            payload = "{}"
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(payload.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 @MainActor
 final class MenubarControllerPortTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        MenubarStatsURLProtocol.resetRequestRecorder()
+    }
 
     /// Test-only PythonRuntime. ServerProcess holds it but doesn't
     /// dereference until `start()` — these tests never start, they just
@@ -42,6 +209,298 @@ final class MenubarControllerPortTests: XCTestCase {
     func testSpawnEnvironmentAdvertisesMenubarSupervisor() {
         let env = makeRuntime().makeEnvironment()
         XCTAssertEqual(env["OMLX_SUPERVISED"], "menubar")
+    }
+
+    func testLiveActivityPrioritizesPrefillOverGeneration() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "active_models": {
+                "models": [
+                  {
+                    "id": "Laguna XS.2",
+                    "prefilling": [
+                      {
+                        "request_id": "prefill-1",
+                        "processed": 12000,
+                        "total": 32000,
+                        "speed": 321.4,
+                        "eta": 46.9
+                      }
+                    ],
+                    "generating": [
+                      {
+                        "request_id": "generation-1",
+                        "generated_tokens": 128,
+                        "tokens_per_second": 42.1,
+                        "elapsed_seconds": 3.0
+                      }
+                    ]
+                  }
+                ],
+                "total_waiting_requests": 2
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
+        let activity = try XCTUnwrap(stats.liveActivity)
+
+        XCTAssertEqual(activity.menuBarTitle, "PP 38% · 12k/32k")
+        XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 tok/s · 47s left")
+    }
+
+    func testLiveActivityShowsGenerationWhenNoPrefillIsActive() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "active_models": {
+                "models": [
+                  {
+                    "id": "Laguna XS.2",
+                    "generating": [
+                      {
+                        "request_id": "generation-1",
+                        "generated_tokens": 128,
+                        "tokens_per_second": 42.1,
+                        "elapsed_seconds": 3.0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
+        let activity = try XCTUnwrap(stats.liveActivity)
+
+        XCTAssertEqual(activity.menuBarTitle, "GEN 42.1 tok/s")
+        XCTAssertEqual(activity.detail, "Laguna XS.2 · 128 tok · 3s")
+    }
+
+    func testLiveActivityShowsQueuedRequestsWhenNoRequestIsRunning() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "active_models": {
+                "models": [],
+                "total_waiting_requests": 2
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
+        let activity = try XCTUnwrap(stats.liveActivity)
+
+        XCTAssertEqual(activity.menuBarTitle, "WAIT 2")
+        XCTAssertEqual(activity.detail, "2 queued requests")
+    }
+
+    func testLiveActivityShowsNonStreamingEngineWork() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "active_models": {
+                "models": [
+                  {
+                    "id": "embed-model",
+                    "activities": [
+                      {
+                        "kind": "embedding",
+                        "detail": "Embedding",
+                        "elapsed_seconds": 12.0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """.data(using: .utf8)
+        )
+
+        let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
+        let activity = try XCTUnwrap(stats.liveActivity)
+
+        XCTAssertEqual(activity.menuBarTitle, "RUN 12s")
+        XCTAssertEqual(activity.detail, "embed-model · Embedding · 12s")
+    }
+
+    func testRefreshOnceLoadsLiveActivityFromActivityEndpoint() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+
+        await poller.refreshOnce()
+
+        XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
+        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 tok/s")
+        XCTAssertEqual(poller.alltimeStats?.totalRequests, 3)
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
+    }
+
+    func testPollingFollowsRefreshIntervalOnlyWhileAMetricItemIsEnabled() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: MenubarMetricPrefs.refreshIntervalKey)
+        defer { defaults.removeObject(forKey: MenubarMetricPrefs.refreshIntervalKey) }
+
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key"
+        )
+
+        XCTAssertEqual(poller.currentPollingInterval, 2.0)
+
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+        XCTAssertEqual(poller.currentPollingInterval, 1.0, "absent pref defaults to 1 s")
+
+        defaults.set(0.5, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(poller.currentPollingInterval, 0.5)
+
+        defaults.set(42.0, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(poller.currentPollingInterval, 1.0, "out-of-set values clamp to 1 s")
+
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: true, alltime: false))
+        defaults.set(3.0, forKey: MenubarMetricPrefs.refreshIntervalKey)
+        XCTAssertEqual(
+            poller.currentPollingInterval, 3.0,
+            "any enabled metric item drives the configured cadence, not just live"
+        )
+
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: false, alltime: false))
+        XCTAssertEqual(poller.currentPollingInterval, 2.0)
+    }
+
+    func testRefreshOnceLoadsActivityWithoutAPIKeyWhenServerAllowsIt() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: nil,
+            sessionConfiguration: sessionConfiguration
+        )
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+
+        await poller.refreshOnce()
+
+        XCTAssertEqual(poller.liveStats?.liveActivity?.menuBarTitle, "GEN 42.1 tok/s")
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 1)
+    }
+
+    func testRefreshOncePostsOneConsolidatedUpdateNotification() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+        let observer = NotificationCenter.default.addObserver(
+            forName: MenubarStatsPoller.didUpdateNotification,
+            object: poller,
+            queue: nil
+        ) { _ in
+            MenubarStatsURLProtocol.recordUpdateNotification()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        await poller.refreshOnce()
+
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 1)
+    }
+
+    func testRefreshOnceSkipsLiveAdminStatsWhenActivityDisplayIsDisabled() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+
+        poller.setEnabledMetrics(EnabledMetrics(live: false, average: false, alltime: false))
+        await poller.refreshOnce()
+
+        XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
+        XCTAssertNil(poller.liveStats)
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedActivityRequestCount(), 0)
+    }
+
+    func testRefreshOnceClearsLiveActivityAfterActivityFailure() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+
+        await poller.refreshOnce()
+        XCTAssertNotNil(poller.liveStats?.liveActivity)
+
+        MenubarStatsURLProtocol.setActivityResponseStatusCode(500)
+        await poller.refreshOnce()
+
+        XCTAssertNil(poller.liveStats)
+    }
+
+    func testRefreshOnceClearsLiveActivityAfterPublicStatusFailure() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        poller.setEnabledMetrics(EnabledMetrics(live: true, average: false, alltime: false))
+
+        await poller.refreshOnce()
+        XCTAssertNotNil(poller.liveStats?.liveActivity)
+
+        MenubarStatsURLProtocol.setPublicStatusResponseStatusCode(500)
+        await poller.refreshOnce()
+
+        XCTAssertNil(poller.liveStats)
+    }
+
+    func testRefreshOncePostsExactlyOneNotificationWhenServerGoesAway() async {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [MenubarStatsURLProtocol.self]
+        let poller = MenubarStatsPoller(
+            baseURL: URL(string: "http://omlx.test")!,
+            apiKey: "test-key",
+            sessionConfiguration: sessionConfiguration
+        )
+        let observer = NotificationCenter.default.addObserver(
+            forName: MenubarStatsPoller.didUpdateNotification,
+            object: poller,
+            queue: nil
+        ) { _ in
+            MenubarStatsURLProtocol.recordUpdateNotification()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 1)
+
+        // First failing tick after a success: one "server went away" repaint…
+        MenubarStatsURLProtocol.setPublicStatusResponseStatusCode(500)
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 2)
+
+        // …then silence while the server stays down (no per-tick spam).
+        await poller.refreshOnce()
+        XCTAssertEqual(MenubarStatsURLProtocol.recordedUpdateNotificationCount(), 2)
     }
 
     // MARK: - displayPort

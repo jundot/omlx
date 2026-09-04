@@ -45,6 +45,7 @@ class MathQABenchmark(BaseBenchmark):
 
         logger.info(f"MathQA: loaded {len(normalized)} questions")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

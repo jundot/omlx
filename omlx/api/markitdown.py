@@ -704,6 +704,27 @@ def _convert_file_with_markitdown(file: MarkItDownFile) -> str:
     return _normalize_markdown_text(getattr(result, "markdown", "") or "")
 
 
+def convert_html_to_markdown(data: bytes, url: str | None = None) -> str:
+    """Convert raw HTML bytes to normalized markdown text.
+
+    Used by the web fetch tool. Raises RuntimeError if MarkItDown is not
+    installed and propagates conversion errors to the caller.
+    """
+    converter = _get_converter()
+
+    try:
+        from markitdown import StreamInfo
+    except ImportError as exc:
+        raise RuntimeError(
+            "MarkItDown is not installed. Install markitdown[pdf,docx,pptx]."
+        ) from exc
+
+    stream_info = StreamInfo(extension=".html", mimetype="text/html", url=url)
+    with _converter_lock:
+        result = converter.convert_stream(io.BytesIO(data), stream_info=stream_info)
+    return _normalize_markdown_text(getattr(result, "markdown", "") or "")
+
+
 def _normalize_markdown_text(markdown: str) -> str:
     lines = [
         line.rstrip()

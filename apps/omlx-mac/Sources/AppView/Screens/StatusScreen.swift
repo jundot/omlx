@@ -11,8 +11,8 @@
 import SwiftUI
 
 struct StatusScreen: View {
-    @EnvironmentObject private var services: AppServices
-    @StateObject private var vm = StatusScreenVM()
+    @Environment(AppServices.self) private var services
+    @State private var vm = StatusScreenVM()
 
     @State private var showingClearStatsConfirm = false
     @State private var showingClearSsdCacheConfirm = false
@@ -38,7 +38,6 @@ struct StatusScreen: View {
                                             defaultValue: "All Time",
                                             comment: "Segmented control option: all-time stats")),
                     ])
-                    .frame(width: 160)
                     Button {
                         showingClearStatsConfirm = true
                     } label: {
@@ -126,12 +125,7 @@ struct StatusScreen: View {
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18).padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task(id: vm.scope) {
             await vm.start(client: services.client)
@@ -290,26 +284,16 @@ private struct RuntimeCacheSection: View {
 
     private var memoryEntriesText: String {
         let n = cache?.hotCacheEntries ?? 0
-        if n == 1 {
-            return String(localized: "status.runtime_cache.memory_entries.one",
-                          defaultValue: "1 entry",
-                          comment: "Singular memory cache entry count")
-        }
-        return String(localized: "status.runtime_cache.memory_entries.other",
-                      defaultValue: "\(n) entries",
-                      comment: "Plural memory cache entry count; placeholder is the number of entries")
+        return String(localized: "status.runtime_cache.memory_entries.count",
+                      defaultValue: "Entries: \(n)",
+                      comment: "Memory cache entry count; placeholder is the number of entries")
     }
 
     private var fileCountText: String {
         guard let n = cache?.totalNumFiles else { return "—" }
-        if n == 1 {
-            return String(localized: "status.runtime_cache.file_count.one",
-                          defaultValue: "1 file",
-                          comment: "Singular cache file count")
-        }
-        return String(localized: "status.runtime_cache.file_count.other",
-                      defaultValue: "\(n) files",
-                      comment: "Plural cache file count; placeholder is the number of files")
+        return String(localized: "status.runtime_cache.file_count.count",
+                      defaultValue: "Files: \(n)",
+                      comment: "Cache file count; placeholder is the number of files")
     }
 
     private var sizeText: String {
@@ -442,26 +426,6 @@ private struct AverageSpeedTilesRow: View {
 
 // MARK: - System rows
 
-/// Horizontal usage bar shared by the GPU memory + system RAM rows.
-/// 140pt × 4pt to match the JSX `.metric-bar` block in the redesign.
-private struct UsageBar: View {
-    let progress: Double
-    let tint: Color
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(theme.codeBg)
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(tint)
-                .frame(width: 140 * max(0, min(progress, 1)))
-                .animation(.easeOut(duration: 0.4), value: progress)
-        }
-        .frame(width: 140, height: 4)
-    }
-}
-
 private struct GpuMemoryTrailing: View {
     let stats: StatsDTO?
     @Environment(\.omlxTheme) private var theme
@@ -470,7 +434,8 @@ private struct GpuMemoryTrailing: View {
         let used = stats?.activeModels.modelMemoryUsed
         let max = stats?.activeModels.modelMemoryMax
         HStack(spacing: 10) {
-            UsageBar(progress: progress, tint: theme.blueDot)
+            ProgressBar(progress: progress, tint: theme.blueDot)
+                .frame(width: 140)
             Text(labelText(used: used, max: max))
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)
@@ -496,12 +461,13 @@ private struct GpuMemoryTrailing: View {
 }
 
 private struct SystemRamTrailing: View {
-    @ObservedObject var metrics: SystemMetricsPoller
+    let metrics: SystemMetricsPoller
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         HStack(spacing: 10) {
-            UsageBar(progress: progress, tint: theme.text.opacity(0.7))
+            ProgressBar(progress: progress, tint: theme.text.opacity(0.7))
+                .frame(width: 140)
             Text(labelText)
                 .font(.omlxMono(11))
                 .foregroundStyle(theme.textSecondary)
@@ -615,9 +581,9 @@ private struct ActiveNowList: View {
 // MARK: - Updates section
 
 private struct UpdatesSection: View {
-    // Observed directly so SwiftUI redraws on UpdateController's own
-    // @Published changes — nested ObservableObjects don't republish.
-    @ObservedObject var updates: UpdateController
+    // Reads UpdateController directly so SwiftUI redraws only for the
+    // observable update properties used by this section.
+    let updates: UpdateController
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
@@ -648,7 +614,7 @@ private struct UpdatesSection: View {
                         get: { updates.channel },
                         set: { updates.channel = $0 }
                     ),
-                    width: 190,
+                    width: .controlMedium,
                     options: UpdateChannel.allCases.map { ($0, $0.displayName) }
                 )
             }
@@ -660,12 +626,10 @@ private struct UpdatesSection: View {
                                  defaultValue: "Look for updates daily in the background",
                                  comment: "Sublabel for the auto-check toggle")
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoCheck },
                     set: { updates.autoCheck = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
@@ -676,12 +640,10 @@ private struct UpdatesSection: View {
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoNotify },
                     set: { updates.autoNotify = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
         }
     }
@@ -808,147 +770,6 @@ private struct UpdatesSection: View {
     }
 }
 
-// MARK: - View model
-
-@MainActor
-final class StatusScreenVM: ObservableObject {
-    @Published var scope: String = "session"
-    @Published var stats: StatsDTO?
-    @Published var lastError: String?
-    /// Loaded once on appear from `scheduler.max_concurrent_requests`.
-    /// 8 is the server's default — used as the divisor before settings load
-    /// so the % column doesn't read 0/0 on first paint.
-    @Published var maxConcurrent: Int = 8
-    @Published var metrics = SystemMetricsPoller()
-
-    private weak var client: OMLXClient?
-    private var pollTask: Task<Void, Never>?
-
-    var systemSubtitle: String {
-        var arch = String(localized: "status.arch.apple_silicon",
-                          defaultValue: "Apple Silicon",
-                          comment: "Architecture label shown in the System section subtitle for Apple Silicon Macs")
-        #if arch(x86_64)
-        arch = String(localized: "status.arch.intel",
-                      defaultValue: "Intel",
-                      comment: "Architecture label shown in the System section subtitle for Intel Macs")
-        #endif
-        let os = ProcessInfo.processInfo.operatingSystemVersion
-        return String(localized: "status.system.subtitle",
-                      defaultValue: "\(arch) · macOS \(os.majorVersion).\(os.minorVersion)",
-                      comment: "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers")
-    }
-
-    var versionText: String {
-        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
-        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
-        return String(localized: "status.version.text",
-                      defaultValue: "\(v) · build \(b)",
-                      comment: "Version row value combining marketing version and build number; placeholders are the version string and build string")
-    }
-
-    var uptimeText: String {
-        guard let s = stats?.uptimeSeconds else { return "—" }
-        return formatUptime(s)
-    }
-
-    var endpointText: String {
-        guard let s = stats else { return "—" }
-        let host = s.host ?? "127.0.0.1"
-        let port = s.port ?? 8000
-        return "\(host):\(port)"
-    }
-
-    var gpuUtilizationPercent: Double {
-        let active = Double(stats?.activeModels.totalActiveRequests ?? 0)
-        let cap = Double(max(1, maxConcurrent))
-        return min(100.0, active / cap * 100.0)
-    }
-
-    var gpuUtilizationText: String {
-        // Trailing "%" looks better tight against the number; the value
-        // is rounded to int so the row doesn't jitter at 12.499 → 12.500.
-        String(format: "%d%%", Int(gpuUtilizationPercent.rounded()))
-    }
-
-    func start(client: OMLXClient) async {
-        self.client = client
-        metrics.start()
-        // Load the scheduler cap once; failing silently is fine — the
-        // default keeps the % column readable until the server responds.
-        if let settings = try? await client.getGlobalSettings(),
-           let max = settings.scheduler?.maxConcurrentRequests {
-            self.maxConcurrent = max
-        }
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                await self.tick()
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
-    }
-
-    func stop() {
-        pollTask?.cancel()
-        pollTask = nil
-        metrics.stop()
-    }
-
-    private func tick() async {
-        guard let client else { return }
-        do {
-            self.stats = try await client.getStats(scope: scope)
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    /// Clear stats for the currently-displayed scope. Refreshes the tile
-    /// values immediately afterwards so the user sees the zeroed state
-    /// without waiting for the next poll.
-    func clearStats() async {
-        guard let client else { return }
-        do {
-            if scope == "alltime" {
-                try await client.clearAlltimeStats()
-            } else {
-                try await client.clearStats()
-            }
-            await tick()
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    /// Drop all SSD KV cache files (loaded models + direct disk sweep).
-    /// Refreshes stats so the Runtime Cache counters reset to zero.
-    func clearSsdCache() async {
-        guard let client else { return }
-        do {
-            _ = try await client.clearSsdCache()
-            await tick()
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    /// Drop the in-memory (hot) KV cache for all loaded models. Subsequent
-    /// requests re-fault from SSD or recompute.
-    func clearHotCache() async {
-        guard let client else { return }
-        do {
-            _ = try await client.clearHotCache()
-            await tick()
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-}
-
 // MARK: - Helpers
 
 private func fmtNum(_ n: Int) -> String {
@@ -957,16 +778,4 @@ private func fmtNum(_ n: Int) -> String {
     if v >= 1e6 { return String(format: "%.2fM", v / 1e6) }
     if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
     return String(n)
-}
-
-private func formatUptime(_ seconds: Double) -> String {
-    let total = Int(seconds)
-    let d = total / 86400
-    let h = (total % 86400) / 3600
-    let m = (total % 3600) / 60
-    let s = total % 60
-    if d > 0 { return "\(d)d \(h)h \(m)m" }
-    if h > 0 { return "\(h)h \(m)m" }
-    if m > 0 { return "\(m)m \(s)s" }
-    return "\(s)s"
 }

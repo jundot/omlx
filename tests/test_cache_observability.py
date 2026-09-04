@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from omlx.cache.observability import CacheRateTracker
+from omlx.cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 
 
 def _make_counters(
@@ -24,6 +24,12 @@ def _make_counters(
     ssd_errors=0,
     hot_cache_evictions=0,
     hot_cache_promotions=0,
+    target_static_hits=0,
+    target_static_misses=0,
+    target_static_tokens_restored=0,
+    draft_prefix_hits=0,
+    draft_prefix_misses=0,
+    draft_prefix_tokens_saved=0,
 ):
     return {
         "prefix_hits": prefix_hits,
@@ -38,6 +44,12 @@ def _make_counters(
         "ssd_errors": ssd_errors,
         "hot_cache_evictions": hot_cache_evictions,
         "hot_cache_promotions": hot_cache_promotions,
+        "target_static_hits": target_static_hits,
+        "target_static_misses": target_static_misses,
+        "target_static_tokens_restored": target_static_tokens_restored,
+        "draft_prefix_hits": draft_prefix_hits,
+        "draft_prefix_misses": draft_prefix_misses,
+        "draft_prefix_tokens_saved": draft_prefix_tokens_saved,
     }
 
 
@@ -120,6 +132,27 @@ class TestCacheRateTrackerRates:
         result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
         assert result["windows"]["1m"]["ssd_hot_rate"] == 0.8
 
+    def test_specprefill_target_and_draft_reuse_are_distinct(self):
+        old = _make_counters()
+        new = _make_counters(
+            target_static_hits=3,
+            target_static_misses=1,
+            target_static_tokens_restored=18_000,
+            draft_prefix_hits=7,
+            draft_prefix_misses=2,
+            draft_prefix_tokens_saved=42_000,
+        )
+
+        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+
+        window = result["windows"]["1m"]
+        assert window["target_static_hit_rate"] == 0.75
+        assert window["target_static_tokens_restored"] == 18_000
+        assert window["draft_prefix_hit_rate"] == pytest.approx(7 / 9, abs=0.0001)
+        assert window["draft_prefix_tokens_saved"] == 42_000
+        assert result["cumulative"]["target_static_hits"] == 3
+        assert result["cumulative"]["draft_prefix_hits"] == 7
+
     def test_insufficient_data_returns_empty_window(self):
         tracker = CacheRateTracker(min_interval=0.0)
 
@@ -200,3 +233,88 @@ class TestCacheRateTrackerClear:
         tracker.maybe_snapshot(_make_counters(prefix_hits=100))
         tracker.clear()
         assert tracker.get_rates() == {"windows": {}, "cumulative": {}}
+
+
+def test_boundary_snapshot_diagnostics_are_structured_and_thread_safe():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "capture_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+    )
+    diagnostics.record(
+        "ssd_fallback",
+        reason="ssd_save_failed",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+        storage="memory",
+    )
+    diagnostics.record(
+        "capture_success",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+        storage="memory",
+    )
+
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot["capture_attempts"] == 1
+    assert snapshot["captures"] == 1
+    assert snapshot["captures_memory"] == 1
+    assert snapshot["captures_ssd"] == 0
+    assert snapshot["ssd_fallbacks"] == 1
+    assert snapshot["reasons"] == {"ssd_save_failed": 1}
+    assert snapshot["last_event"] == {
+        "event": "capture_success",
+        "request_id": "req-a",
+        "token_count": 4096,
+        "block_size": 4096,
+        "source": "prefill",
+        "storage": "memory",
+    }
+
+
+def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "override_miss",
+        reason="ssd_load_failed",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    diagnostics.record(
+        "store_skip",
+        reason="boundary_snapshot_unavailable",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
+
+
+def test_boundary_snapshot_diagnostics_clear_resets_state():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "capture_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+    )
+
+    diagnostics.clear()
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["capture_attempts"] == 0
+    assert snapshot["reasons"] == {}
+    assert snapshot["last_event"] is None

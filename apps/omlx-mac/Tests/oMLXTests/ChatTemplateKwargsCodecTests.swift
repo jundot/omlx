@@ -36,10 +36,51 @@ final class ChatTemplateKwargsCodecTests: XCTestCase {
 
     func testReasoningEffortEncodesAsString() {
         let entries = [
-            ChatTemplateKwargEntry(kind: .reasoningEffort, value: "medium", force: false),
+            ChatTemplateKwargEntry(kind: .reasoningEffort, value: "max", force: false),
         ]
         let (kwargs, _) = ChatTemplateKwargsCodec.encode(entries)
-        XCTAssertEqual(kwargs?["reasoning_effort"]?.value as? String, "medium")
+        XCTAssertEqual(kwargs?["reasoning_effort"]?.value as? String, "max")
+    }
+
+    func testCustomNumericReasoningEffortEncodesAsDouble() {
+        let entries = [
+            ChatTemplateKwargEntry(
+                kind: .reasoningEffort,
+                value: "low",
+                reasoningEffortCustomValue: "0.9",
+                usesCustomReasoningEffort: true
+            ),
+        ]
+        let (kwargs, _) = ChatTemplateKwargsCodec.encode(entries)
+        XCTAssertEqual(kwargs?["reasoning_effort"]?.value as? Double, 0.9)
+    }
+
+    func testCustomStringReasoningEffortStaysString() {
+        let entries = [
+            ChatTemplateKwargEntry(
+                kind: .reasoningEffort,
+                value: "low",
+                reasoningEffortCustomValue: "ultra",
+                usesCustomReasoningEffort: true
+            ),
+        ]
+        let (kwargs, _) = ChatTemplateKwargsCodec.encode(entries)
+        XCTAssertEqual(kwargs?["reasoning_effort"]?.value as? String, "ultra")
+    }
+
+    func testBlankCustomReasoningEffortIsDropped() {
+        let entries = [
+            ChatTemplateKwargEntry(
+                kind: .reasoningEffort,
+                value: "low",
+                reasoningEffortCustomValue: "  ",
+                usesCustomReasoningEffort: true,
+                force: true
+            ),
+        ]
+        let (kwargs, forced) = ChatTemplateKwargsCodec.encode(entries)
+        XCTAssertNil(kwargs)
+        XCTAssertNil(forced)
     }
 
     func testCustomBoolCoercion() {
@@ -135,6 +176,28 @@ final class ChatTemplateKwargsCodecTests: XCTestCase {
         )
         XCTAssertTrue(entries.first(where: { $0.kind == .enableThinking })!.force)
         XCTAssertFalse(entries.first(where: { $0.kind == .custom })!.force)
+    }
+
+    func testDecodeSelectsPresetReasoningEffort() {
+        let entries = ChatTemplateKwargsCodec.decode(
+            kwargs: ["reasoning_effort": AnyCodable("xhigh")],
+            forced: nil
+        )
+        let effort = entries[0]
+        XCTAssertEqual(effort.value, "xhigh")
+        XCTAssertFalse(effort.usesCustomReasoningEffort)
+        XCTAssertEqual(effort.reasoningEffortCustomValue, "")
+    }
+
+    func testDecodeSelectsCustomForNumericReasoningEffort() {
+        let entries = ChatTemplateKwargsCodec.decode(
+            kwargs: ["reasoning_effort": AnyCodable(0.9)],
+            forced: nil
+        )
+        let effort = entries[0]
+        XCTAssertEqual(effort.value, "low")
+        XCTAssertTrue(effort.usesCustomReasoningEffort)
+        XCTAssertEqual(effort.reasoningEffortCustomValue, "0.9")
     }
 
     func testDecodeStringifiesValues() {

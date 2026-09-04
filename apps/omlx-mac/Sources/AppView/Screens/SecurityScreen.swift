@@ -18,8 +18,8 @@ import SwiftUI
 import AppKit
 
 struct SecurityScreen: View {
-    @EnvironmentObject private var services: AppServices
-    @StateObject private var vm = SecurityScreenVM()
+    @Environment(AppServices.self) private var services
+    @State private var vm = SecurityScreenVM()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -27,13 +27,7 @@ struct SecurityScreen: View {
             AuthenticationSection(vm: vm, client: services.client)
             SubKeysSection(vm: vm, client: services.client)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
     }
@@ -42,7 +36,7 @@ struct SecurityScreen: View {
 // MARK: - API key section
 
 private struct APIKeySection: View {
-    @ObservedObject var vm: SecurityScreenVM
+    var vm: SecurityScreenVM
     let client: OMLXClient
 
     var body: some View {
@@ -62,7 +56,7 @@ private struct APIKeySection: View {
 }
 
 private struct APIKeyEditorRow: View {
-    @ObservedObject var vm: SecurityScreenVM
+    var vm: SecurityScreenVM
     let client: OMLXClient
 
     @State private var draft: String = ""
@@ -103,7 +97,8 @@ private struct APIKeyEditorRow: View {
                           comment: "Row label for the API key editor"),
             sublabel: sublabel, isLast: true) {
             HStack(spacing: 6) {
-                field
+                TextInput("security.api_key.row_label", text: $draft, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: .controlMedium)
+                    .onSubmit { Task { await save() } }
                 iconButton(systemName: showKey ? "eye.slash" : "eye",
                            help: showKey
                                 ? String(localized: "security.api_key.hide",
@@ -121,7 +116,7 @@ private struct APIKeyEditorRow: View {
                     draft = APIKeyGenerator.random()
                     showKey = true
                 }
-                iconButton(systemName: copied ? "checkmark" : "doc.on.doc",
+                iconButton(systemName: copied ? "checkmark" : "document.on.document",
                            help: String(localized: "security.api_key.copy",
                                         defaultValue: "Copy to clipboard",
                                         comment: "Tooltip on the API key copy button"),
@@ -147,34 +142,6 @@ private struct APIKeyEditorRow: View {
         .task(id: loaded) {
             if !focused { draft = loaded }
         }
-    }
-
-    @ViewBuilder
-    private var field: some View {
-        Group {
-            if showKey {
-                TextField("sk-omlx-…", text: $draft)
-            } else {
-                SecureField("sk-omlx-…", text: $draft)
-            }
-        }
-        .focused($focused)
-        .textFieldStyle(.plain)
-        .font(.omlxMono(13, weight: .medium))
-        .foregroundStyle(theme.text)
-        .padding(.horizontal, 10)
-        .frame(height: 28)
-        .frame(width: 260)
-        .background(theme.inputBg)
-        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(
-                    focused ? theme.inputBorderFocus : theme.inputBorder,
-                    lineWidth: 0.5
-                )
-        )
-        .onSubmit { Task { await save() } }
     }
 
     @ViewBuilder
@@ -225,7 +192,7 @@ private struct APIKeyEditorRow: View {
 // MARK: - Authentication
 
 private struct AuthenticationSection: View {
-    @ObservedObject var vm: SecurityScreenVM
+    @Bindable var vm: SecurityScreenVM
     let client: OMLXClient
 
     var body: some View {
@@ -243,10 +210,9 @@ private struct AuthenticationSection: View {
                                  comment: "Sublabel for the disable API key verification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: vm.bind($vm.skipApiKeyVerification, save: {
+                RowSwitch(isOn: vm.bind($vm.skipApiKeyVerification, save: {
                     Task { await vm.saveSkipApiKeyVerification(client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
         }
     }
@@ -255,7 +221,7 @@ private struct AuthenticationSection: View {
 // MARK: - Sub keys
 
 private struct SubKeysSection: View {
-    @ObservedObject var vm: SecurityScreenVM
+    var vm: SecurityScreenVM
     let client: OMLXClient
 
     @State private var newName: String = ""
@@ -297,16 +263,35 @@ private struct SubKeysSection: View {
                               placeholder: String(localized: "security.sub_keys.name_placeholder",
                                                   defaultValue: "Claude Code on laptop",
                                                   comment: "Placeholder text for sub-key name input"),
-                              width: 220)
+                              width: .controlMedium)
                 }
                 Row(label: String(localized: "security.sub_keys.key_label",
                                   defaultValue: "Key",
                                   comment: "Row label for sub-key value input")) {
-                    TextInput(text: $newKey,
-                              placeholder: String(localized: "security.sub_keys.key_placeholder",
-                                                  defaultValue: "sk-omlx-sub-…",
-                                                  comment: "Placeholder text inside the sub-key value input"),
-                              mono: true, width: 220)
+                    HStack(spacing: 6) {
+                        TextInput(text: $newKey,
+                                  placeholder: String(localized: "security.sub_keys.key_placeholder",
+                                                      defaultValue: "sk-omlx-sub-…",
+                                                      comment: "Placeholder text inside the sub-key value input"),
+                                  mono: true, width: .controlMedium)
+                        Button {
+                            newKey = APIKeyGenerator.random()
+                        } label: {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .buttonStyle(.omlx(.plain, size: .small))
+                        .help(String(localized: "security.api_key.generate",
+                                     defaultValue: "Generate a random key",
+                                     comment: "Tooltip on the API key regenerate button"))
+                        CopyIconButton(
+                            value: newKey,
+                            helpText: String(localized: "security.api_key.copy",
+                                             defaultValue: "Copy to clipboard",
+                                             comment: "Tooltip on the API key copy button")
+                        )
+                        .disabled(newKey.isEmpty)
+                    }
                 }
                 FreeRow {
                     HStack(spacing: 6) {
@@ -409,114 +394,4 @@ private struct SubKeysSection: View {
                       defaultValue: "Created · \(f.string(from: date))",
                       comment: "Sub-key created-at text; placeholder is the formatted date and time")
     }
-}
-
-// MARK: - View model
-
-@MainActor
-final class SecurityScreenVM: ObservableObject {
-    @Published var apiKeySet: Bool = false
-    @Published var apiKey: String?
-    @Published var skipApiKeyVerification: Bool = false
-    @Published var subKeys: [SubKeyDTO] = []
-    @Published var lastError: String?
-
-    func bind<T: Equatable>(
-        _ binding: Binding<T>,
-        save: @escaping () -> Void
-    ) -> Binding<T> {
-        Binding(
-            get: { binding.wrappedValue },
-            set: { newValue in
-                let changed = binding.wrappedValue != newValue
-                binding.wrappedValue = newValue
-                if changed { save() }
-            }
-        )
-    }
-
-    func load(client: OMLXClient) async {
-        do {
-            let settings = try await client.getGlobalSettings()
-            self.apiKeySet = settings.auth?.apiKeySet ?? false
-            self.apiKey = settings.auth?.apiKey
-            self.skipApiKeyVerification = settings.auth?.skipApiKeyVerification ?? false
-            self.subKeys = settings.auth?.subKeys ?? []
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    func setupApiKey(key: String, confirm: String, client: OMLXClient) async -> Bool {
-        do {
-            _ = try await client.setupApiKey(key, confirm: confirm)
-            // Re-bootstrap the client so subsequent /admin/api/* calls auth
-            // with the new key.
-            client.configure(host: client.host, port: client.port, apiKey: key)
-            await load(client: client)
-            return true
-        } catch {
-            self.lastError = error.omlxDescription
-            return false
-        }
-    }
-
-    /// Unified write path for the editor row. Routes through /setup-api-key
-    /// for first-time setup (server rejects the PATCH path when no key is
-    /// configured) and through PATCH /global-settings for updates.
-    func applyApiKey(_ key: String, client: OMLXClient) async -> Bool {
-        if apiKeySet {
-            do {
-                _ = try await client.updateGlobalSettings(
-                    GlobalSettingsPatch(apiKey: key)
-                )
-                client.configure(host: client.host, port: client.port, apiKey: key)
-                await load(client: client)
-                return true
-            } catch {
-                self.lastError = error.omlxDescription
-                return false
-            }
-        } else {
-            // First-time setup: the dedicated endpoint requires a confirm
-            // value, which the editor row collapses into a single field. We
-            // mirror the draft as the confirm so the server-side equality
-            // check passes — typo protection lives in the field's own
-            // show/copy affordances now, not in a duplicate input.
-            return await setupApiKey(key: key, confirm: key, client: client)
-        }
-    }
-
-    func saveSkipApiKeyVerification(client: OMLXClient) async {
-        do {
-            _ = try await client.updateGlobalSettings(
-                GlobalSettingsPatch(skipApiKeyVerification: skipApiKeyVerification)
-            )
-            self.lastError = nil
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
-    func createSubKey(key: String, name: String, client: OMLXClient) async -> Bool {
-        do {
-            _ = try await client.createSubKey(key: key, name: name)
-            await load(client: client)
-            return true
-        } catch {
-            self.lastError = error.omlxDescription
-            return false
-        }
-    }
-
-    func deleteSubKey(key: String, client: OMLXClient) async {
-        do {
-            _ = try await client.deleteSubKey(key: key)
-            await load(client: client)
-        } catch {
-            self.lastError = error.omlxDescription
-        }
-    }
-
 }

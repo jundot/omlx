@@ -9,7 +9,7 @@ Based on arxiv.org/abs/2502.02789 and waybarrios/vllm-mlx PR #180.
 
 Pipeline:
   1. score_tokens()  — draft model scores token importance via attention
-  2. select_chunks() — chunk-based top-K% selection
+  2. select_chunks() — chunk-based top-K% selection + mandatory tail window
   3. sparse_prefill() — target prefill with manual RoPE at original positions
   4. cleanup_rope()  — restore original RoPE after generation
 
@@ -588,14 +588,32 @@ def score_tokens(
 
 
 def select_chunks(
-    importance: mx.array, keep_pct: float = 0.3, chunk_size: int = 32
+    importance: mx.array,
+    keep_pct: float = 0.3,
+    chunk_size: int = 32,
+    tail_tokens: int = 512,
 ) -> mx.array:
     """Select top-K% token chunks by average importance.
+
+    The final ``ceil(tail_tokens / chunk_size)`` chunks are always selected
+    (covering at least ``tail_tokens - chunk_size + 1`` trailing tokens).
+    Chat templates end with structural markers (tool-result closers,
+    end-of-turn, the generation prompt) whose chunks can lose the
+    importance ranking; when they do, the target model is left
+    mid-structure and emits malformed output (e.g. a bare </tool_response>
+    then EOS) instead of an answer. The mandatory tail chunks are drawn
+    from the normal keep budget first: when the budget covers the tail
+    (keep_n >= 16 chunks at the defaults, i.e. scored regions >= 2,401
+    tokens at keep_pct=0.2) the selected count is unchanged and only the
+    composition shifts; on smaller inputs the floor takes precedence over
+    ``keep_pct``.
 
     Args:
         importance: (M,) per-token importance scores
         keep_pct: fraction of chunks to keep (default 0.3)
         chunk_size: tokens per chunk (default 32)
+        tail_tokens: trailing-token window always selected, rounded up to
+            whole chunks (default 512, 0 disables the floor)
 
     Returns:
         sorted mx.array of kept token indices
@@ -606,16 +624,22 @@ def select_chunks(
 
     n_chunks = math.ceil(M / chunk_size)
     keep_n = max(1, math.ceil(n_chunks * keep_pct))
+    n_tail_chunks = (
+        min(n_chunks, math.ceil(tail_tokens / chunk_size)) if tail_tokens > 0 else 0
+    )
+    ranked_end = n_chunks - n_tail_chunks
 
     chunk_scores = []
-    for i in range(n_chunks):
+    for i in range(ranked_end):
         start = i * chunk_size
         end = min(start + chunk_size, M)
         chunk_scores.append(mx.mean(importance[start:end]).item())
 
-    top_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[
-        :keep_n
+    budget = max(0, keep_n - n_tail_chunks)
+    top_chunks = sorted(range(ranked_end), key=lambda i: chunk_scores[i], reverse=True)[
+        :budget
     ]
+    top_chunks.extend(range(ranked_end, n_chunks))
     top_chunks.sort()
 
     indices = []
@@ -659,10 +683,34 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     """Apply RoPE at arbitrary positions using pre-computed frequencies.
 
-    For custom RoPE variants (Llama3, Yarn, SuScaled) that store _freqs.
+    For custom RoPE variants (Llama3, Yarn, SuScaled) that store ``_freqs``,
+    and for partial-rotary models that report ``dims`` = full head_dim while
+    their frequency table covers only a rotary sub-slice (e.g. Gemma 4, whose
+    local/global attention heads differ).
+
+    The model's real RoPE (mlx-vlm ``ProportionalRoPE`` / HF ``rotate_half``)
+    pairs dim ``i`` with dim ``i + dims // 2`` over the FULL head, and only the
+    first ``len(freqs)`` of those pairs actually rotate -- the remaining pairs
+    pass through unchanged. We reproduce that exactly by zero-padding the
+    inverse frequencies up to ``dims // 2`` (angle 0 is the identity rotation:
+    ``cos 0 = 1``, ``sin 0 = 0``), so the non-rotating pairs are untouched.
+
+    Bit-exact for full-rotary custom-``_freqs`` models (``len(freqs) == dims //
+    2``, no padding added) and correct for the partial-rotary / mixed-head
+    case. An earlier version derived the width as ``2 * len(freqs)`` and rotated
+    the contiguous first ``2 * len(freqs)`` dims (pairing ``i`` with ``i +
+    len(freqs)``), which rotated the wrong lanes and wrote misrotated KV on
+    every global layer (jundot, PR #2295).
     """
     half = dims // 2
+    n = int(freqs.shape[-1])
     inv_freq = (1.0 / freqs).astype(mx.float32)
+    if n < half:
+        # Zero-pad the unrotated pairs: angle 0 keeps them identity, matching
+        # the model's partial rotary exactly.
+        inv_freq = mx.concatenate(
+            [inv_freq, mx.zeros((half - n,), dtype=mx.float32)], axis=-1
+        )
     angles = positions[:, None].astype(mx.float32) * inv_freq[None, :]
     cos_a = mx.cos(angles)[None, None, :, :]
     sin_a = mx.sin(angles)[None, None, :, :]
@@ -706,7 +754,7 @@ class _PositionMappedRoPE:
             self._dims = _get_dims(original_rope)
             self._pre_scale = _get_pre_scale(original_rope)
         else:
-            self._dims = original_rope.dims
+            self._dims = _get_dims(original_rope)
             self._base = original_rope.base
             self._scale = original_rope.scale
 
@@ -735,6 +783,24 @@ class _OffsetAdjustedRoPE:
 
     def __call__(self, x, offset=0):
         return self._original(x, offset=offset + self._adjustment)
+
+    def __getattr__(self, name):
+        # Delegate unknown attrs (e.g. .dims, .base, ._freqs) to the wrapped
+        # rope so this wrapper is transparent if it is ever re-wrapped. See #766.
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+def _unwrap_rope(rope):
+    """Peel any sparse-prefill RoPE wrappers down to the genuine module.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called between multi-turn requests), re-wrapping it would nest wrappers
+    and, before this fix, crash in _PositionMappedRoPE. Always start from the
+    genuine rope. See #766.
+    """
+    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
+        rope = rope._original
+    return rope
 
 
 def _get_dims(rope_module):
@@ -835,9 +901,13 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
+            # Start from the genuine rope: a prior sparse_prefill may have left
+            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
+            # (multi-turn + partial cache hit). See #766.
+            genuine = _unwrap_rope(attn.rope)
+            original_ropes[layer_idx] = genuine
             attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+                genuine, selected_positions, cache_start=cache_start
             )
 
     try:
@@ -892,9 +962,9 @@ def cleanup_rope(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
             continue
-        rope = attn.rope
-        if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+        genuine = _unwrap_rope(attn.rope)
+        if genuine is not attn.rope:
+            attn.rope = genuine
 
 
 # ===========================================================================

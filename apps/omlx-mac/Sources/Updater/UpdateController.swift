@@ -69,7 +69,8 @@ struct AvailableUpdate: Equatable, Identifiable, Sendable {
 }
 
 @MainActor
-final class UpdateController: ObservableObject {
+@Observable
+final class UpdateController {
     static let stateDidChangeNotification = Notification.Name("OMLXUpdateControllerStateDidChange")
 
     enum CheckState: Equatable, Sendable {
@@ -80,7 +81,7 @@ final class UpdateController: ObservableObject {
         case ready(AvailableUpdate)
     }
 
-    @Published private(set) var state: CheckState = .idle(lastChecked: nil) {
+    private(set) var state: CheckState = .idle(lastChecked: nil) {
         didSet {
             NotificationCenter.default.post(
                 name: Self.stateDidChangeNotification,
@@ -88,16 +89,16 @@ final class UpdateController: ObservableObject {
             )
         }
     }
-    @Published private(set) var lastError: String?
-    @Published private(set) var confirmationUpdate: AvailableUpdate?
-    @Published var channel: UpdateChannel {
+    private(set) var lastError: String?
+    private(set) var confirmationUpdate: AvailableUpdate?
+    var channel: UpdateChannel {
         didSet {
             guard !suspendPersist else { return }
             persist()
             checkForUpdates()
         }
     }
-    @Published var autoCheck: Bool {
+    var autoCheck: Bool {
         didSet {
             guard !suspendPersist else { return }
             persist()
@@ -110,18 +111,25 @@ final class UpdateController: ObservableObject {
             }
         }
     }
-    @Published var autoNotify: Bool {
+    var autoNotify: Bool {
         didSet { if !suspendPersist { persist() } }
     }
 
     private let storeURL: URL
     private let currentVersion: String
+    @ObservationIgnored
     private var suspendPersist = true
+    @ObservationIgnored
     private var checkTask: Task<Void, Never>?
+    @ObservationIgnored
     private var updater: AppUpdater?
+    @ObservationIgnored
     private var backgroundTimer: Timer?
+    @ObservationIgnored
     private var terminateForUpdate: (@MainActor () -> Void)?
+    @ObservationIgnored
     private var presentUpdateConfirmation: (@MainActor () -> Void)?
+    @ObservationIgnored
     private var deferredPromptVersion: String?
 
     init(

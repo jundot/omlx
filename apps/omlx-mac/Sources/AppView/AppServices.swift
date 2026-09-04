@@ -1,10 +1,10 @@
 // PR 7 — wires AppDelegate-owned runtime objects (ServerProcess, AppConfig)
-// to the SwiftUI side. AppView mounts a single instance via `.environmentObject`
+// to the SwiftUI side. AppView mounts a single instance via `.environment`
 // so screens can pull whatever they need without prop drilling. The screens
 // keep their own data + polling state in their own view models.
 //
 // `serverState` republishes ServerProcess.State on every state change so a
-// view can `@EnvironmentObject` AppServices and use it as a SwiftUI source
+// view can `@Environment(AppServices.self)` AppServices and use it as a SwiftUI source
 // of truth. ServerProcess itself stays NSNotification-driven (no Combine
 // retrofit).
 
@@ -12,33 +12,34 @@ import Foundation
 import SwiftUI
 
 @MainActor
-final class AppServices: NSObject, ObservableObject {
-    @Published var config: AppConfig
-    @Published var serverState: ServerProcess.State = .stopped
+@Observable
+final class AppServices: NSObject {
+    var config: AppConfig
+    var serverState: ServerProcess.State = .stopped
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
-    @Published var modelDetailID: String?
+    var modelDetailID: String?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's
     /// "Edit on Server →" link) without prop-drilling a `Binding<AppSection>`.
-    @Published var requestedSection: AppSection?
+    var requestedSection: AppSection?
     /// Pair with `requestedSection` to scroll the Server screen to a
     /// specific section after the deep-link lands. ContentScaffold's
     /// `ScrollViewReader` observes this, scrolls, then nils it. Only the
     /// Default Profile anchor is wired today — extend the enum as more
     /// deep links land.
-    @Published var requestedServerAnchor: ServerAnchor?
+    var requestedServerAnchor: ServerAnchor?
 
     let client: OMLXClient
     let updates: UpdateController
     /// Read-only preset bundle (sourced from the shipped JSON + remote
     /// refresh). The per-model settings preset chip strip subscribes via
-    /// `@EnvironmentObject` to react to refreshes.
+    /// Observation to react to refreshes.
     let presetBundle = PresetBundleStore()
 
     /// Long-lived view models for the Bench screens. Owned here (not by
-    /// the screen's `@StateObject`) so a running benchmark survives
+    /// screen-local state) so a running benchmark survives
     /// leaving the screen — the server keeps producing results while
     /// we're off-screen and the poll task continues updating these VMs,
     /// so coming back shows the in-flight state instead of an empty
@@ -46,7 +47,9 @@ final class AppServices: NSObject, ObservableObject {
     /// app-scoped store; SwiftUI needs the lifetime promoted manually.
     let throughputBench = ThroughputBenchScreenVM()
     let accuracyBench   = AccuracyBenchScreenVM()
+    let contextBench    = ContextBenchScreenVM()
 
+    @ObservationIgnored
     private weak var server: ServerProcess?
 
     init(config: AppConfig = .default, server: ServerProcess? = nil) {

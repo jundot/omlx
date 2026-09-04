@@ -93,5 +93,6 @@ class PiIntegration(Integration):
         args = ["pi"]
         if ctx.model:
             args.extend(["--model", f"omlx/{ctx.model}"])
+        args.extend(ctx.extra_args)
 
         os.execvpe("pi", args, env)

@@ -72,6 +72,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルは、現在 HEAD ビルドが必要です:
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### ソースからインストール
 
 ```bash
@@ -79,9 +85,12 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # コアのみ
 pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
+
+# オプション: GLM-5.2 / MiniMax M3 ネイティブカスタムカーネル
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Python 3.10+とApple Silicon（M1/M2/M3/M4）が必要です。
+Python 3.10+とApple Silicon（M1/M2/M3/M4/M5）が必要です。
 
 ## クイックスタート
 
@@ -170,6 +179,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 - **モデルエイリアス**: カスタムAPI表示名を設定します。`/v1/models`でエイリアスが返され、リクエスト時にエイリアスとディレクトリ名の両方が使用可能です。
 - **モデルタイプオーバーライド**: 自動検出に関係なく、LLMまたはVLMとして手動設定します。
+- **プロファイル**: モデルごとの設定に名前を付けて保存し、管理画面から切り替えられます。プロファイルは任意で独立したモデルとして公開できます：`/v1/models` に `<モデル>:<プロファイル>`（例：`qwen3-8b:thinking`）も表示され、ベースモデルと同じエンジン上でプロファイルの設定をリクエストごとに上書きして動作します — 追加のメモリやリロードは不要です。ベースモデルにエイリアスがある場合、公開IDは `<エイリアス>:<プロファイル>` として表示されます。ディレクトリ名の形式もベースモデルと同様に引き続き使用できます。
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX チャットテンプレート引数" width="480">
@@ -346,6 +356,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルを含めてステージング
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 初回 cold ビルドは 10–20 分かかります（venvstacks Python レイヤーの組み立て）。以降のビルドは `packaging/_export/` のキャッシュを再利用し、約 4 分で完了します。レイヤー構成は [packaging/README.md](packaging/README.md)、Swift ソースは [apps/omlx-mac/](apps/omlx-mac/) を参照してください。

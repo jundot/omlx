@@ -90,6 +90,13 @@ enum AdminAPI {
     static let benchStart      = "\(prefix)/bench/start"
     static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
     static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
+    static let aneTuneStart = "\(prefix)/bench/ane-tune/start"
+    static func aneTuneResults(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/results"
+    }
+    static func aneTuneCancel(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/cancel"
+    }
 
     // PR 13 — Accuracy bench
     static let accuracyQueueAdd    = "\(prefix)/bench/accuracy/queue/add"
@@ -98,4 +105,9 @@ enum AdminAPI {
     static let accuracyResults     = "\(prefix)/bench/accuracy/results"
     static let accuracyReset       = "\(prefix)/bench/accuracy/results/reset"
     static let accuracyCancel      = "\(prefix)/bench/accuracy/cancel"
+
+    // Context bench
+    static let contextBenchStart   = "\(prefix)/bench/context/start"
+    static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
+    static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
 }

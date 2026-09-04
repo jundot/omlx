@@ -40,6 +40,7 @@ import pytest
 from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
 from omlx.cache.paged_cache import BlockTable, PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager, SharedHotCacheBudget
+from omlx.cache.pooling_delta import POOLING_CACHE_DELTA_CLASS
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.cache.type_registry import CacheTypeRegistry
 
@@ -130,6 +131,37 @@ def _kvcache_only_data(seq_len):
     ]
 
 
+def _v4_shaped_storage_data():
+    """Serialized V4 shape: top-level rotating plus mixed CacheList."""
+    rotating = (
+        mx.ones((1, 1, WINDOW, 2), dtype=mx.float32),
+        mx.ones((1, 1, WINDOW, 2), dtype=mx.float32),
+    )
+    pooling = (
+        "__nstate__",
+        POOLING_CACHE_DELTA_CLASS,
+        [
+            None,
+            None,
+            mx.ones((1, 1, 2), dtype=mx.float32),
+            mx.ones((1, 1, 2), dtype=mx.float32),
+            mx.ones((1, 1, 2), dtype=mx.float32),
+            mx.array([0, 1], dtype=mx.int64),
+        ],
+    )
+    return (
+        [rotating, ("__cache_list__", [rotating, pooling, pooling])],
+        ["RotatingKVCache", "CacheList"],
+        [
+            (0, WINDOW, WINDOW, WINDOW),
+            (
+                ["RotatingKVCache", "PoolingCache", "PoolingCache"],
+                [None, 4, 4],
+            ),
+        ],
+    )
+
+
 def _store_turn(cache, turn, num_blocks, data_fn=_hybrid_cache_data):
     """Simulate one conversation turn: store a chain of num_blocks blocks.
 
@@ -203,6 +235,50 @@ def test_grandparent_tip_stripped_prev_tip_kept(tmp_path):
     assert _rotating_layer_shape(ssd, tip4) == REAL_ROTATING_SHAPE
 
 
+def test_diverged_store_does_not_track_branch_block_as_tip(tmp_path):
+    """A store that diverged from an existing chain reuses shared-prefix
+    blocks; the last reused block is NOT a superseded tip and must not
+    enter the lineage (it would be stripped two stores later, permanently
+    breaking partial-match walk-back restores on the shared prefix)."""
+    cache, ssd = _make_cache(tmp_path)
+
+    t1 = _store_turn(cache, 1, num_blocks=2)
+    tip1 = _block_hash(cache, t1, -1)
+    _store_turn(cache, 2, num_blocks=3)
+
+    # Diverged chain: shares only block 0 with the existing chain.
+    tokens_b = list(range(BLOCK_SIZE)) + [1000 + i for i in range(2 * BLOCK_SIZE)]
+    tb = cache.store_cache(
+        "branch-1", tokens_b, _hybrid_cache_data(seq_len=len(tokens_b))
+    )
+    assert tb is not None and len(tb.block_ids) == 3
+    tip_b1 = _block_hash(cache, tb, -1)
+
+    # The branch store must not record a lineage entry: its predecessor
+    # block is a shared interior block, not a superseded tip.
+    assert tip_b1 not in cache._rotating_tip_lineage
+
+    # Extending the branch chain twice still strips the branch chain's own
+    # former tip (normal supersede-on-extend behavior resumes).
+    tokens_b2 = tokens_b + [2000 + i for i in range(BLOCK_SIZE)]
+    tb2 = cache.store_cache(
+        "branch-2", tokens_b2, _hybrid_cache_data(seq_len=len(tokens_b2))
+    )
+    assert tb2 is not None
+    tip_b2 = _block_hash(cache, tb2, -1)
+    assert cache._rotating_tip_lineage.get(tip_b2) == tip_b1
+
+    tokens_b3 = tokens_b2 + [3000 + i for i in range(BLOCK_SIZE)]
+    tb3 = cache.store_cache(
+        "branch-3", tokens_b3, _hybrid_cache_data(seq_len=len(tokens_b3))
+    )
+    assert tb3 is not None
+    assert _rotating_layer_shape(ssd, tip_b1) == PLACEHOLDER_SHAPE
+
+    # The original chain's previous tip is untouched by branch activity.
+    assert _rotating_layer_shape(ssd, tip1) == REAL_ROTATING_SHAPE
+
+
 def test_stripped_block_keeps_sliceable_layers(tmp_path):
     """Only the rotating layer is stripped; the KVCache slice survives,
     and the stripped layer reads back as a standard placeholder."""
@@ -227,6 +303,39 @@ def test_stripped_block_keeps_sliceable_layers(tmp_path):
         if CacheTypeRegistry.is_rotating_family(t)
     )
     assert cache._is_placeholder_state(data[rotating_idx])
+
+
+def test_stripped_block_preserves_v4_cachelist_signature(tmp_path):
+    """Re-saving a stripped V4 tip must preserve CacheList composition."""
+    from omlx.cache.paged_ssd_cache import _signature_cachelist_subtypes
+
+    cache, ssd = _make_cache(tmp_path)
+    block_hash = b"\x24" * 32
+    data, layer_types, layer_meta = _v4_shaped_storage_data()
+    expected = {"1": ["RotatingKVCache", "PoolingCache:5", "PoolingCache:5"]}
+
+    assert ssd.save_block(
+        block_hash=block_hash,
+        cache_data=data,
+        token_count=BLOCK_SIZE,
+        model_name="test-model",
+        layer_cache_types=layer_types,
+        layer_meta_states=layer_meta,
+    )
+    _, before_meta = ssd.load_block_with_metadata(block_hash)
+    assert before_meta is not None
+    before_signature = before_meta["cache_signature"]
+    assert _signature_cachelist_subtypes(before_signature) == expected
+
+    assert cache._strip_rotating_payload(block_hash)
+
+    after_data, after_meta = ssd.load_block_with_metadata(block_hash)
+    assert after_data is not None and after_meta is not None
+    assert after_meta["cache_signature"] == before_signature
+    assert _signature_cachelist_subtypes(after_meta["cache_signature"]) == expected
+    assert cache._is_placeholder_state(after_data[0])
+    assert isinstance(after_data[1], list)
+    assert len(after_data[1]) == 3
 
 
 def test_hot_cache_byte_counter_consistent(tmp_path):
@@ -393,6 +502,7 @@ def test_prefill_ready_rotating_name_detects_window_padding():
 def test_registry_rotating_family():
     assert CacheTypeRegistry.is_rotating_family("RotatingKVCache")
     assert CacheTypeRegistry.is_rotating_family("PrefillReadyRotatingKVCache")
+    assert CacheTypeRegistry.is_rotating_family("BufferedRotatingKVCache")
     assert CacheTypeRegistry.is_rotating_family("BatchRotatingKVCache")
     assert not CacheTypeRegistry.is_rotating_family("KVCache")
     assert not CacheTypeRegistry.is_rotating_family("TurboQuantKVCache")

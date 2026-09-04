@@ -8,7 +8,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from omlx.engine_pool import EngineEntry
-from omlx.exceptions import InvalidRequestError, ModelNotFoundError
+from omlx.exceptions import (
+    InvalidRequestError,
+    ModelNotFoundError,
+    ModelUnavailableError,
+)
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.server import (
     EngineType,
@@ -16,14 +20,14 @@ from omlx.server import (
     ServerState,
     _format_generation_speed_for_log,
     _reject_diffusion_structured_outputs,
-    _resolve_metric_durations,
     _reset_boundary_snapshots_for_server,
+    _resolve_metric_durations,
     app,
     get_engine,
     get_max_context_window,
     get_sampling_params,
 )
-from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+from omlx.settings import GlobalSettings
 
 
 class TestBoundarySnapshotLifecycle:
@@ -558,6 +562,25 @@ class TestModelFallback:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_model_unavailable_returns_409(self):
+        """Cached model load failures return 409 instead of an unhandled 500."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = False
+        self._state.default_model = "default-model"
+
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_engine = AsyncMock(
+            side_effect=ModelUnavailableError("broken-model", "cached failure")
+        )
+        self._state.engine_pool = pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("broken-model", EngineType.LLM)
+
+        assert exc_info.value.status_code == 409
+
 
 class TestGetEngineLLMTypeValidation:
     """LLM endpoints must reject non-LLM engines with a clean 400 (#507).
@@ -698,6 +721,9 @@ class TestGetMaxContextWindow:
         """Mount a settings_manager that returns the given per-model overrides."""
         manager = MagicMock()
         manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        manager.get_settings_for_request.side_effect = (
+            lambda mid, resolved_model_id=None: overrides.get(resolved_model_id or mid)
+        )
         self._state.settings_manager = manager
 
     def test_global_default_when_nothing_discovered(self):
@@ -736,3 +762,244 @@ class TestGetMaxContextWindow:
         """An unknown model id doesn't crash — falls through to the default."""
         self._mount_pool({})
         assert get_max_context_window("ghost-model") == 32768
+
+
+class TestExposedProfileModels:
+    """Server behavior for profiles exposed as API-visible models."""
+
+    class _FakePool:
+        def get_status(self):
+            return {
+                "models": [
+                    {
+                        "id": "qwen-base",
+                        "loaded": True,
+                        "pinned": False,
+                        "engine_type": "vlm",
+                        "model_type": "vlm",
+                        "config_model_type": "gemma4",
+                    }
+                ]
+            }
+
+        def resolve_model_id(self, model_id, settings_manager=None):
+            if settings_manager is not None:
+                source = settings_manager.get_exposed_profile_source_model_id(model_id)
+                if source:
+                    return source
+            return model_id
+
+    @staticmethod
+    def _save_exposed_profile(manager, settings):
+        return manager.save_profile(
+            model_id="qwen-base",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings=settings,
+            expose_as_model=True,
+        )
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        """Swap a real ModelSettingsManager into the live server state."""
+        import omlx.server as server_module
+
+        original_pool = server_module._server_state.engine_pool
+        original_settings_manager = server_module._server_state.settings_manager
+        manager = ModelSettingsManager(tmp_path)
+        server_module._server_state.settings_manager = manager
+        try:
+            yield manager
+        finally:
+            server_module._server_state.engine_pool = original_pool
+            server_module._server_state.settings_manager = original_settings_manager
+
+    @pytest.mark.asyncio
+    async def test_v1_models_includes_exposed_profile_models(self, manager):
+        import omlx.server as server_module
+
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(
+            manager, {"max_context_window": 4096, "enable_thinking": True}
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "qwen-base:thinking" in model_ids
+        profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
+        assert profile_model.max_model_len == 4096
+
+    @pytest.mark.asyncio
+    async def test_v1_models_status_includes_exposed_profile_capabilities(
+        self, manager
+    ):
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(max_context_window=100000, max_tokens=8192),
+        )
+        self._save_exposed_profile(
+            manager,
+            {
+                "max_context_window": 4096,
+                "max_tokens": 1024,
+                "enable_thinking": True,
+            },
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        status = await server_module.list_models_status(True)
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert profile_model["source_model_id"] == "qwen-base"
+        assert profile_model["model_type"] == "vlm"
+        assert profile_model["engine_type"] == "vlm"
+        assert profile_model["config_model_type"] == "gemma4"
+        assert profile_model["max_context_window"] == 4096
+        assert profile_model["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
+        """With a base-model alias set, the catalog lists <alias>:<profile> —
+        consistent with the base model being listed under its alias."""
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base", ModelSettings(model_alias="gpt-4", max_context_window=100000)
+        )
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "gpt-4" in model_ids
+        assert "gpt-4:thinking" in model_ids
+        assert "qwen-base:thinking" not in model_ids
+        profile_model = next(m for m in response.data if m.id == "gpt-4:thinking")
+        assert profile_model.max_model_len == 4096
+
+    def test_sampling_params_use_exposed_profile_settings(self, manager):
+        """Runtime settings come from the requested profile model, not its source."""
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(temperature=0.1))
+        self._save_exposed_profile(manager, {"temperature": 0.9})
+        server_module._server_state.engine_pool = pool
+
+        temperature, *_ = get_sampling_params(None, None, "qwen-base:thinking")
+
+        assert temperature == 0.9
+
+    @pytest.mark.asyncio
+    async def test_get_engine_passes_exposed_profile_runtime_settings(self, manager):
+        import omlx.server as server_module
+
+        class RuntimePool:
+            def __init__(self):
+                self.calls = []
+
+            async def get_engine(self, model_id, **kwargs):
+                self.calls.append((model_id, kwargs))
+                return MagicMock(spec=server_module.BaseEngine)
+
+        pool = RuntimePool()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(temperature=0.1, mtp_enabled=False),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"temperature": 0.9, "mtp_enabled": True},
+        )
+        server_module._server_state.engine_pool = pool
+
+        await server_module.get_engine("qwen-base:thinking")
+
+        assert pool.calls[0][0] == "qwen-base"
+        runtime_settings = pool.calls[0][1]["runtime_settings"]
+        assert runtime_settings.temperature == 0.9
+        assert runtime_settings.mtp_enabled is True
+        assert manager.get_settings("qwen-base").temperature == 0.1
+        assert manager.get_settings("qwen-base").mtp_enabled is False
+
+    def test_thinking_budget_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=64),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"thinking_budget_enabled": True, "thinking_budget_tokens": 512},
+        )
+        server_module._server_state.engine_pool = pool
+
+        budget = server_module._resolve_thinking_budget(object(), "qwen-base:thinking")
+
+        assert budget == 512
+
+    def test_max_context_window_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = pool
+
+        max_context = get_max_context_window("qwen-base:thinking")
+
+        assert max_context == 4096
+
+
+class TestHealthPreloadReadiness:
+    """/health must answer 503 "loading" during the startup pinned preload
+    and 200 "healthy" after, so port watchdogs see liveness instead of a
+    closed port while a large pinned model loads (#2184)."""
+
+    @pytest.mark.asyncio
+    async def test_health_503_while_preloading(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = False
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 503
+            assert body["status"] == "loading"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old
+
+    @pytest.mark.asyncio
+    async def test_health_200_after_preload(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = True
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 200
+            assert body["status"] == "healthy"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old

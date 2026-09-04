@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """Codex (OpenAI Codex CLI) integration."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -92,16 +94,36 @@ def write_codex_config(config_path: Path, ctx: IntegrationContext) -> None:
     print(f"Config updated: {config_path}")
 
 
-class CodexIntegration(Integration):
-    """Codex integration that configures ~/.codex/config.toml for oMLX."""
+def codex_config_args(ctx: IntegrationContext) -> list[str]:
+    """Build process-scoped Codex config overrides for an oMLX launch."""
+    overrides: list[tuple[str, str]] = [
+        ("model_provider", json.dumps("omlx")),
+        ("model_providers.omlx.name", json.dumps("oMLX")),
+        ("model_providers.omlx.base_url", json.dumps(ctx.openai_base_url)),
+        ("model_providers.omlx.env_key", json.dumps("OMLX_API_KEY")),
+    ]
+    if ctx.context_window is not None and ctx.context_window > 0:
+        overrides.append(("model_context_window", str(ctx.context_window)))
 
-    CONFIG_PATH = CODEX_CONFIG_PATH
+    is_reasoning = (
+        bool(ctx.reasoning)
+        if ctx.reasoning is not None
+        else bool(re.search(r"\b(thinking|o1|o3|r1)\b", ctx.model.lower()))
+    )
+    if is_reasoning:
+        overrides.append(("model_reasoning_effort", json.dumps("high")))
+
+    return [arg for key, value in overrides for arg in ("-c", f"{key}={value}")]
+
+
+class CodexIntegration(Integration):
+    """Codex integration using process-scoped configuration for oMLX."""
 
     def __init__(self):
         super().__init__(
             name="codex",
             display_name="Codex",
-            type="config_file",
+            type="env_var",
             install_check="codex",
             install_hint="npm install -g @openai/codex",
         )
@@ -113,7 +135,9 @@ class CodexIntegration(Integration):
         )
 
     def configure(self, ctx: IntegrationContext) -> None:
-        write_codex_config(self.CONFIG_PATH, ctx)
+        # Launch-time arguments carry the oMLX settings. Keeping this a no-op
+        # ensures normal Codex sessions continue to use the user's config.
+        return None
 
     def launch(self, ctx: IntegrationContext) -> None:
         self.configure(ctx)
@@ -121,7 +145,7 @@ class CodexIntegration(Integration):
         env = self._scrubbed_env()
         env["OMLX_API_KEY"] = ctx.auth_token
 
-        args = ["codex"]
+        args = ["codex", *codex_config_args(ctx)]
         if ctx.model:
             args.extend(["-m", ctx.model])
         args.extend(ctx.extra_args)

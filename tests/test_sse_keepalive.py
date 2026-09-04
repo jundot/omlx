@@ -93,6 +93,42 @@ class TestSSEKeepaliveExceptionHandling:
         error_items = [i for i in items if i.startswith("data: {")]
         assert len(error_items) == 0
 
+    @pytest.mark.asyncio
+    async def test_fast_stream_disconnect_closes_upstream_generator(self):
+        """Fast tokens must not bypass disconnect polling indefinitely."""
+        closed = asyncio.Event()
+
+        async def gen():
+            try:
+                while True:
+                    yield "data: token\n\n"
+            finally:
+                closed.set()
+
+        class Request:
+            def __init__(self):
+                self.checks = 0
+
+            async def is_disconnected(self):
+                self.checks += 1
+                return self.checks > 1
+
+        request = Request()
+        items = await asyncio.wait_for(
+            _collect(
+                _with_sse_keepalive(
+                    gen(),
+                    http_request=request,
+                    disconnect_poll=0.0,
+                )
+            ),
+            timeout=1.0,
+        )
+
+        assert items[0] == ": keep-alive\n\n"
+        assert request.checks == 2
+        assert closed.is_set()
+
 
 class TestKeepaliveChunkFormats:
     """Tests for protocol-aware keepalive chunk emission."""
@@ -111,6 +147,7 @@ class TestKeepaliveChunkFormats:
         body = items[0].removeprefix("data: ").strip()
         payload = json.loads(body)
         assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["role"] == "assistant"
         assert payload["choices"][0]["delta"]["content"] == ""
         assert payload["choices"][0]["finish_reason"] is None
 
@@ -153,6 +190,28 @@ class TestKeepaliveChunkFormats:
         assert items == ["data: real\n\n"]
 
 
+class TestCompletionKeepaliveSharesStreamId:
+    def test_frame_uses_given_response_id(self):
+        from omlx.server import _completion_keepalive_chunk
+
+        frame = _completion_keepalive_chunk("cmpl-abc123")
+        assert frame.startswith("data: ")
+        assert frame.endswith("\n\n")
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload["id"] == "cmpl-abc123"
+        assert payload["object"] == "text_completion"
+        assert payload["choices"][0]["text"] == ""
+        assert payload["choices"][0]["finish_reason"] is None
+
+    def test_frame_does_not_use_sentinel_id(self):
+        from omlx.server import _completion_keepalive_chunk
+
+        payload = json.loads(
+            _completion_keepalive_chunk("cmpl-real").removeprefix("data: ").strip()
+        )
+        assert payload["id"] != "cmpl-keepalive"
+
+
 class TestChatKeepaliveSharesStreamId:
     """The chunk-form chat keepalive must reuse the stream's completion id.
 
@@ -172,6 +231,7 @@ class TestChatKeepaliveSharesStreamId:
         payload = json.loads(frame.removeprefix("data: ").strip())
         assert payload["id"] == "chatcmpl-abc123"
         assert payload["object"] == "chat.completion.chunk"
+        assert payload["choices"][0]["delta"]["role"] == "assistant"
         assert payload["choices"][0]["delta"]["content"] == ""
         assert payload["choices"][0]["finish_reason"] is None
 
@@ -182,6 +242,33 @@ class TestChatKeepaliveSharesStreamId:
             _chat_keepalive_chunk("chatcmpl-real").removeprefix("data: ").strip()
         )
         assert payload["id"] != "chatcmpl-keepalive"
+
+
+class TestChatKeepaliveCarriesRole:
+    """Every chat keepalive delta must carry ``role: assistant``.
+
+    The chunk-form keepalive is the first SSE event of every stream, and some
+    accumulators type the whole stream from the first chunk's role.
+    LangChain.js builds a generic ChatMessageChunk when the role is absent and
+    then discards all tool_call_chunks when the real AI chunks merge into it,
+    so streamed tool calls are silently lost (#2074, n8n AI Agent workflows).
+    """
+
+    def _first_chunk_role(self, frame: str):
+        # Mirror the accumulator rule: the stream's type is decided by the
+        # first chunk's delta.role alone.
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        return payload["choices"][0]["delta"].get("role")
+
+    def test_static_sentinel_frame_carries_assistant_role(self):
+        from omlx.server import _KEEPALIVE_CHAT_CHUNK
+
+        assert self._first_chunk_role(_KEEPALIVE_CHAT_CHUNK) == "assistant"
+
+    def test_id_sharing_frame_carries_assistant_role(self):
+        from omlx.server import _chat_keepalive_chunk
+
+        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
 
 
 class TestResolveKeepalive:

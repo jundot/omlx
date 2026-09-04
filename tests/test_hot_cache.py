@@ -1528,3 +1528,209 @@ class TestSSDWriteBackSaturation:
             assert mgr.load_block(block_hash) is not None
         finally:
             mgr.close()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestHotCacheWriteThrough:
+    """Write-through mode: hot-cache retention AND immediate SSD persistence.
+
+    Default hot-cache behaviour is write-back — a freshly saved block lives
+    only in RAM until LRU eviction or graceful shutdown persists it, so a
+    crash loses every dirty block. Write-through keeps the RAM copy for
+    fast resume while enqueueing the SSD write at save time.
+    """
+
+    def _make_cache_data(self, num_layers=4, seq_len=32, heads=4, head_dim=32):
+        return [
+            (
+                mx.zeros((1, heads, seq_len, head_dim)),
+                mx.zeros((1, heads, seq_len, head_dim)),
+            )
+            for _ in range(num_layers)
+        ]
+
+    def _make_manager(self, tmp_path, name="wt", write_through=True, **kwargs):
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / name,
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+            hot_cache_write_through=write_through,
+            **kwargs,
+        )
+
+    def _save_block(self, manager, block_hash, num_layers=4, model="test-model"):
+        return manager.save_block(
+            block_hash=block_hash,
+            cache_data=self._make_cache_data(num_layers=num_layers),
+            token_count=64,
+            model_name=model,
+            layer_cache_types=["KVCache"] * num_layers,
+        )
+
+    @staticmethod
+    def _wait_for(predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_write_through_retains_and_persists_immediately(self, tmp_path):
+        """Save lands in the hot cache AND gets an SSD index entry + file
+        without eviction or shutdown."""
+        mgr = self._make_manager(tmp_path)
+        try:
+            block_hash = b"wt_immediate_test_1"
+            assert self._save_block(mgr, block_hash) is True
+
+            # RAM tier retains the block
+            assert mgr._hot_cache_get(block_hash) is not None
+            # SSD index entry is created synchronously (write is async)
+            assert mgr._index.contains(block_hash)
+
+            # The background writer commits the file with no eviction/close
+            meta = mgr._index.get(block_hash)
+            assert self._wait_for(lambda: Path(meta.file_path).exists())
+
+            # The retained entry is marked clean once its write commits
+            assert self._wait_for(
+                lambda: not mgr._hot_cache[block_hash].get("dirty", True)
+            )
+        finally:
+            mgr.close()
+
+    def test_write_through_survives_restart(self, tmp_path):
+        """A cold-start manager must rediscover a write-through block by
+        scanning the cache directory."""
+        mgr = self._make_manager(tmp_path, name="restart")
+        block_hash = b"wt_restart_test_1"
+        assert self._save_block(mgr, block_hash) is True
+        meta = mgr._index.get(block_hash)
+        assert self._wait_for(lambda: Path(meta.file_path).exists())
+        mgr.close()
+
+        mgr2 = PagedSSDCacheManager(
+            cache_dir=tmp_path / "restart",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+            hot_cache_write_through=True,
+        )
+        try:
+            assert mgr2.has_block(block_hash)
+            loaded = mgr2.load_block(block_hash)
+            assert loaded is not None
+            assert len(loaded) == 4
+        finally:
+            mgr2.close()
+
+    def test_default_write_back_still_defers_ssd(self, tmp_path):
+        """Regression guard: with write-through off (the default), a save
+        must NOT create an SSD index entry until eviction or close."""
+        mgr = self._make_manager(tmp_path, name="wb", write_through=False)
+        try:
+            block_hash = b"wt_default_wb_test1"
+            assert self._save_block(mgr, block_hash) is True
+            assert mgr._hot_cache_get(block_hash) is not None
+            assert not mgr._index.contains(block_hash)
+        finally:
+            mgr.close()
+
+    def test_clean_eviction_does_not_rewrite(self, tmp_path):
+        """After the write-through commit marks the entry clean, an LRU
+        eviction drops it without enqueueing a duplicate SSD write."""
+        mgr = self._make_manager(tmp_path, name="clean")
+        try:
+            block_hash = b"wt_clean_evict_test"
+            assert self._save_block(mgr, block_hash) is True
+            meta = mgr._index.get(block_hash)
+            assert self._wait_for(lambda: Path(meta.file_path).exists())
+            assert self._wait_for(
+                lambda: not mgr._hot_cache[block_hash].get("dirty", True)
+            )
+
+            evicted = mgr._hot_cache_remove(block_hash)
+            assert evicted is not None
+            mgr._handle_hot_cache_eviction(block_hash, evicted)
+
+            # Clean entry: dropped, not re-enqueued
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+            assert Path(meta.file_path).exists()
+        finally:
+            mgr.close()
+
+    def test_write_through_ignored_in_hot_cache_only_mode(self, tmp_path):
+        """hot_cache_only means zero SSD I/O even with write-through set."""
+        mgr = self._make_manager(
+            tmp_path, name="only", write_through=True, hot_cache_only=True
+        )
+        try:
+            block_hash = b"wt_only_mode_test_1"
+            assert self._save_block(mgr, block_hash) is True
+            assert mgr._hot_cache_get(block_hash) is not None
+            assert not mgr._index.contains(block_hash)
+            assert not (tmp_path / "only").exists()
+        finally:
+            mgr.close()
+
+    def test_clear_hot_cache_flushes_dirty_entries(self, tmp_path):
+        """clear_hot_cache must flush dirty blocks to SSD, not drop the only
+        copy of a saved chain."""
+        mgr = self._make_manager(tmp_path, name="clear", write_through=False)
+        try:
+            block_hash = b"wt_clear_flush_test"
+            assert self._save_block(mgr, block_hash) is True
+            assert not mgr._index.contains(block_hash)  # write-back: dirty
+
+            assert mgr.clear_hot_cache() == 1
+            assert mgr._hot_cache_get(block_hash) is None
+
+            # Dirty entry was flushed instead of dropped
+            assert mgr._index.contains(block_hash)
+            meta = mgr._index.get(block_hash)
+            assert self._wait_for(lambda: Path(meta.file_path).exists())
+            assert mgr.load_block(block_hash) is not None
+        finally:
+            mgr.close()
+
+    def test_clear_hot_cache_skips_flush_when_writer_dead(self, tmp_path):
+        """A dead writer never drains the queue, so flushing would pin the
+        entries in the pending-write buffers forever. clear must fall back
+        to dropping them, mirroring the liveness guard in close()."""
+        mgr = self._make_manager(tmp_path, name="deadwriter", write_through=False)
+        try:
+            block_hash = b"wt_dead_writer_test"
+            assert self._save_block(mgr, block_hash) is True
+
+            # Stop the writer thread the same way close() does.
+            mgr._writer_shutdown.set()
+            mgr._write_queue.put_nowait(None)
+            mgr._writer_thread.join(timeout=10)
+            assert not mgr._writer_thread.is_alive()
+
+            assert mgr.clear_hot_cache() == 1
+            assert mgr._hot_cache_get(block_hash) is None
+            assert not mgr._index.contains(block_hash)
+            with mgr._pending_write_hashes_lock:
+                assert block_hash not in mgr._pending_write_buffers
+        finally:
+            mgr.close()
+
+    def test_settings_round_trip_and_scheduler_mapping(self):
+        """The flag must survive settings.json serialization and reach
+        SchedulerConfig via GlobalSettings.to_scheduler_config()."""
+        from omlx.settings import CacheSettings, GlobalSettings
+
+        cache = CacheSettings(hot_cache_write_through=True)
+        restored = CacheSettings.from_dict(cache.to_dict())
+        assert restored.hot_cache_write_through is True
+
+        # Absent from old settings files -> default False (backwards compat)
+        legacy = CacheSettings.from_dict({})
+        assert legacy.hot_cache_write_through is False
+
+        settings = GlobalSettings()
+        settings.cache.hot_cache_write_through = True
+        config = settings.to_scheduler_config()
+        assert config.hot_cache_write_through is True
