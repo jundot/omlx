@@ -497,8 +497,13 @@ def test_active_models_dflash_primary_counts_activity():
                         "request_id": "req-1",
                         "kind": "generate",
                         "detail": "generating",
+                        "phase": "generate",
                         "elapsed_seconds": 3.0,
+                        "generation_elapsed_seconds": 2.0,
+                        "last_activity_age_seconds": 0.25,
                         "token_count": 42,
+                        "prompt_tokens": 123,
+                        "max_tokens": 1000,
                     }
                 ],
             }
@@ -508,7 +513,55 @@ def test_active_models_dflash_primary_counts_activity():
     model = data["models"][0]
     assert data["total_active_requests"] == 1
     assert model["active_requests"] == 1
-    assert model["activities"][0]["detail"] == "generating"
+    assert model["activities"] == []
+    assert model["generating"] == [
+        {
+            "request_id": "req-1",
+            "elapsed_seconds": 2.0,
+            "generated_tokens": 42,
+            "tokens_per_second": 21.0,
+            "last_activity_age_seconds": 0.25,
+            "prompt_tokens": 123,
+            "max_tokens": 1000,
+        }
+    ]
+
+
+def test_active_models_dflash_primary_surfaces_prefill_rate():
+    class Engine:
+        scheduler = None
+
+        def get_activity_snapshot(self):
+            return {
+                "active_requests": 1,
+                "activities": [
+                    {
+                        "request_id": "req-prefill",
+                        "kind": "generate",
+                        "detail": "generating",
+                        "phase": "prefill",
+                        "elapsed_seconds": 1.0,
+                        "prefill_processed": 512,
+                        "prefill_total": 1024,
+                        "prefill_speed": 800.0,
+                        "prefill_eta": 0.64,
+                    }
+                ],
+            }
+
+    model = _build_with_pool(FakeDFlashPool(Engine()))["models"][0]
+
+    assert model["activities"] == []
+    assert model["generating"] == []
+    assert model["prefilling"] == [
+        {
+            "request_id": "req-prefill",
+            "processed": 512,
+            "total": 1024,
+            "speed": 800.0,
+            "eta": 0.64,
+        }
+    ]
 
 
 def test_active_models_resolves_scheduler_property_without_async_core():

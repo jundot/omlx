@@ -183,6 +183,29 @@ final class MenubarControllerModelsTests: XCTestCase {
         XCTAssertEqual(model.sizeLabel, "10 GB")
     }
 
+    func testSizeLabelDFlashUsesEstimateInsteadOfLazyLoadDelta() throws {
+        let json = #"""
+        {
+          "id": "dflash-model",
+          "loaded": true,
+          "is_loading": false,
+          "estimated_size": 24588687770,
+          "estimated_size_formatted": "22.90 GB",
+          "actual_size": 1879048192,
+          "actual_size_formatted": "1.75 GB",
+          "settings": {"dflash_enabled": true}
+        }
+        """#
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let model = try decoder.decode(
+            ModelDTO.self,
+            from: XCTUnwrap(json.data(using: .utf8))
+        )
+
+        XCTAssertEqual(model.sizeLabel, "22.90 GB")
+    }
+
     func testSizeLabelEmptyWhenNoSizes() {
         XCTAssertEqual(makeModel("a", loaded: true).sizeLabel, "")
     }

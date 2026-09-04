@@ -5335,6 +5335,8 @@ def _build_active_models_data() -> dict:
         waiting_ids = set()
         waiting = []
         activities = []
+        activity_prefilling = []
+        activity_generating = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -5384,9 +5386,51 @@ def _build_active_models_data() -> dict:
                 # snapshot; the two sources never overlap.
                 snapshot = entry.engine.get_activity_snapshot()
                 activity_requests = snapshot.get("active_requests", 0)
-                activities = snapshot.get("activities", [])
+                for activity in snapshot.get("activities", []):
+                    if activity.get("kind") != "generate":
+                        activities.append(activity)
+                        continue
 
-        prefilling = tracker.get_model_progress(model_id)
+                    if activity.get("phase") == "prefill":
+                        activity_prefilling.append(
+                            {
+                                "request_id": activity.get("request_id"),
+                                "processed": max(
+                                    0, int(activity.get("prefill_processed", 0) or 0)
+                                ),
+                                "total": max(
+                                    0, int(activity.get("prefill_total", 0) or 0)
+                                ),
+                                "speed": max(
+                                    0.0, float(activity.get("prefill_speed", 0) or 0)
+                                ),
+                                "eta": activity.get("prefill_eta"),
+                            }
+                        )
+                        continue
+
+                    generated_tokens = max(0, int(activity.get("token_count", 0) or 0))
+                    generation_elapsed = activity.get("generation_elapsed_seconds")
+                    tokens_per_second = (
+                        generated_tokens / generation_elapsed
+                        if generation_elapsed and generation_elapsed > 0
+                        else 0.0
+                    )
+                    activity_generating.append(
+                        {
+                            "request_id": activity.get("request_id"),
+                            "elapsed_seconds": generation_elapsed,
+                            "generated_tokens": generated_tokens,
+                            "tokens_per_second": tokens_per_second,
+                            "last_activity_age_seconds": activity.get(
+                                "last_activity_age_seconds"
+                            ),
+                            "prompt_tokens": activity.get("prompt_tokens", 0),
+                            "max_tokens": activity.get("max_tokens"),
+                        }
+                    )
+
+        prefilling = tracker.get_model_progress(model_id) + activity_prefilling
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
             active_request_ids = set(running_by_id) | prefilling_ids
@@ -5397,7 +5441,7 @@ def _build_active_models_data() -> dict:
         active_requests += activity_requests
 
         # Generating = active requests that finished prefill.
-        generating = []
+        generating = list(activity_generating)
         for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
             req = running_by_id.get(rid)
             generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0

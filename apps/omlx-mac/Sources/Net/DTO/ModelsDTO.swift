@@ -66,8 +66,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
 extension ModelDTO {
     /// Single size figure for compact UI: the observed footprint once the
     /// model has settled, the estimate while loading or before one exists.
+    /// DFlash materializes most target weights on first inference, so its
+    /// load-time process delta is not a useful resident-size reading.
     var sizeLabel: String {
-        if isLoading {
+        if isLoading || settings?.dflashEnabled == true {
             return estimatedSizeFormatted ?? ""
         }
         return actualSizeFormatted ?? estimatedSizeFormatted ?? ""

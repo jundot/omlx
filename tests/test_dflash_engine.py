@@ -1334,6 +1334,7 @@ class TestDFlashOutputParserWiring:
     @pytest.mark.asyncio
     async def test_non_streaming_propagates_parser_tool_calls(self):
         engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
+        engine._update_activity = MagicMock(wraps=engine._update_activity)
 
         output = await engine.chat([{"role": "user", "content": "search"}], tools=tools)
 
@@ -1342,10 +1343,15 @@ class TestDFlashOutputParserWiring:
         assert output.tool_calls == tool_calls
         assert output.finish_reason == "tool_calls"
         assert output.completion_tokens == 1
+        assert any(
+            call.kwargs.get("generation_elapsed_seconds") is not None
+            for call in engine._update_activity.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_streaming_propagates_parser_tool_calls(self):
         engine, create_with_tools, tools, tool_calls = self._tool_parser_engine()
+        engine._update_activity = MagicMock(wraps=engine._update_activity)
 
         outputs = [
             output
@@ -1360,6 +1366,10 @@ class TestDFlashOutputParserWiring:
         assert outputs[0].tool_calls == tool_calls
         assert outputs[0].finish_reason == "tool_calls"
         assert outputs[0].completion_tokens == 1
+        assert any(
+            call.kwargs.get("generation_elapsed_seconds") is not None
+            for call in engine._update_activity.call_args_list
+        )
 
 
 class TestDFlashCachedTokens:
