@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -69,10 +70,45 @@ def _positive_int(value: object) -> int:
     return parsed if parsed > 0 else 0
 
 
-def _aligned_share_rows(outputs: int, fraction: float) -> int:
-    if outputs <= 0 or fraction <= 0:
+def _aligned_share_rows(outputs: int, fraction: float, alignment: int = 64) -> int:
+    if outputs <= 0 or fraction <= 0 or alignment <= 0:
         return 0
-    return min(outputs, (int(outputs * fraction) // 64) * 64)
+    return min(outputs, (int(outputs * fraction) // alignment) * alignment)
+
+
+def _load_model_config(model_path: str) -> dict | None:
+    """Return the parsed ``config.json``, or ``None`` when it cannot be read."""
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _qwen35_text_config(config: dict) -> dict | None:
+    """Return the text config when this is a Qwen3.5/3.6/3.8 checkpoint."""
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        text = config
+    model_type = str(text.get("model_type") or config.get("model_type") or "")
+    if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
+        return None
+    return text
+
+
+def _qwen35_gdn_layer_count(text: dict, settings: object) -> int:
+    """Count the GDN layers charged for, clamped by the configured maximum."""
+    layer_types = text.get("layer_types")
+    if isinstance(layer_types, list):
+        layers = sum("linear" in str(layer_type).lower() for layer_type in layer_types)
+    else:
+        # Qwen hybrid checkpoints use full attention periodically. Without the
+        # explicit map, charging every layer is the safe estimate.
+        layers = _positive_int(text.get("num_hidden_layers"))
+    return min(
+        layers,
+        max(0, int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0)),
+    )
 
 
 def _qwen35_cpu_share_estimated_bytes(
@@ -96,18 +132,11 @@ def _qwen35_cpu_share_estimated_bytes(
     ):
         return 0
 
-    config_path = Path(model_path) / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-    except (OSError, json.JSONDecodeError):
+    config = _load_model_config(model_path)
+    if config is None:
         return None
-    if not isinstance(config, dict):
-        return None
-    text = config.get("text_config")
-    if not isinstance(text, dict):
-        text = config
-    model_type = str(text.get("model_type") or config.get("model_type") or "")
-    if not any(token in model_type for token in ("qwen3_5", "qwen3_6", "qwen3_8")):
+    text = _qwen35_text_config(config)
+    if text is None:
         return 0
 
     hidden = _positive_int(text.get("hidden_size"))
@@ -157,25 +186,113 @@ def _qwen35_cpu_share_estimated_bytes(
             qkv_outputs,
             _aligned_share_rows(qkv_outputs + z_outputs, gdn_fraction),
         )
-        layer_types = text.get("layer_types")
-        if isinstance(layer_types, list):
-            gdn_layers = sum(
-                "linear" in str(layer_type).lower() for layer_type in layer_types
-            )
-        else:
-            # Qwen hybrid checkpoints use full attention periodically. Without
-            # the explicit map, charging every layer is the safe estimate.
-            gdn_layers = _positive_int(text.get("num_hidden_layers"))
-        gdn_layers = min(
-            gdn_layers,
-            max(
-                0,
-                int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0),
-            ),
+        extra += (
+            _qwen35_gdn_layer_count(text, settings) * gdn_rows * hidden * _FP16_BYTES
         )
-        extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
 
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
+
+@lru_cache(maxsize=32)
+def _ane_program_bytes(input_dim: int, output_dim: int, sequence_length: int) -> int:
+    """Cache one compile per geometry; the size does not depend on the weights."""
+    try:
+        from .custom_kernels.qwen35_prefill import fast
+    except Exception:
+        return 0
+    return fast.qwen35_ane_program_bytes(input_dim, output_dim, sequence_length)
+
+
+def _recurrent_safe_gdn_rows(
+    z_outputs: int, qkv_outputs: int, fraction: float, alignment: int
+) -> int:
+    """Ask the backend itself where its GDN slice stops, so the two cannot drift."""
+    try:
+        from .patches.qwen35_ane_prefill import _recurrent_safe_gdn_ane_outputs
+    except Exception:
+        return 0
+    return _recurrent_safe_gdn_ane_outputs(z_outputs, qkv_outputs, fraction, alignment)
+
+
+def _qwen35_ane_bank_estimated_bytes(
+    model_path: str,
+    settings: object | None,
+) -> int:
+    """Estimate the bytes the Qwen ANE prefill banks wire.
+
+    A resident bank is charged to the kernel's neural ledger and excluded from
+    ``phys_footprint``, so the ordinary accounting cannot see it and admission
+    has never charged for it.
+
+    The size of one program is measured rather than guessed: it is read from a
+    compile of that geometry, which matches what the driver wires, and it does
+    not depend on the weight values, so one compile covers every layer sharing
+    a shape. What stays an estimate is how many layers to charge for -- layers
+    the backend later declines for dtype or row alignment are counted anyway,
+    so the total errs high, which is the safe direction here.
+
+    Returns 0 when the private compiler is unavailable, keeping the previous
+    behaviour.
+    """
+
+    if settings is None or not bool(
+        getattr(settings, "qwen35_ane_prefill_enabled", False)
+    ):
+        return 0
+    config = _load_model_config(model_path)
+    if config is None:
+        return 0
+    text = _qwen35_text_config(config)
+    if text is None:
+        return 0
+
+    hidden = _positive_int(text.get("hidden_size"))
+    intermediate = _positive_int(text.get("intermediate_size"))
+    layer_count = _positive_int(text.get("num_hidden_layers"))
+    sequence_length = _positive_int(
+        getattr(settings, "qwen35_ane_prefill_sequence_length", 2048)
+    )
+    if not hidden or not intermediate or not layer_count or not sequence_length:
+        return 0
+
+    # Dual pins one program per physical ANE and halves each slice, so the
+    # aligned width differs between the two modes.
+    alignment = (
+        128 if bool(getattr(settings, "qwen35_ane_prefill_dual_ane", True)) else 64
+    )
+
+    total = 0
+    mlp_layers = min(
+        layer_count,
+        max(0, int(getattr(settings, "qwen35_ane_prefill_max_layers", 64) or 0)),
+    )
+    mlp_rows = _aligned_share_rows(
+        intermediate,
+        float(getattr(settings, "qwen35_ane_prefill_fraction", 0.0) or 0.0),
+        alignment,
+    )
+    if mlp_layers and mlp_rows:
+        # Gate and up are combined into one program per accelerated layer.
+        total += mlp_layers * _ane_program_bytes(hidden, 2 * mlp_rows, sequence_length)
+
+    if bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
+        value_heads = _positive_int(text.get("linear_num_value_heads"))
+        value_dim = _positive_int(text.get("linear_value_head_dim"))
+        key_heads = _positive_int(text.get("linear_num_key_heads"))
+        key_dim = _positive_int(text.get("linear_key_head_dim"))
+        z_outputs = value_heads * value_dim
+        qkv_outputs = 2 * key_heads * key_dim + z_outputs
+        gdn_rows = _recurrent_safe_gdn_rows(
+            z_outputs,
+            qkv_outputs,
+            float(getattr(settings, "qwen35_ane_prefill_gdn_fraction", 0.0) or 0.0),
+            alignment,
+        )
+        gdn_layers = _qwen35_gdn_layer_count(text, settings)
+        if gdn_layers and gdn_rows:
+            total += gdn_layers * _ane_program_bytes(hidden, gdn_rows, sequence_length)
+
+    return total
 
 
 @dataclass
@@ -374,7 +491,14 @@ class EnginePool:
                 format_size(extra),
                 entry.model_id,
             )
-        return base + extra
+        banks = _qwen35_ane_bank_estimated_bytes(entry.model_path, runtime_settings)
+        if banks > 0:
+            logger.info(
+                "Qwen ANE prefill banks add %s to the projected memory for %s",
+                format_size(banks),
+                entry.model_id,
+            )
+        return base + extra + banks
 
     def _qwen4_ple_offload_status(
         self,

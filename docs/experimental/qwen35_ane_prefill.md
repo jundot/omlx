@@ -211,6 +211,57 @@ FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
 materialization scratch. This projected size participates in the normal memory
 guard before the model begins loading.
 
+## Pricing the banks at admission
+
+A resident bank is charged to the kernel's neural ledger and excluded from
+`phys_footprint`, so the ordinary accounting cannot see it and admission has
+never charged for it. The compiled program size is what the driver wires, and
+it is available before the load commits anything: compiling one projection
+reports exactly the `wiredMemory` the driver goes on to report
+at program-create. Measured across two contractions, three output widths, two
+dtypes and four chunk widths, on blobs from 5.77 MB to 94.37 MB.
+
+The size is fixed by the geometry rather than by the weight values — checked
+across eighteen arms at three geometries, including all-zero, constant and
+widely varying scales — so one compile prices every layer that shares a shape.
+The 64-layer 27B MLP slice and the 48-layer GDN slice are two shapes, and two
+compiles therefore price the whole layout. `engine_pool` caches one price per
+geometry and adds the total to the projected size.
+
+Compiler options change the compiled size as well, so the price is only
+valid for the option set the load path actually uses; the agreement with
+`wiredMemory` is what establishes that, not the geometry alone. The effect
+is program-dependent rather than a fixed offset, and it is not small: on a
+measured convolution fixture a single scheduling option moved the compiled
+size by 16%.
+
+The compiler is reached through `ANECompiler.framework`, resolved by name.
+Its target comes from the runtime's own `aneArchitectureType` rather than a
+chip table, read from the local device, so the probe compiles for the machine
+it runs on. That request is honoured rather than quietly defaulted, which can
+be checked on its own: compile one source for two architectures and the
+outputs differ byte-for-byte at the same length.
+
+When the framework or the symbol is missing the price is zero and admission
+keeps its previous behaviour, which is to charge nothing for the banks. Do
+not substitute the neural ledger figure for the wired one: the difference
+between them varies with chunk width.
+
+The GDN width comes from the backend's own recurrent-safe boundary rather
+than a second copy of that rule, so a fraction too small to cover z is priced
+at nothing, exactly as it is offloaded. The size of one program is measured;
+what remains a prediction is the layer count, since layers the backend later
+declines for dtype or row alignment are charged anyway. The total therefore
+errs high, which is the safe direction for the guard.
+
+Pricing a shape stages a zero-filled blob of that projection's weight
+shape, so it transiently holds about twice that before the load starts.
+
+Two things this does not cover. The ratio a probe compile costs against the
+load it prices is not measured here, and identical inputs produce images of
+identical size but differing content, so a compiled artifact must never be
+identified by hashing it — the cache key is the descriptor, not the image.
+
 ## Recurrent-safe GDN validation
 
 The current z-only policy was selected from a controlled 32K comparison on

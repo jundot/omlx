@@ -13,6 +13,7 @@ import pytest
 from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
+    _qwen35_ane_bank_estimated_bytes,
     _qwen35_cpu_share_estimated_bytes,
 )
 from omlx.exceptions import (
@@ -729,6 +730,108 @@ class TestQwenCpuShareMemoryEstimate:
         assert entry.runtime_estimated_size == 400
         signature = dict(entry.runtime_settings_signature or ())
         assert signature["qwen4_ple_ssd_offload"] == "False"
+
+
+class TestQwenAneBankMemoryEstimate:
+    @staticmethod
+    def _settings(**overrides):
+        from omlx.model_settings import ModelSettings
+
+        base = {
+            "qwen35_ane_prefill_enabled": True,
+            "qwen35_ane_prefill_dual_ane": False,
+            "qwen35_ane_prefill_sequence_length": 2048,
+            "qwen35_ane_prefill_max_layers": 3,
+            "qwen35_ane_prefill_fraction": 0.5,
+            "qwen35_ane_prefill_gdn": True,
+            "qwen35_ane_prefill_gdn_max_layers": 2,
+            "qwen35_ane_prefill_gdn_fraction": 0.5,
+        }
+        base.update(overrides)
+        return ModelSettings(**base)
+
+    @staticmethod
+    def _price_by_output(monkeypatch):
+        """Stub the compiler so each program's price names its own width."""
+        calls = []
+
+        def fake(input_dim, output_dim, sequence_length):
+            calls.append((input_dim, output_dim, sequence_length))
+            return output_dim * 1000
+
+        monkeypatch.setattr("omlx.engine_pool._ane_program_bytes", fake)
+        return calls
+
+    def test_estimate_charges_every_mlp_and_gdn_program(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        calls = self._price_by_output(monkeypatch)
+
+        estimated = _qwen35_ane_bank_estimated_bytes(str(model), self._settings())
+
+        # Gate and up share one program per layer, so the MLP width is 2x the
+        # aligned slice; GDN is capped at its 128 token-local z rows.
+        assert calls == [(256, 512, 2048), (256, 128, 2048)]
+        assert estimated == 3 * 512 * 1000 + 2 * 128 * 1000
+
+    def test_estimate_caps_gdn_at_the_z_boundary(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        calls = self._price_by_output(monkeypatch)
+
+        _qwen35_ane_bank_estimated_bytes(
+            str(model), self._settings(qwen35_ane_prefill_gdn_fraction=0.9)
+        )
+
+        # A 0.9 request aligns to 320 of 384 rows; recurrent qkv stays on GPU.
+        assert calls[1] == (256, 128, 2048)
+
+    def test_estimate_skips_gdn_below_the_z_boundary(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        calls = self._price_by_output(monkeypatch)
+
+        _qwen35_ane_bank_estimated_bytes(
+            str(model), self._settings(qwen35_ane_prefill_gdn_fraction=0.3)
+        )
+
+        # 64 aligned rows cannot reach z, so the backend offloads no GDN at
+        # all and there is nothing to charge for.
+        assert calls == [(256, 512, 2048)]
+
+    def test_dual_widens_the_alignment(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        calls = self._price_by_output(monkeypatch)
+
+        _qwen35_ane_bank_estimated_bytes(
+            str(model),
+            self._settings(
+                qwen35_ane_prefill_dual_ane=True, qwen35_ane_prefill_fraction=0.4
+            ),
+        )
+
+        # 204 aligned rows fall to 192 at 64 and to 128 at 128.
+        assert calls[0] == (256, 2 * 128, 2048)
+
+    def test_estimate_is_zero_without_the_private_compiler(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        monkeypatch.setattr("omlx.engine_pool._ane_program_bytes", lambda *_args: 0)
+
+        assert _qwen35_ane_bank_estimated_bytes(str(model), self._settings()) == 0
+
+    def test_estimate_is_zero_when_ane_prefill_is_off(self, tmp_path, monkeypatch):
+        model = tmp_path / "qwen"
+        TestQwenCpuShareMemoryEstimate._write_config(model)
+        calls = self._price_by_output(monkeypatch)
+
+        estimated = _qwen35_ane_bank_estimated_bytes(
+            str(model), self._settings(qwen35_ane_prefill_enabled=False)
+        )
+
+        assert estimated == 0
+        assert calls == []
 
 
 class TestApplySettingsOverrides:

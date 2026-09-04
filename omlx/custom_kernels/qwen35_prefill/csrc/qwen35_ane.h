@@ -121,6 +121,11 @@ private:
 
 bool qwen35_ane_available();
 bool qwen35_ane_hybrid_nax_enabled();
+// Compiled byte count for one INT8 linear projection of this geometry, which
+// is what the driver wires when the program is loaded. Returns 0 when the
+// private compiler is unavailable, so callers keep their own estimate.
+size_t qwen35_ane_program_bytes(int input_dim, int output_dim,
+                                int sequence_length);
 bool qwen35_cpu_shared_resource_available();
 void qwen35_ane_profile_set_enabled(bool enabled);
 void qwen35_ane_profile_reset();
