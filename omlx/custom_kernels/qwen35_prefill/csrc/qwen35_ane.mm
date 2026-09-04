@@ -1399,6 +1399,126 @@ bool qwen35_ane_available() {
   }
 }
 
+size_t qwen35_ane_program_bytes(int input_dim, int output_dim,
+                                int sequence_length) {
+  if (input_dim <= 0 || output_dim <= 0 || sequence_length <= 0) {
+    return 0;
+  }
+  @autoreleasepool {
+    try {
+      // ANECompiler is a separate framework from the runtime, and its entry
+      // point is resolved by name so a missing symbol costs an estimate
+      // rather than a load failure.
+      using Compile = int (*)(CFDictionaryRef, CFDictionaryRef,
+                              void (^)(int, CFDictionaryRef));
+      static void *compiler = dlopen("/System/Library/PrivateFrameworks/"
+                                     "ANECompiler.framework/ANECompiler",
+                                     RTLD_NOW);
+      static auto compile =
+          compiler ? reinterpret_cast<Compile>(dlsym(compiler, "ANECCompile"))
+                   : nullptr;
+      if (!compile) {
+        return 0;
+      }
+      // The compile target is a die class the runtime already knows; deriving
+      // it from a chip identifier here would be one more table to keep.
+      load_ane_framework();
+      Class device_info = NSClassFromString(@"_ANEDeviceInfo");
+      SEL architecture = @selector(aneArchitectureType);
+      if (!device_info || ![device_info respondsToSelector:architecture]) {
+        return 0;
+      }
+      NSString *target =
+          ((id (*)(Class, SEL))objc_msgSend)(device_info, architecture);
+      if (![target isKindOfClass:[NSString class]] || !target.length) {
+        return 0;
+      }
+
+      NSString *root = [NSTemporaryDirectory()
+          stringByAppendingPathComponent:
+              [@"omlx-ane-price-"
+                  stringByAppendingString:[[NSUUID UUID] UUIDString]]];
+      NSString *source = [root stringByAppendingPathComponent:@"src"];
+      NSString *weights = [source stringByAppendingPathComponent:@"weights"];
+      NSString *output = [root stringByAppendingPathComponent:@"out"];
+      NSFileManager *files = [NSFileManager defaultManager];
+      auto cleanup = [&]() { [files removeItemAtPath:root error:nil]; };
+      if (![files createDirectoryAtPath:weights
+              withIntermediateDirectories:YES
+                               attributes:nil
+                                    error:nil] ||
+          ![files createDirectoryAtPath:output
+              withIntermediateDirectories:YES
+                               attributes:nil
+                                    error:nil]) {
+        cleanup();
+        return 0;
+      }
+
+      // Weight values do not change the compiled size, so zeros of the right
+      // shape price the real program. The vector is a transient copy the blob
+      // helper needs; it is released before the compile returns.
+      const size_t data_bytes =
+          static_cast<size_t>(output_dim) * static_cast<size_t>(input_dim);
+      const size_t scale_bytes = static_cast<size_t>(output_dim) * 2;
+      std::vector<uint8_t> zeros(std::max(data_bytes, scale_bytes), 0);
+      NSData *data_blob = make_blob(zeros.data(), data_bytes);
+      NSData *scale_blob = make_blob(zeros.data(), scale_bytes);
+      zeros.clear();
+      zeros.shrink_to_fit();
+      BOOL staged =
+          [[int8_linear_mil(input_dim, output_dim, sequence_length)
+              dataUsingEncoding:NSUTF8StringEncoding]
+              writeToFile:[source stringByAppendingPathComponent:@"model.mil"]
+               atomically:YES] &&
+          [data_blob
+              writeToFile:[weights
+                              stringByAppendingPathComponent:@"weight_data.bin"]
+               atomically:YES] &&
+          [scale_blob
+              writeToFile:[weights stringByAppendingPathComponent:
+                                       @"weight_scale.bin"]
+               atomically:YES];
+      if (!staged) {
+        cleanup();
+        return 0;
+      }
+
+      // InputNetworks must be an array of per-network dictionaries; the flat
+      // NetworkPlist keys alone are rejected as an unsupported feature.
+      NSDictionary *inputs = @{
+        @"InputNetworks" : @[ @{
+          @"NetworkPlistName" : @"model.mil",
+          @"NetworkPlistPath" : [source stringByAppendingString:@"/"],
+        } ],
+        @"OutputFileName" : @"model.hwx",
+        @"OutputFilePath" : [output stringByAppendingString:@"/"],
+      };
+      NSDictionary *options = @{
+        @"TargetArchitecture" : target,
+        @"scratchPadPath" : NSTemporaryDirectory(),
+      };
+      __block int status = -1;
+      const int result = compile((__bridge CFDictionaryRef)inputs,
+                                 (__bridge CFDictionaryRef)options,
+                                 ^(int code, CFDictionaryRef) { status = code; });
+      size_t bytes = 0;
+      if (result == 0 && status == 0) {
+        NSDictionary *attributes = [files
+            attributesOfItemAtPath:[output
+                                       stringByAppendingPathComponent:
+                                           @"model.hwx"]
+                             error:nil];
+        bytes = static_cast<size_t>([attributes fileSize]);
+      }
+      cleanup();
+      return bytes;
+    } catch (...) {
+      return 0;
+    }
+  }
+}
+
 void qwen35_ane_profile_set_enabled(bool enabled) {
   g_ane_profile_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }

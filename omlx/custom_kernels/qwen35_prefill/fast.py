@@ -348,6 +348,29 @@ def qwen35_ane_available() -> bool:
     )
 
 
+def qwen35_ane_program_bytes(
+    input_dim: int, output_dim: int, sequence_length: int
+) -> int:
+    """Compiled size of one INT8 linear projection, or 0 when unavailable.
+
+    This is what the driver wires when the program loads, so it prices a bank
+    before the load commits the memory. It costs one compile, and the result
+    depends only on the geometry, so one call covers every layer of a shape.
+    The compile stages a zero-filled blob of the projection's weight shape,
+    so callers should cache the result rather than repeat it per layer.
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_ane_program_bytes"):
+        return 0
+    try:
+        return int(
+            _ext.qwen35_ane_program_bytes(
+                int(input_dim), int(output_dim), int(sequence_length)
+            )
+        )
+    except Exception:
+        return 0
+
+
 def qwen35_ane_hybrid_nax_enabled() -> bool:
     """Whether ANE hybrid GPU suffixes currently select bundled NAX QMM."""
     return bool(
