@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
-  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP.",
+  "settings.advanced.prefill_warmup": "Préchauffer le préremplissage après le chargement d'un modèle",
+  "settings.advanced.prefill_warmup_hint": "Le premier prompt après un chargement paie un coût à froid : le premier bloc de 512 jetons fait croître la mémoire du processus d'environ 14,5 Go ; tous les suivants, d'environ 2 Go (le pool de tampons Metal se remplissant une fois). Mesuré sur M1 Ultra avec GLM-5.3-Flash (04/09) : ce bloc froid a poussé un modèle de 103 Go au-dessus de la limite dure de 115,5 Go et a interrompu le premier prompt de l'utilisateur dans 2 chargements sur 4. Activé, une passe jetable de 512 jetons s'exécute juste après chaque chargement (~3-4 s) et le premier vrai prompt trouve un pool chaud. S'applique au prochain démarrage du serveur."
 }

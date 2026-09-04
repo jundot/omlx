@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Descarga iniciada: {repo_id}",
   "js.success.settings_saved": "Configuración guardada correctamente",
   "settings.mcp.expose_tools": "Exponer herramientas MCP del backend a los clientes",
-  "settings.mcp.expose_tools_hint": "Combina las herramientas MCP del backend en las respuestas. Desactívalo si tu cliente tiene sus propios servidores MCP."
+  "settings.mcp.expose_tools_hint": "Combina las herramientas MCP del backend en las respuestas. Desactívalo si tu cliente tiene sus propios servidores MCP.",
+  "settings.advanced.prefill_warmup": "Calentar el prellenado tras cargar un modelo",
+  "settings.advanced.prefill_warmup_hint": "El primer prompt tras una carga paga un coste en frío: el primer bloque de 512 tokens hace crecer la memoria del proceso ~14,5 GB; todos los siguientes, ~2 GB (el pool de búferes de Metal llenándose una vez). Medido en M1 Ultra con GLM-5.3-Flash (04/09): ese bloque frío llevó un modelo de 103 GB por encima de la marca dura de 115,5 GB y abortó el primer prompt del usuario en 2 de 4 cargas. Activado, una pasada descartable de 512 tokens corre justo después de cada carga (~3-4 s) y el primer prompt real ya encuentra el pool caliente. Se aplica en el próximo arranque del servidor."
 }

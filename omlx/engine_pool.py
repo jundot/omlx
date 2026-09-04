@@ -3039,6 +3039,22 @@ class EnginePool:
                 f"full model: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
+            # The cold first prefill chunk costs ~14,5 GB of footprint against
+            # ~2 GB warm (see Scheduler.warmup_prefill); pay it before traffic.
+            # OMLX_PREFILL_WARMUP=0 turns it off (the CLI exports the setting).
+            import os
+
+            if os.environ.get("OMLX_PREFILL_WARMUP", "1") != "0":
+                core = self._resolve_engine_core_from_engine(engine)
+                warm = getattr(getattr(core, "scheduler", None), "warmup_prefill", None)
+                if warm is not None:
+                    try:
+                        await loop.run_in_executor(
+                            getattr(core, "_mlx_executor", None) or get_mlx_executor(),
+                            warm,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Prefill warmup failed for {model_id}: {e}")
         except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback

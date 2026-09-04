@@ -487,6 +487,8 @@
   "cluster.pairing.shared_secret_placeholder": "至少 16 个字符",
   "cluster.pairing.generate": "生成",
   "cluster.pairing.copy": "复制",
+  "settings.advanced.prefill_warmup": "加载模型后预热预填充",
+  "settings.advanced.prefill_warmup_hint": "加载后的第一个提示要付冷启动代价：第一个 512 词元的块使进程内存增长约 14.5 GB，之后每块约 2 GB（Metal 缓冲池只填满一次）。在 M1 Ultra 上用 GLM-5.3-Flash 实测（04/09）：这个冷块把 103 GB 的模型推过 115.5 GB 的硬水位线，4 次加载中有 2 次中止了用户的第一个提示。开启后，每次加载后立即跑一次 512 词元的一次性前向（约 3-4 秒），第一个真实提示就能遇到已预热的缓冲池。下次服务器启动时生效。",
   "settings.advanced.burst_decode": "突发解码",
   "settings.advanced.burst_decode_hint": "内部批量处理 Token 以加快生成速度。级别越高速度越快但流式输出块越大；级别越低流式输出越平滑。即时生效，无需重启。",
   "settings.advanced.burst_decode_off": "关闭（最平滑流式输出）",

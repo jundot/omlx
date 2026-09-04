@@ -1130,5 +1130,7 @@
   "js.success.download_started": "ダウンロード開始: {repo_id}",
   "js.success.settings_saved": "設定が保存されました",
   "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
-  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。"
+  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。",
+  "settings.advanced.prefill_warmup": "モデル読み込み後にプリフィルをウォームアップ",
+  "settings.advanced.prefill_warmup_hint": "読み込み直後の最初のプロンプトはコールドコストを払います。最初の 512 トークンのチャンクでプロセスのメモリが約 14.5 GB 増え、それ以降は約 2 GB です (Metal のバッファプールが一度満たされるため)。M1 Ultra と GLM-5.3-Flash で計測 (04/09): このコールドチャンクが 103 GB のモデルを 115.5 GB のハードウォーターマークの上へ押し出し、4 回の読み込みのうち 2 回で最初のプロンプトを中断させました。有効にすると、読み込み直後に 512 トークンの捨てフォワードが 1 回走り (約 3-4 秒)、最初の実プロンプトは温まったプールに当たります。次のサーバー起動から適用されます。"
 }
