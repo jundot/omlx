@@ -24,6 +24,7 @@ import glob
 import importlib.util
 import json
 import logging
+import os
 import struct
 import sys
 from collections.abc import Callable
@@ -257,6 +258,31 @@ def _build_patched_load_model() -> Callable:
 
         model.eval()
         model.load_weights(list(weights.items()), strict=strict)
+
+        # Opt-in (OMLX_DSV4_LMHEAD_Q8=1): quantize the untied bf16 lm_head
+        # (129280 x 4096, ~1.06 GB read per forward) to 8-bit affine. NOT
+        # bit-exact; Vontra measured ppl-neutral (8.30 -> 8.30, 98.78% top-1
+        # agreement). Halves the per-token head read at decode and in every
+        # DSpark draft/verify logits pass.
+        if (
+            os.environ.get("OMLX_DSV4_LMHEAD_Q8", "0") == "1"
+            and str(config.get("model_type", "")).startswith("deepseek_v4")
+        ):
+            lm = getattr(model, "lm_head", None)
+            if isinstance(lm, nn.Linear) and not isinstance(lm, nn.QuantizedLinear):
+                w = lm.weight
+                qw, scales, biases = mx.quantize(w, group_size=64, bits=8)
+                ql = nn.QuantizedLinear(
+                    w.shape[1], w.shape[0], bias=False, group_size=64, bits=8
+                )
+                ql.weight, ql.scales, ql.biases = qw, scales, biases
+                model.lm_head = ql
+                logger.info(
+                    "DeepSeek-V4 lm_head quantized to 8-bit affine "
+                    "(OMLX_DSV4_LMHEAD_Q8=1): %.2f GB -> %.2f GB",
+                    w.nbytes / 1e9,
+                    (qw.nbytes + scales.nbytes + biases.nbytes) / 1e9,
+                )
 
         if not lazy:
             mx.eval(model.parameters())
