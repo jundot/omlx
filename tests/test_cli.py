@@ -861,7 +861,12 @@ class TestServeCommandFunctions:
                 serve_command(args)
 
             assert exc.value.code != 0
-            assert events == ["bind"]
+            # The #1814 reap-and-retry wrapper (`_bind_socket_with_reap`)
+            # attempts bind once, finds the port held by a non-omlx process
+            # (this test process itself) so refuses to reap, then falls
+            # through to `_bind_socket_or_explain`'s own bind attempt for
+            # the diagnostic message — two bind attempts total, no reap.
+            assert events == ["bind", "bind"]
             assert "omlx.server" not in sys.modules
         finally:
             listener.close()
@@ -1133,3 +1138,223 @@ class TestPortConflictVisibility:
             assert sock is not None
         finally:
             sock.close()
+
+
+class TestIsOmlxProcessTitle:
+    """Tests for the #1814 reap recovery-half title matcher."""
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "omlx-server",
+            "/opt/venv/bin/omlx serve --port 8000",
+            "omlx start",
+            "python -m omlx.cli serve",
+            "OMLX-SERVER",
+        ],
+    )
+    def test_matches_omlx_titles(self, title):
+        from omlx.cli import _is_omlx_process_title
+
+        assert _is_omlx_process_title(title) is True
+
+    @pytest.mark.parametrize(
+        "title",
+        ["", "/usr/bin/nginx", "some-other-daemon --port 8000"],
+    )
+    def test_rejects_non_omlx_titles(self, title):
+        from omlx.cli import _is_omlx_process_title
+
+        assert _is_omlx_process_title(title) is False
+
+
+class TestReapStaleOmlxOnPort:
+    """Tests for the #1814 recovery-half reaper.
+
+    Mocks the pid-discovery and signaling seams so these never touch a
+    real process; only a real (but unused) port is used, for the
+    port-becomes-free probe at the end of a successful reap.
+    """
+
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_refuses_unknown_owner(self, monkeypatch):
+        import os
+
+        from omlx import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "_port_listener_pids", lambda port: [222])
+        monkeypatch.setattr(
+            cli_mod, "_process_title_for_pid", lambda pid: "/usr/bin/some-other-daemon"
+        )
+        kill_calls = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kill_calls.append((pid, sig)))
+
+        result = cli_mod._reap_stale_omlx_on_port(self._free_port(), grace=0.01)
+
+        assert result is False
+        assert kill_calls == []
+
+    def test_no_listeners_returns_false_without_signaling(self, monkeypatch):
+        import os
+
+        from omlx import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "_port_listener_pids", lambda port: [])
+        kill_calls = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: kill_calls.append((pid, sig)))
+
+        result = cli_mod._reap_stale_omlx_on_port(self._free_port(), grace=0.01)
+
+        assert result is False
+        assert kill_calls == []
+
+    def test_sigterm_reaps_quickly_exiting_process(self, monkeypatch):
+        import os
+        import signal
+
+        from omlx import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "_port_listener_pids", lambda port: [333])
+        monkeypatch.setattr(cli_mod, "_process_title_for_pid", lambda pid: "omlx-server")
+
+        calls = []
+
+        def fake_kill(pid, sig):
+            calls.append((pid, sig))
+            if sig == 0:
+                raise ProcessLookupError  # exited promptly after SIGTERM
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        result = cli_mod._reap_stale_omlx_on_port(self._free_port(), grace=5)
+
+        assert result is True
+        assert calls[0] == (333, signal.SIGTERM)
+        assert all(sig != signal.SIGKILL for _, sig in calls)
+
+    def test_escalates_to_sigkill_after_grace(self, monkeypatch):
+        import os
+        import signal
+        import time
+
+        from omlx import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "_port_listener_pids", lambda port: [444])
+        monkeypatch.setattr(cli_mod, "_process_title_for_pid", lambda pid: "omlx serve")
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        state = {"killed": False}
+        calls = []
+
+        def fake_kill(pid, sig):
+            calls.append((pid, sig))
+            if sig == signal.SIGKILL:
+                state["killed"] = True
+                return
+            if sig == 0:
+                if state["killed"]:
+                    raise ProcessLookupError
+                return  # still alive — never exits until SIGKILL
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        result = cli_mod._reap_stale_omlx_on_port(self._free_port(), grace=0.05)
+
+        assert result is True
+        assert (444, signal.SIGTERM) in calls
+        assert (444, signal.SIGKILL) in calls
+        # SIGTERM must be attempted (and the grace period observed) before
+        # escalating — never jump straight to SIGKILL.
+        assert calls.index((444, signal.SIGTERM)) < calls.index((444, signal.SIGKILL))
+
+
+class TestBindSocketWithReap:
+    """Tests for the #1814 bind-retry wrapper around `_bind_socket_or_explain`."""
+
+    def test_reap_disabled_delegates_directly(self, monkeypatch):
+        from omlx import cli as cli_mod
+
+        cfg = MagicMock()
+        explain_spy = MagicMock(return_value="EXPLAIN_RESULT")
+        reap_spy = MagicMock()
+        monkeypatch.setattr(cli_mod, "_bind_socket_or_explain", explain_spy)
+        monkeypatch.setattr(cli_mod, "_reap_stale_omlx_on_port", reap_spy)
+
+        result = cli_mod._bind_socket_with_reap(cfg, "127.0.0.1", 8000, False)
+
+        assert result == "EXPLAIN_RESULT"
+        explain_spy.assert_called_once_with(cfg, "127.0.0.1", 8000)
+        reap_spy.assert_not_called()
+        cfg.bind_socket.assert_not_called()
+
+    def test_successful_bind_skips_reap(self, monkeypatch):
+        from omlx import cli as cli_mod
+
+        cfg = MagicMock()
+        cfg.bind_socket.return_value = "SOCK"
+        reap_spy = MagicMock()
+        monkeypatch.setattr(cli_mod, "_reap_stale_omlx_on_port", reap_spy)
+
+        result = cli_mod._bind_socket_with_reap(cfg, "127.0.0.1", 8000, True)
+
+        assert result == "SOCK"
+        reap_spy.assert_not_called()
+
+    def test_retries_once_after_successful_reap(self, monkeypatch):
+        from omlx import cli as cli_mod
+
+        cfg = MagicMock()
+        cfg.bind_socket.side_effect = [SystemExit(1), "SOCK"]
+        reap_spy = MagicMock(return_value=True)
+        explain_spy = MagicMock()
+        monkeypatch.setattr(cli_mod, "_reap_stale_omlx_on_port", reap_spy)
+        monkeypatch.setattr(cli_mod, "_bind_socket_or_explain", explain_spy)
+
+        result = cli_mod._bind_socket_with_reap(cfg, "127.0.0.1", 8000, True)
+
+        assert result == "SOCK"
+        reap_spy.assert_called_once_with(8000)
+        assert cfg.bind_socket.call_count == 2
+        explain_spy.assert_not_called()
+
+    def test_single_retry_only_then_diagnostic(self, monkeypatch):
+        """A bind that still fails after a successful reap must not loop —
+        it falls through to the #1827 diagnostic exactly once."""
+        from omlx import cli as cli_mod
+
+        cfg = MagicMock()
+        cfg.bind_socket.side_effect = SystemExit(1)
+        reap_spy = MagicMock(return_value=True)
+        explain_spy = MagicMock(return_value="EXPLAINED")
+        monkeypatch.setattr(cli_mod, "_reap_stale_omlx_on_port", reap_spy)
+        monkeypatch.setattr(cli_mod, "_bind_socket_or_explain", explain_spy)
+
+        result = cli_mod._bind_socket_with_reap(cfg, "127.0.0.1", 8000, True)
+
+        assert result == "EXPLAINED"
+        reap_spy.assert_called_once_with(8000)
+        assert cfg.bind_socket.call_count == 2  # initial + single retry-after-reap
+        explain_spy.assert_called_once_with(cfg, "127.0.0.1", 8000)
+
+    def test_no_reap_target_skips_retry(self, monkeypatch):
+        """When nothing reapable holds the port, go straight to the
+        diagnostic without a wasted retry bind."""
+        from omlx import cli as cli_mod
+
+        cfg = MagicMock()
+        cfg.bind_socket.side_effect = SystemExit(1)
+        reap_spy = MagicMock(return_value=False)
+        explain_spy = MagicMock(return_value="EXPLAINED")
+        monkeypatch.setattr(cli_mod, "_reap_stale_omlx_on_port", reap_spy)
+        monkeypatch.setattr(cli_mod, "_bind_socket_or_explain", explain_spy)
+
+        result = cli_mod._bind_socket_with_reap(cfg, "127.0.0.1", 8000, True)
+
+        assert result == "EXPLAINED"
+        assert cfg.bind_socket.call_count == 1
+        explain_spy.assert_called_once_with(cfg, "127.0.0.1", 8000)

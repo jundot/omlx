@@ -147,6 +147,248 @@ def _bind_socket_or_explain(config, host: str, port: int):
         raise
 
 
+# Recovery half of #1814: a stale omlx process left over from an unclean
+# stop can keep holding the port after the diagnostic above names it. These
+# markers identify our own process (setproctitle renames to "omlx-server";
+# unrenamed invocations show up as "omlx serve" / "omlx start" / the module
+# form "omlx.cli") so the reaper never signals a process it can't attribute
+# to omlx.
+_OMLX_TITLE_MARKERS = ("omlx serve", "omlx-server", "omlx start", "omlx.cli")
+
+
+def _is_omlx_process_title(title: str) -> bool:
+    """True when `title` looks like an omlx server process.
+
+    Returns False for an empty/unrecognized title — callers must treat
+    that as "not omlx" and refuse to signal the process.
+    """
+    if not title:
+        return False
+    lowered = title.lower()
+    return any(marker in lowered for marker in _OMLX_TITLE_MARKERS)
+
+
+def _process_title_for_pid(pid: int) -> str:
+    """Best-effort command line for `pid` via `ps`. Returns "" on failure."""
+    import subprocess
+
+    try:
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return ""
+    return res.stdout.strip()
+
+
+def _proc_net_tcp_listener_pids(port: int) -> list[int]:
+    """Fallback listener discovery via /proc/net/tcp[6] (Linux, no lsof).
+
+    Matches socket inodes in LISTEN state to pids via /proc/<pid>/fd
+    symlinks. Returns [] on any platform without /proc (e.g. macOS),
+    where lsof is the only path.
+    """
+    import glob
+    import os
+
+    target_inodes: set[str] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                lines = f.readlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            local_addr, state, inode = fields[1], fields[3], fields[9]
+            if state != "0A":  # TCP_LISTEN
+                continue
+            try:
+                local_port = int(local_addr.rsplit(":", 1)[-1], 16)
+            except ValueError:
+                continue
+            if local_port == port:
+                target_inodes.add(inode)
+
+    if not target_inodes:
+        return []
+
+    pids: list[int] = []
+    for fd_link in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            target = os.readlink(fd_link)
+        except OSError:
+            continue
+        if not target.startswith("socket:["):
+            continue
+        inode = target[len("socket:[") : -1]
+        if inode not in target_inodes:
+            continue
+        try:
+            pid = int(fd_link.split("/")[2])
+        except (IndexError, ValueError):
+            continue
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def _port_listener_pids(port: int) -> list[int]:
+    """Pids listening on `port`: lsof first, /proc/net/tcp fallback.
+
+    Separate from `_describe_port_listener` (#1827), which returns a single
+    human-readable description; the reaper needs the raw pid list since a
+    port can (rarely) have more than one stale listener.
+    """
+    import shutil
+    import subprocess
+
+    pids: list[int] = []
+    if shutil.which("lsof"):
+        try:
+            res = subprocess.run(
+                ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            pids = [int(p) for p in res.stdout.split() if p.isdigit()]
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pids = []
+    if not pids:
+        pids = _proc_net_tcp_listener_pids(port)
+    return pids
+
+
+def _reap_stale_omlx_on_port(port: int, grace: float = 10.0) -> bool:
+    """Terminate a stale omlx process holding `port`, then wait for it to free up.
+
+    Conservative by design: only ever signals a process whose title is
+    recognizably omlx (`_is_omlx_process_title`). An unrecognized owner is
+    logged and left alone, and this returns False so the caller falls
+    through to the existing #1827 diagnostic instead of guessing.
+
+    Sends SIGTERM, polls for exit up to `grace` seconds, escalates to
+    SIGKILL, then polls up to 5s for the port to become bindable again.
+    """
+    import logging
+    import os
+    import signal
+    import socket
+    import time
+
+    log = logging.getLogger("omlx.cli")
+
+    pids = _port_listener_pids(port)
+    if not pids:
+        return False
+
+    reaped_any = False
+    for pid in pids:
+        title = _process_title_for_pid(pid)
+        if not _is_omlx_process_title(title):
+            log.warning(
+                "Port %d is held by pid %d (%s), which does not look like "
+                "an omlx process; refusing to signal it.",
+                port,
+                pid,
+                title or "unknown",
+            )
+            continue
+
+        log.warning(
+            "Reaping stale omlx process on port %d: %s (pid %d)", port, title, pid
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            reaped_any = True
+            continue
+        except OSError as exc:
+            log.warning("Failed to SIGTERM pid %d: %s", pid, exc)
+            continue
+
+        deadline = time.monotonic() + grace
+        exited = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                exited = True
+                break
+            time.sleep(0.2)
+
+        if not exited:
+            log.warning(
+                "pid %d did not exit within %.0fs of SIGTERM; sending SIGKILL",
+                pid,
+                grace,
+            )
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                log.warning("Failed to SIGKILL pid %d: %s", pid, exc)
+            kill_deadline = time.monotonic() + 5
+            while time.monotonic() < kill_deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
+
+        reaped_any = True
+
+    if not reaped_any:
+        return False
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                time.sleep(0.2)
+                continue
+        log.warning("Port %d is free after reaping stale omlx process(es)", port)
+        return True
+    log.warning("Port %d still not free after reaping stale omlx process(es)", port)
+    return False
+
+
+def _bind_socket_with_reap(config, host: str, port: int, reap_stale: bool):
+    """`_bind_socket_or_explain` with one stale-omlx reap-and-retry first.
+
+    When `reap_stale` is true and the initial bind fails, attempt
+    `_reap_stale_omlx_on_port` once and retry the bind a single time
+    before falling through to the #1827 diagnostic error. `reap_stale` is
+    false under a supervisor (OMLX_SUPERVISED), which owns process
+    lifecycle and already has its own restart/backoff policy.
+    """
+    if not reap_stale:
+        return _bind_socket_or_explain(config, host, port)
+
+    try:
+        return config.bind_socket()
+    except SystemExit:
+        pass
+
+    if _reap_stale_omlx_on_port(port):
+        try:
+            return config.bind_socket()
+        except SystemExit:
+            pass
+
+    return _bind_socket_or_explain(config, host, port)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -295,10 +537,18 @@ def serve_command(args):
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
+    # Reap a stale omlx process on bind failure (#1814 recovery half) unless
+    # a supervisor owns lifecycle (it has its own restart/backoff policy) or
+    # the user opted out with --no-reap-stale.
+    reap_stale = getattr(args, "reap_stale", None)
+    if reap_stale is None:
+        reap_stale = not os.environ.get("OMLX_SUPERVISED")
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
     serve_sockets = [
-        _bind_socket_or_explain(uvicorn_config, bind_hosts[0], settings.server.port)
+        _bind_socket_with_reap(
+            uvicorn_config, bind_hosts[0], settings.server.port, reap_stale
+        )
     ]
     for h in bind_hosts[1:]:
         extra_cfg = uvicorn.Config(
@@ -309,7 +559,7 @@ def serve_command(args):
             access_log=show_access_log,
         )
         serve_sockets.append(
-            _bind_socket_or_explain(extra_cfg, h, settings.server.port)
+            _bind_socket_with_reap(extra_cfg, h, settings.server.port, reap_stale)
         )
 
     try:
@@ -907,6 +1157,15 @@ Example directory structure:
         choices=["trace", "debug", "info", "warning", "error"],
         default=None,
         help="Log level (default: info). trace includes full message content",
+    )
+    serve_parser.add_argument(
+        "--reap-stale",
+        dest="reap_stale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reap a stale omlx process still holding the port before "
+        "failing to bind (default: enabled, unless OMLX_SUPERVISED is set "
+        "— the supervisor owns lifecycle there)",
     )
     serve_parser.add_argument(
         "--sse-keepalive-mode",
