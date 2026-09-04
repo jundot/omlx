@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import struct
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -109,8 +110,14 @@ def compute_block_hash(
         # Use fixed seed for reproducibility
         hasher.update(b"omlx-root")
 
-    # Include token content
-    hasher.update(bytes(str(tuple(token_ids)), "utf-8"))
+    # Include token content. One-pass packed-int hashing: struct.pack writes
+    # each id directly as a deterministic, platform-independent 4-byte
+    # little-endian sequence in one C-level call, instead of round-tripping
+    # through str(tuple(token_ids)) (a repr() per element plus join/encode
+    # overhead) on this hot prefix-caching path. Unsigned 32-bit comfortably
+    # covers any real vocab size and raises loudly (struct.error) rather
+    # than silently truncating on an out-of-range id.
+    hasher.update(struct.pack(f"<{len(token_ids)}I", *token_ids))
 
     # Include extra keys if present
     if extra_keys:
@@ -1128,6 +1135,7 @@ class PagedCacheManager(CacheManager):
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        precomputed_hash: Optional[BlockHash] = None,
     ) -> None:
         """
         Register a block's hash for deduplication using chain hash.
@@ -1137,14 +1145,23 @@ class PagedCacheManager(CacheManager):
             tokens: Token IDs in this block
             parent_hash: Hash of the parent block (for chain), or None for first block
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            precomputed_hash: Hash already computed by the caller for these
+                exact (parent_hash, tokens, extra_keys, model_name) — passed
+                through instead of recomputing the same SHA-256 over the
+                block's token content a second time. Callers without one
+                still get it computed here.
         """
         if not self.enable_caching:
             return
 
         with self._lock:
-            block_hash = compute_block_hash(
-                parent_hash, tokens, extra_keys=extra_keys,
-                model_name=self.model_name,
+            block_hash = (
+                precomputed_hash
+                if precomputed_hash is not None
+                else compute_block_hash(
+                    parent_hash, tokens, extra_keys=extra_keys,
+                    model_name=self.model_name,
+                )
             )
             block.block_hash = block_hash
             self.cached_block_hash_to_block.insert(block_hash, block)
