@@ -4,7 +4,7 @@
 On M5-generation GPUs mlx dispatches ``sorted_indices=True`` quantized
 gather matmuls (the MoE sorted-prefill path) to the NAX
 ``*_gather_qmm_rhs_nax`` kernels. Two independent defects corrupt their
-output on mlx <= 0.32.0:
+output through mlx 0.32.2:
 
 - K remainder: the ``align_K=false`` tail bounds the activation tile
   load by ``BK`` instead of the K remainder
@@ -15,7 +15,7 @@ output on mlx <= 0.32.0:
   issue #2267's bit-exactness test caught: with ``inter=32`` the test's
   ``down_proj`` runs at K=32. All dtypes are affected (bf16/fp16/fp32),
   and the mxfp4 variant carries the same tail bug.
-- Row offsets: the int16 fix that landed in mlx 0.32.0 missed this
+- Row offsets: the int16 fix that landed in mlx 0.32.0 still misses this
   kernel, so sorted row counts above 32768 overflow the row offset
   (ml-explore/mlx#3856). Reachable in production: a 4097+ token prefill
   chunk of a top-8 MoE crosses the boundary.

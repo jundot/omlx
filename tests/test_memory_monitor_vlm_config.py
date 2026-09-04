@@ -12,6 +12,7 @@ These tests pin the priority: prefer any sub-config that has the LM layer
 count, else fall back to the top-level config.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
@@ -132,6 +133,45 @@ def test_qwen4_qsa_memory_includes_indexer_and_mrope_state():
 
     assert (full_layers, rotating, arrays) == (12, [], 0)
     assert estimate == 12 * (2 * 2 * 128 * 2 + 128 * 2 + 3 * 8)
+
+
+def test_qwen4_prefill_profile_gathered_core_caps_score_matrix():
+    from omlx.memory_monitor import MemoryMonitor, make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    assert profile is not None
+    monitor = MemoryMonitor(max_kv_cache_memory=1024**3, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    query, kv_len = 4096, 233_472
+    dense = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=False
+    )
+    gathered = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=True
+    )
+    assert gathered * 8 < dense
+    # 147GB resident + this gathered gulp stays under the 214GB safety cap.
+    assert gathered < 12 * 1024**3
 
 
 class TestSetModelInfoForMonitorVLMWalk:
@@ -487,10 +527,12 @@ class TestSetModelInfoTurboQuantDtype:
 class TestSdpaDispatchEstimate:
     """MemoryMonitor mirrors MLX SDPA full/vector dispatch support."""
 
-    def test_sdpa_dispatch_constants_match_mlx_031(self):
+    def test_sdpa_dispatch_constants_match_mlx_0322(self):
         assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
-        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
-        assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 72, 80, 96, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
+        assert frozenset({64, 96, 128, 256}) == (
+            _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+        )
 
     def test_estimate_prefill_uses_full_fallback_for_head_dim_256(self):
         """head_dim=256 is not supported by MLX fused full prefill."""

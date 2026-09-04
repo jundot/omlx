@@ -103,7 +103,11 @@ struct QuantizationScreen: View {
             MessageBanner(error: vm.lastError, success: vm.lastSuccess)
 
             if vm.modelsLoaded && vm.models.isEmpty {
-                EmptyModelsBanner()
+                HintLine(text: String(localized: "quant.empty_models",
+                                      defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
+                                      comment: "Banner shown when no full-precision models are available to quantize"))
+                    .padding(.horizontal, 14)
+                    .padding(.top, 6)
             }
 
             QueueSection(
@@ -179,7 +183,7 @@ private struct SourceModelSection: View {
             ) {
                 Popup(
                     selection: $selectedModelPath,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -195,7 +199,7 @@ private struct SourceModelSection: View {
                 ) {
                     Popup(
                         selection: $sensitivityModelPath,
-                        width: 320,
+                        width: .controlWide,
                         options: sensitivityOptions
                     )
                 }
@@ -209,7 +213,7 @@ private struct SourceModelSection: View {
                                  comment: "Row sublabel explaining the oQ level tradeoff")) {
                 Popup(
                     selection: $oqLevel,
-                    width: 120,
+                    width: .controlCompact,
                     options: levelOptions
                 )
             }
@@ -308,7 +312,7 @@ private struct EstimateStrip: View {
                              defaultValue: "Output size: ~\(outputSizeText)",
                              comment: "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string"))
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 10)
     }
@@ -373,7 +377,7 @@ private struct AdvancedSection: View {
                                              defaultValue: "Exclude vision encoder weights (~2-3% smaller, text-only output)",
                                              comment: "Toggle row sublabel: text-only quantization effect")
                         ) {
-                            Toggle("", isOn: $textOnly).labelsHidden().toggleStyle(.switch)
+                            RowSwitch(isOn: $textOnly)
                         }
                     }
 
@@ -389,9 +393,7 @@ private struct AdvancedSection: View {
                                      defaultValue: "Unavailable — source model has no MTP heads",
                                      comment: "Toggle row sublabel when MTP isn't supported by the chosen source")
                     ) {
-                        Toggle("", isOn: $preserveMtp)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
+                        RowSwitch(isOn: $preserveMtp)
                             .disabled(!selectedHasMTP)
                     }
 
@@ -446,7 +448,7 @@ private struct EnhancedQuantizationSection: View {
                                  comment: "Toggle sublabel explaining what enabling oQe does"),
                 isLast: !enabled
             ) {
-                Toggle("", isOn: $enabled).labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $enabled)
             }
 
             if enabled {
@@ -458,7 +460,7 @@ private struct EnhancedQuantizationSection: View {
                                      defaultValue: "Use a compatible cached imatrix when available; otherwise collect a new one.",
                                      comment: "Toggle sublabel for the oQe imatrix cache reuse option")
                 ) {
-                    Toggle("", isOn: $reuseCache).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $reuseCache)
                 }
 
                 Row(
@@ -475,7 +477,7 @@ private struct EnhancedQuantizationSection: View {
                                             defaultValue: "Automatic",
                                             comment: "Placeholder for an automatically selected oQe imatrix cache path"),
                         mono: true,
-                        width: 320
+                        width: .controlWide
                     )
                 }
 
@@ -488,33 +490,10 @@ private struct EnhancedQuantizationSection: View {
                                      comment: "Toggle sublabel for strict oQe imatrix coverage"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $strictCoverage).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $strictCoverage)
                 }
             }
         }
-    }
-}
-
-private struct EmptyModelsBanner: View {
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 11))
-                .foregroundStyle(theme.textTertiary)
-            Text(String(localized: "quant.empty_models",
-                        defaultValue: "No full-precision models found on disk. Download one from the Downloads tab first.",
-                        comment: "Banner shown when no full-precision models are available to quantize"))
-                .font(.omlxText(11.5))
-                .foregroundStyle(theme.textSecondary)
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .background(theme.codeBg)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 18)
-        .padding(.top, 6)
     }
 }
 
@@ -973,7 +952,7 @@ private struct UploadModalView: View {
                             placeholder: "hf_…",
                             isSecure: true,
                             mono: true,
-                            width: 220
+                            width: .controlMedium
                         )
                         Button {
                             Task { await vm.validateUploadToken(client: client) }
@@ -1010,7 +989,7 @@ private struct UploadModalView: View {
                     ) {
                         Popup(
                             selection: $vm.uploadNamespace,
-                            width: 220,
+                            width: .controlMedium,
                             options: namespaceOptions
                         )
                     }
@@ -1063,7 +1042,7 @@ private struct UploadModalView: View {
                             text: $repoName,
                             placeholder: "model-id",
                             mono: true,
-                            width: 240
+                            width: .controlMedium
                         )
                     }
                 }
@@ -1077,7 +1056,7 @@ private struct UploadModalView: View {
                                      comment: "Toggle row sublabel explaining the private flag"),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $isPrivate).labelsHidden().toggleStyle(.switch)
+                    RowSwitch(isOn: $isPrivate)
                 }
             }
         }
@@ -1101,7 +1080,7 @@ private struct UploadModalView: View {
                 ) {
                     Popup(
                         selection: $readmeSourcePath,
-                        width: 260,
+                        width: .controlWide,
                         options: readmeOptions
                     )
                 }
@@ -1115,7 +1094,7 @@ private struct UploadModalView: View {
                                          comment: "Toggle row sublabel for the re-download notice"),
                         isLast: true
                     ) {
-                        Toggle("", isOn: $addRedownloadNotice).labelsHidden().toggleStyle(.switch)
+                        RowSwitch(isOn: $addRedownloadNotice)
                     }
                 } else {
                     // Trailing row stays flush even when the toggle is hidden.

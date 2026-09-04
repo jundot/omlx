@@ -505,12 +505,106 @@ def test_predicted_transient_zero_without_signals():
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
 
 
+def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
+    """A leftover dense last_delta must not refuse gathered QSA static."""
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    tracker = PrefillTransientTracker()
+    tracker.update(4096, int(69.58 * _GB), gathered_core=False)
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+    predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
+    dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted < dense_poison / 8
+    assert 147 * _GB + predicted < 214 * _GB
+    # Recording the first gathered observation must not make the next
+    # gathered chunk inherit the dense EWMA. Before the histories were split,
+    # this second prediction jumped from ~5.47 GiB to ~64.96 GiB.
+    tracker.update(
+        4096,
+        int(predicted / Scheduler._PREFILL_TRANSIENT_SAFETY),
+        gathered_core=True,
+    )
+    next_predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
+    assert next_predicted == pytest.approx(predicted, rel=1e-6)
+    # Without gathered pricing, that same leftover gulp must still bind.
+    dense_predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=False
+    )
+    assert dense_predicted == pytest.approx(dense_poison, rel=1e-3)
+
+
+def test_predicted_transient_keeps_gathered_spike_from_this_request():
+    """A gathered chunk's own measured spike must still bind the next chunk."""
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    tracker = PrefillTransientTracker()
+    tracker.update(4096, int(69.58 * _GB), gathered_core=True)
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+    dense_poison = 69.58 * _GB * Scheduler._PREFILL_TRANSIENT_SAFETY
+    predicted = ns._predicted_chunk_transient(
+        4096, 233_472, gathered_core=True
+    )
+    assert predicted == pytest.approx(dense_poison, rel=1e-3)
+
+
 def test_adaptive_throttle_charges_recently_reclaimed_footprint():
     """A pool drop must remain priced until the next chunk reallocates it."""
     static_prediction = 11.18 * _GB
     released = 6.34 * _GB
     monitor = SimpleNamespace(
-        estimate_chunk_transient_bytes=lambda _n, _kv: (
+        estimate_chunk_transient_bytes=lambda _n, _kv, *, gathered_core=False: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
         estimate_prompt_kv_bytes=lambda _n: 0,
@@ -556,7 +650,7 @@ def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
         512 * Scheduler._PREFILL_TRANSIENT_SAFETY
     )
     monitor = SimpleNamespace(
-        estimate_chunk_transient_bytes=lambda _n, _kv: (
+        estimate_chunk_transient_bytes=lambda _n, _kv, *, gathered_core=False: (
             static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
         ),
         estimate_prompt_kv_bytes=lambda _n: 0,
@@ -868,6 +962,9 @@ def test_step_prefill_reclaims_before_first_guard():
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
+    ns._qwen4_text_gathered_pricing = Scheduler._qwen4_text_gathered_pricing.__get__(
+        ns, Scheduler
+    )
 
     with (
         patch.object(
@@ -891,6 +988,7 @@ def test_step_prefill_reclaims_before_first_guard():
         loop_label="chunked_step",
         kv_len=0,
         requested_step=2,
+        gathered_core=False,
     )
 
 
@@ -1032,7 +1130,7 @@ def test_adaptive_chunk_size_ignores_observed_max():
     before = _call(ns, 2048, kv_len=5000)
     assert before < 2048, "precondition: the throttle must actually shrink"
 
-    ns._prefill_transient_tracker._observed_max_bytes = 8 * _GB
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 8 * _GB
     after = _call(ns, 2048, kv_len=5000)
     assert after == before
 
@@ -1050,7 +1148,7 @@ def test_guard_abort_gate_charges_observed_max():
     assert _guard_call(ns, 2048, kv_len=50_000) < 2048
 
     # 2GB observed max no longer fits under the 1GB headroom: abort.
-    ns._prefill_transient_tracker._observed_max_bytes = 2 * _GB
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 2 * _GB
     with pytest.raises(PrefillMemoryExceededError):
         _guard_call(ns, 2048, kv_len=50_000)
 
@@ -1065,7 +1163,7 @@ def test_guard_shrink_math_unchanged_by_observed_max():
     before = _guard_call(ns, 2048, kv_len=50_000)
     assert before < 2048
 
-    ns._prefill_transient_tracker._observed_max_bytes = 512 * 1024**2
+    ns._prefill_transient_tracker._dense_history.observed_max_bytes = 512 * 1024**2
     after = _guard_call(ns, 2048, kv_len=50_000)
     assert after == before
 

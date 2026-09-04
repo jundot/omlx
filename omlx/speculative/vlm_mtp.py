@@ -42,28 +42,47 @@ from typing import Any, Callable, Generator, List, Optional, Set, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.speculative import load_drafter as _vlm_load_drafter
+from ..patches.mlx_vlm_mlx0322_compat import (
+    apply_mlx_vlm_mlx0322_compat_patch,
+)
+
+# Install the MLX 0.32.2 source hook before importing mlx-vlm.speculative.
+# Importing that package eagerly loads common, mtp, and utils; applying the
+# hook afterwards can leave their copied generation_stream globals pointing
+# at the stream from the pre-reload common module.
+apply_mlx_vlm_mlx0322_compat_patch()
+
+from mlx_vlm.speculative import common as _vlm_common  # noqa: E402, I001
+from mlx_vlm.speculative import load_drafter as _vlm_load_drafter  # noqa: E402
 
 # The round loops dispatch their target-verify and cache-rollback forwards
 # inside ``with mx.stream(generation_stream)``, using mlx-vlm's own
 # thread-local stream — a different object from mlx-lm's generation_stream
 # and from the per-engine stream. Draining the MTP work means draining this
 # one, resolved on the thread that advances the round loop.
-from mlx_vlm.speculative.common import generation_stream as _vlm_generation_stream
 
 # PR #1169 (f96138e) moved the MTP round loop helpers from ``mlx_vlm.generate``
 # into ``mlx_vlm.speculative.utils``. Import directly from the new location —
 # the symbols are still ``_``-prefixed but this is now their canonical home.
-from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch  # noqa: SLF001
+from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
+    _mtp_rounds,
+    _mtp_rounds_batch,
+)
 
 try:
-    from mlx_vlm.speculative.mtp import _buffer_mtp_target_cache  # noqa: SLF001
+    from mlx_vlm.speculative.mtp import (  # noqa: E402, SLF001
+        _buffer_mtp_target_cache,
+    )
 except Exception:  # pragma: no cover - compatibility with older mlx-vlm
+
     def _buffer_mtp_target_cache(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-from ..utils.metal_sync import _sync_and_clear_cache
-from ..utils.model_loading import materialize_lazy_state
+
+from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
+from ..utils.model_loading import materialize_lazy_state  # noqa: E402
+
+_vlm_generation_stream = _vlm_common.generation_stream
 
 logger = logging.getLogger(__name__)
 

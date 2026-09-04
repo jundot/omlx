@@ -179,6 +179,7 @@ class TestReset:
     def test_reset_clears_all(self):
         t = PrefillTransientTracker("m")
         t.update(1000, 100_000)
+        t.update(1000, 20_000, gathered_core=True)
         t.update(2000, 300_000)
         t.reset()
         assert t.samples == 0
@@ -187,3 +188,41 @@ class TestReset:
         assert t.last_delta_bytes == 0
         assert t.predict(2048) == 0
         assert t.observed_max_bytes == 0
+        assert t.samples_for(True) == 0
+        assert t.bytes_per_token_for(True) == 0.0
+        assert t.last_n_tokens_for(True) == 0
+        assert t.last_delta_bytes_for(True) == 0
+        assert t.predict(2048, gathered_core=True) == 0
+        assert t.observed_max_bytes_for(True) == 0
+
+
+class TestExecutionRegimes:
+    def test_dense_and_gathered_rates_are_independent(self):
+        t = PrefillTransientTracker("m")
+        t.update(4096, 64 * 1024**3, gathered_core=False)
+
+        assert t.samples == 1
+        assert t.samples_for(True) == 0
+        assert t.bytes_per_token_for(True) == 0.0
+        assert t.last_delta_bytes_for(True) == 0
+
+        t.update(4096, 4 * 1024**3, gathered_core=True)
+
+        assert t.samples == 1
+        assert t.samples_for(True) == 1
+        assert t.bytes_per_token == 16 * 1024**2
+        assert t.bytes_per_token_for(True) == 1024**2
+        assert t.last_delta_bytes == 64 * 1024**3
+        assert t.last_delta_bytes_for(True) == 4 * 1024**3
+        assert t.predict(4096, safety_factor=1.0) == 64 * 1024**3
+        assert t.predict(4096, safety_factor=1.0, gathered_core=True) == 4 * 1024**3
+
+    def test_dense_floor_max_does_not_bind_gathered_admission(self):
+        t = PrefillTransientTracker("m")
+        t.update(32, 100 * 1024**2, floor_sample=True)
+        t.update(32, 900 * 1024**2, floor_sample=True)
+        t.update(32, 20 * 1024**2, floor_sample=True, gathered_core=True)
+        t.update(32, 40 * 1024**2, floor_sample=True, gathered_core=True)
+
+        assert t.observed_max_bytes == 900 * 1024**2
+        assert t.observed_max_bytes_for(True) == 40 * 1024**2

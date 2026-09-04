@@ -39,7 +39,7 @@ from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
-from .engine_core import get_mlx_executor
+from .engine_core import get_mlx_executor, shutdown_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
     InsufficientMemoryError,
@@ -285,6 +285,7 @@ class EnginePool:
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server
         self._get_admission_soft_target: object | None = None  # Set by server
+        self._get_residency_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
@@ -299,6 +300,8 @@ class EnginePool:
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self._pending_unload_tasks: dict[str, asyncio.Task[None]] = {}
+        self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
+        self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
         self.configure_hot_cache_budget()
 
@@ -377,6 +380,8 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -396,10 +401,26 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        ceiling = self._fallback_admission_ceiling()
-        if ceiling <= 0:
-            ceiling = self._current_ceiling()
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -409,10 +430,16 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> object | None:
         """Apply a forced mmap decision without mutating persisted settings."""
 
-        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
+        enabled, forced, _ = self._qwen4_ple_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
         if not enabled or not forced or settings is None:
             return settings
         effective = copy.copy(settings)
@@ -463,6 +490,22 @@ class EnginePool:
         pools admit unconditionally).
         """
         cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _residency_ceiling(self) -> int:
+        """Stable ceiling for the resident-vs-mmap call (#PLE residency).
+
+        Wired to `enforcer.get_residency_ceiling`, which drops the vm_stat
+        component so a model swap does not push a table that fits onto SSD.
+        Returns 0 when no callback is wired up; callers fall back to the
+        admission ceiling.
+        """
+        cb = self._get_residency_ceiling
         if cb is None:
             return 0
         try:
@@ -1481,6 +1524,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
+            qwen4_admission_ceiling = None
+            if (
+                (entry.config_model_type or "").replace("-", "_").lower()
+                == "qwen4_exp"
+            ):
+                candidate = self._current_ceiling()
+                if candidate <= 0:
+                    candidate = self._fallback_admission_ceiling()
+                if candidate > 0:
+                    qwen4_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1568,9 +1621,18 @@ class EnginePool:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
+            load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
+                ceiling=qwen4_admission_ceiling,
+            )
+            qwen4_admission_override = load_settings is not admission_settings
+            runtime_load_settings = (
+                load_settings if qwen4_admission_override else runtime_settings
+            )
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                load_settings,
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
@@ -1714,10 +1776,15 @@ class EnginePool:
             await self._load_engine(
                 model_id,
                 force_lm=force_lm,
-                runtime_settings=runtime_settings,
+                runtime_settings=runtime_load_settings,
             )
 
             loaded = self._entries[model_id]
+            if qwen4_admission_override and expected_signature is not None:
+                # Automatic mmap is local to this admission attempt. Keep the
+                # user's requested variant as the reuse key so the next request
+                # does not reload the model merely because pressure recovered.
+                loaded.runtime_settings_signature = expected_signature
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
@@ -2431,6 +2498,15 @@ class EnginePool:
 
         self._wake_process_memory_enforcer()
 
+    def _finish_failed_load_reclaim_task(self, task: asyncio.Task[None]) -> None:
+        self._failed_load_reclaim_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Post-failed-load reclaim task failed")
+
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int
     ) -> None:
@@ -2474,11 +2550,15 @@ class EnginePool:
             )
             self._wake_process_memory_enforcer()
 
-        # Keep a reference so the task isn't garbage-collected mid-flight;
-        # one slot suffices -- a newer failure supersedes the previous task.
-        self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
-            _reclaim()
+        # Keep every task reachable until it finishes. Concurrent load failures
+        # can overlap, and shutdown must cancel/drain all of them before the
+        # process-wide MLX executor is reclaimed.
+        task = asyncio.get_running_loop().create_task(
+            _reclaim(), name=f"engine-failed-load-reclaim:{model_id}"
         )
+        self._failed_load_reclaim_task = task
+        self._failed_load_reclaim_tasks.add(task)
+        task.add_done_callback(self._finish_failed_load_reclaim_task)
 
     async def _load_engine(
         self,
@@ -3028,6 +3108,13 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
+        for task in reclaim_tasks:
+            task.cancel()
+        if reclaim_tasks:
+            await asyncio.gather(*reclaim_tasks, return_exceptions=True)
+        self._failed_load_reclaim_tasks.clear()
+        self._failed_load_reclaim_task = None
         pending_tasks = tuple(self._pending_unload_tasks.values())
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
@@ -3041,6 +3128,7 @@ class EnginePool:
                     except Exception as e:
                         logger.error(f"Error unloading {model_id} during shutdown: {e}")
 
+        shutdown_mlx_executor()
         logger.info("Engine pool shutdown complete")
 
     def get_status(self) -> dict:

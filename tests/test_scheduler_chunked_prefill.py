@@ -238,6 +238,103 @@ class TestHasRequests:
 
 
 # ---------------------------------------------------------------------------
+# Chunk-local mRoPE ownership
+# ---------------------------------------------------------------------------
+
+
+class TestChunkedPrefillMRoPE:
+    def test_text_prefill_rebinds_delta_after_interleaved_cleanup(self):
+        class MRoPERecordingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.batch_deltas = None
+                self.delta_history = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.batch_deltas = mx.array([delta])
+                self.delta_history.append([delta])
+
+            def set_batch_rope_deltas(self, deltas):
+                raise AssertionError("text prefill must use the bounded binder")
+
+            def __call__(self, tokens, cache=None):
+                assert self.batch_deltas is not None
+                super().__call__(tokens, cache=cache)
+
+        model = MRoPERecordingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = _make_request("mrope-interleaved", n_tokens=9)
+        request.rope_deltas = 7.0
+        state = _make_prefill_state(scheduler, request, n_remaining=8)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert not scheduler._step_prefill_chunk(state)
+            # Reproduce a concurrent request's completion cleanup.
+            model.batch_deltas = None
+            assert scheduler._step_prefill_chunk(state)
+
+        assert model.chunk_lengths == [4, 4]
+        assert model.delta_history == [[7.0], [7.0]]
+
+    def test_mock_request_without_rope_delta_uses_text_default(self):
+        """Legacy/minimal request doubles retain the canonical text delta."""
+
+        class MRoPERecordingModel(_RecordingModel):
+            _uses_mrope = True
+
+            def __init__(self):
+                super().__init__("vlm")
+                self.delta_history = []
+
+            def set_text_prefill_rope_delta(self, delta):
+                self.delta_history.append([delta])
+
+        model = MRoPERecordingModel()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = 2
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=4,
+                chunked_prefill=True,
+                paged_cache_block_size=0,
+            ),
+        )
+        request = SimpleNamespace(request_id="mock-without-rope-delta")
+        state = _PrefillState(
+            request=request,
+            cache=[],
+            tokens_remaining=mx.zeros((1, 4), dtype=mx.int32),
+            last_token=[99],
+            tokens_processed=0,
+            base_size=0,
+            emitted_boundaries={},
+            boundary_enabled=False,
+            block_size=0,
+            total_length=5,
+        )
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            assert scheduler._step_prefill_chunk(state)
+
+        assert model.chunk_lengths == [4]
+        assert model.delta_history == [[0.0]]
+
+
+# ---------------------------------------------------------------------------
 # get_stats includes num_prefilling
 # ---------------------------------------------------------------------------
 

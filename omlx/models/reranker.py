@@ -27,7 +27,6 @@ from ..model_discovery import (
     _is_causal_lm_reranker,
 )
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
-from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -943,7 +942,6 @@ class MLXRerankerModel:
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
-        clear_thread_compile_cache()
         gc.collect()
 
     # Default max_length per model type

@@ -653,6 +653,102 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
     ).item()
 
 
+def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
+    monkeypatch,
+):
+    """Canonical text positions preserve exact values and unlock gathered QSA."""
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    mx.random.seed(831)
+    attention = Qwen4ExpAttention(config.text_config)
+    projection = mx.random.normal((config.text_config.hidden_size, 17))
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    text_positions = mx.arange(20, dtype=mx.int32)[None]
+    identical_mrope = mx.broadcast_to(text_positions[None], (3, 1, 20))
+    mx.eval(attention.parameters(), projection, hidden)
+
+    assert attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        text_positions,
+        None,
+        False,
+    )
+    assert not attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        identical_mrope,
+        None,
+        False,
+    )
+
+    gathered_calls = []
+    original_gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked_gathered(*args, **kwargs):
+        gathered_calls.append(True)
+        return original_gathered(*args, **kwargs)
+
+    monkeypatch.setattr(
+        language,
+        "contiguous_causal_gathered_qsa",
+        tracked_gathered,
+    )
+    fast_cache = QSAKVCache()
+    reference_cache = QSAKVCache()
+    actual = attention(
+        hidden,
+        mask="causal",
+        cache=fast_cache,
+        position_ids=text_positions,
+    )
+    expected = attention(
+        hidden,
+        mask="causal",
+        cache=reference_cache,
+        position_ids=identical_mrope,
+    )
+    actual_logits = actual @ projection
+    expected_logits = expected @ projection
+    mx.eval(actual_logits, expected_logits)
+
+    assert gathered_calls == [True]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert mx.allclose(
+        actual_logits,
+        expected_logits,
+        rtol=2e-5,
+        atol=2e-5,
+    ).item()
+    assert mx.array_equal(
+        mx.argmax(actual_logits, axis=-1),
+        mx.argmax(expected_logits, axis=-1),
+    ).item()
+    assert fast_cache.offset == reference_cache.offset == 20
+    fast_keys, fast_values, fast_index_keys, _ = fast_cache.state
+    reference_keys, reference_values, reference_index_keys, _ = reference_cache.state
+    for fast_value, reference_value in (
+        (fast_keys, reference_keys),
+        (fast_values, reference_values),
+    ):
+        assert mx.allclose(
+            fast_value,
+            reference_value,
+            rtol=2e-5,
+            atol=2e-5,
+        ).item()
+    assert mx.allclose(
+        fast_index_keys,
+        reference_index_keys,
+        rtol=2e-5,
+        atol=2e-5,
+    ).item()
+
+
 def test_qwen4_gathered_qsa_fails_closed_for_multimodal_positions(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language

@@ -171,6 +171,28 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
     )
 
 
+def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
+    """Copy the language model's per-request mRoPE state into extra_kwargs.
+
+    get_input_embeddings() leaves ``_position_ids`` and ``_rope_deltas`` lazy
+    on the executor's default stream. They are materialized here because a
+    lazy default-stream input inside the engine-stream prefill graph deadlocks
+    the Qwen ANE prefill primitive on restored-prefix requests (#3305, the
+    same class as the text-only seed in #3279).
+    """
+    if lm is None:
+        return
+    pid = getattr(lm, "_position_ids", None)
+    if pid is not None and "position_ids" not in extra_kwargs:
+        extra_kwargs["position_ids"] = pid
+    rd = getattr(lm, "_rope_deltas", None)
+    if rd is not None:
+        extra_kwargs["_captured_rope_deltas"] = rd
+    lazy_state = [v for v in (pid, rd) if isinstance(v, mx.array)]
+    if lazy_state:
+        mx.eval(*lazy_state)
+
+
 def _apply_minimax_m3_thinking_mode(
     model_type: str | None,
     template_kwargs: dict[str, Any],
@@ -1454,6 +1476,7 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        text_only: bool = False,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1465,6 +1488,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            text_only=text_only,
         )
 
     @property
@@ -3272,14 +3296,9 @@ class VLMBatchedEngine(BaseEngine):
             # global state that gets overwritten by subsequent calls.
             # Storing per-request ensures correct position computation
             # when multiple VLM requests are batched.
-            lm = getattr(self._vlm_model, "language_model", None)
-            if lm is not None:
-                pid = getattr(lm, "_position_ids", None)
-                if pid is not None and "position_ids" not in extra_kwargs:
-                    extra_kwargs["position_ids"] = pid
-                rd = getattr(lm, "_rope_deltas", None)
-                if rd is not None:
-                    extra_kwargs["_captured_rope_deltas"] = rd
+            _capture_vlm_position_state(
+                getattr(self._vlm_model, "language_model", None), extra_kwargs
+            )
 
             # Extract token IDs as list
             token_ids = (
@@ -3868,19 +3887,23 @@ class VLMBatchedEngine(BaseEngine):
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens_real(
+        image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
         )
+        num_tokens += image_tokens
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=image_tokens == 0,
         )
 
     async def preflight_completion(
@@ -3913,7 +3936,10 @@ class VLMBatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=True,
         )
 
     async def stream_chat(

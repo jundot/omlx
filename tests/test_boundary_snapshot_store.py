@@ -369,6 +369,32 @@ class TestBoundarySnapshotSSDStore:
         assert len(loaded) == 4
         assert loaded[1]["class_name"] == "ArraysCache"
 
+    def test_invalid_disk_metadata_is_rejected_before_materialization(
+        self, monkeypatch
+    ):
+        from omlx.cache import boundary_snapshot_store as mod
+
+        request_id = "invalid-metadata"
+        token_count = 1024
+        file_path = self.store._file_path(request_id, token_count)
+        file_path.parent.mkdir(parents=True)
+        mx.save_safetensors(
+            str(file_path),
+            {"payload": mx.ones((8,), dtype=mx.float32)},
+            metadata={
+                "num_layers": "0",
+                "layer_info": "[]",
+                "gdn_sidecar_format_version": "999",
+            },
+        )
+
+        eval_mock = MagicMock(side_effect=AssertionError("unexpected mx.eval"))
+        monkeypatch.setattr(mod.mx, "eval", eval_mock)
+
+        assert self.store.load(request_id, token_count) is None
+        assert self.store.load_file(file_path) is None
+        eval_mock.assert_not_called()
+
     def test_multiple_snapshots_per_request(self):
         """Multiple token boundaries for the same request."""
         for tc in [1024, 2048, 3072, 4096]:

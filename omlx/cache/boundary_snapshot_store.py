@@ -425,7 +425,15 @@ class BoundarySnapshotSSDStore:
                 arrays, metadata = data
             else:
                 return None
-            return self._reconstruct_from_safetensors(arrays, metadata)
+            reconstructed = self._reconstruct_from_safetensors(arrays, metadata)
+            if reconstructed is None:
+                return None
+            # mx.load returns file-backed lazy arrays. Materialize them while
+            # this ephemeral snapshot still exists so the reconstructed cache
+            # cannot retain a read primitive past cleanup or promotion.
+            if arrays:
+                mx.eval(*arrays.values())
+            return reconstructed
         except Exception as e:
             logger.debug(
                 "Failed to load boundary snapshot %s/%d: %s",
@@ -456,7 +464,15 @@ class BoundarySnapshotSSDStore:
             if not (isinstance(data, tuple) and len(data) == 2):
                 return None
             arrays, metadata = data
-            return self._reconstruct_from_safetensors(arrays, metadata)
+            reconstructed = self._reconstruct_from_safetensors(arrays, metadata)
+            if reconstructed is None:
+                return None
+            # ``take_staged_file`` transfers this path to a caller that may
+            # move or unlink it immediately after load_file returns. Detach
+            # every lazy input from the file before returning cache state.
+            if arrays:
+                mx.eval(*arrays.values())
+            return reconstructed
         except Exception as e:
             logger.debug("Failed to load committed boundary snapshot %s: %s", file_path, e)
             return None

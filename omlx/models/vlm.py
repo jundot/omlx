@@ -67,6 +67,14 @@ class VLMModelAdapter(nn.Module):
         # from this dict + current batch UIDs before each step.
         self._uid_rope_deltas: Dict[int, float] = {}
         self._batch_rope_deltas: Optional[mx.array] = None
+        # External/chunked text prefill owns a stronger position-shape proof
+        # than the generic decode binder: the scheduler has already excluded
+        # media embeddings and is advancing one request's scalar cache. Qwen4
+        # uses that proof to keep its position ids rank two, which is exactly
+        # equivalent to three broadcast-identical mRoPE planes and preserves
+        # the qualified gathered-QSA path. Generic/media/batched binds reset
+        # the proof and retain the ordinary rank-three fail-closed path.
+        self._qwen4_text_prefill_positions = False
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
@@ -77,6 +85,7 @@ class VLMModelAdapter(nn.Module):
         self._pending_kwargs = {}
         self._uid_rope_deltas.clear()
         self._batch_rope_deltas = None
+        self._qwen4_text_prefill_positions = False
         self._language_model = None
         self._vlm_model = None
 
@@ -253,6 +262,7 @@ class VLMModelAdapter(nn.Module):
         self._language_model._position_ids = None
         self._language_model._rope_deltas = None
         self._batch_rope_deltas = None
+        self._qwen4_text_prefill_positions = False
 
     def register_rope_delta(self, uid: int, delta: float) -> None:
         """Register rope_delta for a UID after VLM prefill."""
@@ -269,6 +279,18 @@ class VLMModelAdapter(nn.Module):
         an array of rope_deltas aligned to the batch slot order.
         """
         self._batch_rope_deltas = deltas
+        self._qwen4_text_prefill_positions = False
+
+    def set_text_prefill_rope_delta(self, delta: float) -> None:
+        """Bind one scheduler-proven text row for an imminent prefill call.
+
+        This seam is intentionally separate from ``set_batch_rope_deltas``.
+        Only the scheduler's external/chunked non-media prefill paths may call
+        it. A later generic decode, media, or batched bind clears the proof.
+        """
+
+        self._batch_rope_deltas = mx.array([delta])
+        self._qwen4_text_prefill_positions = True
 
     def _batch_rope_deltas_for_size(self, batch_size: int) -> Optional[mx.array]:
         """Return rope deltas aligned to the current model input batch size."""
@@ -300,7 +322,12 @@ class VLMModelAdapter(nn.Module):
         return mx.concatenate([deltas, pad], axis=0)
 
     def _position_ids_from_starts(
-        self, starts: mx.array, batch_size: int, seq_len: int
+        self,
+        starts: mx.array,
+        batch_size: int,
+        seq_len: int,
+        *,
+        qwen4_text_prefill_positions: bool = False,
     ) -> mx.array:
         """Build model-specific decode position_ids from per-row start offsets.
 
@@ -319,6 +346,18 @@ class VLMModelAdapter(nn.Module):
         seq_positions = starts[:, None] + steps[None, :]
         if self._uses_minimax_m3_positions:
             return seq_positions
+        if (
+            self.model_type == "qwen4_exp"
+            and qwen4_text_prefill_positions
+            and batch_size == 1
+        ):
+            # Qwen4's gathered-QSA qualification accepts canonical B1 text
+            # positions as (1, T), never general multimodal (3, B, T) mRoPE.
+            # The generic form constructed below is a broadcast of this exact
+            # row across all three planes, so avoiding that broadcast changes
+            # neither rotary values nor logits; it only preserves the proven
+            # text-only fast-path contract.
+            return seq_positions
         return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
 
     def get_last_rope_deltas(self) -> float:
@@ -330,6 +369,8 @@ class VLMModelAdapter(nn.Module):
         rd = getattr(self._language_model, "_rope_deltas", None)
         if rd is None:
             return 0.0
+        if isinstance(rd, mx.array):
+            return float(rd.reshape(-1)[0].item())
         if hasattr(rd, "item"):
             return float(rd.item())
         return float(rd)
@@ -364,6 +405,12 @@ class VLMModelAdapter(nn.Module):
         Returns:
             Model output (logits as mx.array)
         """
+        # Consume the scheduler proof before doing any work. A failed/cancelled
+        # call therefore cannot leave a text-only capability armed for a later
+        # media or generic request. Each external prefill chunk explicitly
+        # re-arms it at its own model-call boundary.
+        qwen4_text_prefill_positions = self._qwen4_text_prefill_positions
+        self._qwen4_text_prefill_positions = False
         return_hidden = bool(kwargs.get("return_hidden", False))
         if skip_lm_head:
             # Scheduler prefill chunks discard their logits. Translate the
@@ -406,7 +453,10 @@ class VLMModelAdapter(nn.Module):
                 if base_offsets is not None and deltas is not None:
                     positions = base_offsets + deltas.astype(base_offsets.dtype)
                     position_ids = self._position_ids_from_starts(
-                        positions, batch_size, seq_len
+                        positions,
+                        batch_size,
+                        seq_len,
+                        qwen4_text_prefill_positions=(qwen4_text_prefill_positions),
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs
@@ -426,7 +476,10 @@ class VLMModelAdapter(nn.Module):
                 if offsets is not None:
                     batch_size, seq_len = input_ids.shape
                     position_ids = self._position_ids_from_starts(
-                        offsets, batch_size, seq_len
+                        offsets,
+                        batch_size,
+                        seq_len,
+                        qwen4_text_prefill_positions=(qwen4_text_prefill_positions),
                     )
                     result = self._language_model(
                         input_ids, cache=cache, position_ids=position_ids, **kwargs

@@ -13,8 +13,18 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _TransientHistory:
+    ewma_per_token: float = 0.0
+    samples: int = 0
+    last_delta_bytes: int = 0
+    last_n_tokens: int = 0
+    observed_max_bytes: int = 0
 
 
 class PrefillTransientTracker:
@@ -47,20 +57,15 @@ class PrefillTransientTracker:
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
-        self._ewma_per_token: float = 0.0
-        self._samples: int = 0
-        # Last observed delta for debug log inspection.
-        self._last_delta_bytes: int = 0
-        self._last_n_tokens: int = 0
-        # Largest floor-size chunk transient seen this session: a stable
-        # flat bound for admission and the pre-chunk guard's pass/abort
-        # gates, matching the floor-chunk charge they price. Never used
-        # for chunk sizing.
-        self._observed_max_bytes: int = 0
+        self._dense_history = _TransientHistory()
+        self._gathered_history = _TransientHistory()
         # Net process footprint released by negative post-chunk deltas. MLX may
         # need to allocate that pool again on the next chunk, so the scheduler
         # prices it once until a positive measurement confirms reallocation.
         self._recent_reclaim_bytes: int = 0
+
+    def _history(self, gathered_core: bool) -> _TransientHistory:
+        return self._gathered_history if gathered_core is True else self._dense_history
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
         """Accumulate footprint released since the last positive sample."""
@@ -78,7 +83,12 @@ class PrefillTransientTracker:
         self._recent_reclaim_bytes = 0
 
     def update(
-        self, n_tokens: int, transient_bytes: int, *, floor_sample: bool = False
+        self,
+        n_tokens: int,
+        transient_bytes: int,
+        *,
+        floor_sample: bool = False,
+        gathered_core: bool = False,
     ) -> None:
         """Record one chunk observation.
 
@@ -108,13 +118,16 @@ class PrefillTransientTracker:
 
         self._recent_reclaim_bytes = 0
 
-        # The very first sample after a model load carries weight page-fault
-        # and load-residue noise, so it seeds the EWMA but is excluded from
-        # the running max.
-        if floor_sample and self._samples > 0:
+        history = self._history(gathered_core)
+
+        # The very first sample in each execution regime carries weight
+        # page-fault and load-residue noise, so it seeds that regime's EWMA
+        # but is excluded from its running max.
+        if floor_sample and history.samples > 0:
             if transient_bytes <= self._OBSERVED_MAX_CLAMP_BYTES:
-                if transient_bytes > self._observed_max_bytes:
-                    self._observed_max_bytes = transient_bytes
+                history.observed_max_bytes = max(
+                    history.observed_max_bytes, transient_bytes
+                )
             else:
                 logger.debug(
                     "PrefillTransientTracker(%s): rejected %d-byte outlier "
@@ -125,9 +138,9 @@ class PrefillTransientTracker:
                 )
 
         per_token = transient_bytes / n_tokens
-        if self._samples == 0:
-            self._ewma_per_token = per_token
-        elif per_token > self._ewma_per_token * self._EWMA_OUTLIER_RATIO:
+        if history.samples == 0:
+            history.ewma_per_token = per_token
+        elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
             # Reject from the EWMA blend: a single sample this far above
             # the running rate is more likely a noisy phys_footprint()
             # delta (see _record_chunk_transient's docstring on
@@ -139,52 +152,79 @@ class PrefillTransientTracker:
                 "outlier from EWMA (current %.1f, ratio limit %.1fx)",
                 self._model_id,
                 per_token,
-                self._ewma_per_token,
+                history.ewma_per_token,
                 self._EWMA_OUTLIER_RATIO,
             )
         else:
-            self._ewma_per_token = (
+            history.ewma_per_token = (
                 self._EWMA_ALPHA * per_token
-                + (1.0 - self._EWMA_ALPHA) * self._ewma_per_token
+                + (1.0 - self._EWMA_ALPHA) * history.ewma_per_token
             )
-        self._samples += 1
-        self._last_delta_bytes = transient_bytes
-        self._last_n_tokens = n_tokens
+        history.samples += 1
+        history.last_delta_bytes = transient_bytes
+        history.last_n_tokens = n_tokens
 
-    def predict(self, n_tokens: int, *, safety_factor: float = 1.2) -> int:
+    def predict(
+        self,
+        n_tokens: int,
+        *,
+        safety_factor: float = 1.2,
+        gathered_core: bool = False,
+    ) -> int:
         """Predicted transient bytes for a chunk of `n_tokens`.
 
         Returns 0 when no samples have been observed yet — caller must
         fall back to a static estimator in that case.
         """
-        if self._samples == 0 or n_tokens <= 0:
+        samples = self.samples_for(gathered_core)
+        if samples == 0 or n_tokens <= 0:
             return 0
-        return int(self._ewma_per_token * n_tokens * safety_factor)
+        return int(self.bytes_per_token_for(gathered_core) * n_tokens * safety_factor)
+
+    def bytes_per_token_for(self, gathered_core: bool) -> float:
+        """Return the EWMA for the selected execution regime."""
+        return self._history(gathered_core).ewma_per_token
+
+    def samples_for(self, gathered_core: bool) -> int:
+        """Return the sample count for the selected execution regime."""
+        return self._history(gathered_core).samples
+
+    def last_delta_bytes_for(self, gathered_core: bool) -> int:
+        """Return the latest measured delta for the selected regime."""
+        return self._history(gathered_core).last_delta_bytes
+
+    def last_n_tokens_for(self, gathered_core: bool) -> int:
+        """Return the latest measured width for the selected regime."""
+        return self._history(gathered_core).last_n_tokens
+
+    def observed_max_bytes_for(self, gathered_core: bool) -> int:
+        """Return the floor-size maximum for the selected regime."""
+        return self._history(gathered_core).observed_max_bytes
 
     @property
     def bytes_per_token(self) -> float:
         """Current EWMA value (bytes per prefill token). 0.0 if no samples."""
-        return self._ewma_per_token
+        return self._dense_history.ewma_per_token
 
     @property
     def samples(self) -> int:
         """Number of chunks recorded since last reset."""
-        return self._samples
+        return self._dense_history.samples
 
     @property
     def last_delta_bytes(self) -> int:
         """Bytes added by the most recently measured chunk."""
-        return self._last_delta_bytes
+        return self._dense_history.last_delta_bytes
 
     @property
     def last_n_tokens(self) -> int:
         """Token count of the most recently measured chunk."""
-        return self._last_n_tokens
+        return self._dense_history.last_n_tokens
 
     @property
     def observed_max_bytes(self) -> int:
         """Largest accepted chunk transient this session (0 if none yet)."""
-        return self._observed_max_bytes
+        return self._dense_history.observed_max_bytes
 
     @property
     def recent_reclaim_bytes(self) -> int:
@@ -193,9 +233,6 @@ class PrefillTransientTracker:
 
     def reset(self) -> None:
         """Drop all observations (e.g. on model reload or after a long idle)."""
-        self._ewma_per_token = 0.0
-        self._samples = 0
-        self._last_delta_bytes = 0
-        self._last_n_tokens = 0
-        self._observed_max_bytes = 0
+        self._dense_history = _TransientHistory()
+        self._gathered_history = _TransientHistory()
         self._recent_reclaim_bytes = 0

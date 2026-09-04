@@ -82,8 +82,8 @@ def test_worker_requirements_pin_numpy_and_the_cuda_backend():
     requirements = cuda_worker_bootstrap.WORKER_REQUIREMENTS
 
     assert "numpy>=1.24.0,<2.4" in requirements
-    assert "mlx==0.32.0" in requirements
-    assert "mlx-cuda-13==0.32.0" in requirements
+    assert "mlx==0.32.2" in requirements
+    assert "mlx-cuda-13==0.32.2" in requirements
     assert "openai-harmony" in requirements
     assert "psutil>=5.9.0" in requirements
 

@@ -57,6 +57,7 @@ def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
     monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 64)
     monkeypatch.setattr(sdpa256, "_Q_TILE", 16)
     monkeypatch.setattr(sdpa256, "_KV_TILE", 64)
+    monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: False)
 
     mx.random.seed(0)
     queries = mx.random.normal((1, 4, 32, 256)).astype(mx.float16)

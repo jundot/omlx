@@ -1957,6 +1957,9 @@ class TestSchedulerReset:
             "executor_shutdown",
             "drain",
         ], f"Expected drain to bracket executor.shutdown, got: {call_order}"
+        fake_executor.submit.assert_called_once_with(
+            scheduler_module.clear_thread_streams
+        )
         fake_executor.shutdown.assert_called_once_with(wait=False)
 
     def test_shutdown_closes_boundary_snapshot_store(
@@ -5917,10 +5920,12 @@ class TestVLMPositionStateClearing:
                 "clear_vlm_position_state",
                 "parameters",
                 "make_cache",
+                "set_batch_rope_deltas",
             ]
         )
         model.clear_vlm_position_state = MagicMock()
         model.make_cache.return_value = []
+        model.set_batch_rope_deltas = MagicMock()
         return model
 
     def test_schedule_waiting_preserves_vlm_position_state(self, mock_tokenizer):
@@ -5955,6 +5960,34 @@ class TestVLMPositionStateClearing:
 
         model.clear_vlm_position_state.assert_not_called()
 
+    def test_schedule_waiting_uses_first_captured_rope_delta(self, mock_tokenizer):
+        """Per-request capture must tolerate a stale multi-row delta array."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+
+        mock_bg = MagicMock()
+        mock_bg.insert = MagicMock(return_value=[42])
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="vlm-multi-rope-delta",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        request.vlm_inputs_embeds = mx.zeros((1, 5, 64))
+        request.vlm_extra_kwargs = {
+            "_captured_rope_deltas": mx.array([[-42.0], [-7.0]])
+        }
+
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        scheduler._schedule_waiting()
+
+        assert request.rope_deltas == -42.0
+
     def test_schedule_waiting_clears_text_only_position_state(self, mock_tokenizer):
         """Text-only request in _schedule_waiting should clear position state.
 
@@ -5983,6 +6016,39 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+    def test_external_text_prefill_rebinds_mrope_before_every_chunk(
+        self, mock_tokenizer
+    ):
+        """Concurrent decode or cleanup cannot leak adapter position state."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(prefill_step_size=512),
+        )
+        request = Request(
+            request_id="text-mrope-chunks",
+            prompt="chunked",
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        request.prompt_token_ids = list(range(1025))
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.rope_deltas = 7.0
+
+        scheduler._do_external_prefill(
+            request,
+            tokens=request.prompt_token_ids,
+            existing_cache=[],
+            vlm_embeds=None,
+        )
+
+        assert model.call_count == 2
+        assert model.set_batch_rope_deltas.call_count == 2
+        for mock_call in model.set_batch_rope_deltas.call_args_list:
+            delta = mock_call.args[0]
+            assert delta.shape == (1,)
+            assert delta.item() == 7.0
 
     def test_cached_text_only_prefill_seeds_zero_mrope_delta(self, mock_tokenizer):
         """Cached text-only mRoPE suffixes must start at the restored offset."""
@@ -6035,6 +6101,53 @@ class TestVLMPositionStateClearing:
         assert seeded.dtype == mx.int64
         assert eval_mock.call_count == 1
         assert eval_mock.call_args.args[0] is seeded
+
+    def test_cached_vlm_prefill_builds_start_offset_views_on_engine_stream(
+        self, mock_tokenizer
+    ):
+        """Restored-prefix VLM views must not come from the worker default stream.
+
+        A default-stream slice at the head of the chunk graph leaves a
+        cross-stream fence that the Qwen ANE prefill primitive can never
+        satisfy while it blocks on the engine-stream buffer (#3305).
+        """
+        model = self._make_vlm_model()
+        engine_stream = mx.new_stream(mx.cpu)
+        scheduler = Scheduler(
+            model=model, tokenizer=mock_tokenizer, stream=engine_stream
+        )
+        request = Request(
+            request_id="vlm-cached-001",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=50),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6]
+        request.num_prompt_tokens = 6
+        request.cached_tokens = 2
+        embeds = mx.zeros((1, 6, 8))
+        extra = {"position_ids": mx.zeros((3, 1, 6), dtype=mx.int32)}
+        seen_streams = []
+        real_advance = scheduler_module._advance_vlm_extra
+
+        def advance_spy(extra_kwargs, n):
+            seen_streams.append((n, mx.default_stream(mx.cpu)))
+            return real_advance(extra_kwargs, n)
+
+        with patch.object(
+            scheduler_module, "_advance_vlm_extra", side_effect=advance_spy
+        ):
+            scheduler._do_external_prefill(
+                request,
+                tokens=[3, 4, 5, 6],
+                existing_cache=[],
+                vlm_embeds=(embeds, extra, 2),
+            )
+
+        # First advance skips the cached prefix, second advances past the chunk.
+        assert seen_streams == [(2, engine_stream), (3, engine_stream)]
+        chunk_kwargs = model.call_args.kwargs
+        assert chunk_kwargs["inputs_embeds"].shape == (1, 3, 8)
+        assert chunk_kwargs["vlm_extra_kwargs"]["position_ids"].shape == (3, 1, 3)
 
     def test_fresh_text_only_prefill_does_not_seed_or_evaluate_mrope(self):
         previous = mx.array([[123]])
