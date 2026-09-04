@@ -436,6 +436,7 @@ class TestLaunchCommandFunction:
         assert ctx.max_tokens == 8192
         assert ctx.cross_session is False
         assert ctx.model_type == "vlm"
+        assert ctx.available_models == ()
         assert ctx.extra_args == ()
 
     def test_launch_command_passes_cross_session_flag_to_integration(self):
@@ -532,6 +533,228 @@ class TestLaunchCommandFunction:
         assert ctx.max_tokens == 8192
         assert ctx.model_type == "vlm"
         assert ctx.reasoning is False
+
+    def test_launch_codex_catalog_uses_visible_model_ids(self):
+        """Codex catalog excludes hidden status entries and preserves profiles."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen-raw",
+                    "model_alias": "gpt-4o",
+                    "model_type": "vlm",
+                    "max_context_window": 65536,
+                },
+                {
+                    "id": "hidden-helper",
+                    "model_type": "llm",
+                    "is_hidden": True,
+                },
+                {
+                    "id": "coding-profile",
+                    "source_model_id": "qwen-raw",
+                    "model_alias": "gpt-4o",
+                    "model_type": "vlm",
+                    "max_context_window": 32768,
+                },
+                {
+                    "id": "embedding-model",
+                    "model_type": "embedding",
+                    "max_context_window": 512,
+                },
+            ]
+        }
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [
+                {"id": "gpt-4o"},
+                {"id": "coding-profile"},
+                {"id": "embedding-model"},
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="codex",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="gpt-4o",
+            tools_profile="coding",
+        )
+
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        launch_ctx = integration.launch.call_args.args[0]
+        assert [model["id"] for model in launch_ctx.available_models] == [
+            "gpt-4o",
+            "coding-profile",
+        ]
+        assert launch_ctx.available_models[0]["max_context_window"] == 65536
+        assert launch_ctx.available_models[1]["source_model_id"] == "qwen-raw"
+
+    @pytest.mark.parametrize("tool_name", ["codex", "codex_app"])
+    @pytest.mark.parametrize(
+        "failure_mode",
+        [
+            "request_error",
+            "malformed_collection",
+            "missing_type",
+            "invalid_after_valid",
+            "models_request_error",
+        ],
+    )
+    def test_launch_codex_catalog_status_failure_uses_selected_model_only(
+        self, failure_mode, tool_name
+    ):
+        """Missing type metadata must not admit every visible API model."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_payloads = {
+            "malformed_collection": {"models": "not-a-list"},
+            "missing_type": {"models": [{"id": "gpt-4o"}]},
+            "invalid_after_valid": {
+                "models": [
+                    {"id": "gpt-4o", "model_type": "llm"},
+                    {"id": "broken-entry"},
+                ]
+            },
+        }
+        status_response.json.return_value = status_payloads.get(
+            failure_mode, {"models": []}
+        )
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [{"id": "gpt-4o"}, {"id": "embedding-model"}]
+        }
+
+        status_result = (
+            RuntimeError("status unavailable")
+            if failure_mode in ("request_error", "models_request_error")
+            else status_response
+        )
+        models_result = (
+            RuntimeError("models unavailable")
+            if failure_mode == "models_request_error"
+            else models_response
+        )
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool=tool_name,
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="gpt-4o",
+            tools_profile="coding",
+        )
+
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_result, models_result],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        launch_ctx = integration.launch.call_args.args[0]
+        assert launch_ctx.available_models == ({"id": "gpt-4o"},)
+
+    @pytest.mark.parametrize("tool_name", ["codex", "codex_app"])
+    @pytest.mark.parametrize("tier_model", [None, "embedding-model"])
+    def test_launch_codex_status_failure_requires_explicit_model(
+        self, tool_name, tier_model, capsys
+    ):
+        """Untyped inventory and Claude tier flags must not bypass --model."""
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool=tool_name,
+            host=None,
+            port=None,
+            api_key="test-key",
+            model=None,
+            tools_profile="coding",
+            opus_model=None,
+            sonnet_model=tier_model,
+            haiku_model=None,
+        )
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "data": [{"id": "gpt-4o"}, {"id": "embedding-model"}]
+        }
+
+        with (
+            patch(
+                "requests.get",
+                side_effect=[
+                    health_response,
+                    RuntimeError("status unavailable"),
+                    models_response,
+                ],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        integration.select_model.assert_not_called()
+        integration.launch.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Specify a chat model explicitly with --model." in output
 
     def test_launch_command_forwards_extra_args(self):
         """Unknown CLI tokens (e.g. --resume <id>) should reach integration.launch."""
@@ -649,9 +872,21 @@ class TestLaunchCommandFunction:
         status_response.ok = True
         status_response.json.return_value = {
             "models": [
-                {"id": "opus-32k", "max_context_window": 32768},
-                {"id": "sonnet-64k", "max_context_window": 65536},
-                {"id": "haiku-64k", "max_context_window": 65536},
+                {
+                    "id": "opus-32k",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                },
+                {
+                    "id": "sonnet-64k",
+                    "model_type": "llm",
+                    "max_context_window": 65536,
+                },
+                {
+                    "id": "haiku-64k",
+                    "model_type": "llm",
+                    "max_context_window": 65536,
+                },
             ]
         }
 
@@ -705,7 +940,13 @@ class TestLaunchCommandFunction:
         status_response = MagicMock()
         status_response.ok = True
         status_response.json.return_value = {
-            "models": [{"id": "only-32k", "max_context_window": 32768}]
+            "models": [
+                {
+                    "id": "only-32k",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                }
+            ]
         }
 
         models_response = MagicMock()
@@ -767,7 +1008,12 @@ class TestLaunchCommandFunction:
 
         status_map_response = MagicMock()
         status_map_response.ok = True
-        status_map_response.json.return_value = {"models": []}
+        status_map_response.json.return_value = {
+            "models": [
+                {"id": "sonnet-local", "model_type": "llm"},
+                {"id": "opus-local", "model_type": "llm"},
+            ]
+        }
 
         models_response = MagicMock()
         models_response.raise_for_status.return_value = None

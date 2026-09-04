@@ -14,7 +14,10 @@ from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import (
     CodexIntegration,
     codex_config_args,
+    codex_model_catalog_path,
+    codex_profile_path,
     write_codex_config,
+    write_codex_model_catalog,
 )
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
@@ -117,11 +120,20 @@ class TestCodexIntegration:
         assert 'model_reasoning_effort="high"' in reasoning_args
         assert not any("model_reasoning_effort" in arg for arg in non_reasoning_args)
 
-    def test_configure_does_not_write_codex_config(self):
-        with patch("omlx.integrations.codex.write_codex_config") as writer:
-            CodexIntegration().configure(ctx(port=8000, model="new-model"))
+    def test_configure_writes_dedicated_model_catalog(self, tmp_path):
+        catalog_path = tmp_path / "omlx-models.json"
+        with patch(
+            "omlx.integrations.codex.codex_model_catalog_path",
+            return_value=catalog_path,
+        ):
+            result = CodexIntegration().configure(
+                ctx(port=8000, model="new-model", context_window=65_536)
+            )
 
-        writer.assert_not_called()
+        assert result is None
+        catalog = json.loads(catalog_path.read_text())
+        assert catalog["models"][0]["slug"] == "new-model"
+        assert catalog["models"][0]["context_window"] == 65_536
 
     def test_type(self):
         codex = CodexIntegration()
@@ -143,7 +155,14 @@ class TestCodexIntegration:
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         with (
-            patch("omlx.integrations.codex.write_codex_config") as writer,
+            patch(
+                "omlx.integrations.codex.codex_model_catalog_path",
+                return_value=Path("/tmp/omlx-models.json"),
+            ),
+            patch(
+                "omlx.integrations.codex.write_codex_model_catalog",
+                return_value=Path("/tmp/omlx-models.json"),
+            ) as writer,
             patch("omlx.integrations.codex.os.environ", base_env),
             patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
         ):
@@ -158,12 +177,54 @@ class TestCodexIntegration:
 
         assert captured["argv"][-3:] == ["-m", "qwen3.5", "--yolo"]
         assert 'model_provider="omlx"' in captured["argv"]
+        assert 'model_catalog_json="/tmp/omlx-models.json"' in captured["argv"]
         assert "model_context_window=240000" not in captured["argv"]
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
-        writer.assert_not_called()
+        writer.assert_called_once()
+
+
+class TestCodexModelCatalogWriter:
+    def test_paths_respect_codex_home(self, tmp_path):
+        with patch.dict(
+            "omlx.integrations.codex.os.environ",
+            {"CODEX_HOME": str(tmp_path)},
+            clear=True,
+        ):
+            assert codex_model_catalog_path() == tmp_path / "omlx-models.json"
+            assert codex_profile_path() == tmp_path / "omlx.config.toml"
+
+    def test_writes_all_available_models_with_metadata(self, tmp_path):
+        catalog_path = tmp_path / "omlx-models.json"
+        write_codex_model_catalog(
+            catalog_path,
+            ctx(
+                model="qwen-text",
+                context_window=65_536,
+                available_models=(
+                    {
+                        "id": "qwen-text",
+                        "model_type": "llm",
+                        "max_context_window": 65_536,
+                    },
+                    {
+                        "id": "qwen-vl",
+                        "model_type": "vlm",
+                        "model_context_length": 131_072,
+                    },
+                ),
+            ),
+        )
+
+        models = json.loads(catalog_path.read_text())["models"]
+        assert [model["slug"] for model in models] == ["qwen-text", "qwen-vl"]
+        assert models[0]["context_window"] == 65_536
+        assert models[0]["input_modalities"] == ["text"]
+        assert models[1]["context_window"] == 131_072
+        assert models[1]["input_modalities"] == ["text", "image"]
+        assert models[1]["base_instructions"]
 
 
 class TestCodexConfigWriter:
@@ -180,6 +241,7 @@ class TestCodexConfigWriter:
                 api_key="test-key",
                 model="qwen3.5",
             ),
+            tmp_path / "omlx-models.json",
         )
 
         content = config_path.read_text()
@@ -187,6 +249,7 @@ class TestCodexConfigWriter:
         assert 'model_provider = "omlx"' in content
         assert 'base_url = "http://192.168.1.100:9000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
+        assert 'model_catalog_json = "' in content
 
     def test_creates_backup(self, tmp_path):
         config_path = tmp_path / "config.toml"
@@ -238,6 +301,18 @@ class TestCodexConfigWriter:
         assert 'model = "llama-3.1-8b"' in content
         assert "model_reasoning_effort" not in content
 
+    def test_clears_stale_model_catalog_when_not_managed(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-model"\n'
+            'model_provider = "omlx"\n'
+            'model_catalog_json = "/old/omlx-models.json"\n'
+        )
+
+        write_codex_config(config_path, ctx(port=8000, model="new-model"))
+
+        assert "model_catalog_json" not in config_path.read_text()
+
 
 def make_app_bundle(
     root: Path, name: str, bundle_id: str, with_cli: bool = True
@@ -265,20 +340,39 @@ class TestCodexAppIntegration:
 
     def test_configure(self, tmp_path):
         codex_app = CodexAppIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        with patch.object(CodexAppIntegration, "CONFIG_PATH", config_path):
+        codex_home = tmp_path / "codex"
+        base_config_path = codex_home / "config.toml"
+        profile_path = codex_home / "omlx.config.toml"
+        catalog_path = codex_home / "omlx-models.json"
+        codex_home.mkdir()
+        base_config_path.write_text('model = "gpt-5.5"\n')
+        with (
+            patch(
+                "omlx.integrations.codex_app.codex_profile_path",
+                return_value=profile_path,
+            ),
+            patch(
+                "omlx.integrations.codex_app.codex_model_catalog_path",
+                return_value=catalog_path,
+            ),
+        ):
             codex_app.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
 
-        assert config_path.exists()
-        content = config_path.read_text()
+        assert base_config_path.read_text() == 'model = "gpt-5.5"\n'
+        assert profile_path.exists()
+        content = profile_path.read_text()
         assert 'model = "qwen3.5"' in content
         assert 'model_provider = "omlx"' in content
         assert 'base_url = "http://127.0.0.1:8000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
+        assert 'model_catalog_json = "' in content
+        catalog = json.loads(catalog_path.read_text())
+        assert catalog["models"][0]["slug"] == "qwen3.5"
 
     def test_launch_app(self, tmp_path):
         codex_app = CodexAppIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
+        profile_path = tmp_path / "codex" / "omlx.config.toml"
+        catalog_path = tmp_path / "codex" / "omlx-models.json"
         captured = {}
 
         def fake_execvpe(binary, argv, env):
@@ -292,7 +386,14 @@ class TestCodexAppIntegration:
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         with (
-            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch(
+                "omlx.integrations.codex_app.codex_profile_path",
+                return_value=profile_path,
+            ),
+            patch(
+                "omlx.integrations.codex_app.codex_model_catalog_path",
+                return_value=catalog_path,
+            ),
             patch("omlx.integrations.codex_app.os.environ", base_env),
             patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
             patch(
@@ -309,8 +410,12 @@ class TestCodexAppIntegration:
                 )
             )
 
-        # Codex App should launch with "app" subcommand, not "-m <model>"
-        assert captured["argv"] == ["/opt/homebrew/bin/codex", "app"]
+        assert captured["argv"] == [
+            "/opt/homebrew/bin/codex",
+            "--profile",
+            "omlx",
+            "app",
+        ]
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
@@ -354,7 +459,8 @@ class TestCodexAppIntegration:
 
     def test_launch_falls_back_to_bundled_cli(self, tmp_path):
         bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
-        config_path = tmp_path / "codex" / "config.toml"
+        profile_path = tmp_path / "codex" / "omlx.config.toml"
+        catalog_path = tmp_path / "codex" / "omlx-models.json"
         captured = {}
 
         def fake_execvpe(binary, argv, env):
@@ -362,7 +468,14 @@ class TestCodexAppIntegration:
             captured["argv"] = argv
 
         with (
-            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch(
+                "omlx.integrations.codex_app.codex_profile_path",
+                return_value=profile_path,
+            ),
+            patch(
+                "omlx.integrations.codex_app.codex_model_catalog_path",
+                return_value=catalog_path,
+            ),
             patch("omlx.integrations.codex_app.shutil.which", return_value=None),
             patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
             patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
@@ -371,7 +484,7 @@ class TestCodexAppIntegration:
 
         bundled = str(bundle / "Contents" / "Resources" / "codex")
         assert captured["binary"] == bundled
-        assert captured["argv"] == [bundled, "app"]
+        assert captured["argv"] == [bundled, "--profile", "omlx", "app"]
 
     def test_type(self):
         codex_app = CodexAppIntegration()
