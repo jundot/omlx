@@ -13,6 +13,7 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,23 @@ class PrefillTransientTracker:
     # genuinely recurring giant transient still reaches the guard through
     # the last-delta/EWMA terms of _predicted_chunk_transient.
     _OBSERVED_MAX_CLAMP_BYTES = 4 * 1024**3
+    # observed_max_bytes only ever INCREASED before idle-reset existed: one
+    # pathological-but-legitimate (under the clamp) floor-chunk spike early
+    # in a long-running (hours/days, continuously-loaded model) session
+    # permanently raised the admission floor for the rest of that session,
+    # even if the spike never recurred (§B4).
+    #
+    # The first fix tried here decayed the max on every subsequent
+    # floor-size sample. Review caught the flaw: floor samples only occur
+    # once the adaptive throttle is already down at its minimum chunk size
+    # -- the pressure regime -- so that "clock" only ran exactly when the
+    # floor was load-bearing, eroding the protection fastest right when it
+    # mattered most. Forgetting now hangs off wall-clock idle time instead
+    # (``_IDLE_RESET_SECONDS``, checked in ``update``): unrelated to
+    # pressure, so it cannot erode a floor that's actively earning its
+    # keep, and it still clears a stale spike once the session goes quiet
+    # long enough that the spike is no longer representative.
+    _IDLE_RESET_SECONDS = 30 * 60
     # A sample whose per_token exceeds the current EWMA by more than this
     # ratio is treated as measurement noise (a tail/residual prefill chunk,
     # not a genuine cost-per-token regime change) and excluded from the EWMA
@@ -63,6 +81,12 @@ class PrefillTransientTracker:
         # need to allocate that pool again on the next chunk, so the scheduler
         # prices it once until a positive measurement confirms reallocation.
         self._recent_reclaim_bytes: int = 0
+        # Monotonic timestamp of the last recorded sample; None before the
+        # first one. ``update`` resets the tracker when it's been longer
+        # than ``_IDLE_RESET_SECONDS`` since this, so a stale observed-max
+        # from before a long quiet stretch doesn't keep gating admission
+        # once the session resumes (§B4/3.4).
+        self._last_update_monotonic: float | None = None
 
     def _history(self, gathered_core: bool) -> _TransientHistory:
         return self._gathered_history if gathered_core is True else self._dense_history
@@ -102,7 +126,11 @@ class PrefillTransientTracker:
         (Qwen3.6 measured ~3.0GB at 2048-token chunks vs far less at the
         floor; charging the big-chunk max at admission rejected every
         prompt at a 21GB ceiling). Big-chunk transients stay the throttle's
-        domain via the EWMA/last-delta terms.
+        domain via the EWMA/last-delta terms. A floor sample only ever
+        raises the max within one idle window (see ``_IDLE_RESET_SECONDS``
+        and this method's idle check below) — it does not decay it, since
+        floor samples occur exactly under the pressure the max exists to
+        protect against.
 
         A sample whose per-token rate exceeds the current EWMA by more than
         ``_EWMA_OUTLIER_RATIO`` is excluded from the EWMA blend (see that
@@ -115,6 +143,27 @@ class PrefillTransientTracker:
             return
         if transient_bytes <= 0:
             return
+
+        now = time.monotonic()
+        if (
+            self._last_update_monotonic is not None
+            and now - self._last_update_monotonic > self._IDLE_RESET_SECONDS
+        ):
+            # A stale observed-max earned under a past pressure spike is no
+            # longer representative once the session has gone quiet this
+            # long; forget it here (wall-clock, not sample-count driven) so
+            # it can't keep gating admission for a session that has since
+            # moved on. Unrelated to pressure -- see _IDLE_RESET_SECONDS.
+            logger.debug(
+                "PrefillTransientTracker(%s): resetting after %.0fs idle "
+                "(observed_max dense=%.2fMB gathered=%.2fMB)",
+                self._model_id,
+                now - self._last_update_monotonic,
+                self._dense_history.observed_max_bytes / 1024**2,
+                self._gathered_history.observed_max_bytes / 1024**2,
+            )
+            self.reset()
+        self._last_update_monotonic = now
 
         self._recent_reclaim_bytes = 0
 
@@ -223,7 +272,12 @@ class PrefillTransientTracker:
 
     @property
     def observed_max_bytes(self) -> int:
-        """Largest accepted chunk transient this session (0 if none yet)."""
+        """Bound on the largest accepted floor-chunk transient (dense
+        regime) this idle window (0 if none yet). Rises instantly on a new
+        peak; forgotten (not decayed) once ``_IDLE_RESET_SECONDS`` passes
+        with no new sample, so it doesn't stay pinned at its all-time high
+        for the rest of a long-running session (see ``update``'s idle
+        check)."""
         return self._dense_history.observed_max_bytes
 
     @property
@@ -232,7 +286,10 @@ class PrefillTransientTracker:
         return self._recent_reclaim_bytes
 
     def reset(self) -> None:
-        """Drop all observations (e.g. on model reload or after a long idle)."""
+        """Drop all observations (model reload gets a fresh tracker by
+        construction instead of calling this; ``update`` calls it directly
+        after ``_IDLE_RESET_SECONDS`` of no samples)."""
         self._dense_history = _TransientHistory()
         self._gathered_history = _TransientHistory()
         self._recent_reclaim_bytes = 0
+        self._last_update_monotonic = None

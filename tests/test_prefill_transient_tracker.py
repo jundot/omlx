@@ -2,6 +2,8 @@
 """Tests for PrefillTransientTracker — per-scheduler EWMA used by the
 adaptive prefill throttle (#1040 follow-up)."""
 
+import time
+
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 
 
@@ -131,6 +133,11 @@ class TestObservedMax:
         t.update(32, 100_000_000, floor_sample=True)
         t.update(32, 700_000_000, floor_sample=True)
         t.update(32, 300_000_000, floor_sample=True)
+        # #3109: floor samples only ever occur under the pressure regime
+        # the max exists to protect, so a lower reading must NOT pull it
+        # back down (that coupling was the bug) -- it stays pinned at the
+        # highest floor sample seen this idle window. See
+        # TestObservedMaxIdleReset for how it eventually gets forgotten.
         assert t.observed_max_bytes == 700_000_000
 
     def test_non_floor_samples_never_enter_max(self):
@@ -173,6 +180,86 @@ class TestObservedMax:
         ewma = 0.3 * 200.0 + 0.7 * 100.0
         assert abs(t.bytes_per_token - ewma) < 0.01
         assert t.predict(2000, safety_factor=1.0) == int(ewma * 2000)
+
+
+class TestObservedMaxIdleReset:
+    """#3109: an earlier fix decayed observed_max_bytes on every subsequent
+    lower floor-size sample. Review caught the flaw: floor samples only
+    occur once the adaptive throttle is already at its minimum chunk size
+    -- the pressure regime -- so that decay eroded the floor fastest
+    exactly when it was load-bearing. Forgetting now hangs off wall-clock
+    idle time instead (unrelated to pressure/sample count), per the
+    reviewer's suggested alternative: hang it off ``reset()``, which was
+    already documented for "after a long idle" but nothing called."""
+
+    def test_lower_sample_does_not_decay_the_max_within_one_session(self):
+        """The specific coupling the review flagged: repeated lower floor
+        samples with no elapsed time must NOT erode a stale spike -- that
+        was the bug in the pressure-coupled decay this replaces."""
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 1_000_000_000, floor_sample=True)  # spike -> max=1e9
+        for _ in range(400):
+            t.update(32, 100_000_000, floor_sample=True)  # spike never recurs
+        assert t.observed_max_bytes == 1_000_000_000
+
+    def test_new_higher_sample_still_raises_instantly(self):
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 200_000_000, floor_sample=True)
+        t.update(32, 900_000_000, floor_sample=True)  # fresh spike
+        assert t.observed_max_bytes == 900_000_000
+
+    def test_idle_gap_under_threshold_does_not_reset(self, monkeypatch):
+        times = iter([1000.0, 1000.0 + 60.0, 1000.0 + 60.0 + 1700.0])
+        monkeypatch.setattr(time, "monotonic", lambda: next(times))
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # t=1000, first, excluded
+        t.update(32, 1_000_000_000, floor_sample=True)  # t=1060, spike
+        t.update(32, 50_000_000, floor_sample=True)  # t=2760, +1700s < 30min
+        assert t.observed_max_bytes == 1_000_000_000
+        assert t.samples == 3
+
+    def test_idle_gap_over_threshold_resets_the_whole_tracker(self, monkeypatch):
+        """The actual fix: a session that goes quiet for longer than
+        ``_IDLE_RESET_SECONDS`` forgets a stale spike (and everything
+        else) on its next sample, instead of staying pinned at the
+        spike's value indefinitely -- with no dependence on how many
+        floor samples occur afterward."""
+        times = iter([1000.0, 1010.0, 1010.0 + 1900.0])  # +1900s > 30min
+        monkeypatch.setattr(time, "monotonic", lambda: next(times))
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # t=1000, first, excluded
+        t.update(32, 1_000_000_000, floor_sample=True)  # t=1010, spike -> max=1e9
+        assert t.observed_max_bytes == 1_000_000_000
+        assert t.samples == 2
+
+        t.update(32, 50_000_000, floor_sample=True)  # t=2910, past the idle threshold
+        # Reset wipes everything, including samples: this new reading is
+        # itself the tracker's first sample post-reset, so it seeds the
+        # EWMA only and is excluded from the max (mirrors a fresh model
+        # load) rather than becoming the new max outright.
+        assert t.observed_max_bytes == 0
+        assert t.samples == 1
+
+    def test_idle_reset_does_not_fire_before_the_first_sample(self, monkeypatch):
+        """No prior timestamp means no elapsed-time comparison to make --
+        the very first call must seed normally, not reset."""
+        monkeypatch.setattr(time, "monotonic", lambda: 5000.0)
+        t = PrefillTransientTracker("m")
+        t.update(32, 500_000_000, floor_sample=True)
+        assert t.samples == 1
+        assert t.observed_max_bytes == 0  # first sample still excluded
+
+    def test_decay_does_not_apply_to_clamp_rejected_outliers(self):
+        """An above-clamp reading is excluded entirely (existing
+        behavior) -- it must not affect the max at all, since it was
+        never accepted as a real observation."""
+        t = PrefillTransientTracker("m")
+        t.update(32, 100_000_000, floor_sample=True)  # first, excluded
+        t.update(32, 500_000_000, floor_sample=True)  # max = 500M
+        t.update(32, 5 * 1024**3, floor_sample=True)  # above 4GiB clamp
+        assert t.observed_max_bytes == 500_000_000
 
 
 class TestReset:
