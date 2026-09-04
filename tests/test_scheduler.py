@@ -3550,6 +3550,58 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_arrays_cache_block_size_override_honored(
+        self, mock_tokenizer, tmp_path
+    ):
+        """cache.arrays_cache_block_size wins even below the prefill step and the
+        Qwen wide-prefill floor, so a short-turn workload actually gets
+        prefix-cache hits (#3430). The auto target for this qwen3_5 host would be
+        floor(4096); an explicit override of 128 must win, and it must NOT drag
+        prefill_step_size along with it (unlike OMLX_ARRAYS_CACHE_BLOCK in #3407).
+        """
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(),  # qwen3_5 hybrid
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                    arrays_cache_block_size=128,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler.config.paged_cache_block_size == 128
+            # prefill step stays independent: the override only shapes cache-hit
+            # granularity, it does not reshape prefill chunking.
+            assert scheduler.config.prefill_step_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_arrays_cache_block_size_none_keeps_auto_target(
+        self, mock_tokenizer, tmp_path
+    ):
+        """Leaving arrays_cache_block_size unset preserves the auto target
+        (2048 floor) — the override is opt-in only."""
+        with patch("omlx.settings.get_system_memory", return_value=32 * 1024**3):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="other_hybrid"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
     def test_explicit_larger_block_is_preserved(self, mock_tokenizer, tmp_path):
         with (
             patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),

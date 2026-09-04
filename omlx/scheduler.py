@@ -1568,6 +1568,10 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
+    # Explicit operator override for the ArraysCache-only hybrid block size
+    # (from settings `cache.arrays_cache_block_size` / --arrays-cache-block-size).
+    # None/0 selects the auto target in _enlarge_block_size_for_arrays_cache.
+    arrays_cache_block_size: int | None = None
     max_cache_blocks: int | None = (
         None  # Auto-calculated from available KV cache memory
     )
@@ -2813,6 +2817,29 @@ class Scheduler:
             self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
         )
         if not has_arrays_cache:
+            return
+
+        # Explicit operator override (settings cache.arrays_cache_block_size /
+        # --arrays-cache-block-size): honor it exactly, even below the prefill
+        # step or the 2048 default floor. For a short-turn workload a small block
+        # lets the whole (short) prompt land in a single cached block, so every
+        # subsequent turn is a prefix-cache hit; the cost is more recurrent-state
+        # boundary snapshots on the uncached part of a prompt, which is the
+        # trade-off the operator is opting into (see #3430). Unlike the
+        # OMLX_ARRAYS_CACHE_BLOCK env override (#3407), this intentionally leaves
+        # prefill_step_size independent so the operator can shape cache-hit
+        # granularity without also reshaping prefill chunking.
+        explicit = self.config.arrays_cache_block_size
+        if explicit:
+            if self.config.paged_cache_block_size != explicit:
+                logger.info(
+                    "Using configured arrays_cache_block_size=%s for "
+                    "ArraysCache hybrid model (auto target overridden; short "
+                    "prompts now get prefix-cache hits at the cost of more "
+                    "boundary snapshots)",
+                    explicit,
+                )
+                self.config.paged_cache_block_size = explicit
             return
 
         target = max(

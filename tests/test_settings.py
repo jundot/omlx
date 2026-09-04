@@ -467,6 +467,7 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "arrays_cache_block_size": None,
         }
 
     def test_from_dict(self):
@@ -2103,6 +2104,32 @@ class TestGlobalSettings:
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.gdn_ssd_split_enabled is True
         assert scheduler_config.gdn_sidecar_state_dtype == "rht_int8"
+
+    def test_to_scheduler_config_arrays_cache_block_size_default_none(self):
+        """cache.arrays_cache_block_size defaults to None (auto target)."""
+        settings = GlobalSettings()
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.arrays_cache_block_size is None
+
+    def test_to_scheduler_config_arrays_cache_block_size(self):
+        """cache.arrays_cache_block_size passes through to SchedulerConfig."""
+        settings = GlobalSettings()
+        settings.cache.arrays_cache_block_size = 128
+
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.arrays_cache_block_size == 128
+
+    def test_arrays_cache_block_size_roundtrips_through_settings_dict(self):
+        """CacheSettings persists arrays_cache_block_size via to_dict/from_dict."""
+        from omlx.settings import CacheSettings
+
+        original = CacheSettings.from_dict({"arrays_cache_block_size": 64})
+        assert original.arrays_cache_block_size == 64
+
+        restored = CacheSettings.from_dict(original.to_dict())
+        assert restored.arrays_cache_block_size == 64
+        # Unset stays unset (no surprise default).
+        assert CacheSettings.from_dict({}).arrays_cache_block_size is None
 
 
 class TestInitSettings:
