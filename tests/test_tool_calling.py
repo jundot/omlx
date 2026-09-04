@@ -4435,3 +4435,175 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+# =============================================================================
+# _parse_xml_tool_calls / _parse_namespaced_tool_calls bug fixes
+#
+# (1) unconditional json.loads() coercion of parsed XML param values, which
+#     silently turns a string-typed schema param whose value looks like
+#     "123"/"true" into an int/bool. TestSchemaAwareFallbackCoercion above
+#     covers the qwen/GLM XML branches and namespaced malformed-array
+#     repair (_coerce_param_value); the two classes below add the plain
+#     string-not-coerced case for the namespaced parser and the
+#     native-tool_parser passthrough contract, which aren't covered there.
+# (2) a \w+-based regex for the tool/function name that rejects hyphens and
+#     dots, so a hyphenated or dotted tool name that is otherwise valid per
+#     the model's own schema/output would fail to parse. Covered by
+#     TestParseXmlToolCallsHyphenatedName below.
+# =============================================================================
+
+class TestParseXmlToolCallsHyphenatedName:
+    """Regex fix: <function=NAME> must accept hyphens and dots in NAME."""
+
+    def test_hyphenated_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+
+    def test_dotted_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=query>\nhello\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "web.search"
+
+    def test_plain_underscored_name_still_parses(self):
+        """Regression guard: the common \\w+ case (underscores) still works."""
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "get_weather"
+
+    def test_hyphenated_parameter_name_round_trips(self):
+        """Sibling bug: _XML_PARAMETER_OPEN_RE had the same \\w+ regex, so a
+        hyphenated *parameter* name (not just a hyphenated function name)
+        would fail to match and the whole <parameter=...> element -- name
+        AND value -- was silently dropped, leaving `arguments` empty even
+        though the tool name parsed fine.
+        """
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=unit-type>\ncelsius\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"unit-type": "celsius"}
+
+    def test_dotted_parameter_name_round_trips(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=filter.lang>\nen\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"filter.lang": "en"}
+
+
+class TestParseNamespacedToolCallsStringCoercion:
+    """String-not-coerced case for the namespaced (MiniMax-style) parser.
+
+    TestSchemaAwareFallbackCoercion above covers this scenario for the
+    qwen/GLM XML branches (and malformed-array repair for all three
+    branches, including namespaced), but not the plain string-not-coerced
+    case specifically through _parse_namespaced_tool_calls.
+    """
+
+    STRING_PARAM_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    }]
+
+    def test_numeric_looking_string_param_stays_string(self):
+        text = (
+            '<minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">123</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>'
+        )
+        _, tool_calls = _parse_namespaced_tool_calls(
+            text, "minimax", tools=self.STRING_PARAM_TOOLS
+        )
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+
+class TestParseToolCallsNativeParserPreservesTypes:
+    """GLM (and other mlx-lm-native) tool calls go through parse_tool_calls'
+    ``tokenizer.tool_parser`` branch first, *not* through
+    ``_parse_xml_tool_calls`` -- that fallback only runs when the tokenizer
+    has no native tool parser configured. This is not a second, unpatched
+    coercion path: mlx-lm's own tool parsers (e.g. ``glm47.py``) already do
+    their own schema-aware string-vs-bare-token coercion internally, and
+    parse_tool_calls trusts whatever typed ``arguments`` dict the native
+    parser returns without re-coercing it. These tests pin that contract
+    down so a future change to parse_tool_calls doesn't introduce a second,
+    naive ``json.loads`` pass on top of an already-typed native result.
+    """
+
+    def test_native_parser_string_value_passed_through_unmodified(self):
+        """A native tool_parser that already preserved a numeric-looking
+        string (per its own schema awareness) must not be re-coerced by
+        parse_tool_calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"location": "123"},  # native parser kept it a str
+        }
+
+        text = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>123</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+    def test_native_parser_numeric_value_passed_through_unmodified(self):
+        """A genuinely numeric argument from the native parser is untouched too."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"count": 42},
+        }
+
+        text = "<tool_call>get_weather<arg_key>count</arg_key><arg_value>42</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["count"] == 42
+        assert isinstance(args["count"], int)
