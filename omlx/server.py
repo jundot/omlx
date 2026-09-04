@@ -643,6 +643,18 @@ try:
 except ImportError:
     pass
 
+# Include image routes only when mflux is installed (image_routes.py itself
+# imports only fastapi/stdlib, so the dependency must be probed here).
+try:
+    import mflux as _  # noqa: F401
+
+    from .api.image_routes import router as image_router
+
+    app.include_router(image_router, dependencies=[Depends(verify_api_key)])
+    del _
+except ImportError:
+    pass
+
 # Include admin routes
 from .admin.auth import _RedirectToLogin, require_admin
 from .admin.routes import router as admin_router

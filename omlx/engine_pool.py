@@ -34,6 +34,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.image import BaseImageEngine, get_image_engine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
@@ -50,7 +51,12 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
-from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_discovery import (
+    _is_mflux_image_model,
+    discover_models,
+    format_size,
+    is_realtime_stt_model,
+)
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -185,7 +191,7 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal[
-        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "image"
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -196,6 +202,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "image",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -218,6 +225,7 @@ class EngineEntry:
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     engine: (
         BaseEngine
+        | BaseImageEngine
         | EmbeddingEngine
         | RerankerEngine
         | STTEngine
@@ -872,6 +880,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "image": "image",
     }
 
     @staticmethod
@@ -1099,7 +1108,9 @@ class EnginePool:
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        if model_path.exists() and (
+            (model_path / "config.json").exists() or _is_mflux_image_model(model_path)
+        ):
             return
 
         if entry.engine is None:
@@ -2764,6 +2775,8 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
+                elif entry.engine_type == "image":
+                    engine = get_image_engine(model_name=entry.model_path)
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,

@@ -311,6 +311,15 @@
                                                     </span>
                                                     <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
                                                     <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                                    <!-- Step progress (image diffusion and other step-based engines) -->
+                                                    <span x-show="activity.current_step != null && activity.total_steps > 0" class="inline-flex items-center gap-1.5 ml-1">
+                                                        <span class="w-20 h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+                                                            <span class="block h-full bg-green-400 rounded-full transition-all duration-300"
+                                                                  :style="'width: ' + Math.min(100, activity.current_step / activity.total_steps * 100) + '%'"></span>
+                                                        </span>
+                                                        <span class="text-[10px] text-green-500 font-medium"
+                                                              x-text="Math.round(activity.current_step / activity.total_steps * 100) + '%'"></span>
+                                                    </span>
                                                 </div>
                                             </template>
                                         </div>
