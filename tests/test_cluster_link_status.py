@@ -16,6 +16,8 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _RDMA_PROBE_TIMEOUT,
+    _rdma_port_state,
     assess_link,
     classify_link,
     configure_link,
@@ -28,6 +30,7 @@ from omlx.cluster.transport import (
     shared_link_addresses,
     verify_link_reachability,
 )
+from omlx.cluster.vpn import VPNProfile
 
 HOSTS = ("127.0.0.1", "Studio.local")
 
@@ -315,6 +318,31 @@ def test_gui_setup_addresses_only_the_missing_endpoint(monkeypatch):
     assert configured == [("127.0.0.1", "en6", "10.0.1.1")]
 
 
+def _stub_fresh_subnet_selection(monkeypatch):
+    """Pin configure_link's tier-3 selection so tests are hermetic.
+
+    With no address on either endpoint, configure_link reads live interfaces,
+    routes and VPN posture to pick a collision-free /24. On a developer Mac
+    those reads see the real machine, so the stubs stand in for two clean
+    hosts: nothing occupied, no VPN, and the selection lands on the first
+    static candidate, 10.90.99.0/24 (the closest match to the previous
+    single hardcoded default; only a detected VPN promotes 172.16.x -- see
+    choose_fabric_subnet's own tests).
+    """
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport.probe_host_interfaces",
+        lambda host: HostInterfaces(host=host),
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.vpn.detect_vpn",
+        lambda host, **_kwargs: VPNProfile(),
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.vpn.hostile_networks", lambda hosts, **_kwargs: ()
+    )
+
+
 def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     states = iter(
         [
@@ -343,6 +371,7 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     monkeypatch.setattr(
         "omlx.cluster.transport._interface_ip", lambda host, interface: None
     )
+    _stub_fresh_subnet_selection(monkeypatch)
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
@@ -352,8 +381,8 @@ def test_gui_setup_uses_native_authorization_on_both_macs(monkeypatch):
     configure_link(HOSTS)
 
     assert configured == [
-        ("127.0.0.1", "en6", "10.0.1.1"),
-        ("Studio.local", "en5", "10.0.1.2"),
+        ("127.0.0.1", "en6", "10.90.99.1"),
+        ("Studio.local", "en5", "10.90.99.2"),
     ]
 
 
@@ -387,6 +416,7 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
         "omlx.cluster.transport._interface_ip",
         lambda host, interface: None,
     )
+    _stub_fresh_subnet_selection(monkeypatch)
     configured = []
     monkeypatch.setattr(
         "omlx.cluster.transport._authorized_ifconfig",
@@ -395,8 +425,8 @@ def test_gui_setup_can_configure_a_worker_to_worker_pair(monkeypatch):
 
     assert configure_link(hosts).ready is True
     assert configured == [
-        ("mini.local", "10.0.1.1"),
-        ("studio.local", "10.0.1.2"),
+        ("mini.local", "10.90.99.1"),
+        ("studio.local", "10.90.99.2"),
     ]
 
 
@@ -761,7 +791,7 @@ def test_resolving_a_link_falls_back_to_a_verified_ethernet_path():
     assert link.peer.address == "192.168.4.22"
 
 
-def test_link_verification_checks_route_and_ping_from_both_macs():
+def test_link_verification_requires_bound_tcp_from_both_macs():
     link = shared_link_addresses(_laptop(), _studio())
     calls = []
 
@@ -770,18 +800,105 @@ def test_link_verification_checks_route_and_ping_from_both_macs():
         if command[0] == "/sbin/route":
             interface = "en4" if host == "127.0.0.1" else "en5"
             return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        if command[0] == "python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
 
     verified, reason = verify_link_reachability(link, runner=runner)
 
     assert verified is True
     assert reason == link.reason
+    # TCP bound-connect is the success criterion; ping is never consulted.
     assert [command[0] for _, command in calls] == [
         "/sbin/route",
-        "/sbin/ping",
+        "python3",
         "/sbin/route",
-        "/sbin/ping",
+        "python3",
     ]
+    assert not any(command[0] == "/sbin/ping" for _, command in calls)
+
+
+def test_link_verification_flags_firewall_when_tcp_refused_but_ping_ok():
+    # Route + ICMP both fine, but the bound TCP connect is refused in one
+    # direction — the VPN/firewall-drops-inbound-TCP case. Must fail and name
+    # the blocking Mac + the likely cause.
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(host, command):
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        if command[0] == "python3":
+            # coordinator->peer connects; peer->coordinator is refused.
+            ok = host == "127.0.0.1"
+            return subprocess.CompletedProcess(command, 0 if ok else 1, "", "refused")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "cannot accept connections" in reason
+    assert "firewall or VPN" in reason
+
+
+def test_link_verification_reports_host_down_when_tcp_and_ping_fail():
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(host, command):
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        # Both TCP and ping fail in the second direction.
+        rc = 0 if host == "127.0.0.1" else 1
+        return subprocess.CompletedProcess(command, rc, "", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "no TCP, no ping" in reason
+
+
+def test_rdma_port_state_reads_active_port(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert kwargs.get("timeout") == _RDMA_PROBE_TIMEOUT
+        return subprocess.CompletedProcess(
+            command, 0, "\tstate:\t\tPORT_ACTIVE (4)\n", ""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _rdma_port_state("127.0.0.1", "rdma_en3") == "PORT_ACTIVE"
+
+
+def test_rdma_port_state_fails_fast_on_a_wedged_link(monkeypatch):
+    # A downed Thunderbolt controller makes ibv_devinfo hang indefinitely
+    # querying kernel/driver state; the probe must bound that wait tightly
+    # (previously 30s per device) and say the link is the likely cause.
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="did not respond within"):
+        _rdma_port_state("M-FJX1D769D0.local", "rdma_en2")
+
+
+def test_link_verification_accepts_bound_connect_without_route_command():
+    # Linux (or any host lacking macOS `route -n get`, returncode != 0): the
+    # bound TCP connect alone proves the path; existing behavior preserved.
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 1, "", "not supported")
+        if command[0] == "python3":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is True
+    assert reason == link.reason
 
 
 def test_link_verification_rejects_a_route_on_the_wrong_interface():
@@ -817,3 +934,156 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+# ---------------------------------------------------------------------------
+# Readiness ladder (B3): every branch names its rung and carries copy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_ladder"),
+    [
+        ({}, "routed"),
+        ({"thunderbolt": False}, "enabled_no_peer"),
+        ({"rdma_devices": {h: [] for h in HOSTS}}, "disabled"),
+        ({"active_ports": {h: None for h in HOSTS}}, "peer_linked_config_pending"),
+        ({"port_ips": {h: None for h in HOSTS}}, "peer_linked_config_pending"),
+    ],
+)
+def test_classify_branches_carry_the_expected_ladder(overrides, expected_ladder):
+    status = _classify(**overrides)
+    assert status.ladder == expected_ladder
+    assert status.reason.strip(), f"{status.state} shipped without a reason"
+    assert status.remedy.strip(), f"{status.state} shipped without a remedy"
+    payload = status.to_dict()
+    assert payload["ladder"] == expected_ladder
+    assert payload["reason"] and payload["remedy"]
+
+
+def test_classify_rdma_ready_does_not_claim_reachable():
+    """Per-host evidence proves routing, never two-ended reachability."""
+
+    assert _classify().ladder == "routed"
+
+
+def test_no_peers_ladder_is_the_floor():
+    status = assess_link([])
+    assert status.ladder == "unavailable"
+    assert status.reason and status.remedy
+
+
+def test_failed_peer_probe_ladder_is_the_floor(monkeypatch):
+    def rejected(_host):
+        raise RuntimeError("SSH permission denied")
+
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", rejected)
+
+    status = assess_link(HOSTS)
+
+    assert status.ladder == "unavailable"
+    assert "SSH" in status.remedy
+
+
+def _rdma_pair(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_devices",
+        lambda host: ["rdma_en6"] if host == HOSTS[0] else ["rdma_en5"],
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port",
+        lambda host: "en6" if host == HOSTS[0] else "en5",
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._interface_ip",
+        lambda host, _interface: "10.0.1.1" if host == HOSTS[0] else "10.0.1.2",
+    )
+
+
+def test_verified_rdma_link_earns_the_reachable_rung(monkeypatch):
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(
+            HOSTS[0], [("en6", "10.0.1.1", 30)], rdma=("en6",), thunderbolt=("en6",)
+        ),
+        HOSTS[1]: _host(
+            HOSTS[1], [("en5", "10.0.1.2", 30)], rdma=("en5",), thunderbolt=("en5",)
+        ),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (True, "both ends answered"),
+    )
+
+    assert status.state == "rdma_ready"
+    assert status.ladder == "reachable"
+    assert status.reason and status.remedy
+
+
+def test_unreachable_addresses_stop_the_ladder_at_routed(monkeypatch):
+    """The unreachable branch names the Doctor as the way forward."""
+
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en6", "10.0.1.1", 30)], rdma=("en6",)),
+        HOSTS[1]: _host(HOSTS[1], [("en5", "10.0.1.2", 30)], rdma=("en5",)),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "thunderbolt"
+    assert status.ladder == "routed"
+    assert "Fabric Doctor" in status.remedy
+
+
+def test_verified_tcp_fallback_reports_routed_with_doctor_remedy(monkeypatch):
+    _rdma_pair(monkeypatch)
+    interfaces = {
+        HOSTS[0]: _host(
+            HOSTS[0],
+            [("en6", "10.0.1.1", 30), ("en0", "192.168.4.21", 24)],
+            rdma=("en6",),
+        ),
+        HOSTS[1]: _host(
+            HOSTS[1],
+            [("en5", "10.0.1.2", 30), ("en0", "192.168.4.22", 24)],
+            rdma=("en5",),
+        ),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda link: (link.kind == "ethernet", "RDMA did not answer"),
+    )
+
+    assert status.state == "ethernet"
+    assert status.ladder == "routed"
+    assert "Fabric Doctor" in status.remedy
+
+
+def test_unverified_network_route_ladder_is_the_floor(monkeypatch):
+    monkeypatch.setattr("omlx.cluster.transport._rdma_devices", lambda _host: [])
+    monkeypatch.setattr(
+        "omlx.cluster.transport._active_rdma_port", lambda _host: None
+    )
+    interfaces = {
+        HOSTS[0]: _host(HOSTS[0], [("en0", "192.168.4.21", 24)]),
+        HOSTS[1]: _host(HOSTS[1], [("en0", "192.168.4.22", 24)]),
+    }
+
+    status = assess_link(
+        HOSTS,
+        probe=interfaces.__getitem__,
+        verify=lambda _link: (False, "the peer did not answer"),
+    )
+
+    assert status.state == "unknown"
+    assert status.ladder == "unavailable"
+    assert status.reason and status.remedy
