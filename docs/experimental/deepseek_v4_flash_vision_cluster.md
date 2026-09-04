@@ -1,7 +1,14 @@
 # DeepSeek-V4-Flash-Vision two-Mac validation
 
-Status: experimental; single-Mac/loopback and the core physical two-Mac path
-validated. The latest crash-recovery hardening awaits another physical-pair run.
+Status: experimental. Physical 2× M5 Max / 128 GiB validation completed for
+the Ring backend on 2026-09-04 (commit `4cd08e33`): two-rank load, text,
+one-image, streaming, second-image cache isolation, ~10k-token text+image,
+~23k-token tool-heavy prefill, graceful unload/reload, and rank reaping all
+passed. The crash-recovery quarantine engaged correctly on a failed JACCL
+probe and is scoped per deployment. JACCL model serving is NOT yet validated
+on this revision: the Thunderbolt RDMA fabric had no IPv4 addresses and
+assigning them needs interactive sudo on both Macs. JACCL fails closed with a
+clear diagnostic in that state.
 
 This path is intentionally specific to
 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`. Rank 0 preprocesses images, owns
@@ -166,6 +173,34 @@ procedure below for those claims.
     processes exit, then load it again and repeat the text and one-image short
     requests. Success is clean `teardown`, followed by two new `ready` ranks
     and identical answers without stale cache state.
+
+## Physical validation record (2026-09-04, 2× M5 Max 128 GiB)
+
+Revision `4cd08e33` (Ring backend over the Thunderbolt bridge subnet,
+oMLX 0.6.4 / MLX 0.32.2 / mlx-lm 0.31.3 / macOS 26.6.2 / Python 3.13.15):
+
+- Hardware canary: pass on both Macs (`ok: true`, `skipped: false`).
+- Planner: tensor parallel 1, rank 0 layers 22–43 with 932,786,176
+  coordinator bytes, rank 1 layers 0–22 with zero, contiguous, positive
+  headroom on both ranks, planned totals within capacity minus reserve.
+- Load: both ranks `ready`/`live`; layer ranges match the plan; measured
+  rank bytes 78.3 GiB (rank 0) / 80.9 GiB (rank 1); headroom 11.0 / 8.8 GiB.
+- Inference: text-only ok; one-image ok (119 prompt tokens, correct
+  description); streaming ok (22 SSE chunks ending in `[DONE]`); second
+  same-dimension image correctly described (no stale KV reuse); ~10k-token
+  text+image in 18.2 s with no stall; ~23k-token tool-heavy request in
+  24.4 s with prefix-cache reuse and no stall. Catalogue offers the
+  1,048,576-token multimodal context (no 128k fallback).
+- Teardown/reload: graceful unload reaped every rank process on both Macs;
+  reload returned two new `ready` ranks and repeated text/image requests
+  passed with no stale state.
+- Recovery: a JACCL probe without RDMA fabric failed closed
+  (`[jaccl] No IPv4-mapped GID for this device...`) and quarantined reloads
+  for that deployment only; Ring reloads were unaffected. Diagnostics no
+  longer warn on quarantine records after commit `4cd08e33`.
+- JACCL model serving remains unvalidated: `en1`/`en6`/`en2` had no IPv4
+  addresses (bridge `192.168.0.0/24` only) and repair needs interactive sudo
+  on both Macs. Do not mark JACCL hardware-validated from the Ring result.
 
 ## Capture checklist
 
