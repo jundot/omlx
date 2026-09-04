@@ -2370,3 +2370,296 @@ class TestIndexerFallbackTiling:
         _, dm = self._reduce_and_ref()
         assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
         assert dm._INDEXER_MAX_ELEMS < 2**31
+
+
+class TestNativeKernelLatchSemantics:
+    """ValueError shape rejections (std::invalid_argument, raised before any
+    GPU work) must fall back per-call WITHOUT latching the process-wide
+    native-disable flags; genuine runtime failures still latch.
+
+    Regression test for the stale-binary incident: an extension built before
+    the unaligned-tail fix raised ValueError on the first 327-token prefill
+    chunk and latched the fp32 fallback for the whole process, multiplying
+    resident memory at long context.
+    """
+
+    @staticmethod
+    def _sparse_args():
+        import mlx.core as mx
+
+        q = mx.zeros((1, 64, 5, 512), dtype=mx.bfloat16)
+        local_kv = mx.zeros((1, 1, 5, 512), dtype=mx.bfloat16)
+        pooled = mx.zeros((1, 64, 512), dtype=mx.bfloat16)
+        topk = mx.broadcast_to(
+            mx.arange(64, dtype=mx.uint32)[None, None], (1, 5, 64)
+        )
+        sinks = mx.zeros((64,), dtype=mx.bfloat16)
+        return q, local_kv, pooled, topk, sinks
+
+    def test_sparse_attention_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def reject(*args):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "deepseek_v4_sparse_attention", reject)
+        q, local_kv, pooled, topk, sinks = self._sparse_args()
+
+        out = dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        mx.eval(out)
+        assert out.shape == q.shape  # composed MLX fallback produced output
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is False
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED is True
+
+        # Native path stays armed: a second call attempts the kernel again.
+        dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert len(calls) == 2
+
+    def test_sparse_attention_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def boom(*args):
+            calls.append(1)
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "deepseek_v4_sparse_attention", boom)
+        q, local_kv, pooled, topk, sinks = self._sparse_args()
+
+        out = dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert out is not None
+        assert dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED is True
+
+        # Latched: the kernel is not attempted again.
+        dsv4._sparse_pooled_attention(
+            q, local_kv, pooled, topk, None, None, 512**-0.5, sinks,
+            q_offset=0, compress_ratio=128, local_window=128,
+        )
+        assert len(calls) == 1
+
+    @staticmethod
+    def _indexer_config(dsv4):
+        return dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=512,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+
+    def _run_indexer(self, dsv4, indexer):
+        import mlx.core as mx
+
+        x = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        q_residual = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        return indexer(x, q_residual, lambda q, offset: q, None, 0)
+
+    def test_indexer_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.patches.deepseek_v4 import indexer_dispatch
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 600, self.head_dim), dtype=x.dtype
+            ),
+        )
+        calls = []
+
+        def reject(*args, **kwargs):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", reject)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", reject)
+
+        indexer = dsv4.Indexer(self._indexer_config(dsv4), 4)
+        indexer.set_dtype(mx.bfloat16)
+        out = self._run_indexer(dsv4, indexer)
+        mx.eval(out)
+        assert out.shape == (1, 2, 512)  # fp32 MLX fallback produced top-k
+        assert indexer_dispatch.native_indexer_disabled() is False
+        assert dsv4._DEEPSEEK_V4_INDEXER_SHAPE_WARNED is True
+
+        # Native path stays armed: a second call attempts the kernel again.
+        self._run_indexer(dsv4, indexer)
+        assert len(calls) == 2
+
+    def test_indexer_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.patches.deepseek_v4 import indexer_dispatch
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(
+            dsv4.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: mx.zeros(
+                (x.shape[0], 600, self.head_dim), dtype=x.dtype
+            ),
+        )
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(1)
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", boom)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", boom)
+
+        indexer = dsv4.Indexer(self._indexer_config(dsv4), 4)
+        indexer.set_dtype(mx.bfloat16)
+        out = self._run_indexer(dsv4, indexer)
+        mx.eval(out)
+        assert out.shape == (1, 2, 512)
+        assert indexer_dispatch.native_indexer_disabled() is True
+
+        # Latched: the kernel is not attempted again.
+        self._run_indexer(dsv4, indexer)
+        assert len(calls) == 1
+
+    def test_dspark_topk_value_error_falls_back_without_latch(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        calls = []
+
+        def reject(*args):
+            calls.append(1)
+            raise ValueError("unsupported M3 GLM shape.")
+
+        monkeypatch.setattr(fast, "dspark_fp32_topk_indices", reject)
+
+        # Batched path: >1 rows, every row longer than top-k.
+        indexer = SimpleNamespace(index_topk=8, n_heads=2, scale=0.5)
+        pooled_rows = [
+            mx.zeros((1, 10, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 11, 4), dtype=mx.bfloat16),
+        ]
+        projected_q = mx.zeros((1, 2, 2, 4), dtype=mx.bfloat16)
+        projected_weights = mx.zeros((1, 2, 2), dtype=mx.bfloat16)
+        result = dsv4._batch_indexer_rows(
+            indexer, pooled_rows, projected_q, projected_weights
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 8), (1, 1, 8)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is False
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED is True
+
+        # Grouped path: same-length rows, k == 512 gate.
+        indexer512 = SimpleNamespace(index_topk=512, n_heads=2, scale=0.5)
+        result = dsv4._batch_indexer_rows(
+            indexer512,
+            [mx.zeros((1, 600, 4), dtype=mx.bfloat16)],
+            mx.zeros((1, 2, 1, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 1, 2), dtype=mx.bfloat16),
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 512)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is False
+        # Both paths kept the native kernel armed.
+        assert len(calls) == 2
+
+    def test_dspark_topk_runtime_error_still_latches(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        monkeypatch.setattr(
+            dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED", False
+        )
+        monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED", False)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+
+        def boom(*args):
+            raise RuntimeError("metal command buffer failed")
+
+        monkeypatch.setattr(fast, "dspark_fp32_topk_indices", boom)
+
+        indexer = SimpleNamespace(index_topk=8, n_heads=2, scale=0.5)
+        result = dsv4._batch_indexer_rows(
+            indexer,
+            [
+                mx.zeros((1, 10, 4), dtype=mx.bfloat16),
+                mx.zeros((1, 11, 4), dtype=mx.bfloat16),
+            ],
+            mx.zeros((1, 2, 2, 4), dtype=mx.bfloat16),
+            mx.zeros((1, 2, 2), dtype=mx.bfloat16),
+        )
+        mx.eval(*result)
+        assert [r.shape for r in result] == [(1, 1, 8), (1, 1, 8)]
+        assert dsv4._DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED is True

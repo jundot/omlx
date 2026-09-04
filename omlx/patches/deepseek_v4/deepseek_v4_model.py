@@ -485,6 +485,16 @@ _INDEXER_POOL_TILE = 16384
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
+# Shape/argument rejections from the native kernels surface as ValueError
+# (std::invalid_argument) and are raised before any GPU work. They are
+# per-call conditions -- e.g. a stale extension binary rejecting unaligned
+# prefill tails -- so they must NOT latch the process-wide native-disable
+# flags: warn once and fall back for that call only, keeping the native
+# path armed for later calls with different shapes. Genuine runtime
+# failures (RuntimeError etc.) still latch exactly as before.
+_DEEPSEEK_V4_INDEXER_SHAPE_WARNED = False
+_DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED = False
+_DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = False
 _DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
     "OMLX_DSV4F_M2_MMA_SCORE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
@@ -751,6 +761,19 @@ def _sparse_pooled_attention(
                         int(q_offset),
                         int(compress_ratio),
                         int(local_window),
+                    )
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): per-call
+                # condition, raised before GPU work. Do NOT latch -- keep
+                # the native path armed for later calls.
+                global _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED
+                if not _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED:
+                    _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native sparse attention rejected this shape; "
+                        "MLX fallback for this call only (native path "
+                        "stays armed for later calls): %s",
+                        exc,
                     )
             except Exception as exc:
                 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
@@ -1395,6 +1418,20 @@ class Indexer(nn.Module):
                         bucketed=False,
                     )[:, 0]
                     return mx.sort(indices, axis=-1)
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): raised
+                # before any GPU work and per-call -- e.g. a stale extension
+                # binary rejecting an unaligned prefill tail. Do NOT latch:
+                # later calls with different shapes may succeed natively.
+                global _DEEPSEEK_V4_INDEXER_SHAPE_WARNED
+                if not _DEEPSEEK_V4_INDEXER_SHAPE_WARNED:
+                    _DEEPSEEK_V4_INDEXER_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native indexer top-k rejected this shape; MLX "
+                        "fallback for this call only (native path stays "
+                        "armed for later calls): %s",
+                        exc,
+                    )
             except Exception as exc:
                 disable_native_indexer()
                 logging.getLogger(__name__).warning(
@@ -1451,6 +1488,7 @@ def _batch_indexer_rows(
 ) -> List[Optional[mx.array]]:
     """Select each decode row's pooled indices with grouped FP32 GEMMs."""
     global _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED
+    global _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED
 
     lengths = [int(row.shape[1]) for row in pooled_rows]
     if len(lengths) > 1 and min(lengths) > indexer.index_topk:
@@ -1495,6 +1533,18 @@ def _batch_indexer_rows(
                     indices = fast.dspark_fp32_topk_indices(
                         scores,
                         indexer.index_topk,
+                    )
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): per-call
+                # condition, raised before GPU work. Do NOT latch -- keep
+                # the native path armed for later calls.
+                if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
+                    _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native DSpark top-k rejected this shape; "
+                        "stable-sort fallback for this call only (native "
+                        "path stays armed for later calls): %s",
+                        exc,
                     )
             except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
@@ -1553,6 +1603,18 @@ def _batch_indexer_rows(
 
                 if fast.has_symbol("dspark_fp32_topk_indices"):
                     indices = fast.dspark_fp32_topk_indices(scores, k)
+            except ValueError as exc:
+                # Shape/argument rejection (std::invalid_argument): per-call
+                # condition, raised before GPU work. Do NOT latch -- keep
+                # the native path armed for later calls.
+                if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
+                    _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
+                    logging.getLogger(__name__).warning(
+                        "DSV4 native DSpark top-k rejected this shape; "
+                        "stable-sort fallback for this call only (native "
+                        "path stays armed for later calls): %s",
+                        exc,
+                    )
             except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
                 logging.getLogger(__name__).warning(
