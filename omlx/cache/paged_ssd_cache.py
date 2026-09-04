@@ -2386,46 +2386,70 @@ class PagedSSDCacheManager(CacheManager):
 
         signature_digest = self._gdn_signature_digest(cache_signature)
         final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
-        with self._lock:
-            try:
-                sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
-                sidecar_root.mkdir(parents=True, exist_ok=True)
-                if (
-                    sidecar_root.is_symlink()
-                    or sidecar_root.resolve(strict=True).parent
-                    != self._cache_dir.resolve(strict=True)
-                ):
-                    logger.warning("Rejecting unsafe GDN sidecar root")
-                    return None
-                final_path.parent.mkdir(parents=True, exist_ok=True)
-                if (
-                    final_path.parent.is_symlink()
-                    or final_path.parent.resolve(strict=True).parent
-                    != sidecar_root.resolve(strict=True)
-                ):
-                    logger.warning("Rejecting unsafe GDN sidecar destination")
-                    return None
-                if staged_stat.st_dev != final_path.parent.stat().st_dev:
-                    logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
-                    return None
+        try:
+            # Directory-safety checks and mkdir are pure filesystem
+            # introspection with no dependency on shared index/LRU state, so
+            # they run unlocked; mkdir(exist_ok=True) is safe under
+            # concurrent callers by construction.
+            sidecar_root = self._cache_dir / self._GDN_SIDECAR_DIRNAME
+            sidecar_root.mkdir(parents=True, exist_ok=True)
+            if (
+                sidecar_root.is_symlink()
+                or sidecar_root.resolve(strict=True).parent
+                != self._cache_dir.resolve(strict=True)
+            ):
+                logger.warning("Rejecting unsafe GDN sidecar root")
+                return None
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if (
+                final_path.parent.is_symlink()
+                or final_path.parent.resolve(strict=True).parent
+                != sidecar_root.resolve(strict=True)
+            ):
+                logger.warning("Rejecting unsafe GDN sidecar destination")
+                return None
+            if staged_stat.st_dev != final_path.parent.stat().st_dev:
+                logger.warning("Rejecting cross-filesystem GDN sidecar promotion")
+                return None
+
+            # From here, the index-removal window IS the concurrency guard:
+            # only the single store-cache worker thread ever calls this
+            # method (ThreadPoolExecutor max_workers=1, scheduler.py — "we
+            # never have two stores racing on the same paged_ssd index"), so
+            # commit-vs-commit races on the same key cannot happen. Holding
+            # self._lock only for the two index mutations below — not across
+            # os.replace/fsync/the inline eviction unlinks inside
+            # enforce_size_limit — matches enforce_size_limit's own stated
+            # policy (decide evictions under the lock, unlink outside it) and
+            # keeps the lock available to the inference thread's
+            # latency-sensitive GDN restore/lookup path
+            # (get_gdn_checkpoint_file_with_diagnostic, forget_gdn_checkpoint)
+            # during the slow disk I/O below. Removing `old` from the index
+            # here, before releasing the lock, is what makes the unlocked
+            # window safe: forget_gdn_checkpoint's own remove()+unlink()
+            # (also under self._lock) will see the key already absent and
+            # skip its unlink, so it can never race os.replace for the same
+            # path.
+            with self._lock:
                 old = self._gdn_sidecar_index.remove(
                     source_block_hash, signature_digest
                 )
-                try:
-                    # Temporarily remove the destination from LRU accounting so
-                    # size enforcement cannot evict/unlink the checkpoint being
-                    # replaced. Account for the full incoming file while the old
-                    # entry is protected; on promotion failure the old metadata
-                    # is restored below and its file remains intact.
-                    self._enforce_size_limit_for_new_block(staged_stat.st_size)
-                    os.replace(staged_path, final_path)
-                    _fsync_parent_dir(final_path)
-                    committed_at = time.time()
-                    # os.replace preserves the staging file's timestamps. Stamp
-                    # the actual commit/access time so a restart reconstructs LRU
-                    # order from a meaningful mtime rather than stale staging age.
-                    with contextlib.suppress(OSError):
-                        os.utime(final_path, (committed_at, committed_at))
+            try:
+                # Temporarily removed from LRU accounting above so size
+                # enforcement cannot evict/unlink the checkpoint being
+                # replaced. Account for the full incoming file while the old
+                # entry is protected; on promotion failure the old metadata
+                # is restored below and its file remains intact.
+                self._enforce_size_limit_for_new_block(staged_stat.st_size)
+                os.replace(staged_path, final_path)
+                _fsync_parent_dir(final_path)
+                committed_at = time.time()
+                # os.replace preserves the staging file's timestamps. Stamp
+                # the actual commit/access time so a restart reconstructs LRU
+                # order from a meaningful mtime rather than stale staging age.
+                with contextlib.suppress(OSError):
+                    os.utime(final_path, (committed_at, committed_at))
+                with self._lock:
                     self._gdn_sidecar_index.add(
                         GDNCheckpointMetadata(
                             source_block_hash=source_block_hash,
@@ -2439,16 +2463,17 @@ class PagedSSDCacheManager(CacheManager):
                             last_access=committed_at,
                         )
                     )
-                    return final_path
-                except OSError:
-                    if old is not None and self._is_safe_gdn_sidecar_file(
-                        old.file_path
-                    ):
+                return final_path
+            except OSError:
+                if old is not None and self._is_safe_gdn_sidecar_file(
+                    old.file_path
+                ):
+                    with self._lock:
                         self._gdn_sidecar_index.add(old)
-                    raise
-            except OSError as exc:
-                logger.warning("Failed to commit GDN sidecar: %s", exc)
-                return None
+                raise
+        except OSError as exc:
+            logger.warning("Failed to commit GDN sidecar: %s", exc)
+            return None
 
     def get_gdn_checkpoint_file(
         self, source_block_hash: bytes, cache_signature: str
@@ -3416,6 +3441,14 @@ class PagedSSDCacheManager(CacheManager):
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
+            #
+            # Batch-eval all arrays in one command-buffer submission (mirrors
+            # boundary_snapshot_store's pattern) instead of letting each
+            # _extract_tensor_bytes call trigger its own separate eval —
+            # measured 19ms/48-layer state one-by-one; per-array mx.eval calls
+            # below become no-op re-checks once the arrays are materialized.
+            if arrays:
+                mx.eval(*arrays.values())
             tensors_raw = {}
             for name, arr in arrays.items():
                 tensors_raw[name] = _extract_tensor_bytes(arr)
