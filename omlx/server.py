@@ -1980,6 +1980,7 @@ def init_server(
         scheduler_config=scheduler_config,
     )
     from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.fabric_intent import configure_fabric_intent
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
@@ -1987,6 +1988,7 @@ def init_server(
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
+    configure_fabric_intent(base_path)
     configure_strategy_benchmark_store(base_path)
 
     # Discover models (use pinned models from settings file)

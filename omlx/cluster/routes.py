@@ -49,12 +49,14 @@ from .discovery import (
     record_peer_transports,
     verify_pairing_token,
 )
+from .doctor import run_fabric_doctor
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain
+from .guidance import explain, explain_code
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    evict_remote_local_models,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
@@ -97,6 +99,7 @@ from .staging import (
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
+    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
     remote_model_dir,
@@ -116,6 +119,7 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
+from .vpn import detect_vpn, full_tunnel_warning, hostile_networks
 from .worker_bundle import (
     build_cuda_join_command,
     cuda_bootstrap_program,
@@ -370,6 +374,176 @@ def _record_cluster_incident(
         )
     except Exception:  # noqa: BLE001 - logging must never outrank the failure
         return
+
+
+# A full-tunnel VPN is a standing condition, not an event: one INFO incident
+# the first time each host shows it, not one per autoconfigure poll. In-memory
+# is enough — a server restart re-announcing a still-hungry VPN is correct.
+_VPN_FULL_TUNNEL_SEEN: set[str] = set()
+_VPN_FULL_TUNNEL_LOCK = threading.Lock()
+
+# The freshest admin port each peer advertised in its ClusterStatus (C5).
+# There is no server-side peer registry yet (Section A's PairedPeer will own
+# this field); until then, every capability probe that flows through this
+# module deposits the advertised port here so /node-budgets can aim the fast
+# ceiling probe at the peer's real server instead of guessing. In-memory is
+# correct: a restart simply re-learns the port from the next probe.
+_PEER_ADMIN_PORTS: dict[str, int] = {}
+_PEER_ADMIN_PORTS_LOCK = threading.Lock()
+# One WARN per dead advertised port, not one per dashboard poll.
+_CEILING_FALLBACK_SEEN: set[tuple[str, int]] = set()
+
+
+def _peer_key(ssh_target: str) -> str:
+    """One cache key for ``studio.local`` and ``user@studio.local`` alike."""
+
+    return ssh_target.strip().rsplit("@", 1)[-1].lower()
+
+
+def _note_peer_admin_port(probe_result: Any) -> None:
+    """Remember the admin port a capability probe just saw a peer advertise.
+
+    Best-effort by design: a probe payload without the field (older peer,
+    hardware-inventory fallback) simply teaches nothing, and the fast path
+    keeps its legacy port guesses for that peer.
+    """
+
+    if not isinstance(probe_result, dict):
+        return
+    status = probe_result.get("status")
+    if not isinstance(status, dict):
+        return
+    node = status.get("node")
+    if not isinstance(node, dict):
+        return
+    try:
+        port = int(node.get("admin_port") or 0)
+    except (TypeError, ValueError):
+        return
+    ssh_target = str(probe_result.get("ssh") or "")
+    if port <= 0 or not ssh_target:
+        return
+    with _PEER_ADMIN_PORTS_LOCK:
+        _PEER_ADMIN_PORTS[_peer_key(ssh_target)] = port
+
+
+def _advertised_admin_port(ssh_target: str) -> int:
+    with _PEER_ADMIN_PORTS_LOCK:
+        return _PEER_ADMIN_PORTS.get(_peer_key(ssh_target), 0)
+
+
+# Drift is a standing condition too: one WARN per (subnet, kind), not one per
+# fabric read. A restart re-announcing still-drifted addressing is correct.
+_FABRIC_DRIFT_SEEN: set[tuple[str, str]] = set()
+_FABRIC_DRIFT_LOCK = threading.Lock()
+
+
+def _detect_fabric_drift(
+    hosts: list[str], interfaces: dict[str, Any]
+) -> dict[str, Any] | None:
+    """C5's drift watchdog, run where fresh interface readings are in hand.
+
+    Returns the ``DriftFinding`` as plain data (plus the intent's
+    ``addressing``) for the caller to act on, or None when there is no
+    recorded intent for this pair, the store is unconfigured, or live
+    addressing still matches the record. Poll-driven by design — no
+    wake/network-change watcher exists or is wanted; one dashboard tick is
+    when anyone can act on drift anyway.
+    """
+
+    from .fabric_intent import detect_drift, get_fabric_intent
+
+    try:
+        store = get_fabric_intent()
+    except RuntimeError:
+        return None
+    intent = store.current()
+    if intent is None or frozenset(intent.hosts) != frozenset(hosts):
+        return None
+    try:
+        intent_network = ipaddress.ip_network(intent.subnet)
+    except ValueError:
+        return None
+    try:
+        hostile = hostile_networks(hosts, interfaces=interfaces)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        hostile = ()
+    # The intent's own subnet sits on an interface, so the raw hostile set
+    # always contains it; that is not a collision with itself (the same
+    # ``own_networks`` filter configure_link applies).
+    collision_set = tuple(
+        net
+        for net in hostile
+        if net.version != intent_network.version
+        or not net.subnet_of(intent_network)
+    )
+
+    def collides(candidate: ipaddress.IPv4Network) -> bool:
+        return any(
+            candidate.version == net.version and candidate.overlaps(net)
+            for net in collision_set
+        )
+
+    finding = detect_drift(intent, interfaces.values(), collides=collides)
+    if finding is None:
+        return None
+    return {
+        "kind": finding.kind,
+        "live": finding.live,
+        "expected": finding.expected,
+        "auto_restore": finding.auto_restore,
+        "incident": finding.incident,
+        "addressing": intent.addressing,
+    }
+
+
+def _note_fabric_drift(fabric: dict[str, Any]) -> None:
+    """Act on a drift finding: confess the ones that need consent (C5).
+
+    ``auto_restore`` findings (networksetup-recorded intent, collision check
+    still passing) are deliberately not incidents and not acted on here: the
+    service configuration persists, and the next link setup re-asserts the
+    recorded intent via ``configure_link``'s tier 2 without any new consent.
+    Everything else becomes one deduped WARN inviting a consented Fabric
+    Doctor re-address — never a silent privileged action.
+    """
+
+    drift = fabric.get("drift")
+    if not isinstance(drift, dict) or drift.get("auto_restore"):
+        return
+    message = str(drift.get("incident") or "")
+    if not message:
+        return
+    key = (str(drift.get("expected") or ""), str(drift.get("kind") or ""))
+    with _FABRIC_DRIFT_LOCK:
+        if key in _FABRIC_DRIFT_SEEN:
+            return
+        _FABRIC_DRIFT_SEEN.add(key)
+    _record_cluster_incident(Severity.WARN, "fabric_drift", message)
+
+
+def _note_full_tunnel_vpns(fabric: dict[str, Any]) -> None:
+    """Record the C4 pre-warning for each newly seen full-tunnel VPN host.
+
+    Detection only warns and steers address selection; the incident exists so
+    the condition survives page reloads next to the banner. Severity is INFO
+    because the selection below is expected to route around the tunnel.
+    """
+
+    for entry in fabric.get("hosts") or ():
+        vpn = entry.get("vpn") or {}
+        if not vpn.get("full_tunnel"):
+            continue
+        host = str(entry.get("host") or "")
+        with _VPN_FULL_TUNNEL_LOCK:
+            if host in _VPN_FULL_TUNNEL_SEEN:
+                continue
+            _VPN_FULL_TUNNEL_SEEN.add(host)
+        _record_cluster_incident(
+            Severity.INFO,
+            "vpn_full_tunnel",
+            full_tunnel_warning(host, str(vpn.get("client") or "")),
+        )
 
 
 class ClusterPlanNodeRequest(BaseModel):
@@ -930,6 +1104,12 @@ def _resolve_fabric(
     """
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
+    # VPN posture rides along on the reading already in hand. It is a warning
+    # and a selection hint only — a clean addressing read costs no extra SSH,
+    # and nothing here promotes the link past what the probes below prove.
+    vpn_profiles = {
+        host: detect_vpn(host, interfaces=interfaces[host]) for host in hosts
+    }
     verify = verifier or verify_link_reachability
     verified_links: dict[
         tuple[tuple[str, str, str], ...], tuple[bool, str]
@@ -1008,6 +1188,10 @@ def _resolve_fabric(
         "backend_reason": reason,
         "blocker": blocker,
         "fell_back": fell_back,
+        # C5 drift watchdog: the recorded fabric intent compared against the
+        # interface reading already in hand. Data only — the autoconfigure
+        # caller decides between silence, restore, and a WARN incident.
+        "drift": _detect_fabric_drift(hosts, interfaces),
         "link": (unresolved or links[0]).to_dict(),
         "rdma": rdma,
         "hosts": [
@@ -1016,6 +1200,7 @@ def _resolve_fabric(
                 "ips": [link.source.address] if link.source else [],
                 "interface": link.source.interface if link.source else "",
                 "rdma": list(matrix.rows[index]) if backend != "ring" else [],
+                "vpn": vpn_profiles[host].to_dict(),
             }
             for index, (host, link) in enumerate(zip(hosts, links))
         ],
@@ -1152,6 +1337,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 peer_statuses[host.node_id] = await asyncio.to_thread(
                     probe_remote_host, host.ssh
                 )
+                _note_peer_admin_port(peer_statuses[host.node_id])
             except (DistributedLaunchError, OSError, ValueError):
                 peer_statuses[host.node_id] = None
     issues = preflight_issues(
@@ -1278,6 +1464,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 warnings.append(f"Address discovery failed: {fabric_error}")
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
+        # B1 consumer of the C4 detection: the pre-warning must survive page
+        # reloads, so the first sighting per host becomes an INFO incident.
+        _note_full_tunnel_vpns(fabric)
+        # B1 consumer of the C5 watchdog: drifted addressing that needs a
+        # consented re-address becomes one WARN; auto-restorable drift stays
+        # silent (configure_link tier 2 re-asserts it on the next setup).
+        _note_fabric_drift(fabric)
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
@@ -1479,9 +1672,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
 
 
 class ClusterGuidanceRequest(BaseModel):
-    """A failure message the dashboard wants turned into next steps."""
+    """A failure message the dashboard wants turned into next steps.
+
+    ``code`` is the structured key (Guidance.code / readiness-ladder state
+    codes); when present it wins over message-regex matching.
+    """
 
     message: str = Field(default="", max_length=4096)
+    code: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/guidance")
@@ -1493,7 +1691,7 @@ async def cluster_guidance(request: ClusterGuidanceRequest):
     already depend on, and an explanation is only ever needed after a failure.
     """
 
-    return explain(request.message).to_dict()
+    return explain_code(request.code, request.message).to_dict()
 
 
 class ClusterStageRequest(BaseModel):
@@ -1792,6 +1990,173 @@ async def cluster_stage_status(job_id: str):
     return snapshot
 
 
+class ClusterDoctorRequest(BaseModel):
+    """The two link endpoints one Fabric Doctor run inspects."""
+
+    hosts: list[str] = Field(min_length=2, max_length=2)
+
+
+# The Doctor's own tiny job dict, mirroring the staging-job pattern above.
+# Deliberately minimal and generic — job_id/phase/findings/verdict — so a
+# later generalized job store (B2) can absorb it without an API change.
+_DOCTOR_JOBS: dict[str, dict[str, Any]] = {}
+_DOCTOR_JOBS_LOCK = threading.Lock()
+_MAX_DOCTOR_JOBS = 16
+_DOCTOR_JOB_IN_FLIGHT_PHASES = {"queued", "running"}
+
+
+class DoctorJobConflictError(RuntimeError):
+    """Another Fabric Doctor run is already in flight."""
+
+
+def _doctor_job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS.get(job_id)
+        if job is None:
+            return None
+        return json.loads(json.dumps(job))
+
+
+def _record_doctor_job(job: dict[str, Any]) -> None:
+    """Register a new job, refusing it if one is already in flight.
+
+    The Doctor spawns real SSH probes and a real collective-probe subprocess;
+    running two at once contends for the same fabric and ports. The client
+    already disables its own button while a run is active, but that is
+    cosmetic — this lock-guarded check-and-insert is the actual guard, closing
+    the race a second tab, a stale page, or a retried request would otherwise
+    hit (#2878 review).
+    """
+
+    with _DOCTOR_JOBS_LOCK:
+        active = next(
+            (
+                existing
+                for existing in _DOCTOR_JOBS.values()
+                if existing.get("phase") in _DOCTOR_JOB_IN_FLIGHT_PHASES
+            ),
+            None,
+        )
+        if active is not None:
+            raise DoctorJobConflictError(
+                f"A Fabric Doctor run ({active['job_id']}) is already in "
+                "progress. Wait for it to finish before starting another."
+            )
+        if len(_DOCTOR_JOBS) >= _MAX_DOCTOR_JOBS:
+            finished = [
+                key
+                for key, value in _DOCTOR_JOBS.items()
+                if value.get("phase") in {"completed", "failed"}
+            ]
+            if finished:
+                _DOCTOR_JOBS.pop(finished[0], None)
+        _DOCTOR_JOBS[job["job_id"]] = job
+
+
+def _update_doctor_job(job_id: str, update: Any) -> None:
+    with _DOCTOR_JOBS_LOCK:
+        job = _DOCTOR_JOBS[job_id]
+        update(job)
+        job["updated_at"] = time.time()
+
+
+def _run_doctor_job(job_id: str, hosts: tuple[str, ...]) -> None:
+    """Run the ladder checks and land the report in the incident feed.
+
+    The Doctor takes tens of seconds (SSH probes plus a bounded collective
+    handshake), so it runs off-thread behind a job id. Every completed run
+    records exactly one incident whose severity follows the verdict, and the
+    report stays queryable through the job dict and ``/diagnostics``.
+    """
+
+    _update_doctor_job(job_id, lambda job: job.update(phase="running"))
+    try:
+        report = run_fabric_doctor(hosts)
+    except Exception as exc:  # noqa: BLE001 - the job must always conclude
+        message = f"Fabric Doctor run failed: {type(exc).__name__}: {exc}"
+
+        def fail(job: dict[str, Any]) -> None:
+            job.update(phase="failed", error=str(_redact_diagnostic(message)))
+
+        _update_doctor_job(job_id, fail)
+        _record_cluster_incident(
+            Severity.ERROR, "fabric_doctor_failed", message, job_id=job_id
+        )
+        return
+
+    findings = [finding.to_dict() for finding in report.findings]
+
+    def complete(job: dict[str, Any]) -> None:
+        job.update(
+            phase="completed",
+            findings=findings,
+            verdict=report.verdict,
+        )
+
+    _update_doctor_job(job_id, complete)
+    states = {finding.state for finding in report.findings}
+    severity = (
+        Severity.ERROR
+        if "fail" in states
+        else Severity.WARN
+        if "skipped" in states or "warn" in states
+        else Severity.INFO
+    )
+    _record_cluster_incident(
+        severity, "fabric_doctor", report.verdict, job_id=job_id
+    )
+
+
+@router.post("/doctor", status_code=202)
+async def cluster_doctor_start(request: ClusterDoctorRequest):
+    """Start one Fabric Doctor run against a pair of link endpoints."""
+
+    hosts = tuple(host.strip() for host in request.hosts)
+    for host in hosts:
+        if _local_ssh_target(host):
+            continue
+        try:
+            validate_ssh_target(host)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job_id = secrets.token_hex(12)
+    try:
+        _record_doctor_job(
+            {
+                "job_id": job_id,
+                "phase": "queued",
+                "hosts": list(hosts),
+                "findings": [],
+                "verdict": "",
+                "error": "",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+        )
+    except DoctorJobConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    thread = threading.Thread(
+        target=_run_doctor_job,
+        args=(job_id, hosts),
+        name=f"omlx-fabric-doctor-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id}
+
+
+@router.get("/doctor/{job_id}")
+async def cluster_doctor_status(job_id: str):
+    """Phase, findings, and verdict for one Fabric Doctor run."""
+
+    if not re.fullmatch(r"[0-9a-f]{24}", job_id):
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    snapshot = _doctor_job_snapshot(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="doctor job not found")
+    return snapshot
+
+
 @router.get("/status")
 async def cluster_status(route_to: str | None = None):
     """Return this node's read-only distributed capability snapshot."""
@@ -1897,6 +2262,10 @@ async def cluster_diagnostics():
         staging_jobs = json.loads(
             json.dumps(list(_STAGING_JOBS.values())[-_MAX_STAGING_JOBS:])
         )
+    with _DOCTOR_JOBS_LOCK:
+        doctor_reports = json.loads(
+            json.dumps(list(_DOCTOR_JOBS.values())[-_MAX_DOCTOR_JOBS:])
+        )
     incidents: list[dict[str, Any]] = []
     try:
         incidents = [
@@ -1913,6 +2282,7 @@ async def cluster_diagnostics():
         "registry": registry_payload,
         "peer_health": peer_health,
         "staging_jobs": staging_jobs,
+        "fabric_doctor": doctor_reports,
         "incidents": incidents,
         "errors": errors,
     }
@@ -2393,11 +2763,16 @@ async def cluster_peer_probe(request: ClusterPeerProbeRequest):
     """Probe a trusted known_hosts peer without changing either Mac."""
 
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             probe_remote_host,
             request.ssh,
             route_to=request.route_to,
         )
+        # The freshest status this coordinator holds for the peer: remember
+        # the admin port it advertised so the fast ceiling probe (C5) can
+        # target the real server.
+        _note_peer_admin_port(result)
+        return result
     except DistributedLaunchError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2881,7 +3256,8 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
         capacity_bytes = 0
         capacity_source: str | None = None
         if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
+            admin_port = _advertised_admin_port(host.ssh)
+            probe = await asyncio.to_thread(
                 probe_remote_admission_ceiling,
                 host.ssh,
                 # No fallback to sys.executable: inside the packaged app that
@@ -2889,8 +3265,30 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
                 # import oMLX, so every poll 503'd (#2680). Unknown means the
                 # probe discovers the peer's own interpreter.
                 python_executable=host.python_executable,
+                admin_port=admin_port,
             )
+            capacity_bytes = probe.ceiling_bytes
             capacity_source = "admission_ceiling"
+            if not probe.fast_probe_ok and admin_port > 0:
+                # The peer's own advertised port did not answer: the ceiling
+                # above came from the slower in-process computation. Confess
+                # once per dead port, not once per dashboard poll.
+                key = (_peer_key(host.ssh), admin_port)
+                with _PEER_ADMIN_PORTS_LOCK:
+                    seen = key in _CEILING_FALLBACK_SEEN
+                    _CEILING_FALLBACK_SEEN.add(key)
+                if not seen:
+                    _record_cluster_incident(
+                        Severity.WARN,
+                        "ceiling_fast_probe_fallback",
+                        f"fast ceiling probe unreachable on port {admin_port}; "
+                        "using slower local computation"
+                        + (
+                            f" ({probe.fast_probe_error})"
+                            if probe.fast_probe_error
+                            else ""
+                        ),
+                    )
         budget = await asyncio.to_thread(
             suggest_budget,
             role=request.roles.get(host.node_id, "headless"),
@@ -3105,6 +3503,161 @@ async def cluster_deployments():
         return get_cluster_registry().to_dict()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+# The memory guard names the rank and node it refused, and the launcher
+# carries that line back verbatim: ``rank 1 (node): InsufficientMemoryError``.
+_MEMORY_FAILURE_RANK = re.compile(
+    r"rank (\d+) \(([^)]+)\):\s*InsufficientMemoryError"
+)
+
+
+def _memory_squeezed_hosts(
+    deployment: ClusterDeployment, detail: str
+) -> list[ClusterHost]:
+    """Hosts implicated in a memory-attributable activation failure."""
+
+    if "InsufficientMemoryError" not in detail:
+        return []
+    by_node_id = {host.node_id: host for host in deployment.hosts}
+    implicated: dict[str, ClusterHost] = {}
+    for match in _MEMORY_FAILURE_RANK.finditer(detail):
+        rank, node_id = int(match.group(1)), match.group(2)
+        host = by_node_id.get(node_id)
+        if host is None and 0 <= rank < len(deployment.hosts):
+            host = deployment.hosts[rank]
+        if host is not None:
+            implicated[host.node_id] = host
+    # A memory-shaped failure that names no rank still deserves recovery on
+    # every node rather than none.
+    return list(implicated.values()) or list(deployment.hosts)
+
+
+async def _evict_local_models_on_host(
+    host: ClusterHost, reason: str
+) -> dict[str, Any]:
+    """Free one node's standalone models; the coordinator needs no SSH hop."""
+
+    if not _local_ssh_target(host.ssh):
+        return await asyncio.to_thread(
+            evict_remote_local_models,
+            host.ssh,
+            python_executable=host.python_executable,
+        )
+    pool = _engine_pool()
+    outcome: dict[str, Any] = {
+        "evicted": [],
+        "draining": [],
+        "skipped_pinned": [],
+        "errors": [],
+    }
+    for model_id in list(pool.get_loaded_model_ids()):
+        entry = pool.get_entry(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or getattr(entry, "source_type", "") == "cluster"
+        ):
+            continue
+        if entry.is_pinned:
+            outcome["skipped_pinned"].append(model_id)
+            continue
+        try:
+            unloaded = await pool.request_unload(model_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - collect, never mask
+            outcome["errors"].append(f"{model_id}: {exc}")
+            continue
+        (outcome["evicted"] if unloaded else outcome["draining"]).append(model_id)
+    return outcome
+
+
+async def _evict_competing_local_models(
+    deployment: ClusterDeployment | None, detail: str
+) -> str:
+    """After a memory-attributed launch failure, free the implicated Macs.
+
+    A standalone model loaded through a node's own server competes with the
+    cluster rank admitted onto the same unified memory, and every retry then
+    fails at a higher ceiling because the competitor keeps growing. Evict it
+    on exactly the nodes the failure names, so the very next retry is made
+    against the memory the plan was admitted for. This never raises and never
+    replaces the original failure — it appends what was freed so the operator
+    knows a retry is now worth making. Pinned models are left loaded.
+    """
+
+    if deployment is None:
+        return detail
+    hosts = _memory_squeezed_hosts(deployment, detail)
+    if not hosts:
+        return detail
+    reason = (
+        f"cluster activation of {deployment.deployment_id} "
+        "failed for lack of memory"
+    )
+    freed: list[str] = []
+    pending: list[str] = []
+    pinned: list[str] = []
+    problems: list[str] = []
+    for host in hosts:
+        try:
+            outcome = await _evict_local_models_on_host(host, reason)
+        except Exception as exc:  # noqa: BLE001 - recovery must not mask
+            problems.append(f"{host.node_id}: {exc}")
+            continue
+        freed.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("evicted") or []
+        )
+        pending.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("draining") or []
+        )
+        pinned.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("skipped_pinned") or []
+        )
+        problems.extend(
+            f"{host.node_id}: {error}" for error in outcome.get("errors") or []
+        )
+    notes: list[str] = []
+    if freed:
+        notes.append(
+            "oMLX unloaded the competing local model(s) "
+            f"{', '.join(freed)}; retry the activation."
+        )
+    if pending:
+        notes.append(
+            f"{', '.join(pending)} will unload once active requests "
+            "finish; retry the activation after that."
+        )
+    if pinned:
+        notes.append(
+            f"Pinned model(s) {', '.join(pinned)} were left loaded; unpin or "
+            "unload them if the retry still runs out of memory."
+        )
+    if problems:
+        notes.append(
+            "Local-model eviction could not complete everywhere: "
+            + "; ".join(problems)
+        )
+    if not notes:
+        notes.append(
+            "No competing local models were loaded on the implicated node(s)."
+        )
+    if freed or pending or pinned:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery",
+            " ".join(notes),
+            deployment_id=deployment.deployment_id,
+        )
+    if problems:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery_failed",
+            "Local-model eviction after the memory failure did not complete: "
+            + "; ".join(problems),
+            deployment_id=deployment.deployment_id,
+        )
+    return detail + "\n" + " ".join(notes)
 
 
 @router.post("/deployments")
@@ -3334,14 +3887,26 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
+        detail = str(exc)
         await asyncio.to_thread(
             _record_cluster_incident,
             Severity.ERROR,
             "activation_launch_failed",
-            str(exc),
+            detail,
             deployment_id=deployment.deployment_id if deployment else None,
         )
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        try:
+            detail = await _evict_competing_local_models(deployment, detail)
+        except Exception:  # noqa: BLE001 - recovery must never mask the failure
+            await asyncio.to_thread(
+                _record_cluster_incident,
+                Severity.WARN,
+                "activation_memory_recovery_failed",
+                "Local-model eviction after the memory failure crashed; the "
+                "implicated nodes may still hold a competing model.",
+                deployment_id=deployment.deployment_id if deployment else None,
+            )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except ModelNotFoundError as exc:
         await asyncio.to_thread(
             _record_cluster_incident,
