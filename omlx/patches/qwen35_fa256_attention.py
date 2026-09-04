@@ -161,7 +161,20 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
         return False
     if sinks is not None:
         return False
-    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+    # Route only on an explicit "causal" mask, never on None. MLX's own
+    # scaled_dot_product_attention treats mask=None as "no mask at all"
+    # (unrestricted attention), but this kernel is always invoked below
+    # with causal=True -- silently causal-izing a caller that genuinely
+    # intended unrestricted attention would be a correctness bug. No
+    # currently-reachable head_dim=256 caller in this codebase actually
+    # passes mask=None at a routable q_len (audited: every mask=None call
+    # site is either single-token decode, already excluded by the q_len
+    # gate above, or a truncated-key loop where None correctly means "no
+    # mask over the already-causal-truncated keys"), so this only closes a
+    # latent hazard for future callers -- it does not change today's
+    # routing decisions.
+    # See docs/qwen35-hardening-and-optimization.md E4.
+    if not (isinstance(mask, str) and mask == "causal"):
         return False
     if keys.ndim != 4:
         return False

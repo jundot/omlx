@@ -79,7 +79,12 @@ def test_route_gate_is_qwen_fa256_only():
 
     q, k, _ = _qkv(128, 2048)
     assert patch._should_route(q, k, None, "causal", None, min_kv_len=2048)
-    assert patch._should_route(q, k, None, None, None, min_kv_len=2048)
+    # E4: mask=None means "no mask" in MLX's own semantics, but this kernel
+    # is always invoked with causal=True -- routing on None would silently
+    # causal-ize a caller that intended unrestricted attention. Only the
+    # literal "causal" string routes.
+    # See docs/qwen35-hardening-and-optimization.md E4.
+    assert not patch._should_route(q, k, None, None, None, min_kv_len=2048)
     # any q%kv==0 GQA layout routes (issue #2155): the MoE 16/2 layout is
     # the case the relaxation exists for
     assert patch._should_route(q[:, :12], k, None, "causal", None, 2048)
