@@ -131,6 +131,9 @@ struct StatusScreen: View {
             await vm.start(client: services.client)
         }
         .onDisappear { vm.stop() }
+        .onChange(of: services.serverState) { _, newState in
+            if !newState.isRunningLike { vm.clearOnServerStopped() }
+        }
         .confirmationDialog(
             vm.scope == "alltime"
                 ? String(localized: "status.confirm.clear_alltime",
@@ -692,7 +695,14 @@ private struct UpdatesSection: View {
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
-            Text(String(localized: "status.updates.available_secondary",
+            // A download failure reverts state to .available with lastError
+            // set (UpdateController's onError, and the two dmgURL-missing
+            // paths in runCheck/installAndRestart) — this line used to show
+            // "Ready to download" over that error unconditionally, so a
+            // network drop mid-download silently reverted to "update
+            // available" with the promised relaunch never happening and no
+            // visible failure anywhere (§G1). Mirrors .idle's fallback below.
+            Text(updates.lastError ?? String(localized: "status.updates.available_secondary",
                         defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
                         comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
                 .font(.omlxText(11))
@@ -704,7 +714,11 @@ private struct UpdatesSection: View {
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textSecondary)
         case .ready(let upd):
-            Text(String(localized: "status.updates.ready_secondary",
+            // No current failure path leaves state == .ready with lastError
+            // set (performSwap's failure reverts to .idle), but fall back
+            // the same way as .available/.idle defensively rather than
+            // assuming that stays true.
+            Text(updates.lastError ?? String(localized: "status.updates.ready_secondary",
                         defaultValue: "\(upd.version) is ready to install",
                         comment: "Secondary update status line once the staged bundle is ready; placeholder is the version"))
                 .font(.omlxText(11))

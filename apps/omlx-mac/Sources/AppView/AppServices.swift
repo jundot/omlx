@@ -94,9 +94,23 @@ final class AppServices: NSObject {
         serverState = proc.state
     }
 
+    /// Broadcast whenever `config` changes, so consumers that captured a
+    /// snapshot at construction (the menubar's stats poller) can re-read the
+    /// current value instead of one that quietly went stale — the API-key
+    /// desync this fixes (§F1): SecurityScreenVM.applyApiKey routes through
+    /// here now instead of calling client.configure(...) directly, so this
+    /// is also what keeps the menubar and web-dashboard auto-login current
+    /// after a key change.
+    static let configDidChangeNotification = Notification.Name("com.omlx.app.AppServices.configDidChange")
+
     func updateConfig(_ next: AppConfig) {
         self.config = next
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
+        NotificationCenter.default.post(
+            name: Self.configDidChangeNotification,
+            object: self,
+            userInfo: ["config": next]
+        )
     }
 
     func setAutoStartOnLaunch(_ enabled: Bool, persist: Bool = true) throws {

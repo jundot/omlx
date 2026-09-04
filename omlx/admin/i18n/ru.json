@@ -1130,5 +1130,9 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
-  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы.",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?",
+  "js.error.save_claude_code_settings_failed": "Failed to save Claude Code settings",
+  "js.error.save_integration_settings_failed": "Failed to save integration settings",
+  "models.downloader.ms_checking": "Checking ModelScope availability…"
 }

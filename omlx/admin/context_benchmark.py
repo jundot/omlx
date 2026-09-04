@@ -73,7 +73,7 @@ _ABORT_EVIDENCE_SAFETY = 0.9
 # applied; a failed one keeps the last completed value.
 _EXTENSION_FACTOR = 1.2
 
-_CTX_TERMINAL_TYPES = frozenset({"done", "error"})
+_CTX_TERMINAL_TYPES = frozenset({"done", "error", "cancelled"})
 
 # Overall progress bands per phase (0-100).
 _PROGRESS_BANDS = {
@@ -772,7 +772,7 @@ async def run_context_benchmark(run: ContextBenchmarkRun, engine_pool: Any) -> N
     except asyncio.CancelledError:
         run.status = "cancelled"
         run.error_message = "Context benchmark cancelled by user"
-        await _send_event(run, {"type": "error", "message": run.error_message})
+        await _send_event(run, {"type": "cancelled", "message": run.error_message})
         with contextlib.suppress(Exception):
             await engine_pool._unload_engine(request.model_id)
 
