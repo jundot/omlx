@@ -62,7 +62,7 @@ def test_apply_profile_surfaces_server_validation_error():
 
     assert "this.profileError = '';" in method
     assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
+    assert "this.profileError = this.apiErrorMessage(data.detail, 'Failed to apply profile');" in method
     assert "this.profileError = String(e);" in method
 
 
