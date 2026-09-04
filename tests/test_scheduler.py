@@ -3539,6 +3539,87 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_benchmark_trace_memory_fields_gated_to_benchmark_requests(
+        self, mock_tokenizer, tmp_path, caplog
+    ):
+        """New per-chunk memory fields emit only for benchmark_trace
+        requests; normal inference logs stay unchanged."""
+        import logging as _logging
+
+        model = self._hybrid_model()
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        def _request(trace: bool) -> Request:
+            request = Request(
+                request_id="trace-gating",
+                prompt=list(range(4097)),
+                sampling_params=SamplingParams(),
+            )
+            request.prompt_token_ids = list(range(4097))
+            request.num_prompt_tokens = 4097
+            request.benchmark_trace = trace
+            return request
+
+        try:
+            with caplog.at_level(_logging.INFO, logger="omlx.scheduler"):
+                with patch.object(scheduler, "_emit_prefill_boundary_snapshot"):
+                    scheduler._do_external_prefill(
+                        _request(trace=True),
+                        list(range(4097)),
+                        model.make_cache(),
+                    )
+            traced = [
+                record.getMessage()
+                for record in caplog.records
+                if "[benchmark-prefill]" in record.getMessage()
+            ]
+            assert traced, "benchmark_trace request must emit chunk records"
+            for line in traced:
+                for field in (
+                    "phys_pre=",
+                    "phys_post=",
+                    "phys_post_clear=",
+                    "mx_active=",
+                    "mx_peak=",
+                    "predicted_transient=",
+                    "measured_delta=",
+                    "reclaim_recent=",
+                    "guard_cap=",
+                    "guard_headroom=",
+                    "priority=",
+                    "sdpa_stock=",
+                    "sdpa_bounded=",
+                    "sdpa_first_switch_kv=",
+                ):
+                    assert field in line
+
+            caplog.clear()
+            with caplog.at_level(_logging.INFO, logger="omlx.scheduler"):
+                with patch.object(scheduler, "_emit_prefill_boundary_snapshot"):
+                    scheduler._do_external_prefill(
+                        _request(trace=False),
+                        list(range(4097)),
+                        model.make_cache(),
+                    )
+            assert not [
+                record.getMessage()
+                for record in caplog.records
+                if "[benchmark-prefill]" in record.getMessage()
+            ], "normal requests must not emit benchmark trace lines"
+        finally:
+            scheduler.shutdown()
+
 
 class TestPeriodicClearGating:
     """Tests for the conditional periodic clear (#978/#1040 mitigation)."""

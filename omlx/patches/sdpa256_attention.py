@@ -64,6 +64,46 @@ _FORCE_TILED: bool | None = None
 # INFO; repeats stay silent to keep the hot path quiet.
 _TILED_ROUTE_LOGGED: "set[str]" = set()
 
+# Content-free route counters for benchmark correlation: how often the
+# wrapper served each path and the KV length at the first bounded switch.
+# Opt-in (OMLX_SDPA256_ROUTE_STATS=1): the wrapper runs on every SDPA call of
+# every decode step, so the counters must add nothing to the hot path unless
+# they are actually being collected.
+_ROUTE_STATS_ENABLED: bool = os.environ.get(
+    "OMLX_SDPA256_ROUTE_STATS", ""
+).strip() == "1"
+_ROUTE_STATS = {
+    "stock_calls": 0,
+    "bounded_calls": 0,
+    "first_bounded_kv_len": 0,
+}
+
+
+def get_route_snapshot() -> dict[str, int]:
+    """Cumulative route counters since the patch was applied."""
+    return dict(_ROUTE_STATS)
+
+
+def _set_route_stats_enabled(enabled: bool) -> None:
+    global _ROUTE_STATS_ENABLED
+    _ROUTE_STATS_ENABLED = bool(enabled)
+
+
+def _reset_route_stats() -> None:
+    for key in _ROUTE_STATS:
+        _ROUTE_STATS[key] = 0
+
+
+def _note_route_call(bounded: bool, kv_len: int = 0) -> None:
+    if not _ROUTE_STATS_ENABLED:
+        return
+    if bounded:
+        _ROUTE_STATS["bounded_calls"] += 1
+        if _ROUTE_STATS["first_bounded_kv_len"] == 0 and kv_len > 0:
+            _ROUTE_STATS["first_bounded_kv_len"] = int(kv_len)
+    else:
+        _ROUTE_STATS["stock_calls"] += 1
+
 
 def _note_tiled_route(reason: str, detail: str) -> None:
     if reason in _TILED_ROUTE_LOGGED:
@@ -330,7 +370,9 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         sinks: mx.array | None = None,
     ) -> mx.array:
         if _should_route(queries, keys, cache, mask, sinks):
+            _note_route_call(True, keys.shape[-2])
             return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
+        _note_route_call(False)
         return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
     mlx_base.scaled_dot_product_attention = patched_sdpa
@@ -375,7 +417,9 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                 sinks=None,
             ) -> mx.array:
                 if _should_route(queries, keys, cache, mask, sinks):
+                    _note_route_call(True, keys.shape[-2])
                     return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
+                _note_route_call(False)
                 return original_vlm_sdpa(
                     queries, keys, values, cache, scale, mask, sinks
                 )
