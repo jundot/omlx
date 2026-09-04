@@ -295,6 +295,74 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     assert "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false" in state
 
 
+def test_create_profile_sends_expose_as_model_in_body():
+    # §3 Theme A / 1.1 of docs/named-profile-model-list-feature.md: exposing
+    # is a one-step choice at create time, not a second trip through the
+    # edit dialog after the fact.
+    script = _dashboard_script()
+    method = script.split("async createProfile() {", 1)[1].split(
+        "\n            async applyProfileToForm", 1
+    )[0]
+    assert "expose_as_model: !!this.newProfile.expose_as_model" in method
+
+
+def test_new_profile_reset_sites_include_expose_as_model():
+    # All three places that reset `newProfile` (initial data, template
+    # form-open, and the post-create reset) must agree on shape, or a
+    # stale field silently persists across create attempts.
+    script = _dashboard_script()
+    html = _model_settings_template()
+    assert script.count("expose_as_model: false") >= 2
+    assert "expose_as_model:false" in html
+
+
+def test_new_profile_form_has_expose_toggle_and_live_id_preview():
+    html = _model_settings_template()
+    form = html.split(
+        '<!-- New profile inline form (model scope) -->', 1
+    )[1].split("<!-- Edit profile inline dialog", 1)[0]
+    assert "newProfile.expose_as_model = !newProfile.expose_as_model" in form
+    assert "modal.model_settings.profiles.exposed_as" in form
+    # Preview composes exactly the ID that will show up in /v1/models --
+    # <alias-or-directory>:<api-name> -- so it must read live form state,
+    # not a static placeholder.
+    assert "selectedModel?.settings?.model_alias || selectedModel?.id" in form
+    assert "newProfile.api_name || slugifyProfileApiName(newProfile.display_name)" in form
+
+
+def test_profile_pill_api_badge_is_a_standalone_accessible_toggle():
+    # The badge used to be a non-interactive <span> nested inside the apply
+    # button (invalid to make clickable without breaking the apply click).
+    # It's now a sibling <button> so it's independently focusable/clickable
+    # and doesn't trigger applyProfileToForm.
+    html = _model_settings_template()
+    pill = html.split('<template x-for="p in profiles" :key="p.name">', 1)[1].split(
+        '<template x-for="p in profiles" :key=\'edit-\'+p.name>', 1
+    )[0]
+    apply_button = pill.split('@click="applyProfileToForm(p)"', 1)[1].split(
+        "</button>", 1
+    )[0]
+    assert "toggleProfileExpose" not in apply_button
+    assert 'aria-pressed="!!p.expose_as_model"' in pill
+    assert '@click="toggleProfileExpose(p)"' in pill
+
+
+def _models_manager_template() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/templates/dashboard/_models.html").read_text()
+
+
+def test_manager_list_has_exposed_profile_child_rows():
+    # Phase 2.3 of docs/named-profile-model-list-feature.md: lower priority
+    # than the settings-tab table (OQ2), but the same child-row treatment
+    # minus the settings-summary chips this list doesn't show.
+    html = _models_manager_template()
+    assert "managerModelInfo(model.name)?.exposed_profiles" in html
+    assert "editExposedProfileFromList(managerModelInfo(model.name), profile)" in html
+    assert "unexposeProfileFromList(managerModelInfo(model.name), profile)" in html
+    assert "profile.model_id" in html
+
+
 def test_js_embedded_translations_escape_apostrophes():
     # A t() value dropped into a single-quoted Alpine JS string breaks the
     # whole expression as soon as a translation contains an apostrophe (or a

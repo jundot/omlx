@@ -833,6 +833,68 @@ class TestExposedProfileModels:
         assert profile_model.max_model_len == 4096
 
     @pytest.mark.asyncio
+    async def test_v1_models_sorts_favorited_bases_profiles_with_the_base(
+        self, manager
+    ):
+        """Phase 4.1 of docs/named-profile-model-list-feature.md: a
+        favorited base's exposed profile should sort with it, not fall to
+        wherever alphabetical order among non-favorites puts it."""
+        import omlx.server as server_module
+
+        class _TwoModelPool:
+            def get_status(self):
+                return {
+                    "models": [
+                        {
+                            "id": "aaa-not-favorited",
+                            "loaded": True,
+                            "pinned": False,
+                            "engine_type": "vlm",
+                            "model_type": "vlm",
+                            "config_model_type": "gemma4",
+                        },
+                        {
+                            "id": "qwen-base",
+                            "loaded": True,
+                            "pinned": False,
+                            "engine_type": "vlm",
+                            "model_type": "vlm",
+                            "config_model_type": "gemma4",
+                        },
+                    ]
+                }
+
+            def resolve_model_id(self, model_id, settings_manager=None):
+                if settings_manager is not None:
+                    source = settings_manager.get_exposed_profile_source_model_id(
+                        model_id
+                    )
+                    if source:
+                        return source
+                return model_id
+
+        manager.set_settings(
+            "qwen-base", ModelSettings(max_context_window=100000, is_favorite=True)
+        )
+        # Explicit override avoids list_models() falling through to
+        # pool.get_entry(), which this minimal fake pool doesn't implement.
+        manager.set_settings(
+            "aaa-not-favorited", ModelSettings(max_context_window=8192)
+        )
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = _TwoModelPool()
+
+        response = await server_module.list_models(True)
+
+        ids_in_order = [model.id for model in response.data]
+        assert ids_in_order.index("qwen-base") < ids_in_order.index(
+            "aaa-not-favorited"
+        )
+        assert ids_in_order.index("qwen-base:thinking") < ids_in_order.index(
+            "aaa-not-favorited"
+        )
+
+    @pytest.mark.asyncio
     async def test_v1_models_status_includes_exposed_profile_capabilities(
         self, manager
     ):
@@ -965,6 +1027,93 @@ class TestExposedProfileModels:
         max_context = get_max_context_window("qwen-base:thinking")
 
         assert max_context == 4096
+
+    def test_profile_status_flags_variant_inactive_on_signature_mismatch(
+        self, manager
+    ):
+        """§3 Theme B fidelity fix (docs/named-profile-model-list-feature.md):
+        a profile row must not silently report loaded=true for a resident
+        engine whose engine-construction settings differ from what this
+        profile would produce -- selecting it would trigger an unload/reload,
+        not reuse what's already resident."""
+        import omlx.server as server_module
+        from omlx.engine_pool import EngineEntry, EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = EngineEntry(
+            model_id="qwen-base",
+            model_path="/fake/qwen-base",
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=1,
+            engine=object(),
+            # Doesn't match what the profile below (mtp disabled) resolves
+            # to -- a real mismatch, not a fixture accident.
+            runtime_settings_signature=(("mtp_enabled", "True"),),
+        )
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = pool
+
+        status = server_module._with_exposed_profile_status(
+            {"models": [{"id": "qwen-base", "loaded": True, "engine_type": "vlm"}]}
+        )
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert profile_model["variant_active"] is False
+
+    def test_profile_status_omits_variant_flag_on_signature_match(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EngineEntry, EnginePool
+
+        pool = EnginePool()
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        _base_id, merged = manager.get_exposed_profile_runtime_settings_for_request(
+            "qwen-base:thinking"
+        )
+        expected_signature = pool._engine_runtime_signature("qwen-base", merged)
+        pool._entries["qwen-base"] = EngineEntry(
+            model_id="qwen-base",
+            model_path="/fake/qwen-base",
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=1,
+            engine=object(),
+            runtime_settings_signature=expected_signature,
+        )
+        server_module._server_state.engine_pool = pool
+
+        status = server_module._with_exposed_profile_status(
+            {"models": [{"id": "qwen-base", "loaded": True, "engine_type": "vlm"}]}
+        )
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert "variant_active" not in profile_model
+
+    def test_profile_status_skips_variant_check_when_not_loaded(self, manager):
+        """Not-loaded rows never gain the field -- there's no resident
+        variant to compare against."""
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = pool
+
+        status = server_module._with_exposed_profile_status(
+            {"models": [{"id": "qwen-base", "loaded": False, "engine_type": "vlm"}]}
+        )
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert "variant_active" not in profile_model
 
 
 class TestHealthPreloadReadiness:

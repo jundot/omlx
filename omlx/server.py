@@ -2690,6 +2690,7 @@ def _with_exposed_profile_status(status: dict) -> dict:
     if not callable(list_profiles):
         return status
 
+    pool = _server_state.engine_pool
     augmented = dict(status)
     models = [dict(m) for m in augmented.get("models", [])]
     by_id = {m.get("id"): m for m in models}
@@ -2714,6 +2715,13 @@ def _with_exposed_profile_status(status: dict) -> dict:
                 "profile_display_name": profile.get("display_name"),
             }
         )
+        _apply_profile_variant_fidelity(
+            profile_status,
+            profile_model_id,
+            pool,
+            settings_manager,
+            loaded=profile_status.get("loaded", False),
+        )
         models.append(profile_status)
         existing_ids.add(profile_model_id)
 
@@ -2721,6 +2729,61 @@ def _with_exposed_profile_status(status: dict) -> dict:
     augmented["model_count"] = len(models)
     augmented["loaded_count"] = sum(1 for m in models if m.get("loaded"))
     return augmented
+
+
+def _apply_profile_variant_fidelity(
+    profile_status: dict,
+    profile_model_id: str,
+    pool,
+    settings_manager,
+    *,
+    loaded: bool,
+) -> None:
+    """Loaded-state fidelity fix (§3 Theme B of
+    docs/named-profile-model-list-feature.md).
+
+    A profile row's ``loaded`` state is normally copied wholesale from the
+    base model's row, so it reports ``loaded: true`` whenever the base
+    engine is resident -- even when the resident variant was loaded with
+    *different* engine-construction settings and selecting this profile
+    would actually trigger an unload/reload. Sets ``variant_active: False``
+    on ``profile_status`` in exactly that mismatch case; leaves it unset
+    (never ``True``) otherwise, so callers that don't know about this field
+    see no behavior change. ``loaded`` is passed explicitly rather than
+    read off ``profile_status`` since callers key it differently (a
+    ``/v1/models/status`` row vs. a raw profile record from
+    ``list_profiles``).
+    """
+    if pool is None or not loaded:
+        return
+    resolver = getattr(
+        settings_manager, "get_exposed_profile_runtime_settings_for_request", None
+    )
+    if not callable(resolver):
+        return
+    try:
+        resolved = resolver(profile_model_id)
+        if resolved is None:
+            return
+        base_model_id, merged_settings = resolved
+        entry = pool._entries.get(base_model_id)
+        if entry is None or entry.engine is None:
+            return
+        expected_signature = pool._engine_runtime_signature(
+            base_model_id, merged_settings
+        )
+        if (
+            expected_signature is not None
+            and entry.runtime_settings_signature is not None
+            and entry.runtime_settings_signature != expected_signature
+        ):
+            profile_status["variant_active"] = False
+    except Exception as exc:  # noqa: BLE001 - status must never fail the endpoint
+        logger.warning(
+            "Profile variant fidelity check failed for %s: %s",
+            profile_model_id,
+            exc,
+        )
 
 
 async def _preprocess_markitdown_files_for_llm(
@@ -2899,6 +2962,10 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
+    # Phase 4.1 of docs/named-profile-model-list-feature.md: a favorited
+    # base's exposed profiles should sort with it, not fall to wherever
+    # alphabetical order puts them.
+    base_display_id_by_source: dict[str, str] = {}
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
@@ -2945,6 +3012,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             if is_hidden or is_hidden_helper:
                 excluded_model_ids.add(model_id)
                 continue
+            base_display_id_by_source[model_id] = display_id
             if ms is not None and ms.is_favorite:
                 favorite_ids.add(display_id)
             models.append(
@@ -2974,6 +3042,8 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     )
                 )
                 existing_ids.add(profile_model_id)
+                if base_display_id_by_source.get(source_model_id) in favorite_ids:
+                    favorite_ids.add(profile_model_id)
 
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models

@@ -2036,11 +2036,28 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         if settings:
             model_data["settings"] = asdict(settings)
         if settings_manager:
-            model_data["exposed_profiles"] = [
+            exposed_profiles = [
                 profile
                 for profile in settings_manager.list_profiles(model_id)
                 if profile.get("expose_as_model")
             ]
+            if exposed_profiles and model_data["loaded"]:
+                # Same loaded-state fidelity fix as /v1/models/status (§3
+                # Theme B of docs/named-profile-model-list-feature.md) —
+                # deferred import to avoid a circular import with server.py,
+                # matching the existing `from ..server import _server_state`
+                # pattern used throughout this module.
+                from ..server import _apply_profile_variant_fidelity
+
+                for profile in exposed_profiles:
+                    _apply_profile_variant_fidelity(
+                        profile,
+                        profile["model_id"],
+                        engine_pool,
+                        settings_manager,
+                        loaded=True,
+                    )
+            model_data["exposed_profiles"] = exposed_profiles
 
         models.append(model_data)
 
