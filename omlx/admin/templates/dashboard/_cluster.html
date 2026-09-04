@@ -130,6 +130,16 @@
             </ul>
         </details>
 
+        <!-- C4: VPN pre-warning, shown before any fabric setup. A heuristic
+             read of the peer's configuration — it never gates Start; the
+             bound-connect probes remain the authority on the link. -->
+        <template x-for="warning in clusterVpnWarnings()" :key="'vpn-' + warning.host">
+            <div class="mb-6 flex items-start gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                <i data-lucide="shield-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                <span class="break-words" x-text="warning.message"></span>
+            </div>
+        </template>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -916,6 +926,16 @@
                              x-text="clusterStatus.transport.rdma.enabled
                                 ? clusterStatus.transport.rdma.devices.length + ' RDMA interface' + (clusterStatus.transport.rdma.devices.length === 1 ? '' : 's')
                                 : 'RDMA not enabled'"></div>
+                        {# Readiness-ladder copy (B3): the node's reason/remedy render
+                           verbatim until the collective is proven. #}
+                        <template x-if="clusterStatus.transport.readiness && clusterStatus.transport.readiness.state !== 'collective_ok'">
+                            <div class="text-xs mt-2 space-y-0.5">
+                                <div class="text-neutral-500"
+                                     x-text="clusterStatus.transport.readiness.reason"></div>
+                                <div class="text-neutral-400"
+                                     x-text="clusterStatus.transport.readiness.remedy"></div>
+                            </div>
+                        </template>
                     </div>
 
                     <div class="bg-white border border-neutral-200 rounded-2xl p-5">

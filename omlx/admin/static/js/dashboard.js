@@ -5179,6 +5179,37 @@
                 else this.loadClusterFabric();
             },
 
+            // C4 pre-warning: hosts whose configuration shows a full-tunnel
+            // VPN. Heuristic only — it never gates Start or promotes the
+            // ladder; the bound-connect probes stay the authority on the link.
+            clusterVpnWarnings() {
+                const hosts = this.clusterAutoconfigure?.fabric?.hosts
+                    || this.clusterFabric?.hosts
+                    || [];
+                const names = {
+                    warp: 'Cloudflare WARP',
+                    tailscale: 'Tailscale',
+                    globalprotect: 'GlobalProtect',
+                    anyconnect: 'Cisco AnyConnect',
+                };
+                return hosts
+                    .filter(entry => entry?.vpn?.full_tunnel)
+                    .map(entry => {
+                        const label = entry.host === '127.0.0.1'
+                            ? 'This Mac' : entry.host;
+                        const client = names[entry.vpn.client];
+                        return {
+                            host: entry.host,
+                            message: `${label} is on a corporate VPN that `
+                                + `captures all traffic`
+                                + `${client ? ` (${client})` : ''}. `
+                                + 'oMLX will pick link addresses the VPN '
+                                + 'ignores and verify the link end-to-end '
+                                + 'before use.',
+                        };
+                    });
+            },
+
             // Backend is a consequence of the cable, never a preference: the
             // fabric reader is the only thing that may name one, and it falls
             // back to the TCP ring out loud rather than by accident.

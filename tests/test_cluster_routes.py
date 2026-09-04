@@ -478,6 +478,8 @@ def test_cluster_peer_probe_route(monkeypatch):
 
 
 def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch):
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -487,8 +489,9 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(ssh=ssh, python=python_executable)
+            or AdmissionCeilingProbe(213 * gib + 123)
         ),
     )
 
@@ -525,6 +528,8 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
 def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monkeypatch):
     """#2680: sys.executable is the coordinator's bundled binary, not the peer's."""
 
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
     gib = 1024**3
     asked = {}
     monkeypatch.setattr(
@@ -534,8 +539,8 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monk
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(ssh=ssh, python=python_executable) or AdmissionCeilingProbe(64 * gib)
         ),
     )
 
@@ -556,7 +561,7 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     monkeypatch.setattr(
         routes,
         "probe_remote_admission_ceiling",
-        lambda ssh: called.append(ssh),
+        lambda ssh, **kwargs: called.append(ssh),
     )
 
     response = _client().post(
@@ -574,6 +579,174 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     assert response.status_code == 400
     assert "invalid SSH target" in response.json()["detail"]
     assert called == []
+
+
+def test_peer_probe_results_teach_the_advertised_admin_port():
+    """C5: a capability probe deposits the peer's admin port for /node-budgets."""
+
+    routes._note_peer_admin_port(
+        {
+            "ok": True,
+            "ssh": "user@Studio.local",
+            "status": {"node": {"admin_port": 8123}},
+        }
+    )
+    try:
+        assert routes._advertised_admin_port("studio.local") == 8123
+        assert routes._advertised_admin_port("other@STUDIO.local") == 8123
+        # A payload without the field (older peer) teaches nothing.
+        routes._note_peer_admin_port(
+            {"ok": True, "ssh": "studio.local", "status": {"node": {}}}
+        )
+        assert routes._advertised_admin_port("studio.local") == 8123
+    finally:
+        with routes._PEER_ADMIN_PORTS_LOCK:
+            routes._PEER_ADMIN_PORTS.clear()
+
+
+def test_cluster_node_budgets_confess_a_dead_advertised_port(
+    monkeypatch, tmp_path
+):
+    """C5: fast-probe fallback keeps the ceiling and records one WARN."""
+
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.launch import AdmissionCeilingProbe
+
+    gib = 1024**3
+    store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(routes, "_PEER_ADMIN_PORTS", {"studio.local": 8123})
+    monkeypatch.setattr(routes, "_CEILING_FALLBACK_SEEN", set())
+    asked = {}
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_ceiling",
+        lambda ssh, *, python_executable, admin_port: (
+            asked.update(admin_port=admin_port)
+            or AdmissionCeilingProbe(
+                100 * gib,
+                fast_probe_ok=False,
+                fast_probe_error="port 8123: Connection refused",
+            )
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+
+    # The advertised port was threaded into the probe, and the slower
+    # computation's ceiling arrived whole.
+    assert response.status_code == 200
+    assert asked == {"admin_port": 8123}
+    assert response.json()["nodes"][0]["capacity_bytes"] == 100 * gib
+    incidents = [
+        incident
+        for incident in store.list()
+        if incident.state_code == "ceiling_fast_probe_fallback"
+    ]
+    assert len(incidents) == 1
+    assert incidents[0].severity == Severity.WARN
+    assert "fast ceiling probe unreachable on port 8123" in incidents[0].message
+    assert "slower local computation" in incidents[0].message
+
+    # The condition is standing: a second poll must not add a second WARN.
+    again = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [{"node_id": "studio", "ssh": "studio.local"}],
+            "roles": {"studio": "headless"},
+        },
+    )
+    assert again.status_code == 200
+    assert (
+        len(
+            [
+                incident
+                for incident in store.list()
+                if incident.state_code == "ceiling_fast_probe_fallback"
+            ]
+        )
+        == 1
+    )
+
+
+def test_fabric_drift_is_detected_and_confessed_once(monkeypatch, tmp_path):
+    """C5 watchdog: drifted ifconfig addressing becomes one WARN, not spam."""
+
+    from omlx.cluster import fabric_intent as fabric_intent_module
+    from omlx.cluster.incidents import Severity, configure_cluster_incidents
+    from omlx.cluster.transport import HostInterfaces
+
+    hosts = ["127.0.0.1", "studio.local"]
+    store = configure_cluster_incidents(tmp_path)
+    monkeypatch.setattr(routes, "_FABRIC_DRIFT_SEEN", set())
+    try:
+        intent_store = fabric_intent_module.configure_fabric_intent(tmp_path)
+        intent_store.record(
+            subnet="172.16.99.0/24",
+            hosts=tuple(hosts),
+            chosen_by="auto",
+            reason="collision_free_default",
+            addressing="ifconfig",
+        )
+        # The addresses are gone (reboot), and nothing else collides.
+        interfaces = {
+            host: HostInterfaces(
+                host=host,
+                addresses=(),
+                rdma_interfaces=frozenset({"en1"}),
+                thunderbolt_interfaces=frozenset({"en1"}),
+            )
+            for host in hosts
+        }
+        monkeypatch.setattr(routes, "hostile_networks", lambda *a, **k: ())
+
+        drift = routes._detect_fabric_drift(hosts, interfaces)
+
+        assert drift is not None
+        assert drift["kind"] == "address_lost"
+        assert drift["addressing"] == "ifconfig"
+        assert drift["auto_restore"] is False
+
+        routes._note_fabric_drift({"drift": drift})
+        routes._note_fabric_drift({"drift": drift})  # standing condition
+
+        incidents = [
+            incident
+            for incident in store.list()
+            if incident.state_code == "fabric_drift"
+        ]
+        assert len(incidents) == 1
+        assert incidents[0].severity == Severity.WARN
+        assert "Fabric Doctor" in incidents[0].message
+
+        # An auto-restorable finding (networksetup) stays silent.
+        intent_store.record(
+            subnet="172.16.99.0/24",
+            hosts=tuple(hosts),
+            chosen_by="auto",
+            reason="collision_free_default",
+            addressing="networksetup",
+        )
+        restorable = routes._detect_fabric_drift(hosts, interfaces)
+        assert restorable is not None and restorable["auto_restore"] is True
+        routes._note_fabric_drift({"drift": restorable})
+        assert (
+            len(
+                [
+                    incident
+                    for incident in store.list()
+                    if incident.state_code == "fabric_drift"
+                ]
+            )
+            == 1
+        )
+    finally:
+        fabric_intent_module._configured_intent = None
 
 
 def test_cluster_plan_route_builds_unequal_pipeline():
