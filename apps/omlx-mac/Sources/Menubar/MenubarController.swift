@@ -35,7 +35,11 @@ final class MenubarController: NSObject {
     // MARK: - Inputs / state
 
     private let server: ServerProcess?
-    private let config: AppConfig
+    // Was `let`: a snapshot from init that never updated when AppServices.config
+    // changed (§F1) — the stats poller's apiKey (below) and "Open Web Dashboard"'s
+    // auto-login URL both read this and kept using a stale key after a change.
+    // configDidChange(_:) below keeps it current.
+    private var config: AppConfig
     private let updates: UpdateController?
     private let bootstrapError: Error?
     private let client: OMLXClient?
@@ -192,6 +196,17 @@ final class MenubarController: NSObject {
             self,
             selector: #selector(restoreIconRequested(_:)),
             name: MenubarController.restoreIconRequestNotification,
+            object: nil
+        )
+
+        // object: nil — there is exactly one AppServices instance app-wide,
+        // and MenubarController doesn't otherwise hold a reference to it
+        // (only the looser `client`/`config` snapshot), so this stays a
+        // self-contained notification response like defaultsDidChange above.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(configDidChange(_:)),
+            name: AppServices.configDidChangeNotification,
             object: nil
         )
 
@@ -860,6 +875,18 @@ final class MenubarController: NSObject {
         }
     }
 
+    /// AppServices.config changed (an API key edit, most commonly — §F1).
+    /// refreshStatsPollerEndpoint() (used on server-state changes) only
+    /// re-points the poller when the base URL diverges, so a same-host
+    /// key-only change wouldn't trigger it; rebuild unconditionally instead
+    /// — startStatsPoller() already tears down the old poller first and is
+    /// cheap enough to call on every config change.
+    @objc private func configDidChange(_ note: Notification) {
+        guard let next = note.userInfo?["config"] as? AppConfig else { return }
+        self.config = next
+        startStatsPoller()
+    }
+
     /// UserDefaults writes can come from any thread; hop to the main actor
     /// before touching the poller or the status items.
     @objc nonisolated private func defaultsDidChange(_ note: Notification) {
@@ -885,6 +912,14 @@ final class MenubarController: NSObject {
 
     @objc private func startServer() {
         guard let server else { return }
+        // A user-initiated Start is a deliberate retry — if the same
+        // port-conflict/failure recurs, it must alert again instead of
+        // silently no-oping behind a stale dedup key (§F3). Each start()
+        // call passes through .starting first, so ServerProcess.update's own
+        // state-equality guard doesn't suppress the follow-up notification;
+        // only these two alert-presentation guards were swallowing it.
+        lastPresentedPortConflictKey = nil
+        lastPresentedFailureMessage = nil
         do {
             switch try server.start() {
             case .started, .alreadyRunning:
