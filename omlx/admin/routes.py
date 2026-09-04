@@ -1515,7 +1515,14 @@ async def admin_static(path: str):
         ".ttf": "font/ttf",
     }
     media_type = media_types.get(file_path.suffix, "application/octet-stream")
-    return FileResponse(file_path, media_type=media_type)
+    # no-cache: browsers must revalidate every load (cheap 304s via ETag).
+    # Without this, heuristic caching serves stale JS after an update and the
+    # dashboard runs an old frontend against a new backend.
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 # =============================================================================
