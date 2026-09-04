@@ -1281,6 +1281,15 @@ def run_worker(args: argparse.Namespace) -> int:
                     # than "nobody has asked anything for 45 seconds".
                     run("127.0.0.1", args.port, provider)
     except KeyboardInterrupt:
+        # A supervisor-driven SIGTERM is a clean shutdown request, but keep a
+        # terminal marker until the launcher has verified this PID exited.
+        # Coordinated multi-host teardown signals every rank first and checks
+        # them in a second pass; removing the marker here makes that safe
+        # identity check impossible and turns a graceful exit into a false
+        # unconfirmed-process quarantine.
+        preserve_failure_marker = True
+        with suppress(Exception):
+            marker.update("stopped", stop_reason="signal")
         return 0
     except Exception as exc:
         # An ordinary exception is the most useful evidence a failed remote

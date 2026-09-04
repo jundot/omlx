@@ -542,6 +542,7 @@ def _run_rank(
     wired_result=(0, None),
     assignment_honored: bool = False,
     vision: bool = False,
+    interrupt_serving: bool = False,
 ):
     """Drive ``run_worker`` through its real argv, recording what it did.
 
@@ -629,6 +630,8 @@ def _run_rank(
         record["serve_address"] = (host, port)
         written = list(tmp_path.glob("*.json"))
         record["marker_while_serving"] = json.loads(written[0].read_text())
+        if interrupt_serving:
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(mlx_server, "ModelProvider", FakeProvider)
     monkeypatch.setattr(mlx_server, "run", fake_run)
@@ -1168,6 +1171,24 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
+
+
+def test_supervisor_signal_leaves_terminal_marker_for_reap_verification(
+    monkeypatch, tmp_path
+):
+    record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        rank=0,
+        interrupt_serving=True,
+    )
+
+    assert record["exit_code"] == 0
+    markers = list(tmp_path.glob("*.json"))
+    assert len(markers) == 1
+    marker = json.loads(markers[0].read_text())
+    assert marker["phase"] == "stopped"
+    assert marker["stop_reason"] == "signal"
 
 
 class _ThinkTokenizer:

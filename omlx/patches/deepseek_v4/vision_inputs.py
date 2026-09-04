@@ -29,6 +29,9 @@ from omlx.deepseek_v4_vision import (
 
 COMPRESS_PAD_TO = 4
 _MAX_IMAGE_BYTES = 50 * 1024 * 1024
+_MAX_IMAGES_PER_REQUEST = 16
+_MAX_SOURCE_PIXELS = 64 * 1024 * 1024
+_MAX_VISION_PATCHES = 8192
 
 
 @dataclass(frozen=True)
@@ -131,12 +134,12 @@ def _image_bytes(record: Any) -> bytes:
     if isinstance(raw, bytes):
         payload = raw
     elif isinstance(raw, str):
-        payload = base64.b64decode(raw, validate=True)
+        payload = _decode_base64(raw)
     else:
         source = record.get("source")
         if isinstance(source, Mapping):
             if source.get("data") is not None:
-                payload = base64.b64decode(str(source["data"]), validate=True)
+                payload = _decode_base64(str(source["data"]))
             else:
                 record = {"url": source.get("url")}
                 payload = b""
@@ -152,7 +155,7 @@ def _image_bytes(record: Any) -> bytes:
                 header, separator, encoded = url.partition(",")
                 if not separator or ";base64" not in header:
                     raise ValueError("only base64 image data URLs are supported")
-                payload = base64.b64decode(encoded, validate=True)
+                payload = _decode_base64(encoded)
             elif url.startswith(("https://", "http://")):
                 with urlopen(url, timeout=30) as response:  # noqa: S310
                     payload = response.read(_MAX_IMAGE_BYTES + 1)
@@ -163,11 +166,22 @@ def _image_bytes(record: Any) -> bytes:
     return payload
 
 
+def _decode_base64(encoded: str) -> bytes:
+    # Reject before b64decode allocates another large buffer. With validate=True
+    # there is no whitespace to discount, so this is a strict encoded-size cap.
+    max_encoded = 4 * math.ceil(_MAX_IMAGE_BYTES / 3)
+    if len(encoded) > max_encoded:
+        raise ValueError("image payload exceeds 50 MiB")
+    return base64.b64decode(encoded, validate=True)
+
+
 def load_image(record: Any, config: Mapping[str, Any]):
     patch = int(config["vision_patch_size"])
     with Image.open(io.BytesIO(_image_bytes(record))) as source:
+        width, height = source.size
+        if width <= 0 or height <= 0 or width * height > _MAX_SOURCE_PIXELS:
+            raise ValueError("decoded image dimensions exceed the 64 Mi-pixel limit")
         image = source.convert("RGB")
-    width, height = image.size
     max_ratio = int(config.get("vision_max_wh_ratio", 8) or 8)
     if width > height * max_ratio:
         width = height * max_ratio
@@ -188,6 +202,10 @@ def load_image(record: Any, config: Mapping[str, Any]):
         int(config["vision_max_n_token"]),
     )
     n_vit_h, n_vit_w = best_h // patch, best_w // patch
+    if n_vit_h * n_vit_w > _MAX_VISION_PATCHES:
+        raise ValueError(
+            "resized image exceeds the 8192-patch vision-encoder limit"
+        )
     if image.width >= max_ratio * image.height:
         image = image.resize((best_w, best_h))
     else:
@@ -215,6 +233,11 @@ def prepare_token_ids(
         raise ValueError(
             f"found {placeholders} DeepSeek image placeholders but received "
             f"{len(images)} images"
+        )
+    if len(images) > _MAX_IMAGES_PER_REQUEST:
+        raise ValueError(
+            "DeepSeek-V4 Vision accepts at most "
+            f"{_MAX_IMAGES_PER_REQUEST} images per request"
         )
     vocab_size = int(config["vocab_size"])
     tokens: list[int] = []

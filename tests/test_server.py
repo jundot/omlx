@@ -648,6 +648,31 @@ class TestExceptionHandlers:
         data = response.json()
         assert "detail" in data
 
+    @pytest.mark.parametrize("quarantined", [False, True])
+    def test_distributed_launch_failure_returns_unavailable(self, quarantined):
+        from fastapi import FastAPI
+
+        from omlx.cluster.launch import (
+            DistributedLaunchError,
+            DistributedMemoryRecoveryError,
+        )
+
+        # Exercise Starlette's exception lookup, including the recovery subclass,
+        # without starting the real application or touching a cluster.
+        test_app = FastAPI(exception_handlers=app.exception_handlers)
+        error_type = (
+            DistributedMemoryRecoveryError if quarantined else DistributedLaunchError
+        )
+
+        @test_app.post("/v1/chat/completions")
+        async def unavailable():
+            raise error_type("rank memory is not reusable")
+
+        with TestClient(test_app, raise_server_exceptions=False) as client:
+            response = client.post("/v1/chat/completions")
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "rank memory is not reusable"
+
 
 class TestModelFallback:
     """Tests for model fallback to default when requested model not found."""

@@ -205,7 +205,12 @@ class RankPrefillGuard:
 
         from omlx.exceptions import PrefillMemoryExceededError
 
-        local_error: PrefillMemoryExceededError | None = None
+        # Every local failure has to become a vote.  Memory probes and model
+        # estimators are best-effort code and can raise something other than
+        # PrefillMemoryExceededError (for example an MLX runtime error).  Letting
+        # that exception escape here strands peers in this rank-agreement
+        # collective, or in the first model collective that follows it.
+        local_error: Exception | None = None
         try:
             self.check(
                 num_prompt_tokens,
@@ -214,7 +219,7 @@ class RankPrefillGuard:
                 current_usage_bytes=current_usage_bytes,
                 prefill_step_size=prefill_step_size,
             )
-        except PrefillMemoryExceededError as exc:
+        except Exception as exc:
             local_error = exc
 
         if mx_module is None:

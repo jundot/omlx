@@ -42,40 +42,7 @@ def vision_prefill_chunks(
         return ()
     configured = max(1, int(max_chunk_tokens))
 
-    spans: list[tuple[int, int]] = []
-    # An image block can have up to three alignment pads before IMAGE_START.
-    # Treat the complete contiguous sentinel run as the protected span. A
-    # prompt-cache hit may also leave this suffix part-way through a block.
-    start = None
-    saw_start = False
-    for index, token in enumerate(values):
-        kind = token - int(vocab_size)
-        if kind < 0:
-            if start is not None:
-                raise ValueError("DeepSeek image sentinel block is incomplete")
-            continue
-        if start is None:
-            if kind == IMAGE_END:
-                if index == 0:
-                    # The cached prefix can end immediately before IMAGE_END.
-                    spans.append((0, 1))
-                    continue
-                raise ValueError("DeepSeek image end sentinel has no start")
-            start = index
-            saw_start = kind == IMAGE_START
-            continue
-        if kind == IMAGE_START:
-            if saw_start:
-                raise ValueError("nested DeepSeek image sentinel blocks are invalid")
-            saw_start = True
-        elif kind == IMAGE_END:
-            if not saw_start and start != 0:
-                raise ValueError("DeepSeek image end sentinel has no start")
-            spans.append((start, index + 1))
-            start = None
-            saw_start = False
-    if start is not None:
-        raise ValueError("DeepSeek image sentinel block is incomplete")
+    spans = vision_token_spans(values, vocab_size=vocab_size)
 
     chunks: list[tuple[int, int]] = []
     position = 0
@@ -103,6 +70,53 @@ def vision_prefill_chunks(
         position = end
     append_text_until(total)
     return tuple(chunks)
+
+
+def vision_token_spans(
+    tokens,
+    *,
+    vocab_size: int,
+) -> tuple[tuple[int, int], ...]:
+    """Return image-sentinel spans, accepting a cache suffix inside a block."""
+
+    values = [int(token) for token in tokens]
+    spans: list[tuple[int, int]] = []
+    # An image block can have up to three alignment pads before IMAGE_START.
+    # Treat the complete contiguous sentinel run as the protected span. A
+    # prompt-cache hit may also leave this suffix part-way through a block.
+    start = None
+    saw_start = False
+    for index, token in enumerate(values):
+        kind = token - int(vocab_size)
+        if kind < 0:
+            if start is not None:
+                raise ValueError("DeepSeek image sentinel block is incomplete")
+            continue
+        if kind > IMAGE_END:
+            raise ValueError(f"invalid DeepSeek image sentinel kind {kind}")
+        if start is None:
+            if kind == IMAGE_END:
+                if index == 0:
+                    # The cached prefix can end immediately before IMAGE_END.
+                    spans.append((0, 1))
+                    continue
+                raise ValueError("DeepSeek image end sentinel has no start")
+            start = index
+            saw_start = kind == IMAGE_START
+            continue
+        if kind == IMAGE_START:
+            if saw_start:
+                raise ValueError("nested DeepSeek image sentinel blocks are invalid")
+            saw_start = True
+        elif kind == IMAGE_END:
+            if not saw_start and start != 0:
+                raise ValueError("DeepSeek image end sentinel has no start")
+            spans.append((start, index + 1))
+            start = None
+            saw_start = False
+    if start is not None:
+        raise ValueError("DeepSeek image sentinel block is incomplete")
+    return tuple(spans)
 
 
 def _prefill_prompt_chunk(model, prompt_cache, tokens, kwargs) -> None:
@@ -270,16 +284,22 @@ def install_deepseek_v4_vision_runtime(
             raise RuntimeError("DeepSeek-V4 vision request metadata is invalid")
         prompt = prompt_or_type
         initial_state = initial_state_or_message
-        prepared_images = prepared_images_by_digest.get(digest) if rank == 0 else None
-        self.model_provider.model.set_vision_inputs(prepared_images)
-        self.model_provider.model_key = (*base_model_key, "vision", digest)
-        self._omlx_prefill_step_size_override = True
+        prepared_images = prepared_images_by_digest.pop(digest, None) if rank == 0 else None
         model_args = getattr(self.model_provider.model, "args", None)
-        self._omlx_vision_vocab_size = int(
+        vocab_size = int(
             config.get("vocab_size")
             or getattr(model_args, "vocab_size", 0)
             or 0
         )
+        spans = (
+            vision_token_spans(prompt, vocab_size=vocab_size)
+            if vocab_size > 0
+            else ()
+        )
+        self.model_provider.model.set_vision_inputs(prepared_images, spans=spans)
+        self.model_provider.model_key = (*base_model_key, "vision", digest)
+        self._omlx_prefill_step_size_override = True
+        self._omlx_vision_vocab_size = vocab_size
         logger.info(
             "deepseek_v4_vision stage=multimodal_prompt_ready rank=%d "
             "images=%d sequence_length=%d",

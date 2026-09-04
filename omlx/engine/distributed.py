@@ -10,7 +10,8 @@ import math
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import aclosing, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -166,7 +167,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._supports_multimodal_fallback = False
         self._active_requests = 0
-        self._active_lock = asyncio.Lock()
+        self._vision_request_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._peer_health: tuple[float, bool, str] | None = None
@@ -209,6 +210,10 @@ class DistributedBatchedEngine(BatchedEngine):
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
+            except Exception:
+                if cancellation is None:
+                    raise
+                break
         if cancellation is not None:
             try:
                 task.result()
@@ -734,23 +739,39 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         return normalized or None
 
-    @staticmethod
-    def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
-        """Carry private structured reasoning through GenerationOutput safely."""
+    async def _enter_request(self, client: httpx.AsyncClient) -> bool:
+        """Queue sequential Vision work before opening a private HTTP request.
 
-        reasoning_text = reasoning if isinstance(reasoning, str) else ""
-        content_text = content if isinstance(content, str) else ""
-        if reasoning_text:
-            return f"<think>{reasoning_text}</think>{content_text}"
-        return content_text
+        The Vision worker cannot batch requests. Sending queued work to its
+        HTTP server starts the read timeout before generation can begin, and
+        cancelling that socket then tears down the healthy, busy deployment.
+        Waiting here avoids both hazards without reducing worker concurrency.
+        """
 
-    async def _enter_request(self) -> None:
-        async with self._active_lock:
-            self._active_requests += 1
+        serialized = self._supports_multimodal_fallback
+        self._active_requests += 1
+        acquired = False
+        try:
+            if serialized:
+                await self._vision_request_lock.acquire()
+                acquired = True
+                if self._client is not client or not self._loaded:
+                    raise DistributedInferenceError(
+                        "distributed deployment changed while request was queued"
+                    )
+            return serialized
+        except BaseException:
+            if acquired:
+                self._vision_request_lock.release()
+            self._active_requests -= 1
+            raise
 
-    async def _leave_request(self) -> None:
-        async with self._active_lock:
-            self._active_requests = max(0, self._active_requests - 1)
+    async def _leave_request(self, serialized: bool) -> None:
+        # Event-loop-owned counters need no suspension, including when teardown
+        # is interrupted by a second cancellation.
+        self._active_requests = max(0, self._active_requests - 1)
+        if serialized:
+            self._vision_request_lock.release()
 
     async def chat(
         self,
@@ -782,101 +803,41 @@ class DistributedBatchedEngine(BatchedEngine):
                 tools=tools,
                 **kwargs,
             )
-        if not self._loaded:
-            await self.start()
-        client = await self._ensure_available()
-        payload = self._chat_payload(
-            messages=messages,
-            tools=tools,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            stop=kwargs.pop("stop", None),
-            stream=False,
-            kwargs=kwargs,
+        return await self._collect_stream(
+            self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            )
         )
-        await self._enter_request()
-        started_at = time.monotonic()
-        try:
-            response = await client.post("/v1/chat/completions", json=payload)
-            if response.status_code >= 400:
-                detail = self._backend_error_detail(response)
-                for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
-                    response = await client.post(
-                        "/v1/chat/completions", json=retry_payload
-                    )
-                    if response.status_code < 400:
-                        break
-            self._raise_for_backend(response)
-            body = response.json()
-        except httpx.ReadTimeout as exc:
-            error = self._read_timeout_error(stream=False)
-            await self._teardown_failed_request(
-                client,
-                reason="rank-zero request read timeout",
-            )
-            raise error from exc
-        except asyncio.CancelledError:
-            await self._teardown_failed_request(
-                client,
-                reason="cancelled rank-zero request",
-            )
-            raise
-        except httpx.TransportError as exc:
-            try:
-                error = await self._transport_failure_error(
-                    exc,
-                    stream=False,
-                )
-            finally:
-                await self._teardown_failed_request(
-                    client,
-                    reason=(
-                        "rank-zero request transport failure "
-                        f"({type(exc).__name__})"
-                    ),
-                )
-            raise error from exc
-        except json.JSONDecodeError as exc:
-            raise DistributedInferenceError(
-                "rank-zero backend returned invalid chat JSON"
-            ) from exc
-        finally:
-            await self._leave_request()
 
-        try:
-            choice = body["choices"][0]
-            message = choice["message"]
-            usage = body["usage"]
-            details = usage.get("prompt_tokens_details") or {}
-            tool_calls = self._normalize_backend_tool_calls(message.get("tool_calls"))
-            text = self._join_reasoning_and_content(
-                message.get("reasoning") or message.get("reasoning_content"),
-                message.get("content"),
-            )
-            return GenerationOutput(
-                text=text,
-                new_text=text,
-                prompt_tokens=int(usage["prompt_tokens"]),
-                completion_tokens=int(usage["completion_tokens"]),
-                finish_reason=(
-                    "tool_calls"
-                    if tool_calls
-                    else (choice.get("finish_reason") or "stop")
-                ),
-                tool_calls=tool_calls,
-                cached_tokens=int(details.get("cached_tokens", 0)),
-                generated_at=started_at,
-                generated_until=time.monotonic(),
-            )
-        except (IndexError, KeyError, TypeError, ValueError) as exc:
-            raise DistributedInferenceError(
-                "rank-zero backend returned an invalid chat completion"
-            ) from exc
+    @staticmethod
+    async def _collect_stream(
+        stream: AsyncIterator[GenerationOutput],
+    ) -> GenerationOutput:
+        """Use backend progress for public non-streaming requests too.
+
+        MLX-LM sends no keepalives on a non-streaming socket. A healthy long
+        generation would therefore trip the inactivity timeout and kill all
+        ranks. Consume the normal SSE path and retain only its final output,
+        sharing timeout, cancellation, usage and protocol handling.
+        """
+
+        final = None
+        async with aclosing(stream):
+            async for output in stream:
+                if output.finished:
+                    final = output
+        if final is None:
+            raise DistributedInferenceError("rank-zero stream returned no final output")
+        return replace(final, new_text=final.text)
 
     async def stream_chat(
         self,
@@ -936,7 +897,7 @@ class DistributedBatchedEngine(BatchedEngine):
         backend_tool_calls: dict[int, dict[str, Any]] = {}
         request_resolved = False
 
-        await self._enter_request()
+        serialized = await self._enter_request(client)
         try:
             # A client that always sends an unsupported reasoning_effort must
             # never turn this into an unbounded retry loop: `attempts` is
@@ -1116,12 +1077,14 @@ class DistributedBatchedEngine(BatchedEngine):
             )
             raise error from exc
         finally:
-            if not request_resolved:
-                await self._teardown_failed_request(
-                    client,
-                    reason="abandoned or failed rank-zero chat stream",
-                )
-            await self._leave_request()
+            try:
+                if not request_resolved:
+                    await self._teardown_failed_request(
+                        client,
+                        reason="abandoned or failed rank-zero chat stream",
+                    )
+            finally:
+                await self._leave_request(serialized)
 
         pending_final_text = ""
         if reasoning_open:
@@ -1166,90 +1129,20 @@ class DistributedBatchedEngine(BatchedEngine):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> GenerationOutput:
-        if not self._loaded:
-            await self.start()
-        client = await self._ensure_available()
-        payload = self._completion_payload(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            stop=stop,
-            stream=False,
-            kwargs=kwargs,
+        return await self._collect_stream(
+            self.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                **kwargs,
+            )
         )
-        await self._enter_request()
-        started_at = time.monotonic()
-        try:
-            response = await client.post("/v1/completions", json=payload)
-            if response.status_code >= 400:
-                detail = self._backend_error_detail(response)
-                for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
-                    response = await client.post(
-                        "/v1/completions", json=retry_payload
-                    )
-                    if response.status_code < 400:
-                        break
-            self._raise_for_backend(response)
-            body = response.json()
-        except httpx.ReadTimeout as exc:
-            error = self._read_timeout_error(stream=False)
-            await self._teardown_failed_request(
-                client,
-                reason="rank-zero request read timeout",
-            )
-            raise error from exc
-        except asyncio.CancelledError:
-            await self._teardown_failed_request(
-                client,
-                reason="cancelled rank-zero request",
-            )
-            raise
-        except httpx.TransportError as exc:
-            try:
-                error = await self._transport_failure_error(
-                    exc,
-                    stream=False,
-                )
-            finally:
-                await self._teardown_failed_request(
-                    client,
-                    reason=(
-                        "rank-zero request transport failure "
-                        f"({type(exc).__name__})"
-                    ),
-                )
-            raise error from exc
-        except json.JSONDecodeError as exc:
-            raise DistributedInferenceError(
-                "rank-zero backend returned invalid completion JSON"
-            ) from exc
-        finally:
-            await self._leave_request()
-
-        try:
-            choice = body["choices"][0]
-            usage = body["usage"]
-            details = usage.get("prompt_tokens_details") or {}
-            text = choice.get("text") or ""
-            return GenerationOutput(
-                text=text,
-                new_text=text,
-                prompt_tokens=int(usage["prompt_tokens"]),
-                completion_tokens=int(usage["completion_tokens"]),
-                finish_reason=choice.get("finish_reason") or "stop",
-                cached_tokens=int(details.get("cached_tokens", 0)),
-                generated_at=started_at,
-                generated_until=time.monotonic(),
-            )
-        except (IndexError, KeyError, TypeError, ValueError) as exc:
-            raise DistributedInferenceError(
-                "rank-zero backend returned an invalid completion"
-            ) from exc
 
     async def stream_generate(
         self,
@@ -1290,7 +1183,7 @@ class DistributedBatchedEngine(BatchedEngine):
         request_started_at = time.monotonic()
         request_resolved = False
 
-        await self._enter_request()
+        serialized = await self._enter_request(client)
         try:
             # See stream_chat for the retry-bound rationale.
             attempts = [payload]
@@ -1418,12 +1311,14 @@ class DistributedBatchedEngine(BatchedEngine):
             )
             raise error from exc
         finally:
-            if not request_resolved:
-                await self._teardown_failed_request(
-                    client,
-                    reason="abandoned or failed rank-zero completion stream",
-                )
-            await self._leave_request()
+            try:
+                if not request_resolved:
+                    await self._teardown_failed_request(
+                        client,
+                        reason="abandoned or failed rank-zero completion stream",
+                    )
+            finally:
+                await self._leave_request(serialized)
 
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(

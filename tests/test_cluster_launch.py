@@ -314,7 +314,7 @@ def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
-    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda **_kwargs: [])
     monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
 
     supervisor.stop()
@@ -356,13 +356,86 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
-    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda **_kwargs: [])
     monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
 
     supervisor.stop()
 
     assert signals == [(43211, signal.SIGTERM)]
     assert supervisor.process is None
+
+
+def test_supervisor_signals_remote_rank_before_waiting_for_local_group(monkeypatch):
+    class Launcher:
+        pid = 43214
+        stdout = None
+        stderr = None
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            events.append(("launcher-wait", timeout))
+            self.returncode = 0
+            return 0
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    supervisor.process = Launcher()
+    events = []
+
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: True,
+    )
+    monkeypatch.setattr(
+        launch.os,
+        "killpg",
+        lambda _pgid, sig: events.append(("local-signal", sig)),
+    )
+
+    def reap(**kwargs):
+        events.append(("remote-reap", kwargs))
+        return []
+
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", reap)
+    monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
+
+    supervisor.stop()
+
+    assert events[0] == ("local-signal", signal.SIGTERM)
+    assert events[1] == ("remote-reap", {"signal_only": True})
+    assert events[2][0] == "launcher-wait"
+    assert events[-1][0] == "remote-reap"
+    assert 0 < events[-1][1]["graceful_timeout"] <= supervisor.stop_timeout
+
+
+def test_supervisor_retry_gives_remote_rank_grace_without_local_group(monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    supervisor._teardown_incomplete = True
+    supervisor._pending_process_group = None
+    calls = []
+    monkeypatch.setattr(
+        supervisor,
+        "_reap_remote_ranks",
+        lambda **kwargs: calls.append(kwargs) or [],
+    )
+
+    supervisor.stop()
+
+    assert calls[0] == {"signal_only": True}
+    assert 0 < calls[1]["graceful_timeout"] <= supervisor.stop_timeout
+    assert supervisor.status().phase == "stopped"
 
 
 def test_supervisor_refuses_clean_teardown_when_rank_group_survives(
@@ -389,7 +462,7 @@ def test_supervisor_refuses_clean_teardown_when_rank_group_survives(
         launch, "_wait_for_process_group_exit", lambda _pgid, _timeout: False
     )
     monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
-    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda **_kwargs: [])
 
     with pytest.raises(DistributedLaunchError, match="survived SIGKILL"):
         supervisor.stop()
@@ -402,6 +475,45 @@ def test_supervisor_refuses_clean_teardown_when_rank_group_survives(
     )
     with pytest.raises(DistributedLaunchError, match="not confirmed dead"):
         recreated._check_recovery_quarantine()
+
+
+def test_supervisor_refuses_clean_teardown_when_remote_pid_identity_changed(
+    monkeypatch, tmp_path
+):
+    class Launcher:
+        pid = 43215
+        stdout = None
+        stderr = None
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    supervisor.process = Launcher()
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: False)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: True,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_reap_remote_ranks",
+        lambda **_kwargs: [
+            {"rank": 1, "host": "studio.local", "action": "pid-reused"}
+        ],
+    )
+
+    with pytest.raises(DistributedLaunchError, match="pid-reused"):
+        supervisor.stop()
+
+    assert supervisor._recovery_marker_path().is_file()
 
 
 def test_supervisor_reaps_sigkilled_group_leader_before_liveness_recheck(
@@ -439,7 +551,7 @@ def test_supervisor_reaps_sigkilled_group_leader_before_liveness_recheck(
         lambda _pgid, _timeout: launcher.returncode is not None,
     )
     monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
-    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda: [])
+    monkeypatch.setattr(supervisor, "_reap_remote_ranks", lambda **_kwargs: [])
     monkeypatch.setattr(supervisor, "_wait_for_memory_recovery", lambda: None)
 
     supervisor.stop()
@@ -508,6 +620,52 @@ def test_recovery_requires_prelaunch_ceiling_not_merely_plan_fit(monkeypatch):
 
     assert reason is not None
     assert "recovered only 95.0 GiB of its 100.0 GiB pre-launch ceiling" in reason
+
+
+def test_recovery_quarantine_survives_marker_write_failure(monkeypatch, tmp_path):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path), recovery_timeout=0
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_probe_recovery_capacity",
+        lambda: [
+            {"rank": 0, "admission_ceiling_bytes": 1},
+            {"rank": 1, "admission_ceiling_bytes": 1},
+        ],
+    )
+    monkeypatch.setattr(supervisor, "_write_recovery_quarantine", lambda _reason: None)
+
+    with pytest.raises(DistributedMemoryRecoveryError):
+        supervisor._wait_for_memory_recovery()
+
+    assert not supervisor._recovery_marker_path().exists()
+    with pytest.raises(DistributedMemoryRecoveryError, match="quarantined"):
+        supervisor._check_recovery_quarantine()
+
+
+def test_repeated_stop_rechecks_in_memory_recovery_quarantine(monkeypatch, tmp_path):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path)
+    )
+    supervisor._recovery_required_reason = "accelerator memory is still retained"
+    recovery_checks = []
+    remote_reaps = []
+    monkeypatch.setattr(
+        supervisor,
+        "_reap_remote_ranks",
+        lambda **kwargs: remote_reaps.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_wait_for_memory_recovery",
+        lambda: recovery_checks.append(True),
+    )
+
+    supervisor.stop()
+
+    assert recovery_checks == [True]
+    assert remote_reaps == []
 
 
 def test_remote_preflight_uses_prompt_free_noninteractive_ssh():

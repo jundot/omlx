@@ -48,6 +48,26 @@ class _Tokenizer:
         return "\n".join(str(message["content"]) for message in messages)
 
 
+def _sse_response(*, json):
+    import json as json_module
+
+    choices = []
+    for original in json["choices"]:
+        choice = dict(original)
+        if "message" in choice:
+            choice["delta"] = choice.pop("message")
+        choices.append(choice)
+    events = [{"choices": choices}, {"choices": [], "usage": json.get("usage", {})}]
+    content = (
+        ": keepalive 1/1\n\n"
+        + "".join(f"data: {json_module.dumps(event)}\n\n" for event in events)
+        + "data: [DONE]\n\n"
+    )
+    return httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, content=content
+    )
+
+
 def _ready_engine(handler) -> DistributedBatchedEngine:
     engine = DistributedBatchedEngine(_deployment())
     engine._loaded = True
@@ -251,7 +271,7 @@ async def test_distributed_generate_bounds_rank_zero_read_stalls():
     engine, status_calls, stop_calls, client = _stalled_engine()
     with pytest.raises(
         DistributedInferenceError,
-        match="request timed out.*no rank-zero data.*cluster was ready",
+        match="stream timed out.*no rank-zero data.*cluster was ready",
     ):
         await engine.generate("hello")
 
@@ -493,6 +513,240 @@ async def test_cancelled_supervisor_stop_finishes_before_unlock():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_supervisor_operation_preserves_cancellation_on_failure():
+    started = threading.Event()
+    release = threading.Event()
+
+    def failing_operation():
+        started.set()
+        release.wait(timeout=2)
+        raise RuntimeError("teardown failed")
+
+    task = asyncio.create_task(
+        DistributedBatchedEngine._run_supervisor_operation(failing_operation)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(task, 1)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat", [False, True])
+async def test_repeated_stream_cancellation_drains_activity_during_teardown(chat):
+    started = asyncio.Event()
+    stopping = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_request):
+        started.set()
+        await asyncio.Event().wait()
+
+    engine = _ready_engine(handler)
+    client = engine._client
+
+    async def stop_operation(_operation):
+        stopping.set()
+        await release.wait()
+
+    engine._run_supervisor_operation = stop_operation
+
+    async def consume():
+        stream = (
+            engine.stream_chat([{"role": "user", "content": "hello"}])
+            if chat
+            else engine.stream_generate("hello")
+        )
+        async for _output in stream:
+            pass
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        await asyncio.wait_for(stopping.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert engine.has_active_requests() is False
+        assert engine._lifecycle_lock.locked()
+        assert engine._teardown_tasks
+    finally:
+        release.set()
+        await asyncio.gather(*engine._teardown_tasks)
+        await client.aclose()
+    assert not engine._lifecycle_lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cancelled_queued_vision_request_keeps_running_rank_work(chat, streaming):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        started.set()
+        await release.wait()
+        if json.loads(request.content)["stream"]:
+            field = '"delta":{"content":"ok"}' if chat else '"text":"ok"'
+            return httpx.Response(
+                200,
+                content=(
+                    f'data: {{"choices":[{{{field},"finish_reason":"stop"}}]}}\n\n'
+                    "data: [DONE]\n\n"
+                ),
+            )
+        return _sse_response(
+            json={
+                "choices": [
+                    {
+                        "text": "ok",
+                        "message": {"content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    engine._supports_multimodal_fallback = True
+    client = engine._client
+    stop_calls = []
+    engine._supervisor.stop = lambda: stop_calls.append(True)
+
+    async def invoke():
+        prompt = [{"role": "user", "content": "hello"}] if chat else "hello"
+        if streaming:
+            method = engine.stream_chat if chat else engine.stream_generate
+            return [output async for output in method(prompt)]
+        method = engine.chat if chat else engine.generate
+        return await method(prompt)
+
+    running = asyncio.create_task(invoke())
+    queued = None
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        queued = asyncio.create_task(invoke())
+        await asyncio.sleep(0)
+        assert engine._active_requests == 2
+        assert len(requests) == 1, "queued work must not open a backend socket"
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert engine._active_requests == 1
+        assert stop_calls == []
+        assert engine._client is client
+        release.set()
+        await asyncio.wait_for(running, 1)
+        assert not engine.has_active_requests()
+        assert not engine._vision_request_lock.locked()
+        assert stop_calls == []
+    finally:
+        release.set()
+        await asyncio.gather(
+            running, *([queued] if queued else []), return_exceptions=True
+        )
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_queued_vision_request_cannot_use_replaced_deployment():
+    engine = _ready_engine(lambda _request: httpx.Response(200))
+    engine._supports_multimodal_fallback = True
+    client = engine._client
+    await engine._vision_request_lock.acquire()
+    queued = asyncio.create_task(engine.generate("hello"))
+    replacement = httpx.AsyncClient(base_url="http://127.0.0.1:2")
+    try:
+        await asyncio.sleep(0)
+        assert engine._active_requests == 1
+        engine._client = replacement
+        engine._vision_request_lock.release()
+        with pytest.raises(DistributedInferenceError, match="changed while.*queued"):
+            await queued
+        assert not engine.has_active_requests()
+        assert not engine._vision_request_lock.locked()
+        assert engine._client is replacement
+        assert not replacement.is_closed
+    finally:
+        await client.aclose()
+        await replacement.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat", [False, True])
+async def test_nonstream_request_uses_progress_to_outlive_read_timeout(chat):
+    completed = asyncio.Event()
+    seen = []
+
+    async def serve(reader, writer):
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            length = next(
+                int(line.split(b":", 1)[1])
+                for line in headers.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+            seen.append(json.loads(await reader.readexactly(length)))
+            writer.write(b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+            # Total request time exceeds the real HTTP client's inactivity
+            # limit, but regular backend progress makes the request healthy.
+            for _ in range(6):
+                writer.write(b": keepalive 1/2\n\n")
+                await writer.drain()
+                await asyncio.sleep(0.05)
+            choice = {"finish_reason": "stop"}
+            choice.update({"message": {"content": "ok"}} if chat else {"text": "ok"})
+            writer.write(
+                _sse_response(
+                    json={
+                        "choices": [choice],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    }
+                ).content
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            completed.set()
+
+    async with await asyncio.start_server(serve, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        engine = DistributedBatchedEngine(_deployment(), request_read_timeout=0.2)
+        engine._loaded = True
+        engine._tokenizer = _Tokenizer()
+        engine._client = engine._new_client(f"http://127.0.0.1:{port}")
+        client = engine._client
+        stop_calls = []
+        engine._supervisor.stop = lambda: stop_calls.append(True)
+        try:
+            call = (
+                engine.chat([{"role": "user", "content": "hi"}])
+                if chat
+                else engine.generate("hi")
+            )
+            output = await asyncio.wait_for(call, 2)
+            assert output.text == output.new_text == "ok"
+            assert output.completion_tokens == 1
+            assert seen[0]["stream"] is True
+            assert stop_calls == []
+            assert engine._loaded
+        finally:
+            await client.aclose()
+            await asyncio.wait_for(completed.wait(), 1)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_distributed_failures_stop_supervisor_once():
     engine = _ready_engine(lambda _request: httpx.Response(200))
     client = engine._client
@@ -689,9 +943,8 @@ async def test_distributed_generate_translates_backend_completion():
     def handler(request):
         body = json.loads(request.content)
         assert body["prompt"] == "Hello"
-        assert body["stream"] is False
-        return httpx.Response(
-            200,
+        assert body["stream"] is True
+        return _sse_response(
             json={
                 "choices": [{"text": " world", "finish_reason": "stop"}],
                 "usage": {
@@ -737,9 +990,8 @@ async def test_distributed_chat_preserves_rank_zero_tool_calls_and_reasoning():
         assert request.url.path == "/v1/chat/completions"
         assert body["messages"] == [{"role": "user", "content": "Weather?"}]
         assert body["tools"] == tools
-        assert body["stream"] is False
-        return httpx.Response(
-            200,
+        assert body["stream"] is True
+        return _sse_response(
             json={
                 "choices": [
                     {
@@ -1279,7 +1531,7 @@ async def test_cancel_during_transport_diagnosis_still_stops_every_rank():
     engine._supervisor.stop = lambda: stop_calls.append(True)
 
     async def blocked_diagnosis(_exc, *, stream):
-        assert stream is False
+        assert stream is True
         diagnosis_started.set()
         await asyncio.Event().wait()
 
@@ -1423,11 +1675,13 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
                 },
             )
         assert effort == "xhigh"
-        return httpx.Response(
-            200,
+        return _sse_response(
             json={
                 "choices": [
-                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
                 ],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
@@ -1458,8 +1712,7 @@ async def test_distributed_chat_tries_the_normalized_value_first():
         effort = body.get("chat_template_kwargs", {}).get("reasoning_effort")
         calls.append(effort)
         if effort == "high":
-            return httpx.Response(
-                200,
+            return _sse_response(
                 json={
                     "choices": [
                         {
@@ -1502,8 +1755,7 @@ async def test_distributed_generate_retries_unsupported_reasoning_effort():
                 json={"error": "Unexpected reasoning effort minimal."},
             )
         assert effort == "low"
-        return httpx.Response(
-            200,
+        return _sse_response(
             json={
                 "choices": [{"text": "ok", "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},

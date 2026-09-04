@@ -382,3 +382,45 @@ async def test_failed_distributed_teardown_keeps_supervisor_reachable(tmp_path):
 
     assert entry.engine is engine
     assert pool.current_model_memory == 90
+
+
+async def test_quarantined_lease_release_preserves_error_and_pending_retry(tmp_path):
+    from omlx.cluster.launch import DistributedMemoryRecoveryError
+
+    pool = EnginePool()
+    model_path = str(tmp_path / "nemotron")
+    entry = _entry(model_path)
+    stop = AsyncMock(side_effect=DistributedMemoryRecoveryError("retained memory"))
+    engine = SimpleNamespace(deployment=_deployment(model_path), stop=stop)
+    entry.engine = engine
+    entry.in_use = 1
+    entry.is_pinned = True
+    entry.pending_unload_reason = "manual unload"
+    entry.pending_unload_allow_pinned = True
+    entry.abort_requested = True
+    pool._entries[entry.model_id] = entry
+    pool._current_model_memory = 90
+
+    # The cleanup in a request's finally block must not mask the real failure.
+    with pytest.raises(ValueError, match="original request failure"):
+        try:
+            raise ValueError("original request failure")
+        finally:
+            await pool.release_engine(entry.model_id)
+
+    assert entry.in_use == 0
+    assert entry.engine is engine
+    assert pool.current_model_memory == 90
+    assert entry.pending_unload_reason == "manual unload"
+    assert entry.pending_unload_allow_pinned is True
+    assert entry.abort_requested is True
+
+    # Once recovery succeeds, retry really removes the engine and accounting.
+    stop.side_effect = None
+    async with pool._lock:
+        assert await pool._unload_pending_if_idle_locked(entry.model_id)
+    assert entry.engine is None
+    assert pool.current_model_memory == 0
+    assert entry.pending_unload_reason is None
+    assert entry.pending_unload_allow_pinned is False
+    assert entry.abort_requested is False

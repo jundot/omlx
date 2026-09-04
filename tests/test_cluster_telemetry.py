@@ -196,7 +196,7 @@ def test_queue_observer_preserves_mlx_lm_queue_contract():
 def test_telemetry_marker_failure_never_interrupts_inference():
     class BrokenMarker:
         def update(self, phase, **extra):
-            raise OSError("disk unavailable")
+            raise RuntimeError("marker implementation failed")
 
     telemetry = RuntimeTelemetry(BrokenMarker(), publish_interval=0)
 
@@ -368,6 +368,153 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     assert mlx_server.BatchGenerator is FakeBatchGenerator
 
 
+def test_rank_local_memory_cache_hit_is_dropped_when_a_peer_missed(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = mlx_server.LRUPromptCache()
+
+        def _tokenize(self, *_args):
+            prompt = [1, 2, 3, 4]
+            return prompt, [prompt], ["assistant"], "normal"
+
+    class FakeBatchGenerator:
+        pass
+
+    class FakePromptCache:
+        def fetch_nearest_cache(self, _model, tokens):
+            return "rank-local-cache", tokens[2:]
+
+        def __len__(self):
+            return 1
+
+        @property
+        def nbytes(self):
+            return 64
+
+    class Group:
+        @staticmethod
+        def size():
+            return 2
+
+    class Gathered:
+        @staticmethod
+        def tolist():
+            return [2, 0]
+
+    calls = []
+    guard = SimpleNamespace(
+        check_collective=lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda _value: Gathered())
+
+    with install_server_telemetry(_Marker(), prefill_guard=guard):
+        generator = mlx_server.ResponseGenerator()
+        tokenized = generator._tokenize(None, None, None)
+        assert generator.prompt_cache.fetch_nearest_cache(
+            "model", tokenized[0]
+        ) == (None, tokenized[0])
+
+    assert calls[0][1]["cached_tokens"] == 0
+
+
+def test_snapshot_restore_is_dropped_when_one_rank_cannot_load(
+    monkeypatch, tmp_path
+):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    from omlx.cluster import prompt_snapshot_cache
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = mlx_server.LRUPromptCache()
+
+        def _tokenize(self, *_args):
+            prompt = [1, 2, 3, 4, 5]
+            return prompt, [prompt], ["assistant"], "normal"
+
+    class FakeBatchGenerator:
+        pass
+
+    class FakePromptCache:
+        def fetch_nearest_cache(self, _model, tokens):
+            return None, tokens
+
+        def __len__(self):
+            return 0
+
+        @property
+        def nbytes(self):
+            return 0
+
+    class FakeStore:
+        def __init__(self, directory, **_kwargs):
+            self.directory = tmp_path / "snapshots"
+            self.directory.mkdir()
+
+        def present_boundaries(self, _model, _tokens):
+            return (2,)
+
+        def load(self, _model, _tokens, boundary):
+            assert boundary == 2
+            return ["local-snapshot"]
+
+    class Group:
+        @staticmethod
+        def size():
+            return 2
+
+    class CollectiveValue:
+        def __init__(self, value):
+            self.value = value
+
+        def tolist(self):
+            return self.value
+
+        def item(self):
+            return self.value
+
+    reductions = iter((CollectiveValue([0, 2]), CollectiveValue(1)))
+    guard_calls = []
+    guard = SimpleNamespace(
+        check_collective=lambda *args, **kwargs: guard_calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+    monkeypatch.setattr(prompt_snapshot_cache, "SSDPromptSnapshotStore", FakeStore)
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_gather",
+        lambda _value: CollectiveValue([0, 0]),
+    )
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda _value: next(reductions))
+
+    with install_server_telemetry(
+        _Marker(),
+        prefill_guard=guard,
+        ssd_cache_dir=str(tmp_path / "snapshots"),
+        prefill_step_size=2,
+    ):
+        generator = mlx_server.ResponseGenerator()
+        tokenized = generator._tokenize(None, None, None)
+        assert generator.prompt_cache.fetch_nearest_cache(
+            "model", tokenized[0]
+        ) == (None, tokenized[0])
+
+    assert guard_calls[0][1]["cached_tokens"] == 0
+
+
 def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
     monkeypatch,
 ):
@@ -397,8 +544,9 @@ def test_vision_sharing_precedes_telemetry_collectives_and_guards_actual_suffix(
     )
 
     class Model:
-        def set_vision_inputs(self, images):
+        def set_vision_inputs(self, images, *, spans=()):
             self.images = images
+            self.spans = spans
 
     class FakeResponseGenerator:
         def __init__(self):

@@ -208,6 +208,7 @@ class _CollectiveMX:
     def __init__(self, *, rank, votes):
         self._rank = rank
         self._votes = votes
+        self.last_vote = None
         self.distributed = self
 
     def init(self):
@@ -222,7 +223,8 @@ class _CollectiveMX:
     def array(self, value):
         return value
 
-    def all_sum(self, _value):
+    def all_sum(self, value):
+        self.last_vote = value
         return _CollectiveValue(self._votes)
 
 
@@ -247,6 +249,20 @@ def test_collective_admission_allows_every_rank_to_continue():
         current_usage_bytes=1 * GiB,
         mx_module=mx,
     )
+
+
+def test_an_unexpected_local_probe_failure_votes_before_it_is_raised():
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    mx = _CollectiveMX(rank=0, votes=[1, 0])
+
+    def _probe_failed(*_args, **_kwargs):
+        raise RuntimeError("memory probe failed")
+
+    guard.check = _probe_failed
+    with pytest.raises(RuntimeError, match="memory probe failed"):
+        guard.check_collective(2048, mx_module=mx)
+
+    assert mx.last_vote == [1, 0]
 
 
 def test_an_unreadable_model_disables_the_guard():

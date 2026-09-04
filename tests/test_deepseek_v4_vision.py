@@ -14,6 +14,7 @@ from PIL import Image
 from omlx.cluster.deepseek_v4_vision_runtime import (
     install_deepseek_v4_vision_runtime,
     vision_prefill_chunks,
+    vision_token_spans,
 )
 from omlx.deepseek_v4_vision import (
     IMAGE,
@@ -23,6 +24,7 @@ from omlx.deepseek_v4_vision import (
     is_deepseek_v4_vision_config,
 )
 from omlx.patches.deepseek_v4.vision_inputs import (
+    _image_bytes,
     build_image_block,
     prepare_token_ids,
 )
@@ -97,6 +99,47 @@ def test_one_and_multiple_images_expand_in_prompt_order():
     assert IMAGE_PLACEHOLDER.startswith("<")
 
 
+def test_image_count_is_bounded_before_preprocessing():
+    with pytest.raises(ValueError, match="at most 16 images"):
+        prepare_token_ids(
+            [99] * 17,
+            [{"data": "not decoded"}] * 17,
+            image_token_id=99,
+            config=_config(),
+        )
+
+
+def test_base64_size_is_rejected_before_decode_allocation(monkeypatch):
+    from omlx.patches.deepseek_v4 import vision_inputs
+
+    monkeypatch.setattr(vision_inputs, "_MAX_IMAGE_BYTES", 3)
+    with pytest.raises(ValueError, match="exceeds 50 MiB"):
+        _image_bytes({"data": "A" * 8})
+
+
+def test_decoded_image_and_encoder_patch_counts_are_bounded(monkeypatch):
+    from omlx.patches.deepseek_v4 import vision_inputs
+
+    monkeypatch.setattr(vision_inputs, "_MAX_SOURCE_PIXELS", 15)
+    with pytest.raises(ValueError, match="64 Mi-pixel"):
+        prepare_token_ids(
+            [99],
+            [{"url": _data_url("red")}],
+            image_token_id=99,
+            config=_config(),
+        )
+
+    monkeypatch.setattr(vision_inputs, "_MAX_SOURCE_PIXELS", 64 * 1024 * 1024)
+    monkeypatch.setattr(vision_inputs, "_MAX_VISION_PATCHES", 3)
+    with pytest.raises(ValueError, match="8192-patch"):
+        prepare_token_ids(
+            [99],
+            [{"url": _data_url("red")}],
+            image_token_id=99,
+            config=_config(),
+        )
+
+
 def test_vision_prefill_chunks_never_split_an_image_block():
     prompt = [1, 100, 101, 102, 103, 104, 2, 3, 4]
 
@@ -145,6 +188,11 @@ def test_vision_prefill_chunks_accept_an_image_at_prompt_start():
         vocab_size=100,
         max_chunk_tokens=3,
     ) == ((0, 5), (5, 6))
+
+
+def test_vision_token_spans_reject_unknown_out_of_vocab_token():
+    with pytest.raises(ValueError, match="sentinel kind 5"):
+        vision_token_spans([100, 105, 104], vocab_size=100)
 
 
 @pytest.mark.parametrize(
@@ -217,8 +265,9 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
         messages: list
 
     class Model:
-        def set_vision_inputs(self, images):
+        def set_vision_inputs(self, images, *, spans=()):
             self.images = images
+            self.spans = spans
 
     class ResponseGenerator:
         def __init__(self, provider):
@@ -272,6 +321,7 @@ def test_rank_zero_runtime_dispatches_image_prefill_and_streaming():
             tokenizer, shared_request, shared_args
         )
         assert len(provider.model.images) == 1
+        assert provider.model.spans == vision_token_spans(prompt, vocab_size=100)
         assert request.messages[0]["content"][0]["type"] == "image_url"
         assert shared_request.messages[0]["content"][0] == {
             "type": "text",
@@ -295,8 +345,9 @@ def test_runtime_prefills_variable_image_safe_chunks(monkeypatch):
     seen = {}
 
     class Model:
-        def set_vision_inputs(self, images):
+        def set_vision_inputs(self, images, *, spans=()):
             self.images = images
+            self.spans = spans
 
     class ResponseGenerator:
         def _tokenize(self, *_args):
@@ -378,8 +429,9 @@ def test_runtime_uses_one_request_broadcast_for_both_ranks(
         calls = []
 
     class Model:
-        def set_vision_inputs(self, images):
+        def set_vision_inputs(self, images, *, spans=()):
             self.images = images
+            self.spans = spans
 
     class ResponseGenerator:
         def __init__(self, provider):

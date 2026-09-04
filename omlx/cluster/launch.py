@@ -2005,22 +2005,34 @@ class DistributedJobSupervisor:
         process = self.process
         teardown_failures: list[str] = []
         verify_teardown = process is not None or self._teardown_incomplete
-        verify_recovery = process is not None or self._recovery_marker_path().is_file()
+        verify_recovery = (
+            process is not None
+            or self._recovery_required_reason is not None
+            or self._recovery_marker_path().is_file()
+        )
+        deadline = time.monotonic() + self.stop_timeout
         process_group = (
             process.pid if process is not None else self._pending_process_group
         )
+        if process_group is not None and _process_group_alive(process_group):
+            try:
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                teardown_failures.append(
+                    f"local launch process group {process_group} could not "
+                    "be signaled"
+                )
+        if verify_teardown:
+            # Signal remote ranks before spending the local grace period. A
+            # rank blocked in a collective cannot unwind while its peer is
+            # still serving, so serial local-then-remote teardown consumed
+            # both grace windows and routinely forced every rank through
+            # SIGKILL. The second pass below verifies death and escalates only
+            # ranks that did not honor this coordinated SIGTERM.
+            self._reap_remote_ranks(signal_only=True)
         if process_group is not None:
-            deadline = time.monotonic() + self.stop_timeout
-            if _process_group_alive(process_group):
-                try:
-                    os.killpg(process_group, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    teardown_failures.append(
-                        f"local launch process group {process_group} could not "
-                        "be signaled"
-                    )
             if process is not None and process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(
@@ -2062,12 +2074,19 @@ class DistributedJobSupervisor:
                 teardown_failures.append(
                     f"launcher process {process.pid} could not be reaped"
                 )
-        remote_reports = self._reap_remote_ranks()
+        remote_reports = (
+            self._reap_remote_ranks(
+                graceful_timeout=max(0.0, deadline - time.monotonic())
+            )
+            if verify_teardown
+            else []
+        )
         for report in remote_reports:
             if verify_teardown and report["action"] in {
                 "unreachable",
                 "kill-failed",
                 "identity-mismatch",
+                "pid-reused",
                 "marker-unreadable",
                 "no-marker",
                 "no-report",
@@ -2114,7 +2133,11 @@ class DistributedJobSupervisor:
             self._wait_for_memory_recovery()
 
     def _reap_remote_ranks(
-        self, *, runner: SSHRunner = subprocess.run
+        self,
+        *,
+        runner: SSHRunner = subprocess.run,
+        signal_only: bool = False,
+        graceful_timeout: float = 3.0,
     ) -> list[dict[str, Any]]:
         """Kill rank workers on peer hosts that the local group kill cannot reach.
 
@@ -2127,7 +2150,10 @@ class DistributedJobSupervisor:
         ``{state_dir}/{deployment_id}-rank-{rank}.json``. Read that marker
         over SSH, validate that the PID matches the expected deployment,
         plan, and rank, verify the process command line before signaling,
-        and escalate SIGTERM -> wait -> SIGKILL -> confirmed dead.
+        and escalate SIGTERM -> wait -> SIGKILL -> confirmed dead. During a
+        coordinated shutdown, ``signal_only`` sends TERM without waiting so
+        every collective peer gets its grace period at the same time; a later
+        call with a zero grace verifies and force-kills survivors.
 
         The marker file is deliberately left in place: it holds the rank's
         failure phase and error, which ``_runtime_failure_reason`` and the
@@ -2136,6 +2162,7 @@ class DistributedJobSupervisor:
         instead of passing as a clean stop.
         """
         reports: list[dict[str, Any]] = []
+        graceful_timeout = max(0.0, float(graceful_timeout))
         if not self.deployment or not self.deployment.hosts:
             return reports
         for rank, host in enumerate(self.deployment.hosts):
@@ -2194,7 +2221,10 @@ class DistributedJobSupervisor:
                 "  os.kill(pid,signal.SIGTERM)\n"
                 "except ProcessLookupError:\n"
                 "  out('already-dead'); raise SystemExit(0)\n"
-                "deadline=time.monotonic()+3.0\n"
+                f"signal_only={signal_only!r}\n"
+                "if signal_only:\n"
+                "  out('signaled'); raise SystemExit(0)\n"
+                f"deadline=time.monotonic()+{graceful_timeout!r}\n"
                 "while time.monotonic()<deadline:\n"
                 "  if is_dead(pid):\n"
                 "    out('terminated'); raise SystemExit(0)\n"
@@ -2391,42 +2421,52 @@ class DistributedJobSupervisor:
     def _check_recovery_quarantine(self) -> None:
         """Honor a previous crash quarantine before launching any process."""
 
-        if not self._recovery_marker_path().is_file():
+        marker_exists = self._recovery_marker_path().is_file()
+        # Persistence is best effort. Keep the fail-closed decision effective
+        # in this supervisor even when the state directory could not be
+        # written; otherwise a second start on the same object bypasses the
+        # recovery barrier that the first stop just established.
+        if not marker_exists and self._recovery_required_reason is None:
             return
-        try:
-            marker = json.loads(
-                self._recovery_marker_path().read_text(encoding="utf-8")
-            )
-            if marker.get("kind") == "unconfirmed_process":
-                marker_boot = str(marker.get("boot_session_id") or "")
-                current_boot = _boot_session_id()
-                if not marker_boot or not current_boot or marker_boot == current_boot:
-                    reason = str(
-                        marker.get("reason")
-                        or "a previous teardown could not confirm every rank exited"
-                    )
-                    self._phase = "teardown_failed"
-                    self._teardown_failure_reason = reason
-                    raise DistributedLaunchError(
-                        "Distributed reload remains quarantined because a rank "
-                        "process was not confirmed dead in this boot session: "
-                        f"{reason}. Reboot the affected host before retrying."
-                    )
-            baselines = marker.get("baseline_ceiling_bytes", {})
-            if isinstance(baselines, dict):
-                self._recovery_baseline_by_rank = {
-                    int(rank): int(ceiling)
-                    for rank, ceiling in baselines.items()
-                    if int(ceiling) > 0
-                }
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            # A malformed marker still means the previous teardown asked us
-            # not to launch. Re-probe against plan-fit and replace it with a
-            # valid marker if memory remains unavailable.
-            logger.warning(
-                "Distributed memory quarantine marker is unreadable: %s",
-                self._recovery_marker_path(),
-            )
+        if marker_exists:
+            try:
+                marker = json.loads(
+                    self._recovery_marker_path().read_text(encoding="utf-8")
+                )
+                if marker.get("kind") == "unconfirmed_process":
+                    marker_boot = str(marker.get("boot_session_id") or "")
+                    current_boot = _boot_session_id()
+                    if (
+                        not marker_boot
+                        or not current_boot
+                        or marker_boot == current_boot
+                    ):
+                        reason = str(
+                            marker.get("reason")
+                            or "a previous teardown could not confirm every rank exited"
+                        )
+                        self._phase = "teardown_failed"
+                        self._teardown_failure_reason = reason
+                        raise DistributedLaunchError(
+                            "Distributed reload remains quarantined because a rank "
+                            "process was not confirmed dead in this boot session: "
+                            f"{reason}. Reboot the affected host before retrying."
+                        )
+                baselines = marker.get("baseline_ceiling_bytes", {})
+                if isinstance(baselines, dict):
+                    self._recovery_baseline_by_rank = {
+                        int(rank): int(ceiling)
+                        for rank, ceiling in baselines.items()
+                        if int(ceiling) > 0
+                    }
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                # A malformed marker still means the previous teardown asked us
+                # not to launch. Re-probe against plan-fit and replace it with a
+                # valid marker if memory remains unavailable.
+                logger.warning(
+                    "Distributed memory quarantine marker is unreadable: %s",
+                    self._recovery_marker_path(),
+                )
         reason = self._recovery_failure()
         if reason is None:
             self._clear_recovery_quarantine()

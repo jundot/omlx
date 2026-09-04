@@ -575,9 +575,11 @@ class RuntimeTelemetry:
         self._last_publish_at = now
         try:
             self._marker.update("ready", metrics=snapshot)
-        except OSError:
-            # Runtime visibility is deliberately fail-soft. A full disk or
-            # unavailable state directory must never interrupt generation.
+        except Exception as exc:
+            # Runtime visibility is deliberately fail-soft.  In a distributed
+            # worker even a rank-local marker implementation bug must not make
+            # that rank leave before its peers reach the next collective.
+            logger.debug("Runtime marker update failed: %s", exc)
             return
 
 
@@ -700,7 +702,13 @@ def install_server_telemetry(
         # and the sequential generate_step rejects an empty prompt, so a full
         # hit must leave the last token unprocessed. The cap is computed from
         # the broadcast prompt length, so it is identical on every rank.
-        local = set(ssd_store.present_boundaries(model, tokens))
+        try:
+            local = set(ssd_store.present_boundaries(model, tokens))
+        except Exception as exc:
+            # Presence probing is rank-local I/O.  Treat a broken local store
+            # as an empty one, then still contribute the zero vote below.
+            logger.debug("Prompt snapshot presence probe failed: %s", exc)
+            local = set()
         candidates = candidate_boundaries(len(tokens) - 1, snapshot_step)
         if not candidates:
             return 0
@@ -710,6 +718,40 @@ def install_server_telemetry(
         vote = mx.array([1 if c in local else 0 for c in candidates], dtype=mx.int32)
         agreed = mx.distributed.all_sum(vote).tolist()
         return agreed_boundary(candidates, agreed, world_size)
+
+    def agree_memory_cache(
+        cache: Any,
+        rest: list[int],
+        tokens: list[int],
+    ) -> tuple[Any, list[int]]:
+        """Use an in-memory prefix only when every rank found the same length.
+
+        The MLX-LM prompt cache is rank-local.  An eviction or failed lookup on
+        one worker must not let the other ranks start model execution from a
+        different cache position.  Gathering one integer is cheap and makes
+        both the cached-token admission input and the model suffix symmetric.
+        """
+
+        if world_size <= 1:
+            return cache, rest
+        cached = len(tokens) - len(rest) if cache is not None else 0
+        gathered = mx.distributed.all_gather(
+            mx.array([cached], dtype=mx.int32)
+        ).tolist()
+        counts = [int(value) for value in gathered]
+        if len(counts) == world_size and all(value == cached for value in counts):
+            return cache, rest
+        return None, list(tokens)
+
+    def agree_loaded_snapshot(loaded: Any) -> Any | None:
+        """Publish a restored snapshot only when every rank loaded its shard."""
+
+        if world_size <= 1:
+            return loaded
+        loaded_ranks = mx.distributed.all_sum(
+            mx.array(1 if loaded is not None else 0, dtype=mx.int32)
+        ).item()
+        return loaded if int(loaded_ranks) == world_size else None
 
     class TelemetryBatchGenerator(original_batch_generator):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -819,7 +861,13 @@ def install_server_telemetry(
 
     class TelemetryPromptCache(original_prompt_cache):
         def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
-            cache, rest = super().fetch_nearest_cache(model, tokens)
+            try:
+                cache, rest = super().fetch_nearest_cache(model, tokens)
+            except Exception as exc:
+                # A corrupt rank-local entry is a miss.  All ranks still reach
+                # agree_memory_cache below, which prevents asymmetric reuse.
+                logger.debug("In-memory prompt cache lookup failed: %s", exc)
+                cache, rest = None, list(tokens)
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
                 remaining_tokens=len(rest),
@@ -830,24 +878,35 @@ def install_server_telemetry(
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
-            if cache is not None and not rest and tokens:
-                # MLX-LM's exact-hit branch returns an empty rest, unlike its
-                # shorter/longer branches which cap the prefix at len - 1. The
-                # pinned batched server dies inserting a fully consumed
-                # request (insert_segments indexes seq[-1]) and the sequential
-                # generate_step rejects an empty prompt, so hand back the last
-                # token: trimmed off the hit when the cache supports it,
-                # recomputed from scratch when it does not.
-                from mlx_lm.models.cache import (
-                    can_trim_prompt_cache,
-                    trim_prompt_cache,
-                )
+            try:
+                if cache is not None and not rest and tokens:
+                    # MLX-LM's exact-hit branch returns an empty rest, unlike its
+                    # shorter/longer branches which cap the prefix at len - 1. The
+                    # pinned batched server dies inserting a fully consumed
+                    # request (insert_segments indexes seq[-1]) and the sequential
+                    # generate_step rejects an empty prompt, so hand back the last
+                    # token: trimmed off the hit when the cache supports it,
+                    # recomputed from scratch when it does not.
+                    from mlx_lm.models.cache import (
+                        can_trim_prompt_cache,
+                        trim_prompt_cache,
+                    )
 
-                if can_trim_prompt_cache(cache):
-                    trim_prompt_cache(cache, 1)
-                    rest = list(tokens[-1:])
-                else:
-                    cache, rest = None, list(tokens)
+                    if can_trim_prompt_cache(cache):
+                        trim_prompt_cache(cache, 1)
+                        rest = list(tokens[-1:])
+                    else:
+                        cache, rest = None, list(tokens)
+            except Exception as exc:
+                # Trimming an exact hit is rank-local cache work too.  Convert
+                # a bad entry into a miss before entering the agreement call.
+                logger.debug("In-memory prompt cache normalization failed: %s", exc)
+                cache, rest = None, list(tokens)
+            if cache is not None and len(rest) >= len(tokens):
+                # A zero-length prefix has no reusable state and should be
+                # represented identically to an ordinary miss on every rank.
+                cache, rest = None, list(tokens)
+            cache, rest = agree_memory_cache(cache, rest, tokens)
             # Record the full prompt so the boundary-snapshot callback can key
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
@@ -860,7 +919,12 @@ def install_server_telemetry(
                 # path, whose byte-based eviction can diverge across ranks.
                 boundary = agree_ssd_boundary(model, tokens)
                 if cache is None and boundary > 0:
-                    loaded = ssd_store.load(model, tokens, boundary)
+                    try:
+                        loaded = ssd_store.load(model, tokens, boundary)
+                    except Exception as exc:
+                        logger.debug("Prompt snapshot restore failed: %s", exc)
+                        loaded = None
+                    loaded = agree_loaded_snapshot(loaded)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
             return cache, rest

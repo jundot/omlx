@@ -1982,6 +1982,7 @@ class TestDeepSeekV4VisionSuffixes:
             _vision_rank=0,
             _vision_group=_Group(),
             _vision_inputs=(first, second),
+            _vision_spans=((0, 3), (5, 8)),
             _vision_blocks={},
         )
 
@@ -1993,6 +1994,28 @@ class TestDeepSeekV4VisionSuffixes:
         assert vision.calls == [2]
         assert embeddings[0, 1:4].tolist() == [[10, 10], [2, 2], [40, 40]]
         assert fake._vision_inputs == ()
+
+    def test_cached_prefix_prunes_covered_image_arrays_and_blocks(
+        self, applied_patch
+    ):
+        import sys
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        first = SimpleNamespace(start=0, types=(0, 2, 4))
+        second = SimpleNamespace(start=5, types=(0, 2, 4))
+        retained = object()
+        fake = SimpleNamespace(
+            _vision_rank=0,
+            _vision_inputs=(first, second),
+            _vision_spans=((0, 3), (5, 8)),
+            _vision_blocks={0: object(), 5: retained},
+        )
+
+        dsv4.Model._prune_vision_state(fake, offset=4)
+
+        assert fake._vision_inputs == (second,)
+        assert fake._vision_spans == ((5, 8),)
+        assert fake._vision_blocks == {5: retained}
 
     def test_distributed_vision_embeddings_are_materialized_before_pipeline(
         self, applied_patch, monkeypatch
@@ -2032,6 +2055,7 @@ class TestDeepSeekV4VisionSuffixes:
             _vision_rank=1,
             _vision_group=_Group(),
             _vision_inputs=None,
+            _vision_spans=((0, 1),),
             _vision_blocks={},
         )
 
@@ -2131,6 +2155,10 @@ class TestDeepSeekV4VisionSuffixes:
             args=SimpleNamespace(vocab_size=100),
             is_vision_model=True,
             _omlx_mtp_decode_enabled=False,
+            _vision_rank=0,
+            _vision_inputs=(),
+            _vision_spans=((5, 8),),
+            _vision_blocks={},
             _vision_embeddings=vision_embeddings,
             model=inner,
             lm_head=lambda hidden: hidden,
@@ -2658,10 +2686,8 @@ class TestSparseCompressedAttentionIndexerSkip:
 class TestIndexerFallbackTiling:
     """The MLX indexer fallback (used when the native glm_moe_dsa kernel is
     not built) tiles the pooled axis so its (B, heads, L, P) intermediate
-    never crosses 2**31 elements — the boundary where mlx int32 kernel
-    indexing silently zeroes the tail and corrupts top-k selection at
-    >256k context — while keeping top-k selection identical to the untiled
-    reduction."""
+    stays memory-bounded while keeping top-k selection identical to the
+    untiled reduction."""
 
     def _reduce_and_ref(self):
         # The patch registers deepseek_v4_model.py as mlx_lm.models.deepseek_v4
@@ -2779,9 +2805,66 @@ class TestIndexerFallbackTiling:
                 int((ia != ib).sum()) == 0
             ), f"top-k differs at pool_count={pool_count}"
 
-    def test_tile_stays_under_int32_index_limit(self, applied_patch):
-        # The prefill chunk is 512 and index heads are 64; the tiled matmul
-        # output must stay below 2**31 elements at any context length.
+    def test_forced_tiled_fallback_matches_single_matmul(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        config = dm.ModelArgs(
+            hidden_size=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=2,
+            num_hidden_layers=1,
+            compress_ratios=[4],
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=4,
+        )
+        indexer = dm.Indexer(config, compress_ratio=4)
+        mx.random.seed(9)
+        x = mx.random.normal((1, 3, 8))
+        pooled = mx.random.normal((1, 13, 4))
+        q = mx.random.normal((1, 2, 3, 4))
+        weights = mx.random.normal((1, 3, 2))
+        monkeypatch.setattr(
+            dm.Compressor,
+            "__call__",
+            lambda self, _x, _cache, _offset: pooled,
+        )
+
+        monkeypatch.setattr(dm, "_INDEXER_MAX_ELEMS", 1_000_000)
+        untiled = indexer(
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=None,
+            offset=0,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        monkeypatch.setattr(dm, "_INDEXER_MAX_ELEMS", 24)
+        tiled = indexer(
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=None,
+            offset=0,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        mx.eval(untiled, tiled)
+
+        assert untiled.tolist() == tiled.tolist()
+
+    def test_tile_bounds_long_context_prefill_but_not_decode(self, applied_patch):
+        # A 512-token prefill at the last successful 67k-token context would
+        # otherwise materialize ~2 GiB of FP32 scores in each ratio-4 layer.
         _, dm = self._reduce_and_ref()
-        assert 64 * 512 * dm._INDEXER_POOL_TILE < 2**31
-        assert dm._INDEXER_MAX_ELEMS < 2**31
+        per_pool = 64 * 512
+        tile = min(dm._INDEXER_POOL_TILE, dm._INDEXER_MAX_ELEMS // per_pool)
+        assert tile == 2048
+        assert per_pool * tile * 4 == 256 * 1024 * 1024
+
+        # One-token decode at the same context remains below the threshold,
+        # avoiding extra launches in the steady-state hot path.
+        pooled_at_67k = 67_165 // 4
+        assert 64 * pooled_at_67k < dm._INDEXER_MAX_ELEMS

@@ -1336,15 +1336,18 @@ class EnginePool:
             return False
 
         reason = entry.pending_unload_reason
-        entry.pending_unload_reason = None
-        entry.pending_unload_allow_pinned = False
-        entry.abort_requested = False
         logger.warning(
             "Unloading pending model '%s' after activity drained (%s)",
             model_id,
             reason,
         )
         await self._unload_engine(model_id)
+        # A failed teardown must keep both the retry intent and the admission
+        # gate. In particular, driver-retained memory is still accounted until
+        # the distributed supervisor confirms recovery.
+        entry.pending_unload_reason = None
+        entry.pending_unload_allow_pinned = False
+        entry.abort_requested = False
         return True
 
     def _finish_pending_unload_task(
@@ -1759,11 +1762,21 @@ class EnginePool:
             return loaded.engine
 
     async def _release_engine_lease(self, model_id: str) -> None:
+        from .cluster.launch import DistributedLaunchError
+
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
-            await self._unload_pending_if_idle_locked(model_id)
+            try:
+                await self._unload_pending_if_idle_locked(model_id)
+            except DistributedLaunchError as exc:
+                # The lease is released; deferred cleanup is a separate
+                # operation. Do not replace a request's original exception (or
+                # its completed response) with a recovery quarantine error.
+                # _unload_engine retains the engine and memory accounting, and
+                # the pending flag keeps new admissions blocked until retry.
+                logger.warning("Deferred distributed unload for %s: %s", model_id, exc)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
         self._lease_release_tasks.discard(task)

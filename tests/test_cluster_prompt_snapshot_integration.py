@@ -337,7 +337,7 @@ def test_vision_digest_key_lives_through_request_cache_then_is_cleared(
         def __init__(self):
             self.inputs = []
 
-        def set_vision_inputs(self, images):
+        def set_vision_inputs(self, images, *, spans=()):
             self.inputs.append(images)
 
     class Cache:

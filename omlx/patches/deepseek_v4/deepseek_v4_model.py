@@ -565,18 +565,13 @@ def _overlap_compress_kv(kv, gate, ape, head_dim):
 # Pooled-axis tile for the MLX indexer fallback (used when the native
 # glm_moe_dsa extension is not built). The native dsa_indexer_scores kernel
 # keeps the (heads, L, P) score tensor in registers; the fallback has to
-# materialize it, and at ratio 4 with a 512-token chunk P = ctx/4, so the
-# intermediate is (1, 64, 512, ctx/4) fp32 — 8.3 GiB at 273k context, read
-# five more times. Worse, 64*512*P crosses 2**31 elements at ctx = 256k, the
-# boundary where mlx's int32 kernel indexing silently zeros the tail and
-# corrupts top-k selection. Tiling keeps each matmul under 2**31 elements;
-# the memory estimator separately accounts for lazy evaluation retaining
-# multiple score shards at once.
+# materialize it. At ratio 4 with a 512-token chunk, a 67k-token context is
+# already a 2 GiB FP32 temporary in every ratio-4 layer. Bound each fallback
+# matmul to 256 MiB; one-token decode stays well below this threshold and
+# therefore keeps its single-launch path.
 _INDEXER_POOL_TILE = 16384
-# mlx kernels index with int32, so a tensor at or past 2**31 elements has its
-# tail silently zeroed. Stay a factor of 2 below that. For a 512-token chunk
-# with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
-_INDEXER_MAX_ELEMS = 2**30
+# This is also far below MLX's 2**31-element int32 indexing boundary.
+_INDEXER_MAX_ELEMS = 2**26
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
 _DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
     "OMLX_DSV4F_M2_MMA_SCORE", "1"
@@ -1536,28 +1531,27 @@ class Indexer(nn.Module):
         kf = pooled[:, None].swapaxes(-1, -2).astype(mx.float32)  # (B, 1, Dh, P)
         n_pool = pooled.shape[1]
         n_elems = qf.shape[0] * qf.shape[1] * qf.shape[2] * n_pool
-        if n_elems < _INDEXER_MAX_ELEMS:
-            # Single matmul: fastest, and the intermediate is safely indexable.
+        if n_elems <= _INDEXER_MAX_ELEMS:
+            # Single matmul: fastest when the materialized score tensor is small.
             scores = _indexer_head_reduce(qf @ kf, weights, self.scale)
         else:
-            # Only past the int32 indexing limit is tiling worth its cost:
-            # splitting the pooled axis adds matmul launches and a full-width
-            # concatenate (measured: ~1.2x slower slope at 273k), but an
-            # intermediate over 2**31 elements is silently zeroed by mlx's
-            # int32 kernel indexing, which corrupts top-k selection. Choose
-            # the largest tile that stays under the limit so the split is as
-            # coarse as correctness allows.
+            # Keep the expensive head dimension inside bounded score shards.
+            # The concatenated values have already reduced that dimension, so
+            # their aggregate is H times smaller than the unbounded temporary.
             per_pool = max(1, qf.shape[0] * qf.shape[1] * qf.shape[2])
-            tile = max(1024, min(_INDEXER_POOL_TILE, _INDEXER_MAX_ELEMS // per_pool))
-            scores = mx.concatenate(
-                [
-                    _indexer_head_reduce(
-                        qf @ kf[..., s : s + tile], weights, self.scale
-                    )
-                    for s in range(0, n_pool, tile)
-                ],
-                axis=-1,
-            )
+            tile = max(1, min(_INDEXER_POOL_TILE, _INDEXER_MAX_ELEMS // per_pool))
+            reduced_tiles = []
+            for start in range(0, n_pool, tile):
+                reduced = _indexer_head_reduce(
+                    qf @ kf[..., start : start + tile], weights, self.scale
+                )
+                # MLX may otherwise schedule every independent matmul before
+                # the concatenate and retain all per-head score shards. Eagerly
+                # materialize the H-reduced result so the next tile can reuse
+                # the bounded temporary allocation.
+                mx.eval(reduced)
+                reduced_tiles.append(reduced)
+            scores = mx.concatenate(reduced_tiles, axis=-1)
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
@@ -2391,6 +2385,7 @@ class Model(nn.Module):
         self._vision_group = mx.distributed.init()
         self._vision_rank = int(self._vision_group.rank())
         self._vision_inputs = None
+        self._vision_spans = ()
         self._vision_blocks = {}
         if config.vision_n_layers > 0 and self._vision_rank == 0:
             from omlx.patches.deepseek_v4.vision_model import Aligner, ViT
@@ -2406,11 +2401,85 @@ class Model(nn.Module):
     def is_vision_model(self) -> bool:
         return self.args.vision_n_layers > 0
 
-    def set_vision_inputs(self, images) -> None:
+    def set_vision_inputs(self, images, *, spans=()) -> None:
         """Install one request's preprocessed images on coordinator only."""
 
         self._vision_inputs = images if self._vision_rank == 0 else None
+        if spans:
+            self._vision_spans = tuple((int(start), int(end)) for start, end in spans)
+        elif images:
+            self._vision_spans = tuple(
+                (int(image.start), int(image.start) + len(image.types))
+                for image in images
+            )
+        else:
+            self._vision_spans = ()
         self._vision_blocks = {}
+
+    def _prune_vision_state(self, offset: int) -> None:
+        """Drop images already represented by the fetched prompt cache."""
+
+        self._vision_spans = tuple(
+            (start, end) for start, end in self._vision_spans if end > offset
+        )
+        if self._vision_rank != 0:
+            return
+        self._vision_inputs = tuple(
+            image
+            for image in self._vision_inputs or ()
+            if image.start + len(image.types) > offset
+        )
+        pending_starts = {image.start for image in self._vision_inputs}
+        self._vision_blocks = {
+            start: block
+            for start, block in self._vision_blocks.items()
+            if start in pending_starts
+        }
+
+    def _encode_vision_images(self, inputs: mx.array, offset: int):
+        """Encode rank-zero image slices in a short-lived local scope."""
+
+        if not self._vision_inputs:
+            raise RuntimeError(
+                "image sentinel tokens reached the model without "
+                "rank-zero vision inputs"
+            )
+        safe = mx.where(inputs >= self.args.vocab_size, 0, inputs)
+        embeddings = self.model.embed_tokens(safe)
+        params = mx.stack(
+            [
+                self.image_start,
+                self.image_pad,
+                self.image_pad,
+                self.image_newline,
+                self.image_end,
+            ]
+        )
+        image_slices = _image_embedding_slices(
+            self._vision_inputs, offset, inputs.shape[1]
+        )
+        for image, destination, source in image_slices:
+            block = self._vision_blocks.get(image.start)
+            if block is None:
+                patches = mx.array(image.patches, dtype=mx.bfloat16)
+                features = self.aligner(
+                    self.vision(patches, image.n_vit_h, image.n_vit_w),
+                    image.n_vit_h,
+                    image.n_vit_w,
+                )
+                features = features[mx.array(image.permutation, dtype=mx.uint32)]
+                types = mx.array(image.types, dtype=mx.uint32)
+                block = params[types]
+                positions = mx.array(
+                    [i for i, kind in enumerate(image.types) if kind == 2],
+                    dtype=mx.uint32,
+                )
+                block = block.at[positions].add(features - block[positions])
+                self._vision_blocks[image.start] = block
+            current = embeddings[0, destination]
+            embeddings = embeddings.at[0, destination].add(block[source] - current)
+        mx.eval(embeddings)
+        return embeddings, len(image_slices)
 
     def _vision_embeddings(self, inputs: mx.array, offset: int = 0) -> mx.array:
         import time
@@ -2421,59 +2490,26 @@ class Model(nn.Module):
         encode_error = None
         if self._vision_rank == 0:
             try:
-                if not self._vision_inputs:
-                    raise RuntimeError(
-                        "image sentinel tokens reached the model without "
-                        "rank-zero vision inputs"
-                    )
-                safe = mx.where(inputs >= self.args.vocab_size, 0, inputs)
-                embeddings = self.model.embed_tokens(safe)
-                params = mx.stack(
-                    [
-                        self.image_start,
-                        self.image_pad,
-                        self.image_pad,
-                        self.image_newline,
-                        self.image_end,
-                    ]
-                )
-                image_slices = _image_embedding_slices(
-                    self._vision_inputs, offset, inputs.shape[1]
-                )
                 started = time.perf_counter()
+                suffix_end = offset + inputs.shape[1]
+                image_count = sum(
+                    image.start < suffix_end
+                    and image.start + len(image.types) > offset
+                    for image in self._vision_inputs or ()
+                )
                 logger.info(
                     "deepseek_v4_vision stage=vision_encode_begin images=%d",
-                    len(image_slices),
+                    image_count,
                 )
-                for image, destination, source in image_slices:
-                    block = self._vision_blocks.get(image.start)
-                    if block is None:
-                        patches = mx.array(image.patches, dtype=mx.bfloat16)
-                        features = self.aligner(
-                            self.vision(patches, image.n_vit_h, image.n_vit_w),
-                            image.n_vit_h,
-                            image.n_vit_w,
-                        )
-                        features = features[
-                            mx.array(image.permutation, dtype=mx.uint32)
-                        ]
-                        types = mx.array(image.types, dtype=mx.uint32)
-                        block = params[types]
-                        positions = mx.array(
-                            [i for i, kind in enumerate(image.types) if kind == 2],
-                            dtype=mx.uint32,
-                        )
-                        block = block.at[positions].add(features - block[positions])
-                        self._vision_blocks[image.start] = block
-                    current = embeddings[0, destination]
-                    embeddings = embeddings.at[0, destination].add(
-                        block[source] - current
-                    )
-                mx.eval(embeddings)
+                embeddings, encoded_count = Model._encode_vision_images(
+                    self, inputs, offset
+                )
+                if encoded_count != image_count:  # pragma: no cover - invariant
+                    raise RuntimeError("DeepSeek-V4 image slice count changed")
                 logger.info(
                     "deepseek_v4_vision stage=vision_encode_complete images=%d "
                     "elapsed_ms=%.1f",
-                    len(image_slices),
+                    image_count,
                     (time.perf_counter() - started) * 1000,
                 )
             except Exception as exc:
@@ -2500,6 +2536,9 @@ class Model(nn.Module):
             for start, block in self._vision_blocks.items()
             if start in pending_starts
         }
+        self._vision_spans = tuple(
+            (start, end) for start, end in self._vision_spans if end > suffix_end
+        )
         if self._vision_group.size() > 1:
             # Synchronize success before the large embedding collective so a
             # coordinator-side decode/encode failure cannot strand peers.
@@ -2523,6 +2562,9 @@ class Model(nn.Module):
             mx.eval(embeddings)
         elif encode_error is not None:
             raise RuntimeError("DeepSeek-V4 vision encoding failed") from encode_error
+        # The returned embeddings are materialized above. Release transient
+        # ViT/aligner buffers before the much larger language-model prefill.
+        mx.clear_cache()
         logger.info(
             "deepseek_v4_vision stage=multimodal_embeddings shape=%s dtype=%s "
             "sequence_length=%d",
@@ -2533,14 +2575,16 @@ class Model(nn.Module):
         return embeddings
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        multimodal = self.is_vision_model and bool(
-            mx.any(inputs >= self.args.vocab_size).item()
-        )
-        embeddings = (
-            self._vision_embeddings(inputs, _cache_offset(cache))
-            if multimodal
-            else None
-        )
+        embeddings = None
+        if self.is_vision_model and self._vision_spans:
+            offset = _cache_offset(cache)
+            Model._prune_vision_state(self, offset)
+            suffix_end = offset + inputs.shape[1]
+            if any(
+                start < suffix_end and end > offset
+                for start, end in self._vision_spans
+            ):
+                embeddings = self._vision_embeddings(inputs, offset)
         return self.lm_head(self.model(inputs, cache, inputs_embeds=embeddings))
 
     @property

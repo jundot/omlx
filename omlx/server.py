@@ -175,6 +175,7 @@ from .api.utils import (
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+from .cluster.launch import DistributedLaunchError
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
@@ -825,9 +826,10 @@ async def scheduler_queue_full_handler(
     )
 
 
+@app.exception_handler(DistributedLaunchError)
 @app.exception_handler(DistributedInferenceError)
 async def distributed_unavailable_handler(
-    request: FastAPIRequest, exc: DistributedInferenceError
+    request: FastAPIRequest, exc: DistributedInferenceError | DistributedLaunchError
 ):
     """Map a failed distributed cluster check to a clean HTTP 503.
 
