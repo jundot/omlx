@@ -2,14 +2,22 @@
 # ruff: noqa: N803, N806
 """Route Qwen3.5/3.6 Gated DeltaNet prefill to an optimized Metal kernel.
 
-Default route: ``gated_delta_blocked_seq`` — the exact sequential recurrence
-restructured for Apple GPUs (threadgroup-staged k/q/v blocks, register-resident
-state, Dv/32 split). ~2x faster than mlx_lm's stock sequential kernel at 16k
-(14.9ms vs 29.7ms per layer call) with fp32-exact state (rel-err ~5e-8).
+Default (and only) route: ``gated_delta_blocked_seq`` — the exact sequential
+recurrence restructured for Apple GPUs (threadgroup-staged k/q/v blocks,
+register-resident state, Dv/32 split). ~2x faster than mlx_lm's stock
+sequential kernel at 16k (14.9ms vs 29.7ms per layer call) with fp32-exact
+state (rel-err ~5e-8).
 
-Optional route (``OMLX_GDN_IMPL=chunked``): the FLA chunked WY-representation
-kernels — accuracy-validated but slower than the stock kernel E2E; kept for
-future iteration.
+``OMLX_GDN_IMPL=chunked`` (the FLA chunked WY-representation kernels) is
+disabled: it's already slower than the default kernel E2E, has no current
+callers (nothing in this repo's configs, scripts, or CI ever sets it), and
+has real bugs -- unbounded tail-chunk staging reads (can fault at page
+boundaries) and fp16-narrowed state (Inf risk on activation spikes) --
+that aren't worth fixing for a path with no upside today. The kernel
+source (``omlx/custom_kernels/qwen35_prefill/gdn.py``) is left in place for
+future iteration; see docs/qwen35-hardening-and-optimization.md Theme E,
+item E2 for the full writeup. Setting the env var now logs a warning and
+falls back to blocked_seq rather than routing to the buggy kernel.
 
 This rebinds ``gated_delta_update`` in ``mlx_vlm.models.qwen3_5.language`` for
 scalar-gated prefill with T >= OMLX_GDN_MIN_T. Decode (T==1) and
@@ -17,7 +25,6 @@ masked/vectorized paths keep the original kernel.
 
 Toggles:
   OMLX_GDN_KERNEL=0    disable the patch entirely
-  OMLX_GDN_IMPL=...    blocked_seq (default) | chunked
   OMLX_GDN_BLOCK_T=N   blocked_seq time block: 16 | 32 | 48
                          (default 16 for float32, 32 otherwise)
   OMLX_GDN_MIN_T=N     minimum prefill length to engage (default 64)
@@ -57,15 +64,17 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
     stub = os.environ.get("OMLX_GDN_STUB", "0") == "1"
     original = gd.gated_delta_update
 
-    from omlx.custom_kernels.qwen35_prefill import (
-        gated_delta_blocked_seq,
-        gated_delta_chunked_metal,
-    )
+    from omlx.custom_kernels.qwen35_prefill import gated_delta_blocked_seq
 
     impl = os.environ.get("OMLX_GDN_IMPL", "blocked_seq")
-    fast_prefill = (
-        gated_delta_chunked_metal if impl == "chunked" else gated_delta_blocked_seq
-    )
+    if impl == "chunked":
+        logger.warning(
+            "OMLX_GDN_IMPL=chunked is disabled (unbounded tail-chunk reads "
+            "and fp16-narrowed state -- see "
+            "docs/qwen35-hardening-and-optimization.md E2); using the "
+            "default blocked_seq kernel instead."
+        )
+    fast_prefill = gated_delta_blocked_seq
 
     def gated_delta_update_metal(
         q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True
