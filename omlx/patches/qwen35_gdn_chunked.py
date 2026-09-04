@@ -81,8 +81,14 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
             use_kernel
             and mask is None
             and q.shape[1] >= min_t
-            and q.shape[-1] % 16 == 0
-            and v.shape[-1] % 32 == 0
+            # Both the chunked kernel (A) and the default blocked_seq
+            # kernel (S) hard-assume Dk=128/Dv=128 internally; this gate
+            # used to admit any multiple of 16/32, which would silently
+            # misbehave rather than error on other head dims that satisfy
+            # the modulus but not the hard-coded 128 assumption.
+            # See docs/qwen35-hardening-and-optimization.md E2.
+            and q.shape[-1] == 128
+            and v.shape[-1] == 128
             and a.ndim == 3  # scalar per-head gating
         ):
             if fused_g_beta and hasattr(gd, "_compute_g_beta_prefill"):
