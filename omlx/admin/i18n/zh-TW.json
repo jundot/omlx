@@ -1046,6 +1046,7 @@
   "chat.more_actions_tooltip": "更多操作",
   "chat.branch_here": "從此處建立分支",
   "chat.delete_message": "刪除",
+  "chat.confirm_delete_message": "這將刪除此訊息以及此聊天中此訊息之後的所有訊息。是否繼續？",
   "chat.copy_markdown": "複製 Markdown",
   "chat.generating_tooltip": "生成中",
   "chat.delete_response_tooltip": "刪除此回應",

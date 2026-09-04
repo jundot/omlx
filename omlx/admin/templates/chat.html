@@ -6756,6 +6756,10 @@
 
     deleteMessage(index) {
         if (this.isCurrentChatStreaming()) return;
+        // sliceBeforeMessage truncates the whole tail (this message and
+        // everything after it), not just the one row the "Delete from here"
+        // label targets — confirm before doing something that destructive.
+        if (!confirm(window.t('chat.confirm_delete_message'))) return;
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
         const chatId = this.currentChatId;

@@ -1046,6 +1046,7 @@
   "chat.more_actions_tooltip": "Другие действия",
   "chat.branch_here": "Создать ветку здесь",
   "chat.delete_message": "Удалить",
+  "chat.confirm_delete_message": "Это удалит это сообщение и все последующие сообщения в этом чате. Продолжить?",
   "chat.copy_markdown": "Копировать Markdown",
   "chat.generating_tooltip": "Идёт генерация",
   "chat.delete_response_tooltip": "Удалить этот ответ",

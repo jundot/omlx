@@ -1046,6 +1046,7 @@
   "chat.more_actions_tooltip": "More actions",
   "chat.branch_here": "Branch here",
   "chat.delete_message": "Delete",
+  "chat.confirm_delete_message": "이 메시지와 이 채팅의 이후 모든 메시지가 삭제됩니다. 계속하시겠습니까?",
   "chat.copy_markdown": "Copy markdown",
   "chat.generating_tooltip": "Generating",
   "chat.delete_response_tooltip": "Delete this response",
