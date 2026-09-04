@@ -5,6 +5,7 @@ CLI for oMLX.
 
 Commands:
     omlx serve --model-dir /path/to/models    Start multi-model server
+    omlx ps                                   Show model status and memory usage
 
 Usage:
     # Multi-model serving
@@ -12,6 +13,10 @@ Usage:
 
     # With pinned models
     omlx serve --model-dir /path/to/models --pin llama-3b,qwen-7b
+
+    # Show status of the running server
+    omlx ps
+    omlx ps --json
 """
 
 import argparse
@@ -371,6 +376,148 @@ def serve_command(args):
         # after bind succeeds but before the server takes ownership.
         for sock in serve_sockets:
             sock.close()
+
+
+def _format_bytes(size) -> str:
+    try:
+        size = float(size)
+    except (TypeError, ValueError):
+        return "-"
+    if size <= 0:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1000:
+            return f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} PB"
+
+
+def _format_relative_time(epoch_seconds) -> str:
+    import time
+
+    try:
+        last = float(epoch_seconds)
+    except (TypeError, ValueError):
+        return "never"
+    if last <= 0:
+        return "never"
+    delta = max(time.time() - last, 0)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        hours = delta / 3600
+        return f"{hours:.1f}h ago"
+    days = delta / 86400
+    return f"{days:.1f}d ago"
+
+
+def _format_context(context) -> str:
+    """Format a context window in human-readable units (131072 -> "128k").
+
+    Mirrors the admin dashboard's ``clusterTokens``: exact division for
+    multiples of 1024, nearest-1000 rounding otherwise.
+    """
+    try:
+        ctx = int(context)
+    except (TypeError, ValueError):
+        return "-"
+    if ctx <= 0:
+        return "-"
+    if ctx >= 1024 and ctx % 1024 == 0:
+        return f"{ctx // 1024}k"
+    if ctx >= 1000:
+        return f"{round(ctx / 1000)}k"
+    return str(ctx)
+
+
+def ps_command(args) -> int:
+    """Show model status and memory usage of the running oMLX server.
+
+    Queries ``GET /v1/models/status`` and renders a table of models plus
+    a server memory summary line.
+    """
+    import json
+
+    import requests
+
+    from .settings import GlobalSettings
+
+    settings = GlobalSettings.load()
+    host = args.host or settings.server.host
+    port = args.port or settings.server.port
+
+    # host may be a comma-separated list of bind addresses; pick the first
+    # one for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind
+    # targets but not connectable — fall back to localhost in that case.
+    first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
+    connect_host = (
+        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    )
+    base_url = f"http://{connect_host}:{port}"
+    api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
+    except Exception:
+        print(f"oMLX server is not running at {base_url}")
+        print("Start the server first: omlx start")
+        return 1
+
+    if resp.status_code == 401:
+        print(f"Authentication required at {base_url}")
+        print("Pass the API key: omlx ps --api-key <key>")
+        return 1
+    if not resp.ok:
+        print(f"oMLX server returned an error at {base_url}: HTTP {resp.status_code}")
+        return 1
+
+    data = resp.json()
+
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+
+    final_ceiling = data.get("final_ceiling") or 0
+    current_memory = data.get("current_model_memory") or 0
+    models = data.get("models", [])
+
+    summary = f"Memory: {_format_bytes(current_memory)}"
+    if final_ceiling > 0:
+        summary += f" / {_format_bytes(final_ceiling)} (guard ceiling)"
+    print(summary)
+    print()
+
+    header = (
+        f"{'NAME':<40} {'TYPE':<10} {'SIZE':>10} {'CONTEXT':>10} "
+        f"{'STATUS':<8} {'PINNED':<7} {'LAST USED':<14}"
+    )
+    print(header)
+    for model in models:
+        # Loading wins over loaded: a model being reloaded briefly reports both.
+        if model.get("is_loading"):
+            status, size = "loading", model.get("estimated_size")
+        elif model.get("loaded"):
+            status, size = "loaded", (
+                model.get("actual_size") or model.get("estimated_size")
+            )
+        else:
+            status, size = "-", model.get("estimated_size")
+        pinned = "pinned" if model.get("pinned") else "-"
+        print(
+            f"{model.get('id', '')[:40]:<40} "
+            f"{(model.get('model_type') or '-')[:10]:<10} "
+            f"{_format_bytes(size):>10} "
+            f"{_format_context(model.get('max_context_window')):>10} "
+            f"{status:<8} {pinned:<7} "
+            f"{_format_relative_time(model.get('last_access')):<14}"
+        )
+    return 0
 
 
 def launch_command(args, extra_args: list[str] | None = None):
@@ -1302,6 +1449,48 @@ Example directory structure:
         ),
     )
 
+    # Ps command (status of the running server)
+    ps_parser = subparsers.add_parser(
+        "ps",
+        help="List models and memory usage of the running oMLX server",
+        description=(
+            "Show which models are loaded in memory, their sizes, context "
+            "windows, and last-use times. Queries the running server's "
+            "/v1/models/status endpoint."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  omlx ps\n"
+            "  omlx ps --json\n"
+            "  omlx ps --host 127.0.0.1 --port 8999\n"
+            "  omlx ps --api-key <key>\n"
+        ),
+    )
+    ps_parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="oMLX server host (default: from settings or 127.0.0.1)",
+    )
+    ps_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="oMLX server port (default: from settings or 8000)",
+    )
+    ps_parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for oMLX server authentication",
+    )
+    ps_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
         "diagnose",
@@ -1475,6 +1664,8 @@ Example directory structure:
             sys.exit(diagnose_command(args))
         elif args.command == "cluster":
             sys.exit(cluster_command(args))
+        elif args.command == "ps":
+            sys.exit(ps_command(args))
         else:
             parser.print_help()
             sys.exit(1)
