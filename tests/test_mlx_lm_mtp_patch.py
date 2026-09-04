@@ -1901,6 +1901,79 @@ class TestBatchGeneratorDispatch:
         # Cache rebuild unavailable -> degrade to plain drop, never crash.
         assert bg._reconcile_mtp_to_standard(batch, state) is False
 
+    def test_reconcile_chunks_reprefill_through_prefill_step_size(self, monkeypatch):
+        """D1: the reconcile re-prefill must chunk through gen_batch's
+        prefill_step_size instead of one unchunked call over the whole
+        streamed history -- on a long context a single call would
+        materialize O(total_tokens) transient activation memory in the
+        failure path. Uses a call-counting, offset-accumulating fake
+        backbone (unlike the shared _make_reconcile_batch helper's, which
+        overwrites offset and so can't distinguish chunked from unchunked)
+        to verify both the call count and that state still accumulates
+        correctly across chunks.
+        See docs/qwen35-hardening-and-optimization.md D1."""
+        from collections import deque
+
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        vocab = 8
+        call_count = {"n": 0}
+        seen_chunk_lens = []
+
+        class _FakeCache:
+            def __init__(self):
+                self.offset = 0
+                self._mtp_undo = None
+
+        def fake_rebuild(model):
+            return [_FakeCache()]
+
+        def fake_backbone(model, inputs, cache, n_confirmed=0):
+            call_count["n"] += 1
+            chunk_len = int(inputs.shape[1])
+            seen_chunk_lens.append(chunk_len)
+            cache[0].offset += chunk_len  # real caches accumulate, not overwrite
+            cache[0]._mtp_undo = object()
+            arr = np.full((1, chunk_len, vocab), -10.0, dtype=np.float32)
+            arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
+            return mx.array(arr), None, None
+
+        monkeypatch.setattr(bg, "_rebuild_singleton_cache", fake_rebuild)
+        monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
+
+        def greedy(lp_2d):
+            return mx.argmax(lp_2d, axis=-1).astype(mx.uint32)
+
+        tokens = list(range(10, 18))  # 8 streamed tokens
+        state = bg._MtpState(uid=7, queue=deque())
+        batch = SimpleNamespace(
+            model=object(),
+            uids=[7],
+            tokens=[list(tokens)],
+            _num_tokens=[len(tokens)],
+            samplers=[None],
+            fallback_sampler=greedy,
+            logits_processors=[],
+            _next_tokens=mx.array([999]),
+            _next_logprobs=[],
+            _token_context=[],
+            prompt_cache=[object()],
+            _omlx_mtp_state=state,
+            prefill_step_size=3,  # forces 3 chunks: 3 + 3 + 2
+        )
+
+        assert bg._reconcile_mtp_to_standard(batch, state) is True
+        assert call_count["n"] == 3
+        assert seen_chunk_lens == [3, 3, 2]
+        # Cache correctly reflects ALL streamed tokens, not just the last chunk.
+        assert batch.prompt_cache[0].offset == 8
+        # Cycle boundary (empty queue): sampled from the final chunk's
+        # last-position logits, same result as the unchunked path would give.
+        assert batch._next_tokens.tolist() == [5]
+
 
 # ---------------------------------------------------------------------------
 # ModelSettings — mtp_enabled field + mutual exclusion

@@ -1296,9 +1296,25 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         procs = _proc_list(gen_batch)
         _set_singleton_mrope_delta(gen_batch)
         tok_arr = _ensure_uint32(mx.array(list(tokens)))
-        # Inherits the per-engine stream from the enclosing BatchGenerator context.
-        logits, _, _ = _call_backbone(gen_batch.model, tok_arr[None, :], new_cache)
-        last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+        # Chunk the re-prefill through the cache incrementally instead of
+        # one unchunked call over the whole streamed history: on a long
+        # context a single call materializes O(total_tokens) transient
+        # activation memory, in exactly the failure path where it hurts
+        # most (docs/qwen35-hardening-and-optimization.md D1). Reuses the
+        # same step size ordinary prefill uses, and evaluates each chunk
+        # before starting the next -- MLX is lazy, so without a real sync
+        # point here the whole graph could still be built up and evaluated
+        # in one shot at the end, silently defeating the chunking.
+        chunk_size = max(1, int(getattr(gen_batch, "prefill_step_size", 2048) or 2048))
+        last_logits = None
+        for chunk_start in range(0, tok_arr.shape[0], chunk_size):
+            chunk = tok_arr[chunk_start : chunk_start + chunk_size]
+            # Inherits the per-engine stream from the enclosing BatchGenerator context.
+            logits, _, _ = _call_backbone(gen_batch.model, chunk[None, :], new_cache)
+            last_logits = logits[:, -1, :]  # (1, vocab) — dist after tokens[-1]
+            # Evaluating logits transitively forces the cache mutation that
+            # produced them too, since it feeds the same graph.
+            mx.eval(last_logits)
 
         if state.queue:
             next_id, next_lp_1d, _src = state.queue[0]
