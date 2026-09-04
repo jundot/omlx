@@ -288,6 +288,7 @@ def test_estimator_switches_to_ol_when_registered():
     monitor._num_attention_heads = 24
     monitor._num_kv_heads = 4
     monitor._score_dtype_size = 2
+    monitor._tiled_prefill_override = None
 
     chunk, kv = 2048, 200_000
     # Ensure not registered first (isolate from import-time state).
@@ -346,6 +347,7 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     monitor._num_attention_heads = 24
     monitor._num_kv_heads = 4
     monitor._score_dtype_size = 2
+    monitor._tiled_prefill_override = None
 
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
     assert monitor._estimate_sdpa_activation_bytes(2048, 200_000) == (

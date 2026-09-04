@@ -487,6 +487,79 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         assert kwargs["dtype_size"] == 2
 
+    def test_turboquant_active_registers_tiled_prefill_tile_on_monitor(self):
+        """B3/3.2: when turboquant is active and eligible, the guard must
+        stop pricing turboquant-covered prefill with the full O(L^2)
+        fallback -- register the bounded tile on THIS monitor instance."""
+        from omlx.patches.turboquant_attention import (
+            _LONG_PREFILL_KEY_CHUNK_SIZE,
+            _LONG_PREFILL_QUANTIZED_THRESHOLD,
+            _LONG_PREFILL_QUERY_BLOCK_SIZE,
+        )
+
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+
+        sched._set_model_info_for_monitor()
+
+        sched.memory_monitor.register_tiled_prefill_tile.assert_called_once_with(
+            query_block=_LONG_PREFILL_QUERY_BLOCK_SIZE,
+            kv_tile=_LONG_PREFILL_KEY_CHUNK_SIZE,
+            min_kv_len=_LONG_PREFILL_QUANTIZED_THRESHOLD,
+            skip_last=True,  # turboquant_skip_last defaults True, 40 layers
+        )
+        sched.memory_monitor.clear_tiled_prefill_tile.assert_not_called()
+
+    def test_turboquant_active_registers_skip_last_false_when_disabled(self):
+        """#3108: the estimator must know whether turboquant_skip_last is
+        actually in effect for THIS model, not just assume it -- passing it
+        unconditionally would either wrongly double-price a model that skips
+        nothing, or (worse) wrongly trust the cheap tile estimate alone for
+        a model that does skip a layer."""
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_skip_last = False
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.register_tiled_prefill_tile.call_args.kwargs
+        assert kwargs["skip_last"] is False
+
+    def test_no_turboquant_clears_tiled_prefill_tile_on_monitor(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = None
+
+        sched._set_model_info_for_monitor()
+
+        sched.memory_monitor.clear_tiled_prefill_tile.assert_called_once_with()
+        sched.memory_monitor.register_tiled_prefill_tile.assert_not_called()
+
+    def test_turboquant_mla_model_clears_tiled_prefill_tile(self):
+        """MLA models are structurally ineligible for turboquant even when
+        turboquant_kv_bits is configured -- the tile registration must
+        follow the same eligibility gate as the dtype_size override, not
+        just check whether the knob is set."""
+        class _MLAConfig(_PlainLMConfig):
+            kv_lora_rank = 512
+
+        sched = self._make_sched_with_config(_MLAConfig())
+        sched._turboquant_kv_bits = 4.0
+
+        sched._set_model_info_for_monitor()
+
+        sched.memory_monitor.clear_tiled_prefill_tile.assert_called_once_with()
+        sched.memory_monitor.register_tiled_prefill_tile.assert_not_called()
+
+    def test_turboquant_ineligible_cache_clears_tiled_prefill_tile(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched.model.make_cache.return_value = [object()]
+        sched._turboquant_kv_bits = 4.0
+
+        sched._set_model_info_for_monitor()
+
+        sched.memory_monitor.clear_tiled_prefill_tile.assert_called_once_with()
+        sched.memory_monitor.register_tiled_prefill_tile.assert_not_called()
+
     def test_reported_scale_fits_after_turboquant_skip_last_accounting(self):
         tokens = 327_872
         ceiling = 44.0 * 1024**3
