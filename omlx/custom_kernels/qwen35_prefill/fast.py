@@ -941,8 +941,13 @@ def _qmm_use_nax() -> bool:
     return _qmm_nax_cache
 
 
-def _qmm_nax_kwargs() -> dict[str, object]:
-    if not _EXT_HAS_NAX:
+def _qmm_nax_kwargs(bits: int) -> dict[str, object]:
+    # The NAX metal kernel only defines bits 4/5/6/8 (qwen35_qmm_nax.metal).
+    # Routing a q2 call through NAX anyway hits a kernel-lookup failure that
+    # latches `nax_qmm_runtime_ok=false` process-wide, permanently demoting
+    # every q4/q5/q6/q8 layer to the classic kernel for the rest of the
+    # process. Never request NAX for bits==2.
+    if bits == 2 or not _EXT_HAS_NAX:
         return {}
     return {"use_nax": _qmm_use_nax(), "nax_variant": QMM_NAX_VARIANT}
 
@@ -1038,7 +1043,7 @@ def qwen35_q2_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(2),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1062,7 +1067,7 @@ def qwen35_q4_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(4),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1086,7 +1091,7 @@ def qwen35_q5_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(5),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1110,7 +1115,7 @@ def qwen35_q6_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(6),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1134,7 +1139,7 @@ def qwen35_q8_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(8),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
