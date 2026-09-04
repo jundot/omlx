@@ -50,11 +50,12 @@ from .discovery import (
     verify_pairing_token,
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain
+from .guidance import explain, explain_code
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    evict_remote_local_models,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
@@ -97,6 +98,7 @@ from .staging import (
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
+    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
     remote_model_dir,
@@ -116,6 +118,7 @@ from .transport import (
     resolve_link_addresses,
     verify_link_reachability,
 )
+from .vpn import detect_vpn, full_tunnel_warning
 from .worker_bundle import (
     build_cuda_join_command,
     cuda_bootstrap_program,
@@ -370,6 +373,37 @@ def _record_cluster_incident(
         )
     except Exception:  # noqa: BLE001 - logging must never outrank the failure
         return
+
+
+# A full-tunnel VPN is a standing condition, not an event: one INFO incident
+# the first time each host shows it, not one per autoconfigure poll. In-memory
+# is enough — a server restart re-announcing a still-hungry VPN is correct.
+_VPN_FULL_TUNNEL_SEEN: set[str] = set()
+_VPN_FULL_TUNNEL_LOCK = threading.Lock()
+
+
+def _note_full_tunnel_vpns(fabric: dict[str, Any]) -> None:
+    """Record the C4 pre-warning for each newly seen full-tunnel VPN host.
+
+    Detection only warns and steers address selection; the incident exists so
+    the condition survives page reloads next to the banner. Severity is INFO
+    because the selection below is expected to route around the tunnel.
+    """
+
+    for entry in fabric.get("hosts") or ():
+        vpn = entry.get("vpn") or {}
+        if not vpn.get("full_tunnel"):
+            continue
+        host = str(entry.get("host") or "")
+        with _VPN_FULL_TUNNEL_LOCK:
+            if host in _VPN_FULL_TUNNEL_SEEN:
+                continue
+            _VPN_FULL_TUNNEL_SEEN.add(host)
+        _record_cluster_incident(
+            Severity.INFO,
+            "vpn_full_tunnel",
+            full_tunnel_warning(host, str(vpn.get("client") or "")),
+        )
 
 
 class ClusterPlanNodeRequest(BaseModel):
@@ -930,6 +964,12 @@ def _resolve_fabric(
     """
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
+    # VPN posture rides along on the reading already in hand. It is a warning
+    # and a selection hint only — a clean addressing read costs no extra SSH,
+    # and nothing here promotes the link past what the probes below prove.
+    vpn_profiles = {
+        host: detect_vpn(host, interfaces=interfaces[host]) for host in hosts
+    }
     verify = verifier or verify_link_reachability
     verified_links: dict[
         tuple[tuple[str, str, str], ...], tuple[bool, str]
@@ -1016,6 +1056,7 @@ def _resolve_fabric(
                 "ips": [link.source.address] if link.source else [],
                 "interface": link.source.interface if link.source else "",
                 "rdma": list(matrix.rows[index]) if backend != "ring" else [],
+                "vpn": vpn_profiles[host].to_dict(),
             }
             for index, (host, link) in enumerate(zip(hosts, links))
         ],
@@ -1278,6 +1319,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 warnings.append(f"Address discovery failed: {fabric_error}")
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
+        # B1 consumer of the C4 detection: the pre-warning must survive page
+        # reloads, so the first sighting per host becomes an INFO incident.
+        _note_full_tunnel_vpns(fabric)
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
@@ -1479,9 +1523,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
 
 
 class ClusterGuidanceRequest(BaseModel):
-    """A failure message the dashboard wants turned into next steps."""
+    """A failure message the dashboard wants turned into next steps.
+
+    ``code`` is the structured key (Guidance.code / readiness-ladder state
+    codes); when present it wins over message-regex matching.
+    """
 
     message: str = Field(default="", max_length=4096)
+    code: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/guidance")
@@ -1493,7 +1542,7 @@ async def cluster_guidance(request: ClusterGuidanceRequest):
     already depend on, and an explanation is only ever needed after a failure.
     """
 
-    return explain(request.message).to_dict()
+    return explain_code(request.code, request.message).to_dict()
 
 
 class ClusterStageRequest(BaseModel):
@@ -3107,6 +3156,161 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+# The memory guard names the rank and node it refused, and the launcher
+# carries that line back verbatim: ``rank 1 (node): InsufficientMemoryError``.
+_MEMORY_FAILURE_RANK = re.compile(
+    r"rank (\d+) \(([^)]+)\):\s*InsufficientMemoryError"
+)
+
+
+def _memory_squeezed_hosts(
+    deployment: ClusterDeployment, detail: str
+) -> list[ClusterHost]:
+    """Hosts implicated in a memory-attributable activation failure."""
+
+    if "InsufficientMemoryError" not in detail:
+        return []
+    by_node_id = {host.node_id: host for host in deployment.hosts}
+    implicated: dict[str, ClusterHost] = {}
+    for match in _MEMORY_FAILURE_RANK.finditer(detail):
+        rank, node_id = int(match.group(1)), match.group(2)
+        host = by_node_id.get(node_id)
+        if host is None and 0 <= rank < len(deployment.hosts):
+            host = deployment.hosts[rank]
+        if host is not None:
+            implicated[host.node_id] = host
+    # A memory-shaped failure that names no rank still deserves recovery on
+    # every node rather than none.
+    return list(implicated.values()) or list(deployment.hosts)
+
+
+async def _evict_local_models_on_host(
+    host: ClusterHost, reason: str
+) -> dict[str, Any]:
+    """Free one node's standalone models; the coordinator needs no SSH hop."""
+
+    if not _local_ssh_target(host.ssh):
+        return await asyncio.to_thread(
+            evict_remote_local_models,
+            host.ssh,
+            python_executable=host.python_executable,
+        )
+    pool = _engine_pool()
+    outcome: dict[str, Any] = {
+        "evicted": [],
+        "draining": [],
+        "skipped_pinned": [],
+        "errors": [],
+    }
+    for model_id in list(pool.get_loaded_model_ids()):
+        entry = pool.get_entry(model_id)
+        if (
+            entry is None
+            or entry.engine is None
+            or entry.is_loading
+            or getattr(entry, "source_type", "") == "cluster"
+        ):
+            continue
+        if entry.is_pinned:
+            outcome["skipped_pinned"].append(model_id)
+            continue
+        try:
+            unloaded = await pool.request_unload(model_id, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - collect, never mask
+            outcome["errors"].append(f"{model_id}: {exc}")
+            continue
+        (outcome["evicted"] if unloaded else outcome["draining"]).append(model_id)
+    return outcome
+
+
+async def _evict_competing_local_models(
+    deployment: ClusterDeployment | None, detail: str
+) -> str:
+    """After a memory-attributed launch failure, free the implicated Macs.
+
+    A standalone model loaded through a node's own server competes with the
+    cluster rank admitted onto the same unified memory, and every retry then
+    fails at a higher ceiling because the competitor keeps growing. Evict it
+    on exactly the nodes the failure names, so the very next retry is made
+    against the memory the plan was admitted for. This never raises and never
+    replaces the original failure — it appends what was freed so the operator
+    knows a retry is now worth making. Pinned models are left loaded.
+    """
+
+    if deployment is None:
+        return detail
+    hosts = _memory_squeezed_hosts(deployment, detail)
+    if not hosts:
+        return detail
+    reason = (
+        f"cluster activation of {deployment.deployment_id} "
+        "failed for lack of memory"
+    )
+    freed: list[str] = []
+    pending: list[str] = []
+    pinned: list[str] = []
+    problems: list[str] = []
+    for host in hosts:
+        try:
+            outcome = await _evict_local_models_on_host(host, reason)
+        except Exception as exc:  # noqa: BLE001 - recovery must not mask
+            problems.append(f"{host.node_id}: {exc}")
+            continue
+        freed.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("evicted") or []
+        )
+        pending.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("draining") or []
+        )
+        pinned.extend(
+            f"{mid} on {host.node_id}" for mid in outcome.get("skipped_pinned") or []
+        )
+        problems.extend(
+            f"{host.node_id}: {error}" for error in outcome.get("errors") or []
+        )
+    notes: list[str] = []
+    if freed:
+        notes.append(
+            "oMLX unloaded the competing local model(s) "
+            f"{', '.join(freed)}; retry the activation."
+        )
+    if pending:
+        notes.append(
+            f"{', '.join(pending)} will unload once active requests "
+            "finish; retry the activation after that."
+        )
+    if pinned:
+        notes.append(
+            f"Pinned model(s) {', '.join(pinned)} were left loaded; unpin or "
+            "unload them if the retry still runs out of memory."
+        )
+    if problems:
+        notes.append(
+            "Local-model eviction could not complete everywhere: "
+            + "; ".join(problems)
+        )
+    if not notes:
+        notes.append(
+            "No competing local models were loaded on the implicated node(s)."
+        )
+    if freed or pending or pinned:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery",
+            " ".join(notes),
+            deployment_id=deployment.deployment_id,
+        )
+    if problems:
+        _record_cluster_incident(
+            Severity.WARN,
+            "activation_memory_recovery_failed",
+            "Local-model eviction after the memory failure did not complete: "
+            + "; ".join(problems),
+            deployment_id=deployment.deployment_id,
+        )
+    return detail + "\n" + " ".join(notes)
+
+
 @router.post("/deployments")
 async def activate_cluster_deployment(request: ClusterDeploymentRequest):
     """Recompute, preflight, eagerly load, and prove one distributed model."""
@@ -3334,14 +3538,26 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             ),
         ) from exc
     except DistributedLaunchError as exc:
+        detail = str(exc)
         await asyncio.to_thread(
             _record_cluster_incident,
             Severity.ERROR,
             "activation_launch_failed",
-            str(exc),
+            detail,
             deployment_id=deployment.deployment_id if deployment else None,
         )
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        try:
+            detail = await _evict_competing_local_models(deployment, detail)
+        except Exception:  # noqa: BLE001 - recovery must never mask the failure
+            await asyncio.to_thread(
+                _record_cluster_incident,
+                Severity.WARN,
+                "activation_memory_recovery_failed",
+                "Local-model eviction after the memory failure crashed; the "
+                "implicated nodes may still hold a competing model.",
+                deployment_id=deployment.deployment_id if deployment else None,
+            )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except ModelNotFoundError as exc:
         await asyncio.to_thread(
             _record_cluster_incident,
