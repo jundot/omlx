@@ -513,6 +513,31 @@ def _tensor_layer_index(name: str) -> int | None:
     return None
 
 
+def _is_mtp_tensor(name: str) -> bool:
+    """A multi-token-prediction draft-head tensor, VLM or not.
+
+    ``language_model.mtp.layers.0`` (and the plain ``mtp.*`` spelling) lands
+    on decoder layer 0 under ``_tensor_layer_index``'s pattern, so counting
+    its bytes there inflates the wrong stage regardless of whether the
+    checkpoint is a VLM: a pure-text ``-mtp`` checkpoint has the exact same
+    layer-0 collision, and mlx-lm's ``sanitize`` drops the draft heads for
+    every text-only load, VLM or not.
+    """
+
+    return ".mtp." in name or name.startswith("mtp.")
+
+
+def _is_vision_tensor(name: str) -> bool:
+    """A vision-tower/projector tensor mlx-lm's ``sanitize`` drops when a
+    VLM checkpoint is loaded text-only. Only meaningful for VLM checkpoints
+    -- see ``inspect_safetensors_layout``'s ``text_only`` gating, since a
+    pure-text checkpoint never has these prefixes at all."""
+
+    from omlx.model_discovery import _VISION_WEIGHT_PREFIXES
+
+    return name.startswith(_VISION_WEIGHT_PREFIXES)
+
+
 def _activation_bytes_per_token(model_path: Path) -> int:
     """Best-effort FP16/BF16 hidden-state size used by the link cost model."""
 
@@ -727,7 +752,7 @@ def _model_source(model_type: str) -> str:
     return ""
 
 
-def _supports_pipeline(config: dict[str, Any]) -> bool:
+def _supports_pipeline(config: dict[str, Any], *, text_only: bool = False) -> bool:
     """Whether this architecture can be split into pipeline stages.
 
     mlx-lm gates on ``hasattr(model, "model") and hasattr(model.model,
@@ -740,6 +765,15 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     MiniMax-M3 was reported as fitting across two Macs on memory alone, and
     that cost 61.7 GiB of staging and two launches before the load raised
     "The model does not support pipelining but a pipeline_group was provided".
+
+    ``text_only`` matters for a VLM checkpoint: with vision enabled it loads
+    through mlx-vlm's wrapper (see the vision-subconfig guard below), but a
+    text-only deployment loads it through plain mlx-lm instead -- the exact
+    same ``mlx_lm.models.<model_type>`` module a pure-text checkpoint of that
+    architecture would use -- so the vision-subconfig false-negative does not
+    apply and the capability probe must fall through to ``_declares_pipeline``
+    same as any other architecture (#2819's own gate is only correct for the
+    vision-enabled load path it was written for).
     """
 
     model_type = config.get("model_type")
@@ -755,16 +789,18 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     )
     if declared is not None:
         return bool(declared)
-    # A checkpoint carrying a vision sub-config is served by mlx-vlm, whose
-    # loaded wrapper never exposes ``model.model.pipeline`` — the exact
-    # attribute progressive_loading gates on. Its text backbone's source-level
-    # ``pipeline()`` belongs to the mlx-lm implementation this model does not
-    # use, so trusting it (as ``_declares_pipeline`` does) is the false positive
-    # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
-    from omlx.model_discovery import _has_vision_subconfig
+    if not text_only:
+        # A checkpoint carrying a vision sub-config is served by mlx-vlm,
+        # whose loaded wrapper never exposes ``model.model.pipeline`` — the
+        # exact attribute progressive_loading gates on. Its text backbone's
+        # source-level ``pipeline()`` belongs to the mlx-lm implementation
+        # this (vision-enabled) load does not use, so trusting it (as
+        # ``_declares_pipeline`` does) is the false positive that offered
+        # pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
+        from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
-        return False
+        if _has_vision_subconfig(config):
+            return False
     return _declares_pipeline(model_type)
 
 
@@ -990,8 +1026,20 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
-    """Read only safetensors headers and total weights by transformer layer."""
+def inspect_safetensors_layout(
+    model_path: str | Path, *, text_only: bool = False
+) -> ModelLayout:
+    """Read only safetensors headers and total weights by transformer layer.
+
+    ``text_only`` is the caller's own intent for THIS measurement, not a
+    property inferred from the checkpoint's shape: a VLM checkpoint sizes
+    full (vision tower included) unless the caller is specifically sizing a
+    text-only deployment of it, so the catalogue -- which measures every
+    checkpoint once, deployment-agnostic -- keeps advertising full sizes for
+    VLMs nobody has flagged text-only, while a concrete text-only deployment
+    (``ClusterDeployment.text_only``) can size against what it will actually
+    load. Default False keeps that catalogue-safe behavior.
+    """
 
     root = Path(model_path).expanduser()
     if not root.is_dir():
@@ -1028,6 +1076,15 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
             tensor_bytes = offsets[1] - offsets[0]
+            # Validate every tensor (dedup + overlap above), but do not size
+            # the families a text-only load never loads. MTP draft heads are
+            # dropped on every text-only load regardless of VLM-ness; the
+            # vision tower only applies when the caller is actually sizing a
+            # text-only VLM deployment (``text_only``).
+            if _is_mtp_tensor(name):
+                continue
+            if text_only and _is_vision_tensor(name):
+                continue
             layer_index = _tensor_layer_index(name)
             if layer_index is None:
                 fixed_bytes += tensor_bytes
@@ -1086,7 +1143,9 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         ),
         tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
-        supports_pipeline=_supports_pipeline(_model_config(root)),
+        supports_pipeline=_supports_pipeline(
+            _model_config(root), text_only=text_only
+        ),
         kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
             _model_config(root)
         ),
@@ -1101,11 +1160,13 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
 # mtime (no entry added or removed) nor config.json's, and a stale layout
 # would silently mis-size every plan built from it.
 _LayoutFingerprint = tuple[float, float, tuple[tuple[str, float, int], ...]]
-_LAYOUT_CACHE: dict[str, tuple[_LayoutFingerprint, ModelLayout]] = {}
+_LAYOUT_CACHE: dict[tuple[str, bool], tuple[_LayoutFingerprint, ModelLayout]] = {}
 _LAYOUT_CACHE_LOCK = threading.Lock()
 
 
-def complete_model_layout(model_path: str | Path) -> ModelLayout:
+def complete_model_layout(
+    model_path: str | Path, *, text_only: bool = False
+) -> ModelLayout:
     """Layout of a model this node holds in full, refusing one it holds part of.
 
     A pipeline rank keeps its own stage's shards and nothing else. Where the
@@ -1119,8 +1180,12 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     autoconfigure tick (the admin dashboard's cluster tab polls every ~10s
     while open), so opening and re-parsing every safetensors shard's header
     each call put real, sustained disk I/O and CPU load on a node that may be
-    mid-inference. Layouts are cached per resolved path and only recomputed
-    when the model directory or its config.json actually changed.
+    mid-inference. Layouts are cached per (resolved path, ``text_only``) and
+    only recomputed when the model directory or its config.json actually
+    changed -- ``text_only`` is part of the cache key, not just an argument,
+    since the same path measured for the catalogue (text_only=False, full
+    size) and for a concrete text-only deployment (text_only=True, vision
+    excluded) must not collide on one cached answer.
     """
 
     root = Path(model_path).expanduser()
@@ -1133,7 +1198,7 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
 
     maybe_apply_pre_load_patches(str(root))
 
-    resolved = str(root.resolve())
+    cache_key = (str(root.resolve()), text_only)
     try:
         shard_stats = []
         for shard_path in sorted(root.glob("*.safetensors")):
@@ -1150,15 +1215,15 @@ def complete_model_layout(model_path: str | Path) -> ModelLayout:
     layout: ModelLayout | None = None
     if fingerprint is not None:
         with _LAYOUT_CACHE_LOCK:
-            cached = _LAYOUT_CACHE.get(resolved)
+            cached = _LAYOUT_CACHE.get(cache_key)
         if cached is not None and cached[0] == fingerprint:
             layout = cached[1]
 
     if layout is None:
-        layout = inspect_safetensors_layout(root)
+        layout = inspect_safetensors_layout(root, text_only=text_only)
         if fingerprint is not None:
             with _LAYOUT_CACHE_LOCK:
-                _LAYOUT_CACHE[resolved] = (fingerprint, layout)
+                _LAYOUT_CACHE[cache_key] = (fingerprint, layout)
 
     declared = _config_int(_model_config(root), "num_hidden_layers", 0)
     # Multi-token-prediction and draft heads add layers past the declared

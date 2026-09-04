@@ -3526,6 +3526,61 @@ async def create_completion(
         raise
 
 
+def _request_has_image_content(messages) -> bool:
+    """True if any message carries an image content part.
+
+    OpenAI content parts arrive as dicts (``{"type": "image_url", ...}``); be
+    tolerant of object-shaped parts too. Text-only requests have string content
+    and return False.
+    """
+
+    for message in messages:
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for part in content:
+            ptype = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if (
+                ptype in {"image_url", "image", "input_image"}
+                or (isinstance(part, dict) and "image_url" in part)
+                or getattr(part, "image_url", None) is not None
+            ):
+                return True
+    return False
+
+
+def _reject_image_content_for_text_only_deployment(engine, messages) -> None:
+    """Fail closed instead of silently dropping images (#1261/#1426): a VLM
+    served text-only across the cluster dropped its vision tower during
+    load, so an image in the request can never be honored. Single
+    pre-extraction choke point shared by every message-extraction path
+    (OpenAI and Anthropic request shapes both funnel through
+    ``_request_has_image_content``, which already recognizes both content-
+    part vocabularies) so a route added later inherits the same fail-closed
+    behavior instead of needing its own copy of this check.
+    """
+    deployment = getattr(engine, "deployment", None)
+    if (
+        deployment is not None
+        and getattr(deployment, "text_only", False)
+        and _request_has_image_content(messages)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This model is deployed text-only across the cluster "
+                "(vision disabled); image content is not supported. "
+                "Serve it on a single node to use vision."
+            ),
+        )
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -3625,6 +3680,7 @@ async def create_chat_completion(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
+        _reject_image_content_for_text_only_deployment(engine, request.messages)
         extractor = getattr(engine, "message_extractor", None)
         merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
         if extractor is not None:
@@ -5647,6 +5703,7 @@ async def create_anthropic_message(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
+        _reject_image_content_for_text_only_deployment(engine, request.messages)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(

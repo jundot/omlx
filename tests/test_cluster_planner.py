@@ -560,9 +560,9 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     calls = []
     real_inspect = planner.inspect_safetensors_layout
 
-    def counting_inspect(path):
+    def counting_inspect(path, *, text_only=False):
         calls.append(str(path))
-        return real_inspect(path)
+        return real_inspect(path, text_only=text_only)
 
     monkeypatch.setattr(planner, "inspect_safetensors_layout", counting_inspect)
 
@@ -641,6 +641,25 @@ def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
     )
     config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
     assert planner._supports_pipeline(config) is False
+
+
+def test_supports_pipeline_true_for_vision_config_when_text_only(monkeypatch):
+    """#2845 review (post-#2819 heads-up): a text-only deployment of a VLM
+    loads through plain mlx-lm, the same ``mlx_lm.models.<model_type>``
+    module a pure-text checkpoint of that architecture uses -- not through
+    mlx-vlm's wrapper -- so the vision-subconfig false-negative from
+    ``test_supports_pipeline_false_for_vision_config_vlm`` must not apply
+    when the caller is specifically sizing a text-only deployment."""
+
+    from omlx.cluster import planner
+
+    monkeypatch.setattr(
+        planner, "_model_source", lambda mt: "def pipeline(self, group): ..."
+    )
+    config = {"model_type": "qwen3_5_moe", "vision_config": {"depth": 24}}
+    assert planner._supports_pipeline(config, text_only=True) is True
+    # Vision-enabled sizing of the exact same config is unaffected.
+    assert planner._supports_pipeline(config, text_only=False) is False
 
 
 def test_supports_pipeline_true_for_text_model(monkeypatch):
