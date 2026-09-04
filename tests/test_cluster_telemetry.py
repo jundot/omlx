@@ -4,11 +4,14 @@
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
+    _SSD_SNAPSHOT_MAX_BYTES_CAP,
     RuntimeTelemetry,
+    _ssd_snapshot_max_bytes,
     _TelemetryQueue,
     install_server_telemetry,
 )
@@ -554,3 +557,60 @@ def test_serving_starts_the_heartbeat_without_the_caller_asking(monkeypatch):
     settled = marker.count()
     time.sleep(0.1)
     assert marker.count() == settled, "the heartbeat outlived the serving block"
+
+
+class TestSsdSnapshotMaxBytes:
+    """design doc §D2: the live prompt-cache-ssd store had no byte bound —
+    64 entries x ~370 MB/boundary is ~24 GiB per rank, invisible to every
+    other budget. min(32 GiB, 20% of free) caps it from free disk."""
+
+    def test_caps_at_32_gib_on_a_roomy_disk(self, tmp_path):
+        with patch(
+            "shutil.disk_usage",
+            return_value=SimpleNamespace(total=0, used=0, free=1024**4),
+        ):
+            assert _ssd_snapshot_max_bytes(str(tmp_path)) == _SSD_SNAPSHOT_MAX_BYTES_CAP
+
+    def test_scales_down_to_20_percent_of_free_on_a_tight_disk(self, tmp_path):
+        free = 10 * 1024**3
+        with patch(
+            "shutil.disk_usage", return_value=SimpleNamespace(total=0, used=0, free=free)
+        ):
+            assert _ssd_snapshot_max_bytes(str(tmp_path)) == int(free * 0.2)
+
+    def test_falls_back_to_the_cap_when_disk_usage_is_unreadable(self, tmp_path):
+        with patch("shutil.disk_usage", side_effect=OSError("no such volume")):
+            assert _ssd_snapshot_max_bytes(str(tmp_path)) == _SSD_SNAPSHOT_MAX_BYTES_CAP
+
+    def test_walks_up_to_an_existing_parent_for_a_not_yet_created_dir(self, tmp_path):
+        nested = tmp_path / "prompt-cache-ssd" / "deploy-rank-0"
+        with patch(
+            "shutil.disk_usage",
+            return_value=SimpleNamespace(total=0, used=0, free=1024**4),
+        ) as disk_usage:
+            result = _ssd_snapshot_max_bytes(str(nested))
+        assert result == _SSD_SNAPSHOT_MAX_BYTES_CAP
+        disk_usage.assert_called_once_with(tmp_path)
+
+
+def test_install_server_telemetry_passes_max_bytes_to_ssd_store(tmp_path):
+    """The wiring itself (design doc §D2 / Phase 1.2): the store must not
+    silently default back to `max_bytes=None`."""
+
+    import omlx.cluster.prompt_snapshot_cache as snapshot_cache
+
+    captured = {}
+    original = snapshot_cache.SSDPromptSnapshotStore
+
+    class RecordingStore(original):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    marker = _Marker()
+    with patch.object(snapshot_cache, "SSDPromptSnapshotStore", RecordingStore):
+        with install_server_telemetry(marker, ssd_cache_dir=str(tmp_path / "ssd")):
+            pass
+
+    assert captured.get("max_bytes") is not None
+    assert captured["max_bytes"] > 0

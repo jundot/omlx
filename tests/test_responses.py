@@ -2,6 +2,8 @@
 """Tests for OpenAI Responses API models and utilities."""
 
 import json
+import os
+import time
 
 import pytest
 
@@ -958,6 +960,33 @@ class TestResponseStore:
         reloaded = ResponseStore(max_size=10, state_dir=state_dir)
         assert reloaded.get("resp_1")["id"] == "resp_1"
         assert reloaded.get_record("resp_1")["input_messages"][0]["content"] == "Hi"
+
+    def test_stale_tmp_staging_file_reaped_on_load(self, tmp_path):
+        """A `.tmp` leftover from a crash between write and `replace()` is
+        reaped once it's old enough to no longer be an in-flight write
+        (design doc §E2)."""
+        state_dir = tmp_path / "response-state"
+        state_dir.mkdir(parents=True)
+        tmp_file = state_dir / "resp_orphan.tmp"
+        tmp_file.write_text("{}")
+        old_time = time.time() - 7200
+        os.utime(tmp_file, (old_time, old_time))
+
+        ResponseStore(max_size=10, state_dir=state_dir)
+
+        assert not tmp_file.exists()
+
+    def test_fresh_tmp_staging_file_survives_load(self, tmp_path):
+        """A `.tmp` file younger than the age gate may be a write still in
+        flight and must not be touched."""
+        state_dir = tmp_path / "response-state"
+        state_dir.mkdir(parents=True)
+        tmp_file = state_dir / "resp_inflight.tmp"
+        tmp_file.write_text("{}")
+
+        ResponseStore(max_size=10, state_dir=state_dir)
+
+        assert tmp_file.exists()
 
     def test_resolve_chain_messages(self, tmp_path):
         state_dir = tmp_path / "response-state"

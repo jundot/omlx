@@ -122,6 +122,32 @@ class TestBoundarySnapshotSSDStore:
         assert not self.store.has("req-1", 4096)
         assert not self.store.has("req-2", 2048)
 
+    def test_save_degrades_under_hard_disk_pressure(self):
+        """design doc §R2/B1: under the hard floor, save() degrades to the
+        existing failed-save placeholder path instead of staging a new
+        checkpoint — a boundary snapshot is only ever needed for a
+        mid-chain restart, never for the request currently in flight."""
+        self.store.set_disk_pressure_hard(True)
+
+        ok = self.store.save(
+            "req-1", 1024, [MagicMock()], _mock_extract_cache_states
+        )
+
+        assert ok is False
+        assert not self.store.has("req-1", 1024)
+
+    def test_save_resumes_once_pressure_clears(self):
+        self.store.set_disk_pressure_hard(True)
+        self.store.save("req-1", 1024, [MagicMock()], _mock_extract_cache_states)
+        assert not self.store.has("req-1", 1024)
+
+        self.store.set_disk_pressure_hard(False)
+        ok = self.store.save(
+            "req-1", 1024, [MagicMock()], _mock_extract_cache_states
+        )
+
+        assert ok is True
+
     def test_duplicate_boundary_save_coalesces_without_double_reservation(self):
         """A deterministic duplicate must reuse the in-flight generation."""
         import threading
@@ -456,6 +482,83 @@ class TestBoundarySnapshotSSDStore:
         reset_boundary_snapshot_root(self.base_dir)
         assert not orphan_dir.exists()
         assert (self.base_dir / "_boundary_snapshots").exists()
+
+    def test_reset_preserves_a_live_process_session(self):
+        """design doc §B2: a second oMLX process on this Mac (another port,
+        or a start racing a slow shutdown) must keep its in-flight request's
+        snapshots — the reset previously ignored that sessions are
+        per-process and stripped everything."""
+        import os
+
+        live_dir = (
+            self.base_dir / "_boundary_snapshots" / f"{os.getpid()}-livesession"
+        )
+        live_dir.mkdir(parents=True)
+        (live_dir / "marker.safetensors").write_text("in flight")
+
+        reset_boundary_snapshot_root(self.base_dir)
+
+        assert live_dir.exists()
+
+    def test_reset_removes_a_dead_process_session(self):
+        import subprocess
+        import sys
+
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        dead_pid = process.pid
+
+        dead_dir = (
+            self.base_dir / "_boundary_snapshots" / f"{dead_pid}-deadsession"
+        )
+        dead_dir.mkdir(parents=True)
+        (dead_dir / "marker.safetensors").write_text("crash remnant")
+
+        reset_boundary_snapshot_root(self.base_dir)
+
+        assert not dead_dir.exists()
+
+    def test_reset_reduces_to_full_rmtree_in_the_common_single_process_case(
+        self,
+    ):
+        """Every existing session belongs to a now-dead prior invocation
+        when only one *other* oMLX process has ever run here — the doc's
+        stated equivalence with the old blanket-rmtree behavior. (The
+        autouse fixture's own store is this test process's own live
+        session and correctly survives — that's the per-session guarantee
+        under test, not a leak.)"""
+        import subprocess
+        import sys
+
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+        dead_pid = process.pid
+
+        dead_dirs = []
+        for name in (f"{dead_pid}-a", f"{dead_pid}-b"):
+            d = self.base_dir / "_boundary_snapshots" / name
+            d.mkdir(parents=True)
+            (d / "x.safetensors").write_text("stale")
+            dead_dirs.append(d)
+
+        reset_boundary_snapshot_root(self.base_dir)
+
+        assert not any(d.exists() for d in dead_dirs)
+        assert self.store._snapshot_dir.exists()  # this process's own session survives
+
+    def test_reset_refuses_symlinked_session_dir(self):
+        import os
+
+        outside = self.base_dir.parent / "outside_session"
+        outside.mkdir()
+        (outside / "keep.safetensors").write_text("do not delete me")
+        link = self.base_dir / "_boundary_snapshots"
+        link.mkdir(parents=True, exist_ok=True)
+        (link / f"{os.getpid() + 1_000_000}-linked").symlink_to(outside)
+
+        reset_boundary_snapshot_root(self.base_dir)
+
+        assert (outside / "keep.safetensors").exists()
 
     def test_store_creation_does_not_delete_existing_session(self):
         self.store.save("req-a", 1024, [MagicMock()], _mock_extract_cache_states)

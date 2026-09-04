@@ -97,8 +97,37 @@ def _gdn_rht_sign_values(dim: int, seed: int) -> tuple[float, ...]:
     )
 
 
+def _session_owner_pid_is_live(pid: int) -> bool:
+    """Is the process that owns a boundary-snapshot session still running?
+
+    Mirrors ``cluster/liveness.py``'s ``_pid_is_live``, kept as a local
+    copy rather than an import so this module carries no dependency on
+    the optional cluster package — the same reasoning that module states
+    for keeping its own copy local. An unreadable pid is treated as live:
+    refusing to reap is the safe answer when we cannot tell.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError, TypeError, ValueError):
+        return True
+    return True
+
+
 def reset_boundary_snapshot_root(base_dir: Path) -> None:
-    """Remove all boundary snapshot sessions for a server lifecycle boundary."""
+    """Remove dead-owner boundary snapshot sessions for a lifecycle boundary.
+
+    Per-session-aware (design doc §B2): a blanket rmtree strips every
+    session under this root, including one belonging to a *second* oMLX
+    process on this Mac (a server on another port, or a start racing a
+    slow shutdown) whose request is still in flight — the reset ignored
+    that sessions are per-process (``<pid>-<uuid>``) precisely so multiple
+    processes can coexist. Delete only sessions whose owning pid is dead;
+    in the common single-process case every existing session's owner is
+    necessarily dead (a fresh start has no other live line), so this
+    reduces to exactly the prior blanket-rmtree behavior.
+    """
     snapshot_root = base_dir / "_boundary_snapshots"
     if snapshot_root.is_symlink():
         logger.warning(
@@ -106,11 +135,29 @@ def reset_boundary_snapshot_root(base_dir: Path) -> None:
             snapshot_root,
         )
         return
-    if snapshot_root.exists():
-        try:
-            shutil.rmtree(snapshot_root)
-        except Exception as e:
-            logger.warning("Failed to reset boundary snapshots: %s", e)
+    if snapshot_root.is_dir():
+        for session_dir in list(snapshot_root.iterdir()):
+            if session_dir.is_symlink() or not session_dir.is_dir():
+                continue
+            pid_str, _, _rest = session_dir.name.partition("-")
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                # This module only ever names a session "<pid>-<uuid>hex>";
+                # anything else was never a live session under this
+                # convention and is foreign debris, same treatment as a
+                # malformed name anywhere else in the cache tree (§A1).
+                pid = None
+            if pid is not None and _session_owner_pid_is_live(pid):
+                continue
+            try:
+                shutil.rmtree(session_dir)
+            except Exception as e:
+                logger.warning(
+                    "Failed to reap dead boundary snapshot session %s: %s",
+                    session_dir,
+                    e,
+                )
     snapshot_root.mkdir(parents=True, exist_ok=True)
 
 
@@ -187,6 +234,13 @@ class BoundarySnapshotSSDStore:
         self._pending_peak_bytes = 0
         self._backpressure_ms = 0.0
 
+        # Set by the external disk-pressure guard tick (design doc §R2).
+        # A boundary snapshot is only ever needed for a mid-chain restart;
+        # the request itself already has an existing degraded-save path
+        # (the placeholder marker below), so refusing under hard pressure
+        # reuses that path rather than inventing a new failure mode.
+        self._disk_pressure_hard = False
+
         # Cancelled requests with remaining queue item counts. Writer
         # thread decrements on each skip; entry is deleted when count
         # reaches zero, preventing unbounded growth. All access is
@@ -215,6 +269,14 @@ class BoundarySnapshotSSDStore:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_disk_pressure_hard(self, active: bool) -> None:
+        """Toggle the hard-floor degrade switch (design doc §R2).
+
+        Set by the external disk-pressure guard tick. Admission (serving
+        the request) is untouched; only new snapshot staging degrades.
+        """
+        self._disk_pressure_hard = bool(active)
 
     def save(
         self,
@@ -258,6 +320,13 @@ class BoundarySnapshotSSDStore:
             with self._pending_lock:
                 if pw_key in self._pending_writes:
                     return True
+
+            if self._disk_pressure_hard:
+                # Degrade to the existing failed-save placeholder path
+                # (design doc §R2/B1) instead of staging a new checkpoint —
+                # a boundary snapshot is only ever needed for a mid-chain
+                # restart, never for the request currently in flight.
+                return False
 
             # 1. Extract dict-format states on inference thread.
             extracted, model_cache_config = extract_cache_states_fn(snapshot_cache)

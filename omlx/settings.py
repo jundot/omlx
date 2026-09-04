@@ -552,6 +552,67 @@ class MemorySettings:
 
 
 @dataclass
+class DiskSettings:
+    """Idle-time, cross-consumer disk-pressure guard settings (design doc R2).
+
+    Mirrors the memory guard's soft/hard-threshold shape, but expressed in
+    absolute free bytes rather than a fraction of a ceiling: disk pressure
+    from another process (a model download, Time Machine, the user's own
+    files) is invisible to any single consumer's byte budget, so the guard
+    watches the volume directly. Each floor is the larger of a flat GiB
+    number and a fraction of total volume capacity, so a small startup disk
+    and a large data volume both get a sane floor.
+    """
+
+    soft_free_floor_gb: float = 20.0
+    soft_free_floor_fraction: float = 0.05
+    hard_free_floor_gb: float = 10.0
+    hard_free_floor_fraction: float = 0.02
+    guard_tick_interval_seconds: float = 60.0
+
+    def get_soft_free_floor_bytes(self, total_bytes: int) -> int:
+        """Free-byte floor below which the guard sheds cache gradually."""
+        return max(
+            int(self.soft_free_floor_gb * 1024**3),
+            int(total_bytes * self.soft_free_floor_fraction),
+        )
+
+    def get_hard_free_floor_bytes(self, total_bytes: int) -> int:
+        """Free-byte floor below which writes are refused outright."""
+        return max(
+            int(self.hard_free_floor_gb * 1024**3),
+            int(total_bytes * self.hard_free_floor_fraction),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "soft_free_floor_gb": self.soft_free_floor_gb,
+            "soft_free_floor_fraction": self.soft_free_floor_fraction,
+            "hard_free_floor_gb": self.hard_free_floor_gb,
+            "hard_free_floor_fraction": self.hard_free_floor_fraction,
+            "guard_tick_interval_seconds": self.guard_tick_interval_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DiskSettings:
+        """Create from dictionary."""
+        return cls(
+            soft_free_floor_gb=float(data.get("soft_free_floor_gb", 20.0)),
+            soft_free_floor_fraction=float(
+                data.get("soft_free_floor_fraction", 0.05)
+            ),
+            hard_free_floor_gb=float(data.get("hard_free_floor_gb", 10.0)),
+            hard_free_floor_fraction=float(
+                data.get("hard_free_floor_fraction", 0.02)
+            ),
+            guard_tick_interval_seconds=float(
+                data.get("guard_tick_interval_seconds", 60.0)
+            ),
+        )
+
+
+@dataclass
 class ModelIdleTimeoutSettings:
     """Idle timeout settings for automatic model unloading."""
 
@@ -946,6 +1007,7 @@ class GlobalSettings:
     server: ServerSettings = field(default_factory=ServerSettings)
     model: ModelSettings = field(default_factory=ModelSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
+    disk: DiskSettings = field(default_factory=DiskSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
@@ -1030,6 +1092,8 @@ class GlobalSettings:
                 self.model = ModelSettings.from_dict(data["model"])
             if "memory" in data:
                 self.memory = MemorySettings.from_dict(data["memory"])
+            if "disk" in data:
+                self.disk = DiskSettings.from_dict(data["disk"])
             if "scheduler" in data:
                 self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
             if "cache" in data:
@@ -1384,6 +1448,7 @@ class GlobalSettings:
             "server": self.server.to_dict(),
             "model": self.model.to_dict(),
             "memory": self.memory.to_dict(),
+            "disk": self.disk.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
@@ -1737,6 +1802,7 @@ class GlobalSettings:
             "server": self.server.to_dict(),
             "model": self.model.to_dict(),
             "memory": self.memory.to_dict(),
+            "disk": self.disk.to_dict(),
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),

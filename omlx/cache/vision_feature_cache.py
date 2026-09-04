@@ -30,9 +30,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
+from ..utils.formatting import format_bytes
 from .paged_ssd_cache import (
     _extract_tensor_bytes,
     _fsync_parent_dir,
+    _TMP_STAGING_MIN_AGE_SECONDS,
     _write_safetensors_no_mx,
 )
 
@@ -395,14 +397,86 @@ class VisionFeatureSSDCache:
                 pass
             return None
 
+    def _reap_stale_tmp_staging_files(self) -> tuple[int, int]:
+        """Delete age-gated `*_tmp.safetensors` staging leftovers.
+
+        Same class as the main paged SSD cache's A1 orphan class (design
+        doc §7 rule 2 / R1 step 1): a live writer renames its temp file
+        within seconds of creating it, so anything older than the age gate
+        is a crash remnant, not an in-flight write from a concurrent
+        instance over the same directory.
+        """
+        if self._cache_dir is None:
+            return 0, 0
+        now = time.time()
+        count = 0
+        total_bytes = 0
+        for subdir_char in _SUBDIR_CHARS:
+            subdir_path = self._cache_dir / subdir_char
+            if subdir_path.is_symlink() or not subdir_path.is_dir():
+                continue
+            for tmp_path in subdir_path.glob("*_tmp.safetensors"):
+                if tmp_path.is_symlink():
+                    continue
+                try:
+                    st = tmp_path.stat()
+                except OSError:
+                    continue
+                if now - st.st_mtime < _TMP_STAGING_MIN_AGE_SECONDS:
+                    continue
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to reap stale vision cache staging file %s: %s",
+                        tmp_path,
+                        exc,
+                    )
+                    continue
+                count += 1
+                total_bytes += st.st_size
+        return count, total_bytes
+
+    def _reap_corrupt_final_file(self, file_path: Path) -> int:
+        """Delete a final-name vision cache file that failed to parse.
+
+        Only reached for names that survived the `*_tmp.safetensors`
+        filter, so `file_path` was created by a completed atomic rename
+        (`_write_feature_file`) — unparseable or missing required metadata
+        at that name is corrupt, not in-flight (design doc §A1, same rule
+        applied to the main paged SSD cache in `_scan_existing_files`).
+        """
+        if file_path.is_symlink():
+            return 0
+        try:
+            size = file_path.stat().st_size
+            file_path.unlink()
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            logger.warning(
+                "Failed to reap corrupt vision cache file %s: %s", file_path, exc
+            )
+            return 0
+        logger.info(
+            "Reaped corrupt vision cache file %s (%s)", file_path, format_bytes(size)
+        )
+        return size
+
     def _scan_existing_files(self) -> None:
         """Scan SSD cache directory for existing files and rebuild index."""
         if self._cache_dir is None:
             return
 
+        self._reap_stale_tmp_staging_files()
+
         scanned = 0
         indexed = 0
         errors = 0
+        reaped_corrupt = 0
+        reaped_corrupt_bytes = 0
 
         for subdir_char in _SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir_char
@@ -410,6 +484,8 @@ class VisionFeatureSSDCache:
                 continue
 
             for file_path in subdir_path.glob("*.safetensors"):
+                if file_path.name.endswith("_tmp.safetensors"):
+                    continue
                 scanned += 1
                 try:
                     _, metadata = mx.load(str(file_path), return_metadata=True)
@@ -419,6 +495,10 @@ class VisionFeatureSSDCache:
 
                     if not image_hash or not model_name:
                         errors += 1
+                        reaped = self._reap_corrupt_final_file(file_path)
+                        if reaped:
+                            reaped_corrupt += 1
+                            reaped_corrupt_bytes += reaped
                         continue
 
                     key = _composite_key(model_name, image_hash)
@@ -440,13 +520,23 @@ class VisionFeatureSSDCache:
                 except Exception as e:
                     logger.debug("Failed to read vision cache file %s: %s", file_path, e)
                     errors += 1
+                    reaped = self._reap_corrupt_final_file(file_path)
+                    if reaped:
+                        reaped_corrupt += 1
+                        reaped_corrupt_bytes += reaped
 
         if scanned > 0:
-            logger.info(
-                "Vision feature SSD cache scan: scanned=%d, indexed=%d, errors=%d, "
-                "total_size=%.1fMB",
-                scanned, indexed, errors, self._ssd_total_size / (1024 * 1024),
+            log_msg = (
+                f"Vision feature SSD cache scan: scanned={scanned}, "
+                f"indexed={indexed}, errors={errors}, "
+                f"total_size={self._ssd_total_size / (1024 * 1024):.1f}MB"
             )
+            if reaped_corrupt > 0:
+                log_msg += (
+                    f", reaped_corrupt={reaped_corrupt} files "
+                    f"({format_bytes(reaped_corrupt_bytes)})"
+                )
+            logger.info(log_msg)
 
     # ── Background writer ───────────────────────────────────────────
 

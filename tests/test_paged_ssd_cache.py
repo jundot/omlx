@@ -8,6 +8,7 @@ enabling larger effective cache sizes than GPU memory allows.
 
 import errno
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -762,6 +763,78 @@ class TestPagedSSDCacheManagerWithMLX:
             assert keys.shape == (1, 8, 64, 64)
             assert values.shape == (1, 8, 64, 64)
 
+    def test_save_block_refused_under_hard_disk_pressure(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """A cache write is always optional (design doc §R2/C1): under the
+        hard floor, save_block becomes a no-op that counts a stat instead
+        of writing — never an admission refusal."""
+        mx = mock_mlx
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        manager.set_disk_pressure_hard(True)
+
+        block_hash = b"refused_hash"
+        cache_data = [(mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))]
+
+        result = manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache"],
+        )
+
+        assert result is False
+        assert not manager.has_block(block_hash)
+        assert manager.get_stats_dict()["saves_refused_disk_pressure"] == 1
+
+    def test_save_block_resumes_once_pressure_clears(self, tmp_path: Path, mock_mlx):
+        mx = mock_mlx
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        manager.set_disk_pressure_hard(True)
+        block_hash = b"resumes_hash"
+        cache_data = [(mx.zeros((1, 8, 64, 64)), mx.zeros((1, 8, 64, 64)))]
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache"],
+        )
+        assert not manager.has_block(block_hash)
+
+        manager.set_disk_pressure_hard(False)
+        result = manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=64,
+            model_name="test-model",
+            layer_cache_types=["KVCache"],
+        )
+
+        assert result is True
+        assert manager.has_block(block_hash)
+
+    def test_enforce_size_limit_default_trigger_unchanged(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Backward compatibility: the no-arg call must trigger at exactly
+        the same threshold as before trigger_fraction existed (only once
+        the full effective cap is exceeded)."""
+        mx = mock_mlx
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        # Nothing stored: tracked size (0) is always <= any positive cap.
+        assert manager.enforce_size_limit() == 0
+
     def test_load_block_with_metadata(self, tmp_path: Path, mock_mlx):
         """Test loading block with metadata."""
         mx = mock_mlx
@@ -796,6 +869,163 @@ class TestPagedSSDCacheManagerWithMLX:
         assert loaded_meta["block_size"] == 64
         assert loaded_meta["cache_signature"]
         assert loaded_meta["layer_cache_types"] == ["KVCache", "RotatingKVCache"]
+
+    def test_reconcile_prunes_index_entry_whose_file_another_manager_deleted(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """design doc §A5: a second manager sharing this cache directory can
+        evict+unlink a file this manager still has indexed. reconcile_tracked_sizes
+        is the periodic decay that catches it rather than waiting for a
+        touch that may never come."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        block_hash = b"reconcile_hash"
+        cache_data = [(mx.zeros((1, 8, 32, 32)), mx.zeros((1, 8, 32, 32)))]
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+            model_name="m",
+            layer_cache_types=["KVCache"],
+        )
+        manager.close()
+        # Reopen so the block is indexed from disk, not held live in the
+        # hot cache/pending buffer (reconcile only prunes disk-backed
+        # index entries; a hot-cache-only entry is never "dead" this way).
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+        assert manager.has_block(block_hash)
+
+        # Simulate a second manager over the same dir evicting+unlinking it.
+        metadata = manager._index.get(block_hash)
+        metadata.file_path.unlink()
+
+        pruned = manager.reconcile_tracked_sizes()
+
+        assert pruned == 1
+        assert not manager.has_block(block_hash)
+
+    def test_reconcile_leaves_live_entries_alone(self, tmp_path: Path, mock_mlx):
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+        block_hash = b"live_hash"
+        cache_data = [(mx.zeros((1, 8, 32, 32)), mx.zeros((1, 8, 32, 32)))]
+        manager.save_block(
+            block_hash=block_hash,
+            cache_data=cache_data,
+            token_count=32,
+            model_name="m",
+            layer_cache_types=["KVCache"],
+        )
+        manager.close()
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        pruned = manager.reconcile_tracked_sizes()
+
+        assert pruned == 0
+        assert manager.has_block(block_hash)
+
+    def test_stale_main_block_lru_touch_persisted_on_ssd_hit(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """A main-block SSD-tier hit persists its LRU recency to disk mtime
+        once the previously recorded access is stale (design doc §A2):
+        restart previously reseeded `last_access` from write-time mtime, so
+        a heavily-reused old prefix looked exactly as stale as a
+        written-yesterday-never-hit block, biasing eviction against it."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        block_hash = b"\x80" + b"\x00" * 31
+        file_path = self._write_versioned_fixture_block(
+            cache_dir, mx, block_hash, num_layers=1, model_name="m"
+        )
+        old_time = time.time() - 7200
+        os.utime(file_path, (old_time, old_time))
+
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+        assert manager.has_block(block_hash)
+
+        loaded = manager.load_block(block_hash)
+
+        assert loaded is not None
+        assert file_path.stat().st_mtime > old_time + 1000
+
+    def test_fresh_main_block_lru_touch_not_persisted_within_throttle(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """No extra utime syscall on a chain being hit repeatedly within the
+        throttle window — only the sidecar-recency-bias fix matters, not
+        churning mtimes on a hot chain."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        block_hash = b"\x82" + b"\x00" * 31
+        self._write_versioned_fixture_block(
+            cache_dir, mx, block_hash, num_layers=1, model_name="m"
+        )
+        # Just written: file mtime and the scan-seeded last_access are both
+        # "now", well within the throttle window.
+
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        with patch("omlx.cache.paged_ssd_cache.os.utime") as utime_spy:
+            loaded = manager.load_block(block_hash)
+
+        assert loaded is not None
+        utime_spy.assert_not_called()
+
+    def test_stale_main_block_lru_touch_persisted_on_metadata_load(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """Same throttled persistence via `load_block_with_metadata`."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        block_hash = b"\x83" + b"\x00" * 31
+        file_path = self._write_versioned_fixture_block(
+            cache_dir, mx, block_hash, num_layers=1, model_name="m"
+        )
+        old_time = time.time() - 7200
+        os.utime(file_path, (old_time, old_time))
+
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        loaded, meta = manager.load_block_with_metadata(block_hash)
+
+        assert loaded is not None
+        assert meta is not None
+        assert file_path.stat().st_mtime > old_time + 1000
+
+    def test_main_block_ssd_hit_counted_separately_from_hot_cache_hit(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """design doc §0.4/§A3: `hits` lumps every tier together; the
+        disk-cleanup work's budget-share decision needs the SSD-tier
+        main-block/sidecar split isolated from hot-cache hits."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        block_hash = b"\x84" + b"\x00" * 31
+        self._write_versioned_fixture_block(
+            cache_dir, mx, block_hash, num_layers=1, model_name="m"
+        )
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=1024**3,  # enable promotion for the 2nd-load assertion
+        )
+
+        # First load: disk-backed index entry, not yet promoted — SSD-tier hit.
+        assert manager.load_block(block_hash) is not None
+        stats = manager.get_stats_dict()
+        assert stats["main_block_ssd_hits"] == 1
+        assert stats["hot_cache_hits"] == 0
+
+        # Second load: now hot-cache-resident — must not double-count as
+        # an SSD-tier hit.
+        assert manager.load_block(block_hash) is not None
+        stats = manager.get_stats_dict()
+        assert stats["main_block_ssd_hits"] == 1
+        assert stats["hot_cache_hits"] == 1
 
     def test_save_canonicalizes_buffered_rotating_metadata(
         self, tmp_path: Path, mock_mlx
@@ -1205,8 +1435,11 @@ class TestPagedSSDCacheManagerWithMLX:
 
         assert not manager.has_block(corrupt_hash)
         assert manager.has_block(healthy_hash)
-        # Scan-time skips stay non-destructive (shared cache directories).
-        assert corrupt_path.exists()
+        # A final-name file that fails to parse is corrupt, not in-flight
+        # (only ever created by a completed fsync'd rename): the startup
+        # reconciliation sweep reaps it outright rather than leaking it
+        # forever (design doc §7 R1 step 2 / A1).
+        assert not corrupt_path.exists()
 
     def test_scan_rejects_corrupt_layer_meta_states_json(
         self, tmp_path: Path, mock_mlx
@@ -1228,6 +1461,109 @@ class TestPagedSSDCacheManagerWithMLX:
         )
 
         assert not manager.has_block(corrupt_hash)
+
+    def test_stale_tmp_staging_file_reaped_on_scan(self, tmp_path: Path, mock_mlx):
+        """A `*_tmp.safetensors` crash remnant older than the age gate is
+        deleted by the startup reconciliation sweep (design doc §A1/R1)."""
+        cache_dir = tmp_path / "ssd_cache"
+        sub_dir = cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        tmp_path_file = sub_dir / "abc_tmp.safetensors"
+        tmp_path_file.write_bytes(b"partial")
+        old_time = time.time() - 3600
+        os.utime(tmp_path_file, (old_time, old_time))
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert not tmp_path_file.exists()
+
+    def test_fresh_tmp_staging_file_survives_scan(self, tmp_path: Path, mock_mlx):
+        """A `_tmp.safetensors` file younger than the age gate may be a
+        concurrent manager's in-flight rename target and must survive."""
+        cache_dir = tmp_path / "ssd_cache"
+        sub_dir = cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        tmp_path_file = sub_dir / "abc_tmp.safetensors"
+        tmp_path_file.write_bytes(b"partial")
+
+        manager = PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert tmp_path_file.exists()
+        # Never indexed either way, regardless of age.
+        assert not manager.has_block(b"\xab\xc0" + b"\x00" * 30)
+
+    def test_symlinked_tmp_name_never_unlinked(self, tmp_path: Path, mock_mlx):
+        """Reaping never follows a symlink, even at a stale staging name."""
+        cache_dir = tmp_path / "ssd_cache"
+        sub_dir = cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        target = tmp_path / "outside_target.safetensors"
+        target.write_bytes(b"do not delete me")
+        link_path = sub_dir / "abc_tmp.safetensors"
+        link_path.symlink_to(target)
+        old_time = time.time() - 3600
+        os.utime(target, (old_time, old_time), follow_symlinks=False)
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert target.exists()
+
+    def test_empty_gdn_sidecar_digest_dir_removed(self, tmp_path: Path, mock_mlx):
+        """An empty (validly-named) sidecar digest dir is inert clutter and
+        is removed by the reconciliation sweep."""
+        cache_dir = tmp_path / "ssd_cache"
+        digest = hashlib.sha256(b"sig").hexdigest()
+        digest_dir = cache_dir / "_gdn_sidecars" / digest
+        digest_dir.mkdir(parents=True)
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert not digest_dir.exists()
+
+    def test_malformed_gdn_sidecar_digest_dir_removed(self, tmp_path: Path, mock_mlx):
+        """A digest dir whose name never came from `_gdn_signature_digest`
+        (bad length/not hex) was never indexed and is reaped outright."""
+        cache_dir = tmp_path / "ssd_cache"
+        bad_dir = cache_dir / "_gdn_sidecars" / "not-a-valid-digest"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "junk.safetensors").write_bytes(b"junk")
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert not bad_dir.exists()
+
+    def test_nonempty_valid_gdn_sidecar_digest_dir_survives(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """A validly-named digest dir with real sidecar content is left
+        alone by the digest-dir reap pass (only malformed/empty dirs go)."""
+        cache_dir = tmp_path / "ssd_cache"
+        digest = hashlib.sha256(b"sig").hexdigest()
+        digest_dir = cache_dir / "_gdn_sidecars" / digest
+        digest_dir.mkdir(parents=True)
+        source_hash = b"\x11" * 32
+        sidecar_file = digest_dir / f"{source_hash.hex()}.safetensors"
+        sidecar_file.write_bytes(b"real sidecar content")
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert digest_dir.exists()
+        assert sidecar_file.exists()
+
+    def test_malformed_gdn_sidecar_filename_reaped(self, tmp_path: Path, mock_mlx):
+        """A file inside a valid digest dir whose name isn't a hex source
+        hash is corrupt/foreign at a final path (sidecars have no `_tmp`
+        staging convention of their own) and is reaped."""
+        cache_dir = tmp_path / "ssd_cache"
+        digest = hashlib.sha256(b"sig").hexdigest()
+        digest_dir = cache_dir / "_gdn_sidecars" / digest
+        digest_dir.mkdir(parents=True)
+        bad_file = digest_dir / "not-hex.safetensors"
+        bad_file.write_bytes(b"junk")
+
+        PagedSSDCacheManager(cache_dir=cache_dir, max_size_bytes=1024**3)
+
+        assert not bad_file.exists()
 
     def test_scan_logs_skipped_incompatible_count(
         self, tmp_path: Path, mock_mlx, caplog

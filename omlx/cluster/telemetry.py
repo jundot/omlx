@@ -11,6 +11,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from .performance import ExecutionSettings
@@ -622,6 +623,34 @@ class _TelemetryQueue:
         return self._queue.put(item, *args, **kwargs)
 
 
+# 64 entries x ~370 MB/boundary file (full recurrent state + a 2048-token
+# KV slab for the rank's layer slice) is ~24 GiB per rank, invisible to
+# every other budget on whatever disk the rank has (design doc §D2). Bound
+# it from free disk at activation time rather than trust entry count alone.
+_SSD_SNAPSHOT_MAX_BYTES_CAP = 32 * 1024**3
+_SSD_SNAPSHOT_FREE_DISK_FRACTION = 0.2
+
+
+def _ssd_snapshot_max_bytes(ssd_cache_dir: str) -> int | None:
+    """Byte bound for one rank's live prompt-cache-ssd store (design doc §D2).
+
+    min(32 GiB, 20% of free disk) — conservative on purpose, since disk
+    pressure isn't tracked cross-consumer yet (that's the R2 guard). Falls
+    back to the flat cap if free space can't be read.
+    """
+    try:
+        probe = Path(ssd_cache_dir).expanduser()
+        while not probe.exists():
+            parent = probe.parent
+            if parent == probe:
+                return _SSD_SNAPSHOT_MAX_BYTES_CAP
+            probe = parent
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return _SSD_SNAPSHOT_MAX_BYTES_CAP
+    return min(_SSD_SNAPSHOT_MAX_BYTES_CAP, int(free * _SSD_SNAPSHOT_FREE_DISK_FRACTION))
+
+
 @contextmanager
 def install_server_telemetry(
     marker: MarkerWriter,
@@ -677,7 +706,10 @@ def install_server_telemetry(
         )
 
         ssd_store = SSDPromptSnapshotStore(
-            ssd_cache_dir, step=snapshot_step, max_entries=ssd_max_entries
+            ssd_cache_dir,
+            step=snapshot_step,
+            max_entries=ssd_max_entries,
+            max_bytes=_ssd_snapshot_max_bytes(ssd_cache_dir),
         )
     try:
         world_size = int(mx.distributed.init().size())
