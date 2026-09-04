@@ -82,7 +82,9 @@ class TestThinkingBudgetProcessor:
         assert other_logit == float("-inf")
 
     def test_done_after_forced_sequence(self):
-        """After forcing the close sequence, processor should become a no-op."""
+        """After forcing the close sequence the processor stops forcing and,
+        per #1864, masks only the close-think token (to block a duplicate
+        close) while leaving every other logit untouched."""
         proc = self._make_processor(budget=1)
 
         # Call 1 (first_call): budget=1, forcing starts → forces THINK_END_ID
@@ -94,7 +96,9 @@ class TestThinkingBudgetProcessor:
         logits = proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
         assert proc._done
         assert not proc._forcing
-        assert mx.array_equal(logits, _make_logits())
+        # Close token masked; all other positions left as-is.
+        assert logits[0, self.THINK_END_ID].item() == float("-inf")
+        assert logits[0, 0].item() == 0.0
 
     def test_trailing_tokens_forced_after_end(self):
         """Trailing tokens (e.g. \\n) should be forced after </think>."""
@@ -111,10 +115,12 @@ class TestThinkingBudgetProcessor:
         assert proc._forcing
         assert logits1[0, self.NEWLINE_ID].item() == 0.0
 
-        # Call 3: _force_idx advances to 2 == len([42, 99]) → done
+        # Call 3: _force_idx advances to 2 == len([42, 99]) → done.
+        # Close token masked afterwards (#1864); trailing/other tokens free.
         logits2 = proc(_make_tokens(10, self.THINK_END_ID, self.NEWLINE_ID), _make_logits())
         assert proc._done
-        assert mx.array_equal(logits2, _make_logits())
+        assert logits2[0, self.THINK_END_ID].item() == float("-inf")
+        assert logits2[0, self.NEWLINE_ID].item() == 0.0
 
     def test_natural_end_before_budget(self):
         """If model produces </think> naturally, processor becomes no-op."""
@@ -131,6 +137,70 @@ class TestThinkingBudgetProcessor:
         original = _make_logits()
         result = proc(_make_tokens(10, self.THINK_END_ID, 50), original)
         assert mx.array_equal(result, original)
+
+    def test_suppresses_reclose_after_forced_close(self):
+        """Regression for #1864: after the budget force-closes thinking, the
+        model tends to keep reasoning and emit its OWN </think>, which leaks
+        into the answer. Once the forced close completes, the close-think
+        token must be masked to -inf so a duplicate can't be generated."""
+        proc = self._make_processor(budget=1)
+
+        # Call 1 (first_call): budget=1 → forces THINK_END_ID.
+        proc(_make_tokens(10), _make_logits())
+        assert proc._forcing
+        # Call 2: force_sequence = [THINK_END_ID] only → forcing completes.
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+        assert proc._suppress_reclose
+
+        # Subsequent calls must muzzle the close token while leaving the rest
+        # of the distribution untouched (model still picks real answer tokens).
+        result = proc(_make_tokens(10, self.THINK_END_ID, 70), _make_logits())
+        assert result[0, self.THINK_END_ID].item() == float("-inf")
+        assert result[0, 0].item() == 0.0  # other tokens unchanged
+
+    def test_natural_close_does_not_suppress_reclose(self):
+        """A natural close means the model finished on its own — it must NOT
+        be muzzled (only budget-forced closes are, per #1864)."""
+        proc = self._make_processor(budget=100)
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+        assert not proc._suppress_reclose
+        original = _make_logits()
+        result = proc(_make_tokens(10, self.THINK_END_ID, 50), original)
+        assert mx.array_equal(result, original)
+
+    def test_reclose_suppression_clears_on_think_reentry(self):
+        """If the model re-opens a thinking block after a forced close, a
+        future close is legitimate again, so suppression must clear."""
+        proc = self._make_processor(budget=1)
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._suppress_reclose
+
+        # Model emits <think> again → re-entered thinking, suppression cleared.
+        proc(_make_tokens(10, self.THINK_END_ID, self.THINK_START_ID), _make_logits())
+        assert proc._in_thinking
+        assert not proc._suppress_reclose
+
+    def test_multi_token_close_is_not_suppressed(self):
+        """#1864 guard: a multi-token close (subwords like "</", "think", ">")
+        must NOT be masked after a forced close — banning those ids would
+        corrupt the answer. Multi-token models rely on the parser-side strip."""
+        end_ids = [50, 51, 52]
+        proc = self._make_processor(budget=1, end_ids=end_ids)
+        # Drive the full forced close: budget hit, then 50, 51, 52.
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, 50), _make_logits())
+        proc(_make_tokens(10, 50, 51), _make_logits())
+        proc(_make_tokens(10, 50, 51, 52), _make_logits())
+        assert proc._done and proc._suppress_reclose
+
+        # Next step must leave every close-component logit untouched.
+        result = proc(_make_tokens(10, 50, 51, 52, 70), _make_logits())
+        for tid in end_ids:
+            assert result[0, tid].item() == 0.0
 
     def test_first_call_skips_state_update(self):
         """First call should not check tokens[-1] for state transitions."""
@@ -166,9 +236,14 @@ class TestThinkingBudgetProcessor:
         assert logits2[0, 52].item() == 0.0
 
         # Call 4: _force_idx advances to 3 == len(end_ids), then becomes done.
+        # A multi-token close decomposes into ordinary subwords, so the #1864
+        # re-close suppression is NOT applied here (it would ban real answer
+        # tokens) — the processor is a pure no-op afterwards.
         logits3 = proc(_make_tokens(10, 50, 51, 52), _make_logits())
         assert proc._done
         assert not proc._forcing
+        # Flag is set, but the single-token gate in __call__ skips masking.
+        assert proc._suppress_reclose
         assert mx.array_equal(logits3, _make_logits())
 
     def test_waits_for_utf8_completion_before_forcing(self):
