@@ -625,3 +625,116 @@ template <typename T>
   dst[2] = static_cast<T>(out.z);
   dst[3] = static_cast<T>(out.w);
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// Streaming chunk fold kernel (Phase 3.1 / §B1)
+///////////////////////////////////////////////////////////////////////////////
+
+// Online-softmax fold of ONE chunk's normalized partial (o_slot / lse_slot,
+// the same output the attention kernel emits with output_partials) into a
+// persistent fp32 running accumulator (acc) plus a running logsumexp
+// (lse_run_prev -> lse_run_next). Replaces the n_chunks-scaled partial slab
+// with a single chunk slot, so the running transient is O(1) in n_chunks. lse
+// values are in the attention kernel's scaled log2 domain (exp2/log2
+// throughout; the scale cancels in the differences).
+//
+// Threading mirrors attention_chunk_reduce: one thread per 4 head-dim elements
+// of one (b, h, row). acc[..., 4*d4 .. +3] is single-owner (safe to RMW in
+// place). The per-row lse is written only by the d4 == 0 thread and to a
+// DISTINCT ping-pong buffer (lse_run_next), so the bd/4 threads of a row —
+// which span two SIMD-groups at bd=256 — never race on it (they all read the
+// old value from lse_run_prev). Cross-dispatch hazards (fold c writes
+// acc/lse_run read by fold c+1; chunk c+1 writes o_slot read by fold c) are
+// covered by MLX's per-buffer barrier tracking; every chunk c>=1's attention
+// dispatch reliably inserts a global buffer barrier (its o_slot write is a WAR
+// vs. fold c-1's read), which also flushes the acc/lse_run writes.
+template <typename T>
+[[kernel]] void attention_chunk_fold(
+    const device T* o_slot [[buffer(0)]],
+    const device float* lse_slot [[buffer(1)]],
+    device float* acc [[buffer(2)]],
+    const device float* lse_run_prev [[buffer(3)]],
+    device float* lse_run_next [[buffer(4)]],
+    device T* O [[buffer(5)]],
+    const constant AttnChunkFoldParams* params [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  const int d4 = gid.x;
+  const int row = gid.y;
+  const int bh = gid.z;
+  if (row >= params->qL || (4 * d4) >= params->D) {
+    return;
+  }
+  const int b = bh / params->H;
+  const int h = bh % params->H;
+
+  const ulong row_off = ulong(bh) * ulong(params->qL) + row;
+  const ulong o_off = row_off * ulong(params->D) + 4 * d4;
+
+  const float lse_c = lse_slot[row_off];
+
+  float4 acc_v = float4(0);
+  bool wrote_acc = false;
+
+  if (params->is_first) {
+    // First chunk: never read acc/lse_run (uninitialized). A causally-dead
+    // first chunk seeds acc=0, lse_run=-INF so the next real chunk folds like
+    // a fresh first (exp2(-INF - m) == 0).
+    if (lse_c == -INFINITY) {
+      acc_v = float4(0);
+      if (d4 == 0) {
+        lse_run_next[row_off] = -INFINITY;
+      }
+    } else {
+      const device T* op = o_slot + o_off;
+      acc_v = float4(op[0], op[1], op[2], op[3]);
+      if (d4 == 0) {
+        lse_run_next[row_off] = lse_c;
+      }
+    }
+    acc[o_off + 0] = acc_v.x;
+    acc[o_off + 1] = acc_v.y;
+    acc[o_off + 2] = acc_v.z;
+    acc[o_off + 3] = acc_v.w;
+    wrote_acc = true;
+  } else if (lse_c == -INFINITY) {
+    // Dead chunk: acc passes through by NOT writing. The ping-pong lse buffer
+    // must still carry the running value forward or it goes stale.
+    if (d4 == 0) {
+      lse_run_next[row_off] = lse_run_prev[row_off];
+    }
+  } else {
+    const float run = lse_run_prev[row_off];
+    const float m = metal::max(run, lse_c);
+    const float a = metal::exp2(run - m); // 0 when run == -INF
+    const float bw = metal::exp2(lse_c - m);
+    const float sden = a + bw;
+    const device T* op = o_slot + o_off;
+    const float4 ov = float4(op[0], op[1], op[2], op[3]);
+    const float4 old =
+        float4(acc[o_off + 0], acc[o_off + 1], acc[o_off + 2], acc[o_off + 3]);
+    acc_v = (a * old + bw * ov) / sden;
+    acc[o_off + 0] = acc_v.x;
+    acc[o_off + 1] = acc_v.y;
+    acc[o_off + 2] = acc_v.z;
+    acc[o_off + 3] = acc_v.w;
+    wrote_acc = true;
+    if (d4 == 0) {
+      lse_run_next[row_off] = m + metal::log2(sden);
+    }
+  }
+
+  if (params->is_last) {
+    // Store the running accumulator (this pass's value, or the unchanged one on
+    // a dead last chunk) to O through the primitive's output strides.
+    const float4 outv = wrote_acc
+        ? acc_v
+        : float4(
+              acc[o_off + 0], acc[o_off + 1], acc[o_off + 2], acc[o_off + 3]);
+    device T* dst = O + b * params->O_strides[0] + h * params->O_strides[1] +
+        row * params->O_strides[2] + 4 * d4;
+    dst[0] = static_cast<T>(outv.x);
+    dst[1] = static_cast<T>(outv.y);
+    dst[2] = static_cast<T>(outv.z);
+    dst[3] = static_cast<T>(outv.w);
+  }
+}

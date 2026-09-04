@@ -375,10 +375,14 @@ NB_MODULE(_ext, m) {
       "q_block"_a = 32,
       "k_block"_a = 8,
       "dispatch_budget"_a = 0,
+      "stream_fold"_a = false,
       "stream"_a = nb::none());
   // Capability probe for fast.py: older extensions reject the
   // dispatch_budget kwarg, so the wrapper only forwards it when present.
   m.attr("FA256_HAS_DISPATCH_BUDGET") = true;
+  // Capability probe for the Phase 3.1 streaming-fold kwarg (§B1); older
+  // extensions reject stream_fold, so the wrapper only forwards it when set.
+  m.attr("FA256_HAS_STREAM_FOLD") = true;
   m.def(
       "qwen35_q2_affine_qmm_t",
       &omlx::qwen35_prefill_kernels::qwen35_q2_affine_qmm_t,

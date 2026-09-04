@@ -793,6 +793,13 @@ _EXT_HAS_FA256_DISPATCH_BUDGET = _ext is not None and hasattr(
     _ext, "FA256_HAS_DISPATCH_BUDGET"
 )
 
+# Extensions built before the Phase 3.1 streaming-fold change (§B1) reject the
+# stream_fold kwarg, so only forward it when the rebuilt binding is present;
+# those older builds keep the n_chunks-scaled partial-slab behavior.
+_EXT_HAS_FA256_STREAM_FOLD = _ext is not None and hasattr(
+    _ext, "FA256_HAS_STREAM_FOLD"
+)
+
 # Extensions built before the Bonsai group_size=128 support reject the
 # group_size kwarg on the qmm bindings, so only forward it when the rebuilt
 # binding is present.  The q2 binding ships in the same rebuild, so its
@@ -991,6 +998,10 @@ def fa256_supports_dispatch_budget() -> bool:
     return _EXT_HAS_FA256_DISPATCH_BUDGET
 
 
+def fa256_supports_stream_fold() -> bool:
+    return _EXT_HAS_FA256_STREAM_FOLD
+
+
 def qwen35_fa256_attention(
     q: mx.array,
     k: mx.array,
@@ -1000,13 +1011,16 @@ def qwen35_fa256_attention(
     q_block: int = 32,
     k_block: int = 8,
     dispatch_budget: int = 0,
+    stream_fold: bool = False,
     *,
     stream=None,
 ) -> mx.array:
     if _ext is not None and hasattr(_ext, "qwen35_fa256_attention"):
-        budget_kwargs: dict[str, int] = {}
+        budget_kwargs: dict[str, object] = {}
         if _EXT_HAS_FA256_DISPATCH_BUDGET:
             budget_kwargs["dispatch_budget"] = int(dispatch_budget)
+        if _EXT_HAS_FA256_STREAM_FOLD:
+            budget_kwargs["stream_fold"] = bool(stream_fold)
         return _ext.qwen35_fa256_attention(
             q,
             k,
