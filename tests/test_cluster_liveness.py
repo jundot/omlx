@@ -66,6 +66,70 @@ def test_the_local_rank_needs_no_ssh():
     assert probe_peer("localhost", runner=explode) is True
 
 
+def test_probe_peer_retries_a_flaky_mdns_resolution(monkeypatch):
+    """A single dropped multicast round trip must not read as a vanished
+    peer — the exact false negative that made a healthy just-activated
+    cluster report a peer as unreachable a moment later."""
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def flaky(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    assert probe_peer("studio.local", runner=flaky) is True
+    assert len(calls) == 2
+
+
+def test_read_remote_marker_retries_a_flaky_mdns_resolution(monkeypatch):
+    """Same false negative, one layer up: a rank that is running fine must
+    not be reported as having no heartbeat because of one dropped lookup."""
+
+    from omlx.cluster.liveness import read_remote_marker
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+    payload = b'{"marker":{"rank":1},"process_live":true,"peer_now":123.0}'
+
+    def flaky(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+        return subprocess.CompletedProcess(argv, 0, payload, b"")
+
+    marker, live, peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/x.json", runner=flaky
+    )
+
+    assert error == ""
+    assert marker == {"rank": 1}
+    assert live is True
+    assert peer_now == 123.0
+    assert len(calls) == 2
+
+
+def test_read_remote_marker_gives_up_after_exhausting_retries(monkeypatch):
+    from omlx.cluster.liveness import read_remote_marker
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def always_fails(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+
+    marker, live, peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/x.json", runner=always_fails
+    )
+
+    assert marker is None
+    assert "Could not resolve hostname" in error
+    assert len(calls) == 3
+
+
 def test_an_unreachable_peer_is_reported_not_raised(tmp_path):
     health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
                          probe=lambda t: t == "127.0.0.1")

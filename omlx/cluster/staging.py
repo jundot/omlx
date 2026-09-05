@@ -21,12 +21,13 @@ import secrets
 import shlex
 import struct
 import subprocess
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .ssh_policy import cluster_ssh_options
+from .ssh_policy import cluster_ssh_options, run_ssh_retrying
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
@@ -936,7 +937,6 @@ def stage_files_from_source(
     scp destination address the peer's real directory.
     """
 
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     # model_path is the coordinator's own absolute form. On a remote source
@@ -1084,18 +1084,13 @@ def run_remote_python(
         if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
             raise ValueError("remote Python executable must be an absolute path")
         executable_word = shlex.quote(executable)
-    result = subprocess.run(
-        [
-            "ssh",
-            *cluster_ssh_options(connect_timeout=10),
-            ssh_target,
-            f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+    argv = [
+        "ssh",
+        *cluster_ssh_options(connect_timeout=10),
+        ssh_target,
+        f"{executable_word} -c {shlex.quote(snippet)} {shlex.quote(argument)}",
+    ]
+    result = run_ssh_retrying(argv, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(
             f"could not {description} on {ssh_target}: {result.stderr.strip()[:200]}"
@@ -1220,7 +1215,6 @@ def stage_remote_files(
     an empty directory and re-copies everything.
     """
 
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()

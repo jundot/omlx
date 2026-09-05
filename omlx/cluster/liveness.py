@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .ssh_policy import cluster_ssh_options
+from .ssh_policy import cluster_ssh_options, run_ssh_retrying
 
 # A rank refreshes its marker on every phase change, while serving, and on a
 # fixed heartbeat interval even when idle (``RuntimeTelemetry``). Three missed
@@ -133,20 +133,16 @@ def probe_peer(
 
     if ssh_target in _LOOPBACK_TARGETS:
         return True
-    try:
-        result = runner(
-            [
-                "ssh",
-                *cluster_ssh_options(connect_timeout=timeout),
-                ssh_target,
-                "true",
-            ],
-            capture_output=True,
-            timeout=timeout + 2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
+    result = run_ssh_retrying(
+        [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=timeout),
+            ssh_target,
+            "true",
+        ],
+        timeout=timeout + 2,
+        runner=runner,
+    )
     return getattr(result, "returncode", 1) == 0
 
 
@@ -205,20 +201,16 @@ def read_remote_marker(
             shlex.quote(path),
         )
     )
-    try:
-        result = runner(
-            [
-                "ssh",
-                *cluster_ssh_options(connect_timeout=timeout),
-                ssh_target,
-                command,
-            ],
-            capture_output=True,
-            timeout=timeout + 2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, None, None, str(exc)
+    result = run_ssh_retrying(
+        [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=timeout),
+            ssh_target,
+            command,
+        ],
+        timeout=timeout + 2,
+        runner=runner,
+    )
     if getattr(result, "returncode", 1) != 0:
         error = getattr(result, "stderr", b"")
         if isinstance(error, bytes):

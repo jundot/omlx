@@ -19,7 +19,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
-from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
+from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options, run_ssh_retrying
 
 # Link speed thresholds for distinguishing TB4 from TB5
 _TB4_MAX_SPEED_GTBS = 40  # TB4 is up to 40 Gb/s
@@ -193,10 +193,23 @@ def _rdma_devices(ssh_hostname: str) -> list[str]:
     host including ``127.0.0.1``. On a Mac without SSH-to-self configured that
     fails, and RDMA is reported as unavailable on hardware that has it — a
     false negative observed on a machine with rdma_en1/en2/en6 present.
+
+    Only the remote branch retries: a single dropped mDNS round trip for a
+    ``.local`` hostname must not read as "no RDMA", but a local machine with
+    no RDMA hardware fails ``ibv_devices`` deterministically every time, and
+    this probe runs on every activation-progress poll — retrying a call that
+    cannot succeed would add felt latency to every one of those polls.
     """
 
     if ssh_hostname in _LOCAL_HOSTS:
-        command = ["ibv_devices"]
+        try:
+            result = subprocess.run(
+                ["ibv_devices"], capture_output=True, text=True, check=False, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                f"RDMA device probe failed for {ssh_hostname}: {exc}"
+            ) from exc
     else:
         command = [
             "ssh",
@@ -204,14 +217,7 @@ def _rdma_devices(ssh_hostname: str) -> list[str]:
             ssh_hostname,
             "ibv_devices",
         ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(
-            f"RDMA device probe failed for {ssh_hostname}: {exc}"
-        ) from exc
+        result = run_ssh_retrying(command, timeout=30)
     if getattr(result, "returncode", 0) != 0:
         detail = str(result.stderr or result.stdout or "").strip()
         raise RuntimeError(
@@ -1222,22 +1228,23 @@ def parse_linux_ip_addresses(output: str) -> tuple[InterfaceAddress, ...]:
 
 
 def _read(ssh_hostname: str, command: list[str]) -> str:
-    """Run one read-only command on a host, returning "" when it cannot run."""
+    """Run one read-only command on a host, returning "" when it cannot run.
 
+    Retries a bounded few times on failure — see ``run_ssh_retrying`` for why:
+    a single dropped mDNS round trip for a ``.local`` hostname used to be
+    indistinguishable from "this host has no addresses".
+    """
+
+    argv = list(command)
     if ssh_hostname not in _LOCAL_HOSTS:
-        command = [
+        argv = [
             "ssh",
             *cluster_ssh_options(connect_timeout=10),
             ssh_hostname,
-            *command,
+            *argv,
         ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout
+    result = run_ssh_retrying(argv, timeout=30)
+    return result.stdout if result.returncode == 0 else ""
 
 
 def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
