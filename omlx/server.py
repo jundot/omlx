@@ -1764,6 +1764,36 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
     return None
 
 
+def ram_context_cap_tokens(mem_bytes: int | None = None) -> int | None:
+    """Return a RAM-aware context ceiling, or ``None`` to leave native as-is.
+
+    Local Apple Silicon servers advertise the model's theoretical window
+    (often 256k) even when unified memory cannot hold that KV cache.
+    Agent clients then skip compaction and the scheduler crawls through
+    multi-minute throttled prefills until the chassis overheats.
+
+    Per-model ``max_context_window`` overrides still win. An explicit
+    ``sampling.max_context_window_policy`` still wins over this auto cap.
+    """
+    if mem_bytes is None:
+        try:
+            mem_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
+                os.sysconf("SC_PAGE_SIZE")
+            )
+        except (ValueError, OSError, AttributeError):
+            return None
+    if mem_bytes <= 0:
+        return None
+    gb = mem_bytes / (1024**3)
+    if gb <= 36:
+        return 32_768
+    if gb <= 80:
+        return 65_536
+    if gb <= 160:
+        return 131_072
+    return None
+
+
 def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
@@ -1775,7 +1805,9 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         2. **Model-config-discovered native context length** (#1308),
            optionally clamped by the operator policy: if
            ``sampling.max_context_window_policy`` is set, return
-           ``min(native, policy)``; otherwise return ``native`` as-is.
+           ``min(native, policy)``. If policy is unset, also clamp by
+           ``ram_context_cap_tokens()`` so 64 GB machines do not
+           advertise a 256k window they cannot hold.
         3. **Fallback default** from ``SamplingSettings.max_context_window``
            — only used when neither tier 1 nor tier 2 yields a value.
            Treated as a default, NOT capped by the policy; existing
@@ -1811,6 +1843,9 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
             policy = getattr(_server_state.sampling, "max_context_window_policy", None)
             if policy is not None and policy > 0:
                 return min(native, policy)
+            ram_cap = ram_context_cap_tokens()
+            if ram_cap is not None and ram_cap > 0:
+                return min(native, ram_cap)
             return native
 
     # Priority 3: fallback default (not capped — preserves legacy
