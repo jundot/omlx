@@ -2,6 +2,7 @@
 """Tests for ProcessMemoryEnforcer."""
 
 import asyncio
+import logging
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2977,3 +2978,52 @@ class TestPressureReclaimGrace:
             await enforcer._check_and_enforce()
         shrink.assert_called_once()
         engine.abort_all_requests.assert_awaited_once()
+
+
+class TestCustomCeilingWarning:
+    """Construction-time warning when a custom ceiling can never apply.
+
+    ``memory_guard_custom_ceiling_gb`` is only consumed by the enforcer
+    when ``memory_guard_tier == "custom"`` (issue #2928). Users editing
+    settings.json directly have no other way to discover that, so a mis-set
+    ceiling silently no-ops and the enforcer runs on its computed limit.
+    """
+
+    def test_custom_ceiling_ignored_warns_when_tier_is_not_custom(
+        self, caplog, mock_engine_pool
+    ):
+        with caplog.at_level(
+            logging.WARNING, logger="omlx.process_memory_enforcer"
+        ):
+            _make_enforcer(
+                mock_engine_pool,
+                tier="balanced",
+                memory_guard_custom_ceiling_gb=60.0,
+            )
+        assert any(
+            "Custom ceiling" in r.message for r in caplog.records
+        )
+
+    def test_custom_tier_consumes_ceiling_without_warning(
+        self, caplog, mock_engine_pool
+    ):
+        with caplog.at_level(
+            logging.WARNING, logger="omlx.process_memory_enforcer"
+        ):
+            _make_enforcer(
+                mock_engine_pool,
+                tier="custom",
+                memory_guard_custom_ceiling_gb=60.0,
+            )
+        assert not any(
+            "Custom ceiling" in r.message for r in caplog.records
+        )
+
+    def test_zero_ceiling_no_warning(self, caplog, mock_engine_pool):
+        with caplog.at_level(
+            logging.WARNING, logger="omlx.process_memory_enforcer"
+        ):
+            _make_enforcer(mock_engine_pool, tier="balanced")
+        assert not any(
+            "Custom ceiling" in r.message for r in caplog.records
+        )
