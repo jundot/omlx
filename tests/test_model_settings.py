@@ -819,7 +819,6 @@ class TestStreamingIoFields:
         assert s.expert_streaming_coalesce is None
         assert s.expert_streaming_readahead is None
         assert s.expert_streaming_seed is None
-        assert s.expert_streaming_pilot is None
 
     def test_roundtrip_through_dict(self, tmp_path):
         s = ModelSettings(
@@ -827,7 +826,6 @@ class TestStreamingIoFields:
             expert_streaming_coalesce=False,
             expert_streaming_readahead=True,
             expert_streaming_seed=False,
-            expert_streaming_pilot=True,
         )
         d = s.to_dict()
         assert d["expert_streaming_io_depth"] == 8
@@ -837,7 +835,6 @@ class TestStreamingIoFields:
         assert r.expert_streaming_coalesce is False
         assert r.expert_streaming_readahead is True
         assert r.expert_streaming_seed is False
-        assert r.expert_streaming_pilot is True
 
     def test_none_values_dropped_from_dict(self):
         d = ModelSettings().to_dict()
@@ -846,7 +843,6 @@ class TestStreamingIoFields:
             "expert_streaming_coalesce",
             "expert_streaming_readahead",
             "expert_streaming_seed",
-            "expert_streaming_pilot",
         ):
             assert field not in d
 

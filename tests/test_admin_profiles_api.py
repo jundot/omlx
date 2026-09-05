@@ -1026,7 +1026,6 @@ class TestStreamingIoSettings:
                 "expert_streaming_coalesce": False,
                 "expert_streaming_readahead": False,
                 "expert_streaming_seed": False,
-                "expert_streaming_pilot": True,
             },
         )
         assert r.status_code == 200, r.text
@@ -1035,7 +1034,6 @@ class TestStreamingIoSettings:
         assert s.expert_streaming_coalesce is False
         assert s.expert_streaming_readahead is False
         assert s.expert_streaming_seed is False
-        assert s.expert_streaming_pilot is True
 
     def test_put_streaming_io_depth_validation(self, client):
         c, _ = client
@@ -1055,7 +1053,6 @@ class TestStreamingIoSettings:
         assert s.expert_streaming_coalesce is None
         assert s.expert_streaming_readahead is None
         assert s.expert_streaming_seed is None
-        assert s.expert_streaming_pilot is None
 
     def test_streaming_io_fields_excluded_from_profiles(self):
         from omlx.model_profiles import EXCLUDED_FROM_PROFILES
@@ -1065,6 +1062,5 @@ class TestStreamingIoSettings:
             "expert_streaming_coalesce",
             "expert_streaming_readahead",
             "expert_streaming_seed",
-            "expert_streaming_pilot",
         ):
             assert field in EXCLUDED_FROM_PROFILES

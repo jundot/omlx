@@ -125,12 +125,11 @@ class TestDepthPruning:
 
 class TestKnobs:
     def test_env_mapping(self):
-        env = at.Knobs(io_depth=32, coalesce=False, readahead=False, seed=True, pilot=True).env()
+        env = at.Knobs(io_depth=32, coalesce=False, readahead=False, seed=True).env()
         assert env["OMLX_EXPERT_STREAMING_QD"] == "32"
         assert env["OMLX_EXPERT_STREAMING_COALESCE"] == "0"
         assert env["OMLX_EXPERT_STREAMING_RA"] == "0"
         assert env["OMLX_EXPERT_STREAMING_SEED"] == "1"
-        assert env["OMLX_EXPERT_STREAMING_PILOT"] == "1"
         assert env["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "0.0"
         assert at.Knobs(prior=2.0).env()["OMLX_EXPERT_STREAMING_CACHE_PRIOR"] == "2.0"
 
@@ -143,10 +142,10 @@ class TestKnobs:
 
     def test_label_is_stable_and_filesystem_safe(self):
         label = at.Knobs(budget_gib=4.0, topk=0.85).label()
-        assert label == "b4_qd16_c1_ra1_s1_p0_tk0.85"
+        assert label == "b4_qd16_c1_ra1_s1_tk0.85"
 
     def test_prior_knob_label_profile_and_screen(self):
-        assert at.Knobs(prior=1.0).label() == "b0_qd16_c1_ra1_s1_p0_cp1"
+        assert at.Knobs(prior=1.0).label() == "b0_qd16_c1_ra1_s1_cp1"
         kw = at.Knobs(prior=1.0).profile_kwargs()
         s = ModelSettings(**kw)
         assert s.expert_streaming_cache_prior == 1.0
@@ -226,13 +225,13 @@ class TestScreenCandidates:
         cands = at.screen_candidates(
             base, budgets=[0.0, 2.0, 4.0], depths=[8, 16, 32], sweep_topk=False
         )
-        # budget 2 alternatives + qd 2 + pilot 1 + coalesce 1 + ra 1 + seed 1
-        assert len(cands) == 8
+        # budget 2 alternatives + qd 2 + coalesce 1 + ra 1 + seed 1
+        assert len(cands) == 7
         for _knob, cfg in cands:
             # every candidate differs from base in exactly one knob
             diffs = [
                 field
-                for field in ("budget_gib", "io_depth", "coalesce", "readahead", "seed", "pilot")
+                for field in ("budget_gib", "io_depth", "coalesce", "readahead", "seed")
                 if getattr(cfg, field) != getattr(base, field)
             ]
             assert len(diffs) == 1
@@ -314,14 +313,13 @@ class TestApplyToProfile:
 
         monkeypatch.setattr(omlx_settings, "resolve_default_base_path", lambda: tmp_path)
         written = at.apply_to_profile(
-            "moe-model", at.Knobs(budget_gib=4.0, io_depth=8, pilot=True)
+            "moe-model", at.Knobs(budget_gib=4.0, io_depth=8)
         )
         assert written == tmp_path / "model_settings.json"
         mgr = __import__("omlx.model_settings", fromlist=["ModelSettingsManager"]).ModelSettingsManager(tmp_path)
         s = mgr.get_settings("moe-model")
         assert s.expert_streaming_budget_gib == 4.0
         assert s.expert_streaming_io_depth == 8
-        assert s.expert_streaming_pilot is True
         # untouched fields keep defaults
         assert s.expert_streaming_enabled is False
 
@@ -350,7 +348,7 @@ class TestBuildRecommendation:
         )
         assert rec["objective"] == "balanced"
         assert rec["winner"]["expert_streaming_budget_gib"] == 2.0
-        assert rec["winner"]["label"] == "b2_qd16_c1_ra1_s1_p0"
+        assert rec["winner"]["label"] == "b2_qd16_c1_ra1_s1"
         assert rec["applied_to_profile"] is True
         assert rec["machine"]["metal_cap_gib"] == 36.0
         assert rec["notes"] == ["n1"]

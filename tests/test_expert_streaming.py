@@ -663,64 +663,6 @@ def test_cache_slots_reconciled_for_fused_layout():
             assert naive.capacity > cache.capacity  # ...but promises 1.5x more slots
 
 
-def test_pilot_staging_equivalence_and_fused_wiring():
-    """P1: staged bundles equal sync loads; fused projs are wired."""
-    import numpy as np
-
-    from omlx.patches.expert_streaming.prefetch import ExpertPrefetcher
-    from omlx.patches.expert_streaming.streaming_switch import (
-        ExpertLRUCache,
-        StreamingQuantizedSwitchLinear,
-    )
-
-    class _FakeBacking:
-        def load_expert_slice(self, key, eid):
-            return np.full((4,), float(eid), dtype=np.float32)
-
-    backing = _FakeBacking()
-    cache = ExpertLRUCache(0, 1, num_layers=1)  # page-cache-only: staging only
-    pf = ExpertPrefetcher(cache, workers=1)
-    pf.start()
-    try:
-        lin = StreamingQuantizedSwitchLinear(
-            layer_idx=0,
-            proj_name="gate_up_proj",
-            stacked_weight_key="w",
-            stacked_scales_key="s",
-            stacked_biases_key=None,
-            num_experts=8,
-            input_dims=16,
-            output_dims=32,
-            backing=backing,
-            cache=cache,
-        )
-        lin._prefetcher = pf  # wiring path under test (fused proj included)
-        assert hasattr(lin, "_load_expert_np")
-        pf.submit(lin, [3, 5])
-        deadline = __import__("time").time() + 10.0
-        got = None
-        while __import__("time").time() < deadline:
-            got = pf.take(lin.bundle_key(3))
-            if got is not None:
-                break
-            __import__("time").sleep(0.02)
-        assert got is not None
-        assert float(np.asarray(got[0]).ravel()[0]) == 3.0
-        # direct load matches staged bytes
-        direct = lin._load_expert_np(5)
-        deadline = __import__("time").time() + 10.0
-        staged5 = None
-        while __import__("time").time() < deadline:
-            staged5 = pf.take(lin.bundle_key(5))
-            if staged5 is not None:
-                break
-            __import__("time").sleep(0.02)
-        assert staged5 is not None
-        assert np.array_equal(np.asarray(staged5[0]), np.asarray(direct[0]))
-    finally:
-        pf.stop()
-
-
 def test_transition_table_predicts_and_overfetches():
     """FU1: temporal transitions accumulate (EWMA) and predict_next
     returns the top candidate excluding the demand set."""
@@ -745,29 +687,6 @@ def test_transition_table_predicts_and_overfetches():
     st2.record_prev(0, [0])
     st2.record_prev(0, list(range(20)))
     assert len(st2.trans.get((0, 0), {})) <= 8
-
-
-def test_stash_ring_fifo_bound_and_hits():
-    """Gap §7.3: the speculation stash ring is FIFO-bounded and hit-counted."""
-    from omlx.patches.expert_streaming.streaming_switch import (
-        _STASH_MAX_ENTRIES,
-        SpeculationState,
-    )
-
-    st = SpeculationState()
-    assert st.stash_get((0, 1, "w")) is None
-    assert st.stats["stash_misses"] == 0  # get is pure; misses counted by caller
-    for eid in range(_STASH_MAX_ENTRIES + 10):
-        assert st.stash_insert((0, eid, "w"), ("w", "s", None)) is True
-    assert len(st.stash) <= _STASH_MAX_ENTRIES
-    assert st.stats["stash_evictions"] >= 10
-    # Fresh insert hits; evicted old entry misses.
-    assert st.stash_get((0, _STASH_MAX_ENTRIES + 9, "w")) is not None
-    assert st.stats["stash_hits"] == 1
-    assert st.stash_get((0, 0, "w")) is None
-    # Closed state refuses inserts.
-    st.close()
-    assert st.stash_insert((0, 999, "w"), ("w", "s", None)) is False
 
 
 def test_layer_context_rolling_union_equivalence():
@@ -962,7 +881,7 @@ def test_s3fifo_cache_equivalence_and_scan_resistance():
 
 
 def test_expert_streaming_summary_aggregates_counters():
-    """P1: the one-line summary reflects LRU + prefetch + stash + fallbacks."""
+    """P1: the one-line summary reflects LRU + prefetch + fallbacks."""
     from omlx.patches.expert_streaming import expert_streaming_summary
     from omlx.patches.expert_streaming.streaming_switch import ExpertLRUCache
 
@@ -973,7 +892,7 @@ def test_expert_streaming_summary_aggregates_counters():
     cache._count_ctx_fallback("read_failure")
 
     class _Backing:
-        _expert_prefetcher = None
+        pass
 
     s = expert_streaming_summary(cache, _Backing())
     assert s["lru_hits"] == 1
@@ -996,55 +915,14 @@ def test_shutdown_expert_streaming_is_idempotent_and_safe():
 
     shutdown_expert_streaming(_Partial())
 
-    stopped = []
     closed = []
 
     class _Full:
-        class _Pref:
-            def stop(self):
-                stopped.append(True)
-
-        _expert_prefetcher = _Pref()
-
         def close(self):
             closed.append(True)
 
     shutdown_expert_streaming(_Full())
-    assert stopped == [True]
     assert closed == [True]
-
-
-def test_reload_does_not_leak_prefetch_threads():
-    """P0: PILOT threads are owned by the backing and stopped on shutdown."""
-    import threading
-
-    from omlx.patches.expert_streaming import shutdown_expert_streaming
-    from omlx.patches.expert_streaming.prefetch import ExpertPrefetcher
-
-    # Thread names repeat per prefetcher (expert-prefetch-{i}), so track
-    # thread identities, not names.
-    before = {t.ident for t in threading.enumerate()}
-    prefs = [ExpertPrefetcher(cache=None, workers=2) for _ in range(3)]
-    for p in prefs:
-        p.start()
-    assert all(w.is_alive() for p in prefs for w in p._workers)
-    for p in prefs:
-
-        class _Backing:
-            def close(self):
-                pass
-
-        b = _Backing()
-        b._expert_prefetcher = p  # type: ignore[attr-defined]
-        shutdown_expert_streaming(b)
-    for p in prefs:
-        for w in p._workers:
-            w.join(timeout=5.0)
-    leaked = [
-        t for t in threading.enumerate()
-        if t.ident not in before and t.is_alive() and (t.name or "").startswith("expert-prefetch-")
-    ]
-    assert not leaked
 
 
 def test_model_settings_round_trip():
@@ -2279,68 +2157,28 @@ def test_shard_bank_pin_expert_mlock():
         assert end - off == 8 * 16 * 2
 
 
-def test_page_cache_warmer_flow():
+def test_page_cache_warmer_prefill_guard():
+    """The readahead warmer records only decode-sized calls: a prefill-shaped
+    call (positions > _MAX_WARM_ROWS) stores an empty set so the next
+    token's advisory never fires a dense demand set."""
     from omlx.patches.expert_streaming import warmer
-    from omlx.patches.expert_streaming.shard_bank import ExpertBackingStore
-    from omlx.patches.expert_streaming.streaming_switch import (
-        ExpertLRUCache,
-        StreamingQuantizedSwitchLinear,
-    )
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        tensors = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.weight"] = ((4, 8, 16), "BF16")
-            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.scales"] = ((4, 8, 1), "U32")
-            tensors[f"model.layers.0.mlp.switch_mlp.{proj}.biases"] = ((4, 8, 1), "U32")
-        tensors["model.layers.1.mlp.switch_mlp.gate_proj.weight"] = ((4, 8, 16), "BF16")
-        tensors["model.layers.1.mlp.switch_mlp.gate_proj.scales"] = ((4, 8, 1), "U32")
-        tensors["model.layers.1.mlp.switch_mlp.gate_proj.biases"] = ((4, 8, 1), "U32")
-        _write_shard(tmp / "model.safetensors", tensors)
-        wm = {k: "model.safetensors" for k in tensors}
-        (tmp / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
-
-        backing = ExpertBackingStore(tmp)
-        cache = ExpertLRUCache(0, 1 << 12, num_layers=2)
-
-        def mk_lin(layer, proj):
-            return StreamingQuantizedSwitchLinear(
-                layer_idx=layer,
-                proj_name=proj,
-                stacked_weight_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.weight",
-                stacked_scales_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.scales",
-                stacked_biases_key=f"model.layers.{layer}.mlp.switch_mlp.{proj}.biases",
-                num_experts=4,
-                input_dims=16,
-                output_dims=8,
-                backing=backing,
-                cache=cache,
-            )
-
-        linears = {0: [mk_lin(0, p) for p in ("gate_proj", "up_proj", "down_proj")]}
-        linears[1] = [mk_lin(1, "gate_proj")]
-        w = warmer.PageCacheWarmer(linears)
-        hook = warmer.WarmPinHook(w, None)
-        # token 1: layer 0 records its set; layer 1 records its own
-        hook.on_layer_start(0, 8)
-        hook.on_layer_plan(0, [1, 2, 3], 8)
-        hook.on_layer_start(1, 8)
-        hook.on_layer_plan(1, [2], 8)
-        # token 2: layer 0 fires warm for layer 1's token-1 set
-        hook.on_layer_start(0, 8)
-        hook.on_layer_plan(0, [0, 1], 8)
-        # warm pool is async; give it a moment and confirm no crash + reads done
-        import time
-
-        deadline = time.time() + 5
-        while time.time() < deadline and w.warmed == 0:
-            time.sleep(0.05)
-        assert w.warmed > 0
-        # big-prefetch guard: positions > _MAX_WARM_ROWS records empty
-        hook.on_layer_start(0, 4096)
-        hook.on_layer_plan(0, [0, 1, 2, 3], 4096)
-        assert w.last_uniq[0] == []
+    w = warmer.PageCacheWarmer({0: [], 1: []})
+    hook = warmer.WarmPinHook(w, None)
+    # token 1: layer 0 records its decode set; layer 1 records its own
+    hook.on_layer_start(0, 8)
+    hook.on_layer_plan(0, [1, 2, 3], 8)
+    hook.on_layer_start(1, 8)
+    hook.on_layer_plan(1, [2], 8)
+    assert w.last_uniq[0] == [1, 2, 3]
+    assert w.last_uniq[1] == [2]
+    # token 2: layer 0 fires the advisory for layer 1's token-1 set — no
+    # crash even without a backing (submission is dropped inside _submit).
+    hook.on_layer_start(0, 8)
+    # big-prefetch guard: positions > _MAX_WARM_ROWS records empty
+    hook.on_layer_start(0, 4096)
+    hook.on_layer_plan(0, [0, 1, 2, 3], 4096)
+    assert w.last_uniq[0] == []
 
 
 def _ra_warmer_setup(budget_bytes: int = 0):
@@ -2397,7 +2235,7 @@ def test_readahead_warmer_advises_contiguous_runs():
     tmp, warmer, backing, linears = _ra_warmer_setup()
     try:
         advised = []
-        w = warmer.PageCacheWarmer(linears, advise_only=True)
+        w = warmer.PageCacheWarmer(linears)
         hook = warmer.WarmPinHook(w, None)
         hook.on_layer_plan(1, [2], 8)
         hook.on_layer_plan(0, [1, 2, 3], 8)
@@ -2420,7 +2258,6 @@ def test_readahead_warmer_advises_contiguous_runs():
         # ids [2] -> single (2, 1) run per key.
         assert all(count == 1 and first == 2 for _, first, count in advised)
         assert all("model.layers.1." in key for key, _, _ in advised)
-        assert w.warmed == 0  # advise-only: no reads
         assert w.advised == len(advised)
     finally:
         backing.close()
@@ -2693,9 +2530,10 @@ def test_admission_floor_scales_down_for_streaming_chunks():
     model._expert_streaming_backing = back
     sched = _guard_scheduler(model)
     tracker = PrefillTransientTracker()
-    tracker.update(1897, int(17_385_500))  # measured 17.4MB/token at 1.9k chunk
-    tracker._observed_max_bytes = float(1897 * 17_385_500)  # ~32GB
-    tracker._last_n_tokens = 1897
+    # Seed the dense history directly: update() only feeds observed_max from
+    # floor-size samples (see PrefillTransientTracker.update).
+    tracker._dense_history.observed_max_bytes = float(1897 * 17_385_500)  # ~32GB
+    tracker._dense_history.last_n_tokens = 1897
     sched._prefill_transient_tracker = tracker
 
     n_small = 512
@@ -2719,9 +2557,10 @@ def test_admission_floor_kept_without_streaming():
     sched = _guard_scheduler(MagicMock())
     del sched.model._expert_streaming_backing
     tracker = PrefillTransientTracker()
-    tracker.update(1897, int(17_385_500))
-    tracker._observed_max_bytes = 32.0 * 1024**3
-    tracker._last_n_tokens = 1897
+    # Seed the dense history directly (update() only feeds observed_max
+    # from floor-size samples).
+    tracker._dense_history.observed_max_bytes = 32.0 * 1024**3
+    tracker._dense_history.last_n_tokens = 1897
     sched._prefill_transient_tracker = tracker
 
     bound = Scheduler._admission_transient_bound(sched, 512, 0)
@@ -2745,7 +2584,6 @@ def test_io_overrides_resolution_and_clamping():
         "expert_streaming_coalesce": None,
         "expert_streaming_readahead": None,
         "expert_streaming_seed": None,
-        "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
         "expert_streaming_pins": None,
         "expert_streaming_hot_fraction": None,
@@ -2765,7 +2603,6 @@ def test_io_overrides_resolution_and_clamping():
             expert_streaming_coalesce=False,
             expert_streaming_readahead=False,
             expert_streaming_seed=False,
-            expert_streaming_pilot=True,
             expert_streaming_per_layer_eval=False,
             expert_streaming_pins=True,
             expert_streaming_pin_gib=3.0,
@@ -2778,7 +2615,6 @@ def test_io_overrides_resolution_and_clamping():
     assert ov["expert_streaming_coalesce"] is False
     assert ov["expert_streaming_readahead"] is False
     assert ov["expert_streaming_seed"] is False
-    assert ov["expert_streaming_pilot"] is True
     assert ov["expert_streaming_per_layer_eval"] is False
     assert ov["expert_streaming_pins"] is True
     assert ov["expert_streaming_pin_gib"] == 3.0
@@ -3503,12 +3339,12 @@ def test_hot_set_loader_real_denominator():
 
 
 # ---------------------------------------------------------------------------
-# Fase K F1/F2/F3 — O2 advisor key fix, speculation guard, stash ring
+# Fase K F1/F2 — O2 advisor key fix, speculation guard
 # ---------------------------------------------------------------------------
 
 class _AdviseRecorderBacking:
     """Backing double for the O2 advisor: records advise_expert_run calls
-    and serves fake runs/slices for the stash ring."""
+    and serves fake runs/slices."""
 
     def __init__(self, per_expert_bytes: int = 64, num_experts: int = 64):
         self.advised: list[tuple[str, int, int]] = []
@@ -3602,7 +3438,7 @@ class TestFaseKO2Advisor:
         lin1_down = _make_advise_linear(1, "down_proj", backing, cache)
         spec.register_linears(1, [lin1_up, lin1_down])
         spec.prev_uniq_by_layer[1] = [3, 4, 9]
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
+        with patch.object(ss, "_RA_ENV", True):
             plan = ss._RemapPlan()
             lin0._advise_next_layer_prev_token(plan)
         keys = {k for k, _, _ in backing.advised}
@@ -3652,279 +3488,6 @@ class TestFaseKO2Advisor:
             lin0._advise_next_layer_prev_token(plan)
             lin0._advise_next_layer_prev_token(plan)
         assert len(backing.advised) == 1, f"expected 1 run, got {backing.advised}"
-
-
-class TestFaseKO2StashRing:
-    def test_stash_populate_serves_demand(self):
-        """Fase K F3: speculated runs land in the ring under tier-aware
-        bundle keys and a later demand get() hits them."""
-        import time
-
-        import numpy as np
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec = _attach_spec(cache)
-        backing = _AdviseRecorderBacking()
-        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
-        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        spec.register_linears(1, [lin1])
-        spec.prev_uniq_by_layer[1] = [3, 4]
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            plan = ss._RemapPlan()
-            lin0._advise_next_layer_prev_token(plan)
-            deadline = time.time() + 5.0
-            while spec.stats["stash_inserts"] < 2 and time.time() < deadline:
-                time.sleep(0.02)
-        assert spec.stats["stash_inserts"] == 2, "stash reads must land"
-        for eid in (3, 4):
-            key = lin1.bundle_key(eid)
-            assert key in spec.stash, f"stash missing {key}"
-            w, s, b = spec.stash[key]
-            assert w.shape == (64,)
-        # A demand get() against the LRU resolution path must hit the ring.
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            got = lin1._bundle_cached_or_staged(3)
-        assert got is not None and got[0].shape == (64,)
-        # FIFO ring: inserting beyond _STASH_MAX_ENTRIES evicts the oldest.
-        for eid in range(10, 10 + ss._STASH_MAX_ENTRIES):
-            key = (1, eid, lin1.stacked_weight_key)
-            spec.stash_insert(key, (np.zeros(4, np.uint8), None, None))
-        assert len(spec.stash) <= ss._STASH_MAX_ENTRIES
-        # Dedupe: re-inserting an existing key is a no-op that never evicts.
-        existing = list(spec.stash_order)[0]
-        before = len(spec.stash)
-        assert spec.stash_insert(existing, (np.zeros(4, np.uint8), None, None)) is False
-        assert len(spec.stash) == before
-
-
-    def test_stash_sparse_ids_exact_keys(self):
-        """Fase K K2: sparse speculation reads EXACT keys — [3,5,9] must
-        never read or store experts 4, 6, 7, 8 (reader-only segmentation
-        produced (3,2) jobs that spanned the hole and stored the wrong
-        experts)."""
-        import time
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec = _attach_spec(cache)
-        backing = _AdviseRecorderBacking()
-        lin = _make_advise_linear(1, "up_proj", backing, cache)
-        spec.register_linears(1, [lin])
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            lin._stash_populate([3, 5, 9])
-        deadline = time.time() + 5.0
-        while spec.stats["stash_inserts"] < 3 and time.time() < deadline:
-            time.sleep(0.02)
-        assert spec.stats["stash_inserts"] == 3, "all three targets must land"
-        assert spec.stats["stash_targets"] == 3
-        assert spec.stats["stash_inserts"] <= spec.stats["stash_targets"], "coverage"
-        for eid in (3, 5, 9):
-            assert lin.bundle_key(eid) in spec.stash, f"missing {eid}"
-        for eid in (4, 6, 7, 8):
-            assert lin.bundle_key(eid) not in spec.stash, f"hole {eid} stored!"
-        # The reads themselves were single-expert runs (no 3,4 span).
-        assert (lin.stacked_weight_key, 3, 1) in backing.read_runs, "run (3,1) expected"
-        assert not any(run[1:] == (3, 2) for run in backing.read_runs), "no span (3,2)"
-
-    def test_stash_off_by_default_no_stash_reads(self):
-        """Fase K F3: STASH=0 (default) issues advisory hints only."""
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec = _attach_spec(cache)
-        backing = _AdviseRecorderBacking()
-        lin0 = _make_advise_linear(0, "gate_proj", backing, cache)
-        lin1 = _make_advise_linear(1, "up_proj", backing, cache)
-        spec.register_linears(1, [lin1])
-        spec.prev_uniq_by_layer[1] = [3, 4]
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", False):
-            plan = ss._RemapPlan()
-            lin0._advise_next_layer_prev_token(plan)
-        assert backing.read_runs == [], "stash disabled: no speculative reads"
-        assert len(backing.advised) == 1, "F_RDADVISE still fires"
-
-
-class TestFaseKSpecStateLifecycle:
-    """Fase K corrections K1/K7: per-conversion isolation and drain."""
-
-    def test_stash_isolated_per_backing(self):
-        """K1: two conversions with the same keys never share ring bytes."""
-        import time
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        def build() -> tuple:
-            cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-            spec = _attach_spec(cache)
-            backing = _AdviseRecorderBacking()
-            lin = _make_advise_linear(1, "up_proj", backing, cache)
-            spec.register_linears(1, [lin])
-            return cache, backing, spec, lin
-
-        ca, ba, sa, la = build()
-        cb, bb, sb, lb = build()
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            la._stash_populate([3])
-        deadline = time.time() + 5.0
-        while sa.stats["stash_inserts"] < 1 and time.time() < deadline:
-            time.sleep(0.02)
-        assert sa.stats["stash_inserts"] == 1, "A's speculation must land"
-        key = la.bundle_key(3)
-        assert key in sa.stash
-        # B's ring never saw A's bytes; its stats are untouched.
-        assert sb.stats["stash_inserts"] == 0
-        assert lb.bundle_key(3) not in sb.stash
-        # Closing A drains and clears the ring; a closed state accepts nothing.
-        sa.close()
-        assert sa.stash == {} and sa.stash_order == []
-        assert sa.is_closed()
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            assert la._spec_state() is sa
-            la._stash_populate([5])  # closed: silently dropped
-        assert sa.stats["stash_inserts"] == 1, "no inserts after close"
-        # B keeps working independently after A closed.
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            lb._stash_populate([7])
-        deadline = time.time() + 5.0
-        while sb.stats["stash_inserts"] < 1 and time.time() < deadline:
-            time.sleep(0.02)
-        assert sb.stats["stash_inserts"] == 1
-
-    def test_stash_close_drains_inflight_reads(self):
-        """K1: close() during in-flight speculation accepts no late writes."""
-        import time
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        class _SlowBacking(_AdviseRecorderBacking):
-            def load_expert_run(self, key, first_id, count):
-                time.sleep(0.05)
-                return super().load_expert_run(key, first_id, count)
-
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec = _attach_spec(cache)
-        backing = _SlowBacking()
-        lin = _make_advise_linear(1, "up_proj", backing, cache)
-        spec.register_linears(1, [lin])
-        stock = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            lin._stash_populate(stock)
-        deadline = time.time() + 5.0
-        while spec.pending and time.time() < deadline:
-            time.sleep(0.01)
-        assert spec.stats["stash_inserts"] > 0, "reads started before close"
-        with patch.object(ss, "_RA_ENV", True), patch.object(ss, "_STASH_ENV", True):
-            lin._stash_populate([13, 14, 15])
-        before = spec.stats["stash_inserts"]
-        spec.close()
-        deadline = time.time() + 5.0
-        while backing.read_runs and time.time() < deadline:
-            time.sleep(0.02)
-        time.sleep(0.3)  # let any straggler worker finish its disk read
-        assert spec.stash == {}, "close must leave the ring empty"
-        assert spec.stats["stash_inserts"] == before, "no inserts after close"
-        with spec.lock:
-            assert spec.pending == set(), "pending futures dropped on close"
-
-    def test_stash_concurrent_writers_keep_invariants(self):
-        """K7: N threads over overlapping keys keep the ring consistent.
-
-        Invariants: bounded size, FIFO without duplicates, locked stats,
-        bounded pending queue, zero exceptions even under a submit storm.
-        """
-        import time
-
-        import numpy as np
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        spec = ss.SpeculationState()
-        errors: list = []
-
-        def writer(offset: int):
-            try:
-                for i in range(400):
-                    key = (1, (offset + i * 37) % 300, "k")
-                    spec.stash_insert(key, (np.zeros(1, np.uint8), None, None))
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=writer, args=(o,)) for o in range(8)]
-        for th in threads:
-            th.start()
-        for th in threads:
-            th.join()
-        assert not errors, f"writer exceptions: {errors}"
-        assert len(spec.stash) <= ss._STASH_MAX_ENTRIES
-        assert len(spec.stash_order) == len(set(spec.stash_order)), "FIFO has dups"
-        inserts = spec.stats["stash_inserts"]
-        evictions = spec.stats["stash_evictions"]
-        assert inserts == len(spec.stash) + evictions, "stats must reconcile"
-        # Pending cap: a storm of slow reads is dropped, never unbounded.
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec2 = _attach_spec(cache)
-        accepted = 0
-        for _ in range(ss._STASH_MAX_PENDING + 200):
-            if spec2.submit(lambda: time.sleep(0.001)):
-                accepted += 1
-        with spec2.lock:
-            assert len(spec2.pending) <= ss._STASH_MAX_PENDING
-            assert spec2._pending_reserved == 0, "no leaked reservations"
-        assert accepted <= ss._STASH_MAX_PENDING + 200
-        spec2.close()
-        with spec2.lock:
-            assert spec2.pending == set()
-            assert spec2._pending_reserved == 0
-    def test_pending_converges_after_worker_and_pool_failure(self):
-        """Fase L6A: reservations and pending converge after a raising
-        worker and after an executor that rejects the submission itself."""
-        import time
-
-        from omlx.patches.expert_streaming import streaming_switch as ss
-
-        class _DeadPool:
-            def submit(self, fn):
-                raise RuntimeError("pool dead")
-
-        # Worker exception: the future completes exceptionally, the done
-        # callback discards it; pending and reservations converge without
-        # close().
-        cache = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec = _attach_spec(cache)
-
-        def _boom():
-            raise RuntimeError("spec worker failed")
-
-        for _ in range(4):
-            assert spec.submit(_boom)
-        deadline = time.time() + 5.0
-        while spec.pending and time.time() < deadline:
-            time.sleep(0.01)
-        with spec.lock:
-            assert spec.pending == set(), "worker failure must drain pending"
-            assert spec._pending_reserved == 0
-        spec.close()
-        with spec.lock:
-            assert spec.pending == set() and spec._pending_reserved == 0
-
-        # Executor hand-off failure: submit() itself raises, the atomic
-        # reservation must be released on that path.
-        cache2 = ss.ExpertLRUCache(0, 4096, num_layers=2)
-        spec2 = _attach_spec(cache2)
-        old_pool = ss._EXPERT_IO_POOL
-        try:
-            ss._EXPERT_IO_POOL = _DeadPool()
-            assert spec2.submit(lambda: None) is False
-            with spec2.lock:
-                assert spec2._pending_reserved == 0, "executor failure leaked a slot"
-                assert spec2.pending == set()
-        finally:
-            ss._EXPERT_IO_POOL = old_pool
-        spec2.close()
-
 
 
 class TestFaseKAdmissionFilter:
@@ -5985,8 +5548,6 @@ class TestFaseL2RegimePins:
     def test_pin_regime_selects_prefill_hot_set(self, tmp_path):
         """Arm E: the PREfill regime drives the pin selection — the pinner
         wires the prefill-learned experts, not the decode ones."""
-        from collections import Counter
-
         from omlx.patches.expert_streaming import warmer as warmer_mod
 
         linears = {0: [self._lin(0, "gate_proj"), self._lin(0, "down_proj")]}
@@ -6227,7 +5788,6 @@ class TestFaseA2EffectiveConfigGate:
             "prefill_qd": 0,
             "run_merge_gap": 0,
             "ra_enabled": True,
-            "stash_enabled": False,
             "pins_enabled": False,
             "profile_enabled": False,
             "memtrace_enabled": False,
@@ -6745,143 +6305,3 @@ class TestCachePrior:
         assert apply_cache_prior_to_logits(logits, {1}, 0.0) is logits
         assert apply_cache_prior_to_logits(logits, set(), 3.0) is logits
         assert apply_cache_prior_to_logits(logits, {99}, 3.0) is logits
-
-
-
-def test_slot_bank_bit_exact_and_multitoken_invariant(monkeypatch):
-    """Slot-bank spike (docs/spike-slot-bank.md).
-
-    1. Bit-exactness: with the arena enabled, outputs equal the legacy
-       path for identical inputs (single- and multi-position calls).
-    2. #27861 invariant: a multi-position batch whose positions route to
-       DISJOINT expert sets must never alias two uncached experts to one
-       slot — outputs equal the per-position reference.
-    3. Counters: full-hit calls take the fast path (stack=0 evidence is
-       in the profile: load=stack=0 on the second identical call).
-    """
-    import mlx.core as mx
-    import numpy as np
-
-    import omlx.patches.expert_streaming.streaming_switch as ss
-    monkeypatch.setattr(ss, "_SLOT_BANK_ENV", True)
-    monkeypatch.setattr(ss, "_SLOT_BANK_SLOTS", 8)
-    monkeypatch.setattr(ss, "_SLOT_BANK_MAX_POSITIONS", 64)
-
-    E, D_in, D_out = 8, 64, 32
-    mx.random.seed(3)
-    dense = mx.random.normal((E, D_out, D_in))
-    w4, s4, b4 = mx.quantize(dense, group_size=32, bits=4)
-
-    class _RP:
-        def __init__(self, shape):
-            self.per_shape = tuple(shape)
-
-    class _Reader:
-        def __init__(self, shapes):
-            self._shapes = shapes
-
-        def _rp_for(self, key):
-            return _RP(self._shapes[key])
-
-    class _ReaderBacking:
-        """Dict backing WITH the reader protocol the slot arena needs.
-
-        mx.quantize returns (w, s, b) as separate arrays — store each
-        component per stacked key, exactly like a real backing reader.
-        """
-
-        def __init__(self):
-            self.bank = {
-                "k.down_proj.weight": w4,
-                "k.down_proj.scales": s4,
-                "k.down_proj.biases": b4,
-            }
-            self.shapes = {
-                "k.down_proj.weight": tuple(w4.shape[1:]),
-                "k.down_proj.scales": tuple(s4.shape[1:]),
-                "k.down_proj.biases": tuple(b4.shape[1:]),
-            }
-            self.dtypes = {
-                "k.down_proj.weight": w4.dtype,
-                "k.down_proj.scales": s4.dtype,
-                "k.down_proj.biases": b4.dtype,
-            }
-
-        def _reader_for_key(self, key, expert_id=None):
-            return _Reader(self.shapes)
-
-        def load_expert(self, key, expert_id):
-            return self.bank[key][int(expert_id)]
-
-    def _make():
-        return ss.StreamingQuantizedSwitchLinear(
-            layer_idx=0,
-            proj_name="down_proj",
-            stacked_weight_key="k.down_proj.weight",
-            stacked_scales_key="k.down_proj.scales",
-            stacked_biases_key="k.down_proj.biases",
-            num_experts=E,
-            input_dims=D_in,
-            output_dims=D_out,
-            backing=_ReaderBacking(),
-            cache=ss.ExpertLRUCache(1 << 26, 1 << 18, num_layers=1),
-            group_size=32,
-            bits=4,
-            mode="affine",
-        )
-
-    rng = np.random.default_rng(11)
-    # --- 1: single-position calls, bit-exact vs arena-off twin ---
-    lin_on = _make()
-    lin_off = _make()
-    for trial in range(3):
-        T = 4 if trial < 2 else 40
-        x = mx.array(rng.standard_normal((T, 1, D_in)).astype(np.float32))
-        idx = mx.array(rng.integers(0, E, size=T).astype(np.int32))
-        out_ref = lin_off(x, idx)
-        out_on = lin_on(x, idx)
-        assert out_on.shape == out_ref.shape
-        assert mx.array_equal(out_ref, out_on), f"trial {trial} mismatch"
-
-    # --- 2: #27861 invariant: disjoint expert sets across positions ---
-    # 8 experts, 8 slots: positions alternate between two disjoint halves.
-    # After the first call populates slots, a second call with the OTHER
-    # half must still be exact (evictions + inserts under load).
-    x2 = mx.array(rng.standard_normal((8, 1, D_in)).astype(np.float32))
-    idx_a = mx.array([0, 2, 4, 6, 0, 2, 4, 6], dtype=mx.int32)  # even
-    idx_b = mx.array([1, 3, 5, 7, 1, 3, 5, 7], dtype=mx.int32)  # odd
-    lin_i = _make()
-    out_a1 = lin_i(x2, idx_a)
-    out_b = lin_i(x2, idx_b)  # disjoint: all misses, evictions happen
-    out_a2 = lin_i(x2, idx_a)  # evicted even set must reload exactly
-    ref_a = lin_off(x2, idx_a)
-    ref_b = lin_off(x2, idx_b)
-    assert mx.array_equal(out_a1, ref_a)
-    assert mx.array_equal(out_b, ref_b)
-    assert mx.array_equal(out_a2, ref_a)
-
-    # --- 3: repeated-slot gather is exact (same expert twice in batch) ---
-    idx_r = mx.array([5, 5, 5, 5, 2, 2, 5, 2], dtype=mx.int32)
-    out_r = lin_i(x2, idx_r)
-    ref_r = lin_off(x2, idx_r)
-    assert mx.array_equal(out_r, ref_r)
-
-    # --- 4: fast-path counters: identical call twice -> full hit ---
-    # Use a demand set that FITS the 8 slots alongside what is resident
-    # (a 4-expert set): no eviction pressure, second call must be full-hit.
-    idx_fit = mx.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=mx.int32)
-    lin_f = _make()
-    lin_f(x2, idx_fit)
-    sb = lin_f._slot_bank()
-    assert sb is not None and sb.slots == 8
-    h0, m0 = sb.hits, sb.misses
-    lin_f(x2, idx_fit)
-    assert sb.misses == m0, "identical demand set should be a full hit"
-    assert sb.hits > h0
-
-    # --- 5: prefill-shaped call bypasses the arena ---
-    xp = mx.array(rng.standard_normal((100, 1, D_in)).astype(np.float32))
-    idx_p = mx.array(rng.integers(0, E, size=100).astype(np.int32))
-    out_p = lin_i(xp, idx_p)
-    ref_p = lin_off(xp, idx_p)
-    assert mx.array_equal(out_p, ref_p)

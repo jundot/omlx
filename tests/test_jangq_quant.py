@@ -49,8 +49,12 @@ def test_source_packing_prefers_module_values():
     assert _source_packing(src, 64, 8, "affine") == (64, 2, "affine")
 
 
-def test_source_packing_falls_back_to_layer_values():
-    assert _source_packing(SimpleNamespace(), 64, 4, "affine") == (64, 4, "affine")
+def test_source_packing_missing_attrs_fail_loudly():
+    """A projection without packing attrs must raise, never inherit silently."""
+    import pytest
+
+    with pytest.raises(ValueError, match="lacks 'group_size'"):
+        _source_packing(SimpleNamespace(), 64, 4, "affine")
 
 
 def _write_fake_model(tmp_path, *, with_quantization=False):

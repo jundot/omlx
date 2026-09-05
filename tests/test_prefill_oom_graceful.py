@@ -1068,6 +1068,7 @@ def _streaming_chunk_ns(events):
         "_note_streaming_release",
         "_clear_cache_if_pool_large",
         "_accrue_decode_debt",
+        "_qwen4_text_gathered_pricing",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     # Contended gate: decode-fairness would skip the tail clear.
