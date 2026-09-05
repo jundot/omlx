@@ -1560,6 +1560,8 @@ class SchedulerConfig:
     # charges the full prefill_step_size and prompts that would only fit
     # via throttled floor-size chunks are rejected upfront instead.
     prefill_speed_priority: bool = False
+    # Paged-cache block and prefill step for hybrid models; 0 = automatic.
+    hybrid_cache_block: int = 0
     # When True (default), prefill yields GPU time to running decodes:
     # prompts are force-chunked under contention, chunks are capped while
     # any engine decodes, and each chunk accrues a decode time debt repaid
@@ -2820,6 +2822,23 @@ class Scheduler:
             int(self.config.prefill_step_size or 0),
             self._qwen35_prefill_floor,
         )
+        configured_block = int(getattr(self.config, "hybrid_cache_block", 0) or 0)
+        if configured_block > 0:
+            # The panel's choice for hybrid models. Measured 05/09 on GLM-5.3
+            # oQ2e at 110k tokens: 1024 -> 181 tok/s (94 whole chunks, zero
+            # cuts) against 163 with 512; the chunk costs LESS above 16k of
+            # context (285-412 MB against ~1 GB below), so the memory argument
+            # that keeps the default at 7k does not hold at long context. The
+            # prefill step follows the block so chunk boundaries stay aligned
+            # with the paged cache whether or not the SSD cache is on.
+            self.config.prefill_step_size = configured_block
+            self.config.paged_cache_block_size = configured_block
+            logger.info(
+                "hybrid_cache_block=%s (settings): paged cache block_size and "
+                "prefill_step_size set to %s for the hybrid model",
+                configured_block, configured_block,
+            )
+            return
         if self.config.paged_cache_block_size >= target:
             return
 
