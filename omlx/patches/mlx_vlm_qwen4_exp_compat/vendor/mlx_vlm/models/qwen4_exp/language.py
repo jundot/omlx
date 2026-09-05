@@ -913,6 +913,18 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
+# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
+# verify rows only) so the GPU executes layer i while the host builds layer i+1.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
+_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_EAGER_DISPATCH_MAX_ROWS = 64
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
 
@@ -2494,6 +2506,12 @@ class Qwen4ExpModel(nn.Module):
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
+            if (
+                _EAGER_DISPATCH
+                and hidden_states.shape[0] * hidden_states.shape[1]
+                <= _EAGER_DISPATCH_MAX_ROWS
+            ):
+                mx.async_eval(hidden_states)
             if hidden_sink is not None and index in capture:
                 hidden_sink.append(
                     self.hyper_connection_mixer(
