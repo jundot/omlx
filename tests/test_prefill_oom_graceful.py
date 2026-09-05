@@ -945,6 +945,7 @@ def test_step_prefill_reclaims_before_first_guard():
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
+        _reserve_qsa_index_capacity=MagicMock(),
     )
     ns.running = {}
     ns._decode_fairness = True
