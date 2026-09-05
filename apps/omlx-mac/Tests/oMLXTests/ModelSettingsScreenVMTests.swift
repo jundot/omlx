@@ -368,6 +368,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
             virtual: nil,
+            sourceType: nil,
+            sourceRepoId: nil,
+            deletable: nil,
+            removalKind: nil,
+            sourceModelId: nil,
+            profileName: nil,
+            exposedProfiles: nil,
             settings: nil
         )
     }

@@ -1878,6 +1878,15 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+def _model_removal_kind(source_type: str | None) -> str | None:
+    """Return the destructive action supported by a catalog model source."""
+    if source_type == "hf_cache":
+        return "local_cache"
+    if source_type == "local":
+        return "local_model"
+    return None
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1943,6 +1952,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
+        source_type = model_info.get("source_type", "local")
+        removal_kind = _model_removal_kind(source_type)
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
@@ -2016,8 +2027,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_context_length": model_info.get("model_context_length"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
-            "source_type": model_info.get("source_type", "local"),
+            "source_type": source_type,
             "source_repo_id": model_info.get("source_repo_id"),
+            "virtual": False,
+            "deletable": removal_kind is not None,
+            "removal_kind": removal_kind,
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
@@ -2067,6 +2081,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "preserve_thinking_default": None,
                 "source_type": "builtin",
                 "source_repo_id": None,
+                "deletable": False,
+                "removal_kind": None,
                 "last_access": None,
                 "dflash_compatible": False,
                 "dflash_compatibility_reason": "",
@@ -6298,14 +6314,21 @@ async def delete_hf_model(
     model_name: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Delete a downloaded model from disk and refresh the model pool."""
+    """Delete a downloaded model or HF cache entry and refresh the model pool."""
     global_settings = _get_global_settings()
     engine_pool = _get_engine_pool()
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+    # The Models screen includes compatible entries discovered directly from
+    # the Hugging Face Hub cache. Search the same effective roots as discovery
+    # so every catalog model with a removal action resolves here.
+    model_dirs = list(global_settings.get_effective_model_dirs())
+    if not model_dirs:  # Defensive fallback for partial settings/test doubles.
+        model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    from ..model_discovery import _resolve_hf_cache_entry
 
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
@@ -6318,10 +6341,25 @@ async def delete_hf_model(
             model_path = candidate
             parent_model_dir = model_dir
             break
-        # Try two-level: search inside organization folders
+        # Try HF cache entries and two-level organization folders.
         for subdir in model_dir.iterdir():
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
+
+            hf_resolved = _resolve_hf_cache_entry(subdir)
+            if hf_resolved is not None:
+                if (
+                    hf_resolved.model_id == model_name
+                    and (hf_resolved.snapshot_path / "config.json").exists()
+                ):
+                    # A Hub repository cache entry owns its refs, snapshots,
+                    # and blobs as one unit. The confirmation UI explicitly
+                    # warns that removing it may affect other applications.
+                    model_path = subdir
+                    parent_model_dir = model_dir
+                    break
+                continue
+
             candidate = subdir / model_name
             if candidate.is_dir() and (candidate / "config.json").exists():
                 model_path = candidate

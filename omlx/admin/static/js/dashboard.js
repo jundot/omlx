@@ -573,13 +573,14 @@
             hfToken: '',
             hfDownloading: false,
             hfTasks: [],
-            hfModels: [],
-            hfModelsLoaded: false,
+            managerModels: [],
+            managerModelsLoaded: false,
+            managerError: '',
             hfError: '',
             hfSuccess: '',
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
-            hfDeleteConfirm: null,
+            managerRemoveConfirm: null,
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
@@ -918,7 +919,7 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
+                    const loads = [this.loadModels(), this.loadHFTasks(), this.loadOQTasks()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
@@ -6842,10 +6843,12 @@
             async loadModels() {
                 this.loadingModels = true;
                 try {
-                    const response = await fetch('/admin/api/models');
+                    const response = await fetch('/admin/api/models', { cache: 'no-store' });
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
+                        this.managerModels = this.managerModelsFromCatalog(this.models);
+                        this.managerModelsLoaded = true;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -6862,7 +6865,7 @@
                 try {
                     const response = await fetch('/admin/api/reload', { method: 'POST' });
                     if (response.ok) {
-                        await Promise.all([this.loadModels(), this.loadHFModels()]);
+                        await this.loadModels();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -10987,12 +10990,70 @@
                     && this.sortOrder === MODELS_SORT_DEFAULT.order;
             },
 
-            // ---- Manager (Browse Models > Local) filter + sort ----
+            // ---- Manager catalog filter + sort ----
 
-            // Cross-reference the richer /api/models entry (has model_type,
-            // settings) for a manager row keyed by its model name.
-            managerModelInfo(name) {
-                return this.models.find(m => m.id === name);
+            managerModelsFromCatalog(models) {
+                const rows = [];
+                for (const model of models || []) {
+                    rows.push({
+                        ...model,
+                        name: model.id,
+                        size: model.actual_size || model.estimated_size || 0,
+                        size_formatted: model.actual_size_formatted
+                            || model.estimated_size_formatted
+                            || '—',
+                    });
+
+                    for (const profile of model.exposed_profiles || []) {
+                        rows.push({
+                            ...model,
+                            id: profile.model_id,
+                            name: profile.model_id,
+                            display_name: profile.display_name || profile.model_id,
+                            loaded: false,
+                            is_loading: false,
+                            estimated_size: 0,
+                            estimated_size_formatted: '—',
+                            actual_size: 0,
+                            actual_size_formatted: null,
+                            size: 0,
+                            size_formatted: '—',
+                            pinned: false,
+                            is_default: false,
+                            is_favorite: false,
+                            is_hidden: false,
+                            virtual: false,
+                            deletable: true,
+                            removal_kind: 'profile',
+                            source_type: 'profile',
+                            source_model_id: model.id,
+                            profile_name: profile.name,
+                            exposed_profiles: [],
+                            settings: profile.settings || null,
+                        });
+                    }
+                }
+                return rows;
+            },
+
+            managerRemovalLabel(model) {
+                if (model.removal_kind === 'local_cache') {
+                    return window.t('models.manager.remove.local_cache');
+                }
+                if (model.removal_kind === 'profile') {
+                    return window.t('models.manager.remove.profile');
+                }
+                return window.t('models.manager.remove.local_model');
+            },
+
+            managerRemovalWarning(model) {
+                if (model.removal_kind === 'local_cache') {
+                    return window.t('models.manager.remove_warning.local_cache');
+                }
+                if (model.removal_kind === 'profile') {
+                    return window.t('models.manager.remove_warning.profile');
+                }
+                return window.t('models.manager.remove_warning.local_model');
             },
 
             filterModelsByName(list, query) {
@@ -11003,8 +11064,6 @@
                     const display = (m.display_name || '').toLowerCase();
                     const alias = (
                         (m.settings && m.settings.model_alias)
-                        || (this.managerModelInfo(m.name) && this.managerModelInfo(m.name).settings
-                            && this.managerModelInfo(m.name).settings.model_alias)
                         || ''
                     ).toLowerCase();
                     return id.includes(q) || display.includes(q) || alias.includes(q);
@@ -11012,22 +11071,22 @@
             },
 
             get sortedManagerModels() {
-                const list = this.filterModelsByName(this.hfModels, this.managerSearch);
+                const list = this.filterModelsByName(this.managerModels, this.managerSearch);
                 return [...list].sort((a, b) => {
                     // Favorites always sort first, regardless of the active column.
-                    const aFav = this.managerModelInfo(a.name)?.is_favorite ? 1 : 0;
-                    const bFav = this.managerModelInfo(b.name)?.is_favorite ? 1 : 0;
+                    const aFav = a.is_favorite ? 1 : 0;
+                    const bFav = b.is_favorite ? 1 : 0;
                     if (aFav !== bFav) return bFav - aFav;
 
                     let aVal, bVal;
                     switch (this.managerSortBy) {
                         case 'name':
-                            aVal = (a.display_name || a.name || '').toLowerCase();
-                            bVal = (b.display_name || b.name || '').toLowerCase();
+                            aVal = (a.display_name || a.id || '').toLowerCase();
+                            bVal = (b.display_name || b.id || '').toLowerCase();
                             break;
                         case 'type':
-                            aVal = (this.managerModelInfo(a.name)?.model_type || 'llm').toLowerCase();
-                            bVal = (this.managerModelInfo(b.name)?.model_type || 'llm').toLowerCase();
+                            aVal = (a.model_type || 'llm').toLowerCase();
+                            bVal = (b.model_type || 'llm').toLowerCase();
                             break;
                         case 'size':
                             aVal = a.size || 0;
@@ -11071,12 +11130,6 @@
                     localStorage.setItem(byKey, byVal);
                     localStorage.setItem(orderKey, orderVal);
                 } catch (e) { /* storage disabled */ }
-            },
-
-            // Deeplink from a manager row to that model's settings card (modal).
-            openModelSettingsFromManager(name) {
-                const model = this.managerModelInfo(name);
-                if (model) this.openModelSettings(model);
             },
 
             // Theme select
@@ -11219,7 +11272,6 @@
                             this.stopHFRefresh();
                             // Refresh model lists when all downloads finish
                             if (this.hfTasks.some(t => t.status === 'completed')) {
-                                await this.loadHFModels();
                                 await this.loadModels();
                             }
                         }
@@ -11229,21 +11281,6 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF tasks:', err);
-                }
-            },
-
-            async loadHFModels() {
-                try {
-                    const response = await fetch('/admin/api/hf/models');
-                    if (response.ok) {
-                        const data = await response.json();
-                        this.hfModels = data.models || [];
-                        this.hfModelsLoaded = true;
-                    } else if (response.status === 401) {
-                        window.location.href = '/admin';
-                    }
-                } catch (err) {
-                    console.error('Failed to load HF models:', err);
                 }
             },
 
@@ -11293,24 +11330,36 @@
                 }
             },
 
-            async deleteHFModel(modelName) {
-                this.hfDeleteConfirm = null;
+            async removeManagerModel(model) {
+                this.managerRemoveConfirm = null;
+                this.managerError = '';
+
+                let path;
+                if (model.removal_kind === 'profile') {
+                    path = `/admin/api/models/${encodeURIComponent(model.source_model_id)}`
+                        + `/profiles/${encodeURIComponent(model.profile_name)}`;
+                } else if (model.removal_kind === 'local_cache'
+                           || model.removal_kind === 'local_model') {
+                    path = `/admin/api/hf/models/${encodeURIComponent(model.id)}`;
+                } else {
+                    return;
+                }
+
                 try {
-                    const response = await fetch(`/admin/api/hf/models/${encodeURIComponent(modelName)}`, {
+                    const response = await fetch(path, {
                         method: 'DELETE',
                     });
                     if (response.ok) {
-                        await this.loadHFModels();
                         await this.loadModels();
                     } else {
-                        const data = await response.json();
-                        this.hfError = data.detail || window.t('js.error.delete_model_failed');
-                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        const data = await response.json().catch(() => ({}));
+                        this.managerError = data.detail || window.t('js.error.delete_model_failed');
+                        setTimeout(() => { this.managerError = ''; }, 5000);
                     }
                 } catch (err) {
-                    console.error('Failed to delete model:', err);
-                    this.hfError = window.t('js.error.delete_model_connection');
-                    setTimeout(() => { this.hfError = ''; }, 5000);
+                    console.error('Failed to remove model catalog item:', err);
+                    this.managerError = window.t('js.error.delete_model_connection');
+                    setTimeout(() => { this.managerError = ''; }, 5000);
                 }
             },
 
@@ -11410,7 +11459,6 @@
                         if (!hasActive) {
                             this.stopOQRefresh();
                             if (this.oqTasks.some(t => t.status === 'completed')) {
-                                await this.loadHFModels();
                                 await this.loadModels();
                                 await this.loadOQModels();
                             }
@@ -12122,7 +12170,6 @@
                         if (!hasActive) {
                             this.stopMSRefresh();
                             if (this.msTasks.some(t => t.status === 'completed')) {
-                                await this.loadHFModels();
                                 await this.loadModels();
                             }
                         }

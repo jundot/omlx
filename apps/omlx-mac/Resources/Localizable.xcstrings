@@ -9264,6 +9264,42 @@
         }
       }
     },
+    "models.badge.local_cache" : {
+      "comment" : "Badge for a model stored in the shared Hugging Face local cache",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local cache"
+          }
+        }
+      }
+    },
+    "models.badge.profile" : {
+      "comment" : "Badge for an exposed profile backed by a base model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profile"
+          }
+        }
+      }
+    },
+    "models.badge.virtual" : {
+      "comment" : "Badge for a built-in model with no files on disk",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Virtual"
+          }
+        }
+      }
+    },
     "models.delete.confirm_button" : {
       "comment" : "Destructive button label inside the delete-model confirmation dialog; placeholder is the model id",
       "extractionState" : "extracted_with_value",
@@ -9332,6 +9368,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "从磁盘删除此模型？"
+          }
+        }
+      }
+    },
+    "models.remove.local_cache.button" : {
+      "comment" : "Destructive button that removes a Hugging Face repository from the local cache",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove from local cache"
+          }
+        }
+      }
+    },
+    "models.remove.local_cache.message" : {
+      "comment" : "Warning that removing a shared Hugging Face cache repository may affect other apps",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This removes the repository's cache entry, including refs, snapshots, and blobs. Other applications using the same Hugging Face cache may be affected."
+          }
+        }
+      }
+    },
+    "models.remove.local_cache.title" : {
+      "comment" : "Confirmation title before removing a Hugging Face cache-backed model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove this model from local cache?"
+          }
+        }
+      }
+    },
+    "models.remove.profile.button" : {
+      "comment" : "Destructive button that deletes only an exposed model profile",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete profile"
+          }
+        }
+      }
+    },
+    "models.remove.profile.message" : {
+      "comment" : "Warning that deleting an exposed profile preserves its base model files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Only this profile will be deleted. The base model and its files will be kept."
+          }
+        }
+      }
+    },
+    "models.remove.profile.title" : {
+      "comment" : "Confirmation title before deleting an exposed model profile",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete this profile?"
           }
         }
       }
