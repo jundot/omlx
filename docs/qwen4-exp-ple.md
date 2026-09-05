@@ -48,9 +48,8 @@ root).
 - The backbone fits in ~75% of the quant's disk size, which lets larger
   quants fit a given memory ceiling.
 - Measured on oMLX (M4 Pro 48GB, Qwen3.8-Flash-Next-oQ4e-mtp on an external
-  Thunderbolt NVMe, `bench/bench_ple_residency.py`; results in
-  `bench/results/ple_residency.json`). The PLE gather is the only code that
-  differs between modes:
+  Thunderbolt NVMe, `bench/bench_ple_residency.py`). The PLE gather is the
+  only code that differs between modes:
   - **Page-cache warm**: mmap ≈ resident. Per decode step (16 rows, one PLE
     layer): 0.47 ms mmap vs 0.49 ms resident; per 4096-token prefill (65,536
     rows): 55 ms vs 31 ms — noise against multi-second prefill.

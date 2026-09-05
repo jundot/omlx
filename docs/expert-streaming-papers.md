@@ -18,7 +18,7 @@ effective random reads of a 3.7 GB/s sequential drive): the disk saturates befor
 GPU does. We have already implemented and measured the headline techniques of these
 papers **twice**, and both times they lost:
 
-- PILOT staging prefetch (router-lookahead, one layer ahead): 94% of staged bundles
+- Router-lookahead staging prefetch (measured negative; removed — see main doc). The kernel-side F_RDADVISE readahead keeps the useful half.
   dropped unconsumed, 0.037 → 0.011 tok/s.
 - Warm-only prefetch (previous token's next-layer experts, ~35% repeat): neutral to
   negative on the QD16 demand path.
@@ -31,7 +31,7 @@ empirical conclusions of our own doc:
 2. **Routing-consistency analytics before choosing cache policy** (LRC / SRP-SCH) —
    formalizes our measured Qwen 23–32% vs GLM 0% inter-token expert reuse.
 3. **Route-affinity scheduling** (ExpertFlow's token scheduler) — explains why batch
-   decode failed with distinct prompts (Fase A3) and the condition under which it pays.
+   decode failed with distinct prompts (batch pays only when requests share routing).
 
 ## What the implementation already covers
 
@@ -101,41 +101,30 @@ Notes per paper:
 - **MoE-Infinity v3's** insight (batch=1 decode leaves a small reusable hot set) holds
   for Qwen-like routing, not GLM's (0% inter-token reuse at any budget up to 8 GiB).
 
-## Measured: JANG 4S/4M SRP/SCH (2026-09-04, traces in `bench/results/lrc/`)
+## Measured: JANG 4S/4M SRP/SCH (routing-trace harness, budget 0, short prompt)
 
-Traces do protocolo congelado (budget 0, short prompt, 43-46 decode calls/layer,
-`OMLX_EXPERT_STREAMING_TRACE`, 2 regimes separados por `positions`):
-
-| métrica | 4S | 4M | leitura |
+| Metric | 4S | 4M | Reading |
 |---|---|---|---|
-| SCH ceiling (S≥64/layer) | 77.8% | 77.5% | teto de hit de qualquer cache, até oráculo |
-| SCH(S=16) | 65.2% | 65.4% | joelho da curva: 16 slots ≈ 2/3 do teto |
-| SCH(S=32) | 74.2% | 74.2% | 42-64 slots ≈ tudo que existe para ganhar |
-| repeat adjacente (decode) | 38.5% | 39.3% | bate o ~35% da doc; GLM era 0% — famílias opostas |
-| distinct experts/layer no segmento | 104/512 | 103/512 | working set real ~20% do banco |
-| top-10 demand share | 40.5% | 41.1% | um grupo fixo pequeno cobre 40% da demanda |
-| SRP(G=64, seg=128) | 89.6% | 89.8% | demand-weighted; pin fixo cobre quase todo o volume |
-| prefill SCH (S≥256) | 50% | 50% | prefill é broadcast de ~199 uniq/call (570 pos × top-10) — cache não ajuda, seeded burst é o caminho certo |
+| SCH ceiling (S>=64/layer) | 77.8% | 77.5% | hit ceiling of any cache, Belady included |
+| SCH(S=16) | 65.2% | 65.4% | the knee: 16 slots ~ 2/3 of the ceiling |
+| SCH(S=32) | 74.2% | 74.2% | 42-64 slots ~ everything there is to gain |
+| adjacent-call repeat (decode) | 38.5% | 39.3% | matches the ~35% band; GLM measured 0% — opposite families |
+| distinct experts/layer per segment | 104/512 | 103/512 | real working set ~ 20% of the bank |
+| top-10 demand share | 40.5% | 41.1% | a small fixed group covers 40% of demand |
+| SRP(G=64, seg=128) | 89.6% | 89.8% | demand-weighted; a fixed group covers nearly all volume |
+| prefill SCH (S>=256) | 50% | 50% | prefill is a ~199-uniq/call broadcast — the seeded burst is the right mechanism |
 
-Conclusões:
+Conclusions:
 
-1. **Pins: predito pelo joelho, refutado pela matriz** — a matriz pin-knee (`bench/results/lrc/matrix/`) testou o exato joelho SCH (16 slots/layer: 4S 1.5 GiB, 4M 2.0 GiB, 3 reps interleaved A/C, profiles v2 próprios) e ambos ficaram **null (−0.3% na mediana)**: 4S 2.862→2.852, 4M 1.977→1.972 tok/s. O L2-null do oQ4e reproduz no JANG: neste box o page cache já serve o working set de decode até o teto de oráculo — mlock só converte evictable em wired (custo sem ganho). O joelho SCH informa **quantos slots valem a pena se o residente for device-side (slot-bank)**, não quanto pin de página comprar. LRU heap além de ~64 slots/layer continua desperdício.
-2. **Slot-bank é o alavanca certa pro hit path**: com hit 78% no teto, o custo per-use (load 43% + stack 28% do wall) cai sobre ~3/4 das chamadas — o bound do spike melhora. O invariante multi-token (#27861) já está no plano (docs/spike-slot-bank.md).
-3. **4S ≈ 4M em routing**: routing é propriedade do modelo (512 experts, top-10), não do quant — igual ao achado do post 2x3090 ("hit rate não depende do quant, só de slot count"). MAS o learned-pin profile NÃO transfere entre eles: o fingerprint gate (config_sha + packing — 4S `oQ4e3b` vs 4M `oQ4e4b`) recusa por design (verificado: load do profile 4S no 4M loga `fingerprint mismatch — profile ignored`, pin degrada para observação in-run). Transferir exigiria remapear byte-ranges entre packings distintos; não é caminho.
-4. **Prefill**: oráculo limita a 50% (broadcast total) — qualquer esforço de cache em prefill tem teto baixo; o seeded burst existente é o mecanismo certo.
+1. **Pins: predicted by the knee, refuted by the matrix** — the pin-knee matrix tested the exact SCH knee (16 slots/layer; 3 interleaved reps, own v2 profiles) and both measured **null (-0.3% median)**: 4S 2.862->2.852, 4M 1.977->1.972 tok/s. On this box the page cache already serves the decode working set up to the oracle ceiling — mlock only converts evictable into wired. The SCH knee informs how many slots a *device-side* residency scheme should hold, not how much page-pin budget to buy; an LRU heap beyond ~64 slots/layer stays waste.
+2. **4S ~ 4M routing**: routing is a property of the model (512 experts, top-10), not the quant — matching the 2x3090 finding that hit rate depends only on slot count. But learned-pin profiles do NOT transfer between them: the fingerprint gate (config sha + packing, 4S `oQ4e3b` vs 4M `oQ4e4b`) refuses by design.
+3. **Prefill**: the oracle caps at 50% (total broadcast) — any prefill cache effort has a low ceiling.
 
-## Measured: levers de bytes/token no JANG (2026-09-04, `bench/results/lever_matrix/` + `ppl_topk/`)
+## Measured: bytes/token levers on the JANGs (interleaved A/B, warmup discarded)
 
-**topk 0.85 (4S)**: matriz interleaved v2 (warmup descartado, pares adjacentes ×3): base mediana 2.817 → tk85 **3.142 tok/s (+11.5%)**; o cache-prior 2.0 é **null** em budget 0 (3.147; sem LRU não há o que ranquear — recusa consistente com o design). **Custo ppl (4S)**: 1.4848 → 1.5106 (0.9, +1.7%) / 1.5422 (0.85, +3.9%). **Custo ppl (4M)**: 1.2075 → 1.2437 (0.85, **+3.0%**). Trade-off explícito: ~+11% tok/s por ~3–4% ppl — **knob opt-in documentado, NÃO default** (política do projeto: defaults bit-exact; autotuner só o varre com `--sweep-topk`; ppl gate separado via `bench/ppl_expert_streaming.py --streaming` — ppl determinístico, 3 reps idênticos ao 4º decimal).
+**topk 0.85 (4S)**: base median 2.817 -> 3.142 tok/s (**+11.5%**); cache-prior 2.0 is null at budget 0 (no LRU to rerank — the converter refuses it, consistent with the design). PPL cost: +3.9% (4S), +3.0% (4M). Explicit trade: ~+11% tok/s for ~3-4% ppl — an opt-in documented knob, never a default; the autotuner sweeps it only with `--sweep-topk`, and the ppl gate runs via `bench/ppl_expert_streaming.py --streaming` (deterministic to the 4th decimal).
 
-**Cold tier 3-bit (4M) — REJEITADO POR POLÍTICA (decisão do mantenedor, 2026-09-04)**: requantizar 4→3 bits é perda de qualidade por construção, e a classe near-lossless **não é aceita** neste projeto — defaults permanecem bit-exact. O que a linha deixou pronto e **dormente** (atrás de knobs opt-in, nunca default):
-
-- Fixes do requant tool p/ JANGs: chaves per-tensor sem sufixo `.weight` + packing que separa weight/scales/biases entre shards (agrupamento via index global; `--out-dir` p/ tier fora do dir do modelo).
-- Runtime: `OMLX_EXPERT_STREAMING_COLD_ROOT` (tier em dir arbitrário; volumes read-only).
-- Autotuner: sweep de cold_tier exige `--sweep-cold-tier` explícito + `expert_cold/` presente (nunca automático; testes travam esse contrato).
-- Encontrado e NÃO corrigido (condição de reabertura): bug de wiring uniform-tier — a linear é construída com bits do source enquanto o backing serve bytes do tier → `gather_qmm` rejeita o shape. A medição ppl/tok/s **nunca foi completada**; a hipótese (−25% bytes de miss, teto ~+33% no trecho miss-bound) permanece não-testada.
-
-Nota factual: o 4S JÁ É 3-bit no corpo (86×3b + 43×2b + 17×4b) — tier nele nunca fez sentido; o 4M é 4-bit uniforme (144 banks) e o requant funcional mediu 56.2→42.2 GiB (0.75×) antes do veto (artefatos removidos).
+**Cold tier (uniform low-precision requant)**: rejected as a *default* line by maintainer policy — defaults stay bit-exact. The tier ships dormant behind opt-in knobs (`expert_streaming_cold_tier` + the HOBBIT hot/cold split), with the quality/speed Pareto measured per model in the main doc.
 
 ## Prioritized opportunities
 
@@ -159,7 +148,7 @@ Nota factual: o 4S JÁ É 3-bit no corpo (86×3b + 43×2b + 17×4b) — tier nel
    (or oQ3) with the existing oQ quantizer; hot set stays oQ4e; misses read the cheap
    tier → ~½ miss bytes. Prerequisite: a **perplexity/quality harness** (gap — verified
    absent from bench/tools/scripts) plus tok/s & TTFT A/B. Afterwards, re-test
-   F_RDADVISE/PILOT prefetch with the freed headroom.
+   F_RDADVISE readahead with the freed headroom.
 5. **Top-k 0.85** is already implemented (B4, +27% GLM); today's opt-in default is
    correct — only a per-profile default decision remains.
 

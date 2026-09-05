@@ -197,7 +197,7 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 
 ### Expert Streaming (SSD)
 
-Run huge Mixture-of-Experts models on small Macs. Dense weights (attention, shared experts) stay resident; routed expert banks are memory-mapped from the checkpoint and a per-layer LRU keeps only the hot experts in RAM (one `Cache budget (GiB)` knob, default `~2 GiB`, auto-enabled when the resident model would not fit). Trades decode speed for up to ~10× memory saving; the model runs single-stream while streaming (one request at a time). Prefill reuses the existing paged SSD KV cache, so repeated prompts restore in milliseconds. Supported `model_type`: `glm_moe_dsa` (GLM-5.2). See [docs/expert-streaming.md](docs/expert-streaming.md).
+Run MoE models larger than your Mac's RAM: dense weights (attention, shared experts, embeddings) stay resident while routed expert banks stream from SSD via parallel demand reads with coalesced runs (QD16). The OS page cache serves expert reuse by default, with an optional bounded LRU (`budget_auto` scales it to free RAM) and opt-in levers — learned pins, a low-precision cold tier with a HOBBIT hot/cold split, top-k mass truncation, cache-prior reranking, and MTP where draft weights ship — each measured and quality-gated with a perplexity harness. Auto-enabled when the resident model would exceed the memory ceiling; streaming models serve one request at a time, and prefill reuses the paged SSD KV cache. Supported `model_type`s: `glm5_next`, `qwen4_exp`, `glm_moe_dsa`, `deepseek_v4(_mtp)`, `deepseek_v32`, `qwen3_moe`, `qwen2_moe`, `deepseek_v3`, `glm4_moe` — see [docs/expert-streaming.md](docs/expert-streaming.md).
 
 ### Continuous Batching
 
