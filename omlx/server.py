@@ -195,7 +195,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .usage_ledger import close_current_session
+from .usage_ledger import close_current_session, reset_pricing_table
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2022,6 +2022,7 @@ def init_server(
     stats_path = base_path / "stats.json"
     ledger_path = base_path / "usage_sessions.jsonl"
     reset_server_metrics(stats_path=stats_path, ledger_path=ledger_path)
+    reset_pricing_table(base_path)
 
     logger.info(
         f"Server initialized with {_server_state.engine_pool.model_count} models"

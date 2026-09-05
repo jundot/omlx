@@ -345,6 +345,17 @@
                 total_completion_tokens: 0,
                 estimated_api_cost_usd: null,
             },
+            // Cloud pricing table (collapsible sub-section of Usage & Cost).
+            // Fetched lazily on first expand, not on every stats poll.
+            pricingExpanded: false,
+            pricingLoaded: false,
+            pricingRows: [],
+            pricingUserFile: '',
+            pricingError: '',
+            newPricingMatch: '',
+            newPricingDisplayName: '',
+            newPricingInput: '',
+            newPricingOutput: '',
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
@@ -9023,6 +9034,87 @@
                     }
                 } catch (err) {
                     console.error('Failed to load usage & cost:', err);
+                }
+            },
+
+            async togglePricingSection() {
+                this.pricingExpanded = !this.pricingExpanded;
+                if (this.pricingExpanded && !this.pricingLoaded) {
+                    await this.loadPricing();
+                }
+            },
+
+            async loadPricing() {
+                try {
+                    const resp = await fetch('/admin/api/usage/pricing');
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        this.pricingRows = data.rows || [];
+                        this.pricingUserFile = data.user_file || '';
+                        this.pricingLoaded = true;
+                    } else {
+                        console.error('Failed to load pricing table:', resp.status);
+                    }
+                } catch (err) {
+                    console.error('Failed to load pricing table:', err);
+                }
+            },
+
+            async addPricingRow() {
+                this.pricingError = '';
+                const match = this.newPricingMatch.trim().toLowerCase();
+                const input = parseFloat(this.newPricingInput);
+                const output = parseFloat(this.newPricingOutput);
+                if (!match) {
+                    this.pricingError = window.t('status.usage.pricing.error_match_required');
+                    return;
+                }
+                if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) {
+                    this.pricingError = window.t('status.usage.pricing.error_invalid_price');
+                    return;
+                }
+                try {
+                    const resp = await fetch('/admin/api/usage/pricing', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            match,
+                            input,
+                            output,
+                            display_name: this.newPricingDisplayName.trim() || null,
+                        }),
+                    });
+                    if (resp.ok) {
+                        this.newPricingMatch = '';
+                        this.newPricingDisplayName = '';
+                        this.newPricingInput = '';
+                        this.newPricingOutput = '';
+                        await this.loadPricing();
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await resp.json();
+                        this.pricingError = data.detail || window.t('js.error.save_settings_failed');
+                    }
+                } catch (err) {
+                    this.pricingError = window.t('js.error.save_settings_failed');
+                }
+            },
+
+            async deletePricingRow(match) {
+                try {
+                    const resp = await fetch('/admin/api/usage/pricing/' + encodeURIComponent(match), {
+                        method: 'DELETE',
+                    });
+                    if (resp.ok) {
+                        await this.loadPricing();
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        console.error('Failed to delete pricing row:', resp.status);
+                    }
+                } catch (err) {
+                    console.error('Failed to delete pricing row:', err);
                 }
             },
 

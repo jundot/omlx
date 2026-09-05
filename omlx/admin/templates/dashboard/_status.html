@@ -130,6 +130,94 @@
                                 </p>
                             </div>
                         </div>
+
+                        <!-- Cloud pricing: user-editable rows backing estimate_api_cost() -->
+                        <div class="border-t border-neutral-100">
+                            <button type="button" @click="togglePricingSection()"
+                                    class="w-full flex items-center justify-between px-6 py-3 hover:bg-neutral-50 transition-colors">
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.usage.pricing.section_label') }}</span>
+                                <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform" :class="pricingExpanded && 'rotate-180'"></i>
+                            </button>
+                            <div x-show="pricingExpanded" x-cloak class="px-6 pb-6">
+                                <p class="text-xs text-neutral-400 mb-3">
+                                    {{ t('status.usage.pricing.hint') }}
+                                    <code class="text-neutral-500" x-text="pricingUserFile"></code>
+                                </p>
+
+                                <div class="overflow-x-auto border border-neutral-100 rounded-lg mb-4">
+                                    <table class="min-w-full text-xs">
+                                        <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
+                                            <tr>
+                                                <th class="px-3 py-2 text-left">{{ t('status.usage.pricing.col_match') }}</th>
+                                                <th class="px-3 py-2 text-left">{{ t('status.usage.pricing.col_display_name') }}</th>
+                                                <th class="px-3 py-2 text-right">{{ t('status.usage.pricing.col_input') }}</th>
+                                                <th class="px-3 py-2 text-right">{{ t('status.usage.pricing.col_output') }}</th>
+                                                <th class="px-3 py-2 text-left">{{ t('status.usage.pricing.col_source') }}</th>
+                                                <th class="px-3 py-2"></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="divide-y divide-neutral-100 text-neutral-700">
+                                            <template x-for="row in pricingRows" :key="row.source + ':' + row.match">
+                                                <tr>
+                                                    <td class="px-3 py-2 font-mono" x-text="row.match"></td>
+                                                    <td class="px-3 py-2" x-text="row.display_name || '-'"></td>
+                                                    <td class="px-3 py-2 text-right" x-text="'$' + Number(row.input).toFixed(2)"></td>
+                                                    <td class="px-3 py-2 text-right" x-text="'$' + Number(row.output).toFixed(2)"></td>
+                                                    <td class="px-3 py-2">
+                                                        <span class="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase"
+                                                              :class="row.source === 'user' ? 'bg-blue-50 text-blue-600' : 'bg-neutral-100 text-neutral-500'"
+                                                              x-text="row.source === 'user' ? window.t('status.usage.pricing.badge_custom') : window.t('status.usage.pricing.badge_builtin')"></span>
+                                                        <span x-show="row.overridden && row.source === 'builtin'" class="ml-1 text-[10px] text-amber-600" x-text="window.t('status.usage.pricing.badge_overridden')"></span>
+                                                    </td>
+                                                    <td class="px-3 py-2 text-right">
+                                                        <button x-show="row.source === 'user'" type="button" @click="deletePricingRow(row.match)"
+                                                                class="p-1 text-neutral-400 hover:text-red-500 hover:bg-neutral-100 rounded-lg transition-all"
+                                                                :title="window.t('status.usage.pricing.delete_tooltip')">
+                                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            </template>
+                                            <tr x-show="pricingRows.length === 0">
+                                                <td colspan="6" class="px-3 py-4 text-center text-neutral-400">{{ t('status.usage.pricing.empty') }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+
+                                <div class="flex flex-wrap items-end gap-2">
+                                    <div>
+                                        <label class="block text-[11px] text-neutral-400 mb-1">{{ t('status.usage.pricing.add_match_label') }}</label>
+                                        <input type="text" x-model="newPricingMatch"
+                                               placeholder="{{ t('status.usage.pricing.add_match_placeholder') }}"
+                                               class="px-2.5 py-1.5 text-sm border border-neutral-200 rounded-lg w-40">
+                                    </div>
+                                    <div>
+                                        <label class="block text-[11px] text-neutral-400 mb-1">{{ t('status.usage.pricing.add_display_name_label') }}</label>
+                                        <input type="text" x-model="newPricingDisplayName"
+                                               placeholder="{{ t('status.usage.pricing.add_display_name_placeholder') }}"
+                                               class="px-2.5 py-1.5 text-sm border border-neutral-200 rounded-lg w-40">
+                                    </div>
+                                    <div>
+                                        <label class="block text-[11px] text-neutral-400 mb-1">{{ t('status.usage.pricing.add_input_label') }}</label>
+                                        <input type="number" step="0.01" min="0" x-model="newPricingInput"
+                                               placeholder="0.00"
+                                               class="px-2.5 py-1.5 text-sm border border-neutral-200 rounded-lg w-24">
+                                    </div>
+                                    <div>
+                                        <label class="block text-[11px] text-neutral-400 mb-1">{{ t('status.usage.pricing.add_output_label') }}</label>
+                                        <input type="number" step="0.01" min="0" x-model="newPricingOutput"
+                                               placeholder="0.00"
+                                               class="px-2.5 py-1.5 text-sm border border-neutral-200 rounded-lg w-24">
+                                    </div>
+                                    <button type="button" @click="addPricingRow()"
+                                            class="px-3 py-1.5 text-sm font-medium text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all">
+                                        {{ t('status.usage.pricing.add_button') }}
+                                    </button>
+                                </div>
+                                <div x-show="pricingError" x-cloak class="text-xs text-red-500 mt-2" x-text="pricingError"></div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Active Models -->

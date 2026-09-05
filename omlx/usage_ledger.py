@@ -12,9 +12,13 @@ cost $X on GPT-4o / Claude / Gemini".
 
 import json
 import logging
+import math
+import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .settings import resolve_default_base_path
 
 logger = logging.getLogger(__name__)
 
@@ -23,43 +27,320 @@ logger = logging.getLogger(__name__)
 # an unbounded file across years of restarts.
 MAX_LEDGER_SESSIONS = 1000
 
-# Cloud API pricing in USD per 1M tokens, keyed by a lowercase substring
-# matched against the served model_id (see `_lookup_pricing`). Figures are
-# list prices for common hosted models as a rough basis for comparison —
-# not a live pricing feed, and intentionally approximate.
-MODEL_PRICING: Dict[str, Dict[str, float]] = {
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
-    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
-    "gpt-4.1": {"input": 2.00, "output": 8.00},
-    "claude-opus-4": {"input": 15.00, "output": 75.00},
-    "claude-3-opus": {"input": 15.00, "output": 75.00},
-    "claude-sonnet-4": {"input": 3.00, "output": 15.00},
-    "claude-3-7-sonnet": {"input": 3.00, "output": 15.00},
-    "claude-3-5-sonnet": {"input": 3.00, "output": 15.00},
-    "claude-3-5-haiku": {"input": 0.80, "output": 4.00},
-    "claude-3-haiku": {"input": 0.25, "output": 1.25},
-    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
-    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
-    "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
-}
+# Bundled defaults: cloud API list prices in USD per 1M tokens, keyed by a
+# lowercase substring matched against the served model_id (see
+# `PricingTable.lookup`). Figures are list prices for common hosted models
+# as a rough basis for comparison — not a live pricing feed, and
+# intentionally approximate. Shipped as package data (not a Python dict) so
+# a user can override or extend the table without touching code — see
+# `PricingTable`.
+DEFAULT_PRICING_FILE = (
+    Path(__file__).resolve().parent / "admin" / "data" / "cloud_pricing_defaults.json"
+)
+
+# User-editable overrides file name, stored under the resolved base path
+# (same root as settings.json).
+USER_PRICING_FILENAME = "cloud_pricing.json"
 
 
-def _lookup_pricing(model_id: str) -> Optional[Dict[str, float]]:
-    """Find the pricing row whose key is the longest substring match.
+def _load_default_pricing_rows() -> List[Dict[str, Any]]:
+    """Load the bundled default pricing rows from package data.
 
-    Longest-match-wins so a more specific key (``gpt-4o-mini``) is picked
-    over a shorter one it happens to contain (``gpt-4o``).
+    Tolerant: a missing or corrupt file logs a warning and yields an empty
+    table rather than raising, so a packaging mishap degrades to "no
+    pricing known" instead of crashing the server.
     """
-    if not model_id:
-        return None
-    normalized = model_id.lower()
-    best_key: Optional[str] = None
-    for key in MODEL_PRICING:
-        if key in normalized and (best_key is None or len(key) > len(best_key)):
-            best_key = key
-    return MODEL_PRICING[best_key] if best_key else None
+    try:
+        with open(DEFAULT_PRICING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Failed to load bundled cloud pricing defaults from %s: %s",
+            DEFAULT_PRICING_FILE,
+            e,
+        )
+        return []
+    if not isinstance(data, list):
+        logger.warning(
+            "Bundled cloud pricing defaults at %s must be a JSON array; ignoring",
+            DEFAULT_PRICING_FILE,
+        )
+        return []
+    rows = []
+    for row in data:
+        try:
+            rows.append(_validate_pricing_row(row))
+        except ValueError as e:
+            logger.warning(
+                "Skipping invalid bundled pricing row in %s: %s",
+                DEFAULT_PRICING_FILE,
+                e,
+            )
+    return rows
+
+
+def _validate_pricing_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and normalize a pricing row. Raises ``ValueError`` on bad input."""
+    if not isinstance(row, dict):
+        raise ValueError("pricing row must be an object")
+    match = row.get("match")
+    if not isinstance(match, str) or not match.strip():
+        raise ValueError("'match' must be a non-empty string")
+    match = match.strip().lower()
+
+    def _price(field: str) -> float:
+        value = row.get(field)
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"'{field}' must be a number") from None
+        if not math.isfinite(price) or price < 0:
+            raise ValueError(f"'{field}' must be a finite non-negative number")
+        return price
+
+    input_price = _price("input")
+    output_price = _price("output")
+
+    display_name = row.get("display_name")
+    if display_name is not None and not isinstance(display_name, str):
+        raise ValueError("'display_name' must be a string")
+
+    normalized: Dict[str, Any] = {
+        "match": match,
+        "input": input_price,
+        "output": output_price,
+    }
+    if display_name:
+        normalized["display_name"] = display_name
+    return normalized
+
+
+class PricingTable:
+    """Thread-safe merged cloud-pricing table (bundled defaults + user rows).
+
+    Mirrors :class:`UsageLedger`'s locking style. Bundled defaults ship as
+    package data (`DEFAULT_PRICING_FILE`); a user can add, edit, or delete
+    rows at runtime via the admin API/UI or by editing the JSON file at
+    ``user_file`` directly — user rows override a builtin with the same
+    ``match`` key, or extend the table with a new one. The merged view is
+    rebuilt after every mutation, and the user file's mtime is checked on
+    read so a direct on-disk edit is picked up without a server restart.
+    """
+
+    def __init__(self, base_path: Optional[Path] = None):
+        self._lock = threading.Lock()
+        self._user_file = base_path / USER_PRICING_FILENAME if base_path else None
+        self._defaults: List[Dict[str, Any]] = _load_default_pricing_rows()
+        self._user_rows: List[Dict[str, Any]] = []
+        self._merged: List[Dict[str, Any]] = []
+        self._mtime: Optional[float] = None
+        with self._lock:
+            self._reload_locked()
+
+    @property
+    def user_file(self) -> Optional[Path]:
+        """Path to the user-editable overrides file, or ``None`` if unset."""
+        return self._user_file
+
+    def _current_mtime_locked(self) -> Optional[float]:
+        if not self._user_file:
+            return None
+        try:
+            return self._user_file.stat().st_mtime
+        except OSError:
+            return None
+
+    def _read_user_rows_locked(self) -> List[Dict[str, Any]]:
+        if not self._user_file or not self._user_file.exists():
+            return []
+        try:
+            with open(self._user_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                "Failed to load user cloud pricing file %s: %s", self._user_file, e
+            )
+            return []
+        raw_rows = data.get("rows") if isinstance(data, dict) else data
+        if not isinstance(raw_rows, list):
+            logger.warning(
+                "User cloud pricing file %s has an unexpected shape; ignoring",
+                self._user_file,
+            )
+            return []
+        rows = []
+        for row in raw_rows:
+            try:
+                rows.append(_validate_pricing_row(row))
+            except ValueError as e:
+                logger.warning(
+                    "Skipping invalid pricing row in %s: %s", self._user_file, e
+                )
+        return rows
+
+    def _reload_locked(self) -> None:
+        """Recompute the merged view. Must be called while holding the lock."""
+        self._user_rows = self._read_user_rows_locked()
+        self._mtime = self._current_mtime_locked()
+        merged: Dict[str, Dict[str, Any]] = {
+            row["match"]: dict(row, source="builtin") for row in self._defaults
+        }
+        for row in self._user_rows:
+            merged[row["match"]] = dict(row, source="user")
+        self._merged = list(merged.values())
+
+    def _ensure_fresh_locked(self) -> None:
+        """Reload if the user file changed on disk since the last read."""
+        if self._current_mtime_locked() != self._mtime:
+            self._reload_locked()
+
+    def load(self) -> List[Dict[str, Any]]:
+        """Return the merged pricing rows (user rows win by ``match``)."""
+        with self._lock:
+            self._ensure_fresh_locked()
+            return [dict(row) for row in self._merged]
+
+    def rows(self, include_builtin: bool = True) -> List[Dict[str, Any]]:
+        """Return rows for the admin UI, tagged with source/override info.
+
+        Args:
+            include_builtin: When ``False``, only user-defined rows are
+                returned (builtins that a user row overrides are omitted
+                entirely, not just hidden).
+        """
+        with self._lock:
+            self._ensure_fresh_locked()
+            user_matches = {row["match"] for row in self._user_rows}
+            default_matches = {row["match"] for row in self._defaults}
+            result: List[Dict[str, Any]] = []
+            if include_builtin:
+                for row in self._defaults:
+                    tagged = dict(row)
+                    tagged["source"] = "builtin"
+                    tagged["overridden"] = row["match"] in user_matches
+                    result.append(tagged)
+            for row in self._user_rows:
+                tagged = dict(row)
+                tagged["source"] = "user"
+                tagged["overridden"] = row["match"] in default_matches
+                result.append(tagged)
+            return result
+
+    def add_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Add or update a user pricing row. Validates and persists.
+
+        Args:
+            row: ``{"match", "input", "output", "display_name"?}``.
+
+        Returns:
+            The normalized, persisted row.
+
+        Raises:
+            ValueError: if ``row`` fails validation, or no base path is
+                configured to persist to.
+        """
+        validated = _validate_pricing_row(row)
+        if not self._user_file:
+            raise ValueError(
+                "No base path configured for the pricing table; cannot persist rows"
+            )
+        with self._lock:
+            self._ensure_fresh_locked()
+            rows = [r for r in self._user_rows if r["match"] != validated["match"]]
+            rows.append(validated)
+            self._write_user_rows_locked(rows)
+            self._reload_locked()
+        return validated
+
+    def delete_row(self, match: str) -> bool:
+        """Remove a user row, restoring any builtin default it overrode.
+
+        Returns:
+            ``True`` if a user row was removed, ``False`` if ``match`` only
+            exists as a builtin (or not at all) — nothing to delete.
+        """
+        normalized = (match or "").strip().lower()
+        if not self._user_file:
+            return False
+        with self._lock:
+            self._ensure_fresh_locked()
+            if not any(r["match"] == normalized for r in self._user_rows):
+                return False
+            rows = [r for r in self._user_rows if r["match"] != normalized]
+            self._write_user_rows_locked(rows)
+            self._reload_locked()
+        return True
+
+    def _write_user_rows_locked(self, rows: List[Dict[str, Any]]) -> None:
+        """Atomically persist ``rows`` to the user file (tmp + replace)."""
+        assert self._user_file is not None
+        self._user_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self._user_file.with_name(
+            f"{self._user_file.name}.{os.getpid()}.tmp"
+        )
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump({"rows": rows}, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(self._user_file)
+        except OSError as e:
+            logger.warning(
+                "Failed to save user cloud pricing file %s: %s", self._user_file, e
+            )
+            temp_file.unlink(missing_ok=True)
+            raise
+
+    def lookup(self, model_id: str) -> Optional[Dict[str, float]]:
+        """Find the pricing row whose key is the longest substring match.
+
+        Longest-match-wins so a more specific key (``gpt-4o-mini``) is
+        picked over a shorter one it happens to contain (``gpt-4o``). This
+        preserves the exact semantics of the pre-refactor `_lookup_pricing`.
+        """
+        if not model_id:
+            return None
+        with self._lock:
+            self._ensure_fresh_locked()
+            rows = self._merged
+        normalized = model_id.lower()
+        best_row: Optional[Dict[str, Any]] = None
+        for row in rows:
+            key = row["match"]
+            if key in normalized and (
+                best_row is None or len(key) > len(best_row["match"])
+            ):
+                best_row = row
+        if best_row is None:
+            return None
+        return {"input": best_row["input"], "output": best_row["output"]}
+
+
+# Global singleton, mirroring omlx.server_metrics's pattern.
+_pricing_table: Optional[PricingTable] = None
+
+
+def get_pricing_table() -> PricingTable:
+    """Get the global PricingTable singleton.
+
+    Lazily initialized against `resolve_default_base_path()` so callers
+    (e.g. admin routes) don't need the server startup path to have run
+    `reset_pricing_table()` first.
+    """
+    global _pricing_table
+    if _pricing_table is None:
+        _pricing_table = PricingTable(resolve_default_base_path())
+    return _pricing_table
+
+
+def reset_pricing_table(base_path: Optional[Path] = None) -> None:
+    """(Re)point the global pricing table singleton at ``base_path``.
+
+    Called on server start (real base path) and by tests (a tmp_path, or
+    ``None`` to isolate from any on-disk user overrides).
+    """
+    global _pricing_table
+    _pricing_table = PricingTable(base_path)
 
 
 def estimate_api_cost(
@@ -67,10 +348,10 @@ def estimate_api_cost(
 ) -> Optional[float]:
     """Estimate USD cost of serving this usage via a paid cloud API.
 
-    Returns ``None`` (not ``0.0``) when ``model_id`` isn't in the built-in
-    pricing table, so "we don't know" is never confused with "free".
+    Returns ``None`` (not ``0.0``) when ``model_id`` isn't in the pricing
+    table, so "we don't know" is never confused with "free".
     """
-    pricing = _lookup_pricing(model_id)
+    pricing = get_pricing_table().lookup(model_id)
     if pricing is None:
         return None
     cost = (

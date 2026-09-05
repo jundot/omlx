@@ -246,6 +246,15 @@ class UpdateTemplateRequest(BaseModel):
     settings: dict[str, Any] | None = None
 
 
+class PricingRowRequest(BaseModel):
+    """Request body for adding/updating a user cloud-pricing row."""
+
+    match: str
+    input: float
+    output: float
+    display_name: str | None = None
+
+
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
@@ -5687,6 +5696,64 @@ async def get_usage_lifetime(
         "per_model": per_model_rows,
         "estimated_api_cost_usd": estimate_per_model_cost(per_model),
     }
+
+
+@router.get("/api/usage/pricing")
+async def get_usage_pricing(is_admin: bool = Depends(require_admin)):
+    """Return the merged cloud-pricing table (built-in defaults + user rows).
+
+    Returns:
+        rows: every pricing row (builtin + user), each tagged with
+            ``source`` ("builtin"/"user") and ``overridden``.
+        user_file: path to the user-editable JSON file backing custom rows.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    table = get_pricing_table()
+    return {
+        "rows": table.rows(include_builtin=True),
+        "user_file": str(table.user_file) if table.user_file else None,
+    }
+
+
+@router.post("/api/usage/pricing")
+async def add_usage_pricing_row(
+    request: PricingRowRequest, is_admin: bool = Depends(require_admin)
+):
+    """Add or update a user cloud-pricing row.
+
+    Args:
+        request: ``match`` (lowercase substring matched against a served
+            model_id), ``input``/``output`` USD-per-1M-token prices, and an
+            optional ``display_name``. A row already present under the same
+            ``match`` (builtin or user) is overwritten.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    try:
+        row = get_pricing_table().add_row(request.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return row
+
+
+@router.delete("/api/usage/pricing/{match}")
+async def delete_usage_pricing_row(
+    match: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a user cloud-pricing row, restoring any builtin it overrode.
+
+    Args:
+        match: the row's match key. 404 if it only exists as a builtin (or
+            not at all) — nothing user-owned to delete.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    if not get_pricing_table().delete_row(match):
+        raise HTTPException(
+            status_code=404, detail=f"No user pricing row for '{match}'"
+        )
+    return {"status": "ok"}
 
 
 def _iter_loaded_scheduler_records():
