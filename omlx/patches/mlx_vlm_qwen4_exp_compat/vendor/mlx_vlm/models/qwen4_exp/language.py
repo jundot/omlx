@@ -926,14 +926,14 @@ class Qwen4ExpRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        y = x.astype(mx.float32)
-        if self.group_size is not None:
-            y = y.reshape(*y.shape[:-1], -1, self.group_size)
-            weight = self.weight.reshape(-1, self.group_size)
-        else:
-            weight = self.weight
-        y = y * mx.rsqrt(mx.mean(mx.square(y), axis=-1, keepdims=True) + self.eps)
-        y = y * (1.0 + weight.astype(mx.float32))
+        scale = 1.0 + self.weight.astype(mx.float32)
+        if self.group_size is None:
+            return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
+        # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
+        # per-group scale; normalise over the group axis and scale afterwards.
+        # The scale stays fp32 -- rounding (1 + w) to bf16 costs half a ULP.
+        y = x.astype(mx.float32).reshape(*x.shape[:-1], -1, self.group_size)
+        y = mx.fast.rms_norm(y, None, self.eps) * scale.reshape(-1, self.group_size)
         return y.reshape(x.shape).astype(dtype)
 
 
