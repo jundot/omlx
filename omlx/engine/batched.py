@@ -560,6 +560,14 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.model_name = (
+            self._model_name
+        )  # Ensure cache isolation per model
+        # Explicit preserve_thinking=False keeps history think-stripped, so
+        # generated <think> tokens can never match the next prompt — keep
+        # the legacy prompt-only store for thinking requests (#93/#1003).
+        if getattr(self._model_settings, "preserve_thinking", None) is False:
+            scheduler_config.cache_thinking_outputs = False
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
