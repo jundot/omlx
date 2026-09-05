@@ -348,6 +348,14 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # How many interior recurrent-state checkpoints a prefill retains, in
+    # addition to the newest one (always kept). Hybrid models capture one at
+    # every block boundary -- 115.6MB each on a 36-layer GDN model at
+    # block_size 2048 -- so an unbounded 234k-token prefill holds 12GB of them
+    # for its whole duration. Restores land on the deepest retained checkpoint
+    # and re-prefill the gap, so a small budget trades recompute for that
+    # resident memory. 0 keeps every boundary (the historical behavior).
+    boundary_snapshot_retention: int = 0
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -439,6 +447,7 @@ class CacheSettings:
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "boundary_snapshot_retention": self.boundary_snapshot_retention,
         }
 
     @classmethod
@@ -489,6 +498,9 @@ class CacheSettings:
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            boundary_snapshot_retention=int(
+                data.get("boundary_snapshot_retention", 0)
+            ),
         )
 
 
@@ -1727,6 +1739,7 @@ class GlobalSettings:
                 self.cache.gdn_ssd_pending_max_size
             ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            boundary_snapshot_retention=self.cache.boundary_snapshot_retention,
         )
 
     def to_dict(self) -> dict[str, Any]:
