@@ -246,6 +246,15 @@ class UpdateTemplateRequest(BaseModel):
     settings: dict[str, Any] | None = None
 
 
+class PricingRowRequest(BaseModel):
+    """Request body for adding/updating a user cloud-pricing row."""
+
+    match: str
+    input: float
+    output: float
+    display_name: str | None = None
+
+
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
@@ -5601,6 +5610,149 @@ async def clear_alltime_stats(is_admin: bool = Depends(require_admin)):
     from ..server_metrics import get_server_metrics
 
     get_server_metrics().clear_alltime_metrics()
+    return {"status": "ok"}
+
+
+def _usage_session_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Add an estimated cloud API cost to a raw session ledger record."""
+    from ..usage_ledger import estimate_per_model_cost
+
+    per_model = record.get("per_model", {})
+    return {
+        "session_id": record.get("session_id"),
+        "started_at": record.get("started_at"),
+        "ended_at": record.get("ended_at"),
+        "requests": record.get("requests", 0),
+        "prompt_tokens": record.get("prompt_tokens", 0),
+        "completion_tokens": record.get("completion_tokens", 0),
+        "cached_tokens": record.get("cached_tokens", 0),
+        "per_model": per_model,
+        "estimated_api_cost_usd": estimate_per_model_cost(per_model),
+    }
+
+
+@router.get("/api/usage/sessions")
+async def get_usage_sessions(
+    scope: str = "alltime", is_admin: bool = Depends(require_admin)
+):
+    """List per-session token usage, newest first.
+
+    Each entry compares what oMLX served locally against what it would
+    have cost on a paid cloud API for the same token volumes.
+
+    Args:
+        scope: "alltime" (default) returns the live open session followed
+            by every closed session in the ledger. "session" returns only
+            the current open session.
+    """
+    from ..server_metrics import get_server_metrics
+    from ..usage_ledger import get_usage_ledger
+
+    metrics = get_server_metrics()
+    live_record = metrics.to_session_record(is_open=True)
+    sessions = [_usage_session_payload(live_record)]
+    if scope != "session":
+        sessions.extend(
+            _usage_session_payload(r) for r in get_usage_ledger().load_sessions()
+        )
+    return {"sessions": sessions}
+
+
+@router.get("/api/usage/lifetime")
+async def get_usage_lifetime(
+    scope: str = "alltime", is_admin: bool = Depends(require_admin)
+):
+    """Aggregate token usage plus estimated cloud API cost.
+
+    Args:
+        scope: "alltime" (default) for cumulative totals across all
+            sessions (persisted), or "session" for just the current session.
+    """
+    from ..server_metrics import get_server_metrics
+    from ..usage_ledger import estimate_api_cost, estimate_per_model_cost
+
+    metrics = get_server_metrics()
+    snapshot = metrics.get_snapshot(scope=scope)
+    per_model = metrics.get_per_model_breakdown(scope=scope)
+    per_model_rows = [
+        {
+            "model_id": model_id,
+            "prompt_tokens": counters.get("prompt_tokens", 0),
+            "completion_tokens": counters.get("completion_tokens", 0),
+            "cached_tokens": counters.get("cached_tokens", 0),
+            "requests": counters.get("requests", 0),
+            "estimated_api_cost_usd": estimate_api_cost(
+                model_id,
+                counters.get("prompt_tokens", 0),
+                counters.get("completion_tokens", 0),
+            ),
+        }
+        for model_id, counters in per_model.items()
+    ]
+
+    return {
+        **snapshot,
+        "scope": scope,
+        "per_model": per_model_rows,
+        "estimated_api_cost_usd": estimate_per_model_cost(per_model),
+    }
+
+
+@router.get("/api/usage/pricing")
+async def get_usage_pricing(is_admin: bool = Depends(require_admin)):
+    """Return the merged cloud-pricing table (built-in defaults + user rows).
+
+    Returns:
+        rows: every pricing row (builtin + user), each tagged with
+            ``source`` ("builtin"/"user") and ``overridden``.
+        user_file: path to the user-editable JSON file backing custom rows.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    table = get_pricing_table()
+    return {
+        "rows": table.rows(include_builtin=True),
+        "user_file": str(table.user_file) if table.user_file else None,
+    }
+
+
+@router.post("/api/usage/pricing")
+async def add_usage_pricing_row(
+    request: PricingRowRequest, is_admin: bool = Depends(require_admin)
+):
+    """Add or update a user cloud-pricing row.
+
+    Args:
+        request: ``match`` (lowercase substring matched against a served
+            model_id), ``input``/``output`` USD-per-1M-token prices, and an
+            optional ``display_name``. A row already present under the same
+            ``match`` (builtin or user) is overwritten.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    try:
+        row = get_pricing_table().add_row(request.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return row
+
+
+@router.delete("/api/usage/pricing/{match}")
+async def delete_usage_pricing_row(
+    match: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove a user cloud-pricing row, restoring any builtin it overrode.
+
+    Args:
+        match: the row's match key. 404 if it only exists as a builtin (or
+            not at all) — nothing user-owned to delete.
+    """
+    from ..usage_ledger import get_pricing_table
+
+    if not get_pricing_table().delete_row(match):
+        raise HTTPException(
+            status_code=404, detail=f"No user pricing row for '{match}'"
+        )
     return {"status": "ok"}
 
 
