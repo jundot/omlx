@@ -130,3 +130,14 @@ tq_batch_memory.md
 .zcode/
 issues.md
 clusterPlan.md
+
+# Expert-streaming bench artifacts (machine-specific measurement outputs)
+bench/results/
+
+# Local knowledge-graph index
+.codegraph/
+
+# Session handoff/plan notes
+HANDOFF-*.md
+PLAN-*.md
+.workbuddy-ai/
