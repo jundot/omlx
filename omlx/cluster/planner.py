@@ -17,7 +17,12 @@ from typing import Any
 
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
-from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
+from .staging import (
+    DEFAULT_REMOTE_PYTHON,
+    home_relative_model_path,
+    is_local_host,
+    run_remote_python,
+)
 from .tensor_strategies import (
     native_shard_is_layer_local,
     supports_model_type,
@@ -1189,14 +1194,19 @@ def remote_model_layout(
 
     The same treatment staging gives shard indexing: the node that has the
     weights runs the identical code and sends its answer back, instead of the
-    answer being worked out by hand and carried across as JSON.
+    answer being worked out by hand and carried across as JSON. ``model_dir``
+    is the coordinator's own absolute (or already-portable) path; it is
+    re-expressed in ``~``-form here, matching ``remote_model_dir``'s contract
+    (#12) — a cross-user cluster has a different ``$HOME`` per Mac, so the
+    coordinator's absolute path names nothing on the peer.
     """
 
+    portable_dir = home_relative_model_path(str(model_dir))
     try:
         payload = run_remote_python(
             ssh_target,
             _REMOTE_LAYOUT_SNIPPET,
-            str(model_dir),
+            portable_dir,
             description="read the model layout",
             python_executable=python_executable,
             timeout=timeout,
@@ -1238,8 +1248,9 @@ def locate_model_layout(
     the one holding a single stage, and the Mac holding the model is whichever
     one it was downloaded to. So every candidate is asked in turn — this node
     first, because that costs no ssh — and the first that can read a complete
-    model is the one that plans. ``model_path`` is the path on every node, so
-    a ``~``-relative one is expanded by each against its own home.
+    model is the one that plans. ``model_path`` is the coordinator's own
+    absolute (or already-portable) path; ``remote_model_layout`` re-expresses
+    it in ``~``-form for each peer to expand against its own home.
     """
 
     refusals: list[str] = []

@@ -237,6 +237,33 @@ def test_the_peer_runs_the_same_layout_code(monkeypatch):
     assert layout.supports_pipeline
 
 
+def test_remote_model_layout_sends_the_tilde_form_not_the_absolute_path(monkeypatch):
+    """remote_model_layout must own the ~-abbreviation for transit itself
+    (#16), matching remote_model_dir's contract (#7/#12) — callers pass the
+    coordinator's exact absolute path and this function converts it
+    internally, instead of requiring every caller to pre-convert (a cross-user
+    peer has a different $HOME, so the coordinator's absolute path names
+    nothing there)."""
+    monkeypatch.setenv("HOME", "/Users/ranger")
+    captured = {}
+
+    def fake_run(ssh_target, snippet, argument, **kwargs):
+        captured["argument"] = argument
+        return ModelLayout(
+            source="/Users/studio/models/m",
+            fixed_weight_bytes=1024,
+            layer_weight_bytes=(10,),
+            tensor_count=1,
+            supports_pipeline=False,
+        ).to_dict()
+
+    monkeypatch.setattr(planner, "run_remote_python", fake_run)
+
+    remote_model_layout("studio", "/Users/ranger/models/m")
+
+    assert captured["argument"] == "~/models/m"
+
+
 def test_a_peer_that_cannot_read_the_model_fails_as_a_planning_error(monkeypatch):
     def fake_run(*args, **kwargs):
         raise RuntimeError("could not read the model layout on studio: no such file")

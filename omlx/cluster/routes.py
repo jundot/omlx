@@ -94,7 +94,6 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
-    home_relative_model_path,
     index_shards,
     model_staging_inventory,
     plan_staging,
@@ -1568,7 +1567,7 @@ def _run_staging_job(
             }
         else:
             shards, sidecar_sizes = remote_model_staging_inventory(
-                source_host, home_relative_model_path(str(model_path))
+                source_host, str(model_path)
             )
         shard_sizes = {item.name: item.size_bytes for item in shards}
         sidecars = tuple(sorted(sidecar_sizes))
@@ -1580,9 +1579,9 @@ def _run_staging_job(
         # deployment.model is the coordinator's own absolute path. A peer with a
         # different macOS account has a different $HOME, so probing it at that
         # path finds nothing and re-copies the whole model (and then trips the
-        # disk-space check). Resolve each peer's copy in its OWN home from the
-        # portable ~-form.
-        portable_model_path = home_relative_model_path(deployment.model)
+        # disk-space check). Resolve each peer's copy in its OWN home;
+        # remote_model_dir does its own ~-abbreviation for transit (#7), so it
+        # must receive the exact absolute path here, not a pre-abbreviated one.
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
             if _local_ssh_target(host.ssh):
@@ -1597,7 +1596,7 @@ def _run_staging_job(
                     else {}
                 )
             else:
-                destination_dir = remote_model_dir(host.ssh, portable_model_path)
+                destination_dir = remote_model_dir(host.ssh, str(model_path))
                 present = remote_file_sizes(host.ssh, destination_dir)
             plan = plan_staging(
                 model_path,
