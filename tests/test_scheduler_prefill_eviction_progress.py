@@ -84,3 +84,47 @@ def test_pause_mid_external_prefill_commits_the_progress(mock_tokenizer):
     assert request.cached_tokens == 8, request.cached_tokens
     assert request.remaining_tokens == prompt[8:], request.remaining_tokens
     assert request.prompt_cache is cache
+
+
+def test_pause_on_a_cold_prompt_commits_the_progress_too(mock_tokenizer):
+    """The case the first fix missed: with no restored prefix, the pause restarted at token zero.
+
+    Measured 05/09 on GLM-5.3-Flash oQ2e: a cold 229,923-token prompt was paused at
+    206,336 tokens for headroom (111.76 GB against a 112.48 GB target), the eviction
+    reclaimed 1.56 GB, and the request was re-admitted as new (new=229923, kv_exact=0)
+    — 19 minutes of prefill thrown away, with nothing preventing the same at 206k again.
+    The locally built cache has to go onto the request, which is where the retry reads it.
+    """
+    model = _CountingModel()
+    scheduler = Scheduler(
+        model=model, tokenizer=mock_tokenizer, config=SchedulerConfig(prefill_step_size=4)
+    )
+    prompt = list(range(100, 116))
+    request = Request(request_id="req-cold", prompt=prompt, sampling_params=SamplingParams())
+    request.prompt_token_ids = prompt
+    request.num_prompt_tokens = len(prompt)
+    request.cached_tokens = 0
+    request.remaining_tokens = prompt
+    request.prompt_cache = None
+    scheduler.requests[request.request_id] = request
+
+    calls = {"n": 0}
+    original = scheduler._adaptive_chunk_size
+
+    def throttle_on_third(requested, **kw):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise _PrefillEvictionNeeded(
+                SimpleNamespace(reason="adaptive_prefill_throttle", request_id=request.request_id)
+            )
+        return original(requested, **kw)
+
+    scheduler._adaptive_chunk_size = throttle_on_third
+    with pytest.raises(_PrefillEvictionNeeded):
+        scheduler._do_external_prefill(request, prompt, None)
+
+    # two chunks of 4 went in before the pause; the cache must be ON THE REQUEST
+    assert request.prompt_cache is not None
+    assert request.prompt_cache[0].offset == 8
+    assert request.cached_tokens == 8, request.cached_tokens
+    assert request.remaining_tokens == prompt[8:], request.remaining_tokens

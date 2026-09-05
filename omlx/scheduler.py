@@ -3619,7 +3619,22 @@ class Scheduler:
                 # stored from there on misaligned — the next prefix hit
                 # generates garbage (GLM-5.3, 02/09, only reachable when the
                 # MTP head's memory pushed the throttle into a paused chunk).
-                if existing_cache is not None and processed_tokens > 0:
+                #
+                # A COLD prompt has to commit too. The restored-prefix case was
+                # the one measured in 02/09, so the commit was gated on
+                # ``existing_cache``; a cold prompt builds ``prompt_cache``
+                # locally, the pause dropped it with this exception, and the
+                # retry started from token zero. Measured 05/09 on GLM-5.3-Flash
+                # oQ2e: a 229.923-token prompt was paused at 206.336 tokens
+                # ("needs prefill headroom ... current=111.76GB target=112.48GB"),
+                # the eviction reclaimed 1,56 GB, and the request was re-admitted
+                # as ``new=229923 kv_exact=0`` — 19 minutes of prefill thrown
+                # away, and nothing stops it from happening again at the same
+                # point. Attaching the advanced cache to the request is what the
+                # retry path already reads (``cache_to_use = request.prompt_cache``).
+                if processed_tokens > 0:
+                    if existing_cache is None:
+                        request.prompt_cache = prompt_cache
                     request.cached_tokens = (
                         int(getattr(request, "cached_tokens", 0) or 0) + processed_tokens
                     )
