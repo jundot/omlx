@@ -16,8 +16,8 @@ struct ListModelsResponse: Codable, Sendable {
 }
 
 /// Live MoE expert-streaming health for a loaded engine: LRU hit-rate,
-/// prefetch precision, stash, governor state and the effective cache
-/// policy. Every field is optional — the server reports what it has.
+/// governor state and the effective cache policy. Every field is optional —
+/// the server reports what it has.
 struct StreamingHealthDTO: Codable, Equatable, Sendable {
     let lruHitRate: Double?
     let lruHits: Int?
@@ -25,13 +25,6 @@ struct StreamingHealthDTO: Codable, Equatable, Sendable {
     let lruEvictions: Int?
     let lruSize: Int?
     let lruCapacity: Int?
-    let prefetchPrecision: Double?
-    let prefetchSubmissions: Int?
-    let prefetchConsumed: Int?
-    let prefetchDropped: Int?
-    let stashHitRate: Double?
-    let stashHits: Int?
-    let stashMisses: Int?
     let advised: Int?
     let cachePolicy: String?
     let dynamicEnabled: Bool?

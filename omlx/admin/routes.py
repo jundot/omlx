@@ -148,7 +148,6 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_coalesce: bool | None = None
     expert_streaming_readahead: bool | None = None
     expert_streaming_seed: bool | None = None
-    expert_streaming_pilot: bool | None = None
     expert_streaming_per_layer_eval: bool | None = None
     expert_streaming_pins: bool | None = None
     expert_streaming_pin_gib: float | None = None
@@ -503,7 +502,7 @@ def _expert_streaming_health(engine_pool: Any, model_id: str) -> dict | None:
     """Runtime MoE streaming health for a *loaded* engine, or None.
 
     Aggregates the counters the streaming implementation already keeps
-    (LRU hit-rate, prefetch precision, stash, governor state) plus the
+    (LRU hit-rate, advisor, governor state) plus the
     effective cache policy, so the dashboard and the Mac app can show
     live health next to each loaded streaming model. Cheap: reads dicts
     that are maintained anyway; never raises.
@@ -2150,7 +2149,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 getattr(_est, "per_expert_bytes_effective", 0) or 0
             ),
             # Runtime health for loaded streaming engines: LRU hit-rate,
-            # prefetch precision, stash, transition table, governor state.
+            # advisor, transition table, governor state.
             # Cheap (dict already maintained); null when not applicable.
             "expert_streaming_health": _expert_streaming_health(
                 engine_pool, model_id
@@ -2548,8 +2547,6 @@ async def update_model_settings(
         current_settings.expert_streaming_readahead = request.expert_streaming_readahead
     if "expert_streaming_seed" in sent:
         current_settings.expert_streaming_seed = request.expert_streaming_seed
-    if "expert_streaming_pilot" in sent:
-        current_settings.expert_streaming_pilot = request.expert_streaming_pilot
     if "expert_streaming_per_layer_eval" in sent:
         current_settings.expert_streaming_per_layer_eval = (
             request.expert_streaming_per_layer_eval
@@ -5789,8 +5786,8 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
-                # Live MoE streaming health (LRU hit-rate, prefetch
-                # precision, governor) when this loaded model streams experts.
+                # Live MoE streaming health (LRU hit-rate, advisor,
+                # governor) when this loaded model streams experts.
                 "expert_streaming_health": _expert_streaming_health(
                     engine_pool, model_id
                 ),

@@ -700,8 +700,8 @@ def segment_runs(
 ) -> list[tuple[int, int]]:
     """Split ascending expert ids into (first, count) runs (Fase K K2).
 
-    ONE shared segmentation for the demand path (_group_runs), the stash
-    planner, the advisor and read_expert_into, so the four callers can never
+    ONE shared segmentation for the demand path (_group_runs), the
+    advisor and read_expert_into, so the three callers can never
     diverge again: a run groups CONSECUTIVE ids while ``same(first, nxt)``
     holds (reader identity for tier-aware paths; tier match for the demand
     fallback).
@@ -1464,7 +1464,7 @@ each key to its shard filename, so stacked banks spilled outside the
             # merge_gap missing ids — the hole rows are read with the run
             # but the scatter below writes ONLY the demanded ids, so gap
             # bytes can never enter the output (or the LRU). Same shared
-            # segmentation as the demand planner and the stash.
+            # segmentation as the demand planner and the advisor.
             order = sorted(range(n), key=lambda j: eids[j])
             sorted_ids = [eids[j] for j in order]
             segments = segment_runs(sorted_ids, merge_gap=merge_gap)
@@ -1823,9 +1823,9 @@ each key to its shard filename, so stacked banks spilled outside the
         return len(self._pinned)
 
     def close(self) -> None:
-        # Fase K K1: drain the speculation workers before the readers die —
-        # a live stash future would read from closed files or, worse, write
-        # stale bytes into a ring past its owning engine's lifetime.
+        # Fase K K1: stop speculation before the readers die — a live
+        # advisor would otherwise reference closed files past its owning
+        # engine's lifetime.
         spec = getattr(self, "spec_state", None)
         if spec is not None:
             try:

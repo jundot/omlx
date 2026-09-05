@@ -35,7 +35,6 @@ CRITICAL_FIELDS = (
     "prefill_qd",
     "run_merge_gap",
     "ra_enabled",
-    "stash_enabled",
     "pins_enabled",
     "pin_sync_effective",
     "pin_regime_effective",

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warm-only page-cache prefetch and mlock pinning for streamed experts.
+"""F_RDADVISE readahead and mlock pinning for streamed experts.
 
 Both mechanisms exploit the page-cache-only streaming default (no LRU):
 the OS file cache holds recently read expert pages, and reuse is served
@@ -7,11 +7,12 @@ from RAM at memory bandwidth instead of the NVMe.
 
 PageCacheWarmer
     During decode, right before a MoE layer loads its experts, submit
-    discarded reads for the PREVIOUS token's experts of the NEXT layer.
-    Independent per-layer routing repeats ~35% of experts across adjacent
-    tokens (measured on FlashNext-class checkpoints); those reads hit RAM
-    when the next layer demands them. Results are discarded — nothing is
-    stored, no heap, no LRU.
+    F_RDADVISE kernel readahead hints for the PREVIOUS token's experts of
+    the NEXT layer. Independent per-layer routing repeats ~35% of experts
+    across adjacent tokens (measured on FlashNext-class checkpoints); the
+    kernel prefetches those pages so the next layer's demand reads hit
+    RAM. Hints only — nothing is stored, no heap, no LRU, no userspace
+    copy.
 
 PinController
     Observe routed experts for the first N decode calls, then mlock the
@@ -20,8 +21,9 @@ PinController
     become wired memory — they cannot be evicted. This substitutes a hot
     set for the LRU at a fraction of the accounting cost.
 
-Both are opt-in via OMLX_EXPERT_STREAMING_WARM=1 / _PIN=1 and decode-only
-(gated on routing row count).
+Readahead and seeding default on (OMLX_EXPERT_STREAMING_RA/_SEED=0
+disables); pinning is opt-in via _PIN=1. All are decode-only (gated on
+routing row count).
 """
 
 from __future__ import annotations
@@ -40,7 +42,6 @@ logger = logging.getLogger(__name__)
 # A small prompt (<= this many rows) may warm needlessly once — bounded waste.
 _MAX_WARM_ROWS = 64
 
-WARM_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_WARM", "0") == "1"
 PIN_ENABLED = os.environ.get("OMLX_EXPERT_STREAMING_PIN", "0") == "1"
 # F_RDADVISE readahead (Fase G): same prediction flow as the read-warmer,
 # but the submitted jobs are kernel readahead hints instead of discarded
@@ -103,30 +104,25 @@ def _proj_keys(linear: Any) -> list[str]:
 
 
 class PageCacheWarmer:
-    """Fire-and-forget reads of the previous token's next-layer experts.
-
-    With ``advise_only`` the jobs become F_RDADVISE kernel readahead hints
-    (grouped per contiguous expert run) instead of discarded reads: same
-    prediction, zero data copied into userspace.
+    """F_RDADVISE kernel readahead for the previous token's next-layer
+    experts, grouped per contiguous expert run: same prediction flow as
+    the removed warm-only discarded-read arm, zero data copied into
+    userspace.
     """
 
-    def __init__(self, linears_by_layer: Dict[int, list], *, advise_only: bool = False):
+    def __init__(self, linears_by_layer: Dict[int, list]):
         self.linears_by_layer = linears_by_layer
         self.keys_by_layer: Dict[int, dict[int, list[str]]] = {
             layer: {id(lin): _proj_keys(lin) for lin in linears}
             for layer, linears in linears_by_layer.items()
         }
         self.last_uniq: Dict[int, list[int]] = {}
-        self.warmed = 0
-        self.warm_s = 0.0
         self.advised = 0
         self.advised_bytes = 0
         self.advise_failures = 0
-        self.advise_only = advise_only
-        self._inflight: set = set()
 
     def on_layer_start(self, layer_idx: int, positions: int) -> None:
-        """Fire the next layer's previous-token warm reads before this
+        """Fire the next layer's previous-token readahead hints before this
         layer's demand loads (maximum overlap with GPU compute)."""
         if positions > _MAX_WARM_ROWS:
             return
@@ -138,68 +134,39 @@ class PageCacheWarmer:
                 self._submit(prev, linears, nxt)
 
     def on_layer_plan(self, layer_idx: int, uniq_list: list[int], positions: int) -> None:
-        """Record this token's expert set for the next token's warm pass."""
+        """Record this token's expert set for the next token's advisory."""
         self.last_uniq[layer_idx] = [] if positions > _MAX_WARM_ROWS else list(uniq_list)
 
     def _submit(self, eids: list[int], linears: list, layer_idx: int) -> None:
         backing = getattr(linears[0], "backing", None)
         if backing is None:
             return
-        if self.advise_only:
-            if not hasattr(backing, "advise_expert_run"):
-                return
-            jobs = [
-                (key, eids)
-                for lin in linears
-                for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), [])
-            ]
-            if not jobs:
-                return
-
-            def _run():
-                for key, ids in jobs:
-                    # ids come from np.unique (ascending): group contiguous runs.
-                    start = None
-                    prev_id = None
-                    for eid in ids:
-                        if start is None:
-                            start = prev_id = eid
-                            continue
-                        if eid == prev_id + 1:
-                            prev_id = eid
-                            continue
-                        self._advise_one(backing, key, start, prev_id - start + 1)
-                        start = prev_id = eid
-                    if start is not None:
-                        self._advise_one(backing, key, start, prev_id - start + 1)
-
-            _WARM_POOL.submit(_run)
+        if not hasattr(backing, "advise_expert_run"):
             return
-
-        if not hasattr(backing, "load_expert_slice"):
-            return
-        jobs = []
-        for lin in linears:
-            for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), []):
-                for eid in eids:
-                    jobs.append((key, eid))
+        jobs = [
+            (key, eids)
+            for lin in linears
+            for key in self.keys_by_layer.get(layer_idx, {}).get(id(lin), [])
+        ]
         if not jobs:
             return
 
         def _run():
-            t0 = time.perf_counter()
-            for key, eid in jobs:
-                if (key, eid) in self._inflight:
-                    continue
-                self._inflight.add((key, eid))
-                try:
-                    backing.load_expert_slice(key, eid)
-                except Exception:
-                    pass
-                finally:
-                    self._inflight.discard((key, eid))
-            self.warmed += len(jobs)
-            self.warm_s += time.perf_counter() - t0
+            for key, ids in jobs:
+                # ids come from np.unique (ascending): group contiguous runs.
+                start = None
+                prev_id = None
+                for eid in ids:
+                    if start is None:
+                        start = prev_id = eid
+                        continue
+                    if eid == prev_id + 1:
+                        prev_id = eid
+                        continue
+                    self._advise_one(backing, key, start, prev_id - start + 1)
+                    start = prev_id = eid
+                if start is not None:
+                    self._advise_one(backing, key, start, prev_id - start + 1)
 
         _WARM_POOL.submit(_run)
 
@@ -540,54 +507,6 @@ def _infer_per_expert_bytes(linears_by_layer: Dict[int, list], backing: Any) -> 
                 except Exception:
                     pass
     return 0
-
-
-def deterministic_warmup(
-    linears_by_layer: Dict[int, list],
-    backing: Any,
-    *,
-    budget_bytes: int,
-    num_experts: int,
-    max_rows: int = 64,
-) -> int:
-    """Control-arm warmup: fire discarded reads of an evenly spread expert
-    subset per layer until the byte budget is spent.
-
-    The first request's routing is unpredictable, so a deterministic sweep
-    has no correlation with what it needs — this measures exactly that
-    (expected ~0 gain). Returns the number of read jobs submitted.
-    """
-    if num_experts <= 0 or budget_bytes <= 0:
-        return 0
-    per_expert = max(
-        (getattr(l, "_per_expert_hint", 0) for ls in linears_by_layer.values() for l in ls),
-        default=0,
-    )
-    if per_expert <= 0:
-        per_expert = _infer_per_expert_bytes(linears_by_layer, backing)
-    if per_expert <= 0:
-        return 0
-    per_layer = max(1, budget_bytes // max(len(linears_by_layer), 1) // per_expert)
-    stride = max(1, num_experts // max(per_layer, 1))
-    eids = list(range(0, num_experts, stride))[:per_layer]
-    jobs = []
-    for linears in linears_by_layer.values():
-        for lin in linears:
-            for key in _proj_keys(lin):
-                for eid in eids:
-                    jobs.append((key, eid))
-    if not jobs:
-        return 0
-
-    def _run():
-        for key, eid in jobs:
-            try:
-                backing.load_expert_slice(key, eid)
-            except Exception:
-                pass
-
-    _WARM_POOL.submit(_run)
-    return len(jobs)
 
 
 class PrefillHotnessRecorder:

@@ -199,7 +199,6 @@ def _effective_config(
         "prefill_qd": int(prefill_qd),
         "run_merge_gap": int(_ss._RUN_MERGE_GAP),
         "ra_enabled": bool(_warmer_mod.RA_ENABLED),
-        "stash_enabled": bool(_ss._STASH_ENV),
         "pins_enabled": bool(pins),
         "pin_sync_effective": bool(
             getattr(pinner, "pin_sync", False) if pinner is not None else False
@@ -212,7 +211,6 @@ def _effective_config(
         "read_sampling_mode": "profile" if _prof else "off",
         "cache_cool_protocol": "warm-page-cache",
         "cache_policy": str(getattr(_ss, "_CACHE_POLICY_ENV", "lru")),
-        "pilot_enabled": os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1",
         "transition_overfetch": os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0",
         "experiment_knobs": list(knobs or []),
         "active_engines": int(
@@ -275,7 +273,6 @@ _REQUIRED_EFFECTIVE_CONFIG_FIELDS = (
     "prefill_qd",
     "run_merge_gap",
     "ra_enabled",
-    "stash_enabled",
     "pins_enabled",
     "profile_enabled",
     "memtrace_enabled",
@@ -354,7 +351,6 @@ async def run(
     pins: bool = False,
     mtp_block: int | None = None,
     ane: bool = False,
-    warm_control: float = 0.0,
     mem_ceiling: float = 28.0,
     specprefill_draft: str | None = None,
     specprefill_keep: float | None = None,
@@ -516,50 +512,6 @@ async def run(
 
     vlm_model = getattr(engine, "_vlm_model", None)
     cache = find_streaming_cache(vlm_model)
-    if warm_control:
-        # E3 control arm: deterministic warmup (evenly spread experts) fired
-        # post-load. Uncorrelated with the first request's routing by design.
-        from omlx.patches.expert_streaming import warmer as _warmer
-
-        linears_by_layer: dict[int, list] = {}
-        layers = None
-        for path in [
-            ("language_model", "model", "layers"),
-            ("language_model", "layers"),
-            ("model", "layers"),
-            ("layers",),
-        ]:
-            cur = vlm_model
-            ok = True
-            for a in path:
-                if not hasattr(cur, a):
-                    ok = False
-                    break
-                cur = getattr(cur, a)
-            if ok and cur is not None and len(cur) > 0:
-                layers = cur
-                break
-        if layers is not None:
-            for i, layer in enumerate(layers):
-                moe = getattr(layer, "mlp", None) or getattr(layer, "ffn", None)
-                sm = getattr(moe, "switch_mlp", None)
-                if sm is not None:
-                    linears_by_layer[i] = [
-                        getattr(sm, p)
-                        for p in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
-                        if hasattr(sm, p)
-                    ]
-        lin0 = next((l for ls in linears_by_layer.values() for l in ls), None)
-        backing = getattr(lin0, "backing", None)
-        if backing is not None:
-            jobs = _warmer.deterministic_warmup(
-                linears_by_layer,
-                backing,
-                budget_bytes=int(warm_control * 1024**3),
-                num_experts=512,
-            )
-            time.sleep(3.0)  # let the 4-thread warm pool drain
-            print(f"warm-control: {jobs} discard-reads fired")
     # Reference chunk schedule for bit-exactness (B4): fixed per prompt_len
     # so that divergence from different step sizes is explicit and comparable.
     _CHUNK_SCHEDULE_REF = {"short": 512, "512": 512, "2k": 1024, "8k": 4096}
@@ -578,7 +530,6 @@ async def run(
         "mtp": mtp,
         "mtp_block": mtp_block,
         "ane": ane,
-        "warm_control_gib": warm_control,
         "prompt_len": prompt_len,
         "single_request": single_request,
         "chunk_schedule": chunk_schedule,
@@ -823,12 +774,9 @@ async def run(
             profile = cache.profile.report()
             print(f"profile totals {profile['totals']}")
         # PILOT prefetcher stats (attached on language_model.model or wrapper)
-        # Two independent walks: a holder can carry the prefetcher, the
-        # MTP accept counters, both, or neither - breaking on the first
-        # match of either would hide the other. The adapter counters live
-        # on the VLMModelAdapter (engine._adapter / engine.model), while
-        # the prefetcher attaches to language_model.model - walk both.
-        pf = None
+        # The MTP accept counters live on the VLMModelAdapter
+        # (engine._adapter / engine.model); native Lightning MTP does not
+        # go through them, leaving None there.
         mtp_adapter_stats = None
         _holders = (
             getattr(vlm_model, "language_model", None),
@@ -838,21 +786,12 @@ async def run(
             vlm_model,
         )
         for holder in _holders:
-            if pf is None:
-                cand = getattr(holder, "_expert_prefetcher", None)
-                if cand is not None:
-                    pf = cand
             if mtp_adapter_stats is None:
-                # VLMModelAdapter (omlx/models/vlm.py) carries the accept
-                # counters; native Lightning MTP does not, leaving None.
                 cand2 = getattr(holder, "mtp_stats", None)
                 if isinstance(cand2, dict) and cand2.get("cycles", 0) > 0:
                     mtp_adapter_stats = dict(cand2)
-            if pf is not None and mtp_adapter_stats is not None:
+            if mtp_adapter_stats is not None:
                 break
-        if pf is not None:
-            pf_stats = dict(pf.stats)
-            print(f"prefetcher {pf_stats}")
         if mtp_adapter_stats is not None:
             print(f"mtp accept {mtp_adapter_stats}")
         # Chain-level aggregate (authoritative): the batch_generator logs
@@ -869,8 +808,8 @@ async def run(
                     print(f"mtp chain {chain_mtp_stats}")
             except Exception:
                 chain_mtp_stats = None
-        # Fase K F3: export the O2 F_RDADVISE/stash speculation counters so
-        # the readahead coverage is measurable (advised experts, stash hits).
+        # Fase K F3: export the O2 F_RDADVISE speculation counters so
+        # the readahead coverage is measurable (advised experts).
         # K1: the counters live on the per-conversion SpeculationState.
         try:
             _cache_spec = getattr(cache, "spec_state", None)
@@ -1065,7 +1004,6 @@ def main():
                     help="draft model path for SpecPrefill (scores the prompt and prefills only the important tokens)")
     ap.add_argument("--specprefill-keep", type=float, default=None, metavar="PCT",
                     help="keep rate for SpecPrefill (default 0.2)")
-    ap.add_argument("--warm-control", type=float, default=0.0, metavar="GIB", help="post-load deterministic warmup budget")
     ap.add_argument("--pin-gib", type=float, default=None, metavar="GIB",
                     help="pin budget for --pins arms (default 0.25) — L2 matrix: 0.25/0.5/1.25")
     ap.add_argument("--knob", action="append", default=None, metavar="KNOB",
@@ -1104,11 +1042,6 @@ def main():
              "(page-cache-only budgets ignore it). A/B vs lru.",
     )
     ap.add_argument(
-        "--pilot", action="store_true",
-        help="FU3: enable PILOT router-lookahead prefetch (glm5_next hook; "
-             "no-op where no model-loop hook exists). A/B vs off.",
-    )
-    ap.add_argument(
         "--no-transition", action="store_true",
         help="FU1: disable the transition-table k+1 overfetch in the RA "
              "advisor (A/B arm).",
@@ -1118,8 +1051,6 @@ def main():
     # read at import time). All omlx imports in this file are lazy, so
     # main-time mutation is in time.
     os.environ["OMLX_EXPERT_STREAMING_CACHE"] = args.cache_policy
-    if args.pilot:
-        os.environ["OMLX_EXPERT_STREAMING_PILOT"] = "1"
     if args.no_transition:
         os.environ["OMLX_EXPERT_STREAMING_TRANSITION"] = "0"
     try:
@@ -1152,7 +1083,6 @@ def main():
             ane=args.ane,
             specprefill_draft=args.specprefill,
             specprefill_keep=args.specprefill_keep,
-            warm_control=args.warm_control,
             mem_ceiling=args.mem_ceiling_gib,
             out_dir=args.out_dir,
             single_request=args.single_request,

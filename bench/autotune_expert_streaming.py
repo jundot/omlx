@@ -56,7 +56,6 @@ class Knobs:
     coalesce: bool = True
     readahead: bool = True
     seed: bool = True
-    pilot: bool = False
     topk: float | None = None
     prior: float = 0.0
     cold_tier: str | None = None
@@ -69,7 +68,6 @@ class Knobs:
             f"c{int(self.coalesce)}",
             f"ra{int(self.readahead)}",
             f"s{int(self.seed)}",
-            f"p{int(self.pilot)}",
         ]
         if self.topk is not None:
             parts.append(f"tk{self.topk:g}")
@@ -88,7 +86,6 @@ class Knobs:
             "OMLX_EXPERT_STREAMING_COALESCE": "1" if self.coalesce else "0",
             "OMLX_EXPERT_STREAMING_RA": "1" if self.readahead else "0",
             "OMLX_EXPERT_STREAMING_SEED": "1" if self.seed else "0",
-            "OMLX_EXPERT_STREAMING_PILOT": "1" if self.pilot else "0",
             # Hermeticity: pin the fidelity fallback per trial so an ambient
             # shell export cannot leak into base/calibration trials (audit).
             "OMLX_EXPERT_STREAMING_CACHE_PRIOR": str(float(self.prior)),
@@ -102,7 +99,6 @@ class Knobs:
             "expert_streaming_coalesce": bool(self.coalesce),
             "expert_streaming_readahead": bool(self.readahead),
             "expert_streaming_seed": bool(self.seed),
-            "expert_streaming_pilot": bool(self.pilot),
             "expert_streaming_topk_threshold": self.topk,
             "expert_streaming_cache_prior": (float(self.prior) if self.prior > 0 else None),
             "expert_streaming_cold_tier": self.cold_tier,
@@ -111,12 +107,11 @@ class Knobs:
 
 
 # Coordinate-descent sweep order: biggest measured lever first.
-KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "pilot", "coalesce", "readahead", "seed", "topk", "prior", "cold_tier")
+KNOB_SWEEP_ORDER = ("budget_gib", "io_depth", "coalesce", "readahead", "seed", "topk", "prior", "cold_tier")
 
 KNOB_ATTRS = {
     "budget_gib": "budget_gib",
     "io_depth": "io_depth",
-    "pilot": "pilot",
     "coalesce": "coalesce",
     "readahead": "readahead",
     "seed": "seed",

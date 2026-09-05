@@ -154,7 +154,9 @@ class VLMModelAdapter(nn.Module):
         """
         fn = getattr(self._language_model, "mtp_partial_rollback", None)
         if not callable(fn):
-            self.mtp_stats["fallbacks"] += 1
+            stats = getattr(self, "mtp_stats", None)
+            if isinstance(stats, dict):
+                stats["fallbacks"] += 1
             return False
         return fn(caches, accepted, num_drafts)
 
@@ -179,8 +181,20 @@ class VLMModelAdapter(nn.Module):
         return clamped
 
     def _record_mtp_accept(self, accepted: int, drafted: int) -> None:
-        """One verify cycle: accepted positions out of drafted proposals."""
-        stats = self.mtp_stats
+        """One verify cycle: accepted positions out of drafted proposals.
+
+        Defensive against instances built without __init__ (tests,
+        partial adapters): telemetry never turns a missing hook into
+        a failure.
+        """
+        stats = getattr(self, "mtp_stats", None)
+        if not isinstance(stats, dict):
+            stats = self.mtp_stats = {
+                "cycles": 0,
+                "accepted": 0,
+                "drafted": 0,
+                "fallbacks": 0,
+            }
         stats["cycles"] += 1
         stats["accepted"] += max(0, accepted)
         stats["drafted"] += max(0, drafted)

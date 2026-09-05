@@ -3849,8 +3849,7 @@ class VLMBatchedEngine(BaseEngine):
                 return
             logger.info(
                 "expert_streaming req prompt=%d completion=%d lru_hit=%.3f "
-                "(h=%d m=%d evict=%d size=%d/%d) prefetch_prec=%.3f "
-                "(sub=%d con=%d drop=%d) stash_hit=%.3f (h=%d m=%d adv=%d) "
+                "(h=%d m=%d evict=%d size=%d/%d) advised=%d "
                 "ctx_fallbacks=%s",
                 prompt_tokens,
                 completion_tokens,
@@ -3860,13 +3859,6 @@ class VLMBatchedEngine(BaseEngine):
                 summary.get("lru_evictions", 0),
                 summary.get("lru_size", 0),
                 summary.get("lru_capacity", 0),
-                summary.get("prefetch_precision", 0.0),
-                summary.get("prefetch_submissions", 0),
-                summary.get("prefetch_consumed", 0),
-                summary.get("prefetch_dropped", 0),
-                summary.get("stash_hit_rate", 0.0),
-                summary.get("stash_hits", 0),
-                summary.get("stash_misses", 0),
                 summary.get("advised", 0),
                 summary.get("ctx_fallbacks", {}),
             )

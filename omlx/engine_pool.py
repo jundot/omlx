@@ -924,7 +924,6 @@ class EnginePool:
                     "expert_streaming_coalesce",
                     "expert_streaming_readahead",
                     "expert_streaming_seed",
-                    "expert_streaming_pilot",
                     "expert_streaming_per_layer_eval",
                     "expert_streaming_pins",
                     "expert_streaming_pin_gib",
@@ -1937,9 +1936,10 @@ class EnginePool:
             # Resolve budget_auto before accounting: the auto LRU grows
             # resident size, so admission must see the same effective
             # settings the loader will use (else it admits by the smaller
-            # page-cache-only size and the load over-commits).
+            # page-cache-only size and the load over-commits). Base on
+            # load_settings so the qwen4 SSD-offload override is priced too.
             admission_settings = self._effective_expert_streaming_settings(
-                entry, admission_settings
+                entry, load_settings
             )
             admission_size = self._entry_runtime_resident_size(
                 entry,

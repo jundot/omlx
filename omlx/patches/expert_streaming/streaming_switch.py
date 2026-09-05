@@ -155,14 +155,11 @@ _ADMISSION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION", "") == "1"
 _ADMISSION_WINDOW_ENV = int(os.environ.get("OMLX_EXPERT_STREAMING_ADMISSION_WINDOW", "0") or 0)
 _ADMISSION_WINDOW = 1024
 
-# O2 cross-layer speculation (G2 F_RDADVISE + stash). RA is default-on (like G2)
+# O2 cross-layer speculation (G2 F_RDADVISE). RA is default-on (like G2)
 # and can be disabled with OMLX_EXPERT_STREAMING_RA=0. When enabled, each
-# MoE layer advises (or stashes, if OMLX_EXPERT_STREAMING_STASH=1) the next
-# layer's previous-token experts via F_RDADVISE so the NVMe fetch overlaps
-# compute. The stash is a small ring (<=256 experts total, ~650 MB worst)
-# that bypasses the LRU and never blocks demand reads: the advisor submits
-# the speculated runs to the IO pool (async) and the worker stores the raw
-# NumPy bundles into the ring, so a later demand gets them without disk I/O.
+# MoE layer advises the next layer's previous-token experts via F_RDADVISE
+# so the NVMe fetch overlaps compute. Hints only: nothing is copied into
+# userspace and the LRU is untouched.
 #
 # Fase K F1: the advisor targets the NEXT layer's banks (ids come from
 # spec_state.prev_uniq_by_layer[next_layer]); the F_RDADVISE key must be
@@ -170,125 +167,27 @@ _ADMISSION_WINDOW = 1024
 # registry (spec_state.linears_by_layer), never __self__'s key — the old
 # port advised the CURRENT layer's byte range for the NEXT layer's ids
 # (warmed the wrong bytes, and under the HOBBIT split applied the wrong
-# hot-set routing). K1: the whole speculation state (ring, history,
+# hot-set routing). K1: the whole speculation state (history,
 # registry, stats, pending futures) is PER CONVERSION — it hangs off the
-# cache/backing and dies with them, so two engines never share bytes.
+# cache/backing and dies with them, so two engines never share state.
 # Fase K F2: the advisory is guarded like the warmer G2 (_MAX_ADVISE_ROWS)
 # and deduped per layer call (_RemapPlan.advised_runs) so the 3 projections
 # of one layer issue each next-layer run at most once.
 _RA_ENV = os.environ.get("OMLX_EXPERT_STREAMING_RA", "") != "0"
-_STASH_ENV = os.environ.get("OMLX_EXPERT_STREAMING_STASH", "") == "1"
-_STASH_MAX_ENTRIES = 256
 
-# ---------------------------------------------------------------------------
-# Slot-bank (spike, docs/spike-slot-bank.md). OMLX_EXPERT_STREAMING_SLOT_BANK=1
-# enables a device-side resident bank of S slots per (layer, projection):
-# hits index the bank directly as the gather_qmm operand (zero per-call copy -
-# no take, no stack), misses fill a slot once via row-assign and the slot
-# becomes the resident copy. Sized from the measured SCH curve: 16 slots/layer
-# is the knee (65% of the oracle ceiling), 64 saturates (~77.5-77.8%).
-# The llama.cpp #27861 invariant holds by construction: slot remap is
-# per-distinct-expert (one slot per expert in the demand set) - two uncached
-# experts can never alias to the same slot in the same call.
-# ---------------------------------------------------------------------------
-# P3 verdict (audit): SlotBank stays OPT-IN OFF until an A/B proves >2%
-# median decode gain on 2+ checkpoints (fused + split). Rationale: it is a
-# third resident mechanism competing with the LRU + page cache for the
-# same demand population; when the experiment concludes, either promote
-# (drop the 'spike' marks, document the invariant, add a remap test) or
-# delete the class + its 3 call sites. Do not add a fourth mechanism.
-_SLOT_BANK_ENV = os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK", "") == "1"
-_SLOT_BANK_SLOTS = max(0, int(os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK_SLOTS", "16")))
-# Decode-shaped calls only: the arena serves demand sets at or below this
-# many positions. Prefill unions (~199 uniq) would thrash the slots (SCH
-# ceiling 50% — broadcast); 64 covers decode + MTP verify batches (4-8).
-_SLOT_BANK_MAX_POSITIONS = max(
-    0, int(os.environ.get("OMLX_EXPERT_STREAMING_SLOT_BANK_MAX_POS", "64"))
-)
-
-
-class SlotBank:
-    """Device-resident slot arena for one (layer, projection) quantized linear.
-
-    Layout: one mx.array per tensor kind, shape (S, *per_expert_shape) -
-    the exact shape a stacked mini-bank would have, so the arena itself is
-    the gather_qmm operand on the hit path. expert -> slot map lives on the
-    CPU; eviction is true-LRU over slot order (matches ExpertLRUCache's
-    demand-population: a slot survives only while it keeps being hit).
-
-    Multi-token invariant (llama.cpp #27861 lesson): ``lookup`` returns one
-    slot id PER DISTINCT EXPERT. Positions whose expert maps to the same
-    slot share it (repeated take indices are legal and cheaper); a demand
-    set never maps two uncached experts to one slot because insert assigns
-    distinct slots within a call.
-    """
-
-    __slots__ = ("slots", "w", "s", "b", "order", "_lru", "hits", "misses", "evictions", "inserts")
-
-    def __init__(self, slots: int, w_shape, s_shape, b_shape, w_dtype=mx.uint32, s_dtype=mx.float32, b_dtype=mx.float32):
-        self.slots = int(slots)
-        self.w = mx.zeros((self.slots, *w_shape), dtype=w_dtype)
-        self.s = mx.zeros((self.slots, *s_shape), dtype=s_dtype)
-        self.b = mx.zeros((self.slots, *b_shape), dtype=b_dtype) if b_shape else None
-        # expert_id -> slot index (CPU-side, inference thread only)
-        self.order: dict = {}
-        # slot -> expert_id, LRU order
-        self._lru: "OrderedDict[int, int]" = OrderedDict()
-        self.hits = 0
-        self.misses = 0
-        self.evictions = 0
-        self.inserts = 0
-
-    def lookup(self, expert_ids):
-        """Split ids into (slot_of: expert->slot) and missing ids."""
-        slot_of: dict = {}
-        missing: list = []
-        for eid in expert_ids:
-            eid = int(eid)
-            sl = self.order.get(eid)
-            if sl is None:
-                self.misses += 1
-                missing.append(eid)
-            else:
-                self.hits += 1
-                slot_of[eid] = sl
-                self._lru.move_to_end(sl)
-        return slot_of, missing
-
-    def _free_slot(self) -> int:
-        if len(self.order) < self.slots:
-            return len(self.order)
-        slot, victim_eid = next(iter(self._lru.items()))
-        del self._lru[slot]
-        del self.order[victim_eid]
-        self.evictions += 1
-        return slot
-
-    def insert(self, expert_id: int, w_row, s_row, b_row=None) -> int:
-        """Fill a slot with one expert bundle (row-assign, one copy)."""
-        slot = self._free_slot()
-        self.w[slot] = w_row
-        self.s[slot] = s_row
-        if self.b is not None and b_row is not None:
-            self.b[slot] = b_row
-        self.order[expert_id] = slot
-        self._lru[slot] = expert_id
-        self.inserts += 1
-        return slot
 # Fase K F2: hard cap on the advisory row set, matching the warmer G2's
 # _MAX_WARM_ROWS (rows > 64 are prefill-shaped, not decode speculation).
 _MAX_ADVISE_ROWS = 64
 # Fase K correction K1/K7: the O2 advisor's speculation state is PER
 # CONVERSION (one instance per backing/cache pair), never module-global.
 # Two engines (different checkpoints, same tensor keys) can never share
-# ring bytes, routing history or linears registries: the state dies with
+# routing history or linears registries: the state dies with
 # the owning store, and close() drains the speculation workers the same
 # way ExpertBackingStore.close drains its readers.
-_STASH_MAX_PENDING = 2 * _STASH_MAX_ENTRIES
 # FU1: transition-table overfetch. The (layer, expert) -> next-token expert
 # distribution (EWMA, temporal: same layer, token t-1 -> t) feeds the RA
 # advisor with one extra candidate per demanded expert (k+1 overfetch).
-# Hints only (F_RDADVISE/stash), never changes output. 0 disables.
+# Hints only (F_RDADVISE), never changes output. 0 disables.
 _TRANSITION_ENV = os.environ.get("OMLX_EXPERT_STREAMING_TRANSITION", "1") != "0"
 _TRANSITION_TOP = 8  # entries kept per (layer, expert) source
 _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
@@ -297,14 +196,13 @@ _TRANSITION_OVERFETCH = 1  # extra candidates per demanded expert
 class SpeculationState:
     """Per-conversion O2 speculation state (Fase K K1/K7).
 
-    Owns the stash ring (FIFO, bounded), the routing history used by the
-    next-layer advisor, the converted-linears registry, the advise stats,
-    and the in-flight speculation futures. Hangs off ``cache.spec_state``
+    Owns the routing history used by the next-layer advisor, the
+    converted-linears registry, the advise stats, and the transition
+    table. Hangs off ``cache.spec_state``
     (and off ``backing.spec_state`` when the backing is an object) so the
     demand path, the advisor, and backing.close() all share one instance.
-    All mutations are lock-guarded: workers read the disk OUTSIDE the lock
-    and apply insert/evict/stats INSIDE it. Speculation never blocks
-    demand: a full pending queue or a closed state drops submissions.
+    All mutations are lock-guarded. A closed state stops advising so a
+    drained engine never serves another conversion's speculation.
     """
 
     def __init__(self) -> None:
@@ -312,8 +210,6 @@ class SpeculationState:
         self.closed = False
         self.prev_uniq_by_layer: Dict[int, list[int]] = {}
         self.linears_by_layer: Dict[int, list[Any]] = {}
-        self.stash: Dict[Tuple[int, int, str], Any] = {}
-        self.stash_order: list[Tuple[int, int, str]] = []
         self.stats = {
             "advised": 0,
             "advised_runs": 0,
@@ -321,15 +217,7 @@ class SpeculationState:
             "advised_bytes": 0,
             "advice_failures": 0,
             "advice_tier_segments": 0,
-            "stash_hits": 0,
-            "stash_misses": 0,
-            "stash_targets": 0,
-            "stash_inserts": 0,
-            "stash_evictions": 0,
         }
-        self.pending: set[Any] = set()
-        # Fase 5: pending slots reserved before the executor hand-off.
-        self._pending_reserved = 0
         # FU1: transition table (layer, expert) -> {next_expert: weight}.
         # Temporal only (same layer, token t-1 -> t); cross-layer same-token
         # transitions are not observable without a model-loop hook (PILOT
@@ -425,103 +313,24 @@ class SpeculationState:
         except Exception:
             return []
 
-    # -- stash ring (K7: all mutations under one lock) --------------------
-
-    def stash_get(self, key: Tuple[int, int, str]) -> Any:
-        """Demand-path lookup; counts a hit when present (lock-guarded)."""
-        with self.lock:
-            sv = self.stash.get(key)
-            if sv is not None:
-                self.stats["stash_hits"] += 1
-            return sv
-
-    def stash_count_miss(self) -> None:
-        with self.lock:
-            self.stats["stash_misses"] += 1
-
-    def stash_insert(self, key: Tuple[int, int, str], value: Any) -> bool:
-        """Insert one entry under the lock; FIFO evict beyond the bound."""
-        with self.lock:
-            if self.closed or key in self.stash:
-                return False
-            self.stash[key] = value
-            self.stash_order.append(key)
-            self.stats["stash_inserts"] += 1
-            while len(self.stash) > _STASH_MAX_ENTRIES:
-                old = self.stash_order.pop(0)
-                if self.stash.pop(old, None) is not None:
-                    self.stats["stash_evictions"] += 1
-            return True
-
     def bump(self, key: str, amount: int = 1) -> None:
         with self.lock:
             self.stats[key] = self.stats.get(key, 0) + amount
-
-    # -- futures (K7: bounded pending, close drains) ----------------------
-
-    def submit(self, fn: Any) -> bool:
-        """Queue one speculation read; drop silently when full or closed.
-
-        Fase 5: atomically reserves a pending slot UNDER the lock before
-        submitting to the executor — the old check-then-submit window let
-        concurrent callers overshoot the cap between the lock and the
-        executor hand-off. The reservation is released in every path
-        (cancel on close, executor failure, normal completion).
-        """
-        with self.lock:
-            if self.closed or len(self.pending) + self._pending_reserved >= _STASH_MAX_PENDING:
-                return False
-            self._pending_reserved += 1
-        try:
-            fut = _EXPERT_IO_POOL.submit(fn)
-        except Exception:
-            with self.lock:
-                self._pending_reserved -= 1
-            return False
-        with self.lock:
-            if self.closed:
-                self._pending_reserved -= 1
-                fut.cancel()
-                return False
-            self.pending.add(fut)
-            self._pending_reserved -= 1
-        fut.add_done_callback(self._drop_pending)
-        return True
-
-    def _drop_pending(self, fut: Any) -> None:
-        with self.lock:
-            self.pending.discard(fut)
 
     def is_closed(self) -> bool:
         with self.lock:
             return self.closed
 
     def close(self) -> None:
-        """Stop speculation: cancel unscheduled work, drain running reads.
+        """Stop speculation: mark closed and clear the per-conversion state.
 
-        Idempotent. The stash, routing history and registry are cleared so a
-        closed state can never serve stale bytes to another conversion.
+        Idempotent. The routing history and registry are cleared so a
+        closed state can never serve another conversion's speculation.
         """
         with self.lock:
             if self.closed:
                 return
             self.closed = True
-            futs = list(self.pending)
-            self.pending.clear()
-            self._pending_reserved = 0
-        if futs:
-            for fut in futs:
-                if not fut.running():
-                    fut.cancel()
-            try:
-                from concurrent.futures import wait
-
-                wait(futs, timeout=3.0)
-            except Exception:
-                pass
-        with self.lock:
-            self.stash.clear()
-            self.stash_order.clear()
             self.prev_uniq_by_layer.clear()
             self.linears_by_layer.clear()
 
@@ -907,19 +716,10 @@ class ExpertLRUCache:
             return -1
 
     def get(self, key: tuple[int, int, str]) -> Any | None:
-        # O2 stash check (decode speculation) - bypasses LRU, never counts as miss
-        spec = self.spec_state if _STASH_ENV else None
-        if _RA_ENV and spec is not None:
-            sv = spec.stash_get(key)
-            if sv is not None:
-                return sv
-            # Miss counter incremented below after the store miss.
         if key in self._store:
             self._store.move_to_end(key)
             self.stats.hits += 1
             return self._store[key]
-        if _RA_ENV and spec is not None:
-            spec.stash_count_miss()
         self.stats.misses += 1
         return None
 
@@ -1025,7 +825,7 @@ class S3FIFOExpertCache(ExpertLRUCache):
     prefill demand), where S3-FIFO's scan resistance wins: a small FIFO
     filters one-hit wonders, the main queue holds reuse, and a ghost
     queue promotes re-referenced entries (2nd chance). Per-layer caps,
-    admission filter, retain_hot, stats and the stash/spec hooks are
+    admission filter, retain_hot, stats and the spec hooks are
     inherited unchanged — only the global eviction order differs.
     Select with OMLX_EXPERT_STREAMING_CACHE=s3fifo (default lru).
     """
@@ -1062,11 +862,6 @@ class S3FIFOExpertCache(ExpertLRUCache):
         return key in self._small or key in self._store
 
     def get(self, key: tuple[int, int, str]) -> Any | None:
-        spec = self.spec_state if _STASH_ENV else None
-        if _RA_ENV and spec is not None:
-            sv = spec.stash_get(key)
-            if sv is not None:
-                return sv
         if key in self._small:
             # Promote small -> main on re-reference (frequency signal).
             val = self._small.pop(key)
@@ -1077,8 +872,6 @@ class S3FIFOExpertCache(ExpertLRUCache):
             self._store.move_to_end(key)
             self.stats.hits += 1
             return self._store[key]
-        if _RA_ENV and spec is not None:
-            spec.stash_count_miss()
         self.stats.misses += 1
         return None
 
@@ -2237,63 +2030,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                         pass
                     self.cache.put(key, bundle)  # type: ignore[arg-type]
                     return bundle  # type: ignore[return-value]
-        # prefetch staging: worker already read the np slices — promote here
-        # (inference thread) instead of re-reading from the backing.
-        pf = getattr(self, "_prefetcher", None)
-        if pf is not None:
-            t_st = time.perf_counter()
-            staged = pf.take(key)
-            if staged is not None:
-                dt = self._slice_dtypes_lazy()
-                bundle = (
-                    self._promote_np(staged[0]),
-                    self._promote_np(staged[1], dt[0]),
-                    self._promote_np(staged[2], dt[1]) if staged[2] is not None else None,
-                )
-                self.cache.put(key, bundle)  # type: ignore[arg-type]
-                if getattr(self.cache, "profile", None) is not None:
-                    self.cache.profile.add_load_source(
-                        self.layer_idx, staged=True, dt=time.perf_counter() - t_st
-                    )
-                return bundle
         return None
-
-    # -- slot-bank (spike) ------------------------------------------------
-
-    def _slot_bank(self):
-        """Lazily create this linear's slot arena (decode thread only).
-
-        Shapes come from the backing reader protocol so the arena rows
-        match exactly what _slice_view promotes per expert — the arena is
-        then a drop-in gather_qmm operand. Disabled when the env is off or
-        the backing lacks the reader protocol (tests with dict backing use
-        the legacy path).
-        """
-        sb = getattr(self, "_slot_bank_ref", None)
-        if sb is not None:
-            return sb if _SLOT_BANK_ENV else None
-        if not _SLOT_BANK_ENV or _SLOT_BANK_SLOTS <= 0:
-            return None
-        try:
-            reader = self.backing._reader_for_key(self.stacked_weight_key)
-            rp = reader._rp_for(self.stacked_weight_key)
-            sp = reader._rp_for(self.stacked_scales_key)
-            bp = None
-            if self.stacked_biases_key:
-                bp = reader._rp_for(self.stacked_biases_key)
-            sb = SlotBank(
-                _SLOT_BANK_SLOTS,
-                tuple(rp.per_shape),
-                tuple(sp.per_shape),
-                tuple(bp.per_shape) if bp else None,
-                w_dtype=self._slice_dtypes_lazy()[0] or mx.uint32,
-                s_dtype=mx.float32,
-                b_dtype=mx.float32,
-            )
-        except Exception:
-            sb = None
-        self._slot_bank_ref = sb
-        return sb
 
     def _spec_state(self) -> SpeculationState | None:
         """Per-conversion speculation state (Fase K K1).
@@ -2371,10 +2108,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 sorted_prev, same=lambda a, b: rid_of[a] == rid_of[b]
             )
             for target in targets:
-                # Fase K F3: speculate the run into the stash ring (async) —
-                # the read overlaps compute and never blocks demand reads.
-                if _STASH_ENV:
-                    target._stash_populate(sorted_prev)
                 for first, count in runs:
                     if advised_runs is not None:
                         dedupe_key = (id(target), first, count)
@@ -2395,86 +2128,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                             state.bump("advice_failures", 1)
                     except Exception:
                         pass
-        except Exception:
-            pass
-
-    def _stash_populate(self, eids_sorted: list[int]) -> None:
-        """Queue async ring-stash reads for the speculated expert runs.
-
-        The worker reads each run through THIS linear's keys (tier-aware
-        reader resolution by expert id) and stores raw NumPy bundles under
-        this linear's bundle_key — exactly the key the next layer's demand
-        path looks up, so a stash hit returns without disk I/O. Never blocks
-        the caller: reads run on the IO pool.
-        """
-        state = self._spec_state()
-        if state is None or state.is_closed():
-            return
-        if not hasattr(self.backing, "load_expert_run"):
-            return
-        try:
-            ids = [int(e) for e in eids_sorted]
-            # Fase K K2: segment by CONSECUTIVE ids within ONE resolved
-            # reader — reader-only segmentation produced (first, count)
-            # jobs that spanned holes and read+stored the WRONG experts
-            # (e.g. [3,5] read experts 3 AND 4). Same shared segmentation
-            # as the demand path and the advisor.
-            from .shard_bank import segment_runs
-
-            rid_of = {
-                e: id(self.backing._reader_for_key(self.stacked_weight_key, e))
-                for e in ids
-            }
-            jobs = segment_runs(
-                ids, same=lambda a, b: rid_of[a] == rid_of[b]
-            )
-        except Exception:
-            return
-        if not jobs:
-            return
-        state.bump("stash_targets", len(ids))
-        for first, count in jobs:
-            try:
-                # K7: bounded pending queue; a full or closed state drops
-                # the submission silently (speculation never blocks demand).
-                state.submit(lambda f=first, c=count: self._stash_read_run(f, c))
-            except Exception:
-                pass
-
-    def _stash_read_run(self, first_id: int, count: int) -> None:
-        """IO-pool worker: read one run into the stash ring (FIFO, bounded).
-
-        K1/K7: reads the DISK outside the state lock; insert/evict/stats
-        happen inside it. A closed state is checked before and after the
-        reads so a drained engine never receives speculative bytes.
-        """
-        state = self._spec_state()
-        if state is None or state.is_closed():
-            return
-        try:
-            ws = self.backing.load_expert_run(self.stacked_weight_key, first_id, count)
-            ss = self.backing.load_expert_run(self.stacked_scales_key, first_id, count)
-            bs: list | None = None
-            if self.stacked_biases_key:
-                try:
-                    bs = self.backing.load_expert_run(
-                        self.stacked_biases_key, first_id, count
-                    )
-                except Exception:
-                    bs = None
-            for i in range(count):
-                if state.is_closed():
-                    return
-                eid = first_id + i
-                key = self.bundle_key(eid)
-                state.stash_insert(
-                    key,
-                    (
-                        ws[i],
-                        ss[i],
-                        bs[i] if bs is not None and i < len(bs) else None,
-                    ),
-                )
         except Exception:
             pass
 
@@ -2557,60 +2210,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
         missing: list[int] = []
         t_res_start = time.perf_counter()
         context_bundles = None
-        # Slot-bank (spike): decode-shaped calls resolve through the device
-        # arena when possible. The arena lookup precedes the LRU/ctx so a
-        # slot-resident expert is never re-promoted; demand sets beyond
-        # _SLOT_BANK_MAX_POSITIONS (prefill-shaped) skip the arena entirely —
-        # broadcast unions would thrash the S slots (SCH ceiling 50%).
-        slot_of: dict = {}
-        sb = self._slot_bank() if plan.positions <= _SLOT_BANK_MAX_POSITIONS else None
-        if sb is not None:
-            slot_of, sb_missing = sb.lookup(plan.uniq_list)
-            if not sb_missing:
-                # Full hit: the arena IS the gather_qmm operand. Slot remap
-                # is per-distinct-expert (#27861 invariant); repeated slot
-                # indices across positions are legal (cheaper gather).
-                slot_np = np.full((self.num_experts,), -1, dtype=np.int64)
-                for eid, sl in slot_of.items():
-                    slot_np[eid] = sl
-                slot_remapped_np = slot_np[np.asarray(plan.flat_np).reshape(-1)].reshape(plan.indices_shape)
-                w_bank, s_bank, b_bank = sb.w, sb.s, sb.b
-                remapped = mx.array(slot_remapped_np.astype(np.uint32))
-                out = mx.gather_qmm(
-                    x,
-                    w_bank,
-                    s_bank,
-                    b_bank,
-                    rhs_indices=remapped,
-                    transpose=True,
-                    group_size=self.group_size,
-                    bits=self.bits,
-                    mode=self.mode,
-                    sorted_indices=sorted_indices,
-                )
-                if self._bias is not None and self._has_bias:
-                    b_mini = mx.take(self._bias, plan.uniq_mx, axis=0)
-                    out = out + mx.expand_dims(b_mini[remapped], -2)
-                p.record_observed(self.layer_idx, plan.uniq_list)
-                p.add(
-                    self.layer_idx,
-                    gate=plan.gate_s if built else 0.0,
-                    unique=plan.unique_s if built else 0.0,
-                    load=0.0,
-                    stack=0.0,
-                    hits=len(slot_of),
-                    misses=0,
-                    experts=len(plan.uniq_list),
-                    positions=plan.positions,
-                )
-                if _spec_state is not None:
-                    _spec_state.record_prev(self.layer_idx, plan.uniq_list)
-                return out
-            # partial: slot misses fall through to the normal resolution;
-            # the arena insert happens after the bundle resolves (below).
-            missing = list(sb_missing)
-            hits = len(slot_of)
-            misses = len(sb_missing)
         if plan.ctx is not None:
             # Fase K F6 (Etapa B): resolve *this* projection through the
             # layer context; the context prefetches the next one in the
@@ -2637,11 +2236,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     context_bundles = None
                     self.cache._count_ctx_fallback("tier_mismatch")
         if context_bundles is None:
-            # Slot-bank (spike): the arena miss list already seeds
-            # `missing` — dedupe against it so an expert is never read or
-            # slot-inserted twice (the LRU loop below would re-append the
-            # same ids).
-            _sb_missing = set(missing) if sb is not None else set()
             for eid in plan.uniq_list:
                 eid = int(eid)
                 b = self._bundle_cached_or_staged(eid)
@@ -2650,8 +2244,7 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                     hits += 1
                 else:
                     misses += 1
-                    if eid not in _sb_missing:
-                        missing.append(eid)
+                    missing.append(eid)
         banked = None
         if missing:
             # ascending expert id = ascending file offset within the stacked
@@ -2757,27 +2350,6 @@ class StreamingQuantizedSwitchLinear(nn.Module):
                 for eid in missing:
                     bundles[eid] = self._load_expert_bundle(eid)
         t_load = time.perf_counter() - t_res_start
-
-        # Slot-bank (spike): fill free slots with the freshly resolved bundles
-        # (arena-first misses). One row-assign copy per expert-load; the slot
-        # becomes the resident copy for subsequent calls. LRU seeding is
-        # skipped for these ids (cache_result already guards prefill; the
-        # arena competes with the LRU for the same demand population).
-        if sb is not None and missing:
-            dt_sb = self._slice_dtypes_lazy()
-            for eid in missing:
-                b_ = bundles.get(int(eid))
-                if b_ is None:
-                    continue
-                try:
-                    sb.insert(
-                        int(eid),
-                        self._promote_np(b_[0]),
-                        self._promote_np(b_[1], dt_sb[0]),
-                        self._promote_np(b_[2], dt_sb[1]) if b_[2] is not None else None,
-                    )
-                except Exception:
-                    pass
 
         if memtrace.enabled:
             memtrace.record(

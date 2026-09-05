@@ -266,9 +266,6 @@ class ModelSettings:
     expert_streaming_seed: Optional[bool] = (
         None  # Seed expert LRU / page cache from prefill routing hotness
     )
-    expert_streaming_pilot: Optional[bool] = (
-        None  # Async router-lookahead prefetcher (PILOT)
-    )
     expert_streaming_per_layer_eval: Optional[bool] = (
         None  # Qwen4-exp per-layer eval+clear_cache boundary during streaming prefill
         # (default env OMLX_EXPERT_STREAMING_PER_LAYER_EVAL or on). GLM/DeepSeek

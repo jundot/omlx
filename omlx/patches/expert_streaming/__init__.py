@@ -95,7 +95,6 @@ def _io_overrides(model_settings: Any | None) -> dict[str, Any]:
         "expert_streaming_coalesce": None,
         "expert_streaming_readahead": None,
         "expert_streaming_seed": None,
-        "expert_streaming_pilot": None,
         "expert_streaming_per_layer_eval": None,
         "expert_streaming_pins": None,
         "expert_streaming_hot_fraction": None,
@@ -1423,74 +1422,8 @@ def convert_model_to_streaming(
                     "Expert streaming: boundary installed but eval off/class "
                     "mismatch — per-layer bank charge kept (conservative)"
                 )
-        # PILOT: async router-lookahead prefetch into the staging buffer.
-        # The submit hook lives in the glm5_next vendor loop (it scores
-        # the next MoE layer's router against the current layer output) —
-        # other families have no hook, so PILOT is a no-op for them until
-        # one is added. mmap backing only; off when the RAM dict fallback
-        # is in use. Opt in per model (expert_streaming_pilot=True) or
-        # globally with OMLX_EXPERT_STREAMING_PILOT=1.
-        import os
-
-        pilot_requested = io_ov["expert_streaming_pilot"]
-        if pilot_requested is None:
-            pilot_requested = os.environ.get("OMLX_EXPERT_STREAMING_PILOT", "0") == "1"
-        if pilot_requested and not isinstance(
-            backing, dict
-        ):
-            try:
-                from .prefetch import ExpertPrefetcher
-
-                prefetcher = ExpertPrefetcher(cache)
-                prefetcher.start()
-                for obj_ in (
-                    getattr(getattr(model, "language_model", None), "model", None),
-                    getattr(model, "language_model", None),
-                    model,
-                ):
-                    match_ = obj_ is not None and getattr(obj_, "layers", None) is layers
-                    if match_:
-                        obj_._expert_prefetcher = prefetcher  # type: ignore[attr-defined]
-                        break
-                else:
-                    prefetcher.stop()
-                    prefetcher = None
-                    logger.warning(
-                        "Expert streaming: PILOT prefetch attach point not found; disabled"
-                    )
-                if prefetcher is not None:
-                    # P0: owned by the backing so shutdown_expert_streaming
-                    # can stop its threads on unload/reload (no leak).
-                    try:
-                        backing._expert_prefetcher = prefetcher  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                    # Wire streaming linears to their prefetcher so the
-                    # demand path can drain staged np bundles before a
-                    # synchronous backing read. P1: fused gate_up_proj
-                    # included — it resolves bundles exactly like split
-                    # projections and was silently left without prefetch.
-                    wired = 0
-                    for lyr_ in layers:
-                        mlp_ = getattr(lyr_, "mlp", None)
-                        if mlp_ is None:
-                            mlp_ = getattr(lyr_, "ffn", None)
-                        sm_ = getattr(mlp_, "switch_mlp", None)
-                        for proj_ in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
-                            lin_ = getattr(sm_, proj_, None)
-                            if lin_ is not None and hasattr(lin_, "_load_expert_np"):
-                                lin_._prefetcher = prefetcher  # type: ignore[attr-defined]
-                                wired += 1
-                    logger.info(
-                        "Expert streaming: PILOT async prefetch active (%d linears wired)",
-                        wired,
-                    )
-            except Exception as e:
-                logger.warning("Expert streaming: PILOT prefetch init failed: %s", e)
-
-        # Opt-in warm-only page-cache prefetch + mlock pins (page-cache
-        # complements; replaces the LRU's "keep hot experts in RAM" role).
-        # F_RDADVISE readahead (RA) rides the same prediction flow with
+        # mlock pins + page-cache complements: F_RDADVISE readahead (RA)
+        # rides the prediction flow with
         # kernel hints instead of reads and defaults ON, as does the
         # prefill-hotness cache seed (SEED). The per-model readahead/seed
         # settings (autotune) override the env defaults when set.
@@ -1515,12 +1448,7 @@ def convert_model_to_streaming(
             else max(0, min(64.0, float(pin_gib))) * 1024**3
         )
 
-        if (
-            _warmer_mod.WARM_ENABLED
-            or pins_enabled
-            or ra_enabled
-            or seed_enabled
-        ):
+        if pins_enabled or ra_enabled or seed_enabled:
             try:
                 glus: dict[int, Any] = {}
                 for layer_idx_, layer_ in enumerate(layers):
@@ -1536,14 +1464,11 @@ def convert_model_to_streaming(
                     ]
                     for i, g in glus.items()
                 }
-                if _warmer_mod.WARM_ENABLED:
-                    warmer = _warmer_mod.PageCacheWarmer(linears_by_layer)
-                elif ra_enabled:
-                    warmer = _warmer_mod.PageCacheWarmer(
-                        linears_by_layer, advise_only=True
-                    )
-                else:
-                    warmer = None
+                warmer = (
+                    _warmer_mod.PageCacheWarmer(linears_by_layer)
+                    if ra_enabled
+                    else None
+                )
                 pinner = None
                 if pins_enabled and backing is not None and not isinstance(backing, dict):
                     # Per-model learned-pin profile so the hot set is wired
@@ -1613,10 +1538,9 @@ def convert_model_to_streaming(
                     for sm_ in glus.values():
                         sm_._warm_pins = hook  # type: ignore[attr-defined]
                     logger.info(
-                        "Expert streaming: warm=%s pin=%s readahead=%s seed=%s attached (%d layers)",
-                        bool(warmer and not warmer.advise_only),
+                        "Expert streaming: pin=%s readahead=%s seed=%s attached (%d layers)",
                         bool(pinner),
-                        bool(warmer and warmer.advise_only),
+                        bool(warmer),
                         bool(recorder),
                         len(glus),
                     )
@@ -1634,7 +1558,7 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     """P1: one-line request/bench summary of streaming health.
 
     Aggregates the counters the implementation already keeps (LRU hits,
-    PILOT staging, stash ring, advisor, ctx fallbacks) into a single
+    advisor, ctx fallbacks) into a single
     dict for per-request logs and the admin payload. Never raises;
     missing pieces report as None/0.
     """
@@ -1652,26 +1576,9 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     except Exception:
         pass
     try:
-        pf = getattr(backing, "_expert_prefetcher", None)
-        pstats = getattr(pf, "stats", None) if pf is not None else None
-        if pstats is not None:
-            sub = int(pstats.get("submissions", 0) or 0)
-            con = int(pstats.get("staged_consumed", 0) or 0)
-            out["prefetch_precision"] = con / sub if sub else 0.0
-            out["prefetch_submissions"] = sub
-            out["prefetch_consumed"] = con
-            out["prefetch_dropped"] = int(pstats.get("staged_dropped", 0) or 0)
-    except Exception:
-        pass
-    try:
         spec = getattr(cache, "spec_state", None)
         sstats = getattr(spec, "stats", None) if spec is not None else None
         if sstats is not None:
-            sh = int(sstats.get("stash_hits", 0) or 0)
-            sm = int(sstats.get("stash_misses", 0) or 0)
-            out["stash_hit_rate"] = sh / (sh + sm) if (sh + sm) else 0.0
-            out["stash_hits"] = sh
-            out["stash_misses"] = sm
             out["advised"] = int(sstats.get("advised", 0) or 0)
     except Exception:
         pass
@@ -1686,9 +1593,6 @@ def expert_streaming_summary(cache: Any, backing: Any | None = None) -> dict:
     except Exception:
         pass
     try:
-        from .streaming_switch import _SLOT_BANK_ENV as _slot_on
-
-        out["slotbank_on"] = bool(_slot_on)
         out["cache_policy"] = getattr(cache, "policy", "lru")
     except Exception:
         pass
@@ -1774,30 +1678,16 @@ def load_transition_profile(backing: Any, spec: Any) -> int:
 def shutdown_expert_streaming(backing: Any) -> None:
     """Release MoE streaming resources held by *backing* (P0).
 
-    Stops the PILOT prefetcher threads, persists nothing (profiles are
-    saved separately), and closes shard fds/mmaps. Idempotent; safe to
-    call with None or a RAM-dict backing. Engines call this in stop()
-    and before replacing the model on reload so threads/fds never leak
-    across model lifetimes.
+    Persists the transition table, then closes shard fds/mmaps.
+    Idempotent; safe to call with None or a RAM-dict backing. Engines
+    call this in stop() and before replacing the model on reload so
+    threads/fds never leak across model lifetimes.
     """
     if backing is None or isinstance(backing, dict):
         return
     # Persist the learned transition table before threads/fds die.
     try:
         save_transition_profile(backing)
-    except Exception:
-        pass
-    try:
-        prefetcher = getattr(backing, "_expert_prefetcher", None)
-        if prefetcher is not None:
-            try:
-                prefetcher.stop()
-            except Exception:
-                pass
-            try:
-                backing._expert_prefetcher = None  # type: ignore[attr-defined]
-            except Exception:
-                pass
     except Exception:
         pass
     try:

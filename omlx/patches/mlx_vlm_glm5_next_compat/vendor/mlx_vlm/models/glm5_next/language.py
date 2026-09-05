@@ -4,7 +4,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
@@ -950,49 +949,9 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        # Expert-streaming PILOT: score the next MoE layer's router against
-        # the current layer's output (colibri-style lookahead) and prefetch
-        # its predicted expert bundles in background threads. Output is
-        # never affected — missing the prediction falls back to the
-        # synchronous load in the streaming switch. Decode-only: during
-        # prefill every expert is touched anyway (uniq ≈ all 288), so
-        # prediction there just queues ~36k bundles the workers drain long
-        # after the prefill finished — pure overhead.
-        pf = getattr(self, "_expert_prefetcher", None)
-        is_prefill = h.shape[1] > 1
-        if pf is not None and not is_prefill:
-            for i, (layer, c) in enumerate(zip(self.layers, cache)):
-                mask = ssm_mask if layer.is_linear else fa_mask
-                h = layer(h, mask=mask, cache=c)
-                if i + 1 < len(self.layers):
-                    try:
-                        nxt = self.layers[i + 1]
-                        nxt_mlp = getattr(nxt, "mlp", None)
-                        if nxt_mlp is not None and type(nxt_mlp).__name__ == "Glm5NextMoE":
-                            predicted = nxt_mlp.gate(nxt.post_attention_layernorm(h))
-                            mx.eval(predicted[0])
-                            idx_np = np.array(predicted[0], copy=False).reshape(-1)
-                            uniq = np.unique(idx_np)
-                            sm = getattr(nxt_mlp, "switch_mlp", None)
-                            if sm is not None:
-                                try:
-                                    prof = getattr(sm, "_expert_streaming_profile", None)
-                                    if prof is None:
-                                        prof = getattr(getattr(sm, "_cache", None), "profile", None)
-                                    if prof is not None:
-                                        prof.record_predicted(i + 1, uniq)
-                                except Exception:
-                                    pass
-                                for proj in ("gate_proj", "up_proj", "down_proj"):
-                                    lin = getattr(sm, proj, None)
-                                    if lin is not None:
-                                        pf.submit(lin, uniq)
-                    except Exception:
-                        pass
-        else:
-            for i, (layer, c) in enumerate(zip(self.layers, cache)):
-                mask = ssm_mask if layer.is_linear else fa_mask
-                h = layer(h, mask=mask, cache=c)
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            mask = ssm_mask if layer.is_linear else fa_mask
+            h = layer(h, mask=mask, cache=c)
 
         h = h.mean(axis=2)
         return self.norm(h)
