@@ -47,6 +47,14 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
+# Default minimum bits for quantized MTP-head tensors — see _mtp_bits_override
+# for why the head is held above the trunk, and mtp_bits_floor for the knob
+# that lets a memory-starved machine drop it.
+_MTP_MIN_BITS = 4
+
+# Bit floors accepted for the MTP head: the default, or 0 to follow the trunk.
+MTP_BITS_FLOORS: tuple[int, ...] = (_MTP_MIN_BITS, 0)
+
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 
@@ -411,6 +419,78 @@ def _is_token_embedding_tensor(path: str) -> bool:
     )
 
 
+_ATTENTION_CAP_PROJECTIONS = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "b_proj",
+    "g_a_proj",
+    "g_b_proj",
+    "q_a_proj",
+    "q_b_proj",
+    "k_a_proj",
+    "k_b_proj",
+    "v_a_proj",
+    "v_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "qkv_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_a",
+    "in_proj_b",
+    "attn_qkv",
+    "embed_q",
+    "unembed_out",
+    "out_proj",
+)
+
+
+def _is_attention_projection(path_l: str) -> bool:
+    """True for the dense projection matrices of an attention block.
+
+    Deliberately narrow: the tensor must live under an attention module and
+    end in a known projection. The DSA indexer is a format invariant (its Q8
+    override is what makes the kernel load at all), conv1d is a depthwise conv
+    rather than a matmul, and experts/shared experts/embeddings are not
+    attention — all four stay out of the cap.
+    """
+    if not any(p in path_l for p in ("self_attn.", "attn.", "attention.", "mixer.")):
+        return False
+    if ".indexer." in path_l or "conv1d" in path_l:
+        return False
+    if "shared_expert" in path_l or "switch_mlp" in path_l or "experts." in path_l:
+        return False
+    return any(path_l.endswith(p) for p in _ATTENTION_CAP_PROJECTIONS)
+
+
+def _attention_bits_cap(path_l: str, config: dict) -> int | None:
+    """Requested bit ceiling for this tensor, or None when it does not apply.
+
+    The oQ recipe is all floors and no ceiling (see ``bits()`` below): every
+    rule raises, none lowers, so on a large MoE the sensitivity boost takes the
+    whole dense attention to 8 bits. This is the one knob that can bring it
+    back down, and it is opt-in: 0/absent keeps today's behaviour exactly.
+    """
+    cap = config.get("_oq_attention_bits_cap") or 0
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0 or not _is_attention_projection(path_l):
+        return None
+    return cap
+
+
+def _apply_attention_cap(path: str, cand_bits: int, config: dict) -> int:
+    """cand_bits capped by the attention ceiling, if one applies to path."""
+    cap = _attention_bits_cap(_normalize_quant_path(path).lower(), config)
+    return min(cand_bits, cap) if cap is not None else cand_bits
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> Union[bool, dict]:
@@ -473,8 +553,12 @@ def universal_quant_predicate(
             return 128
         return 64
 
+    attention_cap = _attention_bits_cap(path_l, config)
+
     def bits(n):
         effective = int(max(n, base_bits))
+        if attention_cap is not None:
+            effective = min(effective, attention_cap)
         return {
             "bits": effective,
             "group_size": _gs_for_mode(effective, gs()),
@@ -1170,6 +1254,7 @@ def _build_quant_plan(
             max_target = min(cur_bits + 2, 8)
         else:
             max_target = min(cur_bits + 1, 8)
+        max_target = _apply_attention_cap(path, max_target, config)
         if max_target <= cur_bits:
             continue
         candidates.append((layer_score, path, shape, cur_bits, cur_cost, max_target))
@@ -1222,8 +1307,9 @@ def _build_quant_plan(
         for _score, path, shape, cur_bits, cur_cost in sorted(
             fallback_candidates, key=lambda x: x[0], reverse=True
         ):
+            cap = _apply_attention_cap(path, 8, config)
             for cand_bits in (8, 6, 5, 4, 3):
-                if cand_bits <= cur_bits:
+                if cand_bits <= cur_bits or cand_bits > cap:
                     continue
                 cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
                 cand_mode = _mode_for_bits(cand_bits)
@@ -1311,6 +1397,9 @@ def resolve_output_name(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
+    attention_bits_cap: int = 0,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
+    mtp_bits_floor: int = _MTP_MIN_BITS,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -1325,9 +1414,19 @@ def resolve_output_name(
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
+        "Qwen3.5-27B" + 2 + attention_bits_cap=4 -> "Qwen3.5-27B-oQ2-a4"
+        "Qwen3.5-27B" + 2 + group_size=128 -> "Qwen3.5-27B-oQ2-g128"
+        "Qwen3.5-27B" + 2 + preserve_mtp + mtp_bits_floor=0 -> "...-oQ2-mtp2"
+
+    The attention cap and a non-default group size change the weights without
+    changing the level, so the name has to carry them: two oQ2e built with
+    different recipes are otherwise indistinguishable on disk. Same for a
+    dropped MTP floor, and there the suffix carries the bits the head ended up
+    with — but only when dropping it actually lowered them, so every name
+    built under today's defaults is byte-identical to what it was.
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|a[2-8]|g\d{2,3}|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp\d?)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1338,10 +1437,17 @@ def resolve_output_name(
         base = new
     level_str = f"{oq_level:g}"
     suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
+    if attention_bits_cap:
+        suffix += f"-a{int(attention_bits_cap)}"
+    if group_size and int(group_size) != _OQ_DEFAULT_GROUP_SIZE:
+        suffix += f"-g{int(group_size)}"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_mtp:
         suffix += "-mtp"
+        head_bits = _base_bits_for_level(oq_level)
+        if int(mtp_bits_floor) < _MTP_MIN_BITS and head_bits < _MTP_MIN_BITS:
+            suffix += str(head_bits)
     return f"{base}{suffix}"
 
 
@@ -3215,6 +3321,8 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    attention_bits_cap: int = 0,
+    mtp_bits_floor: int = _MTP_MIN_BITS,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3317,6 +3425,8 @@ def estimate_bpw_and_size(
     # the per-tensor pricing loop below (the flag changes which predicate
     # branch answers).
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    config["_oq_attention_bits_cap"] = int(attention_bits_cap or 0)
+    config["_oq_mtp_bits_floor"] = int(mtp_bits_floor)
 
     # Pre-quantized tensors that pass through in source precision (mirrors
     # the decision in quantize_oq_streaming, evaluated pre-boost).
@@ -3421,7 +3531,13 @@ def estimate_bpw_and_size(
             total_output_bytes += n_elements * 2
             total_weighted_bits += n_elements * 16
 
-    for k in ("_oq_use_budget_plan", "_oq_boost_map", "_oq_sensitivity_map"):
+    for k in (
+        "_oq_use_budget_plan",
+        "_oq_boost_map",
+        "_oq_sensitivity_map",
+        "_oq_attention_bits_cap",
+        "_oq_mtp_bits_floor",
+    ):
         config.pop(k, None)
 
     effective_bpw = total_weighted_bits / max(total_params, 1)
@@ -3870,7 +3986,53 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
-def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
+# Vision towers whose float16 behaviour was measured, not assumed. The
+# blanket float32 rule (#1678) was a real symptom with a hypothetical cause
+# and no activation number behind it. Measured here on GLM-5.3-Flash: median
+# cosine 0.99989-0.99998 in float16 against 0.99741-0.99964 for the source
+# bfloat16, peak activation ~228 against the 65504 float16 ceiling, and no
+# inf/nan on real image inputs — this family clamps both vision SwiGLUs at
+# +-10. Every other family keeps the float32 rule until someone measures it.
+_VISION_FP16_FAMILIES = ("glm5_next",)
+
+VISION_DTYPES = ("auto", "float16", "float32")
+
+
+def _config_model_family(config: dict) -> str:
+    """The model_type this config declares, text sub-config included."""
+    for key in (
+        config.get("model_type"),
+        (config.get("text_config") or {}).get("model_type"),
+    ):
+        if isinstance(key, str) and key:
+            return key.lower().replace("-", "_")
+    return ""
+
+
+def _resolve_vision_dtype(config: dict, target_dtype, vision_dtype: str = "auto"):
+    """Storage dtype for the un-quantized vision/audio tensors.
+
+    ``auto`` keeps the float32 rule for every family except the ones measured
+    in ``_VISION_FP16_FAMILIES``; ``float16``/``float32`` force it. The rule
+    only ever mattered when the request asked for float16 — in bfloat16 the
+    tower already stays at source precision.
+    """
+    if vision_dtype not in VISION_DTYPES:
+        raise ValueError(
+            f"Invalid vision_dtype {vision_dtype!r}. Must be one of {VISION_DTYPES}"
+        )
+    if target_dtype != mx.float16:
+        return target_dtype
+    if vision_dtype == "float16":
+        return mx.float16
+    if vision_dtype == "float32":
+        return mx.float32
+    if _config_model_family(config).startswith(_VISION_FP16_FAMILIES):
+        return mx.float16
+    return mx.float32
+
+
+def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype, vision_dtype=None):
     """Cast an unquantized output tensor to its storage dtype."""
     if not mx.issubdtype(w_mx.dtype, mx.floating):
         return w_mx
@@ -3878,8 +4040,9 @@ def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     if target_dtype == mx.float16 and (
         _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
     ):
-        if w_mx.dtype != mx.float32:
-            return w_mx.astype(mx.float32)
+        storage = mx.float32 if vision_dtype is None else vision_dtype
+        if w_mx.dtype != storage:
+            return w_mx.astype(storage)
         return w_mx
 
     if w_mx.dtype != target_dtype:
@@ -4433,7 +4596,7 @@ def _get_predicate_bits(
         gs = result.get("group_size", group_size)
         mode = result.get("mode", _mode_for_bits(bits))
         if _is_mtp_tensor(tensor_name):
-            raised = _mtp_bits_override(bits)
+            raised = _mtp_bits_override(bits, config)
             if raised != bits:
                 # Floor lift re-derives mode and group size; unchanged bits
                 # keep the predicate's choice (e.g. mxfp8 head projections).
@@ -4442,22 +4605,39 @@ def _get_predicate_bits(
         return bits, gs, mode
     bits = base_bits
     if _is_mtp_tensor(tensor_name):
-        bits = _mtp_bits_override(bits)
+        bits = _mtp_bits_override(bits, config)
     return bits, _gs_for_mode(bits, group_size), _mode_for_bits(bits)
 
 
-# Minimum bits for quantized MTP-head tensors. Sub-4-bit oQ levels drag the
-# head down with the trunk (DeepSeek-V4 oQ2.5e stored its head's routed
-# experts and attention at 2-bit gs64), but the head only shapes drafts —
-# every emitted token is trunk-verified — so its footprint (~2 GB on
-# DeepSeek-V4-Flash, ~15 MB on Qwen3.6) buys draft acceptance directly and
-# costs almost nothing relative to the model.
-_MTP_MIN_BITS = 4
-
-
-def _mtp_bits_override(bits: int) -> int:
-    if bits and bits < _MTP_MIN_BITS:
+# Why the head is held above the trunk: sub-4-bit oQ levels drag it down with
+# the trunk (DeepSeek-V4 oQ2.5e stored its head's routed experts and attention
+# at 2-bit gs64), but the head only shapes drafts — every emitted token is
+# trunk-verified — so its footprint (~2 GB on DeepSeek-V4-Flash, ~15 MB on
+# Qwen3.6) buys draft acceptance directly and costs almost nothing relative to
+# the model.
+#
+# On a machine that is short of memory the trade flips, so ``mtp_bits_floor``
+# makes it a choice: 0 drops the floor and the head follows the trunk. It is
+# the only bit reduction that cannot cost answer quality — the trunk is
+# untouched and verifies every emitted token, so perplexity is unchanged by
+# construction and only draft acceptance moves. Measured on GLM-5.3-Flash-oQ2e:
+# the head goes from 4.01 GB at 4 bits to 2.33 GB at 2 bits, -1.68 GB resident.
+def _mtp_head_bits_floor(config: dict | None) -> int:
+    """Bit floor requested for the MTP head. Absent means today's default."""
+    if not config:
         return _MTP_MIN_BITS
+    floor = config.get("_oq_mtp_bits_floor", _MTP_MIN_BITS)
+    try:
+        floor = int(floor)
+    except (TypeError, ValueError):
+        return _MTP_MIN_BITS
+    return max(0, floor)
+
+
+def _mtp_bits_override(bits: int, config: dict | None = None) -> int:
+    floor = _mtp_head_bits_floor(config)
+    if bits and bits < floor:
+        return floor
     return bits
 
 
@@ -5693,6 +5873,9 @@ def quantize_oq_streaming(
     imatrix_num_samples: int = 128,
     imatrix_seq_length: int = 512,
     sensitivity_map_override: dict[int | str, float] | None = None,
+    attention_bits_cap: int = 0,
+    vision_dtype: str = "auto",
+    mtp_bits_floor: int = _MTP_MIN_BITS,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -5802,6 +5985,29 @@ def quantize_oq_streaming(
             f"{oq_level:g}",
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    config["_oq_attention_bits_cap"] = int(attention_bits_cap or 0)
+    config["_oq_mtp_bits_floor"] = int(mtp_bits_floor)
+    vision_target_dtype = _resolve_vision_dtype(config, target_dtype, vision_dtype)
+    if attention_bits_cap:
+        logger.info(
+            "oQ%s: attention projections capped at %d bits",
+            f"{oq_level:g}",
+            int(attention_bits_cap),
+        )
+    if preserve_mtp and int(mtp_bits_floor) < _MTP_MIN_BITS:
+        logger.info(
+            "oQ%s: MTP head bit floor dropped (mtp_bits_floor=%d) — the head "
+            "follows the trunk; the trunk is untouched, only draft acceptance moves",
+            f"{oq_level:g}",
+            int(mtp_bits_floor),
+        )
+    if target_dtype == mx.float16:
+        logger.info(
+            "oQ%s: vision/audio passthrough stored as %s (vision_dtype=%s)",
+            f"{oq_level:g}",
+            vision_target_dtype,
+            vision_dtype,
+        )
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -6354,11 +6560,15 @@ def quantize_oq_streaming(
                         per_layer_config[base] = layer_cfg
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                        w_mx = _cast_passthrough_tensor(
+                            tensor_name, w_mx, target_dtype, vision_target_dtype
+                        )
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
-                    w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                    w_mx = _cast_passthrough_tensor(
+                        tensor_name, w_mx, target_dtype, vision_target_dtype
+                    )
                 out_shard_data[tensor_name] = w_mx
 
             del w_mx
@@ -6462,6 +6672,8 @@ def quantize_oq_streaming(
         "_oq_boost_map",
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
+        "_oq_attention_bits_cap",
+        "_oq_mtp_bits_floor",
     ):
         output_config.pop(temp_key, None)
     if text_only:
@@ -8605,6 +8817,10 @@ def _build_streaming_proxy_for_sensitivity(
         config = json.load(f)
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
+    # The proxy is a throwaway model for sensitivity scoring, but it has to
+    # carry the same vision dtype the real run will write, or the score comes
+    # from a tower the output never has.
+    vision_target_dtype = _resolve_vision_dtype(config, target_dtype, "auto")
 
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
@@ -8740,11 +8956,15 @@ def _build_streaming_proxy_for_sensitivity(
                     del qw, scales, biases
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
-                        w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                        w_mx = _cast_passthrough_tensor(
+                            tensor_name, w_mx, target_dtype, vision_target_dtype
+                        )
                     out_shard_data[tensor_name] = w_mx
             else:
                 if cast_predicate is None or cast_predicate(tensor_name):
-                    w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
+                    w_mx = _cast_passthrough_tensor(
+                        tensor_name, w_mx, target_dtype, vision_target_dtype
+                    )
                 out_shard_data[tensor_name] = w_mx
 
             del w_mx
@@ -8790,6 +9010,8 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_boost_map",
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
+        "_oq_attention_bits_cap",
+        "_oq_mtp_bits_floor",
     ):
         output_config.pop(temp_key, None)
     if not preserve_mtp:
