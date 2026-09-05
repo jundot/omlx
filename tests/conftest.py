@@ -1,3 +1,9 @@
+import os
+
+# MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
+# the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
 # SPDX-License-Identifier: Apache-2.0
 """
 Pytest configuration and fixtures for oMLX tests.
