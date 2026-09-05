@@ -113,20 +113,18 @@
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.usage.session') }}</p>
                                 <p class="text-2xl font-bold text-neutral-900"
                                    x-text="formatNumber(usageSession.total_prompt_tokens + usageSession.total_completion_tokens) + ' ' + window.t('status.usage.tokens')"></p>
-                                <p class="text-xs text-neutral-400 mt-1">
-                                    {{ t('status.usage.would_have_cost') }}
-                                    <span x-text="formatCost(usageSession.estimated_api_cost_usd)"></span>
-                                    &middot; {{ t('status.usage.paid_local') }}
+                                <p class="text-xs text-neutral-400 mt-1" title="{{ t('status.usage.cost_tooltip') }}">
+                                    <span x-text="formatCost(usageSession.estimated_api_cost_usd)"></span> {{ t('status.usage.cloud') }}
+                                    &middot; $0 {{ t('status.usage.local') }}
                                 </p>
                             </div>
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.usage.lifetime') }}</p>
                                 <p class="text-2xl font-bold text-neutral-900"
                                    x-text="formatNumber(usageLifetime.total_prompt_tokens + usageLifetime.total_completion_tokens) + ' ' + window.t('status.usage.tokens')"></p>
-                                <p class="text-xs text-neutral-400 mt-1">
-                                    {{ t('status.usage.would_have_cost') }}
-                                    <span x-text="formatCost(usageLifetime.estimated_api_cost_usd)"></span>
-                                    &middot; {{ t('status.usage.paid_local') }}
+                                <p class="text-xs text-neutral-400 mt-1" title="{{ t('status.usage.cost_tooltip') }}">
+                                    <span x-text="formatCost(usageLifetime.estimated_api_cost_usd)"></span> {{ t('status.usage.cloud') }}
+                                    &middot; $0 {{ t('status.usage.local') }}
                                 </p>
                             </div>
                         </div>
@@ -141,14 +139,14 @@
                             <div x-show="pricingExpanded" x-cloak class="px-6 pb-6">
                                 <p class="text-xs text-neutral-400 mb-3">
                                     {{ t('status.usage.pricing.hint') }}
-                                    <code class="text-neutral-500" x-text="pricingUserFile"></code>
+                                    <span x-show="pricingUserFile" title="{{ pricingUserFile }}">{{ t('status.usage.pricing.file_label') }}: <code class="text-neutral-500" x-text="pricingUserFile"></code></span>
                                 </p>
 
                                 <div class="overflow-x-auto border border-neutral-100 rounded-lg mb-4">
                                     <table class="min-w-full text-xs">
                                         <thead class="bg-neutral-50 text-neutral-500 uppercase tracking-wider">
                                             <tr>
-                                                <th class="px-3 py-2 text-left">{{ t('status.usage.pricing.col_match') }}</th>
+                                                <th class="px-3 py-2 text-left" title="{{ t('status.usage.pricing.match_tooltip') }}">{{ t('status.usage.pricing.col_match') }}</th>
                                                 <th class="px-3 py-2 text-left">{{ t('status.usage.pricing.col_display_name') }}</th>
                                                 <th class="px-3 py-2 text-right">{{ t('status.usage.pricing.col_input') }}</th>
                                                 <th class="px-3 py-2 text-right">{{ t('status.usage.pricing.col_output') }}</th>
