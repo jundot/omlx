@@ -1273,3 +1273,68 @@ def test_speed_priority_guard_passes_full_chunk_that_fits():
     ns._fake_current = 10 * _GB
     ns._prefill_speed_priority = True
     assert _guard_call(ns, 2048, kv_len=5000) == 2048
+
+
+def test_partial_sample_that_would_raise_the_rate_is_dropped():
+    """O colapso do estrangulador em contexto longo, reproduzido.
+
+    Medido em 04/09 no GLM-5.3-Flash oQ2e, um prompt de 110k tokens, todas as
+    amostras com mais de 90k de contexto já lido: um pedaço de 128 tokens mediu
+    1319 MB enquanto um de 512 mediu 333 MB no mesmo ponto do texto. A taxa por
+    token subiu de 1073 para 5549 KB, o estrangulador desceu ao piso de 32
+    tokens e o preparo caiu de 160 para 72 palavras por segundo.
+
+    O colapso é GRADUAL, e é por isso que a proteção de outlier do rastreador
+    (8x a média) não o pega: cada amostra fica dentro do limite e a média sobe
+    em progressão geométrica (alfa 0,3 · uma amostra a 3x deixa a média 1,6x
+    maior, e a próxima parte de um patamar mais alto).
+    """
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_speed_priority=False,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    amostra = lambda n, b: ns._record_chunk_transient(  # noqa: E731
+        n, 0, int(b), request_id="r", loop_label="unit", requested_step=512
+    )
+
+    amostra(512, 333 * 1024**2)  # o pedaço inteiro, a medida honesta
+    taxa_honesta = tracker.bytes_per_token
+    assert taxa_honesta == pytest.approx(333 * 1024**2 / 512)
+
+    # seis pedaços cortados, cada um a 3x a taxa corrente — dentro da proteção
+    # de outlier, que é 8x. Sem o portão a média cresce ~1,6x por amostra.
+    for _ in range(6):
+        n = 128
+        amostra(n, tracker.bytes_per_token * 3 * n)
+
+    assert tracker.bytes_per_token == pytest.approx(taxa_honesta), (
+        f"a taxa subiu de {taxa_honesta / 1024:.0f} para "
+        f"{tracker.bytes_per_token / 1024:.0f} KB por token — é o colapso"
+    )
+
+
+def test_partial_sample_that_lowers_the_rate_still_teaches():
+    """A assimetria é de propósito: custo fixo só sabe inflar a taxa."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=32,
+        _prefill_speed_priority=False,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512, 0, 333 * 1024**2, request_id="r", loop_label="unit", requested_step=512
+    )
+    antes = tracker.bytes_per_token
+    # metade do tamanho, um QUARTO do custo: a taxa cai e a amostra vale
+    ns._record_chunk_transient(
+        256, 0, 83 * 1024**2, request_id="r", loop_label="unit", requested_step=512
+    )
+    assert tracker.bytes_per_token < antes

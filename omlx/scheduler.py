@@ -4793,11 +4793,8 @@ class Scheduler:
                 delta,
             )
             return
-        if (
-            getattr(self, "_prefill_speed_priority", False)
-            and requested_step is not None
-            and n_tokens < requested_step
-        ):
+        partial = requested_step is not None and n_tokens < requested_step
+        if partial and getattr(self, "_prefill_speed_priority", False):
             logger.debug(
                 "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
                 "(skipped: speed partial < requested_step=%d)",
@@ -4808,6 +4805,46 @@ class Scheduler:
                 requested_step,
             )
             return
+        if partial:
+            # Under context priority the partial sample is kept (#2434 scoped
+            # the skip above to speed priority on purpose) — but ONLY when it
+            # does not RAISE the rate. A cut chunk's delta is dominated by the
+            # fixed/pool component, so dividing it by a small n inflates the
+            # per-token rate; feeding that back is a self-reinforcing collapse,
+            # where the inflated rate justifies an even smaller chunk, which
+            # measures worse still. The asymmetry matches the physics: a fixed
+            # cost can only inflate a per-token rate, never deflate it, so a
+            # partial sample that comes in LOWER is trustworthy and still
+            # teaches the tracker.
+            #
+            # Measured 04/09 on GLM-5.3-Flash oQ2e, ONE 110k-token prompt, every
+            # sample past 90k of context already read:
+            #     n=512  ->   333 MB      n=96  ->  912 MB
+            #     n=128  ->  1319 MB      n=64  ->  441 MB
+            # A 128-token chunk reading 4x a 512-token one at the same point in
+            # the text cannot be that chunk's cost. The EWMA rode it from 1073
+            # to 5549 KB/token, the throttle fell to its 32-token floor, and the
+            # prompt ran at 72 tok/s against the 160 it does at 512.
+            #
+            # Real growth is not lost: the predictor takes the MAX with a
+            # kv_len-aware static estimate, and the hard limits read live
+            # memory rather than this rate, so a lower estimate cannot weaken
+            # the abort path.
+            ewma = self._prefill_transient_tracker.bytes_per_token
+            if ewma > 0 and delta / n_tokens > ewma:
+                logger.debug(
+                    "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                    "(skipped: partial < requested_step=%d would raise the rate "
+                    "%.1fKB -> %.1fKB per token)",
+                    loop_label,
+                    request_id,
+                    n_tokens,
+                    delta / 1024**2,
+                    requested_step,
+                    ewma / 1024,
+                    (delta / n_tokens) / 1024,
+                )
+                return
         self._prefill_transient_tracker.update(
             n_tokens,
             delta,
