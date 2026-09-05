@@ -30,6 +30,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1768,6 +1769,30 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
+        # Text-only deployment: drop the vision tower (1.12 GB on GLM-5.3-Flash) so
+        # a long prompt stops meeting the memory guard's target near 180k tokens
+        # (measured 05/09: the miss was ~0.4 GB). Image inputs are refused with a
+        # clear error while it is out. Off by default; OMLX_VISION_TOWER_TEXT_ONLY=1
+        # (the CLI exports the saved setting).
+        self._vision_tower_freed = False
+        if (
+            _read_config_model_type(self._model_name) == "glm5_next"
+            and os.environ.get("OMLX_VISION_TOWER_TEXT_ONLY", "0") == "1"
+        ):
+            try:
+                from ..utils.model_loading import free_vision_tower
+
+                n_tensors, n_bytes = await loop.run_in_executor(
+                    get_mlx_executor(), free_vision_tower, self._vlm_model
+                )
+                self._vision_tower_freed = True
+                logger.info(
+                    "vision tower unloaded (text-only mode): %d tensors, %.2f GB returned",
+                    n_tensors, n_bytes / 1024**3,
+                )
+            except Exception:
+                logger.warning("vision tower unload failed; tower stays resident", exc_info=True)
+
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
@@ -2442,6 +2467,13 @@ class VLMBatchedEngine(BaseEngine):
             and self._count_content_parts(msg.get("content"), audio_part_types) > 0
             for msg in messages
         )
+
+        if getattr(self, "_vision_tower_freed", False) and (has_explicit_images or num_images > 0):
+            raise ValueError(
+                "This model is serving in text-only mode: the vision tower was unloaded "
+                "to free memory (Settings > Advanced > vision tower text-only, or "
+                "OMLX_VISION_TOWER_TEXT_ONLY). Turn it off and reload the model to send images."
+            )
 
         remaining_images = num_images
         remaining_audios = num_audios

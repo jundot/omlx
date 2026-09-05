@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk（預設，相容 OpenClaw / WorkBuddy）",
   "settings.advanced.sse_keepalive_mode_comment": "Comment（舊版 : keep-alive）",
   "settings.advanced.sse_keepalive_mode_off": "關閉（不保持連線）",
+  "settings.advanced.vision_tower_text_only": "卸載視覺塔（純文字模式）",
+  "settings.advanced.vision_tower_text_only_hint": "面向從不傳送圖片的代理：模型載入後釋放視覺塔權重（GLM-5.3-Flash：347 個張量，1.12 GB），圖片輸入以明確錯誤拒絕。在 M1 Ultra 上實測（05/09）：229k 詞元的提示在 180k 附近以約 0.4 GB 之差觸及記憶體守衛目標並暫停兩次；這是留在目標之下最便宜的辦法。下次載入模型時生效。",
   "settings.language.section_label": "語言",
   "settings.language.label": "介面語言",
   "settings.language.en": "English",

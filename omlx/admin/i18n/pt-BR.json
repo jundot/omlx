@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (padrão, compatível com OpenClaw / WorkBuddy)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (legado : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (sem keepalive)",
+  "settings.advanced.vision_tower_text_only": "Tirar a torre de visão (modo só-texto)",
+  "settings.advanced.vision_tower_text_only_hint": "Para agentes que nunca mandam imagem: depois da carga, os pesos da torre de visão são liberados (GLM-5.3-Flash: 347 tensores, 1,12 GB) e pedidos com imagem são recusados com erro claro. Medido no M1 Ultra (05/09): um prompt de 229k tokens encostou no alvo do guarda de memória perto dos 180k por ~0,4 GB e pausou duas vezes; esta é a forma mais barata de ficar abaixo dele. Vale a partir da próxima carga do modelo.",
   "settings.language.section_label": "Idioma",
   "settings.language.label": "Idioma da Interface",
   "settings.language.en": "English",

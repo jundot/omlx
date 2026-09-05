@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (default, OpenClaw / WorkBuddy compatible)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (legacy : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (no keepalive)",
+  "settings.advanced.vision_tower_text_only": "Unload the vision tower (text-only mode)",
+  "settings.advanced.vision_tower_text_only_hint": "For agents that never send images: after the model loads, the vision tower's weights are dropped (GLM-5.3-Flash: 347 tensors, 1.12 GB) and image inputs are refused with a clear error. Measured on M1 Ultra (05/09): a 229k-token prompt met the memory guard's target near 180k tokens by ~0.4 GB and paused twice; this is the cheapest way to stay under it. Applies to the next model load.",
   "settings.language.section_label": "Language",
   "settings.language.label": "Interface Language",
   "settings.language.en": "English",

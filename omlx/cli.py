@@ -117,6 +117,10 @@ def serve_command(args):
     if settings.cache.ane_compile_cache:
         os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
+    # The VLM engine reads this at load; export the saved setting the same way.
+    if bool(getattr(settings.server, "vision_tower_text_only", False)):
+        os.environ.setdefault("OMLX_VISION_TOWER_TEXT_ONLY", "1")
+
     # Register TRACE level (5) — includes full message content
     TRACE = 5
     logging.addLevelName(TRACE, "TRACE")

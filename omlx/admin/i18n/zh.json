@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "分块（默认，兼容 OpenClaw / WorkBuddy）",
   "settings.advanced.sse_keepalive_mode_comment": "注释（旧版 : keep-alive）",
   "settings.advanced.sse_keepalive_mode_off": "关闭（不保活）",
+  "settings.advanced.vision_tower_text_only": "卸载视觉塔（纯文本模式）",
+  "settings.advanced.vision_tower_text_only_hint": "面向从不发送图片的智能体：模型加载后释放视觉塔权重（GLM-5.3-Flash：347 个张量，1.12 GB），图片输入以明确错误拒绝。在 M1 Ultra 上实测（05/09）：229k 词元的提示在 180k 附近以约 0.4 GB 之差触及内存守卫目标并暂停两次；这是留在目标之下最便宜的办法。下次加载模型时生效。",
   "settings.language.section_label": "语言",
   "settings.language.label": "界面语言",
   "settings.language.en": "English",

@@ -1302,3 +1302,38 @@ def maybe_load_custom_quantization(
         return None
 
     return model, processor
+
+
+_VISION_SUBTREES = ("vision_model", "vision_tower")
+
+
+def free_vision_tower(model: Any) -> tuple[int, int]:
+    """Drop the vision tower's weights for a text-only deployment; returns (tensors, bytes).
+
+    Every leaf under the vision subtrees is replaced by a one-element placeholder
+    of the same dtype, so the module tree stays intact (no attribute errors on
+    introspection) while the memory goes back to the allocator. The engine that
+    calls this must refuse image inputs while the tower is out.
+
+    Why: on GLM-5.3-Flash the float16 tower is 1.12 GB resident (347 tensors), and
+    the long-context prefill meets the memory guard's target by ~0.4 GB near 180k
+    tokens (measured 05/09: two throttle pauses on a 229k prompt). An agent that
+    never sends images pays that 1.12 GB for nothing.
+    """
+    from mlx.utils import tree_unflatten
+
+    pares = [
+        (key, value)
+        for key, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and key.split(".", 1)[0] in _VISION_SUBTREES
+    ]
+    n_tensores = len(pares)
+    liberados = sum(int(v.nbytes) for _, v in pares)
+    for start in range(0, len(pares), _MATERIALIZE_EVAL_CHUNK):
+        chunk = [(k, mx.zeros((1,), dtype=v.dtype)) for k, v in pares[start : start + _MATERIALIZE_EVAL_CHUNK]]
+        mx.eval([v for _, v in chunk])
+        model.update(tree_unflatten(chunk))
+        del chunk
+    del pares
+    mx.clear_cache()
+    return n_tensores, liberados
