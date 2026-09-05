@@ -23,6 +23,7 @@ Usage:
     vision API format is transparently handled.
 """
 
+import os
 import asyncio
 import contextlib
 import copy
@@ -1751,6 +1752,25 @@ class VLMBatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
+
+        # glm5_next: the oQ float16 recipe leaves the vision tower in float32
+        # (upstream #1682 rule); on this family float16 is measured 4-5x
+        # closer to float32 than bfloat16 is, and the float32 copy costs ~1 GB
+        # resident. OMLX_VISION_FP16=0 keeps the checkpoint's dtype.
+        if (
+            _read_config_model_type(self._model_name) == "glm5_next"
+            and os.environ.get("OMLX_VISION_FP16", "1") != "0"
+        ):
+            try:
+                from ..utils.model_loading import cast_vision_f32_params_to_fp16
+
+                recast = await loop.run_in_executor(
+                    get_mlx_executor(), cast_vision_f32_params_to_fp16, self._vlm_model
+                )
+                if recast:
+                    logger.info("vision tower dtype: float32 -> float16 (%d tensors)", recast)
+            except Exception:
+                logger.warning("vision fp16 recast failed; staying on float32", exc_info=True)
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
         # The repacked safetensors carries 2-bit biases for format compat;
