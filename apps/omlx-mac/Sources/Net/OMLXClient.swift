@@ -506,6 +506,68 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.contextBenchCancel(benchId))
     }
 
+    // Storage roofline bench
+
+    @discardableResult
+    func startStorageBench(_ body: StorageBenchStartRequest) async throws -> StorageBenchStartResponse {
+        try await post(AdminAPI.storageBenchStart, body: body)
+    }
+
+    func getStorageBenchResults(jobId: String) async throws -> StorageBenchJobResponse {
+        try await get(AdminAPI.storageBenchResults(jobId))
+    }
+
+    func getStorageAutoParams(modelId: String) async throws -> StorageAutoParamsDTO {
+        try await get(AdminAPI.storageBenchAutoParams, query: [
+            URLQueryItem(name: "model_id", value: modelId),
+        ])
+    }
+
+    struct StorageHistoryResponse: Codable, Sendable {
+        let reports: [StorageHistoryEntry]?
+    }
+
+    struct StorageHistoryEntry: Codable, Equatable, Sendable {
+        let timestamp: String?
+        let path: String?
+        let volumeMedia: String?
+        let seqReadGBps: Double?
+        let randReadGBps: Double?
+        let bytesPerStepMB: Double?
+        let ceilingBaseTokS: Double?
+        let ceilingEffectiveTokS: Double?
+        let cacheClean: Bool?
+    }
+
+    func getStorageHistory(limit: Int = 10) async throws -> [StorageHistoryEntry] {
+        let resp: StorageHistoryResponse = try await get(
+            AdminAPI.storageBenchHistory,
+            query: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+        return resp.reports ?? []
+    }
+
+    /// Explicit params go to the server; nil leaves them to the server's
+    /// auto-derived values (params_source rides in the report).
+    func getStoragePrediction(modelId: String,
+                              tokPerCycle: Double? = nil,
+                              verifyMult: Double? = nil,
+                              measuredBaseTokS: Double? = nil) async throws -> StorageRooflineReportDTO {
+        var query: [URLQueryItem] = [
+            URLQueryItem(name: "model_id", value: modelId),
+        ]
+        if let tok = tokPerCycle {
+            query.append(URLQueryItem(name: "tok_per_cycle", value: String(format: "%g", tok)))
+        }
+        if let mult = verifyMult {
+            query.append(URLQueryItem(name: "verify_mult", value: String(format: "%g", mult)))
+        }
+        if let measured = measuredBaseTokS {
+            query.append(URLQueryItem(name: "measured_base_tok_s", value: String(format: "%g", measured)))
+        }
+        return try await get(AdminAPI.storageBenchPredict, query: query)
+    }
+
     // MARK: - Core request
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

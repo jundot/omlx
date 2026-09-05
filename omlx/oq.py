@@ -51,8 +51,12 @@ _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 
 _QWEN4_EXP_NGRAM_GROUP_SIZE = 32
+# JANGQ checkpoints nest the ngram table one level shallower
+# (ple.ngram_embedding); their native PLE group is 16, but the mmap
+# path serves pre-quantized PLE before re-quantization, so pricing
+# stays on the shared oQ predicate.
 _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
-    r"\.ple\.ple_embedding\.ngram_embedding\."
+    r"\.ple\.(?:ple_embedding\.)?ngram_embedding\."
     r"(?:shard_\d+|shards\.\d+)$"
 )
 

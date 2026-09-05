@@ -25,6 +25,7 @@ from omlx.scheduler import (
     _PrefillEvictionNeeded,
     _PrefillState,
 )
+from omlx.prefill_transient_tracker import PrefillTransientTracker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1468,3 +1469,140 @@ class TestPrefillCleanupUsesEngineStream:
 
         assert len(rejected) == 1
         self._assert_engine_stream(streams, sched)
+
+def test_predicted_chunk_transient_uses_measured_over_static():
+    """Once the transient tracker has samples, a wildly over-predicting static
+    estimate must NOT win the per-token MAX.
+
+    Regression for the 8k Qwen3.8 case: the generic SDPA+KV static estimate
+    returned ~34.5 MB/token vs a measured ~0.9 MB/token, and because the old
+    code folded the static term into the MAX unconditionally, the wrong value
+    permanently dominated and throttled every chunk to the floor (2048 -> 512),
+    inflating TTFT ~7x. With samples present the measured signal must win.
+    """
+    scheduler = _make_scheduler()
+    # Measured signal: ~1 MB/token (realistic for a 4-bit MoE model).
+    tracker = PrefillTransientTracker(model_id="test")
+    tracker.update(n_tokens=512, transient_bytes=512 * 1_000_000)
+    scheduler._prefill_transient_tracker = tracker
+    # Static estimate deliberately over-predicts (~34.5 MB/token -> 70 GiB for a
+    # 2048-token chunk), simulating a generic dense formula on a MoE model.
+    monitor = MagicMock()
+    monitor.estimate_chunk_transient_bytes.return_value = 70 * 1024**3
+    monitor.estimate_prompt_kv_bytes.return_value = 0
+    scheduler.memory_monitor = monitor
+    # Isolate the SDPA static term from the streaming bank term.
+    scheduler._streaming_bank_bytes = lambda n: 0
+
+    predicted = scheduler._predicted_chunk_transient(2048, 0)
+    # The static (~34.5 MB/token) is wildly higher than the measured (~1 MB),
+    # so it must be capped at _PREFILL_STATIC_MAX_OVER_MEASURED x the measured
+    # rate, NOT allowed to dominate. Raw static would predict
+    # 70 GiB * 1.3 ~= 91 GiB (which is what throttled every chunk to the
+    # floor in the 8k Qwen3.8 case); the capped prediction stays far below that.
+    raw_static_pred = (70 * 1024**3) * scheduler._PREFILL_TRANSIENT_SAFETY
+    measured_pred = 1_000_000 * 2048 * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted < 0.2 * raw_static_pred          # static did NOT dominate
+    assert predicted >= measured_pred                 # at least the measured rate
+    assert predicted <= 3.5 * measured_pred            # bounded by the cap (~3x)
+
+
+def test_predicted_chunk_transient_static_fallback_without_samples():
+    """Backward-compatible: with no measured samples, the static estimate is
+    still used for the first chunk of a freshly loaded model.
+    """
+    scheduler = _make_scheduler()
+    tracker = PrefillTransientTracker(model_id="test")  # no samples yet
+    assert tracker.bytes_per_token == 0
+    scheduler._prefill_transient_tracker = tracker
+    monitor = MagicMock()
+    monitor.estimate_chunk_transient_bytes.return_value = 70 * 1024**3
+    monitor.estimate_prompt_kv_bytes.return_value = 0
+    scheduler.memory_monitor = monitor
+    scheduler._streaming_bank_bytes = lambda n: 0
+
+    predicted = scheduler._predicted_chunk_transient(2048, 0)
+    # Static path: (70 GiB / 2048 tokens) * 2048 * 1.3 safety ~= 91 GiB.
+    static_expected = (70 * 1024**3) * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted > 50 * 1024**3
+    assert abs(predicted - static_expected) < 0.05 * static_expected
+
+
+def test_predicted_chunk_transient_static_estimate_failure_is_safe():
+    """A monitor that raises must not break chunk sizing: the call falls back
+    to the measured signal (or 0, letting the caller's watermark gate decide).
+    """
+    scheduler = _make_scheduler()
+    tracker = PrefillTransientTracker(model_id="test")
+    tracker.update(n_tokens=512, transient_bytes=512 * 1_000_000)
+    scheduler._prefill_transient_tracker = tracker
+    monitor = MagicMock()
+    monitor.estimate_chunk_transient_bytes.side_effect = RuntimeError("boom")
+    monitor.estimate_prompt_kv_bytes.side_effect = RuntimeError("boom")
+    scheduler.memory_monitor = monitor
+    scheduler._streaming_bank_bytes = lambda n: 0
+
+    # Must not raise; result tracks the measured signal.
+    predicted = scheduler._predicted_chunk_transient(2048, 0)
+    expected = 1_000_000 * 2048 * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted < 10 * 1024**3
+    assert abs(predicted - expected) < 0.1 * expected
+
+def test_prior_samples_zero_falls_back_to_static():
+    """Fase K K3: a restored prior (samples clamped to 0) is NOT measured
+    signal — the first chunk prices the static estimate, never the prior
+    EWMA or its raw deltas (a changed regime could underestimate the Metal
+    peak and OOM the first chunk)."""
+    from unittest.mock import MagicMock
+
+    from omlx.prefill_transient_tracker import PrefillTransientTracker
+
+    scheduler = _make_scheduler()
+    tracker = PrefillTransientTracker(model_id="test")
+    # Simulate the post-load_prior state: EWMA restored, samples == 0.
+    tracker._ewma_per_token = 40.0
+    tracker._last_delta_bytes = 40 * 512
+    tracker._last_n_tokens = 512
+    assert tracker.samples == 0
+    scheduler._prefill_transient_tracker = tracker
+    monitor = MagicMock()
+    monitor.estimate_chunk_transient_bytes.return_value = 70 * 1024**3
+    monitor.estimate_prompt_kv_bytes.return_value = 0
+    scheduler.memory_monitor = monitor
+    scheduler._streaming_bank_bytes = lambda n: 0
+
+    predicted = scheduler._predicted_chunk_transient(2048, 0)
+    static_expected = (70 * 1024**3) * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert abs(predicted - static_expected) < 0.05 * static_expected, (
+        "prior must never cap the static fallback: %r" % predicted
+    )
+
+
+def test_prior_replaced_by_first_measurement():
+    """Fase K K3: one real update() turns the prior into measurement — the
+    F4 static cap (3x over measured) engages from the first measured chunk.
+    """
+    from unittest.mock import MagicMock
+
+    from omlx.prefill_transient_tracker import PrefillTransientTracker
+
+    scheduler = _make_scheduler()
+    tracker = PrefillTransientTracker(model_id="test")
+    tracker._ewma_per_token = 40.0
+    tracker._last_delta_bytes = 40 * 512
+    tracker._last_n_tokens = 512
+    assert tracker.samples == 0
+    tracker.update(n_tokens=512, transient_bytes=512 * 1_000_000)
+    assert tracker.samples == 1
+    assert tracker.last_delta_bytes == 512 * 1_000_000
+    scheduler._prefill_transient_tracker = tracker
+    monitor = MagicMock()
+    monitor.estimate_chunk_transient_bytes.return_value = 70 * 1024**3
+    monitor.estimate_prompt_kv_bytes.return_value = 0
+    scheduler.memory_monitor = monitor
+    scheduler._streaming_bank_bytes = lambda n: 0
+
+    predicted = scheduler._predicted_chunk_transient(2048, 0)
+    measured_pred = 1_000_000 * 2048 * scheduler._PREFILL_TRANSIENT_SAFETY
+    assert predicted >= measured_pred
+    assert predicted <= 3.5 * measured_pred, "cap applies after first sample"

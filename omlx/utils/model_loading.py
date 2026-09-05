@@ -131,6 +131,28 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
     return load(path_or_repo, **kwargs)
 
 
+def _register_fused_experts_split_variants(
+    key: str, val: dict, quant: dict, extras: dict
+) -> None:
+    """Add split-half overrides for one fused experts.* policy entry.
+
+    Fused-quantized MoE banks (JANGQ MTP head) publish one override for
+    the fused ``experts.gate_up_proj`` triple, but sanitize splits it
+    into ``switch_mlp.gate_proj`` + ``switch_mlp.up_proj`` before
+    ``nn.quantize`` runs. Without a variant per half, the lookup misses
+    and the halves are built at the global bits (wrong width).
+    """
+    if ".experts.gate_up_proj" in key:
+        for half in ("gate_proj", "up_proj"):
+            half_key = key.replace(".experts.gate_up_proj", f".switch_mlp.{half}")
+            if half_key not in quant and half_key not in extras:
+                extras[half_key] = val
+    if ".experts.down_proj" in key:
+        down_key = key.replace(".experts.down_proj", ".switch_mlp.down_proj")
+        if down_key not in quant and down_key not in extras:
+            extras[down_key] = val
+
+
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add module-tree-path variants of per-layer quantization keys.
 
@@ -157,17 +179,10 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         for key, val in quant.items():
             if not isinstance(val, dict):
                 continue
-            if key.startswith(_CKPT_TEXT_PREFIX):
-                # model.language_model.X -> language_model.model.X
-                variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
-            elif key.startswith(_VLM_TEXT_PREFIX):
-                # language_model.X -> X
-                variant = key[len(_VLM_TEXT_PREFIX) :]
-            else:
-                # X -> language_model.X
-                variant = _VLM_TEXT_PREFIX + key
-            if variant not in quant and variant not in extras:
-                extras[variant] = val
+            if "mode" not in val:
+                # JANGQ publisher specs omit the mode; the triples carry
+                # scales+biases, so affine is the only valid reading.
+                val["mode"] = "affine"
             # Laguna router overrides: published checkpoints key the
             # per-layer quantization spec by ``mlp.gate``, but the model's
             # actual module-tree path is ``mlp.gate.proj`` (the router is
@@ -179,8 +194,101 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 proj_variant = key + ".proj"
                 if proj_variant not in quant and proj_variant not in extras:
                     extras[proj_variant] = val
+            if ".ple." in key:
+                # PLE ngram shards are served from SSD by the mmap table,
+                # never by a quantizable module: no runtime variant, or
+                # nn.quantize would target the sharded embedding.
+                continue
+            if key.startswith(_CKPT_TEXT_PREFIX):
+                # model.language_model.X -> language_model.model.X
+                variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
+            elif key.startswith(_RUNTIME_TEXT_PREFIX):
+                # Already a runtime path: nothing to add.
+                continue
+            elif key.startswith(_VLM_TEXT_PREFIX):
+                rest = key[len(_VLM_TEXT_PREFIX) :]
+                # language_model.X -> X
+                variant = rest
+                if variant not in quant and variant not in extras:
+                    extras[variant] = val
+                if not rest.startswith("model."):
+                    # JANGQ shallow convention: language_model.layers.N.*
+                    # lives at language_model.model.layers.N.* at runtime.
+                    deep_variant = _RUNTIME_TEXT_PREFIX + rest
+                    if deep_variant not in quant and deep_variant not in extras:
+                        extras[deep_variant] = val
+                continue
+            else:
+                # X -> language_model.X
+                variant = _VLM_TEXT_PREFIX + key
+            if variant not in quant and variant not in extras:
+                extras[variant] = val
         if extras:
             quant.update(extras)
+        # Nextn-style draft heads (GLM-5.3 JANG): the checkpoint stores the
+        # draft as extra trunk-indexed layers (model.layers.<n_main+i>.*)
+        # but the runtime tree nests them under language_model.mtp.<i>.
+        # Without these variants nn.quantize falls back to the global bits
+        # and builds e.g. a 2-bit draft MoE bank as 8-bit, failing the
+        # strict load with a shape error.
+        cfgs = (cfg, cfg.get("text_config") or {})
+        n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+        n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+        if n_mtp > 0 and n_main > 0:
+            for key, val in list(quant.items()):
+                if not isinstance(val, dict):
+                    continue
+                for i in range(n_mtp):
+                    pre = f"model.layers.{n_main + i}."
+                    if not key.startswith(pre):
+                        continue
+                    rest = key[len(pre):]
+                    if rest in ("eh_proj", "enorm", "hnorm"):
+                        nk = f"language_model.mtp.{i}.{rest}"
+                    elif rest == "shared_head.norm":
+                        nk = f"language_model.mtp.{i}.norm"
+                    elif rest.startswith(("shared_head.head", "embed_tokens")):
+                        nk = None
+                    else:
+                        nk = f"language_model.mtp.{i}.block.{rest}"
+                    if nk is not None and nk not in quant:
+                        quant[nk] = val
+                    break
+        # mlx-lm DeepSeek V4 bookends: the checkpoint keys the 8-bit
+        # affine spec by the bare names ``embed``/``head``, but the runtime
+        # tree holds them at ``model.embed_tokens`` / ``lm_head``. Without
+        # the runtime variant the predicate falls back to the global bits
+        # and builds the bookends at the wrong width.
+        for _bare, _runtime in (
+            ("embed", "model.embed_tokens"),
+            ("head", "lm_head"),
+        ):
+            _spec = quant.get(_bare)
+            if isinstance(_spec, dict) and _runtime not in quant:
+                quant[_runtime] = _spec
+        # mlx-lm bare trunk-layer keys (`layers.N.*`): sanitize nests
+        # them under `model.layers.N.*` at runtime. Without the variant
+        # the lookup misses and mixed-bits checkpoints (e.g. 8-bit
+        # attention over a 2-bit global) build at the wrong width.
+        for key, val in list(quant.items()):
+            if not isinstance(val, dict):
+                continue
+            if not key.startswith("layers."):
+                continue
+            _rest = key[len("layers."):]
+            if not _rest[:1].isdigit():
+                continue
+            _variant = "model." + key
+            if _variant not in quant:
+                quant[_variant] = val
+        # Second pass: fused experts.* entries (originals and the prefix
+        # variants just added) each need switch_mlp split-half variants.
+        # Runs after the merge so every spelling is covered; the added
+        # switch_mlp.* keys contain no ".experts." marker, so one pass
+        # terminates.
+        for key, val in list(quant.items()):
+            if isinstance(val, dict):
+                _register_fused_experts_split_variants(key, val, quant, quant)
         if str(cfg.get("model_type", "")).startswith("minimax_m3"):
             # The mlx-lm adapter stores the vendored mlx-vlm tree under
             # ``Model.inner`` and sanitize() re-roots checkpoint weights to
@@ -263,6 +371,72 @@ def normalize_hy_v3_rope_config(cfg: dict) -> dict:
             "rope_theta": cfg["rope_theta"],
             "rope_type": "default",
         }
+    return cfg
+
+
+def normalize_dsv4_mixed_moe_quant(cfg: dict) -> dict:
+    """Synthesize per-projection MoE specs from a JANGQ bit plan.
+
+    JANGQ DeepSeek-V4 checkpoints mix precision inside the routed banks:
+    ``routed_projection_group_sizes`` sets per-projection group sizes
+    (w2/down is gs32 while w1/w3 are gs64) and
+    ``routed_projection_layer_bits`` overrides bits per layer (w1 is 3-bit
+    on a few layers). sanitize stacks ``experts.{i}.w*`` into
+    ``model.layers.N.ffn.switch_mlp.{gate,down,up}_proj``, but no
+    per-module spec exists for those runtime paths, so the predicate
+    falls back to the global bits and the strict load fails. Emit the
+    runtime-path specs here so each projection builds at its true width.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if not str(cfg.get("model_type", "")).startswith("deepseek_v4"):
+        return cfg
+    quant = cfg.get("quantization")
+    if not isinstance(quant, dict):
+        return cfg
+    plan = quant.get("routed_expert_bit_plan")
+    if not isinstance(plan, dict):
+        return cfg
+    group_sizes = plan.get("routed_projection_group_sizes") or {}
+    layer_bits = plan.get("routed_projection_layer_bits") or {}
+    layer_groups = plan.get("routed_projection_layer_group_sizes") or {}
+    try:
+        n_layers = int(cfg.get("num_hidden_layers", 0) or 0)
+    except (TypeError, ValueError):
+        return cfg
+    if n_layers <= 0:
+        return cfg
+    default_bits = int(plan.get("default_bits", quant.get("bits", 2)) or 2)
+    mode = plan.get("codec", quant.get("mode", "affine")) or "affine"
+    for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        gs = int(group_sizes.get(proj, quant.get("group_size", 64)) or 64)
+        per_layer_bits = layer_bits.get(proj) or {}
+        per_layer_gs = layer_groups.get(proj) or {}
+        for n in range(n_layers):
+            try:
+                bits = int(per_layer_bits.get(str(n), per_layer_bits.get(n, default_bits)))
+            except (TypeError, ValueError):
+                bits = default_bits
+            try:
+                lgs = int(per_layer_gs.get(str(n), per_layer_gs.get(n, gs)))
+            except (TypeError, ValueError):
+                lgs = gs
+            key = f"model.layers.{n}.ffn.switch_mlp.{dst}"
+            if key not in quant:
+                quant[key] = {"group_size": lgs, "bits": bits, "mode": mode}
+    # Shared experts carry their own bare specs (`layers.N.ffn.
+    # shared_experts.w*`); sanitize renames w1/w2/w3 to
+    # gate/down/up_proj under `model.layers.N`, so copy the spec to the
+    # runtime path (same bare-vs-runtime miss as the bookends).
+    for n in range(n_layers):
+        for proj, dst in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+            bare = f"layers.{n}.ffn.shared_experts.{proj}"
+            spec = quant.get(bare)
+            if not isinstance(spec, dict):
+                continue
+            runtime = f"model.layers.{n}.ffn.shared_experts.{dst}"
+            if runtime not in quant:
+                quant[runtime] = spec
     return cfg
 
 
@@ -364,11 +538,20 @@ def _patch_mlx_lm_load_config() -> None:
 
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
+        # Spill-stacking context for per-expert DeepSeek-V4 checkpoints:
+        # sanitize needs the checkpoint dir to locate/reuse spill shards.
+        try:
+            from ..patches.deepseek_v4.spill import set_spill_model_path
+
+            set_spill_model_path(str(model_path))
+        except Exception:
+            pass
         normalize_hy_v3_rope_config(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
         normalize_bailing_hybrid_fp8_quant(cfg)
+        normalize_dsv4_mixed_moe_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -683,7 +866,7 @@ def maybe_apply_pre_load_patches(
             mode=(
                 "mmap"
                 if model_settings is not None
-                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
+                and getattr(model_settings, "qwen4_ple_ssd_offload", True)
                 else "resident" if model_settings is not None else None
             ),
             mtp_enabled=mtp_active,
@@ -742,6 +925,12 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
+            elif model_type == "glm5_next":
+                # GLM-5.3 Lightning draft: one attached block, chain-capable
+                # like GLM-5.2's. The draft runs its own 288-expert MoE, so
+                # the adaptive controller's marginal-cost prior matters;
+                # start at the validated general max.
+                set_mtp_depth(3)
             elif model_type in ("gemma4", "gemma4_unified"):
                 # The fused multi-row verify kernel keeps gemma4 global-layer
                 # attention near-flat in L, so depths 4..8 are genuinely
@@ -1113,6 +1302,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"

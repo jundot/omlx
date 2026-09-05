@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "timestamp": "2026-09-04T08:22:33",
+  "volume": {
+    "path": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
+    "mount": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
+    "filesystem": "",
+    "media_name": "",
+    "protocol": "",
+    "location": "",
+    "solid_state": false,
+    "total_bytes": 4096595902464,
+    "free_bytes": 1850714943488
+  },
+  "measurement": {
+    "volume_mount": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
+    "file_bytes": 2147483648,
+    "seq_read_Bps": 2566793287.3876567,
+    "rand_read_Bps": 3068657937.0586524,
+    "rand_iops": 1463.2501302045118,
+    "rand_lat_ms_p50": 0.7004590006545186,
+    "rand_lat_ms_p90": 0.7461250061169267,
+    "rand_lat_ms_p99": 0.7920410134829581,
+    "rand_lat_ms_max": 0.8476250222884119,
+    "write_Bps": 3035154384.0918856,
+    "samples": 256,
+    "read_mb": 2,
+    "cache_clean": true,
+    "method": "F_NOCACHE",
+    "warnings": []
+  },
+  "profile": {
+    "model_dir": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
+    "model_type": "qwen4_exp",
+    "supported": true,
+    "reason": "",
+    "num_moe_layers": 48,
+    "routed_total_per_layer": 512,
+    "top_k": 10,
+    "routed_active_bytes_per_layer": 28224000,
+    "shared_bytes_per_layer": 5285226,
+    "bytes_per_step": 1354752000,
+    "checkpoint_bytes": 103109369716
+  },
+  "prediction": {
+    "bytes_per_step": 1354752000,
+    "bytes_verify": 3115929599,
+    "verify_byte_mult": 2.3,
+    "tok_per_cycle": 1.79,
+    "ceiling_base_tok_s": 2.2651067775199096,
+    "ceiling_mtp_tok_s": 1.7628439708964643,
+    "mtp_profitable": false,
+    "margin_tok_per_cycle": -0.5099999999999998,
+    "explanation": "MTP loses structurally: 1.79 tok/cycle < 2.30x verify bytes (ceiling 1.76 vs base 2.27 tok/s). No faster SSD closes this gap \u2014 only more stages or resident weights do."
+  },
+  "calibration": {
+    "measured_base_tok_s": 3.55,
+    "predicted_ceiling_base_tok_s": 2.2651067775199096,
+    "efficiency": 1.5672550341697065
+  }
+}

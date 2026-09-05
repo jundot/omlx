@@ -185,6 +185,16 @@
                                                 </template>
                                                 <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
                                                      x-text="(m.is_loading ? 'est. ' : '') + modelSizeLabel(m)"></div>
+                                                <template x-if="!m.is_loading && m.expert_streaming_health">
+                                                    <div class="flex items-center gap-2 text-[11px] text-neutral-400 font-mono min-w-0 flex-wrap"
+                                                         :title="window.t('status.active_models.streaming_health')">
+                                                        <span class="px-1 py-0.5 rounded bg-neutral-100 text-neutral-500">MoE-stream</span>
+                                                        <span x-text="window.t('status.active_models.hit_rate') + ' ' + (Math.round((m.expert_streaming_health.lru_hit_rate || 0) * 100) + '%')"></span>
+                                                        <span x-text="(m.expert_streaming_health.cache_policy || 'lru').toUpperCase()"></span>
+                                                        <span x-show="m.expert_streaming_health.dynamic_enabled"
+                                                              x-text="'gov ' + ((m.expert_streaming_health.governor?.actions) || 0) + ' · ' + ((m.expert_streaming_health.governor?.capacity) || 0)"></span>
+                                                    </div>
+                                                </template>
                                             </div>
                                         </div>
                                         <div x-show="!m.is_loading" class="relative shrink-0 self-center">

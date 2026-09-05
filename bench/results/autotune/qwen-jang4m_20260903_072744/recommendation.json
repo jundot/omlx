@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "created_at": "2026-09-03T10:34:49.117740+00:00",
+  "objective": "balanced",
+  "model": "qwen-jang4m",
+  "model_id": "Qwen3.8-Flash-Next-JANG_4M",
+  "machine": {
+    "total_gib": 48.0,
+    "available_gib": 21.50701904296875,
+    "swap_used_gib": 0.80535888671875,
+    "static_ceiling_gib": 42.0,
+    "metal_cap_gib": 37.44000244140625,
+    "tier": "balanced",
+    "checkpoint_gib": 96.02808367088437,
+    "seq_gbps": 4.38,
+    "rand_gbps": 5.47
+  },
+  "screen_context": "short",
+  "validate_context": "8k",
+  "budget_knee_gib": 0.0,
+  "winner": {
+    "expert_streaming_budget_gib": 0.0,
+    "expert_streaming_io_depth": 16,
+    "expert_streaming_coalesce": true,
+    "expert_streaming_readahead": true,
+    "expert_streaming_seed": true,
+    "expert_streaming_pilot": true,
+    "expert_streaming_topk_threshold": null,
+    "expert_streaming_cache_prior": null,
+    "label": "b0_qd16_c1_ra1_s1_p1"
+  },
+  "winner_score": 0.0696,
+  "trials": [
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 11.6,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 10.21,
+      "tok_s": 1.7166,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b1_qd16_c1_ra1_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 14.4,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.91,
+      "tok_s": 1.6352,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p1",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 15.6,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.19,
+      "tok_s": 1.765,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c0_ra1_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 15.0,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.53,
+      "tok_s": 1.7023,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra0_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 14.6,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.54,
+      "tok_s": 1.7656,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s0_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 14.2,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 10.72,
+      "tok_s": 1.6279,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0_cp1",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 11.0,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.81,
+      "tok_s": 1.5981,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0_cp2",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 14.7,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 10.12,
+      "tok_s": 1.6367,
+      "swap_growth_gib": 0.0
+    }
+  ],
+  "applied_to_profile": false,
+  "notes": []
+}

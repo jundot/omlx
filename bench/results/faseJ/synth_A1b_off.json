@@ -1,0 +1,26 @@
+{
+  "etapa": "A1b",
+  "arm": "off",
+  "description": "legacy path: U per-expert promotes + mx.stack per projection",
+  "config": {
+    "layers": 48,
+    "experts": 32,
+    "hidden": 1024,
+    "moe_hidden": 896,
+    "tokens": 2048,
+    "group_size": 64,
+    "bits": 4,
+    "mode": "boundary",
+    "OMLX_EXPERT_STREAMING_LAYER_BARRIER": "1",
+    "OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX": "0"
+  },
+  "reps": 3,
+  "peak_gib": 0.299,
+  "peak_deterministic": true,
+  "wall_s": [0.502, 0.491, 0.499],
+  "path_counters": {
+    "promote_banks": 0,
+    "promote_np": 13824,
+    "mx_stack": 432
+  }
+}

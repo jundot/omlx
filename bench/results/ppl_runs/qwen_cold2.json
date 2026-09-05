@@ -1,0 +1,14 @@
+{
+  "model": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-oQ4e-mtp",
+  "corpus": "bench/corpus/pg1342.txt",
+  "ctx": 2048,
+  "windows": 12,
+  "n_terms": 24564,
+  "mean_nll": 0.5304825333503806,
+  "perplexity": 1.6997522979376847,
+  "mode": "streaming",
+  "cold_tier": "2",
+  "hot_fraction": null,
+  "budget_gib": 2.0,
+  "load_s": 3.3
+}

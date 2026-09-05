@@ -138,6 +138,27 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    expert_streaming_enabled: bool | None = None
+    expert_streaming_budget_gib: float | None = None
+    expert_streaming_budget_auto: bool | None = None
+    expert_streaming_topk_threshold: float | None = None
+    expert_streaming_cache_prior: float | None = None
+    # Expert-streaming IO knobs (autotune-tuned, per model; None = env/default)
+    expert_streaming_io_depth: int | None = None
+    expert_streaming_coalesce: bool | None = None
+    expert_streaming_readahead: bool | None = None
+    expert_streaming_seed: bool | None = None
+    expert_streaming_pilot: bool | None = None
+    expert_streaming_per_layer_eval: bool | None = None
+    expert_streaming_pins: bool | None = None
+    expert_streaming_pin_gib: float | None = None
+    expert_streaming_pin_sync: bool | None = None
+    expert_streaming_pin_regime: str | None = None
+    expert_streaming_cold_tier: str | None = None
+    expert_streaming_hot_fraction: float | None = None
+    expert_streaming_cache_policy: str | None = None
+    expert_streaming_dynamic: bool | None = None
+    expert_streaming_dynamic_max_gib: float | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -476,6 +497,41 @@ def _parse_hot_cache_max_size(value: str) -> int:
 
 
 _PAROQUANT_REASON = "Not supported on paroquant models yet (compatibility not verified)"
+
+
+def _expert_streaming_health(engine_pool: Any, model_id: str) -> dict | None:
+    """Runtime MoE streaming health for a *loaded* engine, or None.
+
+    Aggregates the counters the streaming implementation already keeps
+    (LRU hit-rate, prefetch precision, stash, governor state) plus the
+    effective cache policy, so the dashboard and the Mac app can show
+    live health next to each loaded streaming model. Cheap: reads dicts
+    that are maintained anyway; never raises.
+    """
+    try:
+        entries = getattr(engine_pool, "_entries", None) or {}
+        entry = entries.get(model_id)
+        engine = getattr(entry, "engine", None) if entry is not None else None
+        # Loaded engines expose the streaming backing set at convert time.
+        for eng in (engine, getattr(engine, "engine", None)):
+            backing = getattr(eng, "_expert_streaming_backing", None)
+            if backing is not None:
+                cache = getattr(backing, "_streaming_cache", None)
+                from ..patches.expert_streaming import expert_streaming_summary
+
+                health = expert_streaming_summary(cache, backing) or {}
+                health["cache_policy"] = str(
+                    getattr(cache, "policy", "lru") or "lru"
+                )
+                health["dynamic_enabled"] = getattr(backing, "governor", None) is not None
+                return health or None
+    except Exception:
+        logger.debug(
+            "Could not collect expert streaming health for %s",
+            model_id,
+            exc_info=True,
+        )
+    return None
 
 
 def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -1975,6 +2031,53 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                     exc_info=True,
                 )
 
+        # Expert streaming capability (glm_moe_dsa etc.)
+        expert_streaming_supported = False
+        expert_streaming_forced = False
+        expert_streaming_reason: str | None = None
+        expert_dense_bytes = 0
+        expert_total_bytes = 0
+        expert_resident_bytes = 0
+        expert_streaming_bytes = 0
+        expert_moe_layers = 0
+        experts_per_layer = 0
+        per_expert_bytes = 0
+        try:
+            from ..patches.expert_streaming.residency import expert_streaming_estimate
+
+            _est = expert_streaming_estimate(model_info.get("model_path", "") or "")
+            expert_streaming_supported = bool(_est.supported)
+            expert_streaming_reason = _est.reason
+            expert_dense_bytes = int(_est.dense_bytes)
+            expert_total_bytes = int(_est.expert_bytes)
+            expert_resident_bytes = int(_est.resident_bytes)
+            expert_streaming_bytes = int(_est.streaming_bytes)
+            expert_moe_layers = int(_est.num_moe_layers)
+            experts_per_layer = int(_est.experts_per_layer)
+            per_expert_bytes = int(_est.per_expert_bytes)
+            if _est.supported:
+                try:
+                    _transient = int(getattr(_est, "per_layer_expert_bytes", 0) or 0)
+                    expert_streaming_forced = bool(
+                        _est.force_streaming(residency_ceiling, _transient)
+                    )
+                except Exception:
+                    expert_streaming_forced = False
+        except Exception:
+            logger.debug("Could not inspect expert streaming for %s", model_id, exc_info=True)
+
+        # Cold precision tier presence (I5): a complete expert_cold/ requant
+        # set exists for this checkpoint — the UI only offers the tier then.
+        expert_cold_tier_present = False
+        try:
+            from ..patches.expert_streaming.shard_bank import cold_tier_status
+
+            expert_cold_tier_present = cold_tier_status(
+                model_info.get("model_path", "") or ""
+            )[0]
+        except Exception:
+            pass
+
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -2028,6 +2131,30 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "expert_streaming_supported": expert_streaming_supported,
+            "expert_streaming_forced": expert_streaming_forced,
+            "expert_streaming_reason": expert_streaming_reason,
+            "expert_dense_bytes": expert_dense_bytes,
+            "expert_total_bytes": expert_total_bytes,
+            "expert_resident_bytes": expert_resident_bytes,
+            "expert_streaming_bytes": expert_streaming_bytes,
+            "expert_streaming_cold_tier_present": expert_cold_tier_present,
+            "expert_moe_layers": expert_moe_layers,
+            "experts_per_layer": experts_per_layer,
+            "per_expert_bytes": per_expert_bytes,
+            # P1: tier-aware effective bytes (what decode reads when a
+            # cold tier is active) + slots under it. "none" == source.
+            "expert_tier": getattr(_est, "tier", "none"),
+            "expert_bytes_effective": int(getattr(_est, "expert_bytes_effective", 0) or 0),
+            "per_expert_bytes_effective": int(
+                getattr(_est, "per_expert_bytes_effective", 0) or 0
+            ),
+            # Runtime health for loaded streaming engines: LRU hit-rate,
+            # prefetch precision, stash, transition table, governor state.
+            # Cheap (dict already maintained); null when not applicable.
+            "expert_streaming_health": _expert_streaming_health(
+                engine_pool, model_id
+            ),
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2359,6 +2486,145 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "expert_streaming_enabled" in sent:
+        current_settings.expert_streaming_enabled = bool(
+            request.expert_streaming_enabled
+        )
+    if "expert_streaming_budget_gib" in sent:
+        v = request.expert_streaming_budget_gib
+        if v is None:
+            current_settings.expert_streaming_budget_gib = None
+        else:
+            try:
+                gib = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be a number")
+            if not 0 <= gib <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_budget_gib must be between 0 and 64 GiB")
+            # 0 = page-cache only (no app-level LRU); null = engine default
+            current_settings.expert_streaming_budget_gib = float(gib)
+    if "expert_streaming_budget_auto" in sent:
+        current_settings.expert_streaming_budget_auto = (
+            None if request.expert_streaming_budget_auto is None
+            else bool(request.expert_streaming_budget_auto)
+        )
+    if "expert_streaming_topk_threshold" in sent:
+        v = request.expert_streaming_topk_threshold
+        if v is None:
+            current_settings.expert_streaming_topk_threshold = None
+        else:
+            try:
+                thr = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be a number")
+            if not 0.05 <= thr <= 1.0:
+                raise HTTPException(status_code=400, detail="expert_streaming_topk_threshold must be between 0.05 and 1.0")
+            # >= 1.0 normalizes to exact routing (None)
+            current_settings.expert_streaming_topk_threshold = float(thr) if thr < 1.0 else None
+    if "expert_streaming_cache_prior" in sent:
+        v = request.expert_streaming_cache_prior
+        if v is None:
+            current_settings.expert_streaming_cache_prior = None
+        else:
+            try:
+                prior = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expert_streaming_cache_prior must be a number")
+            if not 0.0 <= prior <= 10.0:
+                raise HTTPException(status_code=400, detail="expert_streaming_cache_prior must be between 0.0 and 10.0")
+            # 0.0 normalizes to exact routing (None)
+            current_settings.expert_streaming_cache_prior = float(prior) if prior > 0 else None
+    if "expert_streaming_io_depth" in sent:
+        v = request.expert_streaming_io_depth
+        if v is None:
+            current_settings.expert_streaming_io_depth = None
+        else:
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_io_depth must be an integer between 1 and 64")
+            current_settings.expert_streaming_io_depth = int(v)
+    if "expert_streaming_coalesce" in sent:
+        current_settings.expert_streaming_coalesce = request.expert_streaming_coalesce
+    if "expert_streaming_readahead" in sent:
+        current_settings.expert_streaming_readahead = request.expert_streaming_readahead
+    if "expert_streaming_seed" in sent:
+        current_settings.expert_streaming_seed = request.expert_streaming_seed
+    if "expert_streaming_pilot" in sent:
+        current_settings.expert_streaming_pilot = request.expert_streaming_pilot
+    if "expert_streaming_per_layer_eval" in sent:
+        current_settings.expert_streaming_per_layer_eval = (
+            request.expert_streaming_per_layer_eval
+        )
+    if "expert_streaming_pins" in sent:
+        current_settings.expert_streaming_pins = request.expert_streaming_pins
+    if "expert_streaming_pin_gib" in sent:
+        v = request.expert_streaming_pin_gib
+        if v is None:
+            current_settings.expert_streaming_pin_gib = None
+        else:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 64:
+                raise HTTPException(status_code=400, detail="expert_streaming_pin_gib must be a number between 0 and 64 GiB")
+            current_settings.expert_streaming_pin_gib = float(v)
+    if "expert_streaming_pin_sync" in sent:
+        v = request.expert_streaming_pin_sync
+        current_settings.expert_streaming_pin_sync = None if v is None else bool(v)
+    if "expert_streaming_pin_regime" in sent:
+        v = request.expert_streaming_pin_regime
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_pin_regime = None
+        elif str(v) in ("decode", "prefill"):
+            current_settings.expert_streaming_pin_regime = str(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_pin_regime must be 'decode' or 'prefill'",
+            )
+    if "expert_streaming_cold_tier" in sent:
+        v = request.expert_streaming_cold_tier
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_cold_tier = None
+        elif str(v).isdigit() and 2 <= int(v) <= 8:
+            current_settings.expert_streaming_cold_tier = str(int(v))
+        else:
+            raise HTTPException(status_code=400, detail="expert_streaming_cold_tier must be 2..8")
+    if "expert_streaming_hot_fraction" in sent:
+        v = request.expert_streaming_hot_fraction
+        if v is None:
+            current_settings.expert_streaming_hot_fraction = None
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= float(v) <= 1:
+            current_settings.expert_streaming_hot_fraction = float(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_hot_fraction must be a number between 0 and 1",
+            )
+    if "expert_streaming_cache_policy" in sent:
+        v = request.expert_streaming_cache_policy
+        if v is None or str(v).strip() == "":
+            current_settings.expert_streaming_cache_policy = None
+        elif str(v).strip().lower() in ("lru", "s3fifo"):
+            current_settings.expert_streaming_cache_policy = str(v).strip().lower()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_cache_policy must be 'lru' or 's3fifo'",
+            )
+    if "expert_streaming_dynamic" in sent:
+        current_settings.expert_streaming_dynamic = (
+            bool(request.expert_streaming_dynamic)
+            if request.expert_streaming_dynamic is not None
+            else None
+        )
+    if "expert_streaming_dynamic_max_gib" in sent:
+        v = request.expert_streaming_dynamic_max_gib
+        if v is None:
+            current_settings.expert_streaming_dynamic_max_gib = None
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < float(v) <= 64:
+            current_settings.expert_streaming_dynamic_max_gib = float(v)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expert_streaming_dynamic_max_gib must be a number between 0 and 64",
+            )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -5523,6 +5789,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                # Live MoE streaming health (LRU hit-rate, prefetch
+                # precision, governor) when this loaded model streams experts.
+                "expert_streaming_health": _expert_streaming_health(
+                    engine_pool, model_id
+                ),
             }
         )
 
@@ -6903,6 +7174,310 @@ async def cancel_ane_tuning(
     if run.task is not None and not run.task.done():
         run.task.cancel()
     return {"status": "cancelled", "tuning_id": tuning_id}
+
+
+# =============================================================================
+# Storage Roofline API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.post("/api/bench/storage/start")
+async def start_storage_benchmark(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Start an uncached storage measurement for the MoE roofline.
+
+    Measures the volume holding the model (or the server's model dir when
+    no model_id is given). Rejects with 409 while any benchmark —
+    throughput, context, ANE, or another storage run — is active: they
+    share the volume queue and would corrupt each other's numbers.
+    Clients should run this with inference IDLE for the same reason.
+    """
+    import asyncio
+
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+    from .benchmark import get_active_run as get_active_throughput_run
+    from .context_benchmark import get_active_run as get_active_context_run
+    from .storage_bench import (
+        StorageBenchRequest,
+        create_job,
+        get_active_job,
+        run_storage_benchmark,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    for label, active in (
+        ("throughput benchmark", get_active_throughput_run()),
+        ("context benchmark", get_active_context_run()),
+        ("ANE tuning", get_active_ane_tuning()),
+        ("storage benchmark", get_active_job()),
+    ):
+        if active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {label} is already running.",
+            )
+
+    # Active-inference guard (roofline F4): a measurement competing with
+    # live decode I/O is a corrupted measurement, not a slow one. Loaded
+    # but IDLE engines stay allowed — they generate no expert reads.
+    try:
+        active = _build_active_models_data()
+        busy = [
+            m.get("name") or m.get("id") or "?"
+            for m in active.get("models", [])
+            if m.get("total_active_requests", 0) > 0
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("active-model check unavailable: %s", exc)
+        busy = []
+    if busy:
+        raise HTTPException(
+            status_code=409,
+            detail="Inference is active on: " + ", ".join(busy) + ". "
+            "Run the storage measurement with inference idle.",
+        )
+
+    try:
+        bench_request = StorageBenchRequest(**(await request.json()))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target_dir: str
+    if bench_request.model_id is not None:
+        entry = engine_pool.get_entry(bench_request.model_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {bench_request.model_id}"
+            )
+        if entry.model_type not in ("llm", "vlm", None):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {bench_request.model_id} is not a supported model "
+                f"(type: {entry.model_type})",
+            )
+        target_dir = entry.model_path
+        # Spill awareness (roofline F3): when a fresh dsv4-style spill
+        # exists, decode demand-reads page from the SPILL volume, not the
+        # checkpoint volume — measure where decode actually reads.
+        try:
+            from omlx.patches.deepseek_v4.spill import spill_is_valid
+
+            spill_dir = spill_is_valid(entry.model_path)
+            if spill_dir is not None:
+                target_dir = str(spill_dir)
+        except Exception:
+            pass
+    else:
+        # Volume-only: measure where the checkpoints live. The pool root
+        # is not exposed, so fall back to the server working directory.
+        target_dir = "."
+
+    job = create_job(bench_request, target_dir)
+    asyncio.get_running_loop().run_in_executor(None, run_storage_benchmark, job)
+    logger.info("Storage benchmark started: %s target=%s", job.job_id, target_dir)
+    return {"job_id": job.job_id, "status": "started"}
+
+
+@router.get("/api/bench/storage/{job_id}/results")
+async def get_storage_benchmark_results(
+    job_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Poll a storage benchmark job (1 Hz like the other benches)."""
+    from .storage_bench import get_job, job_to_response
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Storage job not found: {job_id}")
+    return job_to_response(job)
+
+
+@router.get("/api/bench/storage/history")
+async def get_storage_history(
+    limit: int = 10,
+    is_admin: bool = Depends(require_admin),
+):
+    """Recent storage-roofline reports (newest first), summarized.
+
+    The UI computes deltas between consecutive entries so a drive/cable
+    swap shows up as a diff, not two absolute tables. Empty list (200)
+    before the first run.
+    """
+    from omlx.utils.storage_roofline import list_reports
+
+    return {"reports": list_reports(limit=max(1, min(limit, 100)))}
+
+
+@router.get("/api/bench/storage/auto-params")
+async def get_storage_auto_params(
+    model_id: str,
+    refresh: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Auto-derived verdict parameters for a model (tok/cycle, verify byte
+    mult, measured bytes/token). Empty-but-200 when nothing is derived yet
+    — the UI treats it as "defaults in use", never as an error.
+
+    refresh=1 re-derives from the newest bench results instead of reading
+    the persisted auto_params file (the results scan is milliseconds).
+    """
+    from omlx.utils.storage_roofline import (
+        _bench_results_dirs,
+        derive_bytes_per_token_base,
+        derive_tok_per_cycle,
+        derive_verify_mult,
+        load_auto_params,
+        update_auto_params,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    if refresh:
+        data = update_auto_params(entry.model_path)
+    else:
+        data = load_auto_params(entry.model_path)
+    if data is None:
+        # No usable pairs: also report the raw per-derivation outcome so
+        # the UI can say WHY (e.g. benches exist but ran without telemetry).
+        dirs = _bench_results_dirs()
+        return {
+            "available": False,
+            "model_dir": entry.model_path,
+            "verify_mult": derive_verify_mult(dirs, entry.model_path),
+            "tok_per_cycle": derive_tok_per_cycle(dirs, entry.model_path),
+            "bytes_per_token": derive_bytes_per_token_base(dirs, entry.model_path),
+        }
+    data = dict(data)
+    data["available"] = True
+    return data
+
+
+@router.get("/api/bench/storage/predict")
+async def get_storage_prediction(
+    model_id: str,
+    tok_per_cycle: float | None = None,
+    verify_mult: float | None = None,
+    measured_base_tok_s: float | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Roofline prediction for a model from the latest measurement.
+
+    Fresh profile, reused measurement: profiling headers is milliseconds,
+    measuring the SSD is minutes. Missing tok_per_cycle/verify_mult fall
+    back to the model's auto-derived parameters (bench pairs run with
+    --arm-read-telemetry) and then to documented defaults; the report's
+    params_source says which. 404 when the model is unknown, the profile
+    is unsupported, or no measurement exists yet.
+    """
+    from .storage_bench import latest_measurement
+    from omlx.utils.storage_roofline import (
+        StorageMeasurement,
+        build_report,
+        moe_step_profile,
+        predict_roofline,
+    )
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    # Parameter resolution: explicit query > auto-derived > default. The
+    # auto file also carries bytes_per_token_base (Fase 2 effective
+    # ceiling) even when the explicit query params are the final ones.
+    from omlx.utils.storage_roofline import load_auto_params
+
+    auto = load_auto_params(entry.model_path)
+    params_source = "explicit"
+    if tok_per_cycle is None or verify_mult is None:
+        if auto is not None and (
+            auto.get("tok_per_cycle") or auto.get("verify_byte_mult")
+        ):
+            params_source = "auto"
+        else:
+            params_source = "default"
+        if tok_per_cycle is None:
+            tok_per_cycle = (auto or {}).get("tok_per_cycle") or 1.0
+        if verify_mult is None:
+            verify_mult = (auto or {}).get("verify_byte_mult") or 2.3
+    tok_per_cycle = float(tok_per_cycle)
+    verify_mult = float(verify_mult)
+
+    measurement_dict = latest_measurement()
+    if measurement_dict is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No completed storage measurement yet — run the storage benchmark first.",
+        )
+    try:
+        measurement = StorageMeasurement(**measurement_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stored measurement unreadable: {e}")
+
+    profile = moe_step_profile(entry.model_path)
+    if not profile.supported:
+        raise HTTPException(
+            status_code=404, detail=f"Model not supported for roofline: {profile.reason}"
+        )
+    # Volume-mismatch warning (roofline F3): when a fresh spill exists,
+    # decode reads page from the spill volume - if the latest measurement
+    # was taken on a DIFFERENT volume (st_dev), the ceiling describes the
+    # wrong disk. Warn, don't fail: re-measuring before/after a move is a
+    # legitimate workflow the caller may be mid-way through.
+    warnings: list[str] = []
+    read_volume = profile.data_source_dir or entry.model_path
+    try:
+        from omlx.utils.storage_roofline import volume_info_for
+
+        meas_st_dev = int(
+            (measurement_dict.get("volume_st_dev") or 0)
+            or volume_info_for(measurement.volume_mount or ".").st_dev
+        )
+        target_st_dev = volume_info_for(read_volume).st_dev
+        if meas_st_dev and target_st_dev and meas_st_dev != target_st_dev:
+            warnings.append(
+                "volume_mismatch: the latest measurement was taken on a "
+                "different volume than the model's expert reads page from "
+                f"({profile.data_source}: {read_volume}). Re-run the "
+                "storage benchmark for a matching ceiling."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("volume-mismatch check failed: %s", exc)
+    prediction = predict_roofline(
+        profile, measurement,
+        tok_per_cycle=tok_per_cycle, verify_byte_mult=verify_mult,
+        bytes_per_token_base=(auto or {}).get("bytes_per_token_base"),
+        measured_mtp_slowdown=(auto or {}).get("measured_mtp_slowdown"),
+    )
+    report = build_report(
+        volume_info_for_measurement(measurement_dict),
+        measurement, profile, prediction,
+        measured_base_tok_s=measured_base_tok_s,
+    )
+    if warnings:
+        report["warnings"] = warnings
+    report["params_source"] = params_source
+    report["params_auto"] = auto
+    return report
+
+
+def volume_info_for_measurement(measurement_dict: dict):
+    """Rebuild a VolumeInfo for the volume a measurement was taken on."""
+    from omlx.utils.storage_roofline import VolumeInfo, volume_info_for
+
+    return volume_info_for(measurement_dict.get("volume_mount") or ".")
 
 
 # =============================================================================

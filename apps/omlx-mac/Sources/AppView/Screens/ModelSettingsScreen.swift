@@ -726,6 +726,271 @@ private struct AdvancedTab: View {
                         .disabled(vm.qwen4PleSsdOffloadForced)
                     }
                 }
+                if vm.expertStreamingSupported {
+                    Row(label: String(localized: "settings.advanced.expert_streaming.label",
+                                      defaultValue: "Expert Streaming (SSD)",
+                                      comment: "Row label for the MoE expert streaming toggle"),
+                        sublabel: vm.expertStreamingForced
+                            ? String(localized: "settings.advanced.expert_streaming.forced",
+                                     defaultValue: "Auto-enabled: resident model exceeds the memory ceiling but streaming fits.",
+                                     comment: "Sublabel when expert streaming is forced by memory limits")
+                            : String(localized: "settings.advanced.expert_streaming.sub",
+                                     defaultValue: "Keep only the hot MoE experts in RAM and stream the rest from SSD. Trades decode speed for memory. One request at a time. Takes effect after reload.",
+                                     comment: "Sublabel for the expert streaming toggle")) {
+                        Toggle("", isOn: vm.bind(
+                            $vm.expertStreamingEnabled,
+                            save: {
+                                Task {
+                                    await vm.save(.expertStreamingEnabled, client: client)
+                                }
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(vm.expertStreamingForced)
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.budget.label",
+                                          defaultValue: "Expert LRU budget",
+                                          comment: "Row label for the expert cache budget field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.budget.sub",
+                                             defaultValue: "Fixed app-level expert LRU. Empty = automatic RAM-scaled cache (default); 0 = page-cache only; >0 pins a fixed GiB cache.",
+                                             comment: "Sublabel for the expert cache budget field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingBudgetGib,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingBudgetGib, client: client)
+                                    }
+                                }
+                            ), mono: true, suffix: "GiB", width: 110)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.budget_auto.label",
+                                          defaultValue: "Auto RAM-scaled cache",
+                                          comment: "Row label for the automatic expert cache budget toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.budget_auto.sub",
+                                             defaultValue: "Size the expert cache from this machine's memory ceiling (more RAM = more cached experts). A fixed budget above always wins. Takes effect after reload.",
+                                             comment: "Sublabel for the automatic expert cache budget toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingBudgetAuto,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingBudgetAuto, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.topk.label",
+                                          defaultValue: "Top-k mass threshold",
+                                          comment: "Row label for the adaptive top-k routing threshold field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.topk.sub",
+                                             defaultValue: "Opt-in approximate routing: keep the smallest score-descending top-k prefix reaching this mass share. 1.0 or empty = exact.",
+                                             comment: "Sublabel for the adaptive top-k routing threshold field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingTopkThreshold,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingTopkThreshold, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cacheprior.label",
+                                          defaultValue: "Cache-prior bonus",
+                                          comment: "Row label for the cache-prior routing bonus field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cacheprior.sub",
+                                             defaultValue: "Opt-in approximate routing: resident experts get this logit bonus before top-k. 0.0 or empty = exact.",
+                                             comment: "Sublabel for the cache-prior routing bonus field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingCachePrior,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingCachePrior, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.eval.label",
+                                          defaultValue: "Prefill per-layer sync (Qwen)",
+                                          comment: "Row label for the streaming prefill per-layer eval toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.eval.sub",
+                                             defaultValue: "Evaluate each decoder layer during streaming prefill and trim the allocator cache. Bit-exact; bounds memory peaks on long prompts.",
+                                             comment: "Sublabel for the streaming prefill per-layer eval toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingPerLayerEval,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPerLayerEval, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pins.label",
+                                          defaultValue: "Expert pins (mlock)",
+                                          comment: "Row label for the expert pinning toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pins.sub",
+                                             defaultValue: "Wire the hottest experts per layer into RAM and learn a per-model pin profile saved on unload — warm from the first token next load. No output change.",
+                                             comment: "Sublabel for the expert pinning toggle")) {
+                            VStack(alignment: .trailing, spacing: 6) {
+                                if vm.expertStreamingPins {
+                                    TextInput(text: vm.bind(
+                                        $vm.expertStreamingPinGib,
+                                        save: {
+                                            Task {
+                                                await vm.save(.expertStreamingPinGib, client: client)
+                                            }
+                                        }
+                                    ), mono: true, suffix: "GiB", width: 110)
+                                }
+                                Toggle("", isOn: vm.bind(
+                                    $vm.expertStreamingPins,
+                                    save: {
+                                        Task {
+                                            await vm.save(.expertStreamingPins, client: client)
+                                        }
+                                    }
+                                ))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                            }
+                        }
+                    }
+                    if vm.expertStreamingEnabled && vm.expertStreamingPins {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_sync.label",
+                                          defaultValue: "Apply pins synchronously at load",
+                                          comment: "Row label for the synchronous pinning toggle"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_sync.sub",
+                                             defaultValue: "Bench arms set this so the mlock pass provably completes before the first request. Off = pin in the background.",
+                                             comment: "Sublabel for the synchronous pinning toggle")) {
+                            Toggle("", isOn: vm.bind(
+                                $vm.expertStreamingPinSync,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinSync, client: client)
+                                    }
+                                }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.pin_regime.label",
+                                          defaultValue: "Pin profile regime",
+                                          comment: "Row label for the pin regime field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.pin_regime.sub",
+                                             defaultValue: "Which routing sample the pin selection reads: decode or prefill. Empty = decode.",
+                                             comment: "Sublabel for the pin regime field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingPinRegime,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingPinRegime, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled && vm.expertStreamingColdTierPresent {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cold_tier.label",
+                                          defaultValue: "Cold expert tier (bits)",
+                                          comment: "Row label for the cold precision tier field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cold_tier.sub",
+                                             defaultValue: "Requires tools/requant_cold_tier.py (expert_cold/ present). Reads streamed experts from the low-precision tier — fewer bytes per token. Approximate: gate with the perplexity harness. Empty = off.",
+                                             comment: "Sublabel for the cold precision tier field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingColdTier,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingColdTier, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.hot_fraction.label",
+                                          defaultValue: "Hot expert fraction (HOBBIT split)",
+                                          comment: "Row label for the hot fraction field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.hot_fraction.sub",
+                                             defaultValue: "0–1. With a cold tier and a learned pin profile, this fraction of each layer's most-used experts keeps the original 4-bit; the rest read the cold tier. Empty = uniform tier.",
+                                             comment: "Sublabel for the hot fraction field")) {
+                            TextInput(text: vm.bind(
+                                $vm.expertStreamingHotFraction,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingHotFraction, client: client)
+                                    }
+                                }
+                            ), mono: true, width: 110)
+                        }
+                    }
+                    if vm.expertStreamingEnabled {
+                        Row(label: String(localized: "settings.advanced.expert_streaming.cache_policy.label",
+                                          defaultValue: "Expert cache policy",
+                                          comment: "Row label for the expert cache policy field"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.cache_policy.sub",
+                                             defaultValue: "Eviction policy for resident experts. LRU is the tested default; S3-FIFO resists scans (A/B tied on real traces).",
+                                             comment: "Sublabel for the expert cache policy field")) {
+                            Picker("", selection: vm.bind(
+                                $vm.expertStreamingCachePolicy,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingCachePolicy, client: client)
+                                    }
+                                }
+                            )) {
+                                Text("Default (LRU)").tag("")
+                                Text("LRU").tag("lru")
+                                Text("S3-FIFO").tag("s3fifo")
+                            }.pickerStyle(.menu).frame(width: 140)
+                        }
+                        Row(label: String(localized: "settings.advanced.expert_streaming.dynamic.label",
+                                          defaultValue: "Dynamic expert residency (governor)",
+                                          comment: "Row label for the dynamic residency governor"),
+                            sublabel: String(localized: "settings.advanced.expert_streaming.dynamic.sub",
+                                             defaultValue: "Let oMLX resize the resident-expert cache from free memory: grow with headroom, shrink under pressure. Needs a cache budget above 0.",
+                                             comment: "Sublabel for the dynamic residency governor")) {
+                            Picker("", selection: vm.bind(
+                                $vm.expertStreamingDynamic,
+                                save: {
+                                    Task {
+                                        await vm.save(.expertStreamingDynamic, client: client)
+                                    }
+                                }
+                            )) {
+                                Text("Default (off)").tag(Optional<Bool>.none)
+                                Text("On").tag(Optional<Bool>.some(true))
+                                Text("Off").tag(Optional<Bool>.some(false))
+                            }.pickerStyle(.menu).frame(width: 140)
+                        }
+                        if vm.expertStreamingEnabled && vm.expertStreamingDynamic == true {
+                            Row(label: String(localized: "settings.advanced.expert_streaming.dynamic_max.label",
+                                              defaultValue: "Governor max (GiB)",
+                                              comment: "Row label for the governor ceiling field"),
+                                sublabel: String(localized: "settings.advanced.expert_streaming.dynamic_max.sub",
+                                                 defaultValue: "Ceiling the governor may grow the expert cache to. Empty = 6 GiB.",
+                                                 comment: "Sublabel for the governor ceiling field")) {
+                                TextInput(text: vm.bind(
+                                    $vm.expertStreamingDynamicMaxGib,
+                                    save: {
+                                        Task {
+                                            await vm.save(.expertStreamingDynamicMaxGib, client: client)
+                                        }
+                                    }
+                                ), mono: true, width: 110)
+                            }
+                        }
+                    }
+                }
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),

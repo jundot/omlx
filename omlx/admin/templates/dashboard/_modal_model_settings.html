@@ -740,6 +740,159 @@
                                 <!-- Experimental Features -->
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
 
+                                <!-- Expert Streaming (SSD) — MoE hot-expert cache -->
+                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3"
+                                     x-show="modelSettings.expert_streaming_supported" x-cloak>
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_hint') }}</p>
+                                            <p x-show="modelSettings.expert_streaming_forced"
+                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.expert_streaming_forced') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="if (!modelSettings.expert_streaming_forced) modelSettings.expert_streaming_enabled = !modelSettings.expert_streaming_enabled"
+                                                :disabled="modelSettings.expert_streaming_forced"
+                                                :class="[
+                                                    modelSettings.expert_streaming_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                    modelSettings.expert_streaming_forced ? 'opacity-50 cursor-not-allowed' : ''
+                                                ]"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.expert_streaming_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_budget') }}</label>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_budget_gib" placeholder="auto (RAM-scaled)" min="0" max="64" step="0.5"
+                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_budget_hint') }}</p>
+                                        <div class="flex items-start justify-between gap-3 pt-2">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming_budget_auto') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_budget_auto_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.expert_streaming_budget_auto = !modelSettings.expert_streaming_budget_auto"
+                                                    :class="modelSettings.expert_streaming_budget_auto ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.expert_streaming_budget_auto ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_topk') }}</label>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_topk_threshold" placeholder="1.0 (exact)" min="0.05" max="1" step="0.05"
+                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_topk_hint') }}</p>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_cache_prior') }}</label>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_cache_prior" placeholder="0.0 (exact)" min="0" max="10" step="0.5"
+                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_cache_prior_hint') }}</p>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming_eval') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_eval_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.expert_streaming_per_layer_eval = !modelSettings.expert_streaming_per_layer_eval"
+                                                    :class="modelSettings.expert_streaming_per_layer_eval ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.expert_streaming_per_layer_eval ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming_pins') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_pins_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.expert_streaming_pins = !modelSettings.expert_streaming_pins"
+                                                    :class="modelSettings.expert_streaming_pins ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.expert_streaming_pins ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div x-show="modelSettings.expert_streaming_pins" x-transition class="pt-2">
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_pin_gib') }}</label>
+                                            <input type="number" x-model.number="modelSettings.expert_streaming_pin_gib" placeholder="0.25" min="0" max="64" step="0.25"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_pin_gib_hint') }}</p>
+                                            <div class="flex items-start justify-between gap-3 pt-2">
+                                                <div class="min-w-0">
+                                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming_pin_sync') }}</span>
+                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_pin_sync_hint') }}</p>
+                                                </div>
+                                                <button type="button"
+                                                        @click="modelSettings.expert_streaming_pin_sync = !modelSettings.expert_streaming_pin_sync"
+                                                        :class="modelSettings.expert_streaming_pin_sync ? 'bg-black' : 'bg-neutral-200'"
+                                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                    <span :class="modelSettings.expert_streaming_pin_sync ? 'translate-x-5' : 'translate-x-0'"
+                                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                                </button>
+                                            </div>
+                                            <div class="pt-2">
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_pin_regime') }}</label>
+                                                <input type="text" x-model="modelSettings.expert_streaming_pin_regime" placeholder="decode"
+                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_pin_regime_hint') }}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled && modelSettings.expert_streaming_cold_tier_present" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_cold_tier') }}</label>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_cold_tier" placeholder="off (4-bit)" min="2" max="8" step="1"
+                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_cold_tier_hint') }}</p>
+                                        <div x-show="modelSettings.expert_streaming_enabled && modelSettings.expert_streaming_cold_tier_present" x-transition class="pt-2">
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_hot_fraction') }}</label>
+                                            <input type="number" x-model.number="modelSettings.expert_streaming_hot_fraction" placeholder="off (uniform tier)" min="0" max="1" step="0.05"
+                                                class="w-28 px-2 py-1.5 border border-neutral-200 rounded-lg text-sm text-neutral-800 focus:outline-none focus:ring-2 focus:ring-black/10">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_hot_fraction_hint') }}</p>
+                                        </div>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_cache_policy') }}</label>
+                                        <select x-model="modelSettings.expert_streaming_cache_policy"
+                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            <option value="">{{ t('modal.model_settings.expert_streaming_cache_policy_default') }}</option>
+                                            <option value="lru">LRU</option>
+                                            <option value="s3fifo">S3-FIFO</option>
+                                        </select>
+                                        <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_cache_policy_hint') }}</p>
+                                    </div>
+                                    <div x-show="modelSettings.expert_streaming_enabled" x-transition class="pt-1">
+                                        <div class="flex items-start justify-between gap-3">
+                                            <div class="min-w-0">
+                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming_dynamic') }}</span>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_dynamic_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="modelSettings.expert_streaming_dynamic = (modelSettings.expert_streaming_dynamic === true ? null : true)"
+                                                    :class="modelSettings.expert_streaming_dynamic === true ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="modelSettings.expert_streaming_dynamic === true ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <div x-show="modelSettings.expert_streaming_dynamic === true" x-transition class="pt-1">
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.expert_streaming_dynamic_max') }}</label>
+                                            <input type="number" x-model.number="modelSettings.expert_streaming_dynamic_max_gib" placeholder="6" min="0.5" max="64" step="0.5"
+                                                   class="w-28 px-2 py-1.5 border border-neutral-200 rounded-lg text-sm text-neutral-800 focus:outline-none focus:ring-2 focus:ring-black/10">
+                                            <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.expert_streaming_dynamic_max_hint') }}</p>
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
                                 <template x-if="isQwen35AnePrefillModel(selectedModel)">
                                     <div class="p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">

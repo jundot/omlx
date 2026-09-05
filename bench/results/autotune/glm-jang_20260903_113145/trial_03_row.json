@@ -1,0 +1,11 @@
+{
+  "config": "b0_qd16_c0_ra1_s1_p0",
+  "context": "short",
+  "decode": 42,
+  "ceiling_gib": 21.0,
+  "status": "ok",
+  "reason": null,
+  "ttft_s": 9.64,
+  "tok_s": 1.1445,
+  "swap_growth_gib": 0.0
+}

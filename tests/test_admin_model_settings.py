@@ -377,6 +377,95 @@ async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
 
 
 @pytest.mark.asyncio
+async def test_expert_streaming_ux_knob_roundtrip():
+    """Cache policy, governor toggle and governor ceiling persist via PUT."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            expert_streaming_cache_policy="S3FIFO",
+            expert_streaming_dynamic=True,
+            expert_streaming_dynamic_max_gib=8.0,
+        ),
+    )
+
+    assert settings.expert_streaming_cache_policy == "s3fifo"
+    assert settings.expert_streaming_dynamic is True
+    assert settings.expert_streaming_dynamic_max_gib == 8.0
+    assert result["settings"]["expert_streaming_cache_policy"] == "s3fifo"
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_cache_policy_rejects_unknown_value():
+    pool, _ = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException, match="lru"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(expert_streaming_cache_policy="arc"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_expert_streaming_dynamic_max_gib_rejects_out_of_range():
+    pool, _ = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException, match="0 and 64"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(expert_streaming_dynamic_max_gib=100.0),
+        )
+
+
+def test_expert_streaming_health_helper_reads_loaded_engine():
+    """The health block follows the convert-time attributes the engines set
+    (``_expert_streaming_backing`` / ``_streaming_cache``), reports the
+    effective policy and never raises on odd shapes."""
+    from omlx.patches.expert_streaming.streaming_switch import (
+        ExpertLRUCache,
+        make_expert_cache,
+    )
+
+    cache = make_expert_cache(4096, 128, num_layers=2, policy="s3fifo")
+    cache.put((0, 0, "k"), (1, 2, None))
+    cache.get((0, 0, "k"))  # 1 hit
+    cache.get((0, 1, "k"))  # 1 miss
+
+    class _Backing:
+        _streaming_cache = cache
+        governor = None
+
+    class _Engine:
+        _expert_streaming_backing = _Backing()
+
+    class _Entry:
+        engine = _Engine()
+
+    class _Pool:
+        _entries = {"ling": _Entry()}
+
+    health = admin_routes._expert_streaming_health(_Pool(), "ling")
+    assert health is not None
+    assert health["cache_policy"] == "s3fifo"
+    assert health["dynamic_enabled"] is False
+    assert health["lru_hits"] >= 1
+    assert health["lru_misses"] >= 1
+    assert 0.0 < health["lru_hit_rate"] <= 1.0
+
+    # Absent/odd engines must yield None, not raise.
+    assert admin_routes._expert_streaming_health(_Pool(), "nobody") is None
+    class _Empty:
+        _entries = {}
+
+    assert admin_routes._expert_streaming_health(_Empty(), "ling") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("value", [0, 9])
 async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
     pool, _ = _failed_pool()

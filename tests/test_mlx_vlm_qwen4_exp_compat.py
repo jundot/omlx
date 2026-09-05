@@ -456,7 +456,15 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
         with caplog.at_level("INFO"):
             result = Model.sanitize(model, dict(shifted))
 
+        pre_fc_key = "mtp.pre_fc_norm_embedding.weight"
         for key in target_keys:
+            if key == pre_fc_key:
+                # Mixed centering: the shifted pre_fc mean (+0.275) reads as
+                # an already-residual tensor, so it is left unchanged while
+                # the ones-centered remainder is shifted back.
+                assert result[key].dtype == shifted[key].dtype
+                assert mx.array_equal(result[key], shifted[key]).item()
+                continue
             assert result[key].dtype == mx.float32
             assert mx.array_equal(
                 1.0 + result[key], shifted[key].astype(mx.float32)
@@ -464,14 +472,15 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
 
         gated_key = "language_model.model.layers.0.linear_attn.norm.weight"
         assert mx.array_equal(result[gated_key], shifted[gated_key]).item()
-        assert "Canonicalized 15 ones-centered" in caplog.text
+        assert "Canonicalized 14 ones-centered" in caplog.text
+        assert "1 already-residual tensors left unchanged" in caplog.text
 
         mtp_norm = dict(modules)["mtp.pre_fc_norm_embedding"]
-        mtp_norm.weight = result["mtp.pre_fc_norm_embedding.weight"]
+        mtp_norm.weight = result[pre_fc_key]
         x = mx.array([[1.0, -2.0, 3.0, -4.0]], dtype=mx.float32)
         actual = mtp_norm(x)
         rms = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
-        expected = rms * shifted["mtp.pre_fc_norm_embedding.weight"].astype(mx.float32)
+        expected = rms * (1.0 + result[pre_fc_key].astype(mx.float32))
         assert mx.array_equal(actual, expected).item()
 
         second = Model.sanitize(model, dict(result))
@@ -1327,6 +1336,139 @@ def _warm_qsa_row(length: int, start: int, index_dim: int = 4):
     return cache
 
 
+def test_external_ple_path_is_bounded_and_ssd_alias_resolves(tmp_path):
+    compute = tmp_path / "compute"
+    ple = tmp_path / "ple"
+    compute.mkdir()
+    ple.mkdir()
+    (compute / "config.json").write_text(
+        json.dumps(
+            {
+                "qwen4_exp_artifact": {
+                    "ple_artifact": "../ple",
+                    "ple_residency": "ssd_mmap",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        assert compat.configure_qwen4_exp_runtime(compute) == "mmap"
+    finally:
+        from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
+
+        configure_ple_runtime(compute, mode="resident")
+
+
+def test_sanitize_splits_fused_mtp_experts_scales_and_biases():
+    """Fused MTP experts triples split fully into switch_mlp banks.
+
+    Fused-quantized checkpoints (JANGQ MTP head) store
+    experts.gate_up_proj.{weight,scales,biases}; the runtime MoE keeps
+    split gate/up projections. Splitting .weight alone orphans
+    scales/biases under experts.* names and strict load_weights rejects
+    them as "parameters not in model".
+    """
+    config = _tiny_config()
+    # _tiny_config applies the compat patch, which aliases the vendored
+    # qwen4_exp tree into mlx_vlm.models.
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
+    language._MTP_RUNTIME = language.Qwen4ExpMTPRuntime(
+        enabled=True, checkpoint_prefix="mtp."
+    )
+    try:
+        model = Model(config)
+        weights = {}
+        prefix = "mtp.layers.0.mlp"
+        weights[f"{prefix}.experts.gate_up_proj.weight"] = mx.zeros((4, 8, 16))
+        weights[f"{prefix}.experts.gate_up_proj.scales"] = mx.zeros((4, 8, 2))
+        weights[f"{prefix}.experts.gate_up_proj.biases"] = mx.zeros((4, 8, 2))
+        weights[f"{prefix}.experts.down_proj.weight"] = mx.zeros((4, 16, 4))
+        weights[f"{prefix}.experts.down_proj.scales"] = mx.zeros((4, 16, 2))
+        weights[f"{prefix}.experts.down_proj.biases"] = mx.zeros((4, 16, 2))
+        out = model.sanitize(dict(weights))
+    finally:
+        language._MTP_RUNTIME = language.Qwen4ExpMTPRuntime()
+    assert not [k for k in out if ".experts." in k]
+    for proj, rows in (
+        ("gate_proj", 4),
+        ("up_proj", 4),
+        ("down_proj", 16),
+    ):
+        for suffix, last in (
+            ("weight", 4 if proj == "down_proj" else 16),
+            ("scales", 2),
+            ("biases", 2),
+        ):
+            key = f"{prefix}.switch_mlp.{proj}.{suffix}"
+            assert key in out, key
+    assert out[f"{prefix}.switch_mlp.gate_proj.weight"].shape == (4, 4, 16)
+    assert out[f"{prefix}.switch_mlp.up_proj.scales"].shape == (4, 4, 2)
+
+
+def test_ones_centered_sanitize_leaves_residual_norms_unchanged():
+    """Mixed-centering checkpoints keep residual norms intact.
+
+    JANGQ stores the base-model RMSNorms as direct gamma (ones-centered)
+    but the MTP pre_fc norms already residual-centered (identical to the
+    fp8 reference). The checkpoint-wide ones-centered conversion must
+    skip tensors averaging at or below one half instead of shifting them
+    by -1, which had zeroed MTP draft acceptance.
+    """
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNorm
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import (
+        _normalize_ones_centered_rmsnorm_weights,
+    )
+
+    class _FakeModel:
+        def __init__(self):
+            self.direct = Qwen4ExpRMSNorm(4)
+            self.residual = Qwen4ExpRMSNorm(4)
+
+        def named_modules(self):
+            return [
+                ("mod.direct", self.direct),
+                ("mod.residual", self.residual),
+            ]
+
+    weights = {
+        f"language_model.model.layers.{i}."
+        "attn_hyper_connection.hc_norm.weight": mx.ones((8,)) * 0.95
+        for i in range(8)
+    }
+    weights["mod.direct.weight"] = mx.ones((4,)) * 1.02
+    weights["mod.residual.weight"] = mx.ones((4,)) * -0.76
+    _normalize_ones_centered_rmsnorm_weights(_FakeModel(), weights)
+    assert float(mx.mean(weights["mod.direct.weight"]).item()) == pytest.approx(
+        0.02, abs=1e-6
+    )
+    assert float(mx.mean(weights["mod.residual.weight"]).item()) == pytest.approx(
+        -0.76, abs=1e-6
+    )
+
+
+def test_ple_runtime_auto_defaults_to_mmap():
+    """auto resolves to SSD mmap regardless of checkpoint size; resident
+    remains reachable only as an explicit choice."""
+    from mlx_vlm.models.qwen4_exp.language import resolve_ple_runtime_mode
+
+    assert (
+        resolve_ple_runtime_mode("auto", checkpoint_bytes=1, physical_memory=1 << 40)
+        == "mmap"
+    )
+    assert (
+        resolve_ple_runtime_mode("resident", checkpoint_bytes=1, physical_memory=1)
+        == "resident"
+    )
+    assert (
+        resolve_ple_runtime_mode("mmap", checkpoint_bytes=1, physical_memory=1)
+        == "mmap"
+    )
+
+
 def test_qwen4_cache_extension_promotes_singletons_to_model_owned_batch():
     """A warm QSA singleton joining a running batch must be promoted via the
     model-owned ``to_batch`` before ``extend`` — previously the join path
@@ -1468,6 +1610,8 @@ def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
     assert batch.index_offset == 5
     assert batch.index_keys.shape[1] == 5
     assert batch.index_position_ids.shape[-1] == 5
+
+
 def _make_bound_qwen4_language_model(config):
     from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
 

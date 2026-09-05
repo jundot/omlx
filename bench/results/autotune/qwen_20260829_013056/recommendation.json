@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "created_at": "2026-08-29T04:30:59.255208+00:00",
+  "objective": "balanced",
+  "model": "qwen",
+  "model_id": "Qwen3.8-Flash-Next-oQ4e-mtp",
+  "machine": {
+    "total_gib": 48.0,
+    "available_gib": 21.521865844726562,
+    "swap_used_gib": 0.804443359375,
+    "static_ceiling_gib": 42.0,
+    "metal_cap_gib": 37.44000244140625,
+    "tier": "balanced",
+    "checkpoint_gib": 98.9946207460016,
+    "seq_gbps": 16.37,
+    "rand_gbps": 15.06
+  },
+  "screen_context": "2k",
+  "validate_context": "8k",
+  "winner": {
+    "expert_streaming_budget_gib": 0.0,
+    "expert_streaming_io_depth": 16,
+    "expert_streaming_coalesce": true,
+    "expert_streaming_readahead": true,
+    "expert_streaming_seed": true,
+    "expert_streaming_pilot": false,
+    "expert_streaming_topk_threshold": null,
+    "label": "b0_qd16_c1_ra1_s1_p0"
+  },
+  "winner_score": 0.0,
+  "trials": [],
+  "applied_to_profile": false,
+  "notes": [
+    "dry-run \u2014 no trials executed"
+  ]
+}

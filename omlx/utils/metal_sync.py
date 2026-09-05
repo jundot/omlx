@@ -15,15 +15,30 @@ the work). An mlx ``ThreadLocalStream`` resolves to a different concrete
 given, resolved on the calling thread.
 """
 
+import logging
+import os
 import threading
 from contextlib import suppress
 
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
 
+logger = logging.getLogger(__name__)
+
 # Module-level alias so callers can fall back to mlx-lm's default stream
 # when no per-engine stream is provided.
 _default_generation_stream = generation_stream
+
+# Fase J Etapa D: byte threshold for the *gated* pool clear. A full
+# mx.clear_cache() walks the whole allocator and hands every buffer back to
+# Metal; on a streaming prefill that runs dozens of times per request and
+# the retained pool is the page cache's main competitor (Fase G measured a
+# 30.4 GiB pool and ~8x full-bank re-reads on an 8k prefill). Skipping the
+# clear while the pool is small keeps the re-read cost down without
+# letting the pool grow unbounded — the threshold bounds the steady state.
+# Value is in GiB; 0 disables the gate (every clear runs).
+_CACHE_CLEAR_THRESH_ENV = "OMLX_EXPERT_STREAMING_CACHE_THRESH"
+_CACHE_CLEAR_THRESH_DEFAULT_BYTES = 2 * 1024**3
 
 # Serializes Metal buffer-protocol access from the async store-cache worker
 # against inference-thread mx.clear_cache / mx.synchronize calls that can
@@ -76,3 +91,48 @@ def _sync_and_clear_cache(stream=None):
             pass
         mx.synchronize()  # default stream
         mx.clear_cache()
+
+
+def cache_clear_threshold_bytes() -> int:
+    """Pool size above which a gated ``mx.clear_cache()`` is worth running.
+
+    Single source of truth for ``OMLX_EXPERT_STREAMING_CACHE_THRESH``
+    (GiB): the scheduler's chunk-boundary clears and the streaming per-layer
+    eval boundary gate on the same number, so they cannot drift apart.
+    Falls back to 2 GiB when unset or unparseable.
+    """
+    raw = os.environ.get(_CACHE_CLEAR_THRESH_ENV)
+    if raw:
+        try:
+            return max(0, int(float(raw) * 1024**3))
+        except ValueError:
+            logger.warning("Invalid %s=%r", _CACHE_CLEAR_THRESH_ENV, raw)
+    return _CACHE_CLEAR_THRESH_DEFAULT_BYTES
+
+
+def should_clear_cache(threshold_bytes: int | None = None) -> bool:
+    """Whether the MLX buffer pool is worth trimming right now.
+
+    Fase J Etapa D. The pool is only worth trimming once it has grown past
+    *threshold_bytes* (``cache_clear_threshold_bytes`` by default); below
+    that, clearing costs more than it saves — an allocator walk plus
+    eviction of the page cache holding the mmap'd expert shards the next
+    bank re-reads (Fase G measured ~8x full-bank re-reads at a 30.4 GiB
+    pool).
+
+    This returns only the *decision*. Callers keep their own
+    ``_sync_and_clear_cache`` call site so the sync-before-clear primitive
+    stays a single patchable choke point per module — the scheduler's is
+    instrumented by the prefill tests, and routing through a shared helper
+    would silently bypass that.
+
+    When ``mx.get_cache_memory`` is unavailable the pool cannot be measured,
+    so this returns True: the conservative, pre-Fase-J behavior.
+    """
+    get_cache_memory = getattr(mx, "get_cache_memory", None)
+    if get_cache_memory is None:
+        return True
+    threshold = (
+        cache_clear_threshold_bytes() if threshold_bytes is None else threshold_bytes
+    )
+    return get_cache_memory() >= threshold

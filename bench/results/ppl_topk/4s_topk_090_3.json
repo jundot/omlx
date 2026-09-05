@@ -1,0 +1,17 @@
+{
+  "model": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4S",
+  "corpus": "bench/corpus/pg1342.txt",
+  "ctx": 2048,
+  "windows": 24,
+  "n_terms": 49128,
+  "mean_nll": 0.4125305993260749,
+  "perplexity": 1.5106357660368468,
+  "mode": "streaming",
+  "cold_tier": "none",
+  "hot_fraction": null,
+  "budget_gib": 0.0,
+  "load_s": 3.9,
+  "disk_read_gb": 0.0,
+  "disk_read_mb_per_window": 0.0,
+  "disk_read_bytes_per_term": 0.0
+}

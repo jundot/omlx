@@ -104,6 +104,27 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
+        "expert_streaming_enabled",
+        "expert_streaming_budget_gib",
+        "expert_streaming_budget_auto",
+        "expert_streaming_topk_threshold",
+        "expert_streaming_cache_prior",
+        # Machine/IO-tuned streaming knobs (autotune) — hardware-specific.
+        "expert_streaming_io_depth",
+        "expert_streaming_coalesce",
+        "expert_streaming_readahead",
+        "expert_streaming_seed",
+        "expert_streaming_pilot",
+        "expert_streaming_per_layer_eval",
+        "expert_streaming_pins",
+        "expert_streaming_pin_gib",
+        "expert_streaming_pin_sync",
+        "expert_streaming_pin_regime",
+        "expert_streaming_cold_tier",
+        "expert_streaming_hot_fraction",
+        "expert_streaming_cache_policy",
+        "expert_streaming_dynamic",
+        "expert_streaming_dynamic_max_gib",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

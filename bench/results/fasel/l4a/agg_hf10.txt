@@ -1,0 +1,28 @@
+events: {'ctx.ensure.enter': 2352, 'ctx.ensure.exit': 2580, 'ctx.ensure.fail': 204, 'ctx.fallback': 204, 'dual_tier.add_submitted': 13659, 'dual_tier.cold.bank_ready': 7488, 'dual_tier.cold.qmm_submitted': 7488, 'dual_tier.enter': 7488, 'dual_tier.hot.bank_ready': 6171, 'dual_tier.hot.qmm_submitted': 6171, 'dual_tier.layer_exit': 7488, 'dual_tier.mask_ready': 13659, 'glu.enter': 2496, 'linear.resolve': 7488, 'linear.stack': 7488}
+--- per-event peak (GiB) ---
+ctx.ensure.enter                   n=  2352 peak=  14.23 active=   5.09 footpr=   7.74
+ctx.ensure.exit                    n=  2580 peak=  14.23 active=  11.70 footpr=  17.40
+ctx.ensure.fail                    n=   204 peak=  14.23 active=  11.47 footpr=  16.87
+ctx.fallback                       n=   204 peak=  14.23 active=  11.47 footpr=  16.87
+dual_tier.add_submitted            n= 13659 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.cold.bank_ready          n=  7488 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.cold.qmm_submitted       n=  7488 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.enter                    n=  7488 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.hot.bank_ready           n=  6171 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.hot.qmm_submitted        n=  6171 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.layer_exit               n=  7488 peak=  14.23 active=  11.89 footpr=  17.53
+dual_tier.mask_ready               n= 13659 peak=  14.23 active=  11.89 footpr=  17.53
+glu.enter                          n=  2496 peak=  14.23 active=  10.76 footpr=  19.47
+--- correlation of layer_exit peak with ---
+  hot_positions: 0.43
+  cold_positions: 0.45
+  positions:     0.44
+  mean hot_bank 3.6 MiB / cold_bank 16.5 MiB; max 45.7 / 281.6
+--- boundary retention (medians) ---
+  layer_exit:  peak 5.22 GiB active 5.10 GiB
+  next enter:  peak 5.22 GiB active 5.09 GiB
+  active retained across boundary: 99.9%
+--- per-projection peak (GiB) ---
+  down_proj    n= 23204 peak=  14.23
+  gate_proj    n= 23204 peak=  14.23
+  up_proj      n= 23204 peak=  14.23

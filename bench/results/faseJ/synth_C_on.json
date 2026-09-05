@@ -1,0 +1,12 @@
+{
+  "mode": "boundary",
+  "layers": 48,
+  "experts": 32,
+  "hidden": 1024,
+  "moe_hidden": 896,
+  "tokens": 2048,
+  "shard_bytes": 2378170368,
+  "peak_bytes": 321216524,
+  "peak_gib": 0.299,
+  "wall_s": 0.485
+}

@@ -1,0 +1,99 @@
+{
+  "model": "qwen",
+  "budget_gib": 0.0,
+  "topk_threshold": null,
+  "mtp": false,
+  "runtime_est_gib": 4.822173226624727,
+  "load_s": 3.323603832999652,
+  "phys_before_gib": 0.38,
+  "phys_after_load_gib": 5.28,
+  "cache_per_expert_cap": 0,
+  "cache_per_layer_cap": 0,
+  "ttft_s": 8.79,
+  "decode_tokens": 42,
+  "decode_s": 25.87,
+  "tok_s": 1.6237,
+  "phys_after_decode_gib": 6.25,
+  "active_after_decode_gib": 4.74,
+  "cache_stats": {
+    "hits": 0,
+    "misses": 107844,
+    "evictions": 0,
+    "hit_rate": 0.0,
+    "size": 0,
+    "capacity": 0
+  },
+  "profile": null,
+  "prefetcher": null,
+  "resources": {
+    "phases": {
+      "before_first": {
+        "proc_cpu_pct_avg": 109.7,
+        "proc_cpu_pct_max": 109.7,
+        "sys_cpu_pct_avg": 0.0,
+        "sys_cpu_pct_max": 0.0,
+        "rss_gib_avg": 5.53,
+        "rss_gib_max": 5.53,
+        "gpu_util_pct_avg": 26.0,
+        "gpu_util_pct_max": 26,
+        "mlx_active_gib_avg": 4.54,
+        "mlx_active_gib_max": 4.54,
+        "mlx_cache_gib_avg": 0.0,
+        "mlx_cache_gib_max": 0.0,
+        "samples": 1
+      },
+      "prefill": {
+        "proc_cpu_pct_avg": 70.5,
+        "proc_cpu_pct_max": 83.9,
+        "sys_cpu_pct_avg": 31.9,
+        "sys_cpu_pct_max": 35.0,
+        "rss_gib_avg": 5.84,
+        "rss_gib_max": 6.56,
+        "disk_read_kib_s_avg": 2077223.73,
+        "disk_read_kib_s_max": 2383781.44,
+        "disk_write_kib_s_avg": 316.66,
+        "disk_write_kib_s_max": 1087.09,
+        "gpu_util_pct_avg": 56.75,
+        "gpu_util_pct_max": 77,
+        "mlx_active_gib_avg": 4.75,
+        "mlx_active_gib_max": 4.85,
+        "mlx_cache_gib_avg": 8.25,
+        "mlx_cache_gib_max": 14.97,
+        "samples": 8
+      },
+      "decode": {
+        "proc_cpu_pct_avg": 86.96,
+        "proc_cpu_pct_max": 107.5,
+        "sys_cpu_pct_avg": 32.3,
+        "sys_cpu_pct_max": 37.6,
+        "rss_gib_avg": 6.13,
+        "rss_gib_max": 6.44,
+        "disk_read_kib_s_avg": 1156125.75,
+        "disk_read_kib_s_max": 2525775.07,
+        "disk_write_kib_s_avg": 492.26,
+        "disk_write_kib_s_max": 1932.49,
+        "gpu_util_pct_avg": 61.68,
+        "gpu_util_pct_max": 73,
+        "mlx_active_gib_avg": 4.9,
+        "mlx_active_gib_max": 5.05,
+        "mlx_cache_gib_avg": 2.31,
+        "mlx_cache_gib_max": 13.77,
+        "samples": 25
+      }
+    },
+    "marks": [
+      {
+        "label": "prefill",
+        "t_s": 45156.51
+      },
+      {
+        "label": "decode",
+        "t_s": 45165.3
+      },
+      {
+        "label": "teardown",
+        "t_s": 45191.17
+      }
+    ]
+  }
+}

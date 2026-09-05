@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "model_dir": "/Volumes/SSD 4TB/AI Models/Qwen3.8-Flash-Next-JANG_4M",
+  "derived_at": "2026-09-04T11:28:33",
+  "tok_per_cycle": 1.833,
+  "verify_byte_mult": 1.369,
+  "bytes_per_token_base": 937069714.2857143,
+  "measured_mtp_slowdown": 1.515,
+  "source": {
+    "verify_mult": {
+      "verify_byte_mult": 1.369,
+      "bytes_base": 39356928000,
+      "bytes_mtp": 30787891200,
+      "decode_tokens_base": 42,
+      "decode_tokens_mtp": 42,
+      "verify_cycles_mtp": 24,
+      "tok_s_base": 1.9511,
+      "tok_s_mtp": 1.2882,
+      "measured_mtp_slowdown": 1.515
+    },
+    "tok_per_cycle": {
+      "tok_per_cycle": 1.833,
+      "cycles": 24,
+      "accepted": 18,
+      "drafted": 24,
+      "fallbacks": 6,
+      "decode_tokens": 44
+    },
+    "bytes_per_token": {
+      "bytes_per_token": 937069714.2857143,
+      "decode_bytes": 39356928000,
+      "decode_tokens": 42
+    }
+  }
+}

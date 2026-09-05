@@ -1,0 +1,716 @@
+{
+  "model": "qwen-jang4m",
+  "budget_gib": 6.0,
+  "topk_threshold": null,
+  "cache_prior": null,
+  "cold_tier": null,
+  "hot_fraction": null,
+  "mtp": true,
+  "mtp_block": null,
+  "ane": false,
+  "warm_control_gib": 0.0,
+  "prompt_len": "short",
+  "single_request": false,
+  "chunk_schedule": {
+    "prompt_len": "short",
+    "reference_step": 512,
+    "single_request": false
+  },
+  "runtime_est_gib": 12.33123987261206,
+  "estimate": {
+    "model_type": "qwen4_exp",
+    "supported": true,
+    "num_moe_layers": 48,
+    "experts_per_layer": 512,
+    "per_expert_mb": 2.69,
+    "resident_gib": 100.83,
+    "streaming_gib": 33.0,
+    "scan_ms": 0.4
+  },
+  "load_s": 4.0518811250221916,
+  "phys_before_gib": 0.4,
+  "phys_after_load_gib": 8.42,
+  "cache_per_expert_cap": 6847,
+  "cache_per_layer_cap": 142,
+  "ttft_s": 10.2,
+  "decode_tokens": 42,
+  "decode_s": 32.6,
+  "tok_s": 1.2882,
+  "phys_after_decode_gib": 24.59,
+  "phys_lifetime_max_gib": 24.61,
+  "metal_peak_prefill_gib": 8.556,
+  "metal_peak_decode_gib": 8.892,
+  "active_after_decode_gib": 7.43,
+  "cache_stats": {
+    "hits": 52159,
+    "misses": 91877,
+    "evictions": 18545,
+    "hit_rate": 0.36212474659113,
+    "size": 6816,
+    "capacity": 6847
+  },
+  "profile": null,
+  "prefetcher": null,
+  "advise_stats": {
+    "advised": 162018,
+    "advised_runs": 156888,
+    "advised_experts": 162018,
+    "advised_bytes": 132725145600,
+    "advice_failures": 0,
+    "advice_tier_segments": 156888,
+    "stash_hits": 0,
+    "stash_misses": 0,
+    "stash_targets": 0,
+    "stash_inserts": 0,
+    "stash_evictions": 0
+  },
+  "read_stats": {
+    "profiling_enabled": true,
+    "dropped_samples": 1410716,
+    "sample_capacity": 2048,
+    "lifetime": {
+      "calls": 12150,
+      "runs": 136971,
+      "bytes": 50677862400,
+      "bytes_per_call": 4171017,
+      "run_sizes_buckets": {
+        "1": 116877,
+        "2": 14694,
+        "3": 3888,
+        "4": 963,
+        "5": 288,
+        "6": 144,
+        "7": 81,
+        "8": 18,
+        "9": 9,
+        "10": 9
+      },
+      "run_size_max": 10,
+      "requested_inflight_peak": 16,
+      "failed_calls": 0,
+      "stages_us": {
+        "component_e2e_us": {
+          "count": 12150,
+          "p50": 388,
+          "p95": 4812,
+          "max": 125291,
+          "sum": 24432987
+        },
+        "reader_resolve_us": {
+          "count": 12150,
+          "p50": 4,
+          "p95": 32,
+          "max": 410,
+          "sum": 85392
+        },
+        "plan_us": {
+          "count": 12150,
+          "p50": 3,
+          "p95": 33,
+          "max": 233,
+          "sum": 72816
+        },
+        "buffer_alloc_us": {
+          "count": 136971,
+          "p50": 0,
+          "p95": 1,
+          "max": 223,
+          "sum": 22273
+        },
+        "worker_start_delay_us": {
+          "count": 136971,
+          "p50": 58,
+          "p95": 4087,
+          "max": 124143,
+          "sum": 76792821
+        },
+        "read_duration_us": {
+          "count": 136971,
+          "p50": 265,
+          "p95": 4998,
+          "max": 124623,
+          "sum": 148241332
+        },
+        "window_wait_us": {
+          "count": 135837,
+          "p50": 0,
+          "p95": 524,
+          "max": 125078,
+          "sum": 17706827
+        },
+        "last_future_wait_us": {
+          "count": 11016,
+          "p50": 0,
+          "p95": 122,
+          "max": 16898,
+          "sum": 298638
+        },
+        "scatter_us": {
+          "count": 136971,
+          "p50": 11,
+          "p95": 131,
+          "max": 63971,
+          "sum": 5292684
+        },
+        "fallback_us": {
+          "count": 0,
+          "p50": null,
+          "p95": null,
+          "max": 0,
+          "sum": 0
+        }
+      }
+    },
+    "requests": {
+      "bench-1/decode": {
+        "calls": 10971,
+        "runs": 90738,
+        "bytes": 30787891200,
+        "bytes_per_call": 2806297,
+        "run_sizes_buckets": {
+          "1": 83244,
+          "2": 5955,
+          "3": 1233,
+          "4": 225,
+          "5": 27,
+          "6": 45,
+          "7": 9
+        },
+        "run_size_max": 7,
+        "requested_inflight_peak": 16,
+        "failed_calls": 0,
+        "stages_us": {
+          "component_e2e_us": {
+            "count": 10971,
+            "p50": 376,
+            "p95": 2824,
+            "max": 90728,
+            "sum": 15033835
+          },
+          "reader_resolve_us": {
+            "count": 10971,
+            "p50": 4,
+            "p95": 14,
+            "max": 119,
+            "sum": 59389
+          },
+          "plan_us": {
+            "count": 10971,
+            "p50": 3,
+            "p95": 9,
+            "max": 76,
+            "sum": 51026
+          },
+          "buffer_alloc_us": {
+            "count": 90738,
+            "p50": 0,
+            "p95": 1,
+            "max": 191,
+            "sum": 14747
+          },
+          "worker_start_delay_us": {
+            "count": 90738,
+            "p50": 54,
+            "p95": 3861,
+            "max": 44804,
+            "sum": 37544987
+          },
+          "read_duration_us": {
+            "count": 90738,
+            "p50": 219,
+            "p95": 4254,
+            "max": 61545,
+            "sum": 76155721
+          },
+          "window_wait_us": {
+            "count": 89766,
+            "p50": 0,
+            "p95": 520,
+            "max": 61764,
+            "sum": 10445545
+          },
+          "last_future_wait_us": {
+            "count": 9999,
+            "p50": 0,
+            "p95": 98,
+            "max": 16898,
+            "sum": 240624
+          },
+          "scatter_us": {
+            "count": 90738,
+            "p50": 10,
+            "p95": 126,
+            "max": 63971,
+            "sum": 3595057
+          },
+          "fallback_us": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "max": 0,
+            "sum": 0
+          }
+        }
+      },
+      "bench-1/prefill": {
+        "calls": 1179,
+        "runs": 46233,
+        "bytes": 19889971200,
+        "bytes_per_call": 16870204,
+        "run_sizes_buckets": {
+          "1": 33633,
+          "2": 8739,
+          "3": 2655,
+          "4": 738,
+          "5": 261,
+          "6": 99,
+          "7": 72,
+          "8": 18,
+          "9": 9,
+          "10": 9
+        },
+        "run_size_max": 10,
+        "requested_inflight_peak": 16,
+        "failed_calls": 0,
+        "stages_us": {
+          "component_e2e_us": {
+            "count": 1179,
+            "p50": 713,
+            "p95": 53170,
+            "max": 125291,
+            "sum": 9399152
+          },
+          "reader_resolve_us": {
+            "count": 1179,
+            "p50": 4,
+            "p95": 68,
+            "max": 410,
+            "sum": 26003
+          },
+          "plan_us": {
+            "count": 1179,
+            "p50": 3,
+            "p95": 54,
+            "max": 233,
+            "sum": 21790
+          },
+          "buffer_alloc_us": {
+            "count": 46233,
+            "p50": 0,
+            "p95": 1,
+            "max": 223,
+            "sum": 7526
+          },
+          "worker_start_delay_us": {
+            "count": 46233,
+            "p50": 92,
+            "p95": 4903,
+            "max": 124143,
+            "sum": 39247834
+          },
+          "read_duration_us": {
+            "count": 46233,
+            "p50": 319,
+            "p95": 5480,
+            "max": 124623,
+            "sum": 72085611
+          },
+          "window_wait_us": {
+            "count": 46071,
+            "p50": 0,
+            "p95": 595,
+            "max": 125078,
+            "sum": 7261282
+          },
+          "last_future_wait_us": {
+            "count": 1017,
+            "p50": 0,
+            "p95": 314,
+            "max": 5016,
+            "sum": 58014
+          },
+          "scatter_us": {
+            "count": 46233,
+            "p50": 13,
+            "p95": 128,
+            "max": 15864,
+            "sum": 1697627
+          },
+          "fallback_us": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "max": 0,
+            "sum": 0
+          }
+        }
+      }
+    },
+    "prefill": {
+      "calls": 1179,
+      "runs": 46233,
+      "bytes": 19889971200,
+      "bytes_per_call": 16870204,
+      "run_sizes_buckets": {
+        "1": 33633,
+        "2": 8739,
+        "3": 2655,
+        "4": 738,
+        "5": 261,
+        "6": 99,
+        "7": 72,
+        "8": 18,
+        "9": 9,
+        "10": 9
+      },
+      "run_size_max": 10,
+      "requested_inflight_peak": 16,
+      "failed_calls": 0,
+      "stages_us": {
+        "component_e2e_us": {
+          "count": 1179,
+          "p50": 713,
+          "p95": 53170,
+          "max": 125291,
+          "sum": 9399152
+        },
+        "reader_resolve_us": {
+          "count": 1179,
+          "p50": 4,
+          "p95": 68,
+          "max": 410,
+          "sum": 26003
+        },
+        "plan_us": {
+          "count": 1179,
+          "p50": 3,
+          "p95": 54,
+          "max": 233,
+          "sum": 21790
+        },
+        "buffer_alloc_us": {
+          "count": 46233,
+          "p50": 0,
+          "p95": 1,
+          "max": 223,
+          "sum": 7526
+        },
+        "worker_start_delay_us": {
+          "count": 46233,
+          "p50": 92,
+          "p95": 4903,
+          "max": 124143,
+          "sum": 39247834
+        },
+        "read_duration_us": {
+          "count": 46233,
+          "p50": 319,
+          "p95": 5480,
+          "max": 124623,
+          "sum": 72085611
+        },
+        "window_wait_us": {
+          "count": 46071,
+          "p50": 0,
+          "p95": 595,
+          "max": 125078,
+          "sum": 7261282
+        },
+        "last_future_wait_us": {
+          "count": 1017,
+          "p50": 0,
+          "p95": 314,
+          "max": 5016,
+          "sum": 58014
+        },
+        "scatter_us": {
+          "count": 46233,
+          "p50": 13,
+          "p95": 128,
+          "max": 15864,
+          "sum": 1697627
+        },
+        "fallback_us": {
+          "count": 0,
+          "p50": null,
+          "p95": null,
+          "max": 0,
+          "sum": 0
+        }
+      }
+    },
+    "decode": {
+      "calls": 10971,
+      "runs": 90738,
+      "bytes": 30787891200,
+      "bytes_per_call": 2806297,
+      "run_sizes_buckets": {
+        "1": 83244,
+        "2": 5955,
+        "3": 1233,
+        "4": 225,
+        "5": 27,
+        "6": 45,
+        "7": 9
+      },
+      "run_size_max": 7,
+      "requested_inflight_peak": 16,
+      "failed_calls": 0,
+      "stages_us": {
+        "component_e2e_us": {
+          "count": 10971,
+          "p50": 376,
+          "p95": 2824,
+          "max": 90728,
+          "sum": 15033835
+        },
+        "reader_resolve_us": {
+          "count": 10971,
+          "p50": 4,
+          "p95": 14,
+          "max": 119,
+          "sum": 59389
+        },
+        "plan_us": {
+          "count": 10971,
+          "p50": 3,
+          "p95": 9,
+          "max": 76,
+          "sum": 51026
+        },
+        "buffer_alloc_us": {
+          "count": 90738,
+          "p50": 0,
+          "p95": 1,
+          "max": 191,
+          "sum": 14747
+        },
+        "worker_start_delay_us": {
+          "count": 90738,
+          "p50": 54,
+          "p95": 3861,
+          "max": 44804,
+          "sum": 37544987
+        },
+        "read_duration_us": {
+          "count": 90738,
+          "p50": 219,
+          "p95": 4254,
+          "max": 61545,
+          "sum": 76155721
+        },
+        "window_wait_us": {
+          "count": 89766,
+          "p50": 0,
+          "p95": 520,
+          "max": 61764,
+          "sum": 10445545
+        },
+        "last_future_wait_us": {
+          "count": 9999,
+          "p50": 0,
+          "p95": 98,
+          "max": 16898,
+          "sum": 240624
+        },
+        "scatter_us": {
+          "count": 90738,
+          "p50": 10,
+          "p95": 126,
+          "max": 63971,
+          "sum": 3595057
+        },
+        "fallback_us": {
+          "count": 0,
+          "p50": null,
+          "p95": null,
+          "max": 0,
+          "sum": 0
+        }
+      }
+    }
+  },
+  "mtp_accept_stats": {
+    "requests": 2,
+    "cycles": 24,
+    "emits": 44,
+    "accepts": 18,
+    "drafted": 24,
+    "reject_cycles": 6,
+    "zero_cycles": 0
+  },
+  "run_pool": null,
+  "memtrace_summary": null,
+  "ctx_fallback_to_legacy": {},
+  "pin": {
+    "requested": false,
+    "pin_budget_gib": 0.0,
+    "pinned_bytes": 0,
+    "pinned_experts": 0,
+    "pinned_pages_estimate": 0,
+    "profile_regime": null,
+    "pin_sync_requested": false,
+    "pin_sync_effective": false,
+    "pin_regime_requested": null,
+    "pin_regime_effective": null,
+    "pin_profile_loaded_at_engine_load": false,
+    "pin_applied_before_first_request": false,
+    "profile_fingerprint_match": null,
+    "pin_load_time_ms": 0.0
+  },
+  "effective_config": {
+    "git_sha": "da73b52e",
+    "model_fingerprint": null,
+    "single_request": false,
+    "decode_tokens": 96,
+    "chunk_schedule": {
+      "prompt_len": "short",
+      "reference_step": 512,
+      "single_request": false
+    },
+    "budget_gib": 6.0,
+    "cold_tier": null,
+    "hot_fraction": null,
+    "ctx_mode_policy": "hybrid",
+    "decode_union_rows": 64,
+    "ctx_ahead": 3,
+    "expert_qd": 16,
+    "run_qd": 16,
+    "prefill_qd": 0,
+    "run_merge_gap": 0,
+    "ra_enabled": true,
+    "stash_enabled": false,
+    "pins_enabled": false,
+    "pin_sync_effective": false,
+    "pin_regime_effective": null,
+    "profile_enabled": true,
+    "memtrace_enabled": false,
+    "read_sampling_mode": "profile",
+    "cache_cool_protocol": "warm-page-cache",
+    "experiment_knobs": [],
+    "active_engines": 1
+  },
+  "instrumentation_overhead": null,
+  "resources": {
+    "phases": {
+      "before_first": {
+        "proc_cpu_pct_avg": 107.4,
+        "proc_cpu_pct_max": 107.4,
+        "sys_cpu_pct_avg": 0.0,
+        "sys_cpu_pct_max": 0.0,
+        "rss_gib_avg": 8.47,
+        "rss_gib_max": 8.47,
+        "gpu_util_pct_avg": 100.0,
+        "gpu_util_pct_max": 100,
+        "mlx_active_gib_avg": 7.42,
+        "mlx_active_gib_max": 7.42,
+        "mlx_cache_gib_avg": 0.0,
+        "mlx_cache_gib_max": 0.0,
+        "mlx_peak_gib_avg": 0.0,
+        "mlx_peak_gib_max": 0.0,
+        "samples": 1
+      },
+      "prefill": {
+        "proc_cpu_pct_avg": 77.08,
+        "proc_cpu_pct_max": 90.6,
+        "sys_cpu_pct_avg": 37.96,
+        "sys_cpu_pct_max": 45.6,
+        "rss_gib_avg": 10.73,
+        "rss_gib_max": 13.03,
+        "disk_read_kib_s_avg": 1872713.13,
+        "disk_read_kib_s_max": 2381422.14,
+        "disk_write_kib_s_avg": 444.34,
+        "disk_write_kib_s_max": 3473.03,
+        "gpu_util_pct_avg": 50.56,
+        "gpu_util_pct_max": 98,
+        "mlx_active_gib_avg": 7.84,
+        "mlx_active_gib_max": 8.09,
+        "mlx_cache_gib_avg": 0.8,
+        "mlx_cache_gib_max": 1.85,
+        "mlx_peak_gib_avg": 8.39,
+        "mlx_peak_gib_max": 8.56,
+        "samples": 9
+      },
+      "decode": {
+        "proc_cpu_pct_avg": 81.48,
+        "proc_cpu_pct_max": 89.3,
+        "sys_cpu_pct_avg": 40.49,
+        "sys_cpu_pct_max": 46.9,
+        "rss_gib_avg": 12.66,
+        "rss_gib_max": 15.64,
+        "disk_read_kib_s_avg": 928503.98,
+        "disk_read_kib_s_max": 1776127.31,
+        "disk_write_kib_s_avg": 536.14,
+        "disk_write_kib_s_max": 4326.18,
+        "gpu_util_pct_avg": 31.4,
+        "gpu_util_pct_max": 73,
+        "mlx_active_gib_avg": 8.18,
+        "mlx_active_gib_max": 8.42,
+        "mlx_cache_gib_avg": 1.13,
+        "mlx_cache_gib_max": 1.72,
+        "mlx_peak_gib_avg": 8.82,
+        "mlx_peak_gib_max": 8.89,
+        "samples": 30
+      }
+    },
+    "marks": [
+      {
+        "label": "prefill",
+        "t_s": 293305.38
+      },
+      {
+        "label": "decode",
+        "t_s": 293315.59
+      },
+      {
+        "label": "teardown",
+        "t_s": 293348.19
+      }
+    ]
+  },
+  "tokens": [
+    1596,
+    1144,
+    310,
+    5707,
+    310,
+    1156,
+    25,
+    328,
+    9419,
+    11,
+    1204,
+    513,
+    488,
+    7285,
+    8722,
+    13,
+    14235,
+    1534,
+    4087,
+    13,
+    13262,
+    11321,
+    13,
+    198,
+    248069,
+    271,
+    9419,
+    0,
+    353,
+    2688,
+    3604,
+    1575,
+    11,
+    9414,
+    488,
+    364,
+    9859,
+    13,
+    2500,
+    513,
+    488,
+    30
+  ],
+  "bit_exact_kind": "tokens"
+}

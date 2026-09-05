@@ -9,7 +9,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-_MODEL_OVERHEAD_FACTOR = 1.05
+# P3: single overhead source — expert_streaming.residency owns the value;
+# this module re-exports it so the two estimates cannot drift apart.
+try:
+    from omlx.patches.expert_streaming.residency import (
+        _MODEL_OVERHEAD_FACTOR,
+    )
+except Exception:  # pragma: no cover - import fallback for vendored contexts
+    _MODEL_OVERHEAD_FACTOR = 1.05
 _NGRAM_EMBEDDING_MARKER = ".ngram_embedding."
 
 

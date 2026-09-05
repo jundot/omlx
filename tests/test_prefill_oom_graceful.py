@@ -126,11 +126,17 @@ def _throttle_ctx(
         _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
         _PREFILL_ABORT_MARGIN=Scheduler._PREFILL_ABORT_MARGIN,
         _PREFILL_TRANSIENT_SAFETY=Scheduler._PREFILL_TRANSIENT_SAFETY,
+        _PREFILL_STATIC_MAX_OVER_MEASURED=Scheduler._PREFILL_STATIC_MAX_OVER_MEASURED,
         _last_mlx_active_memory_bytes=0,
     )
     # Bind the real helper methods so the stand-in behaves like a Scheduler.
     ns._snap_chunk_size = Scheduler._snap_chunk_size.__get__(ns, Scheduler)
     ns._current_usage_bytes = Scheduler._current_usage_bytes.__get__(ns, Scheduler)
+    ns._streaming_guard_info = None
+    ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
     ns._predicted_chunk_transient = Scheduler._predicted_chunk_transient.__get__(
         ns, Scheduler
     )
@@ -826,6 +832,11 @@ def test_record_chunk_transient_skips_partial_speed_sample():
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
         ns, Scheduler
     )
+    ns._streaming_guard_info = None
+    ns._streaming_bank_bytes = Scheduler._streaming_bank_bytes.__get__(ns, Scheduler)
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
 
     full_delta = 512 * 1024**2
     ns._record_chunk_transient(
@@ -920,6 +931,11 @@ def test_record_chunk_transient_keeps_partial_context_sample():
 
 
 def test_step_prefill_reclaims_before_first_guard():
+    """The first-chunk reclaim must land before the adaptive/ guard steps.
+
+    Etapa D gates that reclaim on pool size, so the pool is driven above the
+    threshold here to exercise the firing branch.
+    """
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
@@ -951,6 +967,11 @@ def test_step_prefill_reclaims_before_first_guard():
     ns._decode_time_owed_s = 0.0
     ns._decode_activity_key = "test-engine"
     ns._prefill_tps_best = None
+    ns._streaming_guard_info = None
+    ns._resolve_streaming_guard_info = Scheduler._resolve_streaming_guard_info.__get__(
+        ns, Scheduler
+    )
+    ns._throttle_probe_bytes = Scheduler._throttle_probe_bytes.__get__(ns, Scheduler)
     for _name in (
         "_prefill_step_size_for_progress",
         "_base_prefill_step_size",
@@ -958,6 +979,8 @@ def test_step_prefill_reclaims_before_first_guard():
         "_decode_contention",
         "_others_decoding",
         "_should_clear_after_chunk",
+        "_should_release_streaming_pool",
+        "_clear_cache_if_pool_large",
         "_accrue_decode_debt",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
@@ -975,6 +998,8 @@ def test_step_prefill_reclaims_before_first_guard():
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
         patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+        # Etapa D: a big pool is what makes the gated first-chunk clear fire.
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=8 * 1024**3),
     ):
         done = ns._step_prefill_chunk(state)
 
@@ -990,6 +1015,115 @@ def test_step_prefill_reclaims_before_first_guard():
         requested_step=2,
         gathered_core=False,
     )
+
+
+def _streaming_chunk_ns(events):
+    """Harness for the chunk-tail streaming pool release: contended gate
+    (`_should_clear_after_chunk` False) on a streaming model."""
+    request = SimpleNamespace(request_id="req-streaming")
+    state = _PrefillState(
+        request=request,
+        cache=[],
+        tokens_remaining=sched_mod.mx.array([[1, 2, 3]]),
+        last_token=[4],
+        tokens_processed=0,
+        base_size=0,
+        emitted_boundaries={},
+        boundary_enabled=False,
+        block_size=0,
+        total_length=4,
+    )
+    ns = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2, model_name=""),
+        _stream="stream",
+        _memory_limit_bytes=0,
+        _glm_dsa_adaptive_prefill=None,
+        model=lambda *args, **kwargs: events.append("model"),
+        _supports_skip_lm_head=lambda: False,
+        _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
+        _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
+        _record_chunk_transient=MagicMock(),
+        _maybe_record_fixed_state_bytes=MagicMock(),
+    )
+    ns.running = {}
+    ns._decode_fairness = True
+    ns._decode_time_owed_s = 0.0
+    ns._decode_activity_key = "test-engine"
+    ns._prefill_tps_best = None
+    ns._streaming_guard_info = None
+    ns._throttle_probe_bytes = Scheduler._throttle_probe_bytes.__get__(ns, Scheduler)
+    ns._resolve_streaming_guard_info = lambda: {
+        "num_moe_layers": 48,
+        "experts_per_layer": 512,
+        "per_expert_bytes": 2700000,
+    }
+    for _name in (
+        "_prefill_step_size_for_progress",
+        "_base_prefill_step_size",
+        "_contended_prefill_cap",
+        "_decode_contention",
+        "_others_decoding",
+        "_should_release_streaming_pool",
+        "_periodic_clear_threshold_bytes",
+        "_note_streaming_release",
+        "_clear_cache_if_pool_large",
+        "_accrue_decode_debt",
+    ):
+        setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
+    # Contended gate: decode-fairness would skip the tail clear.
+    ns._should_clear_after_chunk = lambda: False
+    ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
+    return ns, state
+
+
+def test_step_prefill_releases_streaming_pool_when_gate_skips():
+    """Chunk tail must release the pool for streaming models even when the
+    decode-fairness gate skips it — the freed-but-retained pool evicts the
+    page cache budget-0 streaming depends on (Fase G)."""
+    events = []
+    ns, state = _streaming_chunk_ns(events)
+
+    with (
+        patch.object(
+            sched_mod,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: events.append("sync"),
+        ),
+        patch.object(sched_mod.mx, "stream"),
+        patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
+        patch.object(sched_mod, "get_phys_footprint", return_value=100),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=5 * 1024**3),
+    ):
+        done = ns._step_prefill_chunk(state)
+
+    assert done is False
+    # First-chunk sync (pre-loop) + tail release off the skipped gate.
+    assert events.count("sync") == 2
+
+
+def test_step_prefill_keeps_pool_below_threshold_without_release():
+    """Below the byte threshold nothing clears: Etapa D also gates the
+    first-chunk reclaim, not just the streaming tail release."""
+    events = []
+    ns, state = _streaming_chunk_ns(events)
+
+    with (
+        patch.object(
+            sched_mod,
+            "_sync_and_clear_cache",
+            side_effect=lambda stream=None: events.append("sync"),
+        ),
+        patch.object(sched_mod.mx, "stream"),
+        patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
+        patch.object(sched_mod, "get_phys_footprint", return_value=100),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3),
+    ):
+        done = ns._step_prefill_chunk(state)
+
+    assert done is False
+    # Small pool: neither the gated first-chunk reclaim nor the streaming
+    # tail release fires, so the pool is left alone entirely.
+    assert events.count("sync") == 0
 
 
 # --------------------------------------------------------------------------

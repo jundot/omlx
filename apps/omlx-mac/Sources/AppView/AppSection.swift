@@ -11,7 +11,7 @@ import SwiftUI
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
     case server, status, appearance, network, performance, logs
     case models, downloads, integrations, quantization
-    case throughputBench, accuracyBench, contextBench
+    case throughputBench, accuracyBench, contextBench, storageRoofline
     case security, about
 
     var id: String { rawValue }
@@ -70,6 +70,10 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
             return String(localized: "sidebar.contextBench",
                           defaultValue: "Context",
                           comment: "Sidebar row label / navigation title for the Context benchmark section")
+        case .storageRoofline:
+            return String(localized: "sidebar.storageRoofline",
+                          defaultValue: "Storage Roofline",
+                          comment: "Sidebar row label / navigation title for the Storage Roofline section")
         case .security:
             return String(localized: "sidebar.security",
                           defaultValue: "Security",
@@ -96,6 +100,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .throughputBench: return "speedometer"
         case .accuracyBench:   return "target"
         case .contextBench:    return "ruler"
+        case .storageRoofline: return "internaldrive"
         case .security:        return "lock"
         case .about:           return "info.circle"
         }

@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "created_at": "2026-09-03T14:42:19.178660+00:00",
+  "objective": "balanced",
+  "model": "glm-jang",
+  "model_id": "GLM-5.3-Flash-JANG-MTP",
+  "machine": {
+    "total_gib": 48.0,
+    "available_gib": 17.1695556640625,
+    "swap_used_gib": 2.0299072265625,
+    "static_ceiling_gib": 42.0,
+    "metal_cap_gib": 37.44000244140625,
+    "tier": "balanced",
+    "checkpoint_gib": 95.46731613203883,
+    "seq_gbps": 1.94,
+    "rand_gbps": 2.48
+  },
+  "screen_context": "short",
+  "validate_context": "8k",
+  "budget_knee_gib": 0.0,
+  "winner": {
+    "expert_streaming_budget_gib": 0.0,
+    "expert_streaming_io_depth": 16,
+    "expert_streaming_coalesce": true,
+    "expert_streaming_readahead": false,
+    "expert_streaming_seed": true,
+    "expert_streaming_pilot": false,
+    "expert_streaming_topk_threshold": null,
+    "expert_streaming_cache_prior": null,
+    "label": "b0_qd16_c1_ra0_s1_p0"
+  },
+  "winner_score": 1.6725,
+  "trials": [
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 15.6,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 24.73,
+      "tok_s": 0.429,
+      "swap_growth_gib": 0.73
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p1",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 14.9,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 23.4,
+      "tok_s": 0.3766,
+      "swap_growth_gib": 0.48
+    },
+    {
+      "config": "b0_qd16_c0_ra1_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 21.0,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.64,
+      "tok_s": 1.1445,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra0_s1_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 28.8,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.58,
+      "tok_s": 1.1856,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s0_p0",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 30.2,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.57,
+      "tok_s": 1.1393,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0_cp1",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 30.3,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.57,
+      "tok_s": 1.1552,
+      "swap_growth_gib": 0.0
+    },
+    {
+      "config": "b0_qd16_c1_ra1_s1_p0_cp2",
+      "context": "short",
+      "decode": 42,
+      "ceiling_gib": 30.3,
+      "status": "ok",
+      "reason": null,
+      "ttft_s": 9.62,
+      "tok_s": 1.1066,
+      "swap_growth_gib": 0.0
+    }
+  ],
+  "applied_to_profile": false,
+  "notes": []
+}

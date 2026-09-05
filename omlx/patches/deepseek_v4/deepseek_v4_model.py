@@ -2343,8 +2343,15 @@ class Model(nn.Module):
 
         top_remap = {
             "embed.weight": "model.embed_tokens.weight",
+            # JANG quantizes the bookends (8-bit affine): the quant
+            # tensors ride along or the strict load fails with
+            # "parameters not in model" (oQ4e bookends were fp).
+            "embed.scales": "model.embed_tokens.scales",
+            "embed.biases": "model.embed_tokens.biases",
             "norm.weight": "model.norm.weight",
             "head.weight": "lm_head.weight",
+            "head.scales": "lm_head.scales",
+            "head.biases": "lm_head.biases",
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",

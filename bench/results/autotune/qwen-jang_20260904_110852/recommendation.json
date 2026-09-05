@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "created_at": "2026-09-04T14:08:56.287954+00:00",
+  "objective": "balanced",
+  "model": "qwen-jang",
+  "model_id": "Qwen3.8-Flash-Next-JANG_4S",
+  "machine": {
+    "total_gib": 48.0,
+    "available_gib": 31.843673706054688,
+    "swap_used_gib": 2.74639892578125,
+    "static_ceiling_gib": 42.0,
+    "metal_cap_gib": 37.44000244140625,
+    "tier": "balanced",
+    "checkpoint_gib": 71.82942052558064,
+    "seq_gbps": 3.49,
+    "rand_gbps": 4.85
+  },
+  "screen_context": "2k",
+  "validate_context": "8k",
+  "budget_knee_gib": null,
+  "winner": {
+    "expert_streaming_budget_gib": 0.0,
+    "expert_streaming_io_depth": 16,
+    "expert_streaming_coalesce": true,
+    "expert_streaming_readahead": true,
+    "expert_streaming_seed": true,
+    "expert_streaming_pilot": false,
+    "expert_streaming_topk_threshold": null,
+    "expert_streaming_cache_prior": null,
+    "expert_streaming_cold_tier": null,
+    "expert_streaming_hot_fraction": null,
+    "label": "b0_qd16_c1_ra1_s1_p0"
+  },
+  "winner_score": 0.0,
+  "trials": [],
+  "applied_to_profile": false,
+  "notes": [
+    "dry-run \u2014 no trials executed"
+  ]
+}

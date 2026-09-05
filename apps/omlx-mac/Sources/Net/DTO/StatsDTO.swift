@@ -47,6 +47,9 @@ struct StatsDTO: Codable, Equatable, Sendable {
         let isLoading: Bool?
         let activeRequests: Int?
         let waitingRequests: Int?
+        /// Live MoE streaming health (nil when this engine does not stream
+        /// experts). Same shape the HTML dashboard card renders.
+        let expertStreamingHealth: StreamingHealthDTO?
     }
 
     /// Mirrors `_build_runtime_cache_observability` in `omlx/admin/routes.py`.

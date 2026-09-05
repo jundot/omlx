@@ -27,7 +27,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -216,10 +216,105 @@ class ModelSettings:
     enable_thinking: Optional[bool] = (
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
-    # Qwen4-Exp only: keep the large PLE N-gram table on SSD and gather rows
-    # through mmap. The runtime may force this on when resident loading cannot
-    # fit under the configured model-memory ceiling but mmap loading can.
-    qwen4_ple_ssd_offload: bool = False
+    # Qwen4-Exp only (default on): keep the large PLE N-gram table on SSD and
+    # gather rows through mmap. PLE lookups are pure row gathers with no
+    # matmuls, so SSD paging costs no throughput while freeing the ~25-30% of
+    # RAM the table would otherwise pin (same behavior llama.cpp measures with
+    # --mmap). Turn off to pin the table in memory. The runtime may force this
+    # on when resident loading cannot fit under the configured model-memory
+    # ceiling but mmap loading can.
+    qwen4_ple_ssd_offload: bool = True
+    # MoE expert streaming (SSD): keep hot experts resident, stream the rest
+    # from SSD. Hardware-specific; may be auto-forced when resident load cannot
+    # fit under the memory ceiling but streaming fits. Budget None/0 =
+    # page-cache only (OS file cache serves expert reuse); >0 pins a fixed
+    # GiB app-level LRU.
+    expert_streaming_enabled: bool = False
+    expert_streaming_budget_gib: Optional[float] = None
+    expert_streaming_budget_auto: Optional[bool] = True
+    # Default-on RAM-scaled expert cache: size the app-level LRU from the
+    # memory ceiling (more RAM = more cached experts) instead of streaming
+    # everything. An explicit budget_gib (including 0 = page-cache only)
+    # always wins; auto only applies when the budget is unset. None follows
+    # the default (on); False opts back out to page-cache only.
+    # Machine-specific: never propagated via model profiles.
+    # Opt-in approximate MoE routing: keep the smallest score-descending
+    # prefix of the top-k experts whose cumulative mass reaches this
+    # threshold. None/1.0 = exact routing (bit-identical to the reference
+    # path); <1.0 trades output fidelity for fewer streamed expert bytes.
+    expert_streaming_topk_threshold: Optional[float] = None
+    # Opt-in cache-conditional MoE routing: logit bonus for LRU-resident
+    # experts before top-k. None/0.0 = exact routing (bit-identical);
+    # >0 trades output fidelity for fewer SSD re-reads (Fase 3: hit
+    # 9.2%->19.3%, +10.8% tok/s at 1.0 on Qwen-JANG_4M short).
+    # Machine-specific: never propagated via model profiles.
+    expert_streaming_cache_prior: Optional[float] = None
+    # Per-model overrides for the expert-streaming IO layer. None keeps the
+    # env-var / built-in default behavior (see patches/expert_streaming).
+    # Autotune (bench/autotune_expert_streaming.py) writes the winning values
+    # here so a machine-tuned profile survives restarts like any other
+    # per-model setting.
+    expert_streaming_io_depth: Optional[int] = (
+        None  # Expert IO thread-pool depth (default env OMLX_EXPERT_STREAMING_QD or 16)
+    )
+    expert_streaming_coalesce: Optional[bool] = (
+        None  # Coalesce consecutive expert ids into single pread runs
+    )
+    expert_streaming_readahead: Optional[bool] = (
+        None  # F_RDADVISE kernel readahead hints for expert runs (decode)
+    )
+    expert_streaming_seed: Optional[bool] = (
+        None  # Seed expert LRU / page cache from prefill routing hotness
+    )
+    expert_streaming_pilot: Optional[bool] = (
+        None  # Async router-lookahead prefetcher (PILOT)
+    )
+    expert_streaming_per_layer_eval: Optional[bool] = (
+        None  # Qwen4-exp per-layer eval+clear_cache boundary during streaming prefill
+        # (default env OMLX_EXPERT_STREAMING_PER_LAYER_EVAL or on). GLM/DeepSeek
+        # decoders honor the boundary natively and are unaffected by this knob.
+    )
+    expert_streaming_pins: Optional[bool] = (
+        None  # mlock-pin the observed/learned hot experts per layer (default env
+        # OMLX_EXPERT_STREAMING_PIN or off). Enables the learned pin profile
+        # (<model>/.omlx/expert_pin_profile.json): saved on unload, reloaded on
+        # load so the hot set is wired from token 1. Zero output change.
+    )
+    expert_streaming_pin_gib: Optional[float] = (
+        None  # Pin budget in GiB (default env OMLX_EXPERT_STREAMING_PIN_GIB or 0.25)
+    )
+    expert_streaming_pin_sync: Optional[bool] = (
+        None  # Fase M1: apply the learned pins synchronously at engine load
+        # (default env OMLX_EXPERT_STREAMING_PIN_SYNC or off). Bench arms set
+        # it so the mlock pass provably completes before the first request.
+    )
+    expert_streaming_pin_regime: Optional[str] = (
+        None  # Fase M1: profile regime that drives the pin selection —
+        # "decode" or "prefill" (default env OMLX_EXPERT_STREAMING_PIN_REGIME).
+    )
+    expert_streaming_cold_tier: Optional[str] = (
+        None  # Cold precision tier for streamed experts: "2"/"3" reads expert
+        # banks from <model>/expert_cold/ (tools/requant_cold_tier.py) — fewer
+        # bytes per token on the NVMe I/O floor, at the tier's fidelity
+        # (gate with the perplexity harness). None/"" = off.
+    )
+    # Fase I6: HOBBIT per-expert hot/cold split — fraction of experts per
+    # layer (top by learned pin-profile frequency) that keep the ORIGINAL
+    # packing while the rest read the cold tier. 0/unset = uniform tier (I5).
+    expert_streaming_hot_fraction: Optional[float] = None
+    # Expert cache eviction policy: "lru" (default) or "s3fifo" (scan
+    # resistant; A/B verdict on real traces: LRU stays default — see
+    # docs/expert-streaming.md). None keeps env OMLX_EXPERT_STREAMING_CACHE
+    # ("lru"). Machine-specific: never propagated via model profiles.
+    expert_streaming_cache_policy: Optional[str] = None
+    # Dynamic expert-residency governor: revisits the LRU capacity at
+    # request boundaries from system free memory (grow with headroom,
+    # halve under pressure, clear when desperate). None keeps env
+    # OMLX_EXPERT_STREAMING_DYNAMIC (off). Requires budget > 0.
+    expert_streaming_dynamic: Optional[bool] = None
+    # Ceiling (GiB) the governor may grow the cache to. None keeps env
+    # OMLX_EXPERT_STREAMING_DYNAMIC_MAX_GIB (6.0).
+    expert_streaming_dynamic_max_gib: Optional[float] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -471,6 +566,25 @@ class ModelSettingsManager:
             # Load model settings
             models_data = data.get("models", {})
             self._settings = {}
+
+            # v1 files persisted qwen4_ple_ssd_offload=False because False was
+            # the field default, not a deliberate opt-out. SSD mmap is now the
+            # default PLE residency, so coerce v1 blobs instead of silently
+            # keeping every existing model resident. An opt-out saved on v2
+            # survives because this only runs for version < 2.
+            if version < 2:
+                coerced = 0
+                for model_data in models_data.values():
+                    if model_data.get("qwen4_ple_ssd_offload") is False:
+                        model_data["qwen4_ple_ssd_offload"] = True
+                        coerced += 1
+                if coerced:
+                    logger.info(
+                        "Settings v1→v2: enabled qwen4_ple_ssd_offload (SSD "
+                        "mmap is now the default PLE residency) for %d "
+                        "model(s)",
+                        coerced,
+                    )
 
             for model_id, model_data in models_data.items():
                 # Settings saved before the vlm_mtp exclusivity rule may

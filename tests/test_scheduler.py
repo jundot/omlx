@@ -108,7 +108,8 @@ class TestSchedulerConfig:
         assert config.policy == SchedulingPolicy.FCFS
         assert config.completion_batch_size == 32
         assert config.embedding_batch_size == 32
-        assert config.prefill_step_size == 2048
+        # Fase J O1 step: default prefill chunk is 4096 (was 2048 pre-merge).
+        assert config.prefill_step_size == 4096
         assert config.paged_cache_block_size == 256
         assert config.max_cache_blocks is None
         assert config.initial_cache_blocks == 256
@@ -1372,7 +1373,12 @@ class TestPrefillAbortInterrupt:
     def test_external_prefill_abort_reclaims_metal_before_raise(
         self, mock_model, mock_tokenizer
     ):
-        """Aborted external prefill must clear transients before unwinding."""
+        """Aborted external prefill must clear transients before unwinding.
+
+        Fase J Etapa D: the first-chunk clear is gated on pool size, but the
+        abort-path clear is unconditional — it guarantees the transients are
+        dropped even when the pool never grew.
+        """
         from omlx.scheduler import _PrefillAbortedError
 
         scheduler = Scheduler(
@@ -1392,17 +1398,28 @@ class TestPrefillAbortInterrupt:
         uid = 42
         scheduler.request_id_to_uid[request.request_id] = uid
         scheduler.uid_to_request_id[uid] = request.request_id
-        scheduler._pending_abort_ids.add(request.request_id)
+        def abort_once(pool_bytes):
+            scheduler._pending_abort_ids.add(request.request_id)
+            with (
+                patch.object(
+                    scheduler_module.mx, "get_cache_memory", return_value=pool_bytes
+                ),
+                patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache,
+            ):
+                with pytest.raises(_PrefillAbortedError):
+                    scheduler._do_external_prefill(
+                        request,
+                        request.prompt_token_ids,
+                        cache,
+                    )
+            return clear_cache.call_args_list
 
-        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear_cache:
-            with pytest.raises(_PrefillAbortedError):
-                scheduler._do_external_prefill(
-                    request,
-                    request.prompt_token_ids,
-                    cache,
-                )
-
-        assert clear_cache.call_args_list == [
+        # Small pool: the gated first-chunk clear is skipped, so the
+        # unconditional abort-path clear is the only one — and it still runs,
+        # which is the point of this test.
+        assert abort_once(0) == [call(scheduler._stream)]
+        # Large pool: the gated first-chunk clear fires as well.
+        assert abort_once(8 * 1024**3) == [
             call(scheduler._stream),
             call(scheduler._stream),
         ]
@@ -3393,6 +3410,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(model_type="qwen4_exp_text"),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3414,6 +3434,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3432,6 +3455,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3451,6 +3477,9 @@ class TestSchedulerArraysCacheBlockAlignment:
                 model=self._hybrid_model(model_type="other_hybrid"),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
+                    # Pin the step: the branch default is 4096 (Fase J) and
+                    # this test isolates the gate (floor 0 -> follows step).
+                    prefill_step_size=2048,
                     paged_ssd_cache_dir=str(tmp_path),
                     paged_cache_block_size=256,
                 ),
@@ -3595,6 +3624,65 @@ class TestPeriodicClearGating:
         # No limit → 2 GiB absolute floor
         scheduler._memory_limit_bytes = 0
         assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+    def test_streaming_pool_release_requires_streaming_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """The off-boundary streaming release must not fire for non-streaming models."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 0
+        # MagicMock models resolve to an empty (falsy) guard info dict.
+        assert scheduler._should_release_streaming_pool() is False
+
+    def test_streaming_pool_release_off_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """Streaming models release the pool off the 512-step boundary.
+
+        A <512-step streaming prefill plus a short decode never lands on the
+        periodic boundary, so the freed-but-retained pool would never be
+        released (Fase G: 30.4 GiB pool evicting the page cache).
+        """
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+        scheduler._step_counter = 1  # deliberately NOT on the interval boundary
+        scheduler._resolve_streaming_guard_info = lambda: {
+            "num_moe_layers": 48,
+            "experts_per_layer": 512,
+            "per_expert_bytes": 2700000,
+        }
+
+        # 5 GiB pool, off-boundary → release fires (periodic gate alone: False).
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=5 * 1024**3):
+            assert scheduler._should_periodic_clear_cache() is False
+            assert scheduler._should_release_streaming_pool() is True
+
+        # 1 GiB pool → below the threshold, no release.
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is False
+
+    def test_streaming_pool_release_threshold_scales_with_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Streaming release uses the same max(limit/3, 2 GiB) threshold."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._memory_limit_bytes = 30 * 1024**3  # → threshold 10 GiB
+        scheduler._resolve_streaming_guard_info = lambda: {
+            "num_moe_layers": 48,
+            "experts_per_layer": 512,
+            "per_expert_bytes": 2700000,
+        }
+
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=9 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is False
+        with patch.object(sched_mod.mx, "get_cache_memory", return_value=11 * 1024**3):
+            assert scheduler._should_release_streaming_pool() is True
 
 
 class TestExtractCacheStatesCacheList:

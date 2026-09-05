@@ -1,0 +1,14 @@
+{
+  "model": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
+  "corpus": "bench/corpus/pg1342.txt",
+  "ctx": 1000,
+  "windows": 24,
+  "n_terms": 23976,
+  "mean_nll": 0.7986190561696136,
+  "perplexity": 2.2224697025613147,
+  "mode": "streaming",
+  "cold_tier": "none",
+  "hot_fraction": null,
+  "budget_gib": 2.0,
+  "load_s": 4.1
+}

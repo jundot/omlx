@@ -1,0 +1,14 @@
+{
+  "model": "/Volumes/SSD 4TB/AI Models/GLM-5.3-Flash-oQ4e",
+  "corpus": "bench/corpus/omlx_code.txt",
+  "ctx": 1000,
+  "windows": 24,
+  "n_terms": 23976,
+  "mean_nll": 1.0282997408826469,
+  "perplexity": 2.796307343455739,
+  "mode": "streaming",
+  "cold_tier": "none",
+  "hot_fraction": null,
+  "budget_gib": 2.0,
+  "load_s": 4.2
+}

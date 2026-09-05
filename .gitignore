@@ -127,5 +127,6 @@ tq_batch_memory.md
 # Local working notes and session tooling — never part of a PR
 .audit/
 .claude/
+.zcode/
 issues.md
 clusterPlan.md

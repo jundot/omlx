@@ -1,0 +1,37 @@
+{
+  "etapa": "A1b",
+  "arm": "on",
+  "description": "single-promotion bank build on the layer-context path",
+  "config": {
+    "layers": 48,
+    "experts": 32,
+    "hidden": 1024,
+    "moe_hidden": 896,
+    "tokens": 2048,
+    "group_size": 64,
+    "bits": 4,
+    "mode": "boundary",
+    "OMLX_EXPERT_STREAMING_LAYER_BARRIER": "1",
+    "OMLX_EXPERT_STREAMING_BANK_PROMOTE_CTX": "1"
+  },
+  "reps": 3,
+  "peak_gib": 0.252,
+  "peak_deterministic": true,
+  "wall_s": [0.491, 0.448, 0.452],
+  "path_counters": {
+    "promote_banks": 144,
+    "promote_np": 0,
+    "mx_stack": 0
+  },
+  "delta_vs_off": {
+    "peak_gib": -0.047,
+    "peak_pct": -15.7
+  },
+  "notes": [
+    "peak byte count identical across all 3 reps in both arms; wall clock is not (0.448-0.502s), so no throughput claim is made",
+    "path counters prove the mechanism: 144 linear calls x 3 tensors = 13824 legacy promotes + 432 stacks collapse into 144 bank promotions",
+    "counters are the reason this A/B is trustworthy: peak memory alone cannot distinguish 'A1b engaged' from 'A1b silently skipped'",
+    "synthetic shards are sparse (truncate()), so read cost is near zero -- Etapa B throughput cannot be validated here",
+    "bit-exactness covered by tests/test_expert_streaming.py::test_ctx_bank_promote_is_bit_identical_on_default_path"
+  ]
+}

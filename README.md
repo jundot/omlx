@@ -195,9 +195,13 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
 
+### Expert Streaming (SSD)
+
+Run huge Mixture-of-Experts models on small Macs. Dense weights (attention, shared experts) stay resident; routed expert banks are memory-mapped from the checkpoint and a per-layer LRU keeps only the hot experts in RAM (one `Cache budget (GiB)` knob, default `~2 GiB`, auto-enabled when the resident model would not fit). Trades decode speed for up to ~10× memory saving; the model runs single-stream while streaming (one request at a time). Prefill reuses the existing paged SSD KV cache, so repeated prompts restore in milliseconds. Supported `model_type`: `glm_moe_dsa` (GLM-5.2). See [docs/expert-streaming.md](docs/expert-streaming.md).
+
 ### Continuous Batching
 
-Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
+Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel. Streaming MoE models run single-stream while the feature is active.
 
 ### Claude Code Optimization
 

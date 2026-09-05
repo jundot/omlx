@@ -94,7 +94,14 @@ def resolve_ple_runtime_mode(
         raise ValueError("OMLX_QWEN4_PLE_MODE must be auto, resident, or mmap")
     if requested != "auto":
         return requested
-    return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
+    # mmap is the default residency: PLE lookups are pure row gathers with no
+    # matmuls, so SSD paging costs no throughput while freeing the ~25-30% of
+    # RAM the table would otherwise pin (matching llama.cpp's --mmap
+    # measurements on the same checkpoint family). Resident loading remains
+    # available as an explicit choice via OMLX_QWEN4_PLE_MODE / ple_residency.
+    # checkpoint_bytes/physical_memory stay in the signature for callers that
+    # report residency estimates.
+    return "mmap"
 
 
 def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:
@@ -1746,6 +1753,15 @@ class _SafeTensorMMap:
     def tensor_dtype(self, key: str) -> str:
         return str(self._header[key]["dtype"])
 
+    def has_tensor(self, key: str) -> bool:
+        """Check header membership without reading tensor data.
+
+        JANGQ checkpoints carry phantom PLE keys in the index whose
+        tensors were never written; base selection must verify the
+        header instead of trusting the index alone.
+        """
+        return key in self._header
+
     def rows(self, key: str, rows: list[int]) -> mx.array:
         entry = self._header[key]
         shape = tuple(entry["shape"])
@@ -1769,7 +1785,7 @@ class _SafeTensorMMap:
             buffer=self._mapping,
             offset=self._data_start + start,
         )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        copied = np.asarray(view[np.asarray(rows, dtype=np.intp)])
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
@@ -1830,23 +1846,52 @@ class DiskBackedShardedEmbedding(nn.Module):
             self._tensor_readers[key] = reader
             return reader
 
+        spellings = [prefix]
         runtime_prefix = prefix
         if runtime_prefix.startswith("model.language_model."):
             runtime_prefix = (
                 "language_model.model." + runtime_prefix[len("model.language_model.") :]
             )
+        if runtime_prefix not in spellings:
+            spellings.append(runtime_prefix)
+        # JANGQ checkpoints nest the ngram table one level shallower
+        # (ple.ngram_embedding, no ple_embedding level) and may drop the
+        # model. prefix. Their index also retains the historical
+        # spellings as phantom keys with no tensor behind them, so every
+        # candidate below is verified against the file header. The
+        # historical spellings stay first: existing checkpoints resolve
+        # exactly as before.
+        for stem in list(spellings):
+            jang = stem.replace(".ple.ple_embedding.", ".ple.")
+            if jang != stem and jang not in spellings:
+                spellings.append(jang)
+        for stem in list(spellings):
+            if stem.startswith("model.language_model."):
+                bare = stem[len("model.") :]
+                if bare not in spellings:
+                    spellings.append(bare)
+
+        def header_backed(key: str) -> bool:
+            filename = weight_map.get(key)
+            if filename is None:
+                return False
+            reader = self._readers.get(filename)
+            if reader is None:
+                reader = _SafeTensorMMap(model_path / filename)
+                self._readers[filename] = reader
+            return reader.has_tensor(key)
+
         for shard_index, shard_size in enumerate(self.shard_sizes):
-            bases = (
-                f"{prefix}.shard_{shard_index}",
-                f"{prefix}.shards.{shard_index}",
-                f"{runtime_prefix}.shard_{shard_index}",
-                f"{runtime_prefix}.shards.{shard_index}",
-            )
+            bases = [
+                f"{stem}.{form}"
+                for stem in spellings
+                for form in (f"shard_{shard_index}", f"shards.{shard_index}")
+            ]
             base = next(
                 (
                     candidate
                     for candidate in bases
-                    if f"{candidate}.weight" in weight_map
+                    if header_backed(f"{candidate}.weight")
                 ),
                 None,
             )
@@ -2753,6 +2798,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         cache[3] = mx.contiguous(
             mx.take_along_axis(history, history_positions, axis=1)
         )
+
 
         state_len = snapshot.conv_state.shape[1]
         if state_len:

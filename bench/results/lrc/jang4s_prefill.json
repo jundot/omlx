@@ -1,0 +1,41 @@
+{
+  "trace": "/tmp/jang4s_prefill.jsonl",
+  "sch": {
+    "128": {
+      "mean": 0.44019196177862807,
+      "per_layer_min": 0.26778242677824265
+    },
+    "256": {
+      "mean": 0.5,
+      "per_layer_min": 0.5
+    },
+    "384": {
+      "mean": 0.5,
+      "per_layer_min": 0.5
+    },
+    "448": {
+      "mean": 0.5,
+      "per_layer_min": 0.5
+    }
+  },
+  "srp": {
+    "128": {
+      "segment": 32,
+      "demand_mean": 0.8803839235572561,
+      "demand_min": 0.5355648535564853,
+      "distinct_mean": 0.8803839235572561
+    },
+    "256": {
+      "segment": 32,
+      "demand_mean": 1.0,
+      "demand_min": 1.0,
+      "distinct_mean": 1.0
+    },
+    "384": {
+      "segment": 32,
+      "demand_mean": 1.0,
+      "demand_min": 1.0,
+      "distinct_mean": 1.0
+    }
+  }
+}
