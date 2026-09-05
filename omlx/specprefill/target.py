@@ -88,6 +88,7 @@ def run_specprefill_target_prefill(
             _find_attention_layers,
             _get_attn_module,
             _OffsetAdjustedRoPE,
+            _rope_owners,
             cleanup_rope,
             sparse_prefill,
         )
@@ -205,15 +206,15 @@ def run_specprefill_target_prefill(
             )
 
         # sparse_prefill computes adjustment for selected conversation tokens.
-        # Decrement to reserve BatchGenerator's separately processed kickoff position.
+        # Decrement to reserve BatchGenerator's separately processed kickoff
+        # position — on EVERY RoPE owner sparse_prefill wrapped. A DSA layer
+        # rotates twice (attention + top-k indexer); decrementing only the
+        # attention left the indexer one position ahead for the whole decode.
         for _, layer in _find_attention_layers(target_model):
             attention_module = _get_attn_module(layer)
-            if (
-                attention_module
-                and hasattr(attention_module, "rope")
-                and isinstance(attention_module.rope, _OffsetAdjustedRoPE)
-            ):
-                attention_module.rope._adjustment -= 1
+            for _slot, owner in _rope_owners(attention_module):
+                if isinstance(getattr(owner, "rope", None), _OffsetAdjustedRoPE):
+                    owner.rope._adjustment -= 1
 
         selected_token_count = int(selected.shape[0])
         prefill_seconds = time.monotonic() - prefill_started_at
