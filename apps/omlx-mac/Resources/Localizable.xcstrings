@@ -11,6 +11,174 @@
         }
       }
     },
+    "activity.badge.done" : {
+      "comment" : "Label on a request row that finished and is leaving the list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Done"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Готово"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已完成"
+          }
+        }
+      }
+    },
+    "activity.badge.generating" : {
+      "comment" : "Pill on a model row emitting tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Generating"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Генерация"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生成中"
+          }
+        }
+      }
+    },
+    "activity.badge.prefill" : {
+      "comment" : "Pill on a model row processing a prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Префилл"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预填充"
+          }
+        }
+      }
+    },
+    "activity.badge.queued" : {
+      "comment" : "Pill on a model row whose requests are all still queued",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Queued"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В очереди"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排队中"
+          }
+        }
+      }
+    },
+    "activity.badge.working" : {
+      "comment" : "Pill on a model row running a non-streaming request",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Working"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "处理中"
+          }
+        }
+      }
+    },
+    "activity.eta" : {
+      "comment" : "Time remaining on a running prefill; placeholder is a duration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ left"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "осталось %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剩余 %@"
+          }
+        }
+      }
+    },
+    "activity.queued_detail" : {
+      "comment" : "Row for requests queued but not started; placeholder is the queue depth",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld waiting"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld в ожидании"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个等待中"
+          }
+        }
+      }
+    },
     "appearance.model_scope.all" : {
       "comment" : "Models submenu scope option that lists the whole library",
       "extractionState" : "manual",
@@ -923,6 +1091,30 @@
         }
       }
     },
+    "menubar.metric.metrics" : {
+      "comment" : "Header above scalar counters in an AVG or ALL serving metric popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serving Stats"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статистика обслуживания"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务统计"
+          }
+        }
+      }
+    },
     "menubar.metric.server_off" : {
       "comment" : "Note in a menubar metric popover while the server is not running",
       "extractionState" : "manual",
@@ -943,6 +1135,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "服务器已关闭"
+          }
+        }
+      }
+    },
+    "menubar.metric.unavailable" : {
+      "comment" : "Note in an AVG or ALL popover when its scoped stats are unavailable",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serving stats are unavailable"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статистика обслуживания недоступна"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务统计不可用"
           }
         }
       }
@@ -8880,26 +9096,98 @@
         }
       }
     },
-    "menubar.stats.live_activity" : {
-      "comment" : "Section header inside the Serving Stats submenu for the current active request",
+    "menubar.stats.current_requests" : {
+      "comment" : "Section header inside Serving Stats for active and queued requests",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Live Activity"
+            "value" : "Current Requests"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Текущая активность"
+            "value" : "Текущие запросы"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "实时活动"
+            "value" : "当前请求"
+          }
+        }
+      }
+    },
+    "menubar.stats.more_requests" : {
+      "comment" : "Current Requests row showing active requests omitted from the capped list; placeholder is the count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld more requests"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Еще %lld запросов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "还有 %lld 个请求"
+          }
+        }
+      }
+    },
+    "menubar.stats.no_current_requests" : {
+      "comment" : "Disabled empty state in Serving Stats when no requests are active or queued",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No active requests"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нет активных запросов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有活动请求"
+          }
+        }
+      }
+    },
+    "menubar.stats.queued_requests" : {
+      "comment" : "Current Requests row showing how many requests have not started; placeholder is the count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld queued requests"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld запросов в очереди"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个请求排队中"
           }
         }
       }

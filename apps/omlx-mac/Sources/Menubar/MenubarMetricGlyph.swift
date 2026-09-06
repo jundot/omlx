@@ -25,11 +25,7 @@ enum MenubarMetricGlyph {
         guard let value, value.isFinite else {
             return "–"
         }
-        let clamped = max(0, value)
-        if clamped >= 10_000 {
-            return String(format: "%.1fktk/s", clamped / 1_000)
-        }
-        return "\(Int(clamped.rounded()))tk/s"
+        return "\(ActivityFormat.rate(value))tk/s"
     }
 
     /// Cheap pixel-change detector: same signature ⇒ identical glyph, so the

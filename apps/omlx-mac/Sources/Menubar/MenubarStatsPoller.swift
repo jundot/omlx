@@ -1,6 +1,6 @@
 // Menubar poller: use lightweight /api/status for liveness, authenticated
 // /admin/api/activity reads for current request activity, and occasional
-// all-time stats reads for the Serving Stats submenu. Emits
+// all-time stats reads only while a consumer needs them. Emits
 // NotificationCenter posts so the menubar refreshes without polling state
 // itself.
 //
@@ -87,12 +87,47 @@ final class MenubarStatsPoller {
         }
 
         struct LiveActivity: Equatable, Sendable {
-            let menuBarTitle: String
-            let detail: String
+            /// A hard cap keeps the LIV popover useful without allowing a busy
+            /// server to grow an unbounded menubar panel.
+            static let maximumVisibleRequests = 6
 
-            private init(menuBarTitle: String, detail: String) {
-                self.menuBarTitle = menuBarTitle
-                self.detail = detail
+            struct Request: Equatable, Sendable, Identifiable {
+                enum Kind: Equatable, Sendable {
+                    case prefill
+                    case generating
+                    case nonStreaming
+                }
+
+                let id: String
+                let title: String
+                let detail: String
+                let kind: Kind
+            }
+
+            struct ModelGroup: Equatable, Sendable, Identifiable {
+                let modelID: String
+                let requests: [Request]
+
+                var id: String { modelID }
+            }
+
+            let groups: [ModelGroup]
+            let queuedRequestCount: Int
+            let hiddenRequestCount: Int
+
+            var isIdle: Bool {
+                groups.isEmpty && queuedRequestCount == 0
+            }
+
+            var detail: String {
+                if let group = groups.first, let request = group.requests.first {
+                    return [group.modelID, request.detail]
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " · ")
+                }
+                return queuedRequestCount > 0
+                    ? "\(queuedRequestCount) queued request\(queuedRequestCount == 1 ? "" : "s")"
+                    : ""
             }
 
             init?(activeModels: ActiveModels?) {
@@ -100,111 +135,85 @@ final class MenubarStatsPoller {
                     return nil
                 }
 
+                var visibleCount = 0
+                var hiddenRequestCount = 0
+                var groups: [ModelGroup] = []
                 for activeModel in activeModels.models {
-                    if let prefill = activeModel.prefilling?.first {
-                        self = Self.prefill(modelID: activeModel.id, progress: prefill)
-                        return
+                    let requests = Self.requests(for: activeModel)
+                    let available = max(0, Self.maximumVisibleRequests - visibleCount)
+                    let shown = Array(requests.prefix(available))
+                    hiddenRequestCount += requests.count - shown.count
+                    visibleCount += shown.count
+                    if !shown.isEmpty {
+                        groups.append(ModelGroup(modelID: activeModel.id, requests: shown))
                     }
                 }
 
-                for activeModel in activeModels.models {
-                    if let generation = activeModel.generating?.first {
-                        self = Self.generation(modelID: activeModel.id, progress: generation)
-                        return
-                    }
-                }
-
-                for activeModel in activeModels.models {
-                    if let activity = activeModel.activities?.first {
-                        self = Self.nonStreaming(modelID: activeModel.id, activity: activity)
-                        return
-                    }
-                }
-
-                if let waitingRequestCount = activeModels.totalWaitingRequests,
-                   waitingRequestCount > 0 {
-                    self = Self.waiting(requestCount: waitingRequestCount)
-                    return
-                }
-
-                return nil
+                self.groups = groups
+                self.queuedRequestCount = max(0, activeModels.totalWaitingRequests ?? 0)
+                self.hiddenRequestCount = hiddenRequestCount
             }
 
-            private static func prefill(
-                modelID: String,
-                progress: PrefillProgress
-            ) -> LiveActivity {
+            private static func requests(for model: ActiveModel) -> [Request] {
+                let prefill = (model.prefilling ?? []).enumerated().map { index, progress in
+                    Self.prefill(index: index, progress: progress)
+                }
+                let generation = (model.generating ?? []).enumerated().map { index, progress in
+                    Self.generation(index: index, progress: progress)
+                }
+                let activity = (model.activities ?? []).enumerated().map { index, item in
+                    Self.nonStreaming(index: index, activity: item)
+                }
+                return prefill + generation + activity
+            }
+
+            private static func prefill(index: Int, progress: PrefillProgress) -> Request {
                 let processedTokens = max(0, progress.processed ?? 0)
                 let totalTokens = max(0, progress.total ?? 0)
                 let percentage = totalTokens > 0
                     ? Int((Double(processedTokens) / Double(totalTokens) * 100).rounded())
                     : 0
 
-                var detailParts = [modelID]
-                if let tokensPerSecond = progress.speed, tokensPerSecond > 0 {
-                    detailParts.append("\(Int(tokensPerSecond.rounded())) tok/s")
-                }
-                if let etaSeconds = progress.eta, etaSeconds >= 0 {
-                    detailParts.append("\(formatDuration(etaSeconds)) left")
-                }
-
-                return LiveActivity(
-                    menuBarTitle: "PP \(percentage)% · \(formatTokenCount(processedTokens))/\(formatTokenCount(totalTokens))",
-                    detail: detailParts.joined(separator: " · ")
+                return Request(
+                    id: "prefill-\(index)",
+                    title: "\(percentage)% · \(formatPrefillProgressTokenCount(processedTokens)) / \(formatPrefillProgressTokenCount(totalTokens)) tk",
+                    detail: "\(ActivityFormat.rate(max(0, progress.speed ?? 0))) tk/s",
+                    kind: .prefill
                 )
             }
 
-            private static func generation(
-                modelID: String,
-                progress: GenerationProgress
-            ) -> LiveActivity {
+            private static func formatPrefillProgressTokenCount(_ count: Int) -> String {
+                guard count >= 1_000 else { return "\(count)" }
+                guard count < 10_000 else { return ActivityFormat.tokens(count) }
+                return String(format: "%.1fk", Double(count) / 1_000)
+            }
+
+            private static func generation(index: Int, progress: GenerationProgress) -> Request {
                 let tokensPerSecond = max(0, progress.tokensPerSecond ?? 0)
                 let generatedTokens = max(0, progress.generatedTokens ?? 0)
 
-                var detailParts = [modelID, "\(generatedTokens) tok"]
-                if let elapsedSeconds = progress.elapsedSeconds {
-                    detailParts.append(formatDuration(elapsedSeconds))
-                }
-
-                return LiveActivity(
-                    menuBarTitle: "GEN \(String(format: "%.1f", tokensPerSecond)) tok/s",
-                    detail: detailParts.joined(separator: " · ")
+                return Request(
+                    id: "generation-\(index)",
+                    title: "\(ActivityFormat.tokens(generatedTokens)) tk",
+                    detail: "\(ActivityFormat.rate(tokensPerSecond)) tk/s",
+                    kind: .generating
                 )
             }
 
-            private static func waiting(requestCount: Int) -> LiveActivity {
-                LiveActivity(
-                    menuBarTitle: "WAIT \(requestCount)",
-                    detail: "\(requestCount) queued request\(requestCount == 1 ? "" : "s")"
-                )
-            }
-
-            private static func nonStreaming(
-                modelID: String,
-                activity: NonStreamingActivity
-            ) -> LiveActivity {
+            private static func nonStreaming(index: Int, activity: NonStreamingActivity) -> Request {
                 let elapsed = activity.elapsedSeconds.map(formatDuration)
                 let activityDetail = activity.detail ?? activity.kind ?? "Active request"
-                var detailParts = [modelID, activityDetail]
+                var detailParts = [activityDetail]
                 if let elapsed {
                     detailParts.append(elapsed)
                 }
 
-                return LiveActivity(
-                    menuBarTitle: elapsed.map { "RUN \($0)" } ?? "RUN",
-                    detail: detailParts.joined(separator: " · ")
+                return Request(
+                    id: "working-\(index)",
+                    title: elapsed.map { "RUN \($0)" } ?? "RUN",
+                    detail: detailParts.joined(separator: " · "),
+                    kind: .nonStreaming
                 )
-            }
-
-            private static func formatTokenCount(_ tokenCount: Int) -> String {
-                if tokenCount >= 1_000_000 {
-                    let millions = Double(tokenCount) / 1_000_000
-                    return String(format: millions >= 10 ? "%.0fM" : "%.1fM", millions)
-                }
-                if tokenCount >= 1_000 {
-                    return "\(Int((Double(tokenCount) / 1_000).rounded()))k"
-                }
-                return "\(tokenCount)"
             }
 
             private static func formatDuration(_ seconds: Double) -> String {
@@ -226,6 +235,7 @@ final class MenubarStatsPoller {
     private let idleInterval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
+    private var refreshInProgress = false
     /// Seconds between all-time fetches. All-time averages only change when a
     /// request completes and the endpoint is heavyweight (it also builds
     /// active_models/engines/runtime_cache), so it is never polled at the
@@ -235,6 +245,7 @@ final class MenubarStatsPoller {
         enabledMetrics.alltime ? 5 : 30
     }
     private var tickCount = 0
+    private(set) var servingStatsSubmenuOpen = false
     private(set) var enabledMetrics = EnabledMetrics(
         live: false, average: false, alltime: false
     )
@@ -292,12 +303,8 @@ final class MenubarStatsPoller {
             return
         }
 
-        let liveTurnedOff = enabledMetrics.live && !metrics.live
-        let alltimeTurnedOn = !enabledMetrics.alltime && metrics.alltime
+        let alltimeTurnedOn = !needsAlltimeStats && (metrics.alltime || servingStatsSubmenuOpen)
         enabledMetrics = metrics
-        if liveTurnedOff {
-            clearLiveStats()
-        }
         if alltimeTurnedOn {
             // Force an all-time fetch on the next tick so a freshly enabled
             // ALL item doesn't sit on "–" for up to a full cadence period.
@@ -305,12 +312,36 @@ final class MenubarStatsPoller {
         }
     }
 
+    /// The hosted Serving Stats menu is a consumer independent of the optional
+    /// LIV / AVG / ALL status items. Opening it starts the admin-backed scopes;
+    /// closing it leaves only explicitly enabled metric items polling them.
+    func setServingStatsSubmenuOpen(_ isOpen: Bool) {
+        guard servingStatsSubmenuOpen != isOpen else {
+            return
+        }
+
+        servingStatsSubmenuOpen = isOpen
+        if isOpen {
+            // The next pass fetches all-time data immediately instead of waiting
+            // for the submenu's lower-frequency cadence.
+            tickCount = 0
+        }
+    }
+
     /// Any enabled menubar metric item polls at the user-configured refresh
     /// interval (read live from UserDefaults so setting changes apply on the
-    /// next loop pass); otherwise the idle 2 s cadence keeps the Serving
-    /// Stats submenu fresh at minimal cost.
+    /// next loop pass); otherwise the idle 2 s cadence keeps public session
+    /// data fresh without background admin traffic.
     var currentPollingInterval: TimeInterval {
         enabledMetrics.any ? MenubarMetricPrefs.refreshInterval : idleInterval
+    }
+
+    var needsLiveActivity: Bool {
+        enabledMetrics.live || servingStatsSubmenuOpen
+    }
+
+    var needsAlltimeStats: Bool {
+        enabledMetrics.alltime || servingStatsSubmenuOpen
     }
 
     deinit {
@@ -321,6 +352,15 @@ final class MenubarStatsPoller {
     // MARK: - Polling
 
     func refreshOnce() async {
+        // Opening the hosted submenu requests a prompt refresh. If it lands
+        // during the timer's fetch, that fetch completes with the current
+        // demand and the next timer pass picks up any newly enabled scope.
+        guard !refreshInProgress else {
+            return
+        }
+        refreshInProgress = true
+        defer { refreshInProgress = false }
+
         let alltimeEveryNTicks = max(
             1,
             Int((alltimeRefreshInterval / currentPollingInterval).rounded())
@@ -331,19 +371,14 @@ final class MenubarStatsPoller {
             let s = try await fetchPublicStatus()
             self.sessionStats = s
             self.lastStatusSuccessAt = Date()
-            if enabledMetrics.live {
-                do {
-                    let live = try await fetchAdminActivity()
-                    if enabledMetrics.live {
-                        self.liveStats = live
-                    }
-                } catch {
-                    if enabledMetrics.live {
-                        clearLiveStats(shouldPostUpdate: false)
-                    }
+            do {
+                if needsLiveActivity {
+                    self.liveStats = try await fetchAdminActivity()
                 }
+            } catch {
+                clearLiveStats(shouldPostUpdate: false)
             }
-            if fetchAlltime, hasAPIKey,
+            if fetchAlltime, needsAlltimeStats, hasAPIKey,
                let alltime = try? await fetchAdminStats(scope: "alltime") {
                 self.alltimeStats = alltime
             }

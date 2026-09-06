@@ -12,44 +12,17 @@ struct MetricPopoverView: View {
     let openSettings: () -> Void
     let openDashboard: () -> Void
 
-    @Environment(\.omlxTheme) private var theme
-
     var body: some View {
-        let rates = store.rates[kind]
+        let snapshot = store.snapshot(for: kind)
         let series = store.history[kind] ?? MenubarMetricsStore.Series()
 
         VStack(alignment: .leading, spacing: 6) {
-            sectionHeader(kind.displayName)
-
-            valueRow(
-                label: "PP",
-                value: Self.popoverTps(rates?.promptTps),
-                tint: theme.blueDot
+            ServingStatsScopeView(
+                kind: kind,
+                snapshot: snapshot,
+                series: series,
+                serverIsRunning: store.serverIsRunning
             )
-            valueRow(
-                label: "TG",
-                value: Self.popoverTps(rates?.generationTps),
-                tint: theme.greenDot
-            )
-
-            if let note = statusNote {
-                Text(note)
-                    .font(.omlxText(11))
-                    .foregroundStyle(theme.textTertiary)
-            }
-
-            Divider().padding(.vertical, 2)
-
-            sectionHeader(String(
-                localized: "menubar.metric.activity",
-                defaultValue: "Activity",
-                comment: "Header above the throughput graphs in a menubar metric popover"
-            ))
-
-            graphCaption("PP tk/s")
-            MetricSparkline(values: series.promptTps, color: theme.blueDot)
-            graphCaption("TG tk/s")
-            MetricSparkline(values: series.generationTps, color: theme.greenDot)
 
             Divider().padding(.vertical, 2)
 
@@ -86,71 +59,539 @@ struct MetricPopoverView: View {
                 .disabled(!store.serverIsRunning)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .frame(width: 260)
+        .padding(.horizontal, MenubarStatsPanelLayout.horizontalInset)
+        .padding(.vertical, MenubarStatsPanelLayout.verticalInset)
+        .frame(width: MenubarStatsPanelLayout.width)
+    }
+}
+
+/// Read-only, value-driven presentation for a detailed Serving Stats scope.
+/// It keeps the metrics, activity history, and terminal detail reusable while
+/// preserving the full popover composition for LIV, AVG, and ALL.
+struct ServingStatsScopeView: View {
+    let snapshot: ServingStatsSnapshot
+    let series: MenubarMetricsStore.Series
+    let serverIsRunning: Bool
+    let composition: ServingStatsPresentation.ScopeComposition
+    let showsStatusNote: Bool
+
+    @Environment(\.omlxTheme) private var theme
+
+    init(
+        kind: MenubarMetricsStore.Kind,
+        snapshot: ServingStatsSnapshot,
+        series: MenubarMetricsStore.Series,
+        serverIsRunning: Bool
+    ) {
+        self.init(
+            snapshot: snapshot,
+            series: series,
+            serverIsRunning: serverIsRunning,
+            composition: ServingStatsPresentation.popoverScope(for: kind),
+            showsStatusNote: true
+        )
     }
 
-    private var statusNote: String? {
-        if !store.serverIsRunning {
+    init(
+        snapshot: ServingStatsSnapshot,
+        series: MenubarMetricsStore.Series,
+        serverIsRunning: Bool,
+        composition: ServingStatsPresentation.ScopeComposition,
+        showsStatusNote: Bool = false
+    ) {
+        self.snapshot = snapshot
+        self.series = series
+        self.serverIsRunning = serverIsRunning
+        self.composition = composition
+        self.showsStatusNote = showsStatusNote
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            MenubarStatsPanelHeader(title: composition.kind.displayName)
+
+            if composition.showsThroughput {
+                ServingStatsThroughputValues(snapshot: snapshot)
+            }
+
+            if showsStatusNote, let note = ServingStatsPresentation.statusNote(
+                for: composition.kind,
+                snapshot: snapshot,
+                serverIsRunning: serverIsRunning
+            ) {
+                Text(note)
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.textTertiary)
+            }
+
+            if composition.activityGraphCount > 0 {
+                ServingStatsActivityGraphs(series: series)
+            }
+
+            Divider().padding(.vertical, 2)
+            switch composition.terminalDetail {
+            case .currentRequests:
+                CurrentRequestsView(
+                    activity: snapshot.liveActivity,
+                    showsHeader: composition.showsTerminalDetailHeader
+                )
+            case .scalarMetrics:
+                ScalarMetricsView(
+                    snapshot: snapshot,
+                    showsHeader: composition.showsTerminalDetailHeader
+                )
+            }
+        }
+    }
+}
+
+/// The compact main-menu overview reuses the serving leaves without the
+/// standalone popovers' activity graphs or unavailable-state notes.
+struct ServingStatsMenuPanel: View {
+    let live: ServingStatsSnapshot
+    let average: ServingStatsSnapshot
+    let alltime: ServingStatsSnapshot
+    let liveSeries: MenubarMetricsStore.Series
+    let averageSeries: MenubarMetricsStore.Series
+    let alltimeSeries: MenubarMetricsStore.Series
+    let serverIsRunning: Bool
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Group {
+            switch ServingStatsPresentation.menuComposition(serverIsRunning: serverIsRunning) {
+            case .serverOff:
+                Text(String(
+                    localized: "menubar.stats.server_off",
+                    defaultValue: "Server is off",
+                    comment: "Disabled placeholder in the Serving Stats submenu when the server isn't running"
+                ))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textTertiary)
+                .padding(.vertical, 14)
+            case .sections(let sections):
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(sections) { section in
+                        compactScope(section)
+                        if section.kind != .alltime {
+                            SectionRule()
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: MenubarStatsPanelLayout.contentWidth, alignment: .leading)
+        .padding(.horizontal, MenubarStatsPanelLayout.horizontalInset)
+        .padding(.vertical, MenubarStatsPanelLayout.verticalInset)
+        .frame(width: MenubarStatsPanelLayout.width)
+    }
+
+    private func compactScope(
+        _ section: ServingStatsPresentation.ScopeComposition
+    ) -> some View {
+        ServingStatsScopeView(
+            snapshot: snapshot(for: section.kind),
+            series: series(for: section.kind),
+            serverIsRunning: serverIsRunning,
+            composition: section,
+            showsStatusNote: false
+        )
+    }
+
+    private func snapshot(for kind: MenubarMetricsStore.Kind) -> ServingStatsSnapshot {
+        switch kind {
+        case .live:
+            return live
+        case .average:
+            return average
+        case .alltime:
+            return alltime
+        }
+    }
+
+    private func series(for kind: MenubarMetricsStore.Kind) -> MenubarMetricsStore.Series {
+        switch kind {
+        case .live:
+            return liveSeries
+        case .average:
+            return averageSeries
+        case .alltime:
+            return alltimeSeries
+        }
+    }
+}
+
+enum ServingStatsPresentation {
+    enum TerminalDetail: Equatable {
+        case currentRequests
+        case scalarMetrics
+    }
+
+    struct ScopeComposition: Equatable, Identifiable {
+        let kind: MenubarMetricsStore.Kind
+        let showsThroughput: Bool
+        let activityGraphCount: Int
+        let terminalDetail: TerminalDetail
+        let showsTerminalDetailHeader: Bool
+
+        init(
+            kind: MenubarMetricsStore.Kind,
+            showsThroughput: Bool,
+            activityGraphCount: Int,
+            terminalDetail: TerminalDetail,
+            showsTerminalDetailHeader: Bool = false
+        ) {
+            self.kind = kind
+            self.showsThroughput = showsThroughput
+            self.activityGraphCount = activityGraphCount
+            self.terminalDetail = terminalDetail
+            self.showsTerminalDetailHeader = showsTerminalDetailHeader
+        }
+
+        var id: MenubarMetricsStore.Kind { kind }
+    }
+
+    enum MenuComposition: Equatable {
+        case serverOff
+        case sections([ScopeComposition])
+    }
+
+    static func popoverScope(for kind: MenubarMetricsStore.Kind) -> ScopeComposition {
+        ScopeComposition(
+            kind: kind,
+            showsThroughput: true,
+            activityGraphCount: 2,
+            terminalDetail: kind == .live ? .currentRequests : .scalarMetrics,
+            showsTerminalDetailHeader: kind == .live
+        )
+    }
+
+    static func menuComposition(serverIsRunning: Bool) -> MenuComposition {
+        guard serverIsRunning else {
+            return .serverOff
+        }
+        return .sections([
+            ScopeComposition(
+                kind: .live,
+                showsThroughput: true,
+                activityGraphCount: 2,
+                terminalDetail: .currentRequests,
+                showsTerminalDetailHeader: true
+            ),
+            ScopeComposition(
+                kind: .average,
+                showsThroughput: true,
+                activityGraphCount: 0,
+                terminalDetail: .scalarMetrics
+            ),
+            ScopeComposition(
+                kind: .alltime,
+                showsThroughput: true,
+                activityGraphCount: 0,
+                terminalDetail: .scalarMetrics
+            )
+        ])
+    }
+
+    static func statusNote(
+        for kind: MenubarMetricsStore.Kind,
+        snapshot: ServingStatsSnapshot,
+        serverIsRunning: Bool
+    ) -> String? {
+        if !serverIsRunning {
             return String(
                 localized: "menubar.metric.server_off",
                 defaultValue: "Server is off",
                 comment: "Note in a menubar metric popover while the server is not running"
             )
         }
-        if kind == .live, store.rates[.live] == nil {
-            // The server answers but /admin/api/activity does not — the
-            // admin API key is missing or rejected.
+        if kind == .live, snapshot.isUnavailable {
             return String(
                 localized: "menubar.metric.live_unavailable",
                 defaultValue: "Set an API key to enable live activity",
                 comment: "Note in the LIV popover when live stats need admin authentication"
             )
         }
+        if kind != .live, snapshot.isUnavailable {
+            return String(
+                localized: "menubar.metric.unavailable",
+                defaultValue: "Serving stats are unavailable",
+                comment: "Note in an AVG or ALL popover when its scoped stats are unavailable"
+            )
+        }
         return nil
     }
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.omlxText(10, weight: .bold))
-            .kerning(1)
-            .foregroundStyle(theme.accent)
-            .frame(maxWidth: .infinity, alignment: .center)
-    }
-
-    private func valueRow(label: String, value: String, tint: Color) -> some View {
-        HStack {
-            Circle()
-                .fill(tint)
-                .frame(width: 6, height: 6)
-            Text(label)
-                .font(.omlxText(12, weight: .medium))
-                .foregroundStyle(theme.textSecondary)
-            Spacer()
-            Text(value)
-                .font(.omlxMono(12, weight: .medium))
-                .foregroundStyle(theme.text)
-        }
-    }
-
-    private func graphCaption(_ text: String) -> some View {
-        Text(text)
-            .font(.omlxMono(9))
-            .foregroundStyle(theme.textTertiary)
-    }
-
-    /// Popover readout: one decimal below 100 tk/s, whole numbers above,
-    /// "–" for unknown.
     static func popoverTps(_ value: Double?) -> String {
         guard let value, value.isFinite else {
             return "–"
         }
-        let clamped = max(0, value)
-        if clamped < 100 {
-            return String(format: "%.1f tk/s", clamped)
+        return "\(ActivityFormat.rate(value)) tk/s"
+    }
+}
+
+struct ServingStatsActivityGraphs: View {
+    let series: MenubarMetricsStore.Series
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            MenubarStatsPanelCaption(text: "PP tk/s")
+            MetricSparkline(values: series.promptTps, color: theme.blueDot)
+            MenubarStatsPanelCaption(text: "TG tk/s")
+            MetricSparkline(values: series.generationTps, color: theme.greenDot)
         }
-        return "\(Int(clamped.rounded())) tk/s"
+    }
+}
+
+struct ServingStatsThroughputValues: View {
+    let snapshot: ServingStatsSnapshot
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            value(
+                label: "PP",
+                value: ServingStatsPresentation.popoverTps(snapshot.rates?.promptTps),
+                tint: theme.blueDot
+            )
+            value(
+                label: "TG",
+                value: ServingStatsPresentation.popoverTps(snapshot.rates?.generationTps),
+                tint: theme.greenDot
+            )
+        }
+    }
+
+    private func value(label: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(tint)
+                    .frame(width: 6, height: 6)
+                Text(label)
+                    .font(.omlxText(12))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            Text(value)
+                .font(.omlxMono(12))
+                .foregroundStyle(theme.text)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct ScalarMetricsView: View {
+    let snapshot: ServingStatsSnapshot
+    let showsHeader: Bool
+
+    init(snapshot: ServingStatsSnapshot, showsHeader: Bool = true) {
+        self.snapshot = snapshot
+        self.showsHeader = showsHeader
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if showsHeader {
+                MenubarStatsPanelHeader(title: String(
+                    localized: "menubar.metric.metrics",
+                    defaultValue: "Serving Stats",
+                    comment: "Header above scalar counters in an AVG or ALL serving metric popover"
+                ))
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                MenubarStatsValueRow(
+                    label: String(
+                        localized: "menubar.stats.total_tokens",
+                        defaultValue: "Total Tokens Processed",
+                        comment: "Stats row label for total tokens processed"
+                    ),
+                    value: Self.compact(snapshot.totalPromptTokens)
+                )
+                MenubarStatsValueRow(
+                    label: String(
+                        localized: "menubar.stats.cached_tokens",
+                        defaultValue: "Cached Tokens",
+                        comment: "Stats row label for cached tokens count"
+                    ),
+                    value: Self.compact(snapshot.totalCachedTokens)
+                )
+                MenubarStatsValueRow(
+                    label: String(
+                        localized: "menubar.stats.cache_efficiency",
+                        defaultValue: "Cache Efficiency",
+                        comment: "Stats row label for the cache efficiency percentage"
+                    ),
+                    value: Self.percent(snapshot.cacheEfficiency)
+                )
+                MenubarStatsValueRow(
+                    label: String(
+                        localized: "menubar.stats.total_requests",
+                        defaultValue: "Total Requests",
+                        comment: "Stats row label for total request count"
+                    ),
+                    value: Self.compact(snapshot.totalRequests)
+                )
+            }
+        }
+    }
+
+    private static func compact(_ value: Int?) -> String {
+        guard let value else { return "–" }
+        let clamped = max(0, value)
+        if clamped >= 1_000_000 {
+            return String(format: clamped >= 10_000_000 ? "%.0fM" : "%.1fM", Double(clamped) / 1_000_000)
+        }
+        if clamped >= 1_000 {
+            return String(format: clamped >= 10_000 ? "%.0fk" : "%.1fk", Double(clamped) / 1_000)
+        }
+        return "\(clamped)"
+    }
+
+    private static func percent(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "–" }
+        return String(format: "%.1f%%", max(0, value))
+    }
+}
+
+struct CurrentRequestsView: View {
+    let activity: MenubarStatsPoller.Stats.LiveActivity?
+    let showsHeader: Bool
+    @Environment(\.omlxTheme) private var theme
+
+    init(
+        activity: MenubarStatsPoller.Stats.LiveActivity?,
+        showsHeader: Bool = true
+    ) {
+        self.activity = activity
+        self.showsHeader = showsHeader
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if showsHeader {
+                MenubarStatsPanelHeader(title: String(
+                    localized: "menubar.stats.current_requests",
+                    defaultValue: "Current Requests",
+                    comment: "Section header inside Serving Stats for active and queued requests"
+                ))
+            }
+
+            if let activity {
+                if activity.isIdle {
+                    emptyState
+                } else {
+                    ForEach(activity.groups) { group in
+                        Text(group.modelID)
+                            .font(.omlxMono(12, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                            .lineLimit(1)
+                        ForEach(group.requests) { request in
+                            requestRow(request)
+                        }
+                    }
+                    if activity.queuedRequestCount > 0 {
+                        statusRow(String(
+                            localized: "menubar.stats.queued_requests",
+                            defaultValue: "\(activity.queuedRequestCount) queued requests",
+                            comment: "Current Requests row showing how many requests have not started; placeholder is the count"
+                        ))
+                    }
+                    if activity.hiddenRequestCount > 0 {
+                        statusRow(String(
+                            localized: "menubar.stats.more_requests",
+                            defaultValue: "\(activity.hiddenRequestCount) more requests",
+                            comment: "Current Requests row showing active requests omitted from the capped list; placeholder is the count"
+                        ))
+                    }
+                }
+            } else {
+                Text(String(
+                    localized: "menubar.stats.loading",
+                    defaultValue: "Loading stats…",
+                    comment: "Disabled placeholder shown while stats are loading"
+                ))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.textTertiary)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        Text(String(
+            localized: "menubar.stats.no_current_requests",
+            defaultValue: "No active requests",
+            comment: "Disabled empty state in Serving Stats when no requests are active or queued"
+        ))
+        .font(.omlxText(11))
+        .foregroundStyle(theme.textTertiary)
+    }
+
+    private func requestRow(_ request: MenubarStatsPoller.Stats.LiveActivity.Request) -> some View {
+        HStack(spacing: 6) {
+            if let marker = CurrentRequestMarker.marker(for: request.kind) {
+                Circle()
+                    .fill(marker.color(in: theme))
+                    .frame(width: 6, height: 6)
+                Text(marker.abbreviation)
+                    .font(.omlxMono(12, weight: .medium))
+                    .foregroundStyle(marker.color(in: theme))
+            }
+            Text(request.title)
+                .font(.omlxMono(12))
+                .foregroundStyle(theme.text)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text(request.detail)
+                .font(.omlxMono(12))
+                .foregroundStyle(theme.textSecondary)
+                .lineLimit(1)
+        }
+    }
+
+    private func statusRow(_ text: String) -> some View {
+        Text(text)
+            .font(.omlxText(11))
+            .foregroundStyle(theme.textTertiary)
+    }
+}
+
+enum CurrentRequestMarker: Equatable {
+    case prefill
+    case generating
+
+    static func marker(
+        for kind: MenubarStatsPoller.Stats.LiveActivity.Request.Kind
+    ) -> CurrentRequestMarker? {
+        switch kind {
+        case .prefill:
+            return .prefill
+        case .generating:
+            return .generating
+        case .nonStreaming:
+            return nil
+        }
+    }
+
+    var abbreviation: String {
+        switch self {
+        case .prefill:
+            return "PP"
+        case .generating:
+            return "TG"
+        }
+    }
+
+    func color(in theme: OMLXTheme) -> Color {
+        switch self {
+        case .prefill:
+            return theme.blueDot
+        case .generating:
+            return theme.greenDot
+        }
     }
 }
 

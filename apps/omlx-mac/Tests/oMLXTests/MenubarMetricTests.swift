@@ -77,6 +77,58 @@ final class MenubarMetricTests: XCTestCase {
         XCTAssertEqual(rates.generationTps, 48.7)
     }
 
+    func testScopedSnapshotsMapLiveAndAggregateData() throws {
+        let stats = try decodeStats(
+            """
+            {
+              "total_prompt_tokens": 12000,
+              "total_cached_tokens": 3000,
+              "cache_efficiency": 25.0,
+              "avg_prefill_tps": 512.3,
+              "avg_generation_tps": 48.7,
+              "total_requests": 9,
+              "active_models": {
+                "models": [{
+                  "id": "model-a",
+                  "prefilling": [{"processed": 3, "total": 10, "speed": 300.0}],
+                  "generating": [{"generated_tokens": 5, "tokens_per_second": 40.0}]
+                }]
+              }
+            }
+            """
+        )
+
+        let live = try XCTUnwrap(MenubarMetricsStore.snapshot(for: .live, from: stats))
+        XCTAssertEqual(live.rates, MetricRates(promptTps: 300, generationTps: 40))
+        XCTAssertNil(live.totalPromptTokens)
+        XCTAssertNotNil(live.liveActivity)
+
+        for kind in [MenubarMetricsStore.Kind.average, .alltime] {
+            let aggregate = try XCTUnwrap(MenubarMetricsStore.snapshot(for: kind, from: stats))
+            XCTAssertEqual(aggregate.rates, MetricRates(promptTps: 512.3, generationTps: 48.7))
+            XCTAssertEqual(aggregate.totalPromptTokens, 12000)
+            XCTAssertEqual(aggregate.totalCachedTokens, 3000)
+            XCTAssertEqual(aggregate.cacheEfficiency, 25.0)
+            XCTAssertEqual(aggregate.totalRequests, 9)
+            XCTAssertNil(aggregate.liveActivity)
+        }
+    }
+
+    func testUnavailableSnapshotKeepsUnknownValuesDistinctFromIdle() {
+        XCTAssertNil(MenubarMetricsStore.snapshot(for: .live, from: nil))
+        XCTAssertTrue(ServingStatsSnapshot.unavailable.isUnavailable)
+
+        let idle = ServingStatsSnapshot(
+            rates: MetricRates(promptTps: 0, generationTps: 0),
+            totalPromptTokens: nil,
+            totalCachedTokens: nil,
+            cacheEfficiency: nil,
+            totalRequests: nil,
+            liveActivity: nil
+        )
+        XCTAssertFalse(idle.isUnavailable)
+    }
+
     // MARK: - History ring buffer
 
     func testHistoryAppendCapsAtCapacityDroppingOldest() {
@@ -93,16 +145,31 @@ final class MenubarMetricTests: XCTestCase {
     func testApplyTickRecordsRatesAndRollsHistory() {
         let store = MenubarMetricsStore()
         store.applyTick(
-            live: MetricRates(promptTps: 100, generationTps: 10),
-            average: MetricRates(promptTps: 200, generationTps: 20),
+            live: ServingStatsSnapshot(
+                rates: MetricRates(promptTps: 100, generationTps: 10),
+                totalPromptTokens: nil,
+                totalCachedTokens: nil,
+                cacheEfficiency: nil,
+                totalRequests: nil,
+                liveActivity: nil
+            ),
+            average: ServingStatsSnapshot(
+                rates: MetricRates(promptTps: 200, generationTps: 20),
+                totalPromptTokens: 300,
+                totalCachedTokens: 40,
+                cacheEfficiency: 13.3,
+                totalRequests: 2,
+                liveActivity: nil
+            ),
             alltime: nil,
             serverRunning: true
         )
 
         XCTAssertTrue(store.serverIsRunning)
-        XCTAssertEqual(store.rates[.live]?.promptTps, 100)
-        XCTAssertEqual(store.rates[.average]?.generationTps, 20)
-        XCTAssertNil(store.rates[.alltime])
+        XCTAssertEqual(store.snapshot(for: .live).rates?.promptTps, 100)
+        XCTAssertEqual(store.snapshot(for: .average).rates?.generationTps, 20)
+        XCTAssertEqual(store.snapshot(for: .average).totalRequests, 2)
+        XCTAssertTrue(store.snapshot(for: .alltime).isUnavailable)
         // Unknown readings still roll a 0 so the graph timeline stays contiguous.
         XCTAssertEqual(store.history[.alltime]?.promptTps, [0])
         XCTAssertEqual(store.history[.live]?.promptTps, [100])
@@ -112,20 +179,152 @@ final class MenubarMetricTests: XCTestCase {
     func testMarkServerStoppedBlanksRatesButFreezesHistory() {
         let store = MenubarMetricsStore()
         store.applyTick(
-            live: MetricRates(promptTps: 100, generationTps: 10),
-            average: MetricRates(promptTps: 200, generationTps: 20),
-            alltime: MetricRates(promptTps: 300, generationTps: 30),
+            live: ServingStatsSnapshot(
+                rates: MetricRates(promptTps: 100, generationTps: 10),
+                totalPromptTokens: nil,
+                totalCachedTokens: nil,
+                cacheEfficiency: nil,
+                totalRequests: nil,
+                liveActivity: nil
+            ),
+            average: ServingStatsSnapshot(
+                rates: MetricRates(promptTps: 200, generationTps: 20),
+                totalPromptTokens: nil,
+                totalCachedTokens: nil,
+                cacheEfficiency: nil,
+                totalRequests: nil,
+                liveActivity: nil
+            ),
+            alltime: ServingStatsSnapshot(
+                rates: MetricRates(promptTps: 300, generationTps: 30),
+                totalPromptTokens: nil,
+                totalCachedTokens: nil,
+                cacheEfficiency: nil,
+                totalRequests: nil,
+                liveActivity: nil
+            ),
             serverRunning: true
         )
 
         store.markServerStopped()
 
         XCTAssertFalse(store.serverIsRunning)
-        XCTAssertNil(store.rates[.live])
-        XCTAssertNil(store.rates[.average])
-        XCTAssertNil(store.rates[.alltime])
+        XCTAssertTrue(store.snapshot(for: .live).isUnavailable)
+        XCTAssertTrue(store.snapshot(for: .average).isUnavailable)
+        XCTAssertTrue(store.snapshot(for: .alltime).isUnavailable)
         XCTAssertEqual(store.history[.live]?.promptTps, [100])
         XCTAssertEqual(store.history[.alltime]?.generationTps, [30])
+    }
+
+    func testLiveSnapshotRetainsRequestActivity() throws {
+        let stats = try decodeStats(
+            """
+            {
+              "active_models": {
+                "models": [{
+                  "id": "model-a",
+                  "generating": [{
+                    "generated_tokens": 128,
+                    "tokens_per_second": 42.1,
+                    "elapsed_seconds": 3
+                  }]
+                }],
+                "total_waiting_requests": 2
+              }
+            }
+            """
+        )
+
+        let live = try XCTUnwrap(MenubarMetricsStore.snapshot(for: .live, from: stats))
+        XCTAssertEqual(live.rates, MetricRates(promptTps: 0, generationTps: 42.1))
+        XCTAssertEqual(live.liveActivity?.groups.first?.requests.first?.title, "GEN 42.1 tok/s")
+        XCTAssertEqual(live.liveActivity?.queuedRequestCount, 2)
+    }
+
+    func testPrefillTitlesCompactOnlyProgressCounts() throws {
+        let stats = try decodeStats(
+            """
+            {
+              "active_models": {
+                "models": [{
+                  "id": "model-a",
+                  "prefilling": [
+                    {"processed": 999, "total": 1000, "speed": 0},
+                    {"processed": 1024, "total": 1700, "speed": 0},
+                    {"processed": 10000, "total": 12400, "speed": 0}
+                  ],
+                  "generating": [{"generated_tokens": 9999, "tokens_per_second": 0}]
+                }]
+              }
+            }
+            """
+        )
+        let requests = try XCTUnwrap(
+            MenubarMetricsStore.snapshot(for: .live, from: stats)?.liveActivity?.groups.first?.requests
+        )
+
+        XCTAssertEqual(requests[0].title, "100% · 999 / 1.0k tk")
+        XCTAssertEqual(requests[1].title, "60% · 1.0k / 1.7k tk")
+        XCTAssertEqual(requests[2].title, "81% · 10k / 12.4k tk")
+        XCTAssertEqual(requests[3].title, "9,999 tk")
+    }
+
+    func testDetailedServingStatsPopoversKeepOneActivityBlockAndScopeSpecificTerminalDetail() {
+        let live = ServingStatsPresentation.popoverScope(for: .live)
+        let average = ServingStatsPresentation.popoverScope(for: .average)
+        let alltime = ServingStatsPresentation.popoverScope(for: .alltime)
+
+        XCTAssertEqual([live.kind, average.kind, alltime.kind], [.live, .average, .alltime])
+        XCTAssertEqual(
+            [live.activityGraphCount, average.activityGraphCount, alltime.activityGraphCount],
+            [2, 2, 2]
+        )
+        XCTAssertTrue(live.showsThroughput)
+        XCTAssertTrue(average.showsThroughput)
+        XCTAssertTrue(alltime.showsThroughput)
+        XCTAssertEqual(live.terminalDetail, .currentRequests)
+        XCTAssertEqual(average.terminalDetail, .scalarMetrics)
+        XCTAssertEqual(alltime.terminalDetail, .scalarMetrics)
+        XCTAssertTrue(live.showsTerminalDetailHeader)
+        XCTAssertFalse(average.showsTerminalDetailHeader)
+        XCTAssertFalse(alltime.showsTerminalDetailHeader)
+    }
+
+    func testServingStatsMenuCompositionKeepsLiveDetailAndHeaderlessScalarSummaries() {
+        XCTAssertEqual(
+            ServingStatsPresentation.menuComposition(serverIsRunning: false),
+            .serverOff
+        )
+
+        guard case .sections(let sections) = ServingStatsPresentation.menuComposition(
+            serverIsRunning: true
+        ) else {
+            return XCTFail("running server must compose the serving stats menu")
+        }
+
+        XCTAssertEqual(sections.map(\.kind), [.live, .average, .alltime])
+        XCTAssertEqual(sections.map(\.showsThroughput), [true, true, true])
+        XCTAssertEqual(sections.map(\.activityGraphCount), [2, 0, 0])
+        XCTAssertEqual(
+            sections.map(\.terminalDetail),
+            [.currentRequests, .scalarMetrics, .scalarMetrics]
+        )
+        XCTAssertEqual(sections.map(\.showsTerminalDetailHeader), [true, false, false])
+    }
+
+    func testMenubarStatsPanelLayoutKeepsServingAndSystemContentAligned() {
+        XCTAssertEqual(MenubarStatsPanelLayout.width, 270)
+        XCTAssertEqual(MenubarStatsPanelLayout.horizontalInset, 14)
+        XCTAssertEqual(MenubarStatsPanelLayout.verticalInset, 8)
+        XCTAssertEqual(MenubarStatsPanelLayout.contentWidth, 242)
+    }
+
+    func testCurrentRequestMarkersFollowRequestKind() {
+        XCTAssertEqual(CurrentRequestMarker.marker(for: .prefill), .prefill)
+        XCTAssertEqual(CurrentRequestMarker.marker(for: .generating), .generating)
+        XCTAssertNil(CurrentRequestMarker.marker(for: .nonStreaming))
+        XCTAssertEqual(CurrentRequestMarker.prefill.abbreviation, "PP")
+        XCTAssertEqual(CurrentRequestMarker.generating.abbreviation, "TG")
     }
 
     // MARK: - Model library scope pref
@@ -149,14 +348,17 @@ final class MenubarMetricTests: XCTestCase {
 
     // MARK: - Glyph formatting
 
-    func testFormatTpsCoversUnknownWholeAndCompactRanges() {
+    func testRateReadoutsUseSharedFormattingAndSurfaceSpecificUnitSpacing() {
         XCTAssertEqual(MenubarMetricGlyph.formatTps(nil), "–")
         XCTAssertEqual(MenubarMetricGlyph.formatTps(.infinity), "–")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(-3), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(0), "0tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(24.4), "24tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(999.6), "1000tk/s")
-        XCTAssertEqual(MenubarMetricGlyph.formatTps(12_345), "12.3ktk/s")
+        XCTAssertEqual(ServingStatsPresentation.popoverTps(nil), "–")
+        XCTAssertEqual(ServingStatsPresentation.popoverTps(.infinity), "–")
+
+        for value in [1.0, 100, 9_999, 10_000] {
+            let expected = ActivityFormat.rate(value)
+            XCTAssertEqual(MenubarMetricGlyph.formatTps(value), "\(expected)tk/s")
+            XCTAssertEqual(ServingStatsPresentation.popoverTps(value), "\(expected) tk/s")
+        }
     }
 
     func testSignatureIsStableForIdenticalReadingsAndTracksEveryInput() {

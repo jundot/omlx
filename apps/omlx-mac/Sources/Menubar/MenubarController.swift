@@ -80,6 +80,8 @@ final class MenubarController: NSObject {
     private var modelsFetchTask: Task<Void, Never>?
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
+    private var servingStatsSubmenuOpen = false
+    private var servingStatsPanelHost: NSHostingView<AnyView>?
     private var systemStatsParentItem: NSMenuItem!
     private var systemStatsSubmenu: NSMenu!
     private let systemStatsSampler = SystemStatsSampler()
@@ -304,9 +306,11 @@ final class MenubarController: NSObject {
                                action: nil,
                                symbol: "chart.bar")
         statsSubmenu = NSMenu()
+        statsSubmenu.autoenablesItems = false
+        statsSubmenu.delegate = self
         statsParentItem.submenu = statsSubmenu
         menu.addItem(statsParentItem)
-        rebuildStatsSubmenu()
+        buildServingStatsSubmenu()
         rebuildModelsSubmenu()
 
         menu.addItem(.separator())
@@ -619,88 +623,40 @@ final class MenubarController: NSObject {
         }
     }
 
-    private func rebuildStatsSubmenu() {
+    /// Serving Stats is one retained hosting view rather than a rebuilt list
+    /// of disabled menu rows. Replacing its value-driven root is safe while
+    /// AppKit tracks the menu and lets SwiftUI compute each fresh fitting size.
+    private func buildServingStatsSubmenu() {
         statsSubmenu.removeAllItems()
+        let hosting = NSHostingView(rootView: servingStatsPanelRoot())
+        servingStatsPanelHost = hosting
+        statsSubmenu.addItem(panelItem(hosting: hosting))
+    }
 
-        let isRunning: Bool
-        if case .running = server?.state { isRunning = true } else { isRunning = false }
+    private func servingStatsPanelRoot() -> AnyView {
+        AnyView(
+            ServingStatsMenuPanel(
+                live: metricsStore.snapshot(for: .live),
+                average: metricsStore.snapshot(for: .average),
+                alltime: metricsStore.snapshot(for: .alltime),
+                liveSeries: metricsStore.history[.live] ?? MenubarMetricsStore.Series(),
+                averageSeries: metricsStore.history[.average] ?? MenubarMetricsStore.Series(),
+                alltimeSeries: metricsStore.history[.alltime] ?? MenubarMetricsStore.Series(),
+                serverIsRunning: serverIsRunning
+            )
+            .omlxThemed()
+        )
+    }
 
-        if !isRunning {
-            statsSubmenu.addItem(disabled(String(localized: "menubar.stats.server_off",
-                                                 defaultValue: "Server is off",
-                                                 comment: "Disabled placeholder in the Serving Stats submenu when the server isn't running")))
+    private func updateServingStatsPanel() {
+        guard let servingStatsPanelHost else {
             return
         }
-        let session = statsPoller?.sessionStats
-        let liveActivity = statsPoller?.liveStats?.liveActivity
-        let alltime = statsPoller?.alltimeStats
-        if session == nil && alltime == nil {
-            statsSubmenu.addItem(disabled(statsPoller == nil
-                                          ? String(localized: "menubar.stats.no_api_key",
-                                                   defaultValue: "Set OMLX_API_KEY to enable stats",
-                                                   comment: "Disabled placeholder in the Serving Stats submenu when no API key is configured")
-                                          : String(localized: "menubar.stats.loading",
-                                                   defaultValue: "Loading stats…",
-                                                   comment: "Disabled placeholder shown while stats are loading")))
-            return
+        servingStatsPanelHost.rootView = servingStatsPanelRoot()
+        let fitting = servingStatsPanelHost.fittingSize
+        if servingStatsPanelHost.frame.size != fitting {
+            servingStatsPanelHost.frame.size = fitting
         }
-
-        if let liveActivity {
-            statsSubmenu.addItem(disabled(String(
-                localized: "menubar.stats.live_activity",
-                defaultValue: "Live Activity",
-                comment: "Section header inside the Serving Stats submenu for the current active request"
-            )))
-            statsSubmenu.addItem(disabled(liveActivity.menuBarTitle))
-            statsSubmenu.addItem(disabled(liveActivity.detail))
-            statsSubmenu.addItem(.separator())
-        }
-
-        statsSubmenu.addItem(disabled(String(localized: "menubar.stats.session_section",
-                                             defaultValue: "Session",
-                                             comment: "Section header inside the Serving Stats submenu for current-session metrics")))
-        appendStat(String(localized: "menubar.stats.total_tokens",
-                          defaultValue: "Total Tokens Processed",
-                          comment: "Stats row label for total tokens processed"),
-                   compact(session?.totalPromptTokens))
-        appendStat(String(localized: "menubar.stats.cached_tokens",
-                          defaultValue: "Cached Tokens",
-                          comment: "Stats row label for cached tokens count"),
-                   compact(session?.totalCachedTokens))
-        appendStat(String(localized: "menubar.stats.cache_efficiency",
-                          defaultValue: "Cache Efficiency",
-                          comment: "Stats row label for the cache efficiency percentage"),
-                   percent(session?.cacheEfficiency))
-        appendStat(String(localized: "menubar.stats.avg_pp_speed",
-                          defaultValue: "Avg PP Speed",
-                          comment: "Stats row label for the average prompt-processing (prefill) speed"),
-                   tps(session?.avgPrefillTps))
-        appendStat(String(localized: "menubar.stats.avg_tg_speed",
-                          defaultValue: "Avg TG Speed",
-                          comment: "Stats row label for the average token-generation speed"),
-                   tps(session?.avgGenerationTps))
-
-        statsSubmenu.addItem(.separator())
-
-        statsSubmenu.addItem(disabled(String(localized: "menubar.stats.alltime_section",
-                                             defaultValue: "All-Time",
-                                             comment: "Section header inside the Serving Stats submenu for all-time metrics")))
-        appendStat(String(localized: "menubar.stats.total_tokens",
-                          defaultValue: "Total Tokens Processed",
-                          comment: "Stats row label for total tokens processed"),
-                   compact(alltime?.totalPromptTokens))
-        appendStat(String(localized: "menubar.stats.cached_tokens",
-                          defaultValue: "Cached Tokens",
-                          comment: "Stats row label for cached tokens count"),
-                   compact(alltime?.totalCachedTokens))
-        appendStat(String(localized: "menubar.stats.cache_efficiency",
-                          defaultValue: "Cache Efficiency",
-                          comment: "Stats row label for the cache efficiency percentage"),
-                   percent(alltime?.cacheEfficiency))
-        appendStat(String(localized: "menubar.stats.total_requests",
-                          defaultValue: "Total Requests",
-                          comment: "Stats row label for total request count"),
-                   compact(alltime?.totalRequests))
     }
 
     // MARK: - Pollers
@@ -736,6 +692,7 @@ final class MenubarController: NSObject {
             object: p
         )
         p.setEnabledMetrics(MenubarMetricPrefs.enabledMetrics)
+        p.setServingStatsSubmenuOpen(servingStatsSubmenuOpen)
         p.start()
         self.statsPoller = p
         self.statsPollerBaseURL = baseURL
@@ -777,7 +734,6 @@ final class MenubarController: NSObject {
 
     @objc private func serverStateChanged(_ note: Notification) {
         refreshMenuState()
-        rebuildStatsSubmenu()
         rebuildModelsSubmenu()
         refreshStatsPollerEndpoint()
 
@@ -799,6 +755,9 @@ final class MenubarController: NSObject {
             break
         }
         metricItemsController.sync()
+        if servingStatsSubmenuOpen {
+            updateServingStatsPanel()
+        }
 
         if case .failed(let message) = server.state,
            MenubarController.shouldShowGenericFailureAlert(message: message) {
@@ -825,22 +784,21 @@ final class MenubarController: NSObject {
         let tickOK = statsPoller?.lastTickWasSuccess ?? false
         metricsStore.applyTick(
             live: tickOK
-                ? MenubarMetricsStore.liveRates(from: statsPoller?.liveStats)
+                ? MenubarMetricsStore.snapshot(for: .live, from: statsPoller?.liveStats)
                 : nil,
             average: tickOK
-                ? MenubarMetricsStore.averageRates(from: statsPoller?.sessionStats)
+                ? MenubarMetricsStore.snapshot(for: .average, from: statsPoller?.sessionStats)
                 : nil,
             alltime: tickOK
-                ? MenubarMetricsStore.averageRates(from: statsPoller?.alltimeStats)
+                ? MenubarMetricsStore.snapshot(for: .alltime, from: statsPoller?.alltimeStats)
                 : nil,
             serverRunning: serverIsRunning && tickOK
         )
         metricItemsController.sync()
-        // Stats only need to redraw if the submenu is open or about to open;
-        // menuWillOpen (NSMenuDelegate) handles the latter, so for now we
-        // rebuild eagerly — the next render will pick up fresh values.
         refreshMenuState()
-        rebuildStatsSubmenu()
+        if servingStatsSubmenuOpen {
+            updateServingStatsPanel()
+        }
     }
 
     @objc private func updateStateChanged(_ note: Notification) {
@@ -1328,29 +1286,6 @@ final class MenubarController: NSObject {
         return false
     }
 
-    private func appendStat(_ label: String, _ value: String) {
-        let it = NSMenuItem(title: "\(label):  \(value)", action: nil, keyEquivalent: "")
-        it.isEnabled = false
-        statsSubmenu.addItem(it)
-    }
-
-    private func compact(_ value: Int?) -> String {
-        guard let n = value else { return "—" }
-        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1e9) }
-        if n >= 1_000_000     { return String(format: "%.1fM", Double(n) / 1e6) }
-        if n >= 1_000         { return String(format: "%.1fK", Double(n) / 1e3) }
-        return "\(n)"
-    }
-
-    private func percent(_ value: Double?) -> String {
-        guard let v = value else { return "—" }
-        return String(format: "%.1f%%", v)
-    }
-
-    private func tps(_ value: Double?) -> String {
-        guard let v = value else { return "—" }
-        return String(format: "%.1f tok/s", v)
-    }
 }
 
 // MARK: - Live endpoint resolution
@@ -1490,12 +1425,23 @@ extension MenubarController: NSMenuDelegate {
             systemSamplingTick()
             return
         }
+        if menu === statsSubmenu {
+            servingStatsSubmenuOpen = true
+            statsPoller?.setServingStatsSubmenuOpen(true)
+            updateServingStatsPanel()
+            if serverIsRunning {
+                Task { [weak self] in
+                    await self?.statsPoller?.refreshOnce()
+                }
+            }
+            return
+        }
         // One menubar dropdown at a time — the metric popovers don't dismiss
         // on a click that lands on our own main status item.
         metricItemsController.closeAllPopovers()
         systemItemsController.closeAllPopovers()
         refreshMenuState()
-        rebuildStatsSubmenu()
+        updateServingStatsPanel()
         rebuildModelsSubmenu()
         scheduleModelsRefresh()
     }
@@ -1503,6 +1449,10 @@ extension MenubarController: NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         // The submenu posts its own close; the main-menu close is the
         // belt-and-suspenders for teardown paths that skip it.
+        if menu === statsSubmenu || menu === self.menu {
+            servingStatsSubmenuOpen = false
+            statsPoller?.setServingStatsSubmenuOpen(false)
+        }
         if menu === systemStatsSubmenu || menu === self.menu {
             systemStatsSubmenuOpen = false
             reconcileSystemSampling()

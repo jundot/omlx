@@ -20,6 +20,7 @@ struct ModelsScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             ActiveModelsSection(
                 models: vm.activeModels,
+                activity: vm.activity,
                 onUnload: { id in vm.unload(id: id, client: services.client) }
             )
 
@@ -71,6 +72,7 @@ struct ModelsScreen: View {
 
 private struct ActiveModelsSection: View {
     let models: [ModelDTO]
+    let activity: ModelActivityPoller
     let onUnload: (String) -> Void
 
     @Environment(\.omlxTheme) private var theme
@@ -100,35 +102,42 @@ private struct ActiveModelsSection: View {
                 }
             } else {
                 ForEach(Array(models.enumerated()), id: \.element.id) { idx, m in
+                    let live = activity.snapshot(for: m.id)
                     FreeRow(isLast: idx == models.count - 1) {
-                        HStack(spacing: 10) {
-                            if m.pinned == true {
-                                Image(systemName: "pin.fill")
-                                    .font(.system(size: 11))
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 10) {
+                                if m.pinned == true {
+                                    Image(systemName: "pin.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(theme.textSecondary)
+                                }
+                                Text(m.displayTitle)
+                                    .font(.omlxText(13, weight: .medium))
+                                    .foregroundStyle(theme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 8)
+                                ActiveBadge(model: m, live: live)
+                                Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
+                                    .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
+                                    .frame(minWidth: 60, alignment: .trailing)
+                                Button {
+                                    onUnload(m.id)
+                                } label: {
+                                    Image(systemName: "eject")
+                                        .font(.system(size: 12))
+                                }
+                                .buttonStyle(.omlx(.plain, size: .small))
+                                .help(String(localized: "models.active.unload.help",
+                                             defaultValue: "Unload model",
+                                             comment: "Tooltip on the eject button that unloads an active model"))
                             }
-                            Text(m.displayTitle)
-                                .font(.omlxText(13, weight: .medium))
-                                .foregroundStyle(theme.text)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer(minLength: 8)
-                            ActiveBadge(model: m)
-                            Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
-                                .font(.omlxMono(11))
-                                .foregroundStyle(theme.textSecondary)
-                                .frame(minWidth: 60, alignment: .trailing)
-                            Button {
-                                onUnload(m.id)
-                            } label: {
-                                Image(systemName: "eject")
-                                    .font(.system(size: 12))
+                            if let live, !m.isLoading {
+                                ModelActivityList(snapshot: live)
                             }
-                            .buttonStyle(.omlx(.plain, size: .small))
-                            .help(String(localized: "models.active.unload.help",
-                                         defaultValue: "Unload model",
-                                         comment: "Tooltip on the eject button that unloads an active model"))
                         }
+                        .animation(.easeInOut(duration: 0.18), value: live != nil)
                     }
                 }
             }
@@ -138,11 +147,15 @@ private struct ActiveModelsSection: View {
 
 private struct ActiveBadge: View {
     let model: ModelDTO
+    var live: ModelActivitySnapshot? = nil
+
     @Environment(\.omlxTheme) private var theme
 
     var body: some View {
         if model.isLoading {
             StatusPill(status: .starting)
+        } else if let live, live.isBusy {
+            ModelActivityBadge(snapshot: live)
         } else if model.loaded {
             StatusPill(status: .custom(color: theme.greenDot,
                                        label: String(localized: "models.active.badge.loaded",

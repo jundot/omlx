@@ -11,6 +11,7 @@ final class StatusScreenVM {
     /// so the % column doesn't read 0/0 on first paint.
     var maxConcurrent: Int = 8
     var metrics = SystemMetricsPoller()
+    var activity = ModelActivityPoller()
 
     @ObservationIgnored
     private weak var client: OMLXClient?
@@ -67,6 +68,7 @@ final class StatusScreenVM {
     func start(client: OMLXClient) async {
         self.client = client
         metrics.start()
+        activity.start(client: client)
         // Load the scheduler cap once; failing silently is fine — the
         // default keeps the % column readable until the server responds.
         if let settings = try? await client.getGlobalSettings(),
@@ -87,6 +89,7 @@ final class StatusScreenVM {
         pollTask?.cancel()
         pollTask = nil
         metrics.stop()
+        activity.stop()
     }
 
     private func tick() async {

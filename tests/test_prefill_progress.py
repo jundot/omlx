@@ -76,7 +76,7 @@ class TestPrefillProgressTracker:
         assert result[0]["speed"] == 0.0
         assert result[0]["eta"] is None
 
-    def test_speed_and_eta_calculation(self):
+    def test_first_positive_rate_is_returned_raw_and_seeds_eta(self):
         t = 100.0
         with patch("omlx.prefill_progress.time") as mock_time:
             mock_time.monotonic.return_value = t
@@ -86,10 +86,56 @@ class TestPrefillProgressTracker:
             mock_time.monotonic.return_value = t + 1.0
             self.tracker.update("req-1", 2048, 8192, "llama-3b")
 
-        result = self.tracker.get_model_progress("llama-3b")
-        assert result[0]["speed"] == 2048.0
-        # eta = (8192 - 2048) / 2048 = 3.0 seconds
-        assert result[0]["eta"] == 3.0
+            result = self.tracker.get_model_progress("llama-3b")
+            assert result[0]["speed"] == 2048.0
+            assert result[0]["eta"] == 3.0
+
+    def test_eta_uses_ema_while_speed_stays_raw(self):
+        with patch("omlx.prefill_progress.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            self.tracker.update("req-1", 0, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 101.0
+            self.tracker.update("req-1", 100, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 102.0
+            self.tracker.update("req-1", 300, 1000, "llama-3b")
+
+            result = self.tracker.get_model_progress("llama-3b")[0]
+
+        assert result["speed"] == 200.0
+        assert result["eta"] == 5.2
+
+    def test_no_progress_does_not_degrade_rate_or_eta(self):
+        with patch("omlx.prefill_progress.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            self.tracker.update("req-1", 0, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 101.0
+            self.tracker.update("req-1", 100, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 102.0
+            self.tracker.update("req-1", 100, 1000, "llama-3b")
+
+            result = self.tracker.get_model_progress("llama-3b")[0]
+
+        assert result["speed"] == 100.0
+        assert result["eta"] == 9.0
+
+    def test_phase_change_resets_rate_and_eta_ema(self):
+        with patch("omlx.prefill_progress.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            self.tracker.update("req-1", 0, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 101.0
+            self.tracker.update("req-1", 100, 1000, "llama-3b")
+            mock_time.monotonic.return_value = 102.0
+            self.tracker.update("req-1", 300, 1000, "llama-3b", phase="spec-prefill")
+
+            after_phase_change = self.tracker.get_model_progress("llama-3b")[0]
+            mock_time.monotonic.return_value = 103.0
+            self.tracker.update("req-1", 400, 1000, "llama-3b", phase="spec-prefill")
+            after_first_new_sample = self.tracker.get_model_progress("llama-3b")[0]
+
+        assert after_phase_change["speed"] == 0.0
+        assert after_phase_change["eta"] is None
+        assert after_first_new_sample["speed"] == 100.0
+        assert after_first_new_sample["eta"] == 6.0
 
     def test_eta_none_when_speed_zero(self):
         self.tracker.update("req-1", 2048, 8192, "llama-3b")
