@@ -11,6 +11,7 @@ NATIVE_KERNEL_PACKAGES = (
     "glm_moe_dsa",
     "minimax_m3",
     "qwen35_prefill",
+    "qwen4_moe_stream",
 )
 
 

@@ -21,6 +21,8 @@ import ctypes
 import logging
 import os
 import sys
+import threading
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -140,3 +142,71 @@ def get_lifetime_max_phys_footprint(pid: int | None = None) -> int:
     if rc != 0:
         return 0
     return info.ri_lifetime_max_phys_footprint
+
+
+# --------------------------------------------------------------------------- #
+# Externally-wired byte accounting                                            #
+# --------------------------------------------------------------------------- #
+# Some memory this process holds is wired OUTSIDE MLX's allocator tracking --
+# notably the qwen4_exp MoE expert-streaming artifact, mmap'd and bound via
+# ``newBufferWithBytesNoCopy``. Such bytes ARE counted by
+# ``mx.get_active_memory()`` but NOT by the phys_footprint ledger above. Any
+# consumer comparing an active-memory sample against a phys/ceiling budget
+# (admission, throttle, OOM, load-delta sizing) over-reports usage by that
+# external total unless it discounts them.
+#
+# Contract (load-bearing): DISCOUNT AT THE SAMPLE SITE; caches store discounted
+# values; no consumer discounts twice. This module never samples MLX (and never
+# imports mlx) -- it is pure arithmetic over a lock-snapshotted provider
+# registry, safe from any thread/async context, so each call site keeps its own
+# already-correct sampling discipline. Providers are snapshotted under the lock
+# but CALLED outside it (a slow provider cannot stall unrelated call sites) and
+# must be cheap, non-blocking, and never touch MLX; exceptions are swallowed.
+
+_EXTERNAL_WIRED_LOCK = threading.Lock()
+_EXTERNAL_WIRED_PROVIDERS: dict[str, Callable[[], int]] = {}
+
+
+def register_external_wired_provider(name: str, provider: Callable[[], int]) -> None:
+    """Register (or replace) a worst-case externally-wired byte provider.
+
+    Name-keyed and replace-on-register, so registration is idempotent by
+    construction: re-registering the same name replaces its provider (callers
+    may register on every model load without accumulating duplicates, which
+    would multiply the count). No object-identity guards.
+    """
+    with _EXTERNAL_WIRED_LOCK:
+        _EXTERNAL_WIRED_PROVIDERS[name] = provider
+
+
+def unregister_external_wired_provider(name: str) -> None:
+    """Remove a provider by name (rarely needed: a provider that returns 0 when
+    nothing is wired can stay registered for the process lifetime)."""
+    with _EXTERNAL_WIRED_LOCK:
+        _EXTERNAL_WIRED_PROVIDERS.pop(name, None)
+
+
+def external_wired_bytes() -> int:
+    """Best-effort sum of every registered provider's current worst-case bytes.
+
+    Providers are snapshotted under the lock and called OUTSIDE it; each is
+    guarded so a failing/slow provider neither crashes nor stalls the sum.
+    """
+    with _EXTERNAL_WIRED_LOCK:
+        providers = list(_EXTERNAL_WIRED_PROVIDERS.values())
+    total = 0
+    for provider in providers:
+        try:
+            total += max(0, int(provider()))
+        except Exception:
+            continue
+    return total
+
+
+def discount_external_wired(sample_bytes: int) -> int:
+    """Discount the externally-wired total from a raw active-memory sample.
+
+    Call at the sample site, wrapping ONLY the ``mx.get_active_memory()`` term
+    (never phys_footprint, which already excludes external bytes). Clamped >= 0.
+    """
+    return max(0, int(sample_bytes) - external_wired_bytes())

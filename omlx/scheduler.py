@@ -79,7 +79,7 @@ from .utils.metal_sync import (
     _sync_and_clear_cache,
     clear_thread_streams,
 )
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import discount_external_wired, get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
 
@@ -4483,7 +4483,14 @@ class Scheduler:
         return n
 
     def get_cached_mlx_active_memory_bytes(self) -> int:
-        """Return the last MLX active-memory sample taken on the executor."""
+        """Return the last MLX active-memory sample taken on the executor.
+
+        NOTE: this value is EXTERNAL-WIRED-DISCOUNTED at the sample site (see
+        ``_current_usage_bytes``) -- it excludes mmap'd externally-wired bytes
+        (e.g. the MoE expert-streaming artifact) that ``mx.get_active_memory()``
+        counts but phys_footprint does not. Consumers (e.g. the process memory
+        enforcer's cached-executor path) must NOT discount it again.
+        """
         return self._last_mlx_active_memory_bytes
 
     def _hot_cache_cpu_bytes(self) -> int:
@@ -4520,7 +4527,12 @@ class Scheduler:
         """
         active = self._last_mlx_active_memory_bytes
         if refresh_mlx_active:
-            active = max(0, int(mx.get_active_memory()))
+            # Discount external-wired bytes (e.g. mmap'd MoE expert-streaming
+            # artifact) AT THE SAMPLE SITE: mx.get_active_memory() counts them
+            # but phys_footprint / the real budget do not. The cache thus stores
+            # a PRE-DISCOUNTED value -- consumers of _last_mlx_active_memory_bytes
+            # / get_cached_mlx_active_memory_bytes() must NOT discount again.
+            active = discount_external_wired(max(0, int(mx.get_active_memory())))
             self._last_mlx_active_memory_bytes = active
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):

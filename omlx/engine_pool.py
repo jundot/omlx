@@ -52,7 +52,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
 from .scheduler import SchedulerConfig
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import discount_external_wired, get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -321,8 +321,93 @@ class EnginePool:
             return None
         return registry.get_for_model(entry.model_path)
 
+    def _qwen4_moe_streaming_offload_bytes(self, entry: EngineEntry) -> int:
+        """Bytes MoE expert streaming takes off this entry's resident weight
+        budget (0 if streaming would not engage). Mirrors the vlm wire-in gating
+        so the admission estimate agrees with reality."""
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type != "qwen4_exp":
+            return 0
+        try:
+            from .custom_kernels.qwen4_moe_stream import loader as _qms
+
+            return int(_qms.streaming_offload_bytes(entry.model_path))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _extract_qwen4_streaming_artifact(self, engine):
+        """Return the MoE expert-streaming artifact attached to an engine's model
+        (see vlm._stream_qwen4_exp_experts_on_load), or None. The isinstance
+        check is load-bearing: Mock engines in tests auto-vivify a truthy
+        ``_qwen4_moe_streaming_artifact`` attribute, so only a genuine
+        StreamingArtifact must trigger the unload-close path."""
+        if engine is None:
+            return None
+        model = getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
+        if model is None:
+            return None
+        artifact = getattr(model, "_qwen4_moe_streaming_artifact", None)
+        if artifact is None:
+            return None
+        try:
+            from .custom_kernels.qwen4_moe_stream.loader import StreamingArtifact
+        except Exception:  # noqa: BLE001
+            return None
+        return artifact if isinstance(artifact, StreamingArtifact) else None
+
+    async def _close_qwen4_streaming_artifact(self, model_id: str, artifact) -> None:
+        """Close a streaming artifact on unload, freeing the ~46.9GB mmap so the
+        ceiling recovers (LIVE TEST 1 issue C: eviction left it mapped, keeping
+        external_wired high and the ceiling collapsed).
+
+        Ordering (Fable): model refs already dropped (stop + settle above) ->
+        drain GPU -> close -> verify mapped_bytes()==0. The refcounted deferred
+        unmap keeps this safe even if a wrapped array outlives this point: the
+        munmap then completes when that last array is freed.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            from .custom_kernels.qwen4_moe_stream import fast as _qms_fast
+
+            # Run deleters + drain the GPU so no in-flight command reads the
+            # buffers before a (possible) immediate unmap.
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (gc.collect(), mx.synchronize())
+            )
+            artifact.close()
+            remaining = _qms_fast.mapped_bytes()
+            if remaining == 0:
+                logger.info(
+                    "qwen4_moe_stream: unmapped streaming artifact for %s "
+                    "(ceiling restored)",
+                    model_id,
+                )
+            else:
+                logger.warning(
+                    "qwen4_moe_stream: %s streaming artifact still %s mapped "
+                    "after close (a wrapped array outlived unload; deferred "
+                    "unmap will finish when it frees)",
+                    model_id,
+                    format_size(remaining),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "qwen4_moe_stream: error closing streaming artifact for %s",
+                model_id,
+                exc_info=True,
+            )
+
     def _entry_resident_size(self, entry: EngineEntry) -> int:
         """Return this process's planned weights, not the full cluster model."""
+
+        # MoE expert streaming makes the routed experts reclaimable page cache,
+        # off the resident WEIGHT budget: resident weights ~= full model minus
+        # the streamed artifact. This must win over runtime_estimated_size (the
+        # PLE-era estimate that is streaming-unaware) or reload is refused
+        # against a footprint that is no longer resident (LIVE TEST 1).
+        streamed = self._qwen4_moe_streaming_offload_bytes(entry)
+        if streamed > 0 and entry.estimated_size:
+            return max(0, entry.estimated_size - streamed)
 
         if entry.runtime_estimated_size is not None:
             return entry.runtime_estimated_size
@@ -1654,7 +1739,7 @@ class EnginePool:
                     # large model load without evicting the first, over-
                     # committing past the ceiling (#1623).
                     current = max(
-                        mx.get_active_memory(),
+                        discount_external_wired(mx.get_active_memory()),
                         get_phys_footprint(),
                         self._current_model_memory,
                     )
@@ -1705,7 +1790,8 @@ class EnginePool:
                         # keep trusting phys_footprint because it may be
                         # unrelated process pressure rather than model residue.
                         committed = max(
-                            mx.get_active_memory(), self._current_model_memory
+                            discount_external_wired(mx.get_active_memory()),
+                            self._current_model_memory,
                         )
                         committed_projected = committed + admission_size
                         if committed_projected <= ceiling:
@@ -1988,7 +2074,7 @@ class EnginePool:
         async with self._lock:
             while True:
                 current = max(
-                    mx.get_active_memory(),
+                    discount_external_wired(mx.get_active_memory()),
                     get_phys_footprint(),
                     self._current_model_memory,
                 )
@@ -2308,7 +2394,13 @@ class EnginePool:
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
         resident_size = self._entry_resident_size(entry)
-        pre_unload_active = 0 if distributed else mx.get_active_memory()
+        pre_unload_active = (
+            0 if distributed else discount_external_wired(mx.get_active_memory())
+        )
+        # Capture any MoE expert-streaming artifact BEFORE stop() releases the
+        # model; it is closed after the GPU settle/drain below (Fable ordering:
+        # drop model refs -> drain -> close -> verify mapped_bytes==0).
+        streaming_artifact = self._extract_qwen4_streaming_artifact(entry.engine)
 
         try:
             await entry.engine.stop()
@@ -2410,7 +2502,12 @@ class EnginePool:
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
-            active_now = mx.get_active_memory()
+            # Discount external-wired bytes at the same instant as the sample
+            # (pre_unload_active was discounted too, so the delta is consistent).
+            # If a streaming artifact's munmap lands between this sample and the
+            # discount, one poll's freed-figure is skewed by the external total;
+            # the settle loop self-corrects on the next tick.
+            active_now = discount_external_wired(mx.get_active_memory())
             actual_freed = pre_unload_active - active_now
             if actual_freed >= min_expected_freed:
                 settled = True
@@ -2482,7 +2579,7 @@ class EnginePool:
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
                 await asyncio.sleep(1.0)
-            active_after = mx.get_active_memory()
+            active_after = discount_external_wired(mx.get_active_memory())
             if active_after > self._current_model_memory + 5 * 1024**3:
                 logger.error(
                     f"Emergency reclaim failed for '{model_id}': "
@@ -2495,6 +2592,9 @@ class EnginePool:
                     f"Emergency reclaim succeeded: "
                     f"active_memory={format_size(active_after)}"
                 )
+
+        if streaming_artifact is not None:
+            await self._close_qwen4_streaming_artifact(model_id, streaming_artifact)
 
         self._wake_process_memory_enforcer()
 
@@ -2533,7 +2633,10 @@ class EnginePool:
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                current = max(
+                    discount_external_wired(mx.get_active_memory()),
+                    get_phys_footprint(),
+                )
                 if current <= target:
                     logger.info(
                         f"Reclaimed memory after failed load of '{model_id}': "
@@ -2588,7 +2691,9 @@ class EnginePool:
         entry_detached = False
         entry.abort_loading = False
         resident_size = self._entry_resident_size(entry)
-        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+        pre_load_memory = max(
+            discount_external_wired(mx.get_active_memory()), get_phys_footprint()
+        )
         try:
             effective_type = entry.engine_type
             if force_lm and effective_type == "vlm":
@@ -2993,7 +3098,9 @@ class EnginePool:
                 lambda: (mx.synchronize(), mx.clear_cache()),
             )
 
-            post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+            post_load_memory = max(
+                discount_external_wired(mx.get_active_memory()), get_phys_footprint()
+            )
             observed_delta = max(0, post_load_memory - pre_load_memory)
             entry.actual_size = observed_delta or resident_size
 

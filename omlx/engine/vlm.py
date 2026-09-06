@@ -1128,6 +1128,135 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
 
 @contextlib.contextmanager
+def _stream_qwen4_exp_experts_on_load(model_dir: Path):
+    """Stream qwen4_exp MoE routed-expert (switch_mlp) weights off the wired/phys
+    budget: bind them as mmap-backed arrays over a page-aligned artifact next to
+    the checkpoint instead of loading ~46.87 GB resident.
+
+    Runs POST-sanitize by construction -- mlx-vlm's load_model does
+    sanitize -> nn.quantize -> load_weights, so the load_weights patch here sees
+    final (post-sanitize, incl. ``mtp.*``-renamed) keys. Swapping the values in
+    the weights list BEFORE mlx-vlm's ``mx.eval`` means the originals are never
+    materialized. ``expect_all=True`` hard-fails on any shortfall, so a
+    mis-ordered / silent-resident load is impossible. A load-time bit-exactness
+    canary then guards against a wrong-bytes read.
+
+    No-op (resident fallback) unless: model_type is qwen4_exp, the native
+    extension is available, the artifact exists next to the checkpoint, and
+    streaming is not force-disabled via ``OMLX_QWEN4_MOE_STREAM=0``.
+    """
+    import os
+
+    if _read_config_model_type(model_dir) != "qwen4_exp":
+        yield
+        return
+    if os.environ.get("OMLX_QWEN4_MOE_STREAM", "1").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        yield
+        return
+    try:
+        from omlx.custom_kernels.qwen4_moe_stream import fast as _qms_fast
+        from omlx.custom_kernels.qwen4_moe_stream import loader as _qms
+    except Exception as exc:  # noqa: BLE001
+        logger.info("qwen4_moe_stream import failed (%s); resident expert load", exc)
+        yield
+        return
+    if not _qms_fast.is_native_available():
+        logger.info(
+            "qwen4_moe_stream native extension unavailable; loading experts resident"
+        )
+        yield
+        return
+    artifact_path = _qms.default_artifact_path(str(model_dir))
+    if artifact_path is None:
+        logger.info(
+            "qwen4_moe_stream artifact not found next to %s; resident expert load",
+            model_dir.name,
+        )
+        yield
+        return
+
+    artifact = _qms.StreamingArtifact(artifact_path)
+    artifact.open()  # mmaps + registers the external-wired provider (idempotent)
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    swapped_total = 0
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal swapped_total
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+        items = list(weights_items)
+        # Only the top-level model load carries the full switch_mlp set; any
+        # submodule load_weights lacks expert keys -> pass straight through.
+        has_experts = any(
+            isinstance(it, (tuple, list))
+            and len(it) >= 2
+            and isinstance(it[0], str)
+            and _qms.canonical_key(it[0]) is not None
+            for it in items
+        )
+        if not has_experts:
+            return original_load_weights(self, items, *args, **kwargs)
+        new_items, n_swapped, _n_missing = _qms.stream_weight_items(
+            items, artifact, expect_all=True
+        )
+        swapped_total += n_swapped
+        # Keep the mapping alive for the model's lifetime (wrapped arrays point
+        # into it); enables a future unload-time close.
+        try:
+            self._qwen4_moe_streaming_artifact = artifact
+        except Exception:  # noqa: BLE001
+            pass
+        return original_load_weights(self, new_items, *args, **kwargs)
+
+    _nn.Module.load_weights = _patched_load_weights
+    load_failed = False
+    try:
+        yield
+    except BaseException:
+        # The load body raised AFTER the weight swap (e.g. OOM during mx.eval).
+        # Record it so the finally block skips the success path: running the
+        # canary here would (a) mask this real failure if the canary itself
+        # raised (raise-inside-finally), and (b) log a false streaming success
+        # for a load that never completed.
+        load_failed = True
+        raise
+    finally:
+        _nn.Module.load_weights = original_load_weights
+        if load_failed:
+            # Failed load: no engine will hold the model, so the unload-time
+            # close never fires -- close here to release the ~47 GB mapping (a
+            # retry would otherwise double-map). Guard the close: an exception
+            # is already propagating and a raising close() would mask it.
+            try:
+                artifact.close()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "qwen4_moe_stream: artifact.close() failed after a failed "
+                    "load; mapping may leak until process exit", exc_info=True
+                )
+        elif swapped_total > 0:
+            try:
+                _qms.run_load_canary(artifact)
+            except Exception:
+                artifact.close()  # never serve unverified/wrong weights
+                raise
+            logger.info(
+                "qwen4_moe_stream: streaming %d expert tensors for %s "
+                "(~%.1f GB off the resident budget)",
+                swapped_total, model_dir.name, artifact.provider()() / 1024**3,
+            )
+        else:
+            # Streaming never engaged -> drop the mapping so we don't pin ~47 GB
+            # of page cache behind a resident load.
+            artifact.close()
+
+
+@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -1682,6 +1811,7 @@ class VLMBatchedEngine(BaseEngine):
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
+                _stream_qwen4_exp_experts_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
                 _transpose_qwen35_mlx_vision_patch_embed_on_load(
                     Path(self._model_name)
