@@ -577,7 +577,18 @@ def read_runtime_markers(
 
     jobs: list[dict[str, Any]] = []
     warnings: list[str] = []
-    candidates = [path for path in entries if path.name.endswith(".json")]
+    # The runtime directory also owns launch manifests and one-shot control
+    # files. They are JSON by design but are not rank markers; parsing them as
+    # such produced persistent false warnings in the dashboard after every
+    # cancellation, unload, or reboot.
+    control_suffixes = ("-cancel.json", "-cancel-ack.json", "-serve.json")
+    candidates = [
+        path
+        for path in entries
+        if path.name.endswith(".json")
+        and not path.name.startswith("launch-")
+        and not path.name.endswith(control_suffixes)
+    ]
     if len(candidates) > _MAX_MARKERS:
         warnings.append(f"runtime marker limit exceeded; showing first {_MAX_MARKERS}")
     for path in candidates[:_MAX_MARKERS]:

@@ -422,6 +422,24 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
+    # Reap distributed ranks orphaned by a crashed previous coordinator
+    # (G8): all teardown used to live in-process, so a SIGKILL/panic of
+    # omlx-server stranded loaded ranks with no owner. The launch manifest
+    # written at spawn lets this new coordinator finish the teardown.
+    # Best effort: a reaping failure must never block server startup.
+    try:
+        from .cluster.launch import reap_orphaned_launches
+
+        orphan_report = await asyncio.to_thread(reap_orphaned_launches)
+        if orphan_report["reaped"] or orphan_report["failures"]:
+            logger.warning(
+                "Reaped orphaned distributed launches from a previous "
+                "coordinator: %s",
+                orphan_report,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Orphaned-launch reaper failed at startup: %s", exc)
+
     # Publish the interpreter another Mac's coordinator discovers over SSH.
     # Without it a packaged-app peer fails every discovery candidate and gets
     # reported as "worker runtime is not installed" (#2680). Best effort: a
@@ -464,6 +482,48 @@ async def lifespan(app: FastAPI):
                     break
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
+
+    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # manual + Tailscale). Best-effort: discovery failures must never block
+    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    discovery_service = None
+    if (
+        distributed_inference_enabled()
+        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        try:
+            from .cluster.discovery import (
+                DiscoveryConfig,
+                DiscoveryService,
+                configure_discovery_service,
+                load_cluster_name,
+            )
+            from .cluster.identity import get_node_identity
+            from .cluster.registry import get_device_registry
+
+            cluster_base = (
+                Path(_server_state.global_settings.base_path)
+                if _server_state.global_settings is not None
+                else Path.home() / ".omlx"
+            )
+            discovery_service = DiscoveryService(
+                get_node_identity(),
+                get_device_registry(),
+                DiscoveryConfig(
+                    cluster_name=load_cluster_name(cluster_base),
+                    http_port=(
+                        _server_state.global_settings.server.port
+                        if _server_state.global_settings is not None
+                        else 8000
+                    )
+                ),
+            )
+            configure_discovery_service(discovery_service)
+            await asyncio.to_thread(discovery_service.start)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to start: %s", exc)
+            discovery_service = None
 
     # Start process memory enforcer if configured
     if (
@@ -571,6 +631,14 @@ async def lifespan(app: FastAPI):
             await bonjour_task
     if bonjour_publisher is not None:
         bonjour_publisher.stop()
+    if discovery_service is not None:
+        try:
+            from .cluster.discovery import configure_discovery_service
+
+            await asyncio.to_thread(discovery_service.stop)
+            configure_discovery_service(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to stop: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -677,12 +745,51 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster v2 model-sync manifest: admin-gated like the rest of the
+    # cluster surface; peers use it to compare model contents before sync.
+    from .cluster.modelsync import manifest_router as cluster_manifest_router
+    from .cluster.modelsync import set_modelsync_getters
+
+    set_modelsync_getters(get_engine_pool)
+    app.include_router(
+        cluster_manifest_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
     # command. Claim/source/complete authenticate with one-time enrollment
     # credentials, not the browser's admin cookie.
     app.include_router(
         cluster_join_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # rate-limited probe peers use to verify announced addresses before any
+    # pairing trust exists; /api/cluster/devices requires admin per-route.
+    from .cluster.discovery_routes import discovery_router
+
+    app.include_router(
+        discovery_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # verifier bound to the node and SSH identities; pair/status returns a
+    # code-encrypted cluster key only after admin approval. Approve, deny, and
+    # unpair are admin-only like every other cluster mutation.
+    from .cluster.pairing_routes import pair_admin_router, pair_router
+
+    app.include_router(
+        pair_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    app.include_router(
+        pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
     )
     _cluster_routes_registered = True
 
@@ -1979,15 +2086,48 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
-    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
-    from .cluster.registry import configure_cluster_registry
+    from .cluster.pairing import configure_pairing_manager
+    from .cluster.registry import (
+        configure_cluster_registry,
+        configure_device_registry,
+        get_device_registry,
+    )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+    # Cluster v2: stable node identity + trusted device inventory. Best
+    # effort — a failure here must never block local inference. Configured
+    # before the pairing manager so pairing approvals persist into the real
+    # device registry instead of the schema-compatible fallback store.
+    try:
+        from .cluster.identity import configure_node_identity
+
+        configure_node_identity(base_path)
+        configure_device_registry(base_path / "cluster" / "devices.json")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+    try:
+        device_registry = get_device_registry()
+    except RuntimeError:
+        device_registry = None
+    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # available (DeviceRegistryBridge adapts the API and fails loudly on
+    # drift); otherwise the schema-compatible fallback store is used. Resolve
+    # capabilities lazily because the discovery service starts later.
+    from .cluster.discovery import announced_addrs, announced_caps
+
+    configure_pairing_manager(
+        base_path,
+        registry=device_registry,
+        enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
+        address_provider=announced_addrs,
+    )
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager

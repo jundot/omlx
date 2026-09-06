@@ -881,7 +881,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -2333,10 +2333,13 @@ class EnginePool:
             await entry.engine.stop()
         except Exception as e:
             if distributed:
-                # Keep the supervisor reachable and the planned memory
-                # accounted so a later unload can retry process teardown.
+                # The supervisor raises (DistributedTeardownError) when the
+                # final SIGKILL cannot be verified, so this path is now
+                # reachable: keep the supervisor reachable and the planned
+                # memory accounted so a later unload can retry process
+                # teardown instead of releasing the budget over a live rank.
                 logger.error(
-                    f"Distributed teardown failed for {model_id}; "
+                    f"Distributed teardown failed for {model_id} ({e}); "
                     "keeping the engine registered for retry",
                     exc_info=True,
                 )

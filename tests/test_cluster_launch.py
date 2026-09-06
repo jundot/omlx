@@ -22,6 +22,7 @@ from omlx.cluster.launch import (
     _install_cluster_ssh_wrapper,
     _local_probe_versions,
     _local_runtime_versions,
+    _set_serve_release,
     build_mlx_launch_argv,
     discover_remote_python_executable,
     discover_remote_system_python,
@@ -52,6 +53,75 @@ def _deployment(model: str = "org/model") -> ClusterDeployment:
     )
 
 
+def test_stop_deployment_processes_sweeps_even_without_a_live_supervisor(
+    tmp_path, monkeypatch
+):
+    deployment = _deployment()
+    calls = []
+
+    def sweep(deployment_id, hosts, **kwargs):
+        calls.append((deployment_id, hosts, kwargs))
+        return []
+
+    monkeypatch.setattr(launch, "_sweep_rank_processes", sweep)
+
+    report = launch.stop_deployment_processes(deployment, state_dir=tmp_path)
+
+    assert report == {
+        "verified": True,
+        "deployment_id": deployment.deployment_id,
+        "ranks_checked": 2,
+        "manifest_retired": False,
+    }
+    assert calls[0][0] == deployment.deployment_id
+    assert calls[0][1] == [
+        {"rank": 0, "node_id": "local", "ssh": "127.0.0.1"},
+        {"rank": 1, "node_id": "studio", "ssh": "user@studio.local"},
+    ]
+    assert calls[0][2]["plan_hash"] == deployment.plan_hash
+
+
+def test_stop_deployment_processes_refuses_unverified_rank_exit(tmp_path, monkeypatch):
+    deployment = _deployment()
+    monkeypatch.setattr(
+        launch,
+        "_sweep_rank_processes",
+        lambda *_args, **_kwargs: ["rank 1 is still resident"],
+    )
+
+    with pytest.raises(launch.DistributedTeardownError, match="still resident"):
+        launch.stop_deployment_processes(deployment, state_dir=tmp_path)
+
+
+def test_serve_release_is_atomic_and_mirrored_to_remote(tmp_path):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    deployment = _deployment()
+    payload = {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "plan_hash": deployment.plan_hash,
+        "world_size": deployment.world_size,
+    }
+
+    _set_serve_release(deployment, tmp_path, payload, runner=runner)
+
+    marker = tmp_path / f"{deployment.deployment_id}-serve.json"
+    assert json.loads(marker.read_text()) == payload
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert len(calls) == 1
+    assert "user@studio.local" in calls[0][0]
+
+    _set_serve_release(deployment, tmp_path, None, runner=runner)
+
+    assert not marker.exists()
+    assert len(calls) == 2
+
+
 def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     model = "org/model with spaces;$(touch nope)"
     deployment = _deployment(model)
@@ -64,6 +134,9 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
         collective_port=32120,
         python_executable="/opt/omlx/bin/python",
         cwd=Path("/opt/omlx"),
+        control_host="10.0.0.1",
+        control_port=32140,
+        control_token="e" * 64,
     )
 
     assert argv[0] == "/opt/omlx/bin/python"
@@ -71,6 +144,10 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv[argv.index("--backend") + 1] == "ring"
     assert argv[argv.index("--starting-port") + 1] == "32120"
     assert argv[argv.index("--port") + 1] == "32100"
+    assert argv[argv.index("--control-host") + 1] == "10.0.0.1"
+    assert argv[argv.index("--control-port") + 1] == "32140"
+    assert argv[argv.index("--control-token") + 1] == "e" * 64
+    assert argv[argv.index("--control-token") + 1] != deployment.plan_hash
     assert argv[argv.index("--plan-hash") + 1] == deployment.plan_hash
     assert argv[argv.index("--connections-per-ip") + 1] == "2"
     assert argv[argv.index("--execution-profile") + 1] == "balanced"
@@ -88,6 +165,25 @@ def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
             api_port=32100,
             collective_port=32100,
             python_executable="/opt/omlx/bin/python",
+        )
+
+
+def test_launcher_requires_an_explicit_random_control_token(tmp_path):
+    kwargs = {
+        "hostfile": (tmp_path / "hosts.json").resolve(),
+        "api_port": 32100,
+        "collective_port": 32120,
+        "python_executable": "/opt/omlx/bin/python",
+        "control_host": "10.0.0.1",
+        "control_port": 32140,
+    }
+    with pytest.raises(ValueError, match="host, port, and token"):
+        build_mlx_launch_argv(_deployment(), **kwargs)
+    with pytest.raises(ValueError, match="64 ASCII bytes"):
+        build_mlx_launch_argv(
+            _deployment(),
+            **kwargs,
+            control_token="public-plan-hash-is-not-a-secret",
         )
 
 
@@ -180,7 +276,7 @@ def test_launcher_selects_the_probed_python_path_for_each_rank(tmp_path):
     worker = argv[argv.index("--") + 1 :]
 
     assert worker[:2] == ["/bin/sh", "-c"]
-    assert '${MLX_RANK:-}' in worker[2]
+    assert "${MLX_RANK:-}" in worker[2]
     assert "/Applications/oMLX/python" in worker[2]
     assert "/opt/omlx/bin/python" in worker[2]
     assert worker[3:6] == [
@@ -312,6 +408,13 @@ def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
+    # The marker-pid sweep has its own tests below; here it would attempt
+    # real SSH to the fake "studio" host.
+    monkeypatch.setattr(
+        launch.DistributedJobSupervisor,
+        "_sweep_rank_leftovers",
+        lambda self, **_kw: [],
+    )
 
     supervisor.stop()
 
@@ -352,11 +455,54 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
         "killpg",
         lambda pgid, sig: signals.append((pgid, sig)),
     )
+    monkeypatch.setattr(
+        launch.DistributedJobSupervisor,
+        "_sweep_rank_leftovers",
+        lambda self, **_kw: [],
+    )
 
     supervisor.stop()
 
     assert signals == [(43211, signal.SIGTERM)]
     assert supervisor.process is None
+
+
+def test_supervisor_stop_handles_reused_group_permission_error(monkeypatch):
+    class Launcher:
+        pid = 43212
+        stdout = None
+        stderr = None
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    supervisor.process = Launcher()
+    swept = []
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(
+            PermissionError("Operation not permitted")
+        ),
+    )
+    monkeypatch.setattr(
+        launch.DistributedJobSupervisor,
+        "_sweep_rank_leftovers",
+        lambda self, **kwargs: swept.append(kwargs) or [],
+    )
+
+    supervisor.stop()
+
+    assert swept == [{"process_group": None}]
+    assert supervisor.process is None
+    assert supervisor.status().phase == "stopped"
 
 
 def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
@@ -729,9 +875,7 @@ def test_peer_probe_discovers_a_different_linux_python_path():
 
     assert result["runtime_compatible"] is True
     assert commands[-1].startswith("/opt/omlx/bin/python")
-    assert result["status"]["runtime"]["python_executable"] == (
-        "/opt/omlx/bin/python"
-    )
+    assert result["status"]["runtime"]["python_executable"] == ("/opt/omlx/bin/python")
 
 
 def test_peer_probe_preserves_packaged_cluster_wrapper_path():
@@ -751,9 +895,10 @@ def test_peer_probe_preserves_packaged_cluster_wrapper_path():
 
     def runner(argv, **_kwargs):
         command = argv[-1]
-        if command.startswith(
-            "~/.omlx/bin/omlx-cluster-python"
-        ) and "import os,omlx" in command:
+        if (
+            command.startswith("~/.omlx/bin/omlx-cluster-python")
+            and "import os,omlx" in command
+        ):
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -824,8 +969,7 @@ def test_remote_python_discovery_falls_back_to_packaged_source_launcher():
 
     assert discovered == "/Users/test/.omlx/bin/omlx-source-python"
     assert any(
-        command.startswith("~/.omlx/bin/omlx-source-python")
-        for command in commands
+        command.startswith("~/.omlx/bin/omlx-source-python") for command in commands
     )
 
 
@@ -1201,9 +1345,7 @@ def test_preinstall_inventory_will_not_claim_missing_when_omlx_is_installed():
 
     assert result["bootstrap_required"] is True
     assert result["runtime_compatible"] is False
-    assert result["runtime_mismatches"] == [
-        "oMLX worker runtime could not be verified"
-    ]
+    assert result["runtime_mismatches"] == ["oMLX worker runtime could not be verified"]
     assert result["worker_runtime_evidence"] == ["/Applications/oMLX.app"]
     assert result["status"]["warnings"] == [
         "oMLX is installed on this node but its worker runtime could not be run."
@@ -1621,7 +1763,9 @@ def test_supervisor_reaps_remote_ranks_via_ssh_sigterm(monkeypatch, tmp_path):
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=2.0)
         assert victim.poll() is not None
-        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+        assert (
+            marker_file.exists()
+        )  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1687,7 +1831,9 @@ def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_pat
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=5.0)
         assert victim.poll() is not None
-        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+        assert (
+            marker_file.exists()
+        )  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1809,3 +1955,425 @@ def test_supervisor_reap_rejects_mismatched_deployment_or_plan(monkeypatch, tmp_
     finally:
         victim.kill()
         victim.wait()
+
+
+def _fake_launcher(pid: int = 43210):
+    class Launcher:
+        stdout = None
+        stderr = None
+
+        def __init__(self):
+            self.pid = pid
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            self.returncode = 0
+            return 0
+
+    return Launcher()
+
+
+def _rank_marker(pid: int, rank: int, *, phase: str = "ready") -> dict:
+    return {
+        "schema_version": 1,
+        "deployment_id": "cluster-test",
+        "model": "org/model",
+        "backend": "ring",
+        "plan_hash": "c" * 64,
+        "phase": phase,
+        "updated_at": "2026-08-17T00:00:00+00:00",
+        "pid": pid,
+        "rank": rank,
+        "world_size": 2,
+    }
+
+
+def test_supervisor_stop_retries_sigkill_once_then_succeeds(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    launcher = _fake_launcher()
+    supervisor.process = launcher
+    signals = []
+    swept = []
+    waits = iter((False, False, True))
+
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: next(waits),
+    )
+    monkeypatch.setattr(
+        launch.os,
+        "killpg",
+        lambda pgid, sig: signals.append((pgid, sig)),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_sweep_rank_leftovers",
+        lambda **_kw: swept.append(True) or [],
+    )
+
+    supervisor.stop()
+
+    assert signals == [
+        (launcher.pid, signal.SIGTERM),
+        (launcher.pid, signal.SIGKILL),
+        (launcher.pid, signal.SIGKILL),
+    ]
+    assert swept == [True]
+    assert supervisor.process is None
+    assert supervisor.status().phase == "stopped"
+
+
+def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
+    tmp_path, monkeypatch
+):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    launcher = _fake_launcher()
+    supervisor.process = launcher
+    supervisor._phase = "ready"
+    supervisor._write_launch_manifest()
+    signals = []
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: False,
+    )
+    monkeypatch.setattr(
+        launch.os,
+        "killpg",
+        lambda pgid, sig: signals.append((pgid, sig)),
+    )
+    monkeypatch.setattr(supervisor, "_sweep_rank_leftovers", lambda **_kw: [])
+
+    with pytest.raises(launch.DistributedTeardownError) as excinfo:
+        supervisor.stop()
+
+    assert "could not be verified" in str(excinfo.value)
+    assert signals == [
+        (launcher.pid, signal.SIGTERM),
+        (launcher.pid, signal.SIGKILL),
+        (launcher.pid, signal.SIGKILL),
+    ]
+    # State is kept so a later stop() retries instead of dropping the job.
+    assert supervisor.process is launcher
+    assert supervisor.status().phase == "ready"
+    assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
+
+
+def test_supervisor_stop_raises_on_unkillable_leftover_rank(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    launcher = _fake_launcher()
+    supervisor.process = launcher
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: True,
+    )
+    monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_sweep_rank_leftovers",
+        lambda **_kw: ["rank 0 (local) pid 424242 survived SIGKILL"],
+    )
+
+    with pytest.raises(launch.DistributedTeardownError) as excinfo:
+        supervisor.stop()
+
+    assert "rank 0 (local) pid 424242 survived SIGKILL" in str(excinfo.value)
+    assert supervisor.process is launcher
+
+
+def test_verified_stop_writes_then_removes_launch_manifest(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+        state_dir=str(tmp_path),
+    )
+    launcher = _fake_launcher()
+    supervisor.process = launcher
+    supervisor.port = 18081
+    supervisor._write_launch_manifest()
+    manifest_path = launch._launch_manifest_path(tmp_path, "cluster-test")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["deployment_id"] == "cluster-test"
+    assert manifest["plan_hash"] == "c" * 64
+    assert manifest["launcher_pid"] == launcher.pid
+    assert manifest["process_group"] == launcher.pid
+    assert manifest["coordinator_pid"] > 0
+    assert manifest["api_port"] == 18081
+    assert [host["rank"] for host in manifest["hosts"]] == [0, 1]
+
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch,
+        "_wait_for_process_group_exit",
+        lambda _pgid, _timeout: True,
+    )
+    monkeypatch.setattr(launch.os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(supervisor, "_sweep_rank_leftovers", lambda **_kw: [])
+
+    supervisor.stop()
+
+    assert not manifest_path.exists()
+    assert supervisor.status().phase == "stopped"
+
+
+def test_teardown_sweep_kills_leftover_local_rank_by_marker_pid(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    marker_path = tmp_path / "cluster-test-rank-0.json"
+    marker_path.write_text(json.dumps(_rank_marker(424242, 0)), encoding="utf-8")
+    kills = []
+
+    def fake_kill(pid, sig):
+        # os.kill(pid, 0) liveness probes (also patched) are not kills.
+        if sig != 0:
+            kills.append((pid, sig))
+
+    monkeypatch.setattr(launch.os, "kill", fake_kill)
+    process = launch._LocalProcessState(
+        424242,
+        1,
+        424242,
+        "S",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: (
+            ((), "")
+            if any(sig == signal.SIGKILL for _, sig in kills)
+            else ((process,), "")
+        ),
+    )
+    # The pid stays "alive" until the SIGKILL lands.
+    monkeypatch.setattr(
+        launch,
+        "_pid_alive",
+        lambda _pid: not any(sig == signal.SIGKILL for _, sig in kills),
+    )
+    monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
+
+    assert failures == []
+    assert kills == [
+        (424242, signal.SIGTERM),
+        (424242, signal.SIGKILL),
+    ]
+
+
+def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    marker_path = tmp_path / "cluster-test-rank-0.json"
+    marker_path.write_text(json.dumps(_rank_marker(424242, 0)), encoding="utf-8")
+    monkeypatch.setattr(launch.os, "kill", lambda _pid, _sig: None)
+    process = launch._LocalProcessState(
+        424242,
+        1,
+        424242,
+        "D",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: ((process,), ""),
+    )
+    monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
+
+    assert any(
+        "pid 424242" in failure and "survived SIGKILL" in failure
+        for failure in failures
+    )
+    assert any("Reboot this Mac" in failure for failure in failures)
+
+
+def test_teardown_sweep_kills_live_remote_rank_over_ssh(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    commands = []
+
+    class Result:
+        stdout = "gone\n"
+
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (_rank_marker(535353, 1), True, 0.0, ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_run_cluster_ssh",
+        lambda target, command, **kw: commands.append((target, command)) or Result(),
+    )
+
+    failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
+
+    assert failures == []
+    assert len(commands) == 1
+    target, command = commands[0]
+    assert target == "user@studio.local"
+    assert "kill -TERM 535353" in command
+    assert "kill -KILL 535353" in command
+
+
+def test_teardown_sweep_ignores_foreign_deployment_markers(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    foreign = _rank_marker(424242, 0) | {"deployment_id": "other-deployment"}
+    (tmp_path / "other-deployment-rank-0.json").write_text(
+        json.dumps(foreign), encoding="utf-8"
+    )
+    kills = []
+    monkeypatch.setattr(
+        launch.os,
+        "kill",
+        # os.kill(pid, 0) liveness probes (also patched) are not kills.
+        lambda pid, sig: kills.append((pid, sig)) if sig != 0 else None,
+    )
+    monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    assert supervisor._sweep_rank_leftovers(kill_grace=0.01) == []
+    assert kills == []
+
+
+def test_reap_orphaned_launches_reaps_ranks_of_a_dead_coordinator(
+    tmp_path, monkeypatch
+):
+    deployment = _deployment()
+    launch._write_launch_manifest(
+        tmp_path, deployment, launcher_pid=433000, api_port=18081
+    )
+    marker_path = tmp_path / "cluster-test-rank-0.json"
+    marker_path.write_text(json.dumps(_rank_marker(424243, 0)), encoding="utf-8")
+    kills = []
+
+    def fake_kill(pid, sig):
+        # os.kill(pid, 0) liveness probes (also patched) are not kills.
+        if sig != 0:
+            kills.append((pid, sig))
+
+    coordinator_pid = json.loads(
+        launch._launch_manifest_path(tmp_path, "cluster-test").read_text(
+            encoding="utf-8"
+        )
+    )["coordinator_pid"]
+    monkeypatch.setattr(launch.os, "kill", fake_kill)
+    process = launch._LocalProcessState(
+        424243,
+        1,
+        424243,
+        "S",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: (
+            ((), "")
+            if any(sig == signal.SIGKILL for _, sig in kills)
+            else ((process,), "")
+        ),
+    )
+    # The crashed coordinator and its launcher are gone; the rank pid lives.
+    monkeypatch.setattr(
+        launch,
+        "_pid_alive",
+        lambda pid: (
+            pid not in (coordinator_pid, 433000)
+            and not any(sig == signal.SIGKILL for _, sig in kills)
+        ),
+    )
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: False)
+    monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+
+    report = launch.reap_orphaned_launches(tmp_path, kill_grace=0.01)
+
+    assert report["reaped"] == ["cluster-test"]
+    assert report["failures"] == []
+    assert kills == [
+        (424243, signal.SIGTERM),
+        (424243, signal.SIGKILL),
+    ]
+    assert not launch._launch_manifest_path(tmp_path, "cluster-test").exists()
+
+
+def test_reap_orphaned_launches_leaves_an_active_job_alone(tmp_path, monkeypatch):
+    launch._write_launch_manifest(
+        tmp_path, _deployment(), launcher_pid=433000, api_port=18081
+    )
+    kills = []
+    monkeypatch.setattr(launch.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+
+    report = launch.reap_orphaned_launches(tmp_path, kill_grace=0.01)
+
+    assert report["active"] == ["cluster-test"]
+    assert report["reaped"] == []
+    assert kills == []
+    assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
