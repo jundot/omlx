@@ -700,6 +700,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type and model_type.startswith("qwen3_5"):
+        from ..patches.mlx_vlm_qwen35_vision_repeat import (
+            apply_qwen35_vision_repeat_patch,
+        )
+
+        if apply_qwen35_vision_repeat_patch():
+            logger.info(
+                "Qwen3.5 MLX-safe vision repeat patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
