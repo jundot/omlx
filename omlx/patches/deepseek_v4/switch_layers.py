@@ -21,6 +21,29 @@ _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
+# Below this many (token, expert) routes the stock unsorted gather_qmm runs;
+# at/above it routes are sorted by expert. Measured on M1 Ultra, GLM-5.3 oQ2e
+# (affine 2-bit, g64), one MoE layer, ms per layer:
+#   T=4:  unsorted 1.23 · sorted stock 1.11 · sorted native blocks 2.95
+#   T=8:  unsorted 2.10 · sorted stock 1.91 · sorted native blocks 5.13
+#   T=64: unsorted 12.3 · sorted stock 10.7 · sorted native blocks 15.8
+#   T=128: unsorted 24.2 · sorted stock 20.9 · sorted native blocks 19.4
+# Sorting pays from T=4 (32 routes); the affine block kernel only pays past
+# ~900 routes, so it has its own floor below. The old single threshold of 64
+# routes sent every 8..110-token window (DFlash block-8 verify, batched
+# decode at B>=8) down the block kernel at 2-2.7x the cost.
+# Route-count crossovers for the affine (oQ 2/3-bit) MoE path, measured on
+# M1 Ultra with real GLM-5.3-Flash expert weights (2-bit, group 64):
+#   - sorting the routes pays off from 32 routes;
+#   - the native block kernels only beat mx.gather_qmm from ~1024 routes
+#     (the crossover sits at T=128 x 8 experts); below it they cost 2-2.7x.
+# The single 64-route gate that engaged both at once sat exactly in the
+# losing region. Same pattern as _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES below:
+# tuned on one machine, overridable per deployment.
+_SORT_MIN_ROUTES = int(os.environ.get("OMLX_DEEPSEEK_SORT_MIN_ROUTES", "32"))
+_AFFINE_NATIVE_MIN_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES", "1024")
+)
 # Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
 # other pre-NAX chips; M5 prefill uses the NAX fallback below.
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
@@ -243,6 +266,7 @@ class QuantizedSwitchLinear(nn.Module):
             sorted_indices
             and x.ndim == 3
             and x.shape[-2] == 1
+            and int(x.shape[0]) >= _AFFINE_NATIVE_MIN_ROUTES
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
             and self.bits in (2, 3)
@@ -397,6 +421,58 @@ class SwiGLU(nn.Module):
         return swiglu(gate, x)
 
 
+# Opt-in PER INSTANCE (glu._fuse_gate_up = True, set by whoever builds the
+# model): the concatenated pair steers the kernel to a different tile
+# variant and the sum lands 1 fp16 ulp from the reference, so the exact-
+# parity tests in this file (and families that did not measure a gain) stay
+# on the bit-identical path. OMLX_MOE_FUSE_GATE_UP=0 is the global kill switch.
+_FUSE_GATE_UP = os.environ.get("OMLX_MOE_FUSE_GATE_UP", "1") != "0"
+
+
+def _fuse_gate_up_storage(glu) -> bool:
+    """Concatenate gate+up on the output axis and serve both from ONE projection.
+
+    At decode (T<=8) every MoE layer launched one gather for the gate and
+    another for the up with the SAME input and the SAME indices; a gather
+    costs launch latency, not bandwidth (moving 21 or 71 MB costs the same).
+    The native pair kernel only covered the block path (>=1024 routes). The
+    fusion here is in STORAGE: up_proj's arrays become the concatenated pair,
+    gate_proj's are released (left with 0 output columns), and every existing
+    kernel path of the projection computes both at once — a split returns the
+    halves. Bench on real 2-bit g64 weights (GLM-5.3-Flash): T=1 0.60 -> 0.53
+    ms, T=8 1.84 -> 1.61, max diff 0.0 in isolation.
+    """
+    up, gate = glu.up_proj, glu.gate_proj
+    if not (
+        isinstance(up, QuantizedSwitchLinear)
+        and isinstance(gate, QuantizedSwitchLinear)
+        and getattr(up, "mode", "affine") == "affine"
+        and getattr(gate, "mode", "affine") == "affine"
+        and "bias" not in up
+        and "bias" not in gate
+        and hasattr(up, "biases")
+        and hasattr(gate, "biases")
+        and up.group_size == gate.group_size
+        and up.bits == gate.bits
+        and up.weight.shape == gate.weight.shape
+        and up.weight.dtype == gate.weight.dtype
+    ):
+        return False
+    half = up.output_dims
+    up.weight = mx.contiguous(mx.concatenate([up.weight, gate.weight], axis=1))
+    up.scales = mx.contiguous(mx.concatenate([up.scales, gate.scales], axis=1))
+    up.biases = mx.contiguous(mx.concatenate([up.biases, gate.biases], axis=1))
+    mx.eval(up.weight, up.scales, up.biases)
+    # The gate loses its arrays (0 output columns): the originals' memory is
+    # returned, and any path that still called it would fail loudly.
+    gate.weight = gate.weight[:, :0]
+    gate.scales = gate.scales[:, :0]
+    gate.biases = gate.biases[:, :0]
+    mx.eval(gate.weight, gate.scales, gate.biases)
+    glu._gate_up_half = half
+    return True
+
+
 class SwitchGLU(nn.Module):
     def __init__(
         self,
@@ -417,7 +493,16 @@ class SwitchGLU(nn.Module):
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
-        do_sort = indices.size >= 64
+        if _FUSE_GATE_UP and not self.training and getattr(self, "_fuse_gate_up", False):
+            fused = getattr(self, "_gate_up_half", None)
+            if fused is None and not getattr(self, "_gate_up_fuse_tried", False):
+                self._gate_up_fuse_tried = True
+                if _fuse_gate_up_storage(self):
+                    fused = self._gate_up_half
+        else:
+            fused = None
+
+        do_sort = indices.size >= _SORT_MIN_ROUTES
         idx = indices
         inv_order = None
         if do_sort:
@@ -427,7 +512,13 @@ class SwitchGLU(nn.Module):
 
         block_plan = None
         native_kinds = None
-        projections = (self.up_proj, self.gate_proj, self.down_proj)
+        # With the fusion the pair also answers for the gate: the triple keeps
+        # its shape (the block path reads native_kinds[2] for down_proj).
+        projections = (
+            (self.up_proj, self.up_proj, self.down_proj)
+            if fused is not None
+            else (self.up_proj, self.gate_proj, self.down_proj)
+        )
         use_f16_moe = original_dtype == mx.bfloat16 and all(
             isinstance(p, QuantizedSwitchLinear)
             and p._has_affine_metadata_dtype(mx.float16)
@@ -463,7 +554,8 @@ class SwitchGLU(nn.Module):
             x = x.astype(mx.float16)
 
         use_pair_proj = (
-            block_plan is not None
+            fused is None
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "mxfp4"
             and native_kinds[1] == "mxfp4"
@@ -472,7 +564,8 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
         )
         use_affine_pair_proj = (
-            block_plan is not None
+            fused is None
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "affine"
             and native_kinds[1] == "affine"
@@ -534,6 +627,12 @@ class SwitchGLU(nn.Module):
             hidden_dims = self.up_proj.output_dims
             x_up = x_pair[..., :hidden_dims]
             x_gate = x_pair[..., hidden_dims:]
+        elif fused is not None:
+            # The fused projection computes gate and up at once through
+            # WHICHEVER kernel path it picks (gather_qmm, native block).
+            x_pair = self.up_proj(x, idx, sorted_indices=do_sort, block_plan=block_plan)
+            x_up = x_pair[..., :fused]
+            x_gate = x_pair[..., fused:]
         else:
             x_up = self.up_proj(x, idx, sorted_indices=do_sort, block_plan=block_plan)
             x_gate = self.gate_proj(
@@ -595,7 +694,7 @@ class SwitchMLP(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _SORT_MIN_ROUTES
         idx = indices
         inv_order = None
         if do_sort:
