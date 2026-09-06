@@ -235,19 +235,64 @@ class _VLMAdapterMTPProxy:
             getattr(adapter, "_uses_mrope", False)
         )
 
+    def _mrope_speculative_verify_hidden(
+        self,
+        inputs: mx.array,
+        cache: list[Any],
+    ) -> tuple[mx.array, dict, list | None]:
+        """Verify through the adapter so mRoPE positions are preserved."""
+        out = self._adapter(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
+
+    def _mrope_logits_projection(self) -> Optional[Callable[..., Any]]:
+        """Return the projection paired with adapter-owned mRoPE verify."""
+        for owner in (self._adapter, self._language_model):
+            projection = getattr(owner, "speculative_logits_from_hidden", None)
+            if callable(projection):
+                return projection
+        return None
+
+    def positioned_sampling_available(self) -> bool:
+        """Whether mlx-vlm can apply a positioned target sampler safely."""
+        projection = getattr(self, "speculative_logits_from_hidden", None)
+        if not callable(projection):
+            return False
+        if self._allow_language_model_fast_paths:
+            return True
+        return callable(getattr(self, "speculative_verify_hidden", None))
+
     def __getattr__(self, name: str) -> Any:
         if name == "language_model":
             if self._expose_language_model:
                 return self._language_model
             raise AttributeError(name)
+
+        if not self._allow_language_model_fast_paths:
+            # mRoPE verification must run through the adapter. Only expose
+            # the two hooks used by positioned target sampling; hiding every
+            # token-producing shortcut ensures processors see each slot.
+            if name == "speculative_verify_hidden":
+                if self._mrope_logits_projection() is not None:
+                    return self._mrope_speculative_verify_hidden
+                raise AttributeError(name)
+            if name == "speculative_logits_from_hidden":
+                projection = self._mrope_logits_projection()
+                if projection is not None:
+                    return projection
+                raise AttributeError(name)
+            if name == "model" or name.startswith("speculative_"):
+                raise AttributeError(name)
+
         try:
             return getattr(self._adapter, name)
         except AttributeError:
-            if (
-                not self._allow_language_model_fast_paths
-                and (name == "model" or name.startswith("speculative_"))
-            ):
-                raise
             return getattr(self._language_model, name)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -282,15 +327,13 @@ def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
     when the object mlx-vlm resolves as ``lm`` exposes
     ``speculative_logits_from_hidden``. That object is not the inner
     language model: ``run_vlm_mtp_decode`` wraps adapters in
-    ``_VLMAdapterMTPProxy``, which for mRoPE adapters (Qwen VLMs)
-    intentionally hides the inner model's ``speculative_*`` fast paths so
-    verify keeps mRoPE position handling. Checking the inner model
-    directly would report the hook as available while the round loop
-    falls back to plain vectorized sampling — silently dropping the
-    processors (#2399).
+    ``_VLMAdapterMTPProxy``. For mRoPE adapters, the proxy
+    exposes only position-safe verification and final logits projection;
+    token-producing shortcuts remain hidden so processors cannot be
+    bypassed (#2399).
 
-    This helper mirrors the proxy's visibility rules exactly; the
-    equivalence is pinned by tests against the real proxy resolution.
+    Adapter capability is owned by ``_VLMAdapterMTPProxy`` so the route gate
+    and the object handed to mlx-vlm cannot drift apart.
     """
     adapter_lm = getattr(target_language_model, "_language_model", None)
     if adapter_lm is None:
@@ -299,16 +342,9 @@ def vlm_mtp_positioned_sampling_available(target_language_model: Any) -> bool:
         inner = getattr(target_language_model, "language_model", None)
         lm = inner if inner is not None else target_language_model
         return hasattr(lm, "speculative_logits_from_hidden")
-    # Adapter case: rounds receive _VLMAdapterMTPProxy, which hides
-    # ``language_model`` outside drafter reset, so mlx-vlm uses the proxy
-    # itself as ``lm``. Attribute lookup tries the adapter first, then
-    # falls through to the inner model — unless the adapter uses mRoPE,
-    # in which case ``speculative_*`` names are blocked at the proxy.
-    if hasattr(target_language_model, "speculative_logits_from_hidden"):
-        return True
-    if bool(getattr(target_language_model, "_uses_mrope", False)):
-        return False
-    return hasattr(adapter_lm, "speculative_logits_from_hidden")
+    # Adapter case: probe the same proxy object the round loop receives.
+    proxy = _VLMAdapterMTPProxy(target_language_model, adapter_lm)
+    return proxy.positioned_sampling_available()
 
 
 def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:

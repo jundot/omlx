@@ -255,12 +255,38 @@ class _FakeDrafter:
         return mx.array([row], dtype=dtype)
 
 
-def _run_rounds(sampler, lm=None, drafter=None, max_tokens=16, first_bonus=THINK):
+class _FakeMRoPERoundLanguageModel(_FakeTargetLM):
+    """Inner target that records real VLMModelAdapter verification calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = SimpleNamespace(layers=[])
+        self.args = SimpleNamespace()
+        self.verify_kwargs = []
+
+    def __call__(self, inputs, cache=None, **kwargs):
+        self.verify_kwargs.append(kwargs)
+        hidden, shared_kv = self.speculative_verify_hidden(inputs, cache)
+        return SimpleNamespace(
+            hidden_states=[hidden],
+            shared_kv_states=shared_kv,
+            gdn_states=None,
+        )
+
+
+def _run_rounds(
+    sampler,
+    lm=None,
+    drafter=None,
+    max_tokens=16,
+    first_bonus=THINK,
+    prompt_cache=None,
+):
     from mlx_vlm.speculative.mtp import _mtp_rounds
 
     lm = lm or _FakeTargetLM()
     drafter = drafter or _FakeDrafter()
-    prompt_cache = [SimpleNamespace(offset=len(PROMPT))]
+    prompt_cache = prompt_cache or [SimpleNamespace(offset=len(PROMPT))]
     hidden = mx.zeros((1, 1, 4))
 
     tokens = [first_bonus]
@@ -336,6 +362,46 @@ class TestEndToEndMtpRounds:
         # Control: a bare sampler (pre-fix behaviour) never closes thinking.
         tokens, _, _ = _run_rounds(_argmax_sampler, max_tokens=12)
         assert all(t == THINK for t in tokens)
+
+    def test_mrope_proxy_rounds_enforce_budget_through_adapter_verify(self):
+        from omlx.models.vlm import VLMModelAdapter
+
+        proc, sampler, bonus = _wrapped_sampler(budget=5)
+        language_model = _FakeMRoPERoundLanguageModel()
+        outer = SimpleNamespace(
+            language_model=language_model,
+            config=SimpleNamespace(
+                model_type="qwen3_5",
+                text_config=SimpleNamespace(
+                    rope_scaling=None,
+                    rope_parameters={"mrope_section": [11, 11, 10]},
+                ),
+            ),
+        )
+        adapter = VLMModelAdapter(outer)
+        adapter.set_batch_rope_deltas(mx.array([0.0]))
+        proxy = _VLMAdapterMTPProxy(adapter, language_model)
+        cache = [SimpleNamespace(offset=mx.array([len(PROMPT)]))]
+
+        tokens, _, _ = _run_rounds(
+            sampler,
+            lm=proxy,
+            first_bonus=bonus,
+            max_tokens=12,
+            prompt_cache=cache,
+        )
+
+        assert tokens[:4] == [THINK] * 4
+        assert tokens[4:7] == [LEAD, END, TRAIL]
+        assert proc._done
+        assert not sampler._degraded
+        assert language_model.verify_kwargs
+        assert all(call["skip_logits"] is True for call in language_model.verify_kwargs)
+        assert all(
+            call["return_hidden"] is True for call in language_model.verify_kwargs
+        )
+        assert all("position_ids" in call for call in language_model.verify_kwargs)
+        assert not hasattr(proxy, "speculative_argmax_from_hidden")
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +567,9 @@ def _make_adapter(*, mrope: bool, adapter_hook: bool, lm_hook: bool):
 
 class TestPositionedHookVisibility:
     """The routing gate must probe what mlx-vlm's round loop will actually
-    see. For mRoPE adapters (Qwen VLMs) _VLMAdapterMTPProxy hides the inner
-    language model's ``speculative_*`` fast paths, so a check against the
-    inner model passes while the loop silently falls back to plain
-    vectorized sampling and drops the processors (#2399)."""
+    see. For mRoPE adapters (Qwen VLMs), _VLMAdapterMTPProxy must expose
+    position-safe verification and logits projection while hiding shortcuts
+    that pre-sample target tokens before processors run (#2399)."""
 
     @pytest.mark.parametrize("mrope", [False, True])
     @pytest.mark.parametrize("adapter_hook", [False, True])
@@ -512,39 +577,34 @@ class TestPositionedHookVisibility:
     def test_helper_matches_real_proxy_resolution(
         self, mrope, adapter_hook, lm_hook
     ):
-        """vlm_mtp_positioned_sampling_available == what the round loop
-        resolves through the real proxy, for every combination."""
+        """The route helper delegates adapter capability to the real proxy."""
         adapter, lm = _make_adapter(
             mrope=mrope, adapter_hook=adapter_hook, lm_hook=lm_hook
         )
         proxy = _VLMAdapterMTPProxy(adapter, lm)
-        # mlx-vlm's resolution (mtp.py): lm = model.language_model if
-        # present else model; positioned path gated on the hook's presence.
-        loop_lm = (
-            proxy.language_model
-            if hasattr(proxy, "language_model")
-            else proxy
-        )
-        loop_sees_hook = hasattr(loop_lm, "speculative_logits_from_hidden")
         assert (
-            vlm_mtp_positioned_sampling_available(adapter) == loop_sees_hook
+            vlm_mtp_positioned_sampling_available(adapter)
+            == proxy.positioned_sampling_available()
         )
 
-    def test_mrope_hides_inner_hook(self):
-        """The maintainer-reported case: inner LM has the hook, adapter is
-        mRoPE — the proxy hides it, so availability must be False."""
+    def test_mrope_exposes_safe_inner_projection(self):
+        """mRoPE verification stays on the adapter while final projection
+        remains visible to mlx-vlm's positioned sampling path."""
         adapter, lm = _make_adapter(
             mrope=True, adapter_hook=False, lm_hook=True
         )
-        assert hasattr(lm, "speculative_logits_from_hidden")  # naive check
-        assert not vlm_mtp_positioned_sampling_available(adapter)
+        proxy = _VLMAdapterMTPProxy(adapter, lm)
+        assert hasattr(proxy, "speculative_verify_hidden")
+        assert hasattr(proxy, "speculative_logits_from_hidden")
+        assert vlm_mtp_positioned_sampling_available(adapter)
 
     def test_adapter_level_hook_survives_mrope(self):
-        """An mRoPE-safe hook implemented on the adapter itself is visible
-        to the loop and keeps the vlm_mtp route open."""
-        adapter, _ = _make_adapter(
+        """An adapter projection is paired with adapter-owned mRoPE verify."""
+        adapter, lm = _make_adapter(
             mrope=True, adapter_hook=True, lm_hook=False
         )
+        proxy = _VLMAdapterMTPProxy(adapter, lm)
+        assert hasattr(proxy, "speculative_verify_hidden")
         assert vlm_mtp_positioned_sampling_available(adapter)
 
     def test_no_adapter_falls_back_to_model_probe(self):
@@ -552,10 +612,11 @@ class TestPositionedHookVisibility:
         assert vlm_mtp_positioned_sampling_available(bare)
         assert not vlm_mtp_positioned_sampling_available(SimpleNamespace())
 
-    def test_route_gate_declines_mrope_adapter(self, caplog):
-        """Regression for the silent-drop report on Qwen VLM targets: the
-        gate must decline (falling back to BatchGenerator) even though the
-        inner language model carries the hook."""
+    def test_route_gate_passes_mrope_adapter_with_safe_inner_projection(
+        self, caplog
+    ):
+        """The mRoPE proxy exposes the safe positioned path, so routing
+        advances to the next guard instead of dropping processors."""
         adapter, _ = _make_adapter(
             mrope=True, adapter_hook=False, lm_hook=True
         )
@@ -569,13 +630,14 @@ class TestPositionedHookVisibility:
                 sched,
                 _make_route_request(),
                 [object()],
-                [42],
+                [],
                 _argmax_sampler,
                 object(),
                 logits_processors=[_make_budget_processor(4)],
             )
         assert uid is None
-        assert "positioned verify sampling is unavailable" in caplog.text
+        assert "positioned verify sampling is unavailable" not in caplog.text
+        assert "last_tokens empty" in caplog.text
 
     def test_route_gate_passes_non_mrope_adapter(self, caplog):
         """Same shape, mRoPE off: the hook is visible through the proxy, so
@@ -585,6 +647,61 @@ class TestPositionedHookVisibility:
         adapter, _ = _make_adapter(
             mrope=False, adapter_hook=False, lm_hook=True
         )
+        sched = SimpleNamespace(
+            _vlm_mtp_drafter=object(),
+            _vlm_mtp_active={},
+            model=adapter,
+        )
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            uid = Scheduler._route_to_vlm_mtp(
+                sched,
+                _make_route_request(),
+                [object()],
+                [],
+                _argmax_sampler,
+                object(),
+                logits_processors=[_make_budget_processor(4)],
+            )
+        assert uid is None
+        assert "positioned verify sampling is unavailable" not in caplog.text
+        assert "last_tokens empty" in caplog.text
+
+    def test_route_gate_passes_qwen_mrope_adapter(self, caplog):
+        """The real Qwen adapter proxy exposes positioned sampling without
+        the inner model's processor-bypassing speculative shortcuts."""
+        from omlx.models.vlm import VLMModelAdapter
+
+        class FakeLanguageModel:
+            model = SimpleNamespace(layers=[])
+            args = SimpleNamespace()
+
+            def rollback_speculative_cache(self, *args, **kwargs):
+                return None
+
+            def speculative_logits_from_hidden(self, hidden):
+                return hidden
+
+            def speculative_argmax_from_hidden(self, hidden):
+                raise AssertionError("positioned sampling must not bypass processors")
+
+        outer = SimpleNamespace(
+            language_model=FakeLanguageModel(),
+            config=SimpleNamespace(
+                model_type="qwen3_5",
+                text_config=SimpleNamespace(
+                    rope_scaling=None,
+                    rope_parameters={"mrope_section": [11, 11, 10]},
+                ),
+            ),
+        )
+        adapter = VLMModelAdapter(outer)
+        assert adapter._uses_mrope
+
+        proxy = _VLMAdapterMTPProxy(adapter, adapter._language_model)
+        assert hasattr(proxy, "speculative_verify_hidden")
+        assert hasattr(proxy, "speculative_logits_from_hidden")
+        assert not hasattr(proxy, "speculative_argmax_from_hidden")
+
         sched = SimpleNamespace(
             _vlm_mtp_drafter=object(),
             _vlm_mtp_active={},
