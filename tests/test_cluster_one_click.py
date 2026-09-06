@@ -1535,6 +1535,12 @@ def test_connectx_cuda_pair_is_one_logical_unit_with_two_physical_members():
             "clusterCudaFabricVerificationKey",
             "clusterNodeHardwareLabel",
             "clusterDeviceCountLabel",
+            "clusterDeploymentAlignedQuickNodes",
+            "clusterLiveFabricMemberKeys",
+            "clusterLiveDeployment",
+            "clusterFabricHostKeys",
+            "clusterFabricNodeMatchesKeys",
+            "clusterNeuralFabricJob",
             "clusterMemoryNodes",
             "clusterCombinedUsableMemoryGiB",
             "clusterCombinedPhysicalMemoryGiB",
@@ -1593,6 +1599,58 @@ process.stdout.write(JSON.stringify({
         "countLabel": "2 visual groups · 3 execution ranks",
         "memoryLabel": "450 GiB model-usable of 512 GiB installed",
     }
+
+
+def test_fabric_membership_matches_job_deployment_and_normalizes_ids():
+    result = _run_dashboard_helpers(
+        (
+            "clusterNeuralFabricJob",
+            "clusterLiveDeployment",
+            "clusterLiveFabricMemberKeys",
+            "clusterFabricHostKeys",
+        ),
+        """
+component.clusterStatus = { runtime_jobs: { jobs: [
+  {
+    live: true,
+    deployment_id: 'dep-b',
+    assignments: [
+      { rank: 0, node_id: 'worker-a' },
+      { rank: 1, node_id: '' },
+    ],
+  },
+] } };
+component.clusterDeployments = [
+  {
+    deployment_id: 'dep-a',
+    hosts: [{ node_id: 'stale', ssh: 'stale.local' }],
+  },
+  {
+    deployment_id: 'dep-b',
+    hosts: [
+      { node_id: 'worker-a', ssh: 'Ops@Worker-A.Local' },
+      { node_id: '', ssh: 'unassigned.local' },
+    ],
+  },
+];
+const deployment = component.clusterLiveDeployment();
+const keys = [...(component.clusterLiveFabricMemberKeys() || [])];
+process.stdout.write(JSON.stringify({
+  deploymentId: deployment.deployment_id,
+  keys,
+  hostKeyProbe: [...component.clusterFabricHostKeys({ ssh: 'user@node-2.local' })],
+}));
+""",
+    )
+
+    # Membership joins the LIVE JOB's deployment (not just deployments[0]),
+    # blank node ids never shadow the lookup map, and user@ / mDNS
+    # decoration is stripped so identity keys line up across sources.
+    assert result["deploymentId"] == "dep-b"
+    assert "worker-a" in result["keys"]
+    assert "ops@worker-a.local" in result["keys"]
+    assert all(not key.startswith("unassigned") for key in result["keys"])
+    assert "node-2" in result["hostKeyProbe"]
 
 
 def test_dashboard_verifies_connectx_and_persists_group_in_plan_payload():

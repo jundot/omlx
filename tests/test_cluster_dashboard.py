@@ -436,6 +436,104 @@ def test_cluster_neural_fabric_uses_real_runtime_measurements():
     assert "@media (prefers-reduced-motion: reduce)" in stylesheet
 
 
+def test_cluster_fabric_firing_requires_live_job_membership():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    assert "clusterLiveFabricMemberKeys()" in javascript
+    assert "clusterFabricNodeMatchesKeys(node, memberKeys)" in javascript
+    fabric = javascript.split("clusterNeuralFabricNodes()", 1)[1].split(
+        "clusterNeuralFabricEdges()", 1
+    )[0]
+    # The firing state is gated per node on holding a rank in the live job,
+    # not stamped globally onto every remembered candidate.
+    assert "this.clusterFabricNodeMatchesKeys(node, memberKeys)" in fabric
+    # The old unconditional conjunction must be gone.
+    assert (
+        "const working = this.clusterNeuralFabricFiring()\n"
+        "                        && Boolean(job?.live || "
+        "this.clusterActivationLoading);"
+    ) not in javascript
+
+
+def test_cluster_fabric_shows_deployed_hosts_while_a_job_is_live():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+    fabric = javascript.split("clusterNeuralFabricNodes()", 1)[1].split(
+        "clusterNeuralFabricEdges()", 1
+    )[0]
+
+    # With a live job and known membership the ring renders exactly the
+    # rank-holding deployment hosts; without one, candidate discovery
+    # behavior is unchanged.
+    assert "(job?.live && memberKeys)" in fabric
+    assert "this.clusterLogicalNodes(" in fabric
+    assert "clusterDeploymentAlignedQuickNodes()" in fabric
+    assert ": this.clusterLogicalNodes();" in fabric
+    # Membership comes from deployment hosts joined to job assignments, with
+    # mDNS suffixes stripped so discovered names match deployed node ids.
+    member_keys = javascript.split("clusterLiveFabricMemberKeys()", 1)[1].split(
+        "clusterFabricNodeMatchesKeys(node, memberKeys)", 1
+    )[0]
+    assert "deployment?.hosts" in member_keys
+    assert "item?.node_id" in member_keys
+    assert "/\\.local\\.?$/" in javascript
+
+    # Alignment is not only subtractive: a rank-holding host that browser
+    # selection forgot is restored as a placeholder node.
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "hosts.forEach(host => {" in aligned
+    assert "memberKeys.has(key)" in aligned
+    assert "deployedPlaceholder: true," in aligned
+
+
+def test_cluster_pool_summary_excludes_non_members_while_a_job_is_live():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The compute-pool title and device count describe the running cluster,
+    # so they must use deployment-aligned nodes instead of raw candidates.
+    assert "clusterDeploymentAlignedQuickNodes()" in javascript
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "quickNodes.filter(node =>" in aligned
+    pair_title = javascript.split("clusterPairTitle()", 1)[1].split(
+        "clusterDeviceCountLabel()", 1
+    )[0]
+    assert "const nodes = this.clusterDeploymentAlignedQuickNodes();" in pair_title
+    device_count = javascript.split("clusterDeviceCountLabel()", 1)[1].split(
+        "clusterPeerDisplayName()", 1
+    )[0]
+    assert "this.clusterDeploymentAlignedQuickNodes().length" in device_count
+
+
+def test_fabric_membership_uses_job_matched_deployment_and_clean_keys():
+    javascript = _read("omlx/admin/static/js/dashboard.js")
+
+    # The deployment is selected by the live job's deployment_id, falling
+    # back to the first entry only when the status payload omits it.
+    assert "clusterLiveDeployment() {" in javascript
+    assert "String(item.deployment_id)" in javascript
+    member_keys = javascript.split("clusterLiveFabricMemberKeys()", 1)[1].split(
+        "clusterFabricNodeMatchesKeys(node, memberKeys)", 1
+    )[0]
+    assert "this.clusterLiveDeployment()" in member_keys
+    assert "if (nodeId) byNodeId.set(nodeId, host);" in member_keys
+    assert "if (!nodeId) return;" in member_keys
+
+    # Host identity keys drop user@ prefixes as well as mDNS suffixes.
+    host_keys = javascript.split("clusterFabricHostKeys(host) {", 1)[1].split(
+        "return keys;", 1
+    )[0]
+    assert "lastIndexOf('@')" in host_keys
+
+    # Sets have no .some(): the restoration loop must spread before scanning.
+    aligned = javascript.split("clusterDeploymentAlignedQuickNodes()", 1)[1].split(
+        "clusterPairTitle()", 1
+    )[0]
+    assert "[...this.clusterFabricHostKeys(host)]" in aligned
+
+
 def test_tensor_parallel_controls_are_derived_from_detected_node_count():
     cluster = _read("omlx/admin/templates/dashboard/_cluster.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")

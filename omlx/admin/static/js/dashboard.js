@@ -4089,10 +4089,10 @@
                 return nodes;
             },
 
-            clusterLogicalNodes() {
+            clusterLogicalNodes(nodes = this.clusterQuickNodes()) {
                 const logical = [];
                 const groups = new Map();
-                const physical = this.clusterQuickNodes();
+                const physical = nodes;
                 const candidateGroups = new Map();
                 physical.forEach(node => {
                     if (!node.fabricGroup) return;
@@ -4346,9 +4346,103 @@
                 );
             },
 
-            clusterNeuralFabricNodes() {
-                const nodes = this.clusterLogicalNodes();
+            // The deployment hosting the live job, matched by deployment_id
+            // with a first-entry fallback for status payloads that omit the
+            // job's id; null when nothing is deployed.
+            clusterLiveDeployment() {
+                const deployments = this.clusterDeployments || [];
                 const job = this.clusterNeuralFabricJob();
+                return deployments.find(
+                    item => item?.deployment_id
+                        && String(item.deployment_id)
+                            === String(job?.deployment_id)
+                ) || deployments[0] || null;
+            },
+
+            // Normalized identity keys for one deployment host (or ring node):
+            // ssh destination (with any user@ prefix dropped), node id, and
+            // known IPs, with mDNS suffixes stripped so a discovered
+            // "worker-a.local" peer matches host id "worker-a" and a
+            // "user@worker-a.local" destination matches too.
+            clusterFabricHostKeys(host) {
+                const keys = new Set();
+                const push = value => {
+                    const raw = String(value ?? '').trim().toLowerCase();
+                    if (!raw) return;
+                    for (const key of [raw, raw.replace(/\.local\.?$/, '')]) {
+                        if (!key) continue;
+                        keys.add(key);
+                        const at = key.lastIndexOf('@');
+                        if (at !== -1 && at + 1 < key.length) {
+                            keys.add(key.slice(at + 1));
+                        }
+                    }
+                };
+                push(host?.ssh);
+                push(host?.node_id);
+                (Array.isArray(host?.ips) ? host.ips : []).forEach(push);
+                return keys;
+            },
+
+            // Identity keys of the hosts holding ranks in the live job, or
+            // null when participation cannot be determined (no live job, or
+            // deployments not loaded). Callers treat null as "cannot tell,
+            // keep previous behavior" so a slow deployments fetch never
+            // blanks the fabric.
+            clusterLiveFabricMemberKeys() {
+                const job = this.clusterNeuralFabricJob();
+                if (!job?.live) return null;
+                const deployment = this.clusterLiveDeployment();
+                const hosts = Array.isArray(deployment?.hosts)
+                    ? deployment.hosts
+                    : [];
+                if (!hosts.length) return null;
+                const byNodeId = new Map();
+                hosts.forEach(host => {
+                    const nodeId = String(host?.node_id || '')
+                        .trim().toLowerCase();
+                    if (nodeId) byNodeId.set(nodeId, host);
+                });
+                const assignments = Array.isArray(job.assignments)
+                    && job.assignments.length
+                    ? job.assignments
+                    : (Array.isArray(deployment?.assignments)
+                        ? deployment.assignments
+                        : []);
+                const keys = new Set();
+                assignments.forEach(item => {
+                    const nodeId = String(item?.node_id || '')
+                        .trim().toLowerCase();
+                    if (!nodeId) return;
+                    const host = byNodeId.get(nodeId);
+                    if (!host) return;
+                    this.clusterFabricHostKeys(host).forEach(key => keys.add(key));
+                });
+                return keys.size ? keys : null;
+            },
+
+            clusterFabricNodeMatchesKeys(node, memberKeys) {
+                if (!memberKeys) return true;
+                for (const key of this.clusterFabricHostKeys(node)) {
+                    if (memberKeys.has(key)) return true;
+                }
+                return false;
+            },
+
+            clusterNeuralFabricNodes() {
+                const job = this.clusterNeuralFabricJob();
+                const memberKeys = this.clusterLiveFabricMemberKeys();
+                // A live deployment is the authority on who participates.
+                // The ring renders exactly the rank-holding hosts: remembered
+                // Bonjour candidates that hold no rank are dropped, and any
+                // participant the selection forgot is restored — a neighbor
+                // Mac merely advertising SSH must never render as a cluster
+                // member, and a deployed worker must never vanish from the
+                // ring just because browser state forgot it.
+                const nodes = (job?.live && memberKeys)
+                    ? this.clusterLogicalNodes(
+                        this.clusterDeploymentAlignedQuickNodes())
+                    : this.clusterLogicalNodes();
                 const assignments = job?.assignments || [];
                 const ranks = job?.ranks || [];
                 const memoryNodes = this.clusterMemoryNodes();
@@ -4402,7 +4496,8 @@
                             + `${this.formatClusterGiB(capacity)}`;
                     }
                     const working = this.clusterNeuralFabricFiring()
-                        && Boolean(job?.live || this.clusterActivationLoading);
+                        && Boolean(job?.live || this.clusterActivationLoading)
+                        && this.clusterFabricNodeMatchesKeys(node, memberKeys);
                     return {
                         ...node,
                         ...positions[index],
@@ -4824,8 +4919,60 @@
                     .join(' + ');
             },
 
+            // Quick nodes aligned to the running deployment. While a job is
+            // live and membership is known: remembered candidates that hold
+            // no rank are dropped, and any rank-holding deployment host the
+            // selection forgot is re-added, so the ring and pool summaries
+            // always describe every participating Mac. Without a live job
+            // the full candidate list is returned untouched.
+            clusterDeploymentAlignedQuickNodes() {
+                const quickNodes = this.clusterQuickNodes();
+                const memberKeys = this.clusterLiveFabricMemberKeys();
+                if (!memberKeys) return quickNodes;
+                const aligned = quickNodes.filter(node =>
+                    this.clusterFabricNodeMatchesKeys(node, memberKeys));
+                const present = new Set();
+                aligned.forEach(node =>
+                    this.clusterFabricHostKeys(node).forEach(key => present.add(key)));
+                const deployment = this.clusterLiveDeployment();
+                const hosts = Array.isArray(deployment?.hosts)
+                    ? deployment.hosts
+                    : [];
+                const loopback = new Set(['127.0.0.1', 'localhost', '::1']);
+                hosts.forEach(host => {
+                    const hostKeys = [...this.clusterFabricHostKeys(host)];
+                    if (!hostKeys.some(key => memberKeys.has(key))) return;
+                    if (hostKeys.some(key => present.has(key))) return;
+                    const ssh = String(host?.ssh || '').trim();
+                    const synthetic = {
+                        rank: aligned.reduce(
+                            (max, node) => Math.max(max, Number(node.rank) || 0),
+                            0
+                        ) + 1,
+                        name: String(host?.node_id || '').trim() || ssh,
+                        ssh,
+                        local: loopback.has(ssh),
+                        connected: true,
+                        online: true,
+                        chip: '',
+                        memory: 0,
+                        physicalMemory: 0,
+                        accelerator: 'metal',
+                        acceleratorVendor: 'apple',
+                        memoryKind: 'unified',
+                        fabricKind: '',
+                        fabricGroup: '',
+                        fabricVerified: false,
+                        deployedPlaceholder: true,
+                    };
+                    this.clusterFabricHostKeys(synthetic).forEach(key => present.add(key));
+                    aligned.push(synthetic);
+                });
+                return aligned;
+            },
+
             clusterPairTitle() {
-                const nodes = this.clusterQuickNodes();
+                const nodes = this.clusterDeploymentAlignedQuickNodes();
                 if (nodes.length === 1) return `${nodes[0].name} · finding workers`;
                 const logical = this.clusterLogicalNodes();
                 const mixed = new Set(nodes.map(node => node.accelerator)).size > 1;
@@ -4837,7 +4984,7 @@
             },
 
             clusterDeviceCountLabel() {
-                const devices = this.clusterQuickNodes().length;
+                const devices = this.clusterDeploymentAlignedQuickNodes().length;
                 const units = this.clusterLogicalNodes().length;
                 return units === devices
                     ? `${devices} device${devices === 1 ? '' : 's'}`
