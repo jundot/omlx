@@ -261,6 +261,7 @@ include = ["omlx*"]
     "bench_corpora/*",
 ]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.custom_kernels.ds4" = ["LICENSE.ds4-metal", "VENDOR.md"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
