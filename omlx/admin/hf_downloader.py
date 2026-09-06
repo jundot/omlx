@@ -314,17 +314,204 @@ _DTYPE_BYTES = {
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
+# Follow-up model_info(files_metadata=True) calls for U32-packed repos.
+_BLOB_FETCH_CONCURRENCY = 8
+_BLOB_FETCH_BATCH_TIMEOUT = 15
+_BLOB_SIZE_CACHE_TTL = 3600.0
+_BLOB_SIZE_CACHE_MAX = 512
+_blob_size_cache: dict[str, tuple[int, float]] = {}
 
-def _calc_safetensors_disk_size(safetensors: dict) -> int:
-    """Calculate actual disk size in bytes from safetensors parameters.
 
-    safetensors.total is the parameter count, not bytes.
-    We need to multiply each dtype's parameter count by its byte width.
+def _safetensors_parameters(safetensors) -> dict:
+    """Return the dtype → count map from HF safetensors metadata."""
+    if not safetensors:
+        return {}
+    if isinstance(safetensors, dict):
+        params = safetensors.get("parameters") or {}
+        return params if isinstance(params, dict) else {}
+    params = getattr(safetensors, "parameters", None)
+    return params if isinstance(params, dict) else {}
+
+
+def _histogram_has_packed_u32(safetensors) -> bool:
+    """True when HF reports U32 weights — packed MLX quants, not 4-byte params."""
+    return "U32" in _safetensors_parameters(safetensors)
+
+
+def _sum_safetensors_blob_bytes(siblings) -> int | None:
+    """Sum current-revision *.safetensors blob sizes from model_info siblings.
+
+    Returns None when siblings are missing or have no sizes (list_models does
+    not populate them). Does not use usedStorage, which includes old revisions.
     """
-    params = safetensors.get("parameters", {})
+    if not isinstance(siblings, (list, tuple)):
+        return None
+    total = 0
+    saw_size = False
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None) or ""
+        if not str(name).endswith(".safetensors"):
+            continue
+        try:
+            size = int(getattr(sibling, "size", None) or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            total += size
+            saw_size = True
+    return total if saw_size else None
+
+
+def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
+    """Look up *.safetensors blob bytes for one repo. 0 on failure."""
+    try:
+        info = api.model_info(repo_id, files_metadata=True)
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 401:
+            logger.debug("Could not fetch blob sizes for %s: %s", repo_id, e)
+            return 0
+        try:
+            info = api.model_info(repo_id, files_metadata=True, token=False)
+        except Exception as retry_error:
+            logger.debug(
+                "Could not fetch blob sizes for %s: %s", repo_id, retry_error
+            )
+            return 0
+    except Exception as e:
+        logger.debug("Could not fetch blob sizes for %s: %s", repo_id, e)
+        return 0
+    return _sum_safetensors_blob_bytes(getattr(info, "siblings", None)) or 0
+
+
+def _cached_blob_size(repo_id: str) -> int | None:
+    """Return a still-fresh cached positive blob size, or None."""
+    entry = _blob_size_cache.get(repo_id)
+    if entry is None:
+        return None
+    size, stored_at = entry
+    if time.monotonic() - stored_at > _BLOB_SIZE_CACHE_TTL:
+        _blob_size_cache.pop(repo_id, None)
+        return None
+    return size
+
+
+def _prune_blob_size_cache() -> None:
+    """Drop expired entries, then the oldest if still over the cap."""
+    now = time.monotonic()
+    expired = [
+        repo_id
+        for repo_id, (_, stored_at) in _blob_size_cache.items()
+        if now - stored_at > _BLOB_SIZE_CACHE_TTL
+    ]
+    for repo_id in expired:
+        _blob_size_cache.pop(repo_id, None)
+    overflow = len(_blob_size_cache) - _BLOB_SIZE_CACHE_MAX
+    if overflow <= 0:
+        return
+    oldest = sorted(_blob_size_cache.items(), key=lambda item: item[1][1])
+    for repo_id, _ in oldest[:overflow]:
+        _blob_size_cache.pop(repo_id, None)
+
+
+def _store_blob_size(repo_id: str, size: int) -> None:
+    """Cache Hub blob sizes that actually resolved. Failures stay uncached."""
+    if size > 0:
+        _blob_size_cache[repo_id] = (size, time.monotonic())
+        _prune_blob_size_cache()
+
+
+async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, int]:
+    """Fetch blob sizes for U32-packed repos, concurrently, with a batch cap."""
+    unique_ids = list(dict.fromkeys(repo_ids))
+    if not unique_ids:
+        return {}
+
+    sizes: dict[str, int] = {}
+    to_fetch: list[str] = []
+    for repo_id in unique_ids:
+        cached = _cached_blob_size(repo_id)
+        if cached is not None:
+            sizes[repo_id] = cached
+        else:
+            to_fetch.append(repo_id)
+    if not to_fetch:
+        return sizes
+
+    semaphore = asyncio.Semaphore(_BLOB_FETCH_CONCURRENCY)
+
+    async def _one(repo_id: str) -> tuple[str, int]:
+        async with semaphore:
+            try:
+                size = await asyncio.to_thread(
+                    _fetch_safetensors_blob_bytes, api, repo_id
+                )
+                return repo_id, size
+            except Exception:
+                return repo_id, 0
+
+    tasks = [asyncio.create_task(_one(repo_id)) for repo_id in to_fetch]
+    done, pending = await asyncio.wait(tasks, timeout=_BLOB_FETCH_BATCH_TIMEOUT)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.warning(
+            "Timed out fetching safetensors blob sizes for %d U32-packed repo(s)",
+            len(pending),
+        )
+
+    for repo_id in to_fetch:
+        sizes.setdefault(repo_id, 0)
+    for task in done:
+        try:
+            repo_id, size = task.result()
+        except Exception:
+            continue
+        sizes[repo_id] = size
+        _store_blob_size(repo_id, size)
+    return sizes
+
+
+def _needs_u32_blob_fetch(model) -> bool:
+    """True when the listing has a U32 histogram but no sibling blob sizes."""
+    if not _histogram_has_packed_u32(getattr(model, "safetensors", None)):
+        return False
+    return _sum_safetensors_blob_bytes(getattr(model, "siblings", None)) is None
+
+
+def _list_disk_size(model, blob_sizes: dict[str, int]) -> int:
+    """On-disk size for a list_models row: dtype formula, or U32 blob bytes."""
+    safetensors = getattr(model, "safetensors", None)
+    params = _safetensors_parameters(safetensors)
     if not params:
         return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
+    if "U32" in params:
+        blob = _sum_safetensors_blob_bytes(getattr(model, "siblings", None))
+        if blob is not None:
+            return blob
+        return int(blob_sizes.get(getattr(model, "id", ""), 0) or 0)
+    return _calc_safetensors_disk_size({"parameters": params})
+
+
+def _calc_safetensors_disk_size(safetensors: dict) -> int:
+    """Estimate disk size from a dtype histogram.
+
+    Accurate for BF16/F16/F32. Wrong for U32-packed MLX quants: HF reports
+    logical parameter counts under U32, not packed word counts (#3401).
+
+    Malformed counts (None, non-int) return 0 rather than raising, so one
+    bad Hub row cannot take down Browse/Search/Recommended.
+    """
+    params = safetensors.get("parameters", {}) or {}
+    if not params:
+        return 0
+    try:
+        return sum(
+            int(count) * _DTYPE_BYTES.get(dtype, 1)
+            for dtype, count in params.items()
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_model_size(size_bytes: int) -> str:
@@ -350,10 +537,13 @@ def _format_param_count(total_params: int) -> str:
 
 def _get_param_count(safetensors: dict) -> int:
     """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
+    params = safetensors.get("parameters", {}) or {}
     if not params:
         return 0
-    return sum(params.values())
+    try:
+        return sum(int(count) for count in params.values())
+    except (TypeError, ValueError):
+        return 0
 
 
 # HF API sort field mapping for search.
@@ -405,7 +595,7 @@ class HFDownloader:
         """
         api, _endpoint = _get_hf_api()
 
-        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+        async def _list(sort: str) -> tuple[list, bool]:
             kwargs = {
                 "sort": sort,
                 "limit": limit,
@@ -415,48 +605,63 @@ class HFDownloader:
                 kwargs["author"] = "mlx-community"
             # list_models returns a lazy generator; drain it inside the worker
             # thread so the paginated HTTP calls never block the event loop.
-            models, token_rejected = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
+
+        (trending_models, trending_rejected), (popular_models, popular_rejected) = (
+            await asyncio.gather(
+                _list("trendingScore"),
+                _list("downloads"),
+            )
+        )
+
+        def _eligible(model) -> bool:
+            if not _safetensors_parameters(getattr(model, "safetensors", None)):
+                return False
+            return (model.downloads or 0) >= _MIN_DOWNLOADS
+
+        need_blob: list[str] = []
+        for models in (trending_models, popular_models):
+            for model in models:
+                if _eligible(model) and _needs_u32_blob_fetch(model):
+                    need_blob.append(model.id)
+        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
+
+        def _build(models) -> list[dict]:
             results = []
-            for m in models:
-                if not m.safetensors or not m.safetensors.get("parameters"):
+            for model in models:
+                if not _eligible(model):
                     continue
-                downloads = m.downloads or 0
-                if downloads < _MIN_DOWNLOADS:
-                    continue
-                size = _calc_safetensors_disk_size(m.safetensors)
+                size = _list_disk_size(model, blob_sizes)
                 if size <= 0 or size > max_memory_bytes:
                     continue
-                params = _get_param_count(m.safetensors)
+                params = _get_param_count(
+                    {"parameters": _safetensors_parameters(model.safetensors)}
+                )
                 results.append(
                     {
-                        "repo_id": m.id,
-                        "name": m.id.split("/")[-1],
-                        "downloads": downloads,
-                        "likes": m.likes or 0,
-                        "trending_score": m.trending_score or 0,
+                        "repo_id": model.id,
+                        "name": model.id.split("/")[-1],
+                        "downloads": model.downloads or 0,
+                        "likes": model.likes or 0,
+                        "trending_score": model.trending_score or 0,
                         "size": size,
-                        "size_formatted": _format_model_size(size),
+                        "size_formatted": (
+                            _format_model_size(size) if size > 0 else ""
+                        ),
                         "params": params if params > 0 else None,
                         "params_formatted": (
                             _format_param_count(params) if params > 0 else None
                         ),
                     }
                 )
-            return results, token_rejected
-
-        (trending, trending_rejected), (popular, popular_rejected) = (
-            await asyncio.gather(
-                _fetch("trendingScore"),
-                _fetch("downloads"),
-            )
-        )
+            return results
 
         return {
-            "trending": trending[:result_limit],
-            "popular": popular[:result_limit],
+            "trending": _build(trending_models)[:result_limit],
+            "popular": _build(popular_models)[:result_limit],
             "hf_token_invalid": trending_rejected or popular_rejected,
         }
 
@@ -522,24 +727,31 @@ class HFDownloader:
             timeout=_HF_API_TIMEOUT,
         )
 
-        results = []
+        pending: list[tuple[object, int | None, dict]] = []
         for m in models:
             params = None
-            params_formatted = None
-            size = 0
-
-            if m.safetensors and m.safetensors.get("parameters"):
-                params = _get_param_count(m.safetensors)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if params and params <= 0:
-                    params = None
-
-            # Apply filters
+            st_params = _safetensors_parameters(getattr(m, "safetensors", None))
+            if st_params:
+                params = _get_param_count({"parameters": st_params}) or None
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
                 continue
+            pending.append((m, params, st_params))
+
+        need_blob = [m.id for m, _, _ in pending if _needs_u32_blob_fetch(m)]
+        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
+
+        results = []
+        for m, params, st_params in pending:
+            size = 0
+            params_formatted = None
+            if st_params:
+                params_formatted = (
+                    _format_param_count(params) if params and params > 0 else None
+                )
+                size = _list_disk_size(m, blob_sizes)
+
             if min_size is not None and size < min_size:
                 continue
             if max_size is not None and size > max_size:
@@ -615,17 +827,18 @@ class HFDownloader:
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
 
-        # Extract params and size from safetensors
+        # Params from the dtype histogram (logical count). Size from current
+        # revision blob bytes — U32 packed quants are not 4 bytes/param (#3401).
         params = None
         params_formatted = None
-        size = 0
+        size = _sum_safetensors_blob_bytes(info.siblings) or 0
         safetensors = getattr(info, "safetensors", None)
-        if safetensors:
-            st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
-            if st_dict.get("parameters"):
-                params = _get_param_count(st_dict)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(st_dict)
+        st_params = _safetensors_parameters(safetensors)
+        if st_params:
+            params = _get_param_count({"parameters": st_params})
+            params_formatted = _format_param_count(params) if params > 0 else None
+            if size == 0 and "U32" not in st_params:
+                size = _calc_safetensors_disk_size({"parameters": st_params})
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -907,24 +1120,35 @@ class HFDownloader:
                             api.model_info,
                             task.repo_id,
                             token=hf_token or None,
-                            expand=["safetensors"],
+                            files_metadata=True,
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
-                    if model_info.safetensors and model_info.safetensors.get(
-                        "parameters"
-                    ):
+                    st_params = _safetensors_parameters(
+                        getattr(model_info, "safetensors", None)
+                    )
+                    if st_params:
                         ignore_patterns = [
                             "*.bin",
                             "original/**",
                             "consolidated.*.pth",
                         ]
-                        # Computed inside this try so malformed metadata
-                        # (non-int counts) degrades to no estimate instead
-                        # of failing the download from the dry-run handler.
-                        st_estimate = _calc_safetensors_disk_size(
-                            model_info.safetensors
-                        )
+                        # Blob sizes match the download; the U32 dtype
+                        # histogram is logical params, not disk bytes (#3401).
+                        # Non-int counts degrade to no estimate instead of
+                        # failing the download from the dry-run handler.
+                        try:
+                            blob = _sum_safetensors_blob_bytes(
+                                getattr(model_info, "siblings", None)
+                            )
+                            if blob is not None:
+                                st_estimate = blob
+                            elif "U32" not in st_params:
+                                st_estimate = _calc_safetensors_disk_size(
+                                    {"parameters": st_params}
+                                )
+                        except (TypeError, ValueError):
+                            st_estimate = 0
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
