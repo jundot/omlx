@@ -3619,6 +3619,28 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
+    def test_glm5_next_hybrid_uses_512_block(self, mock_tokenizer, tmp_path):
+        """glm5_next stays on block 512: measured on a 20-turn growing conversation
+        through the API, block 2048 pins the prefix-cache hit at 2048 and every
+        turn re-prefills up to 2047 tokens (15-21 s); with 512 the hit follows the
+        conversation (10-14 s, -21%), and chunk sizes above 512 do not move this
+        model's prefill time (29k tokens: 186/181/186 s at 32/512/1024).
+        OMLX_ARRAYS_CACHE_BLOCK overrides for any hybrid."""
+        with patch("omlx.settings.get_system_memory", return_value=64 * 1024**3):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next_text"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+        try:
+            assert scheduler.config.paged_cache_block_size == 512
+            assert scheduler.config.prefill_step_size == 512
+        finally:
+            scheduler.shutdown()
+
     def test_custom_prefill_step_raises_arrays_block(self, mock_tokenizer, tmp_path):
         scheduler = Scheduler(
             model=self._hybrid_model(model_type="other_hybrid"),
