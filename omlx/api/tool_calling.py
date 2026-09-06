@@ -471,7 +471,14 @@ def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str
         search = close + len(close_tag)
 
 
-_XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=(\w+)>")
+# Parameter names follow the same convention as tool/function names (see
+# _XML_FUNCTION_CLOSE handling above and _parse_bracket_tool_calls): they
+# must start with a letter/underscore and may contain word chars, dots, and
+# hyphens (e.g. "unit-type"). A bare \w+ here silently fails to match a
+# hyphenated or dotted parameter name, so the whole <parameter=...> element
+# is skipped and that argument is dropped from the parsed result even
+# though the surrounding tool call otherwise parses successfully.
+_XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z_][\w.-]*)>")
 
 
 def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
@@ -615,7 +622,14 @@ def _parse_xml_tool_calls(
         # Bounded by rfind rather than a non-greedy match: the payload is already
         # delimited, so the element closes at the LAST </function>, and a literal
         # copy inside a parameter value must not end it early (#2507).
-        func_open = re.match(r"<function=(\w+)>", content)
+        # Tool/function names follow the same convention as elsewhere in this
+        # module (see _parse_bracket_tool_calls, ToolCallStreamFilter): they
+        # must start with a letter/underscore and may contain word chars,
+        # dots, and hyphens (e.g. "web.search" or "get-weather"). A bare
+        # \w+ here would silently fail to match — and thus drop — a
+        # call to any hyphenated or dotted tool name, even though it is
+        # otherwise valid per the model's own schema/output.
+        func_open = re.match(r"<function=([A-Za-z_][\w.-]*)>", content)
         func_close = content.rfind(_XML_FUNCTION_CLOSE)
         if func_open and func_close >= func_open.end():
             func_name = func_open.group(1)
