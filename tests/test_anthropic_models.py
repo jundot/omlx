@@ -431,6 +431,42 @@ class TestThinkingConfig:
         assert config.type == "enabled"
 
 
+class TestOutputConfig:
+    """Tests for output_config passthrough (Claude Code /effort selector)."""
+
+    def test_output_config_effort(self):
+        """Test output_config with an effort value is preserved."""
+        req = MessagesRequest(
+            model="claude-3-opus",
+            max_tokens=4096,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+            output_config={"effort": "high"},
+        )
+
+        assert req.output_config == {"effort": "high"}
+
+    def test_output_config_default_none(self):
+        """Test output_config defaults to None."""
+        req = MessagesRequest(
+            model="claude-3-opus",
+            max_tokens=4096,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        assert req.output_config is None
+
+    def test_output_config_extra_fields_preserved(self):
+        """Test unknown output_config fields are kept (forward-compat)."""
+        req = MessagesRequest(
+            model="claude-3-opus",
+            max_tokens=4096,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+            output_config={"effort": "xhigh", "something_new": 1},
+        )
+
+        assert req.output_config == {"effort": "xhigh", "something_new": 1}
+
+
 class TestMessagesRequest:
     """Tests for MessagesRequest model."""
 
