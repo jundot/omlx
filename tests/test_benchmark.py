@@ -856,6 +856,66 @@ class TestBenchmarkEngineSelection:
         assert pool._scheduler_config.prefill_speed_priority is False
 
     @pytest.mark.asyncio
+    async def test_run_benchmark_logs_gen_tps_in_pp_result(self, caplog):
+        run = BenchmarkRun(
+            bench_id="bench-log-gen-tps",
+            request=BenchmarkRequest(
+                model_id="m",
+                prompt_lengths=[1024],
+                generation_length=1,
+            ),
+        )
+        with (
+            patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()),
+            caplog.at_level(logging.INFO),
+        ):
+            await run_benchmark(run, _FakeBenchEnginePool())
+
+        pp_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if "[benchmark-pp-result]" in record.getMessage()
+        ]
+        assert pp_logs
+        assert "processing_tps=" in pp_logs[0]
+        assert "gen_tps=" in pp_logs[0]
+
+    @pytest.mark.asyncio
+    async def test_run_benchmark_logs_zero_gen_tps_when_unmeasured(self, caplog):
+        run = BenchmarkRun(
+            bench_id="bench-log-gen-tps-none",
+            request=BenchmarkRequest(
+                model_id="m",
+                prompt_lengths=[1024],
+                generation_length=128,
+            ),
+        )
+        metrics = {
+            "prompt_tokens": 1024,
+            "completion_tokens": 128,
+            "cached_tokens": 0,
+            "ttft_ms": 100.0,
+            "e2e_latency_s": 0.25,
+            "tpot_ms": None,
+            "gen_tps": None,
+            "processing_tps": 500.0,
+        }
+        with (
+            patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()),
+            patch("omlx.admin.benchmark._run_single_test", AsyncMock(return_value=metrics)),
+            caplog.at_level(logging.INFO),
+        ):
+            await run_benchmark(run, _FakeBenchEnginePool())
+
+        pp_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if "[benchmark-pp-result]" in record.getMessage()
+        ]
+        assert pp_logs
+        assert "gen_tps=0.000" in pp_logs[0]
+
+    @pytest.mark.asyncio
     async def test_batch_request_skips_engine_with_none_scheduler_core(self):
         run = BenchmarkRun(
             bench_id="bench-test",
