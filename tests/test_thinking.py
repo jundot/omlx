@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for thinking/reasoning content parser."""
 
-from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.api.thinking import (
+    ThinkingParser,
+    _CLOSE_TAG,
+    _OPEN_TAG,
+    extract_thinking,
+    reclassify_truncated_thinking,
+)
 
 
 class TestExtractThinking:
@@ -427,3 +433,112 @@ class TestCleanOutputTextBackwardCompat:
         from omlx.api.utils import clean_output_text
         result = clean_output_text("<|im_end|>Hello<|endoftext|>")
         assert result == "Hello"
+
+
+class TestTruncatedThinkingRecovery:
+    """Regression tests for issue #2457.
+
+    When a generation is cut off by max_tokens (finish_reason == "length")
+    while the model is still inside a thinking block, the accumulated
+    reasoning must NOT be re-emitted as content. Doing so leaks the chain
+    of thought into the visible answer.
+    """
+
+    # -- Streaming path: ThinkingParser.finish(truncated=...) ------------
+
+    def test_streaming_truncated_does_not_recover_thinking_as_content(self):
+        """finish(truncated=True) skips recovery: no content leak."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("the user is asking ")
+        parser.feed("about a complex topic")
+        t, c = parser.finish(truncated=True)
+        # Nothing is recovered as content — the reasoning is not leaked.
+        assert t == ""
+        assert c == ""
+
+    def test_streaming_truncated_with_partial_buffer_thinking(self):
+        """A buffered partial tag (the "<" of a close tag) stays thinking,
+        not content, when the stream is truncated."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("draft text ")
+        parser.feed("<")  # partial close tag buffered
+        t, c = parser.finish(truncated=True)
+        assert t == "<"
+        assert c == ""
+
+    def test_streaming_truncated_after_close_tag_keeps_content(self):
+        """Once a close tag has switched to content mode, truncated finish
+        does not resurrect the earlier thinking as content."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("draft")
+        parser.feed(_CLOSE_TAG + "answer")
+        t, c = parser.finish(truncated=True)
+        assert t == ""
+        assert c == ""
+
+    def test_streaming_not_truncated_still_recovers(self):
+        """Default finish() (not truncated) keeps the #903 recovery behavior."""
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("the whole answer ")
+        parser.feed("never closed")
+        t, c = parser.finish()
+        assert t == ""
+        assert c == "the whole answer never closed"
+
+    def test_streaming_truncated_accumulated_not_emitted_as_content(self):
+        """The accumulated reasoning text is never surfaced as content."""
+        parser = ThinkingParser(start_in_thinking=True)
+        chunks = ["step one ", "step two ", "step three"]
+        for ch in chunks:
+            parser.feed(ch)
+        t, c = parser.finish(truncated=True)
+        assert t == ""
+        assert c == ""
+
+    # -- Non-streaming path: reclassify_truncated_thinking ----------------
+
+    def test_reclassify_truncated_thinking_reclassifies(self):
+        """length + prompt-opened thinking + no close tag -> all thinking."""
+        raw = "1. **Analyse the request**\nstep one\nstep two"
+        thinking, content = reclassify_truncated_thinking(
+            raw, "length", start_in_thinking=True
+        )
+        assert thinking == raw
+        assert content == ""
+
+    def test_reclassify_truncated_thinking_keeps_normal_separation(self):
+        """With a close tag present, normal separation is untouched."""
+        raw = _OPEN_TAG + "reasoning" + _CLOSE_TAG + "answer"
+        thinking, content = reclassify_truncated_thinking(
+            raw, "length", start_in_thinking=True
+        )
+        assert thinking == "reasoning"
+        assert content == "answer"
+
+    def test_reclassify_truncated_thinking_stop_keeps_recovery(self):
+        """finish_reason == "stop" keeps the tag-free content recovery (#903)."""
+        raw = "the whole answer body"
+        thinking, content = reclassify_truncated_thinking(
+            raw, "stop", start_in_thinking=True
+        )
+        assert thinking == ""
+        assert content == "the whole answer body"
+
+    def test_reclassify_truncated_thinking_no_think_keeps_content(self):
+        """length but prompt did not open thinking: real truncated content."""
+        raw = "a real answer that got cut off"
+        thinking, content = reclassify_truncated_thinking(
+            raw, "length", start_in_thinking=False
+        )
+        assert thinking == ""
+        assert content == "a real answer that got cut off"
+
+    def test_reclassify_truncated_thinking_with_close_tag_no_change(self):
+        """length + close tag present: even without open tag, keep as content."""
+        raw = "thought" + _CLOSE_TAG + "answer"
+        thinking, content = reclassify_truncated_thinking(
+            raw, "length", start_in_thinking=True
+        )
+        # _CLOSE_TAG present in raw -> normal extract_thinking result.
+        assert thinking == "thought"
+        assert content == "answer"
