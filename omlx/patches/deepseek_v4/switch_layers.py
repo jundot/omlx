@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Apple Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DeepSeek V4 switch layers with an experimental MXFP4 block-list MoE GEMM."""
+"""DeepSeek V4 switch layers with block-list quantized MoE GEMMs."""
 
 from __future__ import annotations
 
@@ -245,7 +245,8 @@ class QuantizedSwitchLinear(nn.Module):
             and x.shape[-2] == 1
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
-            and self.bits in (2, 3)
+            and self.bits in (2, 3, 4, 6, 8)
+            and glm_fast.affine_moe_supports_bits(self.bits)
             and self.mode == "affine"
             and biases is not None
             and "bias" not in self
