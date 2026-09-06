@@ -348,6 +348,14 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Paged-cache block size (in tokens) for ArraysCache-only hybrid models
+    # (GatedDeltaNet: Qwen3.5/3.6, GLM-5.x). None (default) picks the auto target
+    # (at least 2048, floored by the effective prefill step and the Qwen wide
+    # prefill floor). An explicit value is honored even below the prefill step so
+    # short-turn workloads get prefix-cache hits (small blocks cost more boundary
+    # snapshots on the uncached part of a prompt, but a hit then covers a whole
+    # short turn). See issue #3430.
+    arrays_cache_block_size: int | None = None
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -439,6 +447,7 @@ class CacheSettings:
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "arrays_cache_block_size": self.arrays_cache_block_size,
         }
 
     @classmethod
@@ -489,6 +498,7 @@ class CacheSettings:
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            arrays_cache_block_size=data.get("arrays_cache_block_size"),
         )
 
 
@@ -1727,6 +1737,7 @@ class GlobalSettings:
                 self.cache.gdn_ssd_pending_max_size
             ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            arrays_cache_block_size=self.cache.arrays_cache_block_size,
         )
 
     def to_dict(self) -> dict[str, Any]:

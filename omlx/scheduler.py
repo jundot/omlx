@@ -1569,6 +1569,10 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
+    # Explicit operator override for the ArraysCache-only hybrid block size
+    # (from settings `cache.arrays_cache_block_size` / --arrays-cache-block-size).
+    # None/0 selects the auto target in _enlarge_block_size_for_arrays_cache.
+    arrays_cache_block_size: int | None = None
     max_cache_blocks: int | None = (
         None  # Auto-calculated from available KV cache memory
     )
@@ -2815,6 +2819,29 @@ class Scheduler:
             self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
         )
         if not has_arrays_cache:
+            return
+
+        # Explicit operator override (settings cache.arrays_cache_block_size /
+        # --arrays-cache-block-size): honor it exactly, even below the prefill
+        # step or the 2048 default floor. For a short-turn workload a small block
+        # lets the whole (short) prompt land in a single cached block, so every
+        # subsequent turn is a prefix-cache hit; the cost is more recurrent-state
+        # boundary snapshots on the uncached part of a prompt, which is the
+        # trade-off the operator is opting into (see #3430). Unlike the
+        # OMLX_ARRAYS_CACHE_BLOCK env override (#3407), this intentionally leaves
+        # prefill_step_size independent so the operator can shape cache-hit
+        # granularity without also reshaping prefill chunking.
+        explicit = self.config.arrays_cache_block_size
+        if explicit:
+            if self.config.paged_cache_block_size != explicit:
+                logger.info(
+                    "Using configured arrays_cache_block_size=%s for "
+                    "ArraysCache hybrid model (auto target overridden; short "
+                    "prompts now get prefix-cache hits at the cost of more "
+                    "boundary snapshots)",
+                    explicit,
+                )
+                self.config.paged_cache_block_size = explicit
             return
 
         target = max(
@@ -7498,6 +7525,61 @@ class Scheduler:
             )
             return None
 
+    def _verify_live_boundary_aligned(
+        self, request_id: str, uid: int, boundary_tokens: int
+    ) -> list[dict[str, Any]] | None:
+        """Return extracted cache state iff the live cache is exactly at a block
+        boundary, else None.
+
+        Recovery path for the store-time ``_BoundaryStoreUnavailable`` case: when
+        every decode-time boundary capture was skipped (MTP skew guard) but the
+        request finished on a block boundary, the live recurrent/rotating state
+        sits at that boundary and is safe to persist. The leaf cache ``offset``
+        must equal the boundary token count exactly — mirroring
+        ``_extract_boundary_snapshot``'s positional-consistency guard — so we
+        never label an off-boundary state with a block-boundary count.
+        """
+        if self.batch_generator is None or uid is None or uid < 0:
+            return None
+        try:
+            with self._phase_timer("store_cache_boundary_verify"):
+                _safe_sync_stream(self._stream)
+                with mx.stream(self._stream):
+                    result = self.batch_generator.extract_cache([uid])
+            if uid not in result:
+                logger.debug(
+                    "Cannot verify live cache for %s: uid %s not present",
+                    request_id,
+                    uid,
+                )
+                return None
+            cache_list, _tokens = result[uid]
+            for c in cache_list:
+                offset = _first_leaf_cache_offset(c)
+                if offset is None:
+                    continue
+                if offset != boundary_tokens:
+                    logger.debug(
+                        "Live cache for %s is off-boundary (offset %d != boundary %d); "
+                        "skipping recovery store",
+                        request_id,
+                        offset,
+                        boundary_tokens,
+                    )
+                    return None
+                break
+            extracted_cache, _ = self._extract_cache_states(cache_list)
+            if not extracted_cache:
+                return None
+            return extracted_cache
+        except Exception as e:
+            logger.debug(
+                "Failed to verify live cache for boundary store %s: %s",
+                request_id,
+                e,
+            )
+            return None
+
     def _prepare_prompt_boundary_cache_store(
         self,
         request_id: str,
@@ -11543,7 +11625,63 @@ class Scheduler:
                                             # the current decode offset (which
                                             # speculative decode can leave off
                                             # the emitted count entirely).
-                                            raise _BoundaryStoreUnavailable()
+                                            #
+                                            # Recovery: when every decode-time
+                                            # capture was skipped (MTP skew
+                                            # guard) but the request itself
+                                            # finished on a block boundary, the
+                                            # live extracted cache is exactly
+                                            # that boundary-aligned snapshot —
+                                            # storing it is safe and recovers
+                                            # prefix reuse instead of throwing
+                                            # away a usable recurrent state.
+                                            block_size = (
+                                                self.config.paged_cache_block_size
+                                            )
+                                            live_cache = None
+                                            if (
+                                                block_size > 0
+                                                and len(cacheable_sequence)
+                                                % block_size
+                                                == 0
+                                            ):
+                                                # Only trust the live state when
+                                                # its leaf cache offset actually
+                                                # sits on the boundary (emitted
+                                                # length alone can be fooled by
+                                                # the MTP emit queue). uid_for_store
+                                                # may be unset when this request
+                                                # carried its own _extracted_cache,
+                                                # so resolve it here.
+                                                live_uid = (
+                                                    self.request_id_to_uid.get(
+                                                        request_id, -1
+                                                    )
+                                                )
+                                                live_cache = (
+                                                    self._verify_live_boundary_aligned(
+                                                        request_id,
+                                                        live_uid,
+                                                        len(cacheable_sequence),
+                                                    )
+                                                )
+                                            if live_cache:
+                                                token_sequence_to_store = (
+                                                    cacheable_sequence
+                                                )
+                                                cache_to_store = live_cache
+                                                intermediate_snapshots = None
+                                                logger.info(
+                                                    "Using live boundary-aligned "
+                                                    "cache for %s: request finished "
+                                                    "on block boundary "
+                                                    "(%d/%d tokens)",
+                                                    request_id,
+                                                    len(cacheable_sequence),
+                                                    len(full_token_sequence),
+                                                )
+                                            else:
+                                                raise _BoundaryStoreUnavailable()
                                         if boundary_override is not None:
                                             (
                                                 token_sequence_to_store,

@@ -320,6 +320,11 @@ def serve_command(args):
                 args.hot_cache_write_through
             )
 
+        # ArraysCache block size override: explicit CLI flag > settings file
+        # (already carried through settings.to_scheduler_config()).
+        if getattr(args, "arrays_cache_block_size", None) is not None:
+            scheduler_config.arrays_cache_block_size = args.arrays_cache_block_size
+
         if args.no_cache:
             print(
                 "Mode: Multi-model serving (no oMLX cache, mlx-lm BatchGenerator only)"
@@ -1147,6 +1152,15 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+    serve_parser.add_argument(
+        "--arrays-cache-block-size",
+        type=int,
+        default=None,
+        help="Paged-cache block size (tokens) for ArraysCache hybrids (Qwen3.5/3.6, "
+        "GLM-5.x). Overrides the auto 2048+ floor so short prompts get "
+        "prefix-cache hits (e.g. 64-256 for a short-turn voice agent); costs more "
+        "boundary snapshots on the uncached part of a prompt.",
     )
 
     # MCP options
