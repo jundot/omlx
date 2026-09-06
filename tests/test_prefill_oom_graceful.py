@@ -1546,7 +1546,7 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     original_adaptive = ns._adaptive_chunk_size
 
     def adaptive(n, **kwargs):
-        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(True))
+        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(False))
         return original_adaptive(n, **kwargs)
 
     ns._adaptive_chunk_size = adaptive

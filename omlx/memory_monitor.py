@@ -13,6 +13,7 @@ Key features:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import Counter
@@ -43,6 +44,28 @@ except ImportError:
 # different head dimensions; unsupported cases fall back to an unfused
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+
+
+def qwen4_gathered_min_query_tokens() -> int:
+    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
+    try:
+        return max(
+            2, int(os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "16"))
+        )
+    except ValueError:
+        return 16
+
+
+def qwen4_gathered_prefill_route(
+    query_tokens: int, cache_tokens: int, indexer_budget: int
+) -> bool:
+    """Whether Qwen4 text prefill uses sparse gathered QSA."""
+    return (
+        query_tokens >= qwen4_gathered_min_query_tokens()
+        and cache_tokens + query_tokens > indexer_budget
+    )
+
+
 _SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # Default bytes/elem for the materialized unfused score matrix when the model's
@@ -862,6 +885,16 @@ class MemoryMonitor:
         """True when this monitor prices Qwen4 QSA gathered-core prefill."""
         return isinstance(
             self._prefill_memory_profile, _Qwen4ExpPrefillMemoryProfile
+        )
+
+    def qwen4_gathered_prefill_route(
+        self, query_tokens: int, cache_tokens: int
+    ) -> bool:
+        profile = self._prefill_memory_profile
+        return isinstance(
+            profile, _Qwen4ExpPrefillMemoryProfile
+        ) and qwen4_gathered_prefill_route(
+            query_tokens, cache_tokens, profile.indexer_budget
         )
 
     def estimate_chunk_transient_bytes(
