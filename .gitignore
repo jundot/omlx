@@ -129,3 +129,4 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+packaging/_venvstacks_resolved.toml
