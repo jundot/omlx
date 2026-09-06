@@ -30,6 +30,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1751,6 +1752,31 @@ class VLMBatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
+
+        # Native-fp16 activations. Off by default; OMLX_ACT_FP16=1 forces it on
+        # for a one-off A/B without touching persisted settings.
+        if os.environ.get("OMLX_ACT_FP16") == "1" or getattr(
+            self._model_settings, "activation_fp16_enabled", False
+        ):
+            try:
+                from ..utils.model_loading import cast_bf16_params_to_fp16
+
+                recast = await loop.run_in_executor(
+                    get_mlx_executor(), cast_bf16_params_to_fp16, self._vlm_model
+                )
+                if recast:
+                    logger.info(
+                        "activation dtype: bfloat16 -> float16 (%d tensors)", recast
+                    )
+                else:
+                    logger.info(
+                        "activation dtype: already float16 or better; nothing to recast"
+                    )
+            except Exception:
+                logger.warning(
+                    "fp16 activation recast failed; staying on bfloat16",
+                    exc_info=True,
+                )
 
         # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
         # The repacked safetensors carries 2-bit biases for format compat;

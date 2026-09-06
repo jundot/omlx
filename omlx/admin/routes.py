@@ -142,6 +142,8 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
     mtp_num_draft_tokens: int | None = None
+    # Recast the checkpoint's bfloat16 leaves to float16 after load
+    activation_fp16_enabled: bool | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
@@ -1947,6 +1949,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        try:
+            from ..utils.model_loading import checkpoint_has_bf16_leaves
+
+            activation_fp16_supported = checkpoint_has_bf16_leaves(
+                model_info.get("model_path", "") or ""
+            )
+        except (OSError, TypeError, ValueError):
+            activation_fp16_supported = False
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2030,6 +2040,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "activation_fp16_supported": activation_fp16_supported,
         }
 
         # Add settings if available
@@ -2394,6 +2405,11 @@ async def update_model_settings(
             request.index_cache_freq
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
+        )
+    # Load-time activation dtype recast
+    if "activation_fp16_enabled" in sent:
+        current_settings.activation_fp16_enabled = (
+            request.activation_fp16_enabled or False
         )
     # TurboQuant KV cache settings
     if "turboquant_kv_enabled" in sent:
