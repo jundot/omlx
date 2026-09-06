@@ -505,6 +505,78 @@ class TestRunSingleTest:
         assert metrics["gen_tps"] < 1000.0
 
     @pytest.mark.asyncio
+    async def test_records_per_trial_expert_streaming_and_metal_metrics(self):
+        class InstrumentedEngine:
+            def __init__(self):
+                self.lookups = 100
+
+            def get_stats(self):
+                result = {
+                    "cache_slots_per_layer": 128,
+                    "layer_count": 48,
+                    "resident_experts": 6144,
+                    "resident_capacity": 6144,
+                    "execution_bank_slots": 32,
+                    "execution_banks_per_layer": 4,
+                    "hotlist_preloaded": 1536,
+                    "optimistic_preloaded": 0,
+                    "route_lookups": self.lookups,
+                    "cache_hits": self.lookups - 10,
+                    "cache_misses": 10,
+                    "evictions": 4,
+                    "loads": 10,
+                    "ssd_bytes_read": 4096,
+                    "ssd_io_seconds": 0.25,
+                    "bank_materialize_seconds": 0.5,
+                    "bank_group_calls": 12,
+                    "qmm_calls": 36,
+                }
+                return {"expert_streaming": result}
+
+            async def stream_generate(self, **kwargs):
+                self.lookups = 140
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=32,
+                    cached_tokens=0,
+                    new_text="xx",
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tps=16.0,
+                    generation_tps=2.0,
+                )
+
+        with (
+            patch("omlx.admin.benchmark.mx.get_active_memory", side_effect=[11, 22]),
+            patch("omlx.admin.benchmark.mx.get_peak_memory", return_value=33),
+        ):
+            metrics = await _run_single_test(
+                InstrumentedEngine(),
+                prompt=[0] * 32,
+                max_tokens=2,
+                pp_len=32,
+            )
+
+        streaming = metrics["expert_streaming"]
+        assert streaming["route_lookups"] == 40
+        assert streaming["cache_hits"] == 40
+        assert streaming["cache_misses"] == 0
+        assert streaming["hit_rate"] == 1.0
+        assert streaming["cache_slots_per_layer"] == 128
+        assert streaming["execution_bank_slots"] == 32
+        assert streaming["execution_banks_per_layer"] == 4
+        assert streaming["hotlist_preloaded"] == 1536
+        assert streaming["optimistic_preloaded"] == 0
+        assert streaming["resident_fill_rate"] == 1.0
+        assert streaming["hotlist_preload_fill_rate"] == 0.25
+        assert streaming["startup_preload_fill_rate"] == 0.25
+        assert metrics["metal_memory"] == {
+            "active_start_bytes": 11,
+            "active_end_bytes": 22,
+            "peak_bytes": 33,
+        }
+
+    @pytest.mark.asyncio
     async def test_uses_diffusion_canvas_metrics_when_eos_stops_early(self):
         """Diffusion benchmark TG should measure canvas work, not early EOS text."""
 
@@ -617,7 +689,26 @@ class TestRunBatchTest:
                 )
 
         core = Core()
-        engine = SimpleNamespace(_engine=core)
+
+        class Engine:
+            _engine = core
+
+            def __init__(self):
+                self.snapshots = 0
+
+            def get_stats(self):
+                value = self.snapshots * 4
+                self.snapshots += 1
+                return {
+                    "expert_streaming": {
+                        "cache_slots_per_layer": 32,
+                        "cache_hits": value,
+                        "cache_misses": 0,
+                        "qmm_calls": value * 3,
+                    }
+                }
+
+        engine = Engine()
         prompts = [[row] * 1024 for row in (1, 2)]
 
         metrics = await _run_batch_test(
@@ -631,6 +722,9 @@ class TestRunBatchTest:
         assert list(core.prompts.values()) == prompts
         assert core.skip_cache_store == [True, True]
         assert metrics["batch_size"] == 2
+        assert metrics["expert_streaming"]["cache_hits"] == 4
+        assert metrics["expert_streaming"]["qmm_calls"] == 12
+        assert metrics["metal_memory"]["peak_bytes"] >= 0
 
     @pytest.mark.asyncio
     async def test_rejects_mismatched_prompt_before_submission(self):

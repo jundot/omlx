@@ -177,3 +177,14 @@ def test_qwen4_exp_loader_uses_explicit_ple_ssd_offload_setting(tmp_path):
         for_vlm=True,
     )
     assert get_ple_runtime_mode() == "mmap"
+
+    maybe_apply_pre_load_patches(
+        str(tmp_path),
+        SimpleNamespace(
+            mtp_enabled=False,
+            qwen4_ple_ssd_offload=False,
+            expert_streaming_enabled=True,
+        ),
+        for_vlm=True,
+    )
+    assert get_ple_runtime_mode() == "mmap"

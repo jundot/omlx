@@ -57,6 +57,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// MoE expert streaming capability and the currently projected resident
+    /// footprint for pinned experts, PLE, and configured hot-cache slots.
+    let expertStreamingSupported: Bool?
+    let expertStreamingResidentBytes: Int64?
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -89,6 +93,18 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
+    // SSD Expert Streaming / Soft-REAP
+    let expertStreamingEnabled: Bool?
+    let expertStreamingMode: String?
+    let expertStreamingManifest: String?
+    let expertStreamingCacheExperts: Int?
+    let expertStreamingScratchExperts: Int?
+    let expertStreamingCachePolicy: String?
+    let expertStreamingFastResourceLoading: Bool?
+    let expertStreamingDirectIo: Bool?
+    let expertStreamingNativeDemand: Bool?
+    let expertStreamingDecodeScratchAsCache: Bool?
+    let expertStreamingIoCoalescingKib: Int?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -176,6 +192,18 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool? = nil
     var qwen4PleSsdOffload: Bool? = nil
+    // SSD Expert Streaming / Soft-REAP
+    var expertStreamingEnabled: Bool? = nil
+    var expertStreamingMode: String? = nil
+    var expertStreamingManifest: String? = nil
+    var expertStreamingCacheExperts: Int? = nil
+    var expertStreamingScratchExperts: Int? = nil
+    var expertStreamingCachePolicy: String? = nil
+    var expertStreamingFastResourceLoading: Bool? = nil
+    var expertStreamingDirectIo: Bool? = nil
+    var expertStreamingNativeDemand: Bool? = nil
+    var expertStreamingDecodeScratchAsCache: Bool? = nil
+    var expertStreamingIoCoalescingKib: Int? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
@@ -238,6 +266,16 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+}
+
+/// Result returned after the server validates and stores a Soft-REAP JSON
+/// manifest for a model.
+struct ExpertManifestUploadResponse: Codable, Equatable, Sendable {
+    let success: Bool
+    let manifestPath: String
+    let layers: Int
+    let pinnedCountMin: Int
+    let pinnedCountMax: Int
 }
 
 /// Generic acknowledgment shape returned by non-streaming admin endpoints

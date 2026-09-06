@@ -1,5 +1,5 @@
 class Omlx < Formula
-  CUSTOM_KERNELS = %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill].freeze
+  CUSTOM_KERNELS = %w[bonsai decode_fast fast_resource_loading glm_moe_dsa minimax_m3 qwen35_prefill].freeze
 
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"

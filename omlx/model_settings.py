@@ -220,6 +220,19 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Experimental SSD expert streaming. Disabled by default; when enabled,
+    # exact router demand fills bounded per-layer banks from safetensor shards.
+    expert_streaming_enabled: bool = False
+    expert_streaming_mode: str = "soft_reap"
+    expert_streaming_manifest: Optional[str] = None
+    expert_streaming_cache_experts: int = 32
+    expert_streaming_scratch_experts: int = 32
+    expert_streaming_cache_policy: str = "route_frequency"
+    expert_streaming_fast_resource_loading: bool = True
+    expert_streaming_direct_io: bool = True
+    expert_streaming_native_demand: bool = True
+    expert_streaming_decode_scratch_as_cache: bool = True
+    expert_streaming_io_coalescing_kib: int = 64
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
@@ -339,6 +352,36 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if self.expert_streaming_mode not in {"soft_reap", "cache_only"}:
+            raise ValueError("expert_streaming_mode must be soft_reap or cache_only")
+        if self.expert_streaming_cache_policy not in {"lru", "route_frequency"}:
+            raise ValueError("expert_streaming_cache_policy must be lru or route_frequency")
+        for name, value in (
+            ("expert_streaming_cache_experts", self.expert_streaming_cache_experts),
+            ("expert_streaming_scratch_experts", self.expert_streaming_scratch_experts),
+        ):
+            if not 0 <= value <= 512:
+                raise ValueError(f"{name} must be between 0 and 512")
+        if not 0 <= self.expert_streaming_io_coalescing_kib <= 4096:
+            raise ValueError(
+                "expert_streaming_io_coalescing_kib must be between 0 and 4096"
+            )
+        if self.expert_streaming_enabled:
+            if (
+                self.expert_streaming_mode == "soft_reap"
+                and not self.expert_streaming_manifest
+            ):
+                raise ValueError(
+                    "expert_streaming_manifest is required in soft_reap mode"
+                )
+            if not self.expert_streaming_fast_resource_loading and (
+                self.expert_streaming_direct_io or self.expert_streaming_native_demand
+            ):
+                raise ValueError(
+                    "expert streaming direct I/O and native demand require "
+                    "Fast Resource Loading"
+                )
+
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is

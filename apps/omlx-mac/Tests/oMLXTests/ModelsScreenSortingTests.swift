@@ -68,6 +68,8 @@ final class ModelsScreenSortingTests: XCTestCase {
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
             qwen4PleMmapBytes: nil,
+            expertStreamingSupported: nil,
+            expertStreamingResidentBytes: nil,
             virtual: nil,
             settings: nil
         )

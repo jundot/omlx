@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 @MainActor
@@ -109,6 +110,28 @@ final class ModelSettingsScreenVM {
             ("8", String(localized: "settings.turboquant.bits.8",
                          defaultValue: "8-bit",
                          comment: "TurboQuant KV bit-width option")),
+        ]
+    }
+
+    static var expertStreamingModeOptions: [(String, String)] {
+        [
+            ("soft_reap", String(localized: "settings.expert_streaming.mode.soft_reap",
+                                 defaultValue: "Soft-REAP pinning",
+                                 comment: "SSD expert streaming mode that pins experts selected by a manifest")),
+            ("cache_only", String(localized: "settings.expert_streaming.mode.cache_only",
+                                  defaultValue: "Analytical cache only",
+                                  comment: "SSD expert streaming mode with no automatically pinned experts")),
+        ]
+    }
+
+    static var expertStreamingCachePolicyOptions: [(String, String)] {
+        [
+            ("route_frequency", String(localized: "settings.expert_streaming.cache_policy.frequency",
+                                      defaultValue: "Route frequency",
+                                      comment: "SSD expert cache policy based on decayed route frequency")),
+            ("lru", String(localized: "settings.expert_streaming.cache_policy.lru",
+                           defaultValue: "Least recently used",
+                           comment: "SSD expert cache policy based on recent access")),
         ]
     }
 
@@ -241,6 +264,19 @@ final class ModelSettingsScreenVM {
     var qwen4PleSsdOffload: Bool = false
     var qwen4PleSsdOffloadSupported: Bool = false
     var qwen4PleSsdOffloadForced: Bool = false
+    var expertStreamingEnabled: Bool = false
+    var expertStreamingMode: String = "soft_reap"
+    var expertStreamingManifest: String = ""
+    var expertStreamingCacheExperts: String = "32"
+    var expertStreamingScratchExperts: String = "32"
+    var expertStreamingCachePolicy: String = "route_frequency"
+    var expertStreamingFastResourceLoading: Bool = true
+    var expertStreamingDirectIo: Bool = true
+    var expertStreamingNativeDemand: Bool = true
+    var expertStreamingDecodeScratchAsCache: Bool = true
+    var expertStreamingIoCoalescingKib: String = "64"
+    var expertManifestUploadInProgress: Bool = false
+    var expertManifestSummary: String?
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -376,6 +412,11 @@ final class ModelSettingsScreenVM {
         (model?.configModelType ?? "")
             .lowercased()
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
+    }
+
+    var expertManifestFileName: String {
+        guard !expertStreamingManifest.isEmpty else { return "" }
+        return (expertStreamingManifest as NSString).lastPathComponent
     }
 
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
@@ -516,6 +557,18 @@ final class ModelSettingsScreenVM {
                     m.qwen4PleSsdOffloadSupported ?? false
                 self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
                     || (s?.qwen4PleSsdOffload ?? false)
+                self.expertStreamingEnabled = s?.expertStreamingEnabled ?? false
+                self.expertStreamingMode = s?.expertStreamingMode ?? "soft_reap"
+                self.expertStreamingManifest = s?.expertStreamingManifest ?? ""
+                self.expertStreamingCacheExperts = s?.expertStreamingCacheExperts.map(String.init) ?? "32"
+                self.expertStreamingScratchExperts = s?.expertStreamingScratchExperts.map(String.init) ?? "32"
+                self.expertStreamingCachePolicy = s?.expertStreamingCachePolicy ?? "route_frequency"
+                self.expertStreamingFastResourceLoading = s?.expertStreamingFastResourceLoading ?? true
+                self.expertStreamingDirectIo = s?.expertStreamingDirectIo ?? true
+                self.expertStreamingNativeDemand = s?.expertStreamingNativeDemand ?? true
+                self.expertStreamingDecodeScratchAsCache = s?.expertStreamingDecodeScratchAsCache ?? true
+                self.expertStreamingIoCoalescingKib = s?.expertStreamingIoCoalescingKib.map(String.init) ?? "64"
+                self.expertManifestSummary = nil
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -878,6 +931,49 @@ final class ModelSettingsScreenVM {
         }
     }
 
+    func uploadExpertManifest(url: URL, client: OMLXClient) async {
+        guard !expertManifestUploadInProgress else { return }
+        expertManifestUploadInProgress = true
+        defer { expertManifestUploadInProgress = false }
+
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+        }
+
+        do {
+            let fileSize = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            guard (fileSize ?? 0) <= 2 * 1024 * 1024 else {
+                lastError = String(localized: "settings.expert_streaming.manifest.too_large",
+                                   defaultValue: "The expert manifest must be 2 MiB or smaller.",
+                                   comment: "Validation error when an expert manifest exceeds the upload limit")
+                return
+            }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            guard data.count <= 2 * 1024 * 1024 else {
+                lastError = String(localized: "settings.expert_streaming.manifest.too_large",
+                                   defaultValue: "The expert manifest must be 2 MiB or smaller.",
+                                   comment: "Validation error when an expert manifest exceeds the upload limit")
+                return
+            }
+            let response = try await client.uploadExpertManifest(
+                id: modelID,
+                fileName: url.lastPathComponent,
+                data: data
+            )
+            expertStreamingManifest = response.manifestPath
+            expertManifestSummary = String(
+                localized: "settings.expert_streaming.manifest.summary",
+                defaultValue: "\(response.layers) layers · \(response.pinnedCountMin)–\(response.pinnedCountMax) pinned experts per layer",
+                comment: "Summary shown after a Soft-REAP expert manifest is validated and uploaded"
+            )
+            profileDirty = true
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
     /// Stage the best tuner result in the working profile. The user can then
     /// update the active profile or save it as a new one without detaching the
     /// model from its current profile via a direct settings write.
@@ -1152,6 +1248,30 @@ final class ModelSettingsScreenVM {
 
         // Model-specific — experimental
         if !isDiffusion {
+            putBool(ProfileSettingsKey.expertStreamingEnabled, expertStreamingEnabled)
+            if expertStreamingEnabled {
+                putString(ProfileSettingsKey.expertStreamingMode, expertStreamingMode)
+                if expertStreamingMode == "soft_reap" {
+                    putString(ProfileSettingsKey.expertStreamingManifest, expertStreamingManifest)
+                }
+                putInt(ProfileSettingsKey.expertStreamingCacheExperts, expertStreamingCacheExperts)
+                putInt(ProfileSettingsKey.expertStreamingScratchExperts, expertStreamingScratchExperts)
+                putBool(
+                    ProfileSettingsKey.expertStreamingFastResourceLoading,
+                    expertStreamingFastResourceLoading
+                )
+                putString(
+                    ProfileSettingsKey.expertStreamingCachePolicy,
+                    expertStreamingCachePolicy
+                )
+                putBool(ProfileSettingsKey.expertStreamingDirectIo, expertStreamingDirectIo)
+                putBool(ProfileSettingsKey.expertStreamingNativeDemand, expertStreamingNativeDemand)
+                putBool(
+                    ProfileSettingsKey.expertStreamingDecodeScratchAsCache,
+                    expertStreamingDecodeScratchAsCache
+                )
+                putInt(ProfileSettingsKey.expertStreamingIoCoalescingKib, expertStreamingIoCoalescingKib)
+            }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
@@ -1352,7 +1472,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateQwenAneWorkingSettings(), validateExpertStreamingWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1399,7 +1519,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateQwenAneWorkingSettings(), validateExpertStreamingWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1474,6 +1594,61 @@ final class ModelSettingsScreenVM {
         case .success: return true
         case .failure(let error): lastError = error.message; return false
         }
+    }
+
+    private func validateExpertStreamingWorkingSettings() -> Bool {
+        guard expertStreamingEnabled else { return true }
+        guard Self.expertStreamingModeOptions.contains(where: { $0.0 == expertStreamingMode }) else {
+            lastError = String(localized: "settings.expert_streaming.validation.mode",
+                               defaultValue: "Choose a valid SSD Expert Streaming mode.",
+                               comment: "Validation error for an unknown SSD expert streaming mode")
+            return false
+        }
+        if expertStreamingMode == "soft_reap",
+           expertStreamingManifest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lastError = String(localized: "settings.expert_streaming.validation.manifest",
+                               defaultValue: "Choose a Soft-REAP expert manifest before saving.",
+                               comment: "Validation error when Soft-REAP mode has no expert manifest")
+            return false
+        }
+        guard let cacheExperts = Int(expertStreamingCacheExperts), (0...512).contains(cacheExperts) else {
+            lastError = String(localized: "settings.expert_streaming.validation.cache",
+                               defaultValue: "Hot cache size must be a whole number from 0 to 512 experts per layer.",
+                               comment: "Validation error for SSD expert streaming hot cache size")
+            return false
+        }
+        guard let scratchExperts = Int(expertStreamingScratchExperts),
+              (0...512).contains(scratchExperts) else {
+            lastError = String(
+                localized: "settings.expert_streaming.validation.scratch",
+                defaultValue: "Cold execution size must be a whole number from 0 to 512 experts per layer.",
+                comment: "Validation error for SSD expert streaming scratch size"
+            )
+            return false
+        }
+        guard Self.expertStreamingCachePolicyOptions.contains(where: {
+            $0.0 == expertStreamingCachePolicy
+        }) else {
+            lastError = String(localized: "settings.expert_streaming.validation.cache_policy",
+                               defaultValue: "Choose a valid SSD Expert Streaming cache policy.",
+                               comment: "Validation error for an unknown SSD expert cache policy")
+            return false
+        }
+        guard let coalescingKib = Int(expertStreamingIoCoalescingKib),
+              (0...4096).contains(coalescingKib) else {
+            lastError = String(localized: "settings.expert_streaming.validation.coalescing",
+                               defaultValue: "I/O coalescing must be a whole number from 0 to 4096 KiB.",
+                               comment: "Validation error for SSD expert I/O coalescing")
+            return false
+        }
+        guard !expertStreamingNativeDemand || expertStreamingFastResourceLoading,
+              !expertStreamingDirectIo || expertStreamingFastResourceLoading else {
+            lastError = String(localized: "settings.expert_streaming.validation.fast_resource",
+                               defaultValue: "Native demand and direct I/O require Fast Resource Loading.",
+                               comment: "Validation error for dependent SSD expert streaming settings")
+            return false
+        }
+        return true
     }
 
     /// Discard working changes by reloading the server's view.

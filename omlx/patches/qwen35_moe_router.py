@@ -206,9 +206,14 @@ def apply_qwen35_moe_router_patch() -> bool:
                 gates = mx.softmax(gates, axis=-1, precise=True)
                 inds, scores = fused_router_topk(gates, self.top_k)
 
-                y = vlm_moe._target_verify_switch_glu(
-                    self.switch_mlp, x, inds, target_verify
-                )
+                if getattr(self.switch_mlp, "_omlx_expert_streaming", False):
+                    # The streaming pool chunks wide MTP verification routes
+                    # as a whole GLU so each expert group is loaded once.
+                    y = self.switch_mlp(x, inds)
+                else:
+                    y = vlm_moe._target_verify_switch_glu(
+                        self.switch_mlp, x, inds, target_verify
+                    )
                 y = (y * scores[..., None]).sum(axis=-2)
 
                 shared_y = self.shared_expert(x, target_verify)

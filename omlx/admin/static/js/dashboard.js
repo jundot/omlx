@@ -7378,6 +7378,33 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    expert_streaming_supported:
+                        model?.expert_streaming_supported === true,
+                    expert_streaming_enabled: s.expert_streaming_enabled === true,
+                    expert_streaming_mode: s.expert_streaming_mode || 'soft_reap',
+                    expert_streaming_manifest: s.expert_streaming_manifest || '',
+                    expert_streaming_manifest_name: s.expert_streaming_manifest
+                        ? s.expert_streaming_manifest.split('/').pop()
+                        : '',
+                    expert_streaming_manifest_file: null,
+                    expert_streaming_cache_experts:
+                        s.expert_streaming_cache_experts ?? 32,
+                    expert_streaming_scratch_experts:
+                        s.expert_streaming_scratch_experts ?? 32,
+                    expert_streaming_cache_policy:
+                        s.expert_streaming_cache_policy || 'route_frequency',
+                    expert_streaming_fast_resource_loading:
+                        s.expert_streaming_fast_resource_loading !== false,
+                    expert_streaming_direct_io:
+                        s.expert_streaming_direct_io !== false,
+                    expert_streaming_native_demand:
+                        s.expert_streaming_native_demand !== false,
+                    expert_streaming_decode_scratch_as_cache:
+                        s.expert_streaming_decode_scratch_as_cache !== false,
+                    expert_streaming_io_coalescing_kib:
+                        s.expert_streaming_io_coalescing_kib ?? 64,
+                    expert_streaming_resident_bytes:
+                        model?.expert_streaming_resident_bytes || 0,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -8247,6 +8274,28 @@
 
                 this.savingModelSettings = true;
                 try {
+                    let expertManifestPath = this.modelSettings.expert_streaming_manifest || '';
+                    const manifestFile = this.modelSettings.expert_streaming_manifest_file;
+                    const softReapMode =
+                        this.modelSettings.expert_streaming_mode === 'soft_reap';
+                    if (this.modelSettings.expert_streaming_enabled && softReapMode && manifestFile) {
+                        const form = new FormData();
+                        form.append('file', manifestFile);
+                        const uploadResponse = await fetch(
+                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/expert-manifest`,
+                            { method: 'POST', body: form },
+                        );
+                        const uploadData = await uploadResponse.json();
+                        if (!uploadResponse.ok) {
+                            throw new Error(uploadData.detail || 'Invalid Soft-REAP manifest');
+                        }
+                        expertManifestPath = uploadData.manifest_path;
+                        this.modelSettings.expert_streaming_manifest = expertManifestPath;
+                        this.modelSettings.expert_streaming_manifest_name = manifestFile.name;
+                    }
+                    if (this.modelSettings.expert_streaming_enabled && softReapMode && !expertManifestPath) {
+                        throw new Error('Upload a Soft-REAP manifest before enabling expert streaming.');
+                    }
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
@@ -8300,6 +8349,31 @@
                                 enable_thinking: this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                expert_streaming_enabled:
+                                    !!this.modelSettings.expert_streaming_enabled,
+                                expert_streaming_mode:
+                                    this.modelSettings.expert_streaming_mode || 'soft_reap',
+                                expert_streaming_manifest:
+                                    this.modelSettings.expert_streaming_enabled && softReapMode
+                                        ? (expertManifestPath || null)
+                                        : null,
+                                expert_streaming_cache_experts:
+                                    Number(this.modelSettings.expert_streaming_cache_experts) || 0,
+                                expert_streaming_scratch_experts:
+                                    Number(this.modelSettings.expert_streaming_scratch_experts) || 0,
+                                expert_streaming_cache_policy:
+                                    this.modelSettings.expert_streaming_cache_policy || 'route_frequency',
+                                expert_streaming_fast_resource_loading:
+                                    !!this.modelSettings.expert_streaming_enabled
+                                    && !!this.modelSettings.expert_streaming_fast_resource_loading,
+                                expert_streaming_direct_io:
+                                    !!this.modelSettings.expert_streaming_direct_io,
+                                expert_streaming_native_demand:
+                                    !!this.modelSettings.expert_streaming_native_demand,
+                                expert_streaming_decode_scratch_as_cache:
+                                    !!this.modelSettings.expert_streaming_decode_scratch_as_cache,
+                                expert_streaming_io_coalescing_kib:
+                                    Number(this.modelSettings.expert_streaming_io_coalescing_kib) || 0,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -8500,7 +8574,7 @@
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
-                    alert(window.t('js.error.save_model_settings_failed'));
+                    alert(err?.message || window.t('js.error.save_model_settings_failed'));
                 } finally {
                     this.savingModelSettings = false;
                 }

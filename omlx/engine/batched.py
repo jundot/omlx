@@ -9,6 +9,7 @@ for better throughput when serving multiple concurrent requests.
 import copy
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -271,6 +272,12 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                lazy=bool(
+                    self._model_settings is not None
+                    and getattr(
+                        self._model_settings, "expert_streaming_enabled", False
+                    )
+                ),
             )
 
         loop = asyncio.get_running_loop()
@@ -286,6 +293,100 @@ class BatchedEngine(BaseEngine):
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
 
+        if getattr(self._model_settings, "expert_streaming_enabled", False):
+            from ..expert_streaming import install_expert_streaming
+
+            manifest_path = getattr(
+                self._model_settings, "expert_streaming_manifest", None
+            )
+            streaming_mode = str(
+                getattr(self._model_settings, "expert_streaming_mode", "soft_reap")
+            )
+            if streaming_mode == "soft_reap" and not manifest_path:
+                raise ValueError(
+                    "Expert streaming is enabled without a Soft-REAP manifest"
+                )
+            hotlist_cache_root = getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            )
+            hotlist_profile_dir = (
+                Path(hotlist_cache_root) / "expert-hotlists"
+                if hotlist_cache_root
+                else None
+            )
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: install_expert_streaming(
+                    self._model,
+                    self._model_name,
+                    manifest_path,
+                    cache_experts=int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_cache_experts",
+                            32,
+                        )
+                    ),
+                    scratch_experts=int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_scratch_experts",
+                            32,
+                        )
+                    ),
+                    cache_policy=str(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_cache_policy",
+                            "route_frequency",
+                        )
+                    ),
+                    streaming_mode=streaming_mode,
+                    hotlist_profile_dir=hotlist_profile_dir,
+                    fast_resource_loading=(
+                        "all"
+                        if bool(
+                            getattr(
+                                self._model_settings,
+                                "expert_streaming_fast_resource_loading",
+                                True,
+                            )
+                        )
+                        else False
+                    ),
+                    direct_io=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_direct_io",
+                            True,
+                        )
+                    ),
+                    native_demand=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_native_demand",
+                            True,
+                        )
+                    ),
+                    native_demand_decode_only=True,
+                    decode_scratch_as_cache=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_decode_scratch_as_cache",
+                            True,
+                        )
+                    ),
+                    fast_resource_max_gap_bytes=1024
+                    * int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_io_coalescing_kib",
+                            64,
+                        )
+                    ),
+                ),
+            )
+
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(
@@ -299,6 +400,9 @@ class BatchedEngine(BaseEngine):
         if (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(
+                self._model_settings, "expert_streaming_enabled", False
+            )
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -661,6 +765,7 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        runtime = getattr(self._model, "_omlx_expert_streaming_runtime", None)
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
@@ -668,6 +773,11 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+        if runtime is not None:
+            try:
+                runtime.close()
+            except Exception:
+                logger.warning("Error closing expert streaming runtime", exc_info=True)
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -1289,6 +1399,9 @@ class BatchedEngine(BaseEngine):
         }
         if self._engine:
             stats.update(self._engine.get_stats())
+        runtime = getattr(self._model, "_omlx_expert_streaming_runtime", None)
+        if runtime is not None:
+            stats["expert_streaming"] = runtime.stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

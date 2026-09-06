@@ -475,6 +475,128 @@
                                    class="text-xs text-amber-600">{{ t('modal.model_settings.qwen4_ple_ssd_offload_forced') }}</p>
                             </div>
 
+                            <!-- SSD Expert Streaming -->
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="modelSettings.expert_streaming_supported" x-cloak>
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming') }}</span>
+                                        <span class="ml-1 text-[10px] font-bold uppercase tracking-wider text-amber-600">{{ t('modal.model_settings.experimental_label') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="modelSettings.expert_streaming_enabled = !modelSettings.expert_streaming_enabled"
+                                            :class="modelSettings.expert_streaming_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="modelSettings.expert_streaming_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="modelSettings.expert_streaming_enabled" x-transition class="space-y-3 pt-1">
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_streaming_mode') }}</span>
+                                        <select x-model="modelSettings.expert_streaming_mode"
+                                                class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                            <option value="soft_reap">{{ t('modal.model_settings.expert_streaming_mode_soft_reap') }}</option>
+                                            <option value="cache_only">{{ t('modal.model_settings.expert_streaming_mode_cache_only') }}</option>
+                                        </select>
+                                        <span class="block mt-1 text-xs text-neutral-400"
+                                              x-text="modelSettings.expert_streaming_mode === 'cache_only' ? '{{ t('modal.model_settings.expert_streaming_mode_cache_only_hint')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.expert_streaming_mode_soft_reap_hint')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></span>
+                                    </label>
+                                    <label class="block" x-show="modelSettings.expert_streaming_mode === 'soft_reap'">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_manifest') }}</span>
+                                        <input type="file" accept="application/json,.json"
+                                               @change="modelSettings.expert_streaming_manifest_file = $event.target.files[0] || null; if (modelSettings.expert_streaming_manifest_file) modelSettings.expert_streaming_manifest_name = modelSettings.expert_streaming_manifest_file.name"
+                                               class="mt-1 block w-full text-xs text-neutral-600 file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-200 file:px-3 file:py-2 file:text-xs file:font-medium file:text-neutral-700 hover:file:bg-neutral-300">
+                                        <span x-show="modelSettings.expert_streaming_manifest_name"
+                                              x-text="modelSettings.expert_streaming_manifest_name"
+                                              class="block mt-1 text-xs text-neutral-400 truncate"></span>
+                                    </label>
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_cache') }}</span>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_cache_experts"
+                                               min="0" max="512" step="1"
+                                               class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                        <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_cache_hint') }}</span>
+                                    </label>
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_cache_policy') }}</span>
+                                        <select x-model="modelSettings.expert_streaming_cache_policy"
+                                                class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                            <option value="route_frequency">{{ t('modal.model_settings.expert_cache_policy_frequency') }}</option>
+                                            <option value="lru">{{ t('modal.model_settings.expert_cache_policy_lru') }}</option>
+                                        </select>
+                                        <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_cache_policy_hint') }}</span>
+                                    </label>
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_scratch') }}</span>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_scratch_experts"
+                                               min="0" max="512" step="1"
+                                               class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                        <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_scratch_hint') }}</span>
+                                    </label>
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_fast_resource_loading') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_fast_resource_loading_hint') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="modelSettings.expert_streaming_fast_resource_loading = !modelSettings.expert_streaming_fast_resource_loading"
+                                                :class="modelSettings.expert_streaming_fast_resource_loading ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.expert_streaming_fast_resource_loading ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_direct_io') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_direct_io_hint') }}</p>
+                                        </div>
+                                        <button type="button" @click="modelSettings.expert_streaming_direct_io = !modelSettings.expert_streaming_direct_io"
+                                                :class="modelSettings.expert_streaming_direct_io ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.expert_streaming_direct_io ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_native_demand') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_native_demand_hint') }}</p>
+                                        </div>
+                                        <button type="button" @click="modelSettings.expert_streaming_native_demand = !modelSettings.expert_streaming_native_demand"
+                                                :class="modelSettings.expert_streaming_native_demand ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.expert_streaming_native_demand ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_decode_scratch') }}</span>
+                                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_decode_scratch_hint') }}</p>
+                                        </div>
+                                        <button type="button" @click="modelSettings.expert_streaming_decode_scratch_as_cache = !modelSettings.expert_streaming_decode_scratch_as_cache"
+                                                :class="modelSettings.expert_streaming_decode_scratch_as_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.expert_streaming_decode_scratch_as_cache ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <label class="block">
+                                        <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_io_coalescing') }}</span>
+                                        <input type="number" x-model.number="modelSettings.expert_streaming_io_coalescing_kib"
+                                               min="0" max="4096" step="1"
+                                               class="mt-1 w-full px-3 py-2 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                        <span class="block mt-1 text-xs text-neutral-400">{{ t('modal.model_settings.expert_io_coalescing_hint') }}</span>
+                                    </label>
+                                    <p x-show="modelSettings.expert_streaming_resident_bytes > 0"
+                                       class="text-xs text-neutral-500"
+                                       x-text="'{{ t('modal.model_settings.expert_projected_resident')|replace('\\', '\\\\')|replace("'", "\\'") }} ' + formatSizeBytes(modelSettings.expert_streaming_resident_bytes)"></p>
+                                </div>
+                            </div>
+
                             <!-- Thinking Budget -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>

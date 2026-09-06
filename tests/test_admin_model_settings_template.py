@@ -167,6 +167,10 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.qwen_ane_tune_test",
         "modal.model_settings.qwen_ane_tune_throughput",
         "modal.model_settings.qwen_ane_tail_padding",
+        "modal.model_settings.expert_scratch",
+        "modal.model_settings.expert_scratch_hint",
+        "modal.model_settings.expert_fast_resource_loading",
+        "modal.model_settings.expert_fast_resource_loading_hint",
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
@@ -202,6 +206,47 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     assert 'placeholder="0.53"' in html
     assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
+
+
+def test_expert_streaming_cold_execution_bank_is_fully_wired():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    field = "expert_streaming_scratch_experts"
+
+    assert f'modelSettings.{field}' in html
+    assert script.count(f"{field}:") >= 2
+    assert f"s.{field} ?? 32" in script
+    assert f"Number(this.modelSettings.{field}) || 0" in script
+
+
+def test_expert_streaming_fast_resource_loading_is_fully_wired():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    field = "expert_streaming_fast_resource_loading"
+
+    assert f"modelSettings.{field}" in html
+    assert script.count(f"{field}:") >= 2
+    assert f"s.{field} !== false" in script
+    assert f"!!this.modelSettings.{field}" in script
+
+
+def test_expert_streaming_acceleration_controls_are_fully_wired():
+    html = _model_settings_template()
+    script = _dashboard_script()
+    fields = (
+        "expert_streaming_cache_policy",
+        "expert_streaming_direct_io",
+        "expert_streaming_native_demand",
+        "expert_streaming_decode_scratch_as_cache",
+        "expert_streaming_io_coalescing_kib",
+    )
+
+    for field in fields:
+        assert f"modelSettings.{field}" in html
+        assert script.count(f"{field}:") >= 2
+
+    assert "expert_streaming_substitution_threshold_percent" not in html
+    assert "expert_streaming_execution_policy" not in html
 
 
 def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():

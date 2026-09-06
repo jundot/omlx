@@ -1707,7 +1707,13 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    # Lazy loading is required for expert streaming on every
+                    # MoE architecture, not only Qwen4-Exp: streaming banks
+                    # are installed before materialization so routed expert
+                    # tensors never become resident.
+                    if model_type == QWEN4_EXP_MODEL_TYPE or getattr(
+                        self._model_settings, "expert_streaming_enabled", False
+                    ):
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
@@ -1719,6 +1725,100 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        if getattr(self._model_settings, "expert_streaming_enabled", False):
+            from ..expert_streaming import install_expert_streaming
+
+            manifest_path = getattr(
+                self._model_settings, "expert_streaming_manifest", None
+            )
+            streaming_mode = str(
+                getattr(self._model_settings, "expert_streaming_mode", "soft_reap")
+            )
+            if streaming_mode == "soft_reap" and not manifest_path:
+                raise ValueError(
+                    "Expert streaming is enabled without a Soft-REAP manifest"
+                )
+            hotlist_cache_root = getattr(
+                self._scheduler_config, "paged_ssd_cache_dir", None
+            )
+            hotlist_profile_dir = (
+                Path(hotlist_cache_root) / "expert-hotlists"
+                if hotlist_cache_root
+                else None
+            )
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: install_expert_streaming(
+                    self._vlm_model,
+                    self._model_name,
+                    manifest_path,
+                    cache_experts=int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_cache_experts",
+                            32,
+                        )
+                    ),
+                    scratch_experts=int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_scratch_experts",
+                            32,
+                        )
+                    ),
+                    cache_policy=str(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_cache_policy",
+                            "route_frequency",
+                        )
+                    ),
+                    streaming_mode=streaming_mode,
+                    hotlist_profile_dir=hotlist_profile_dir,
+                    fast_resource_loading=(
+                        "all"
+                        if bool(
+                            getattr(
+                                self._model_settings,
+                                "expert_streaming_fast_resource_loading",
+                                True,
+                            )
+                        )
+                        else False
+                    ),
+                    direct_io=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_direct_io",
+                            True,
+                        )
+                    ),
+                    native_demand=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_native_demand",
+                            True,
+                        )
+                    ),
+                    native_demand_decode_only=True,
+                    decode_scratch_as_cache=bool(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_decode_scratch_as_cache",
+                            True,
+                        )
+                    ),
+                    fast_resource_max_gap_bytes=1024
+                    * int(
+                        getattr(
+                            self._model_settings,
+                            "expert_streaming_io_coalescing_kib",
+                            64,
+                        )
+                    ),
+                ),
+            )
 
         if self.model_type == "unlimited-ocr":
             from ..utils.tokenizer import (
@@ -1776,6 +1876,9 @@ class VLMBatchedEngine(BaseEngine):
         if (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
+            and not getattr(
+                self._model_settings, "expert_streaming_enabled", False
+            )
         ):
             try:
                 from ..patches.qwen35_moe_gate_up import (
@@ -1847,6 +1950,11 @@ class VLMBatchedEngine(BaseEngine):
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
+        streaming_runtime = getattr(
+            self._vlm_model, "_omlx_expert_streaming_runtime", None
+        )
+        if streaming_runtime is not None:
+            streaming_runtime.attach_model(self._adapter)
 
         # Create scheduler config
         scheduler_config = (
@@ -2270,12 +2378,20 @@ class VLMBatchedEngine(BaseEngine):
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         engine = self._engine
-
+        runtime = getattr(
+            self._vlm_model, "_omlx_expert_streaming_runtime", None
+        )
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
             cancel_event.set()
 
         if engine:
             await engine.stop()
+
+        if runtime is not None:
+            try:
+                runtime.close()
+            except Exception:
+                logger.warning("Error closing expert streaming runtime", exc_info=True)
 
         if self._vision_cache is not None:
             try:
@@ -4593,6 +4709,9 @@ class VLMBatchedEngine(BaseEngine):
             stats["active_requests"] = self._diffusion_active_requests
         if self._engine:
             stats.update(self._engine.get_stats())
+        runtime = getattr(self._vlm_model, "_omlx_expert_streaming_runtime", None)
+        if runtime is not None:
+            stats["expert_streaming"] = runtime.stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

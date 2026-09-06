@@ -647,6 +647,169 @@ def _compute_single_metrics(
     }
 
 
+_EXPERT_STREAMING_DELTA_FIELDS = (
+    "route_lookups",
+    "pinned_hits",
+    "cache_hits",
+    "cache_misses",
+    "evictions",
+    "loads",
+    "pinned_loads",
+    "cold_loads",
+    "scratch_loads",
+    "scratch_prefetch_requests",
+    "warm_start_loads",
+    "expert_major_calls",
+    "qmm_calls",
+    "sorted_prefill_groups",
+    "sorted_prefill_routes",
+    "sorted_qmm_calls",
+    "route_materialize_calls",
+    "just_in_time_loads",
+    "native_demand_calls",
+    "native_demand_callbacks",
+    "native_demand_positions",
+    "native_demand_destination_fence_skips",
+    "elastic_decode_cache_activations",
+    "elastic_decode_cache_demotions",
+    "hotness_decays",
+    "ssd_bytes_read",
+    "ssd_read_operations",
+    "ssd_preload_bytes_read",
+    "ssd_preload_read_operations",
+    "ssd_cold_bytes_read",
+    "ssd_cold_read_operations",
+    "ssd_io_seconds",
+    "ssd_decode_seconds",
+    "bank_bind_seconds",
+    "bank_materialize_seconds",
+    "scratch_prefetch_wait_seconds",
+    "scratch_call_seconds",
+    "scratch_groups",
+    "scratch_load_seconds",
+    "scratch_gather_seconds",
+    "scratch_compute_seconds",
+    "scratch_scatter_seconds",
+    "scratch_submit_seconds",
+    "scratch_mlx_materialize_seconds",
+    "route_materialize_seconds",
+    "native_demand_submit_seconds",
+    "native_demand_callback_seconds",
+)
+
+_EXPERT_STREAMING_CONFIG_FIELDS = (
+    "cache_budget_bytes",
+    "cache_slots_per_layer",
+    "scratch_budget_bytes",
+    "scratch_slots_per_layer",
+    "layer_count",
+    "resident_experts",
+    "resident_capacity",
+    "execution_bank_slots",
+    "execution_banks_per_layer",
+    "fused_gate_up",
+    "sorted_prefill",
+    "streaming_mode",
+    "cache_policy",
+    "native_demand",
+    "native_demand_decode_only",
+    "decode_scratch_as_cache",
+    "fast_resource_loading",
+    "fast_resource_loading_scope",
+    "fast_resource_max_gap_bytes",
+    "direct_io",
+    "hotlist_profile",
+    "hotlist_preloaded",
+    "optimistic_preloaded",
+    "hotlist_profile_error",
+)
+
+
+def _expert_streaming_snapshot(engine: Any) -> dict[str, Any] | None:
+    """Read the engine's cumulative streaming counters when available."""
+    getter = getattr(engine, "get_stats", None)
+    if not callable(getter):
+        return None
+    try:
+        stats = getter()
+    except Exception:
+        logger.debug(
+            "Could not snapshot benchmark expert streaming stats", exc_info=True
+        )
+        return None
+    if not isinstance(stats, dict):
+        return None
+    streaming = stats.get("expert_streaming")
+    return dict(streaming) if isinstance(streaming, dict) else None
+
+
+def _expert_streaming_delta(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return per-trial counters without copying the large per-layer snapshot."""
+    if after is None:
+        return None
+    before = before or {}
+    result = {
+        key: after.get(key) for key in _EXPERT_STREAMING_CONFIG_FIELDS if key in after
+    }
+    for key in _EXPERT_STREAMING_DELTA_FIELDS:
+        if key not in after:
+            continue
+        current = after.get(key, 0)
+        previous = before.get(key, 0)
+        try:
+            result[key] = max(0, current - previous)
+        except TypeError:
+            continue
+    attempts = sum(
+        int(result.get(key, 0) or 0)
+        for key in ("pinned_hits", "cache_hits", "cache_misses")
+    )
+    result["hit_rate"] = (
+        (int(result.get("pinned_hits", 0) or 0) + int(result.get("cache_hits", 0) or 0))
+        / attempts
+        if attempts
+        else 1.0
+    )
+    capacity = int(result.get("resident_capacity", 0) or 0)
+    result["resident_fill_rate"] = (
+        int(result.get("resident_experts", 0) or 0) / capacity
+        if capacity
+        else 1.0
+    )
+    hot_capacity = (
+        int(result.get("cache_slots_per_layer", 0) or 0)
+        * int(result.get("layer_count", 0) or 0)
+    )
+    result["hotlist_preload_fill_rate"] = (
+        min(1.0, int(result.get("hotlist_preloaded", 0) or 0) / hot_capacity)
+        if hot_capacity
+        else 1.0
+    )
+    result["startup_preload_fill_rate"] = (
+        min(
+            1.0,
+            (
+                int(result.get("hotlist_preloaded", 0) or 0)
+                + int(result.get("optimistic_preloaded", 0) or 0)
+            )
+            / hot_capacity,
+        )
+        if hot_capacity
+        else 1.0
+    )
+    return result
+
+
+def _active_metal_memory() -> int:
+    try:
+        return int(mx.get_active_memory())
+    except Exception:
+        return 0
+
+
 def _pin_speed_priority(engine_pool: Any) -> bool | None:
     """Force prefill speed priority for the benchmark's duration.
 
@@ -712,6 +875,9 @@ async def _run_single_test(
             f"Benchmark prompt length mismatch before pp{pp_len}: "
             f"built {len(prompt)} tokens"
         )
+
+    streaming_before = _expert_streaming_snapshot(engine)
+    active_memory_start = _active_metal_memory()
 
     # Reset peak memory tracking
     try:
@@ -785,6 +951,8 @@ async def _run_single_test(
         peak_memory = mx.get_peak_memory()
     except Exception:
         peak_memory = 0
+    active_memory_end = _active_metal_memory()
+    streaming_after = _expert_streaming_snapshot(engine)
 
     if last_output is None:
         raise RuntimeError(f"Benchmark pp{pp_len} produced no engine output")
@@ -878,6 +1046,14 @@ async def _run_single_test(
     )
     if ane_trace_config is not None:
         metrics["ane_trace"] = ane_trace
+    metrics["metal_memory"] = {
+        "active_start_bytes": active_memory_start,
+        "active_end_bytes": active_memory_end,
+        "peak_bytes": peak_memory,
+    }
+    streaming_delta = _expert_streaming_delta(streaming_before, streaming_after)
+    if streaming_delta is not None:
+        metrics["expert_streaming"] = streaming_delta
     return metrics
 
 
@@ -1067,6 +1243,8 @@ async def _run_batch_test(
         temperature=0.0,
         top_p=1.0,
     )
+    streaming_before = _expert_streaming_snapshot(engine)
+    active_memory_start = _active_metal_memory()
 
     async def _single_request(prompt: list[int]) -> dict:
         """Run a single request within the batch."""
@@ -1125,6 +1303,8 @@ async def _run_batch_test(
             peak_memory = mx.get_peak_memory()
         except Exception:
             peak_memory = 0
+    active_memory_end = _active_metal_memory()
+    streaming_after = _expert_streaming_snapshot(engine)
 
     # Aggregate metrics
     total_gen_tokens = sum(r["completion_tokens"] for r in results)
@@ -1142,7 +1322,7 @@ async def _run_batch_test(
     gen_wall_time = wall_end - max_first_token
     tg_tps = total_gen_tokens / max(gen_wall_time, 1e-9)
 
-    return {
+    metrics = {
         "pp_tps": round(pp_tps, 1),
         "tg_tps": round(tg_tps, 1),
         "avg_ttft_ms": round(avg_ttft_ms, 1),
@@ -1150,7 +1330,16 @@ async def _run_batch_test(
         "peak_memory_bytes": peak_memory,
         "total_gen_tokens": total_gen_tokens,
         "batch_size": batch_size,
+        "metal_memory": {
+            "active_start_bytes": active_memory_start,
+            "active_end_bytes": active_memory_end,
+            "peak_bytes": peak_memory,
+        },
     }
+    streaming_delta = _expert_streaming_delta(streaming_before, streaming_after)
+    if streaming_delta is not None:
+        metrics["expert_streaming"] = streaming_delta
+    return metrics
 
 
 async def _run_external_single_test(
@@ -1962,6 +2151,103 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
                 int(metrics.get("cached_tokens", 0) or 0),
             )
+            streaming_metrics = metrics.get("expert_streaming")
+            if isinstance(streaming_metrics, dict):
+                logger.info(
+                    "[benchmark-expert-streaming] pp=%d slots=%s "
+                    "scratch=%s execution_bank=%s banks=%s fused_gate_up=%s "
+                    "hit_rate=%.4f hits=%d "
+                    "misses=%d evictions=%d loads=%d ssd_bytes=%d "
+                    "ssd_io_ms=%.3f decode_ms=%.3f bind_ms=%.3f "
+                    "materialize_ms=%.3f scratch_wait_ms=%.3f "
+                    "scratch_mlx_ms=%.3f "
+                    "expert_major=%d qmm_calls=%d sorted_groups=%d "
+                    "sorted_routes=%d sorted_qmm=%d "
+                    "resident_fill=%.4f hotlist_preloaded=%s "
+                    "optimistic_preloaded=%s hotlist_fill=%.4f "
+                    "startup_fill=%.4f metal_start_gib=%.3f "
+                    "metal_end_gib=%.3f metal_peak_gib=%.3f",
+                    pp_len,
+                    streaming_metrics.get("cache_slots_per_layer"),
+                    streaming_metrics.get("scratch_slots_per_layer"),
+                    streaming_metrics.get("execution_bank_slots"),
+                    streaming_metrics.get("execution_banks_per_layer"),
+                    streaming_metrics.get("fused_gate_up"),
+                    float(streaming_metrics.get("hit_rate", 1.0) or 0.0),
+                    int(streaming_metrics.get("pinned_hits", 0) or 0)
+                    + int(streaming_metrics.get("cache_hits", 0) or 0),
+                    int(streaming_metrics.get("cache_misses", 0) or 0),
+                    int(streaming_metrics.get("evictions", 0) or 0),
+                    int(streaming_metrics.get("loads", 0) or 0),
+                    int(streaming_metrics.get("ssd_bytes_read", 0) or 0),
+                    float(streaming_metrics.get("ssd_io_seconds", 0.0) or 0.0)
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get("ssd_decode_seconds", 0.0) or 0.0
+                    )
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get("bank_bind_seconds", 0.0) or 0.0
+                    )
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get("bank_materialize_seconds", 0.0)
+                        or 0.0
+                    )
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get("scratch_prefetch_wait_seconds", 0.0)
+                        or 0.0
+                    )
+                    * 1000.0,
+                    float(
+                        streaming_metrics.get(
+                            "scratch_mlx_materialize_seconds", 0.0
+                        )
+                        or 0.0
+                    )
+                    * 1000.0,
+                    int(streaming_metrics.get("expert_major_calls", 0) or 0),
+                    int(streaming_metrics.get("qmm_calls", 0) or 0),
+                    int(streaming_metrics.get("sorted_prefill_groups", 0) or 0),
+                    int(streaming_metrics.get("sorted_prefill_routes", 0) or 0),
+                    int(streaming_metrics.get("sorted_qmm_calls", 0) or 0),
+                    float(streaming_metrics.get("resident_fill_rate", 1.0) or 0.0),
+                    streaming_metrics.get("hotlist_preloaded"),
+                    streaming_metrics.get("optimistic_preloaded"),
+                    float(
+                        streaming_metrics.get("hotlist_preload_fill_rate", 1.0)
+                        or 0.0
+                    ),
+                    float(
+                        streaming_metrics.get("startup_preload_fill_rate", 1.0)
+                        or 0.0
+                    ),
+                    float(metrics["metal_memory"]["active_start_bytes"]) / 1024**3,
+                    float(metrics["metal_memory"]["active_end_bytes"]) / 1024**3,
+                    float(metrics["metal_memory"]["peak_bytes"]) / 1024**3,
+                )
+                if (
+                    streaming_metrics.get("streaming_mode") == "cache_only"
+                    and float(
+                        streaming_metrics.get("hotlist_preload_fill_rate", 0.0)
+                        or 0.0
+                    )
+                    < 1.0
+                ):
+                    logger.warning(
+                        "[benchmark-expert-streaming] pp=%d analytical cache "
+                        "hotlist was only %.1f%% prefilled; compare only with a "
+                        "run having the same warm-start coverage",
+                        pp_len,
+                        float(
+                            streaming_metrics.get(
+                                "hotlist_preload_fill_rate", 0.0
+                            )
+                            or 0.0
+                        )
+                        * 100.0,
+                    )
 
             result = {
                 "test_type": "single",
@@ -2015,6 +2301,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 batch_size=batch_size,
             )
             batch_metrics["system_metrics"] = _sample_window(run, window_start)
+            batch_streaming = batch_metrics.get("expert_streaming")
+            if isinstance(batch_streaming, dict):
+                logger.info(
+                    "[benchmark-expert-streaming-batch] batch=%d slots=%s "
+                    "hit_rate=%.4f misses=%d evictions=%d ssd_bytes=%d "
+                    "qmm_calls=%d metal_peak_gib=%.3f",
+                    batch_size,
+                    batch_streaming.get("cache_slots_per_layer"),
+                    float(batch_streaming.get("hit_rate", 1.0) or 0.0),
+                    int(batch_streaming.get("cache_misses", 0) or 0),
+                    int(batch_streaming.get("evictions", 0) or 0),
+                    int(batch_streaming.get("ssd_bytes_read", 0) or 0),
+                    int(batch_streaming.get("qmm_calls", 0) or 0),
+                    float(batch_metrics["metal_memory"]["peak_bytes"]) / 1024**3,
+                )
 
             result = {
                 "test_type": "batch",

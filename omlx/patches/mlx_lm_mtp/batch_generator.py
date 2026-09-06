@@ -86,6 +86,45 @@ from . import prompt_priming as _prompt_priming
 logger = logging.getLogger(__name__)
 
 
+def _native_expert_demand_enabled(model: Any) -> bool:
+    candidates = [model]
+    for name in ("_vlm_model", "_language_model", "language_model"):
+        candidate = getattr(model, name, None)
+        # Identity check: nn.Module is a dict subclass, so ``in`` would fall
+        # back to a deep dict comparison over parameter arrays.
+        if candidate is not None and not any(
+            candidate is existing for existing in candidates
+        ):
+            candidates.append(candidate)
+    return any(
+        bool(
+            getattr(
+                getattr(candidate, "_omlx_expert_streaming_runtime", None),
+                "native_demand",
+                False,
+            )
+        )
+        for candidate in candidates
+    )
+
+
+def _eval_for_model(model: Any, *arrays: Any) -> None:
+    """Release the GIL only when native expert-demand callbacks need it."""
+
+    import mlx.core as mx
+
+    if not _native_expert_demand_enabled(model):
+        mx.eval(*arrays)
+        return
+    from omlx.custom_kernels.fast_resource_loading import eval_with_gil_released
+
+    if eval_with_gil_released is None:
+        raise RuntimeError(
+            "Native expert demand requires the Fast Resource Loading extension"
+        )
+    eval_with_gil_released(*arrays)
+
+
 def _set_verify_qmm_armed(flag: bool) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
@@ -1311,7 +1350,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
             next_lp = next_lp_2d.squeeze(0)
 
-        mx.eval(next_tok)
+        _eval_for_model(gen_batch.model, next_tok)
         # Reconciliation produces committed standard-decoding state. A long
         # re-prefill is still an armed MTP-managed backbone call, so discard
         # its speculative snapshots before exposing or merging the cache.
@@ -2477,7 +2516,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
         # Depth-k seed: the history fold pairs hidden(main_tok) with
         # next_main_tok — the first committed history entry — and its logits
         # are the first draft's distribution; the rest of the chain follows.
-        mx.eval(main_tok, next_main_tok)
+        _eval_for_model(gen_batch.model, main_tok, next_main_tok)
         state = _MtpState(uid=gen_batch.uids[0])
         state.chain = True
         state.depth = depth
@@ -2537,7 +2576,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     # sampling distribution rather than the raw softmax.
     draft_accept_lp_2d = _accept_lp_for(sampler, draft_lp_2d)
 
-    mx.eval(main_tok, next_main_tok, draft_tok)
+    _eval_for_model(gen_batch.model, main_tok, next_main_tok, draft_tok)
 
     # Queue the two confirmed tokens (main_tok + next_main_tok); their
     # logprobs come from the standard / patched samplers. Cache draft_id
@@ -2700,7 +2739,7 @@ def _feed_next_main_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         last = _apply_processors(procs, prev_buf, logits[:, -1, :])
         lp_2d = _logprobs(last)
         next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
-        mx.eval(next_tok)
+        _eval_for_model(gen_batch.model, next_tok)
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
     except Exception as exc:
@@ -2948,6 +2987,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         step_tok = _ensure_uint32(sampler(combined_lp[:1]).reshape(1))
         m = 0
         draft_ids: List[int] = []
+        _eval_for_model(gen_batch.model, step_tok)
         emit_last_id = int(step_tok.tolist()[0])
         emit_last_lp = combined_lp[0]
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
@@ -2957,9 +2997,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
         matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
         m_arr = mx.cumprod(matches).sum().reshape(1)
-        host = mx.concatenate(
+        host_array = mx.concatenate(
             [m_arr, targets, state.drafts.astype(mx.int32)]
-        ).tolist()
+        )
+        _eval_for_model(gen_batch.model, host_array)
+        host = host_array.tolist()
         m = int(host[0])
         target_ids = host[1 : k + 2]
         draft_ids = host[k + 2 :]
@@ -2991,14 +3033,16 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         res_dist = mx.where(z > 0, res, p_all)
         res_samples = mx.random.categorical(mx.log(res_dist))  # (k,)
         bonus_tok = sampler(combined_lp[k : k + 1]).reshape(1)
-        host = mx.concatenate(
+        host_array = mx.concatenate(
             [
                 m_arr.astype(mx.int32),
                 state.drafts.astype(mx.int32),
                 res_samples.astype(mx.int32),
                 bonus_tok.astype(mx.int32),
             ]
-        ).tolist()
+        )
+        _eval_for_model(gen_batch.model, host_array)
+        host = host_array.tolist()
         m = int(host[0])
         draft_ids = host[1 : k + 1]
         res_ids = host[k + 1 : 2 * k + 1]
@@ -3160,7 +3204,7 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     next_logits = _apply_processors(procs, prev_buf, logits[:, -1, :])
     next_lp_2d = _logprobs(next_logits)
     next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
-    mx.eval(next_tok)
+    _eval_for_model(gen_batch.model, next_tok)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
@@ -3256,7 +3300,7 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     )
     verify_logits = logits[:, 0, :]
     bonus_logits = logits[:, 1, :]
-    mx.eval(logits)
+    _eval_for_model(gen_batch.model, logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
@@ -3279,7 +3323,7 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     bonus_lp_2d = combined_lp[1:2]
     verify_tok = sampler(verify_lp_2d)
     bonus_tok = sampler(bonus_lp_2d)
-    mx.eval(verify_tok, bonus_tok)
+    _eval_for_model(gen_batch.model, verify_tok, bonus_tok)
 
     # ``draft_id`` was cached when the draft was sampled (post_init or the
     # prior _step_mtp); skip the GPU→CPU sync that ``state.draft_tok.tolist()``
