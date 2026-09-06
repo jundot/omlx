@@ -180,14 +180,28 @@ def test_ineligible_model_is_logged_once(monkeypatch, caplog):
         # Prefill-sized inputs are expected to skip the fused path and must not log.
         monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
         assert not hc_fused.compatible(_module(4), mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16))
-        # Upstream's exact hybrid projection is a deliberate runtime choice, not a layout gap.
-        monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
-        hybrid = _module(4)
-        hybrid._omlx_exact_hybrid_projection = True
-        assert not hc_fused.compatible(hybrid, mx.random.normal((1, 1, WIDTH)).astype(mx.bfloat16))
     messages = [r.getMessage() for r in caplog.records if "fused hyper-connection kernels not used" in r.getMessage()]
     assert len(messages) == 1
     assert "hidden_size=800" in messages[0]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_fused_path_takes_precedence_over_exact_hybrid_projection(monkeypatch):
+    # With MTP off, load_weights flags modules with upstream's exact hybrid projection and compiles
+    # their single-token _forward. The fused path must still win for decode rows (+12..14% serial).
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+    module._omlx_exact_hybrid_projection = True
+    module._compiled_forward = lambda h: pytest.fail("compiled single-token path must not run")
+    x = mx.random.normal((1, 1, WIDTH)).astype(mx.bfloat16)
+    assert hc_fused.compatible(module, x)
+    calls = []
+    original = hc_fused.fused_forward
+    monkeypatch.setattr(hc_fused, "fused_forward", lambda m, h: calls.append(h.shape) or original(m, h))
+    out = module(x)
+    mx.eval(out)
+    assert calls == [(1, 1, WIDTH)]
 
 
 def test_compatible_fails_closed():

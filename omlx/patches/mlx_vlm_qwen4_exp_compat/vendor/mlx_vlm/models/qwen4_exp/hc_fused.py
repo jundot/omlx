@@ -16,8 +16,10 @@ row-batched Metal kernels replace it for small row counts:
 * ``U`` -- ``input_mix_weight_up`` per output element, sigmoid, times the
   normed stream, mean over streams via simd shuffles.
 
-Rows live in the grid (``batch * seq <= 16``). The affine unpack helpers come
-from :mod:`hc_projection`. Any ``hidden_size`` that is a multiple of 64 is
+Rows live in the grid (``batch * seq <= 16``); within that limit the fused path
+runs ahead of upstream's exact hybrid projection and compiled single-token path
+(serial decode) as well as the canonical path (MTP verify). The affine unpack
+helpers come from :mod:`hc_projection`. Any ``hidden_size`` that is a multiple of 64 is
 supported: the norm, down and inject loops guard their partial final blocks
 (compiled out for the shipped 2560). Results match the canonical path to a few
 bf16 ULP (fp32 is kept through the epilogues); the path fails closed to
@@ -298,11 +300,12 @@ def compatible(module, hyper_input) -> bool:
         and 1 <= hyper_input.shape[0] * hyper_input.shape[1] <= MAX_ROWS
     ):
         return False
-    if getattr(module, "_omlx_exact_hybrid_projection", False):
-        # Upstream's exact hybrid projection (installed at load time for serial decode)
-        # keeps its own compiled single-token path; that is a runtime choice, not a
-        # checkpoint layout, so it is not logged.
-        return False
+    # With Lightning MTP off, load_weights installs upstream's exact hybrid projection
+    # (``_omlx_exact_hybrid_projection``) and compiles ``_forward`` for single-token
+    # decode. The fused path deliberately takes precedence over both: three kernels
+    # per module against a compiled call plus its own kernels measured +12..14%
+    # serial tok/s on the M5 Max. ``_forward`` keeps the hybrid for the rows this
+    # path does not take.
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
