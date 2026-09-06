@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract
+from .deployment import decode_worker_contract, decode_worker_path_map
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -666,9 +666,9 @@ def _validate_loaded_stage(
         and start in (None, 0)
         and end in (None, len(layers))
     )
-    if (
-        not expected_complete_tensor_stage
-        and (start, end) != (assignment.start_layer, assignment.end_layer)
+    if not expected_complete_tensor_stage and (start, end) != (
+        assignment.start_layer,
+        assignment.end_layer,
     ):
         raise RuntimeError(
             "loaded model pipeline range does not match the approved plan: "
@@ -970,6 +970,15 @@ def run_worker(args: argparse.Namespace) -> int:
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
 
+    # Cluster v2: a deployment may give each node its own absolute model path.
+    # The rank's path comes from the signed contract's path_map; nodes without
+    # an entry keep the shared --model argument, the pre-v2 behavior.
+    path_map = decode_worker_path_map(args.plan)
+    if path_map:
+        rank_model_path = path_map.get(assignments[rank].node_id)
+        if rank_model_path and rank_model_path != args.model:
+            args.model = rank_model_path
+
     marker = RuntimeMarker(
         state_dir=args.state_dir,
         deployment_id=args.deployment_id,
@@ -1103,25 +1112,28 @@ def run_worker(args: argparse.Namespace) -> int:
             # it is checked again against what the rank actually holds, all the
             # way through the load. A rank that overruns dies here rather than
             # taking the Mac with it.
-            with watch_rank_load(
-                load_budget,
-                rank=rank,
-                node_id=getattr(assignment, "node_id", ""),
-                on_sample=lambda observed: marker.update(
-                    "loading",
-                    load_stage="loading_weights",
-                    load_memory_bytes=observed,
+            with (
+                watch_rank_load(
+                    load_budget,
+                    rank=rank,
+                    node_id=getattr(assignment, "node_id", ""),
+                    on_sample=lambda observed: marker.update(
+                        "loading",
+                        load_stage="loading_weights",
+                        load_memory_bytes=observed,
+                    ),
                 ),
-            ), install_progressive_loader(
-                mlx_server,
-                progress=lambda progress: marker.update(
-                    "loading",
-                    load_stage=progress.get("phase", "materializing_layers"),
-                    **{
-                        key: value
-                        for key, value in progress.items()
-                        if key != "phase"
-                    },
+                install_progressive_loader(
+                    mlx_server,
+                    progress=lambda progress: marker.update(
+                        "loading",
+                        load_stage=progress.get("phase", "materializing_layers"),
+                        **{
+                            key: value
+                            for key, value in progress.items()
+                            if key != "phase"
+                        },
+                    ),
                 ),
             ):
                 provider.load_default()
@@ -1211,9 +1223,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             provider.model,
                             rank=rank,
                             node_id=getattr(assignment, "node_id", ""),
-                            layer_count=(
-                                assignment.end_layer - assignment.start_layer
-                            ),
+                            layer_count=(assignment.end_layer - assignment.start_layer),
                             tensor_parallel_size=assignment.tensor_parallel_size,
                             memory_guard_tier=guard_tier,
                             # The attention peak is set by the prefill chunk, so the

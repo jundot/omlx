@@ -637,6 +637,13 @@ def _run_rank(
         "decode_worker_contract",
         lambda _plan: ("a" * 64, assignments, (), 1),
     )
+    # The fake plan above is not a real encoded contract, so the path_map
+    # decoder it feeds must be faked alongside it (empty = legacy behavior).
+    monkeypatch.setattr(
+        inference_worker,
+        "decode_worker_path_map",
+        lambda _plan: {},
+    )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
         record["order"].append("guard")

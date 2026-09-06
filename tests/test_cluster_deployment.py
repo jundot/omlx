@@ -159,6 +159,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
     import base64
     import json
     import zlib
+
     compressed = base64.b64decode(encoded, altchars=b"-_")
     raw = zlib.decompress(compressed)
     payload = json.loads(raw)
@@ -360,9 +361,7 @@ def test_the_role_survives_the_worker_plan_and_the_registry_file():
     )
 
     # The registry writes and reloads this.
-    restored = ClusterDeployment.from_dict(
-        json.loads(json.dumps(deployment.to_dict()))
-    )
+    restored = ClusterDeployment.from_dict(json.loads(json.dumps(deployment.to_dict())))
     # The rank decodes this.
     _hash, decoded = decode_worker_plan(deployment.encode_worker_plan())
 
@@ -433,3 +432,30 @@ def test_a_plan_carrying_an_unknown_role_refuses_to_launch():
 
     with pytest.raises(ValueError, match="unknown node role"):
         _assignment_from_dict(payload)
+
+
+def test_link_local_zone_ids_are_stripped_from_communication_ips():
+    """macOS announces Thunderbolt addresses as fe80::…%en10; mlx's address
+    parser cannot read the zone and the rank died at startup on it."""
+    host = ClusterHost(
+        "node", "peer.local", ("10.0.0.2", "fe80::23:3ee:ec30:9a92%en10")
+    )
+    assert host.ips == ("10.0.0.2", "fe80::23:3ee:ec30:9a92")
+
+
+def test_hostfile_advertises_routable_addresses_before_link_local():
+    from omlx.cluster.deployment import _hostfile_ips
+
+    host = ClusterHost(
+        "node",
+        "peer.local",
+        ("fe80::1%en4", "10.0.0.2", "fe80::2%en5"),
+    )
+    assert _hostfile_ips(host) == ["10.0.0.2", "fe80::1", "fe80::2"]
+
+
+def test_a_link_local_only_host_keeps_its_zone_free_fallback():
+    from omlx.cluster.deployment import _hostfile_ips
+
+    host = ClusterHost("node", "peer.local", ("fe80::1%en4",))
+    assert _hostfile_ips(host) == ["fe80::1"]

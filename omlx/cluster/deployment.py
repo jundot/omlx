@@ -27,6 +27,15 @@ from .planner import (
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 
+# Version 2 adds ``path_map``: an optional per-node absolute model path, so
+# nodes no longer need the model at the same absolute path on every Mac.
+# Version 1 payloads decode with an empty map, which reproduces the legacy
+# shared-path behavior exactly.
+DEPLOYMENT_SCHEMA_VERSION = 2
+_SUPPORTED_DEPLOYMENT_SCHEMAS = (1, DEPLOYMENT_SCHEMA_VERSION)
+_MAX_PATH_MAP_ENTRIES = 64
+_MAX_MODEL_PATH_BYTES = 4096
+
 _SSH_TARGET = re.compile(
     r"^(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])$"
 )
@@ -54,11 +63,32 @@ def validate_ssh_target(value: str) -> str:
 
 def _validate_ip(value: str) -> str:
     value = value.strip()
+    # macOS reports Thunderbolt/link-local addresses with a zone id
+    # (fe80::…%en10). mlx's address parser cannot read the suffix — a rank
+    # died at startup on exactly that — and a zone only means something on
+    # the machine that named it, so it never belongs on the wire.
+    value = value.split("%", 1)[0]
     try:
         ipaddress.ip_address(value)
     except ValueError as exc:
         raise ValueError(f"invalid communication IP: {value!r}") from exc
     return value
+
+
+def _hostfile_ips(host: ClusterHost) -> list[str]:
+    """Communication IPs in the order a rank should try them.
+
+    Routable addresses first: a link-local IPv6 without its (machine-local)
+    zone id is ambiguous, so it can only ever be a fallback. This is what
+    keeps a Mac that announces fe80:: Thunderbolt addresses alongside its
+    configured link IPs from advertising the unusable one first.
+    """
+
+    def _link_local(ip: str) -> bool:
+        return ipaddress.ip_address(ip).is_link_local
+
+    routable = [ip for ip in host.ips if not _link_local(ip)]
+    return routable + [ip for ip in host.ips if _link_local(ip)]
 
 
 def _validate_rdma_path(value: Any) -> RDMAPath:
@@ -77,6 +107,48 @@ def _validate_rdma_path(value: Any) -> RDMAPath:
                 raise ValueError(f"invalid RDMA device: {path!r}")
         return paths
     raise ValueError("RDMA entries must be a device, a device list, or null")
+
+
+def validate_model_path_map(
+    path_map: Any,
+    node_ids: tuple[str, ...] | None = None,
+) -> dict[str, str]:
+    """Validate an optional per-node model path override map.
+
+    Keys are cluster node IDs; values are absolute paths that exist only on
+    the node that resolves them, so no existence check happens here. An empty
+    map is the legacy "same absolute path on every node" behavior.
+    """
+
+    if path_map is None:
+        return {}
+    if not isinstance(path_map, dict):
+        raise ValueError("path_map must be an object mapping node IDs to paths")
+    if len(path_map) > _MAX_PATH_MAP_ENTRIES:
+        raise ValueError("path_map cannot hold more than 64 nodes")
+    known = set(node_ids) if node_ids is not None else None
+    validated: dict[str, str] = {}
+    for node_id, raw_path in path_map.items():
+        if not isinstance(node_id, str) or _NODE_ID.fullmatch(node_id) is None:
+            raise ValueError(f"invalid path_map node ID: {node_id!r}")
+        if known is not None and node_id not in known:
+            raise ValueError(
+                f"path_map names a node outside the deployment: {node_id!r}"
+            )
+        if not isinstance(raw_path, str):
+            raise ValueError(f"path_map path for {node_id!r} must be a string")
+        path = raw_path.strip()
+        if (
+            not path
+            or "\x00" in path
+            or "\n" in path
+            or "\r" in path
+            or len(path.encode()) > _MAX_MODEL_PATH_BYTES
+            or not Path(path).is_absolute()
+        ):
+            raise ValueError(f"path_map path for {node_id!r} must be absolute")
+        validated[node_id] = path
+    return validated
 
 
 @dataclass(frozen=True)
@@ -248,6 +320,10 @@ class ClusterDeployment:
     performance_profiles: tuple[NodePerformanceProfile, ...] = ()
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
+    # node_id → absolute model path on that node. Empty means every node uses
+    # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
+    # only the nodes they name; the coordinator path stays the fallback.
+    path_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -268,23 +344,27 @@ class ClusterDeployment:
                 "tensor_parallel_size must be between 1 and the host count"
             )
         if len(self.hosts) % self.tensor_parallel_size != 0:
-            raise ValueError(
-                "host count must be divisible by tensor_parallel_size"
-            )
+            raise ValueError("host count must be divisible by tensor_parallel_size")
         if (
             not isinstance(self.target_context_tokens, int)
             or isinstance(self.target_context_tokens, bool)
             or not 1 <= self.target_context_tokens <= 1_048_576
         ):
-            raise ValueError(
-                "target_context_tokens must be between 1 and 1,048,576"
-            )
+            raise ValueError("target_context_tokens must be between 1 and 1,048,576")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
             raise ValueError("rank 0 must use SSH target 127.0.0.1")
         if len({host.node_id for host in self.hosts}) != len(self.hosts):
             raise ValueError("cluster node IDs must be unique")
+        object.__setattr__(
+            self,
+            "path_map",
+            validate_model_path_map(
+                self.path_map,
+                tuple(host.node_id for host in self.hosts),
+            ),
+        )
         if len(self.plan_hash) != 64 or any(
             char not in "0123456789abcdef" for char in self.plan_hash
         ):
@@ -340,6 +420,15 @@ class ClusterDeployment:
     def distributed_init_backend(self) -> str:
         return "jaccl" if self.backend.startswith("jaccl") else "ring"
 
+    def model_path_for(self, node_id: str) -> str:
+        """The model directory one rank loads, honouring per-node overrides.
+
+        Nodes absent from ``path_map`` keep the coordinator's shared path,
+        which is exactly the legacy same-absolute-path behavior.
+        """
+
+        return self.path_map.get(node_id, self.model)
+
     def hostfile_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
@@ -347,7 +436,7 @@ class ClusterDeployment:
             "hosts": [
                 {
                     "ssh": host.ssh,
-                    "ips": list(host.ips),
+                    "ips": _hostfile_ips(host),
                     "rdma": [
                         list(path) if isinstance(path, tuple) else path
                         for path in host.rdma
@@ -359,7 +448,7 @@ class ClusterDeployment:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": DEPLOYMENT_SCHEMA_VERSION,
             "deployment_id": self.deployment_id,
             "model": self.model,
             "backend": self.backend,
@@ -373,11 +462,15 @@ class ClusterDeployment:
             ],
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
+            "path_map": dict(sorted(self.path_map.items())),
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ClusterDeployment:
-        if not isinstance(payload, dict) or payload.get("schema_version", 1) != 1:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version", 1) not in _SUPPORTED_DEPLOYMENT_SCHEMAS
+        ):
             raise ValueError("unsupported cluster deployment schema")
         hosts = payload.get("hosts")
         assignments = payload.get("assignments")
@@ -414,6 +507,9 @@ class ClusterDeployment:
             ),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
+            # Schema 1 payloads predate per-node paths; they decode to the
+            # empty map, which is the shared-path behavior they ran with.
+            path_map=validate_model_path_map(payload.get("path_map")),
         )
 
     def encode_worker_plan(self) -> str:
@@ -421,7 +517,7 @@ class ClusterDeployment:
 
         raw = json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": DEPLOYMENT_SCHEMA_VERSION,
                 "plan_hash": self.plan_hash,
                 "assignments": [
                     assignment.to_dict() for assignment in self.assignments
@@ -430,6 +526,7 @@ class ClusterDeployment:
                     profile.to_dict() for profile in self.performance_profiles
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
+                "path_map": dict(sorted(self.path_map.items())),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -439,15 +536,8 @@ class ClusterDeployment:
         return base64.urlsafe_b64encode(zlib.compress(raw, level=9)).decode()
 
 
-def decode_worker_contract(
-    encoded: str,
-) -> tuple[
-    str,
-    tuple[PipelineAssignment, ...],
-    tuple[NodePerformanceProfile, ...],
-    int,
-]:
-    """Decode and validate the full worker contract without accepting code."""
+def _decode_worker_payload(encoded: str) -> dict[str, Any]:
+    """Inflate and validate a worker plan payload without accepting code."""
 
     if not isinstance(encoded, str) or len(encoded) > _MAX_PLAN_BYTES * 2:
         raise ValueError("encoded pipeline plan is too large")
@@ -470,7 +560,10 @@ def decode_worker_contract(
         payload = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("pipeline plan is not valid JSON") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") not in _SUPPORTED_DEPLOYMENT_SCHEMAS
+    ):
         raise ValueError("unsupported pipeline plan schema")
     plan_hash = payload.get("plan_hash")
     assignments = payload.get("assignments")
@@ -485,13 +578,28 @@ def decode_worker_contract(
         char not in "0123456789abcdef" for char in plan_hash
     ):
         raise ValueError("pipeline plan hash is invalid")
-    parsed = tuple(_assignment_from_dict(item) for item in assignments)
+    return payload
+
+
+def decode_worker_contract(
+    encoded: str,
+) -> tuple[
+    str,
+    tuple[PipelineAssignment, ...],
+    tuple[NodePerformanceProfile, ...],
+    int,
+]:
+    """Decode and validate the full worker contract without accepting code."""
+
+    payload = _decode_worker_payload(encoded)
+    parsed = tuple(_assignment_from_dict(item) for item in payload["assignments"])
     if [item.rank for item in sorted(parsed, key=lambda item: item.rank)] != list(
         range(len(parsed))
     ):
         raise ValueError("pipeline plan ranks must be contiguous from zero")
     profiles = tuple(
-        NodePerformanceProfile.from_dict(item) for item in performance_profiles
+        NodePerformanceProfile.from_dict(item)
+        for item in payload.get("performance_profiles", [])
     )
     if profiles and (
         len(profiles) != len(parsed)
@@ -501,8 +609,22 @@ def decode_worker_contract(
         raise ValueError("worker performance profiles do not match the shard plan")
     tensor_parallel_size = int(payload.get("tensor_parallel_size", 1))
     if not 1 <= tensor_parallel_size <= len(parsed):
-        raise ValueError("tensor_parallel_size must be between 1 and the assignment count")
-    return plan_hash, parsed, profiles, tensor_parallel_size
+        raise ValueError(
+            "tensor_parallel_size must be between 1 and the assignment count"
+        )
+    return payload["plan_hash"], parsed, profiles, tensor_parallel_size
+
+
+def decode_worker_path_map(encoded: str) -> dict[str, str]:
+    """Per-node model path overrides carried inside the worker contract.
+
+    Schema 1 contracts predate per-node paths and decode to an empty map;
+    callers then fall back to the shared ``--model`` argument, which is the
+    legacy behavior those contracts ran with.
+    """
+
+    payload = _decode_worker_payload(encoded)
+    return validate_model_path_map(payload.get("path_map"))
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:

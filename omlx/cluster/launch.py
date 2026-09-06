@@ -227,9 +227,7 @@ def _python_minor(version: str) -> tuple[str, str] | None:
     return (parts[0], parts[1])
 
 
-def _interpreter_parity(
-    local: str, remote: Any
-) -> tuple[str | None, str | None]:
+def _interpreter_parity(local: str, remote: Any) -> tuple[str | None, str | None]:
     """Compare the interpreter two ranks will actually run under (#2695).
 
     Returns ``(blocking, warning)``, at most one of which is set.
@@ -284,8 +282,7 @@ def _rank_python_module_argv(
         for rank, executable in enumerate(executables)
     )
     script = (
-        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; '
-        'exec "$omlx_python" "$@"'
+        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; exec "$omlx_python" "$@"'
     )
     return ["/bin/sh", "-c", script, "omlx-rank-python", "-m", module]
 
@@ -690,7 +687,10 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             f"CUDA fabric probe exited with code {completed.returncode}{suffix}"
         )
-    if len(completed.stdout.encode()) + len(completed.stderr.encode()) > _REMOTE_OUTPUT_LIMIT:
+    if (
+        len(completed.stdout.encode()) + len(completed.stderr.encode())
+        > _REMOTE_OUTPUT_LIMIT
+    ):
         raise DistributedLaunchError("CUDA fabric probe output exceeded the safe limit")
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -705,7 +705,9 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             "CUDA fabric probe did not return one result from each worker"
         )
-    observed = min(float(record.get("payload_bytes_per_second") or 0) for record in records)
+    observed = min(
+        float(record.get("payload_bytes_per_second") or 0) for record in records
+    )
     verified = observed >= minimum_bytes_per_second
     identity = "\0".join(sorted(host.ssh for host in hosts)).encode()
     group_id = f"connectx-{hashlib.sha256(identity).hexdigest()[:16]}"
@@ -854,8 +856,7 @@ def discover_remote_python_executable(
         # bare command name (``python3``) needs ``sys.executable`` to become an
         # absolute path.
         script = (
-            "import os,omlx; print(os.path.expanduser("
-            f"{candidate!r}))"
+            f"import os,omlx; print(os.path.expanduser({candidate!r}))"
             if candidate.startswith(("~", "/"))
             else "import sys,omlx; print(sys.executable)"
         )
@@ -1127,9 +1128,7 @@ def probe_remote_system_host(
         "ssh_reachable": True,
         "status": payload,
         "runtime_compatible": False,
-        "runtime_mismatches": [
-            _RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING
-        ],
+        "runtime_mismatches": [_RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING],
         # Same keys as the healthy path, so a caller never has to know which
         # branch produced the result before reading it.
         "runtime_warnings": [],
@@ -1458,7 +1457,10 @@ def preflight_remote_hosts(
     script = _PREFLIGHT_SCRIPT
     local_python_version = platform.python_version()
     results: list[dict[str, Any]] = []
-    local_model_exists = Path(deployment.model).is_dir()
+    # Cluster v2: each rank validates against its own path_map entry; nodes
+    # without an entry share the coordinator path, as before v2.
+    local_model_path = deployment.model_path_for(deployment.hosts[0].node_id)
+    local_model_exists = Path(local_model_path).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
     if len(assignments) != len(deployment.hosts):
         raise DistributedLaunchError(
@@ -1466,7 +1468,7 @@ def preflight_remote_hosts(
         )
     local_validation = (
         validate_staged_model(
-            deployment.model,
+            local_model_path,
             assignments[0].start_layer,
             assignments[0].end_layer,
         )
@@ -1478,9 +1480,7 @@ def preflight_remote_hosts(
         from .memory_guard import ceiling_breakdown
 
         local_admission_ceiling = int(
-            ceiling_breakdown(
-                assignments[0].memory_guard_tier
-            ).get("hard_limit", 0)
+            ceiling_breakdown(assignments[0].memory_guard_tier).get("hard_limit", 0)
         )
     except Exception as exc:
         raise DistributedLaunchError(
@@ -1513,15 +1513,18 @@ def preflight_remote_hosts(
             )
             continue
         remote_python = host.python_executable or python_executable
-        # Send the ~-form: deployment.model is the coordinator's absolute path,
-        # which names nothing on a peer with a different macOS account. The
-        # preflight script expanduser()s it in the peer's own home.
+        # A path_map entry is already absolute on this peer. Without one, send
+        # the portable ~-form so peers with different macOS accounts resolve
+        # the model under their own home directory.
+        remote_model_path = deployment.path_map.get(
+            host.node_id, home_relative_model_path(deployment.model)
+        )
         remote_command = shlex.join(
             [
                 remote_python,
                 "-c",
                 script,
-                home_relative_model_path(deployment.model),
+                remote_model_path,
                 str(assignment.start_layer),
                 str(assignment.end_layer),
                 assignment.memory_guard_tier,
@@ -1573,9 +1576,12 @@ def preflight_remote_hosts(
         runtime_warnings = [warning] if warning is not None else []
         if versions.get("model-exists") is not True:
             mismatches.append(
-                f"model directory is missing on remote host: {deployment.model}"
+                f"model directory is missing on remote host: {remote_model_path}"
             )
-        if local_identity is not None and versions.get("model_identity") != local_identity:
+        if (
+            local_identity is not None
+            and versions.get("model_identity") != local_identity
+        ):
             mismatches.append(
                 "model identity differs from the coordinator "
                 "(config, tokenizer, processor, or weight index)"
@@ -1641,9 +1647,7 @@ def _validate_deployment_admission(
                 0.0,
                 min(
                     1.0,
-                    (
-                        assignment.capacity_bytes - assignment.reserve_bytes
-                    )
+                    (assignment.capacity_bytes - assignment.reserve_bytes)
                     / assignment.capacity_bytes,
                 ),
             )
@@ -1939,9 +1943,7 @@ class DistributedJobSupervisor:
                     os.killpg(process_group, signal.SIGTERM)
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
-                    process.wait(
-                        timeout=max(0.0, deadline - time.monotonic())
-                    )
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
 
             # mlx.launch can exit promptly while a local rank remains blocked
             # in a Metal/JACCL collective. Waiting only for the launcher left
@@ -2104,9 +2106,7 @@ class DistributedJobSupervisor:
                     host.ssh,
                 )
             elif action in ("terminated", "killed"):
-                logger.info(
-                    "reaped remote rank %d on %s (%s)", rank, host.ssh, action
-                )
+                logger.info("reaped remote rank %d on %s (%s)", rank, host.ssh, action)
             elif action:
                 logger.debug(
                     "remote rank reap for rank %d on %s: %s",
@@ -2116,8 +2116,7 @@ class DistributedJobSupervisor:
                 )
             else:
                 logger.warning(
-                    "remote rank reap for rank %d on %s returned no report "
-                    "(exit %s)",
+                    "remote rank reap for rank %d on %s returned no report (exit %s)",
                     rank,
                     host.ssh,
                     completed.returncode,
@@ -2148,9 +2147,7 @@ class DistributedJobSupervisor:
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
             if host.ssh in _LOOPBACK_TARGETS:
-                marker = read_marker(
-                    Path(self.state_dir).expanduser() / filename
-                )
+                marker = read_marker(Path(self.state_dir).expanduser() / filename)
             else:
                 remote_root = self.state_dir.rstrip("/") or "."
                 marker, _, _, _ = read_remote_marker(
@@ -2163,7 +2160,8 @@ class DistributedJobSupervisor:
                 marker.get("deployment_id") != self.deployment.deployment_id
                 or marker.get("plan_hash") != self.deployment.plan_hash
                 or marker.get("rank") != rank
-                or marker.get("phase") not in {
+                or marker.get("phase")
+                not in {
                     "failed",
                     "peer_lost",
                     "launcher_lost",
@@ -2172,9 +2170,7 @@ class DistributedJobSupervisor:
                 continue
             error = marker.get("error")
             if isinstance(error, str) and error.strip():
-                failures.append(
-                    f"rank {rank} ({host.node_id}): {error.strip()}"
-                )
+                failures.append(f"rank {rank} ({host.node_id}): {error.strip()}")
         return "; ".join(failures)[:_LOG_LINE_LIMIT] or None
 
     def _failure_reason(self) -> str | None:

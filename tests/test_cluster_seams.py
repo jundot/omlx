@@ -29,7 +29,8 @@ _PREFIX = "/admin/api/cluster"
 # Template literals interpolate with ${...}, which may contain calls and nested
 # parens: /deployments/${encodeURIComponent(id)}
 _CLUSTER_URL = re.compile(
-    re.escape(_PREFIX) + r"(?P<path>(?:\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}|[A-Za-z0-9/_\-.])*)"
+    re.escape(_PREFIX)
+    + r"(?P<path>(?:\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}|[A-Za-z0-9/_\-.])*)"
 )
 
 
@@ -73,7 +74,9 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    allowed_without_caller: set[str] = set()
+    # The backend PR intentionally lands before the Cluster v2 dashboard. The
+    # UI follow-up will call replan after the deployment contract settles.
+    allowed_without_caller: set[str] = {"/admin/api/cluster/replan"}
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
@@ -105,10 +108,13 @@ def test_pairing_token_round_trips():
     from omlx.cluster.discovery import generate_pairing_token, verify_pairing_token
 
     secret = "correct-horse-battery-staple"
-    assert verify_pairing_token(
-        generate_pairing_token(shared_secret=secret),
-        shared_secret=secret,
-    ) is True
+    assert (
+        verify_pairing_token(
+            generate_pairing_token(shared_secret=secret),
+            shared_secret=secret,
+        )
+        is True
+    )
 
 
 def test_pairing_token_rejects_a_tampered_payload():
@@ -230,11 +236,15 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test hooks that drop process-wide v2 singletons between cases; only
+        # the test suite calls them (production swaps via configure_*).
+        ("identity.py", "reset_configured_identity"),
+        ("registry.py", "reset_configured_device_registry"),
+        ("pairing.py", "reset_pairing_manager"),
+        ("pairing_routes.py", "set_pairing_manager_getter"),
     }
 
-    sources = {
-        path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")
-    }
+    sources = {path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")}
 
     uncalled = []
     for path in sorted(_CLUSTER.glob("*.py")):
@@ -429,10 +439,13 @@ def test_key_exchange_rejects_a_tampered_token():
     payload["node_id"] = "attacker-mac"
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
-    assert ssh_keys.verify_key_exchange_token(
-        forged,
-        shared_secret="correct-horse-battery-staple",
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            forged,
+            shared_secret="correct-horse-battery-staple",
+        )
+        is None
+    )
 
 
 def test_key_exchange_rejects_the_wrong_shared_secret():
@@ -447,10 +460,13 @@ def test_key_exchange_rejects_the_wrong_shared_secret():
         shared_secret="correct-horse-battery-staple",
     )
 
-    assert ssh_keys.verify_key_exchange_token(
-        token,
-        shared_secret="a-different-shared-secret",
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            token,
+            shared_secret="a-different-shared-secret",
+        )
+        is None
+    )
 
 
 def test_key_exchange_rejects_an_authenticated_ssh_option_target():
@@ -488,7 +504,10 @@ def test_key_exchange_rejects_an_authenticated_ssh_option_target():
     ).hexdigest()
     forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
-    assert ssh_keys.verify_key_exchange_token(
-        forged,
-        shared_secret=secret,
-    ) is None
+    assert (
+        ssh_keys.verify_key_exchange_token(
+            forged,
+            shared_secret=secret,
+        )
+        is None
+    )
