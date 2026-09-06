@@ -1138,13 +1138,20 @@ def probe_remote_system_host(
     }
 
 
-def probe_remote_admission_ceiling(
+@dataclass(frozen=True)
+class RemoteAdmissionProbeResult:
+    admission_ceiling_bytes: int
+    memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
+
+
+def probe_remote_admission_details(
     ssh_target: str,
     *,
     python_executable: str | None = None,
     timeout: float = 8.0,
     runner: SSHRunner = subprocess.run,
-) -> int:
+) -> RemoteAdmissionProbeResult:
     """Read only the peer's live memory ceiling, without a hardware rescan.
 
     The full capability probe invokes ``system_profiler`` and transport tools;
@@ -1176,6 +1183,13 @@ def probe_remote_admission_ceiling(
     script = (
         "import json,urllib.request\n"
         "ceiling=0\n"
+        "tier='balanced'\n"
+        "custom_gb=0.0\n"
+        "try:\n"
+        "    from omlx.cluster.memory_guard import _operator_memory_settings\n"
+        "    tier, custom_gb, _ = _operator_memory_settings()\n"
+        "except Exception:\n"
+        "    pass\n"
         f"for port in {ports!r}:\n"
         "    try:\n"
         "        with urllib.request.urlopen("
@@ -1189,7 +1203,7 @@ def probe_remote_admission_ceiling(
         "if ceiling<=0:\n"
         "    from omlx.cluster.memory_guard import ceiling_breakdown\n"
         "    ceiling=int(ceiling_breakdown().get('hard_limit',0))\n"
-        "print(json.dumps({'admission_ceiling_bytes':ceiling}))"
+        "print(json.dumps({'admission_ceiling_bytes':ceiling,'memory_guard_tier':tier,'memory_guard_custom_ceiling_gb':custom_gb}))"
     )
 
     def _read(executable: str) -> subprocess.CompletedProcess[str]:
@@ -1252,6 +1266,8 @@ def probe_remote_admission_ceiling(
     try:
         payload = json.loads(completed.stdout)
         ceiling = int(payload.get("admission_ceiling_bytes") or 0)
+        tier = str(payload.get("memory_guard_tier") or "balanced")
+        custom_gb = float(payload.get("memory_guard_custom_ceiling_gb") or 0.0)
     except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DistributedLaunchError(
             f"{ssh_target} returned an invalid memory ceiling"
@@ -1260,7 +1276,11 @@ def probe_remote_admission_ceiling(
         raise DistributedLaunchError(
             f"{ssh_target} did not report an oMLX memory ceiling"
         )
-    return ceiling
+    return RemoteAdmissionProbeResult(
+        admission_ceiling_bytes=ceiling,
+        memory_guard_tier=tier,
+        memory_guard_custom_ceiling_gb=custom_gb,
+    )
 
 
 def probe_remote_host(

@@ -486,9 +486,12 @@ def test_cluster_node_budgets_use_each_hosts_live_admission_ceiling(monkeypatch)
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 213 * gib + 123
+            asked.update(ssh=ssh, python=python_executable)
+            or routes.RemoteAdmissionProbeResult(
+                admission_ceiling_bytes=213 * gib + 123
+            )
         ),
     )
 
@@ -533,9 +536,10 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monk
     )
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
+        "probe_remote_admission_details",
         lambda ssh, *, python_executable: (
-            asked.update(ssh=ssh, python=python_executable) or 64 * gib
+            asked.update(ssh=ssh, python=python_executable)
+            or routes.RemoteAdmissionProbeResult(admission_ceiling_bytes=64 * gib)
         ),
     )
 
@@ -551,12 +555,33 @@ def test_cluster_node_budgets_let_the_probe_discover_an_unknown_interpreter(monk
     assert asked == {"ssh": "studio.local", "python": None}
 
 
+def test_cluster_node_budgets_rejects_invalid_remote_memory_guard_tier(monkeypatch):
+    from omlx.cluster.launch import RemoteAdmissionProbeResult
+
+    monkeypatch.setattr(
+        routes,
+        "probe_remote_admission_details",
+        lambda ssh, *, python_executable: RemoteAdmissionProbeResult(
+            admission_ceiling_bytes=64 * 1024**3,
+            memory_guard_tier="not-a-tier",
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={"hosts": [{"node_id": "peer", "ssh": "studio.local"}]},
+    )
+
+    assert response.status_code == 503
+    assert "unknown memory guard tier" in response.json()["detail"]
+
+
 def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     called = []
     monkeypatch.setattr(
         routes,
-        "probe_remote_admission_ceiling",
-        lambda ssh: called.append(ssh),
+        "probe_remote_admission_details",
+        lambda ssh, **kw: called.append(ssh),
     )
 
     response = _client().post(

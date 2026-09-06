@@ -283,6 +283,8 @@ class NodeBudgetSuggestion:
     reserve_bytes: int
     role: str
     capacity_source: str  # "admission_ceiling" | "recommended_working_set" | ...
+    memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
 
     @property
     def usable_bytes(self) -> int:
@@ -311,6 +313,8 @@ class NodeBudgetSuggestion:
             "reserve_bytes": self.reserve_bytes,
             "usable_bytes": self.usable_bytes,
             "role": self.role,
+            "memory_guard_tier": self.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": self.memory_guard_custom_ceiling_gb,
             "capacity_source": self.capacity_source,
             "summary": self.describe(),
         }
@@ -319,6 +323,8 @@ class NodeBudgetSuggestion:
 def suggest_budget(
     *,
     role: str = DEFAULT_ROLE,
+    memory_guard_tier: str | None = None,
+    memory_guard_custom_ceiling_gb: float | None = None,
     ssh_target: str | None = None,
     capacity_bytes: int = 0,
     capacity_source: str | None = None,
@@ -331,6 +337,19 @@ def suggest_budget(
         "admission_ceiling" if capacity_bytes else "metal_cap"
     )
     capacity = capacity_bytes
+    tier = memory_guard_tier
+    custom_gb = memory_guard_custom_ceiling_gb
+    if (tier is None or not capacity) and _is_local(ssh_target):
+        try:
+            from .memory_guard import _operator_memory_settings
+
+            op_tier, op_custom_gb, _ = _operator_memory_settings()
+            if tier is None:
+                tier = op_tier
+            if custom_gb is None:
+                custom_gb = op_custom_gb
+        except Exception:
+            pass
     if not capacity and _is_local(ssh_target):
         # Prefer the ceiling the memory guard admits against, so the planner
         # and the guard cannot disagree. The raw sysctl is higher than what
@@ -345,10 +364,19 @@ def suggest_budget(
         capacity = installed_memory_bytes(ssh_target=ssh_target, runner=runner)
         source = "installed_ram"
     if capacity <= 0:
-        return NodeBudgetSuggestion(0, 0, node_role.key, source)
+        return NodeBudgetSuggestion(
+            0,
+            0,
+            node_role.key,
+            source,
+            memory_guard_tier=tier or "balanced",
+            memory_guard_custom_ceiling_gb=custom_gb or 0.0,
+        )
     return NodeBudgetSuggestion(
         capacity_bytes=capacity,
         reserve_bytes=node_role.reserve_for(capacity),
         role=node_role.key,
         capacity_source=source,
+        memory_guard_tier=tier or "balanced",
+        memory_guard_custom_ceiling_gb=custom_gb or 0.0,
     )

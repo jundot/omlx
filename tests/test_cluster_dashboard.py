@@ -173,7 +173,7 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
         "async runClusterPlan()", 1
     )[0]
     assert "memory_guard_tier:" in node_payload
-    assert "this.globalSettings?.memory?.memory_guard_tier || 'balanced'" in node_payload
+    assert "node.memory_guard_tier" in node_payload
     assert "const useDiscoveredFabric = !this.clusterIpsOverridden" in javascript
     assert "if (this.clusterIpsOverridden) return 'ring'" in javascript
     assert "this.clusterFabric?.backend === 'jaccl'" in javascript

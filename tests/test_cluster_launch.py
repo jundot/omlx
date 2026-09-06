@@ -440,13 +440,14 @@ def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
             stderr="",
         )
 
-    ceiling = launch.probe_remote_admission_ceiling(
+    details = launch.probe_remote_admission_details(
         "user@studio.local",
         python_executable="/opt/omlx/bin/python",
         runner=runner,
     )
 
-    assert ceiling == 213 * 1024**3
+    assert details.admission_ceiling_bytes == 213 * 1024**3
+    assert details.memory_guard_tier == "balanced"
     argv, kwargs = calls[0]
     assert "BatchMode=yes" in argv
     assert "StrictHostKeyChecking=accept-new" in argv
@@ -1102,13 +1103,13 @@ def test_admission_ceiling_probe_discovers_the_peer_interpreter_when_unknown():
             )
         return runner(argv, **kwargs)
 
-    ceiling = launch.probe_remote_admission_ceiling(
+    details = launch.probe_remote_admission_details(
         "studio",
         python_executable=None,
         runner=ceiling_runner,
     )
 
-    assert ceiling == 213 * 1024**3
+    assert details.admission_ceiling_bytes == 213 * 1024**3
     assert commands[-1].startswith(_PEER_SHIM)
 
 
@@ -1126,13 +1127,13 @@ def test_admission_ceiling_probe_rediscovers_when_the_known_interpreter_broke():
             )
         return runner(argv, **kwargs)
 
-    ceiling = launch.probe_remote_admission_ceiling(
+    details = launch.probe_remote_admission_details(
         "studio",
         python_executable=_BUNDLED_PYTHON,
         runner=ceiling_runner,
     )
 
-    assert ceiling == 7
+    assert details.admission_ceiling_bytes == 7
     assert commands[0].startswith(_BUNDLED_PYTHON)
     assert commands[-1].startswith(_PEER_SHIM)
 
@@ -1144,7 +1145,7 @@ def test_admission_ceiling_probe_reports_the_original_failure_when_no_peer_pytho
         )
 
     with pytest.raises(DistributedLaunchError, match="memory ceiling probe failed"):
-        launch.probe_remote_admission_ceiling(
+        launch.probe_remote_admission_details(
             "studio",
             python_executable=_BUNDLED_PYTHON,
             runner=runner,
