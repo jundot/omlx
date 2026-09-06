@@ -32,6 +32,7 @@ from .qsa_fast import (
     contiguous_causal_gathered_qsa_decode,
     pool_completed_index_keys,
 )
+from . import hc_fused
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -913,6 +914,18 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
+# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
+# verify rows only) so the GPU executes layer i while the host builds layer i+1.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
+_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_EAGER_DISPATCH_MAX_ROWS = 64
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
 
@@ -926,14 +939,14 @@ class Qwen4ExpRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        y = x.astype(mx.float32)
-        if self.group_size is not None:
-            y = y.reshape(*y.shape[:-1], -1, self.group_size)
-            weight = self.weight.reshape(-1, self.group_size)
-        else:
-            weight = self.weight
-        y = y * mx.rsqrt(mx.mean(mx.square(y), axis=-1, keepdims=True) + self.eps)
-        y = y * (1.0 + weight.astype(mx.float32))
+        scale = 1.0 + self.weight.astype(mx.float32)
+        if self.group_size is None:
+            return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
+        # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
+        # per-group scale; normalise over the group axis and scale afterwards.
+        # The scale stays fp32 -- rounding (1 + w) to bf16 costs half a ULP.
+        y = x.astype(mx.float32).reshape(*x.shape[:-1], -1, self.group_size)
+        y = mx.fast.rms_norm(y, None, self.eps) * scale.reshape(-1, self.group_size)
         return y.reshape(x.shape).astype(dtype)
 
 
@@ -1480,6 +1493,10 @@ class Qwen4ExpGatedResidual(nn.Module):
             )
 
     def __call__(self, hyper_input: mx.array, target_verify: bool = False):
+        if hc_fused.compatible(self, hyper_input):
+            fused = hc_fused.fused_forward(self, hyper_input)
+            if fused is not None:
+                return fused
         compiled_forward = getattr(self, "_compiled_forward", None)
         if (
             compiled_forward is not None
@@ -2494,6 +2511,12 @@ class Qwen4ExpModel(nn.Module):
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
+            if (
+                _EAGER_DISPATCH
+                and hidden_states.shape[0] * hidden_states.shape[1]
+                <= _EAGER_DISPATCH_MAX_ROWS
+            ):
+                mx.async_eval(hidden_states)
             if hidden_sink is not None and index in capture:
                 hidden_sink.append(
                     self.hyper_connection_mixer(
