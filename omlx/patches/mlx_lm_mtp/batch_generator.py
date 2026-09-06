@@ -743,6 +743,11 @@ class _MtpState:
     # from verify-forward hidden rows so the head sees a dense, committed-only
     # timeline.
     hist_offset: int = 0
+    # Qwen4 suffix-local priming keeps the draft head on a local zero-based
+    # suffix timeline while the verified target cache remains absolute. Never
+    # use target_expected_offset to trim the head cache.
+    target_expected_offset: Optional[int] = None
+    suffix_local_priming: bool = False
     # Sampler for draft tokens (lazily resolved). For stochastic target
     # samplers this is a *sharper* distribution than the target (temp 0.6 /
     # top_p 0.95 / top_k 20) — the Leviathan/Chen acceptance ratio uses the
@@ -1224,11 +1229,21 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
             park_state.cooldown_tokens,
         )
 
-    logger.info(
-        "MTP path activated for uid=%s (model has mtp_forward, batch=1, primed=%d)",
-        state.uid,
-        max(0, int(getattr(state, "hist_offset", 0)) - 1),
-    )
+    if state.suffix_local_priming:
+        logger.info(
+            "MTP path activated for uid=%s (model has mtp_forward, batch=1, "
+            "primed=%d local suffix tokens, target_offset=%d)",
+            state.uid,
+            max(0, int(state.hist_offset) - 1),
+            int(state.target_expected_offset or 0),
+        )
+    else:
+        logger.info(
+            "MTP path activated for uid=%s "
+            "(model has mtp_forward, batch=1, primed=%d)",
+            state.uid,
+            max(0, int(getattr(state, "hist_offset", 0)) - 1),
+        )
     return state
 
 
@@ -1689,6 +1704,77 @@ def _mtp_head_trim_to(mtp_cache: List[Any], offset: int) -> None:
         extra = current - offset
         if extra > 0:
             c.trim(extra)
+
+
+def _adopt_primed_head_state(
+    state: _MtpState,
+    primed: Any,
+    target_cache: Optional[List[Any]],
+) -> bool:
+    """Install generic or Qwen4 suffix-local priming, failing closed."""
+
+    if isinstance(primed, _prompt_priming.SuffixLocalPrimedState):
+        head_offset = _prompt_priming.mtp_cache_offset(primed.mtp_cache)
+        target_offset = _prompt_priming.target_cache_offset(target_cache)
+        if (
+            head_offset != primed.head_hist_offset
+            or target_offset != primed.target_expected_offset
+        ):
+            logger.debug(
+                "Qwen4 suffix-local priming rejected at activation: "
+                "head=%s/%s target=%s/%s",
+                head_offset,
+                primed.head_hist_offset,
+                target_offset,
+                primed.target_expected_offset,
+            )
+            return False
+        state.mtp_cache = primed.mtp_cache
+        state.hist_offset = primed.head_hist_offset
+        state.target_expected_offset = primed.target_expected_offset
+        state.suffix_local_priming = True
+        return True
+    try:
+        mtp_cache, hist_offset = primed
+    except (TypeError, ValueError):
+        return False
+    state.mtp_cache = mtp_cache
+    state.hist_offset = int(hist_offset)
+    return True
+
+
+def _trim_committed_mtp_head(state: _MtpState) -> None:
+    """Trim against the local head timeline and prove suffix isolation."""
+
+    _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+    if state.suffix_local_priming:
+        observed = _prompt_priming.mtp_cache_offset(state.mtp_cache)
+        if observed != state.hist_offset:
+            raise _MtpStepFallback(
+                "Qwen4 suffix-local MTP head escaped its local trim boundary "
+                f"(expected={state.hist_offset}, observed={observed})"
+            )
+
+
+def _advance_suffix_local_target(
+    state: _MtpState,
+    target_cache: Optional[List[Any]],
+    retained_tokens: int,
+) -> None:
+    """Advance and verify the separate absolute target-cache timeline."""
+
+    if not state.suffix_local_priming:
+        return
+    if state.target_expected_offset is None or retained_tokens <= 0:
+        raise _MtpStepFallback("Qwen4 suffix-local target seam is incomplete")
+    expected = state.target_expected_offset + int(retained_tokens)
+    observed = _prompt_priming.target_cache_offset(target_cache)
+    if observed != expected:
+        raise _MtpStepFallback(
+            "Qwen4 suffix-local target cache left its absolute seam "
+            f"(expected={expected}, observed={observed})"
+        )
+    state.target_expected_offset = expected
 
 
 # Loop-tax measurement (feeds _DepthController.EXIT_MARGIN): right after a
@@ -2506,9 +2592,11 @@ def _post_init_mtp(gen_batch: Any) -> None:
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
         )
-        if primed is not None:
-            state.mtp_cache, state.hist_offset = primed
-        else:
+        if primed is None or not _adopt_primed_head_state(
+            state,
+            primed,
+            gen_batch.prompt_cache,
+        ):
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
@@ -3104,11 +3192,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         if procs is not None:
             _trim_token_buffer(gen_batch, k - m)
     state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000
+    # Target verification committed exactly m accepted drafts plus the
+    # correction/bonus token. Keep its absolute timeline independent from the
+    # suffix-local draft-head offset.
+    _advance_suffix_local_target(state, gen_batch.prompt_cache, m + 1)
 
     # --- MTP-head history + next draft chain (async-dispatched) ---
     t0 = time.perf_counter()
     if not state.head_clone:
-        _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+        _trim_committed_mtp_head(state)
     committed = mx.array(
         [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
     )
@@ -3170,6 +3262,7 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
         gen_batch.prompt_cache,
     )
     _clear_rollback(gen_batch.prompt_cache)
+    _advance_suffix_local_target(state, gen_batch.prompt_cache, 1)
     next_logits = _apply_processors(procs, prev_buf, logits[:, -1, :])
     next_lp_2d = _logprobs(next_logits)
     next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
@@ -3177,6 +3270,12 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
+    if not state.head_clone:
+        # The first next-draft chain may have appended speculative local-head
+        # rows past hist_offset. Boundary materialization commits another target
+        # token before rebuilding that chain, so rewind to the local committed
+        # seam first (head-clone families already keep the persistent cache clean).
+        _trim_committed_mtp_head(state)
     _chain_next_drafts(
         gen_batch,
         state,

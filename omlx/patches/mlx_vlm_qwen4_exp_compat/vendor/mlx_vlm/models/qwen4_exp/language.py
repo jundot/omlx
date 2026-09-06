@@ -2741,6 +2741,11 @@ class LanguageModel(Qwen3_5LanguageModel):
         self._omlx_mtp_chain = True
         self._omlx_mtp_depth = get_mtp_depth()
         self._omlx_mtp_head_prenorm = True
+        # The target backbone verifies every draft, so a restart may prime the
+        # drafter from only the exact uncached TEXT suffix when the durable
+        # backbone prefix has no matching in-memory MTP sidecar. Generic/DS4
+        # hosts never receive this narrow capability marker.
+        self._omlx_mtp_suffix_local_capability = "qwen4-verified-text-v1"
 
     def get_mtp_module(self):
         module = getattr(self, "mtp", None)
