@@ -1508,7 +1508,7 @@ raise SystemExit(2)
 
         if (
             not full_text
-            and not tool_calls
+            and not backend_tool_calls
             and finish_reason is None
             and completion_tokens == 0
         ):
