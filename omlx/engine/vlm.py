@@ -1500,6 +1500,21 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
+
+    @property
     def model_type(self) -> str | None:
         vlm_model = getattr(self, "_vlm_model", None)
         if vlm_model is not None and hasattr(vlm_model, "config"):
@@ -3705,6 +3720,7 @@ class VLMBatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))

@@ -152,15 +152,13 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     - Empty think: ``<think></think>answer`` → ``("", "answer")``
     - Think only: ``<think>reasoning</think>`` → ``("reasoning", "")``
     - Malformed (open with no close): ``<think>everything…`` →
-      ``("", "everything…")`` — recovery for V4-style models that
-      occasionally skip the ``</think>`` boundary token. Without this
-      fallback the entire body would be classified as thinking and the
-      visible answer would be empty.
+      ``("everything…", "")`` — unfinished private reasoning is never
+      reclassified as a visible answer.
 
-    Tag-free text is always classified as content. Mirrors
-    ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
-    fallback): when the model emits no thinking markers, surface the body
-    as the answer so the response is never empty.
+    Tag-free text is always classified as content because this non-streaming
+    helper has no prompt-open-state information. Streaming callers use
+    :class:`ThinkingParser`, which preserves unfinished prompt-opened text as
+    reasoning and reports the response as incomplete.
 
     Args:
         text: Complete model output text.
@@ -190,6 +188,13 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         remaining = remaining[:match.start()] + remaining[match.end():]
 
     if thinking_parts:
+        # A later malformed block can follow one or more complete blocks, for
+        # example ``<think>a</think>answer<think>private``. Preserve the public
+        # prefix, but keep the unterminated suffix in the reasoning channel.
+        if '<think>' in remaining:
+            idx = remaining.index('<think>')
+            thinking_parts.append(remaining[idx + _OPEN_LEN:])
+            remaining = remaining[:idx]
         thinking = "\n".join(thinking_parts).strip()
         return (thinking, remaining.strip())
 
@@ -201,13 +206,13 @@ def extract_thinking(text: str) -> Tuple[str, str]:
             remaining = text[match.end():].strip()
             return (thinking, remaining)
 
-    # Malformed: <think> opened but never closed. Drop the open tag and
-    # treat the remainder as content so the answer body is not empty.
+    # Malformed: <think> opened but never closed. Keep the remainder private;
+    # surfacing chain-of-thought as an answer is a protocol/privacy failure.
     if '<think>' in text and '</think>' not in text:
         idx = text.index('<think>')
         before = text[:idx]
         after = text[idx + _OPEN_LEN:]
-        return ("", (before + after).strip())
+        return (after.strip(), before.strip())
 
     return ("", text)
 
@@ -237,12 +242,8 @@ class ThinkingParser:
     def __init__(self, start_in_thinking: bool = False):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
-        # Recovery state for malformed thinking: when the prompt prepends
-        # ``<think>`` and the model never emits ``</think>`` before EOS,
-        # everything we streamed went out as thinking. The streamed events
-        # cannot be retracted, so finish() emits the accumulated thinking
-        # text once more as content — the client will show both panels but
-        # the answer body is no longer empty.
+        # State retained for protocol validation and observability. Unfinished
+        # thinking is never copied into visible answer content.
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
@@ -328,34 +329,16 @@ class ThinkingParser:
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
-        Also recovers from malformed thinking — when the model never
-        emitted ``</think>`` and no content was ever produced, returns
-        the accumulated thinking text as content so the client surfaces
-        a non-empty answer body.
+        Unfinished reasoning remains reasoning. Callers can inspect
+        :attr:`unfinished_thinking` and surface an incomplete finish reason;
+        they must not leak accumulated chain-of-thought into answer content.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
-            (plus recovered content if applicable).
+            from the remaining buffer.
         """
         partial = self._buffer
         self._buffer = ""
-
-        # Recovery: prompt opened a thinking block (or model echoed
-        # ``<think>`` itself), the close tag never arrived, and nothing
-        # ever streamed as content. Re-emit the accumulated thinking text
-        # as content so the answer body is not empty. The thinking events
-        # already streamed live cannot be retracted, so the client sees
-        # the same text twice — once in the thinking panel, once as the
-        # answer. UX trade-off documented in the chat template plan.
-        if (
-            self._in_thinking
-            and not self._close_seen
-            and not self._content_emitted
-            and self._thinking_accumulated
-        ):
-            recovered = "".join(self._thinking_accumulated) + partial
-            self._content_emitted = True
-            return ("", recovered)
 
         if not partial:
             return ("", "")
@@ -367,6 +350,12 @@ class ThinkingParser:
         else:
             self._content_emitted = True
             return ("", partial)
+
+    @property
+    def unfinished_thinking(self) -> bool:
+        """Whether the stream ended while a reasoning block was still open."""
+
+        return self._in_thinking
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:
@@ -389,29 +378,33 @@ class ThinkingParser:
 
 
 class ThinkingBudgetProcessor:
-    """Logits processor that enforces a thinking token budget.
+    """Logits processor that keeps an opened thinking protocol well formed.
 
-    Counts tokens generated while in thinking mode.  When the budget is
-    exceeded, forces the close-think token(s) one at a time, then becomes
-    a no-op for the rest of generation.
+    While the prompt-opened thinking block is active, terminal stop tokens can
+    be suppressed so a sampled EOS cannot strand the response inside
+    ``<think>``.  When a budget is configured, the processor additionally
+    counts thinking tokens and forces the close-think sequence once the budget
+    is reached.  After the close marker it becomes a no-op.
 
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
     Args:
         think_end_token_ids: Token ID(s) for the close-think tag.
-        budget: Maximum number of thinking tokens before forcing close.
+        budget: Optional maximum thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        stop_token_ids: Terminal token IDs forbidden until thinking closes.
     """
 
     def __init__(
         self,
         think_end_token_ids: List[int],
-        budget: int,
+        budget: Optional[int],
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        stop_token_ids: Optional[Sequence[int]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -420,9 +413,12 @@ class ThinkingBudgetProcessor:
             + list(think_end_token_ids)
             + (trailing_token_ids or [])
         )
-        self._budget = budget
+        self._budget = None if budget is None else max(1, int(budget))
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._stop_token_ids = tuple(
+            sorted({int(token_id) for token_id in (stop_token_ids or ())})
+        )
 
         # State
         self._thinking_tokens: int = 0
@@ -458,10 +454,22 @@ class ThinkingBudgetProcessor:
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        # A prompt-opened reasoning block is a protocol region, not a complete
+        # assistant response.  Sampling EOS here used to terminate the request
+        # before ``</think>``; the streaming fallback then had no choice but to
+        # duplicate the unfinished reasoning into visible content.  Mask only
+        # terminal tokens while the block is open.  Every replacement remains
+        # sampled and target-verified; natural ``</think>`` immediately removes
+        # the constraint.
+        if self._in_thinking and self._stop_token_ids:
+            logits[..., list(self._stop_token_ids)] = mx.array(float("-inf"))
+
         if self._waiting_utf8:
             return logits
 
         if self._in_thinking:
+            if self._budget is None:
+                return logits
             self._thinking_tokens += 1
             if self._thinking_tokens >= self._budget:
                 if self._last_token_utf8_complete:

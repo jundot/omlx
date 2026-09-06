@@ -1858,6 +1858,14 @@ def parse_tool_calls_with_thinking_fallback(
     return result.cleaned_text, result.tool_calls
 
 
+@dataclass(frozen=True)
+class ToolCallStreamSegment:
+    """One FIFO-safe visible-content or complete-envelope stream event."""
+
+    kind: str
+    text: str
+
+
 class ToolCallStreamFilter:
     """Streaming filter that suppresses tool-call markup from content deltas.
 
@@ -1878,9 +1886,21 @@ class ToolCallStreamFilter:
             that never contains a separator-prefixed tool-call block (the
             thinking channel), where holding trailing newlines would flush
             them only after the channel closed.
+        capture_ordered_segments: Retain an opt-in FIFO of visible-content and
+            complete-envelope events for the narrow qwen3_coder Chat path.
+            Other filters pay no segment-copying cost.
     """
 
-    def __init__(self, tokenizer: Any, *, consume_dsml_separator: bool = True):
+    _COMPLETED_ENVELOPE_MAX_COUNT = 16
+    _COMPLETED_ENVELOPE_MAX_BYTES = 2 * 1024 * 1024
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        consume_dsml_separator: bool = True,
+        capture_ordered_segments: bool = False,
+    ):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
         # Normalize None-like values but preserve empty strings.
@@ -1936,6 +1956,11 @@ class ToolCallStreamFilter:
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
+        self._completed_envelopes: List[str] = []
+        self._completed_envelope_bytes = 0
+        self._completed_envelope_overflowed = False
+        self._capture_ordered_segments = bool(capture_ordered_segments)
+        self._ordered_segments: List[ToolCallStreamSegment] = []
         self._reset_json_scan()
 
     @staticmethod
@@ -1957,6 +1982,75 @@ class ToolCallStreamFilter:
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
         return candidate
+
+    def take_completed_envelopes(self) -> List[str]:
+        """Return complete suppressed envelopes ready for exact parsing.
+
+        Populated only when ``capture_ordered_segments=True``. Callers may emit
+        a structured tool-call delta as soon as the complete envelope validates
+        instead of waiting for generation to terminate. Partial/malformed
+        envelopes never enter this queue.
+        """
+
+        completed = self._completed_envelopes
+        self._completed_envelopes = []
+        self._completed_envelope_bytes = 0
+        return completed
+
+    def take_ordered_segments(self) -> List[ToolCallStreamSegment]:
+        """Return content/envelope events in their exact raw stream order."""
+
+        segments = self._ordered_segments
+        self._ordered_segments = []
+        return segments
+
+    @property
+    def completed_envelope_overflowed(self) -> bool:
+        """Whether an envelope exceeded the bounded early-stream queue."""
+
+        return self._completed_envelope_overflowed
+
+    @property
+    def envelope_open(self) -> bool:
+        """Whether model output is currently buffered inside a tool envelope."""
+
+        return bool(self._suppressing or self._suppressing_until is not None)
+
+    def _record_content(self, out: List[str], text: str) -> None:
+        if not text:
+            return
+        out.append(text)
+        if self._capture_ordered_segments:
+            self._ordered_segments.append(ToolCallStreamSegment("content", text))
+
+    def _record_completed_envelope(self, completed: str) -> None:
+        if not self._capture_ordered_segments:
+            return
+        if self._completed_envelope_overflowed:
+            return
+        if (
+            len(self._completed_envelopes) >= self._COMPLETED_ENVELOPE_MAX_COUNT
+            or self._completed_envelope_bytes + len(completed)
+            > self._COMPLETED_ENVELOPE_MAX_BYTES
+        ):
+            # Latch for the lifetime of this filter. Clear the not-yet-consumed
+            # queue/segments so a dropped earlier call can never be followed by
+            # a later early-emitted call out of sequence.
+            self._completed_envelope_overflowed = True
+            self._completed_envelopes = []
+            self._completed_envelope_bytes = 0
+            self._ordered_segments = [
+                segment
+                for segment in self._ordered_segments
+                if segment.kind != "envelope"
+            ]
+            return
+        self._completed_envelopes.append(completed)
+        self._completed_envelope_bytes += len(completed)
+        if self._capture_ordered_segments:
+            self._ordered_segments.append(
+                ToolCallStreamSegment("envelope", completed)
+            )
 
     def _clear_pending_envelope(self) -> None:
         self._pending_envelope_parts = []
@@ -2533,6 +2627,11 @@ class ToolCallStreamFilter:
                         self._shift_json_scan(len(moved), moved)
                         self._buffer = ""
                     break
+                completed = (
+                    "".join(self._pending_envelope_parts)
+                    + self._buffer[: end_idx + len(self._suppressing_until)]
+                )
+                self._record_completed_envelope(completed)
                 self._buffer = self._buffer[end_idx + len(self._suppressing_until) :]
                 self._suppressing_until = None
                 self._clear_pending_envelope()
@@ -2543,7 +2642,8 @@ class ToolCallStreamFilter:
                 idx, consume_len, close_marker = start
                 opening_marker = self._buffer[idx : idx + consume_len]
                 if idx > 0:
-                    out.append(
+                    self._record_content(
+                        out,
                         self._sanitize_prefix_before_suppression(self._buffer[:idx])
                     )
                 self._buffer = self._buffer[idx + consume_len :]
@@ -2560,11 +2660,11 @@ class ToolCallStreamFilter:
 
             keep = self._partial_suffix_len(self._buffer)
             if keep == 0:
-                out.append(self._buffer)
+                self._record_content(out, self._buffer)
                 self._buffer = ""
                 break
             if len(self._buffer) > keep:
-                out.append(self._buffer[:-keep])
+                self._record_content(out, self._buffer[:-keep])
                 self._buffer = self._buffer[-keep:]
             break
 

@@ -49,12 +49,19 @@ class TestThinkingBudgetProcessor:
 
     NEWLINE_ID = 99  # Dummy \n token ID
 
-    def _make_processor(self, budget: int = 5, end_ids=None, trailing_ids=None):
+    def _make_processor(
+        self,
+        budget: int | None = 5,
+        end_ids=None,
+        trailing_ids=None,
+        stop_ids=None,
+    ):
         return ThinkingBudgetProcessor(
             think_end_token_ids=end_ids or [self.THINK_END_ID],
             budget=budget,
             think_start_token_id=self.THINK_START_ID,
             trailing_token_ids=trailing_ids,
+            stop_token_ids=stop_ids,
         )
 
     # --- Budget enforcement ---
@@ -131,6 +138,40 @@ class TestThinkingBudgetProcessor:
         original = _make_logits()
         result = proc(_make_tokens(10, self.THINK_END_ID, 50), original)
         assert mx.array_equal(result, original)
+
+    def test_masks_eos_until_natural_thinking_close_without_budget(self):
+        """Prompt-opened thinking cannot terminate before ``</think>``."""
+        eos_id = 2
+        proc = self._make_processor(budget=None, stop_ids=[eos_id])
+
+        masked = proc(_make_tokens(10), _make_logits())
+        assert masked[0, eos_id].item() == float("-inf")
+        assert masked[0, 0].item() == 0.0
+        assert not proc._forcing
+
+        # Once the target naturally emits the close marker, ordinary EOS is
+        # immediately available for the answer phase.
+        unmasked = proc(
+            _make_tokens(10, self.THINK_END_ID),
+            _make_logits(),
+        )
+        assert proc._done
+        assert unmasked[0, eos_id].item() == 0.0
+
+    def test_eos_mask_survives_snapshot_restore(self):
+        """Speculative rollback preserves the open-thinking EOS guard."""
+        eos_id = 2
+        proc = self._make_processor(budget=None, stop_ids=[eos_id])
+        proc(_make_tokens(10), _make_logits())
+        snapshot = proc.snapshot_state()
+
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+        proc.restore_state(snapshot)
+
+        masked = proc(_make_tokens(10), _make_logits())
+        assert not proc._done
+        assert masked[0, eos_id].item() == float("-inf")
 
     def test_first_call_skips_state_update(self):
         """First call should not check tokens[-1] for state transitions."""
@@ -338,6 +379,47 @@ class TestParserBackedThinkingBudgetWiring:
         ]
         assert len(budget_processors) == 1
         assert budget_processors[0]._think_end_ids == [101]
+
+    def test_prompt_opened_thinking_gets_eos_guard_without_budget(self):
+        scheduler = self._make_scheduler(None, {})
+        scheduler._resolve_think_end_token_ids = MagicMock(return_value=[42])
+        # A close marker can also appear in a model's terminal-token set. It
+        # must remain sampleable or the protocol could never close.
+        scheduler._get_stop_tokens = MagicMock(return_value={2, 3, 42})
+        request = self._make_request()
+        request.sampling_params.thinking_budget = None
+        # Caller-owned stops remain authoritative and are not folded into the
+        # protocol guard. Only scheduler/model terminal EOS IDs are masked.
+        request.sampling_params.stop_token_ids = [77]
+        request.needs_think_prefix = True
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params,
+            request,
+        )
+
+        protocol_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(protocol_processors) == 1
+        assert protocol_processors[0]._budget is None
+        assert protocol_processors[0]._stop_token_ids == (2, 3)
+
+    def test_no_protocol_processor_for_plain_request_without_budget(self):
+        scheduler = self._make_scheduler(None, {})
+        request = self._make_request()
+        request.sampling_params.thinking_budget = None
+        request.needs_think_prefix = False
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params,
+            request,
+        )
+
+        assert not any(
+            isinstance(processor, ThinkingBudgetProcessor)
+            for processor in processors
+        )
 
     def test_parser_marker_ignores_none_tokenizer_think_end(self):
         factory = OutputParserFactory(

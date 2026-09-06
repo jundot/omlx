@@ -156,11 +156,13 @@ from .api.responses_utils import (
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
+    parse_tool_calls,
     parse_json_output,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
@@ -4730,6 +4732,96 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _registered_tool_names(tools: object) -> set[str]:
+    """Return nonempty function names explicitly registered by the request."""
+
+    names: set[str] = set()
+    for tool in tools or []:
+        function = (
+            tool.get("function")
+            if isinstance(tool, dict)
+            else getattr(tool, "function", None)
+        )
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else getattr(function, "name", None)
+        )
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
+    """Canonical name/JSON-object identity, or ``None`` when malformed.
+
+    This is syntactic validation plus the separate registered-name check at the
+    call site; it is deliberately not full JSON Schema argument validation.
+    """
+
+    function = getattr(tool_call, "function", None)
+    name = getattr(function, "name", None)
+    arguments = getattr(function, "arguments", None)
+    if not isinstance(name, str) or not name or not isinstance(arguments, str):
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return name, canonical
+
+
+def _chat_can_stream_qwen_tool_envelopes(engine: BaseEngine) -> bool:
+    """Narrow Chat-only early-tool gate.
+
+    The engine capability is authoritative and defaults false. The tokenizer
+    must independently expose mlx-lm's qwen3_coder parser; all other APIs and
+    parser families remain terminal-buffered.
+    """
+
+    if getattr(engine, "supports_early_tool_call_streaming", False) is not True:
+        return False
+    tokenizer = getattr(engine, "tokenizer", None)
+    parser = getattr(tokenizer, "tool_parser", None)
+    try:
+        from mlx_lm.tool_parsers.qwen3_coder import (
+            parse_tool_call as expected_parser,
+        )
+    except ImportError:
+        return False
+    return bool(
+        parser is expected_parser
+        and getattr(parser, "__name__", None) == "parse_tool_call"
+        and getattr(parser, "__module__", None)
+        == "mlx_lm.tool_parsers.qwen3_coder"
+    )
+
+
+def _merge_streamed_tool_call_prefix(streamed: list, terminal: list | None) -> list:
+    """Keep validated early calls as an occurrence-aware semantic prefix."""
+
+    remaining = list(terminal or [])
+    merged = list(streamed)
+    for early in streamed:
+        key = _tool_call_semantic_key(early)
+        if key is None:
+            continue
+        for index, candidate in enumerate(remaining):
+            if _tool_call_semantic_key(candidate) == key:
+                remaining.pop(index)
+                break
+    merged.extend(remaining)
+    return merged
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4747,6 +4839,7 @@ async def stream_chat_completion(
     """
     start_time = time.perf_counter()
     first_token_time = None
+    first_visible_time = None
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
@@ -4763,6 +4856,11 @@ async def stream_chat_completion(
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+
+    def mark_visible_delta() -> None:
+        nonlocal first_visible_time
+        if first_visible_time is None:
+            first_visible_time = time.perf_counter()
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4785,9 +4883,22 @@ async def stream_chat_completion(
     # clients do not see raw envelopes/tags in assistant content deltas.
     tool_filter = None
     thinking_filter = None
+    streamed_tool_calls = []
+    stream_tool_sequence_safe = True
+    stream_completed_qwen_tools = False
+    qwen_tool_envelope_streaming_capable = False
+    registered_tool_names: set[str] = set()
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        registered_tool_names = _registered_tool_names(kwargs.get("tools"))
+        qwen_tool_envelope_streaming_capable = bool(
+            registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
+        )
+        stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            capture_ordered_segments=stream_completed_qwen_tools,
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
@@ -4799,11 +4910,26 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
-            if first_token_time is None and output.new_text:
-                first_token_time = time.perf_counter()
+        async for output in engine_stream:
+            if first_token_time is None:
+                produced_at = getattr(output, "first_token_at", None)
+                if produced_at is None:
+                    produced_at = getattr(output, "generated_at", None)
+                if produced_at is not None:
+                    first_token_time = float(produced_at)
+                elif getattr(output, "completion_tokens", 0) > 0 or output.new_text:
+                    # Engines without producer timestamps can only expose the
+                    # exact API-observation time. Never substitute end-of-turn.
+                    first_token_time = time.perf_counter()
             last_output = output
+            if output.tool_calls:
+                # A structured producer is authoritative. Correct engines keep
+                # the explicit capability false; this guard also prevents a
+                # same-output raw envelope from racing its structured result.
+                stream_completed_qwen_tools = False
+                stream_tool_sequence_safe = False
             if output.new_text:
                 accumulated_text += output.new_text
 
@@ -4814,6 +4940,10 @@ async def stream_chat_completion(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
+                        # Thinking-channel calls are terminal fallback only:
+                        # content-channel calls take precedence, so they cannot
+                        # be streamed safely before the turn finishes.
+                        thinking_filter.take_completed_envelopes()
                     chunk = ChatCompletionChunk(
                         id=response_id,
                         model=request.model,
@@ -4827,27 +4957,125 @@ async def stream_chat_completion(
                         ],
                     )
                     if thinking_delta:
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        event = (
+                            f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        )
+                        mark_visible_delta()
+                        yield event
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
                 if content_delta:
+                    ordered_segments: list[ToolCallStreamSegment] = []
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
-                    if content_delta:
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        content=content_delta
-                                    ),
-                                    finish_reason=None,
+                        if stream_completed_qwen_tools:
+                            ordered_segments = tool_filter.take_ordered_segments()
+                            # The legacy completed queue shares the same string
+                            # objects; drain it so ordered capture adds no
+                            # retained duplicate state.
+                            tool_filter.take_completed_envelopes()
+                            if tool_filter.completed_envelope_overflowed:
+                                logger.warning(
+                                    "Early qwen tool streaming disabled for this "
+                                    "Chat turn: completed-envelope queue exceeded "
+                                    "its count or byte bound"
                                 )
-                            ],
+                                stream_completed_qwen_tools = False
+                                stream_tool_sequence_safe = False
+                                ordered_segments = [
+                                    segment
+                                    for segment in ordered_segments
+                                    if segment.kind == "content"
+                                ]
+                        else:
+                            tool_filter.take_ordered_segments()
+                            tool_filter.take_completed_envelopes()
+                    if not ordered_segments and content_delta:
+                        ordered_segments = [
+                            ToolCallStreamSegment("content", content_delta)
+                        ]
+
+                    for segment in ordered_segments:
+                        if segment.kind == "content":
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            content=segment.text
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            event = (
+                                f"data: {chunk.model_dump_json(exclude_none=True)}"
+                                "\n\n"
+                            )
+                            mark_visible_delta()
+                            yield event
+                            continue
+
+                        if segment.kind != "envelope":
+                            stream_tool_sequence_safe = False
+                            continue
+                        _cleaned, completed_calls = parse_tool_calls(
+                            segment.text,
+                            engine.tokenizer,
+                            kwargs.get("tools"),
                         )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        completed_calls = completed_calls or []
+                        completed_keys = [
+                            _tool_call_semantic_key(tc) for tc in completed_calls
+                        ]
+                        if (
+                            not completed_calls
+                            or any(key is None for key in completed_keys)
+                            or any(
+                                key[0] not in registered_tool_names
+                                for key in completed_keys
+                                if key is not None
+                            )
+                        ):
+                            stream_tool_sequence_safe = False
+                            continue
+                        if not stream_tool_sequence_safe:
+                            continue
+                        for tc in completed_calls:
+                            index = len(streamed_tool_calls)
+                            streamed_tool_calls.append(tc)
+                            tc_chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            tool_calls=[
+                                                {
+                                                    "index": index,
+                                                    "id": tc.id,
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tc.function.name,
+                                                        "arguments": (
+                                                            tc.function.arguments
+                                                        ),
+                                                    },
+                                                }
+                                            ]
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            event = (
+                                f"data: {tc_chunk.model_dump_json(exclude_none=True)}"
+                                "\n\n"
+                            )
+                            mark_visible_delta()
+                            yield event
     except Exception as e:
         error_data = _streaming_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
@@ -4855,8 +5083,10 @@ async def stream_chat_completion(
         return
 
     # Flush remaining buffered content from thinking/tool-call parsers
+    unfinished_thinking = False
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
+        unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -4873,7 +5103,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
@@ -4889,7 +5121,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -4904,7 +5138,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
         if tool_filter:
             remaining = tool_filter.finish()
@@ -4919,12 +5155,22 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
     # Parse tool calls from accumulated text
     tool_calls = None
     cleaned_text = accumulated_text
-    if last_output and last_output.tool_calls:
+    terminal_tool_calls_authoritative = bool(
+        not unfinished_thinking and last_output and last_output.tool_calls
+    )
+    if unfinished_thinking:
+        # A tool-like envelope inside an unfinished private reasoning region is
+        # not an executable assistant action, even if a model-side parser
+        # optimistically extracted it.
+        cleaned_text = ""
+    elif last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
@@ -4941,6 +5187,20 @@ async def stream_chat_completion(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
+        if tool_calls and qwen_tool_envelope_streaming_capable:
+            # Raw-text parsing is never allowed to promote malformed or
+            # unregistered functions on the explicitly capability-gated qwen
+            # early-stream path. Other parser families retain their existing
+            # terminal semantics; engine-native structured calls above are
+            # authoritative and intentionally bypass this API-layer filter.
+            tool_calls = [
+                tool_call
+                for tool_call in tool_calls
+                if (
+                    (key := _tool_call_semantic_key(tool_call)) is not None
+                    and key[0] in registered_tool_names
+                )
+            ]
 
         # Process response_format if specified
         if request.response_format and not tool_calls:
@@ -4967,7 +5227,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
             if cleaned_text:
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -4979,7 +5241,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
@@ -4988,6 +5252,8 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        recovered_content = ""
     if not tool_calls:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -5002,7 +5268,9 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
         if recovered_content:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5014,7 +5282,44 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
+
+    # A qwen3_coder raw-envelope stream has no engine-side structured parser,
+    # so preserve each already-emitted validated occurrence even if malformed
+    # later markup makes terminal extraction partial. Structured engine output
+    # is authoritative and, by capability contract, can never race this path.
+    if (
+        streamed_tool_calls
+        and not terminal_tool_calls_authoritative
+        and not unfinished_thinking
+    ):
+        tool_calls = _merge_streamed_tool_call_prefix(
+            streamed_tool_calls,
+            tool_calls,
+        )
+
+    # Reconcile by canonical JSON semantics plus occurrence—not raw argument
+    # formatting or list position. Repeated identical calls remain distinct.
+    streamed_by_fingerprint: dict[tuple[str, str], list] = {}
+    reconcilable_streamed = (
+        [] if terminal_tool_calls_authoritative else streamed_tool_calls
+    )
+    for streamed in reconcilable_streamed:
+        fingerprint = _tool_call_semantic_key(streamed)
+        if fingerprint is not None:
+            streamed_by_fingerprint.setdefault(fingerprint, []).append(streamed)
+    streamed_tool_call_ids: set[str] = set()
+    for final in tool_calls or []:
+        fingerprint = _tool_call_semantic_key(final)
+        if fingerprint is None:
+            continue
+        candidates = streamed_by_fingerprint.get(fingerprint) or []
+        if candidates:
+            streamed = candidates.pop(0)
+            final.id = streamed.id
+            streamed_tool_call_ids.add(streamed.id)
 
     # Reverse Gemma 4 parameter renaming for streaming path
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
@@ -5030,6 +5335,8 @@ async def stream_chat_completion(
     # Emit tool call chunks if found
     if tool_calls:
         for i, tc in enumerate(tool_calls):
+            if tc.id in streamed_tool_call_ids:
+                continue
             tc_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -5051,7 +5358,9 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
 
     # Final chunk with finish_reason
     finish_reason = (
@@ -5059,6 +5368,20 @@ async def stream_chat_completion(
         if tool_calls
         else (last_output.finish_reason if last_output else "stop")
     )
+    if (
+        not tool_calls
+        and unfinished_thinking
+        and finish_reason != "length"
+    ):
+        # The target terminated inside a prompt-opened reasoning block. Treat
+        # this as an incomplete response rather than a successful answer; the
+        # private reasoning has already streamed on reasoning_content and must
+        # never be promoted into delta.content.
+        finish_reason = "length"
+        logger.warning(
+            "Chat stream ended before the thinking protocol closed; "
+            "reporting an incomplete response"
+        )
     final_chunk = ChatCompletionChunk(
         id=response_id,
         model=request.model,
@@ -5075,16 +5398,35 @@ async def stream_chat_completion(
     if last_output and last_output.finished:
         end_time = time.perf_counter()
         total_duration = end_time - start_time
-        ttft = (first_token_time - start_time) if first_token_time else total_duration
+        model_ttft = (
+            max(0.0, first_token_time - start_time)
+            if first_token_time is not None
+            else None
+        )
+        visible_ttft = (
+            max(0.0, first_visible_time - start_time)
+            if first_visible_time is not None
+            else None
+        )
         is_diffusion = getattr(engine, "is_diffusion_model", False)
         if is_diffusion:
             gen_duration = total_duration
         else:
-            gen_duration = end_time - (first_token_time or start_time)
+            gen_duration = max(
+                0.0,
+                end_time
+                - (
+                    first_token_time
+                    if first_token_time is not None
+                    else start_time
+                ),
+            )
         metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
             last_output,
             is_diffusion=is_diffusion,
-            prefill_duration=ttft,
+            prefill_duration=(
+                model_ttft if model_ttft is not None else total_duration
+            ),
             generation_duration=gen_duration,
         )
         get_server_metrics().record_request_complete(
@@ -5104,13 +5446,21 @@ async def stream_chat_completion(
             tokens_per_sec,
             is_diffusion=is_diffusion,
         )
+        model_ttft_text = (
+            f"{model_ttft:.2f}s" if model_ttft is not None else "unavailable"
+        )
+        visible_ttft_text = (
+            f"{visible_ttft:.2f}s" if visible_ttft is not None else "unavailable"
+        )
         logger.info(
             f"Chat completion: model={resolved_model or request.model}, "
             f"{last_output.completion_tokens} tokens in "
             f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
-            f"request_max_tokens={request.max_tokens}"
+            f"request_max_tokens={request.max_tokens}, "
+            f"stream_model_ttft={model_ttft_text}, "
+            f"stream_visible_ttft={visible_ttft_text}"
         )
 
         # Emit usage chunk if requested
@@ -5134,7 +5484,14 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
+                    time_to_first_token=(
+                        round(model_ttft, 2) if model_ttft is not None else None
+                    ),
+                    time_to_first_visible_token=(
+                        round(visible_ttft, 2)
+                        if visible_ttft is not None
+                        else None
+                    ),
                     total_time=round(total_time, 2),
                     prompt_eval_duration=round(metric_prefill_duration, 2),
                     generation_duration=round(metric_gen_duration, 2),
@@ -5353,6 +5710,7 @@ async def stream_anthropic_messages(
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
+    unfinished_thinking = thinking_parser.unfinished_thinking
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5426,7 +5784,11 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
-    if last_output and last_output.tool_calls:
+    if unfinished_thinking:
+        # Never execute a tool candidate emitted inside a malformed/private
+        # reasoning region.
+        tool_calls = None
+    elif last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
@@ -5445,6 +5807,8 @@ async def stream_anthropic_messages(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        recovered_content = ""
     if not tool_calls:
         if recovered_thinking:
             if text_block_started:
@@ -5524,8 +5888,20 @@ async def stream_anthropic_messages(
             yield create_content_block_stop_event(index=i)
 
     # 6. Send message_delta with stop_reason and actual token counts
+    anthropic_finish_reason = output.finish_reason if output else "stop"
+    if (
+        not tool_calls
+        and unfinished_thinking
+        and anthropic_finish_reason != "length"
+    ):
+        anthropic_finish_reason = "length"
+        logger.warning(
+            "Anthropic stream ended before the thinking protocol closed; "
+            "reporting max_tokens"
+        )
     stop_reason = map_finish_reason_to_stop_reason(
-        output.finish_reason if output else "stop", bool(tool_calls)
+        anthropic_finish_reason,
+        bool(tool_calls),
     )
     # Use actual token counts from the last output
     actual_input_tokens = last_output.prompt_tokens if last_output else 0
@@ -6569,19 +6945,22 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        # Capability is only a conservative fallback when rendering cannot be
+        # inspected. The actual prompt wins, because clients can explicitly
+        # disable thinking on a model that supports native reasoning.
+        start_in_thinking = native_reasoning
+        logger.debug("Could not detect Responses stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     seq = 0
 
@@ -6886,8 +7265,10 @@ async def stream_responses_api(
         return
 
     # Flush remaining content from parsers
+    unfinished_thinking = False
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
+        unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6939,10 +7320,16 @@ async def stream_responses_api(
                     },
                 )
 
-    # Parse tool calls from accumulated text
+    # Parse tool calls from accumulated text. An unfinished reasoning block is
+    # structurally incomplete and therefore cannot contain trusted public
+    # content or an executable tool call. Fail closed before reparsing the raw,
+    # tag-free text; otherwise Responses would correctly stream it as reasoning
+    # and then duplicate it into ``output_text.done`` at finalization.
     tool_calls = None
     cleaned_text = accumulated_text
-    if last_output and last_output.tool_calls:
+    if unfinished_thinking:
+        cleaned_text = ""
+    elif last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
@@ -6986,6 +7373,10 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        # Filter recovery is only for a complete output protocol. Never promote
+        # a buffered candidate from an unfinished reasoning region.
+        recovered_content = ""
     if not tool_calls:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
@@ -7236,7 +7627,10 @@ async def stream_responses_api(
         }
 
     # 13. Emit the terminal event matching the final response status.
-    truncated = getattr(last_output, "finish_reason", None) == "length"
+    truncated = bool(
+        getattr(last_output, "finish_reason", None) == "length"
+        or (not tool_calls and unfinished_thinking)
+    )
     terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,

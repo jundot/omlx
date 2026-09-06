@@ -374,6 +374,11 @@ class Usage(BaseUsage):
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
+    # Chat streaming only, measured from stream_chat_completion entry (not HTTP
+    # endpoint arrival): first nonempty reasoning/content/structured-tool SSE
+    # delta after all output filters. This may be later than model TTFT for tool
+    # envelopes; Responses/Completions do not currently populate it.
+    time_to_first_visible_token: Optional[float] = None
     total_time: Optional[float] = None
     prompt_eval_duration: Optional[float] = None
     generation_duration: Optional[float] = None
