@@ -19,19 +19,20 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True):
+def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
+    width = HC * hidden
     module = Qwen4ExpGatedResidual.__new__(Qwen4ExpGatedResidual)
     nn.Module.__init__(module)
-    module.hc_count, module.hidden_size, module.hc_lowrank = HC, HIDDEN, LOWRANK
-    module.hc_norm = Qwen4ExpRMSNorm(WIDTH, group_size=HIDDEN, eps=1e-6)
-    module.hc_norm.weight = (mx.random.normal((WIDTH,)) * 0.05).astype(mx.bfloat16)
-    module.input_mix_weight_down = nn.QuantizedLinear(WIDTH, LOWRANK, bias=False, group_size=64, bits=bits)
-    module.input_mix_weight_up = nn.QuantizedLinear(LOWRANK, WIDTH, bias=False, group_size=64, bits=bits)
+    module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
+    module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
+    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
+    module.input_mix_weight_down = nn.QuantizedLinear(width, LOWRANK, bias=False, group_size=64, bits=bits)
+    module.input_mix_weight_up = nn.QuantizedLinear(LOWRANK, width, bias=False, group_size=64, bits=bits)
     if use_combine:
-        module.block_inject_weight = nn.QuantizedLinear(WIDTH, HC, bias=False, group_size=64, bits=bits)
+        module.block_inject_weight = nn.QuantizedLinear(width, HC, bias=False, group_size=64, bits=bits)
     for name in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
         projection = getattr(module, name, None)
         if projection is not None:
@@ -50,7 +51,8 @@ def _reference_fp32(module, x):
     normed = module.hc_norm(x).astype(mx.float32)
     mix = nn.silu((normed @ dequant(module.input_mix_weight_down).T) / HC)
     gate = mx.sigmoid(mix @ dequant(module.input_mix_weight_up).T)
-    mixed = mx.mean(gate.reshape(*gate.shape[:-1], HC, HIDDEN) * normed.reshape(*normed.shape[:-1], HC, HIDDEN), axis=-2)
+    hidden = module.hidden_size
+    mixed = mx.mean(gate.reshape(*gate.shape[:-1], HC, hidden) * normed.reshape(*normed.shape[:-1], HC, hidden), axis=-2)
     if "block_inject_weight" not in module:
         return mixed, None
     return mixed, 2 * mx.sigmoid((normed @ dequant(module.block_inject_weight).T) / HC)
@@ -69,11 +71,23 @@ def _ulps(a, b):
 @pytest.mark.parametrize("rows", [1, 4, 16])
 @pytest.mark.parametrize("use_combine", [True, False])
 def test_fused_matches_canonical_path(bits, rows, use_combine):
+    mx.random.seed(20260905 + bits * 100 + rows)
+    _assert_fused_matches_canonical(_module(bits, use_combine), rows, use_combine)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("hidden,bits", [(512, 4), (1536, 5), (1536, 6)])
+def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits):
+    # Odd multiples of 512 exercise the down kernel's block loop at a size the checkpoint never has.
+    mx.random.seed(20260906 + hidden + bits)
+    _assert_fused_matches_canonical(_module(bits, True, hidden=hidden), 16, True)
+
+
+def _assert_fused_matches_canonical(module, rows, use_combine):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
-    mx.random.seed(20260905 + bits * 100 + rows)
-    module = _module(bits, use_combine)
-    x = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    hidden = module.hidden_size
+    x = mx.random.normal((1, rows, HC * hidden)).astype(mx.bfloat16)
     mx.eval(x)
     assert hc_fused.compatible(module, x)
     fused = hc_fused.fused_forward(module, x)
@@ -90,7 +104,7 @@ def test_fused_matches_canonical_path(bits, rows, use_combine):
         assert _ulps(fused_inject, ref_inject)[0] <= 4
     else:
         fused_mixed, canon_mixed = fused, canonical
-    assert fused_mixed.shape == canon_mixed.shape == (1, rows, HIDDEN)
+    assert fused_mixed.shape == canon_mixed.shape == (1, rows, hidden)
     assert fused_mixed.dtype == mx.bfloat16
     max_vs_canon, mean_vs_canon = _ulps(fused_mixed, canon_mixed)
     assert max_vs_canon <= 16 and mean_vs_canon <= 0.5
@@ -135,6 +149,18 @@ def test_gated_residual_call_routes_through_fused_path(monkeypatch):
     out = module(x)
     mx.eval(out)
     assert calls == [(1, 2, WIDTH)]
+
+
+@pytest.mark.parametrize("hidden,bits", [(768, 4), (1280, 5), (768, 6), (1280, 8)])
+def test_compatible_rejects_hidden_not_multiple_of_512(hidden, bits):
+    # The fused down projection walks each K-slice (= hidden) in 512-element blocks for 4/5-bit
+    # weights with no tail handling; hidden=768/4-bit and 1280/5-bit pass the norm kernel's
+    # multiple-of-256 rule yet read past the slice (PR #3469 review).
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(bits, True, hidden=hidden)
+    x = mx.random.normal((1, 4, HC * hidden)).astype(mx.bfloat16)
+    assert not hc_fused.compatible(module, x)
 
 
 def test_compatible_fails_closed():

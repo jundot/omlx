@@ -280,10 +280,12 @@ def compatible(module, hyper_input) -> bool:
         and isinstance(hidden, int)
         and isinstance(lowrank, int)
         and hc_count == 4
-        and hidden % 256 == 0
+        # The down projection walks each K-slice (= hidden) in blocks of 32 lanes x 2 packs
+        # x 8 values = 512 elements for 4/5-bit weights with no tail handling; the norm
+        # kernel needs a multiple of 256. Require 512 for every bit width.
+        and hidden % 512 == 0
         and lowrank % 64 == 0
         and lowrank % 8 == 0
-        and (hc_count * hidden) % 512 == 0
         and hyper_input.shape[2] == hc_count * hidden
     ):
         return False
