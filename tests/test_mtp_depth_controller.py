@@ -443,3 +443,15 @@ def test_std_tax_probe_measures_and_smooths():
     for _ in range(_STD_TAX_SAMPLES):
         _record_std_tax_sample(gb, 11.0)
     assert 1.0 < model._omlx_mtp_loop_tax < 1.2
+
+
+def test_marginal_est_ignores_the_plain_step_in_the_slope():
+    """t[0] is the plain step, below the L=1 -> L=2 jump (_t_est says so);
+    including it in the slope overstates the per-row marginal. Measured on
+    GLM-5.3-Flash: plain 48, d1 71, d2 93 -> the real marginal is 22; with
+    depth 0 in the fit a warm-up with a low t[0] would give (93-30)/2 = 31.5."""
+    c = _DepthController(3, marginal_ms=7.0)
+    c.t = {0: 30.0, 1: 71.0, 2: 93.0}
+    assert math.isclose(c._marginal_est(), 22.0, rel_tol=1e-9)
+    c.t = {0: 30.0, 1: 71.0}
+    assert c._marginal_est() == 7.0, "one speculative depth leaves the prior"
