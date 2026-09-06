@@ -617,6 +617,148 @@ def _start_launcher_watchdog(marker: RuntimeMarker, parent_pid: int) -> None:
     thread.start()
 
 
+_DEFAULT_PROGRESS_STALL_TIMEOUT = 180.0
+
+
+def _resolve_progress_stall_timeout(value: float | None = None) -> float:
+    """Stall threshold for :class:`ProgressWatchdog`, env-overridable.
+
+    Must comfortably exceed the longest legitimate gap between completed
+    batch steps: one prefill chunk (``prefill_step_size`` tokens) on a slow
+    Mac, plus scheduling slop. It must be far below "forever", which is how
+    long a rank wedged inside a mismatched collective otherwise spins.
+    """
+
+    if value is not None:
+        timeout = float(value)
+    else:
+        raw = os.environ.get("OMLX_PROGRESS_STALL_TIMEOUT")
+        if raw is None or raw == "":
+            return _DEFAULT_PROGRESS_STALL_TIMEOUT
+        try:
+            timeout = float(raw)
+        except ValueError:
+            raise ValueError(
+                "OMLX_PROGRESS_STALL_TIMEOUT must be a number, got "
+                f"{raw!r}"
+            ) from None
+    if timeout != timeout or timeout in (float("inf"), float("-inf")):
+        raise ValueError("progress stall timeout must be finite")
+    if timeout <= 0:
+        raise ValueError(f"progress stall timeout must be positive, got {timeout}")
+    return timeout
+
+
+class ProgressWatchdog:
+    """End the rank when its serving pipeline stops completing steps.
+
+    Heartbeats prove the process is alive, not that inference advances. A
+    collective wedged between two ranks leaves every heartbeat thread running
+    while the generation thread spins inside a Metal fence forever. Observed
+    live on a two-Mac TP2 deployment where two concurrent streams froze
+    mid-prefill and both ranks burned a full CPU core each until someone
+    killed them by hand. The peer watchdog could not see it: SSH worked,
+    markers were fresh, pids were live.
+
+    The telemetry ``batch_steps`` counter only advances when the pipeline
+    completes a step. An idle generator blocks inside ``BatchGenerator.next()``,
+    so the counter freezes while idle too, and a frozen counter with no
+    in-flight requests is healthy. The stall signature is a frozen counter
+    while requests are in flight: a stated failure naming the stall instead
+    of a zombie that looks healthy to every existing check.
+    """
+
+    def __init__(
+        self,
+        telemetry: Any,
+        marker: RuntimeMarker,
+        *,
+        interval: float = 10.0,
+        stall_timeout: float | None = None,
+        clock: Any = time.monotonic,
+        sleep: Any = time.sleep,
+        exit_process: Any = os._exit,
+        emit_event: Any = _emit_event,
+    ) -> None:
+        self._telemetry = telemetry
+        self._marker = marker
+        self._interval = max(0.0, float(interval))
+        self._stall_timeout = _resolve_progress_stall_timeout(stall_timeout)
+        self._clock = clock
+        self._sleep = sleep
+        self._exit_process = exit_process
+        self._emit_event = emit_event
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        """Stop the watchdog thread. Safe to call from tests or teardown."""
+
+        self._stop.set()
+
+    def _sample(self) -> tuple[int, int] | None:
+        """(batch_steps, active_requests), or None when unreadable."""
+
+        try:
+            snapshot = self._telemetry.snapshot()
+        except Exception:
+            # Telemetry failing must not kill a possibly-healthy rank; we
+            # simply lose the stall signal for as long as it stays broken.
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        pipeline = snapshot.get("pipeline")
+        steps = pipeline.get("batch_steps") if isinstance(pipeline, dict) else None
+        if not isinstance(steps, int) or isinstance(steps, bool):
+            return None
+        active = snapshot.get("active_requests")
+        if not isinstance(active, int) or isinstance(active, bool) or active < 0:
+            # An unreadable in-flight count reads as idle: fail open.
+            active = 0
+        return steps, active
+
+    def run(self) -> None:
+        # An idle generator does NOT tick: BatchGenerator.next() blocks until
+        # there is work, so a frozen counter with zero requests is healthy.
+        # The stall signature is a frozen counter WHILE requests are in
+        # flight, exactly what both ranks showed during the live two-stream
+        # collective wedge (active_requests=2, batch_steps frozen).
+        last_steps: int | None = None
+        last_change = self._clock()
+        while not self._stop.is_set():
+            self._sleep(self._interval)
+            if self._stop.is_set():
+                return
+            sample = self._sample()
+            now = self._clock()
+            if sample is None:
+                continue
+            steps, active = sample
+            if last_steps is None or steps != last_steps or active == 0:
+                last_steps = steps
+                last_change = now
+                continue
+            if now - last_change < self._stall_timeout:
+                continue
+            reason = (
+                f"pipeline made no batch-step progress for "
+                f"{self._stall_timeout:g}s while serving {active} "
+                f"request(s) (batch_steps={steps})"
+            )
+            self._marker.update("progress_stalled", error=reason)
+            self._emit_event({"type": "progress_stalled", "reason": reason})
+            self._exit_process(1)
+            return
+
+
+def _start_progress_watchdog(telemetry: Any, marker: RuntimeMarker) -> None:
+    """Arm the progress watchdog once telemetry is installed, before serving starts."""
+
+    watchdog = ProgressWatchdog(telemetry, marker)
+    threading.Thread(
+        target=watchdog.run, name="omlx-cluster-progress-watchdog", daemon=True
+    ).start()
+
+
 def _runtime_assignment(
     assignment: PipelineAssignment,
 ) -> dict[str, Any]:
@@ -1221,7 +1363,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             # really use, not from mlx-lm's 2048 default.
                             prefill_step_size=args.prefill_step_size,
                         ),
-                    ),
+                    ) as telemetry,
                     _bind_generation_thread_stream(
                         ResponseGenerator,
                         mx,
@@ -1235,6 +1377,12 @@ def run_worker(args: argparse.Namespace) -> int:
                     # install_server_telemetry also runs the idle heartbeat for
                     # the length of this block, so "stale" means stalled rather
                     # than "nobody has asked anything for 45 seconds".
+                    #
+                    # The progress watchdog is armed here rather than at load:
+                    # batch_steps only exists once telemetry is installed, and
+                    # a frozen counter is only meaningful once this rank is
+                    # expected to serve.
+                    _start_progress_watchdog(telemetry, marker)
                     run("127.0.0.1", args.port, provider)
     except KeyboardInterrupt:
         return 0

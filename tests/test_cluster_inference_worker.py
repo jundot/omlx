@@ -11,10 +11,12 @@ import pytest
 
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
+    ProgressWatchdog,
     _bind_generation_thread_stream,
     _cross_thread_generation_stream,
     _execution_settings,
     _install_distributed_model_protocol,
+    _resolve_progress_stall_timeout,
     _server_arguments,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
@@ -1309,3 +1311,178 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+# ---------------------------------------------------------------------------
+# The progress watchdog.
+#
+# Heartbeats prove the process is alive, not that inference advances. Two
+# concurrent streams on a live TP2 deployment froze mid-prefill and both
+# ranks spun inside a Metal fence at 100% CPU forever while every existing
+# check (fresh markers, live pids, reachable SSH) reported healthy.
+# batch_steps only advances when the pipeline completes a step, so a frozen
+# counter with requests in flight is the one honest stall signal the rank
+# has about itself.
+# ---------------------------------------------------------------------------
+
+
+class _StepTelemetry:
+    """Telemetry whose batch_steps counter follows a script."""
+
+    def __init__(self, *steps: int, active: int = 1) -> None:
+        self._steps = list(steps)
+        self.active = active
+
+    def snapshot(self):
+        assert self._steps, "snapshot called past its script"
+        if len(self._steps) == 1:
+            steps = self._steps[0]
+        else:
+            steps = self._steps.pop(0)
+        return {
+            "pipeline": {"batch_steps": steps},
+            "active_requests": self.active,
+        }
+
+
+class _BrokenTelemetry:
+    def snapshot(self):
+        raise RuntimeError("telemetry exploded")
+
+
+def _watch(
+    telemetry,
+    *,
+    sleeps_limit,
+    stall_timeout=6.0,
+):
+    updates = []
+    events = []
+    exits = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    clock = {"t": 0.0}
+
+    def tick():
+        clock["t"] += 2.0
+        return clock["t"]
+
+    watchdog = ProgressWatchdog(
+        telemetry,
+        marker,
+        interval=2.0,
+        stall_timeout=stall_timeout,
+        clock=tick,
+        sleep=lambda _seconds: None,
+        exit_process=exits.append,
+        emit_event=events.append,
+    )
+    ticks = [0]
+
+    def fake_sleep(_seconds):
+        ticks[0] += 1
+        if ticks[0] >= sleeps_limit:
+            watchdog.stop()
+
+    watchdog._sleep = fake_sleep  # type: ignore[method-assign]
+    watchdog.run()
+    return updates, events, exits
+
+
+def test_progress_watchdog_exits_when_batch_steps_freeze():
+    updates, events, exits = _watch(_StepTelemetry(7), sleeps_limit=5)
+
+    assert exits == [1]
+    assert len(updates) == 1
+    phase, extra = updates[0]
+    assert phase == "progress_stalled"
+    assert "no batch-step progress" in extra["error"]
+    assert "batch_steps=7" in extra["error"]
+    assert events[0]["type"] == "progress_stalled"
+
+
+def test_progress_watchdog_survives_advancing_steps():
+    updates, events, exits = _watch(
+        _StepTelemetry(1, 2, 3, 4, 5, 6, 7),
+        sleeps_limit=6,
+    )
+
+    assert exits == []
+    assert updates == []
+    assert events == []
+
+
+def test_progress_watchdog_stays_blind_when_telemetry_breaks():
+    """A broken counter must disable the watchdog, not kill the rank."""
+
+    updates, events, exits = _watch(_BrokenTelemetry(), sleeps_limit=3)
+
+    assert exits == []
+    assert updates == []
+    assert events == []
+
+
+def test_progress_stall_timeout_defaults_env_and_rejects_garbage(monkeypatch):
+    monkeypatch.delenv("OMLX_PROGRESS_STALL_TIMEOUT", raising=False)
+    assert (
+        _resolve_progress_stall_timeout()
+        == inference_worker._DEFAULT_PROGRESS_STALL_TIMEOUT
+    )
+
+    monkeypatch.setenv("OMLX_PROGRESS_STALL_TIMEOUT", "45")
+    assert _resolve_progress_stall_timeout() == 45.0
+
+    monkeypatch.setenv("OMLX_PROGRESS_STALL_TIMEOUT", "bogus")
+    with pytest.raises(ValueError, match="number"):
+        _resolve_progress_stall_timeout()
+
+    monkeypatch.setenv("OMLX_PROGRESS_STALL_TIMEOUT", "-1")
+    with pytest.raises(ValueError, match="positive"):
+        _resolve_progress_stall_timeout()
+
+
+def test_the_progress_watchdog_is_armed_with_live_telemetry_before_serving(
+    monkeypatch, tmp_path
+):
+    armed = []
+    monkeypatch.setattr(
+        inference_worker,
+        "_start_progress_watchdog",
+        lambda telemetry, marker: armed.append(telemetry),
+    )
+
+    record = _run_rank(monkeypatch, tmp_path)
+
+    assert record["order"][-1] == "serve"
+    assert len(armed) == 1, "the watchdog must be armed before serving starts"
+
+
+def test_progress_watchdog_ignores_a_frozen_counter_when_idle():
+    """Idle generators block instead of ticking: frozen + zero requests is
+    the healthy park state, not a stall. The first cut of this watchdog killed
+    a freshly-loaded, canary-passed rank 30s after arming because it read the
+    parked pipeline as wedged."""
+
+    updates, events, exits = _watch(
+        _StepTelemetry(4, active=0),
+        sleeps_limit=6,
+    )
+
+    assert exits == []
+    assert updates == []
+    assert events == []
+
+
+def test_progress_watchdog_fires_only_while_requests_are_in_flight():
+    """The live wedge signature: batch_steps frozen AND active_requests=2."""
+
+    updates, events, exits = _watch(
+        _StepTelemetry(7, active=2),
+        sleeps_limit=5,
+    )
+
+    assert exits == [1]
+    phase, extra = updates[0]
+    assert phase == "progress_stalled"
+    assert "while serving 2 request(s)" in extra["error"]
