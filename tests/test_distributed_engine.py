@@ -1380,3 +1380,82 @@ async def test_stream_generate_rejects_empty_stream_on_rank_drop():
                 pass
     finally:
         await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_toolcall_only_text_is_not_an_empty_stream():
+    """A tool-call-only stream (no prose) must finalize, not UnboundLocalError.
+
+    Regression: the empty-stream guard read ``tool_calls`` before assignment,
+    so any response with empty ``full_text`` crashed even when the backend
+    had accumulated tool calls (typical non-thinking coder output).
+    """
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_read",
+                                "type": "function",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path":"/tmp/x"}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 3,
+                "total_tokens": 23,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            },
+        },
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Read it."}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert outputs[-1].tool_calls == [
+        {
+            "id": "call_read",
+            "name": "read",
+            "arguments": '{"path":"/tmp/x"}',
+        }
+    ]
