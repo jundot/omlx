@@ -3459,16 +3459,54 @@ async def get_server_info(is_admin: bool = Depends(require_admin)):
     }
 
 
-def _schedule_self_terminate(delay: float = 0.5) -> None:
+def _respawn_self() -> int | None:
+    """Spawn a detached replacement omlx server process with the same argv.
+
+    Unsupervised restart fallback (#1814 recovery half): without this, a
+    plain ``omlx serve`` process that self-terminates for a restart has
+    nothing to bring it back, so the web server dies permanently. Spawns
+    before the caller signals SIGTERM. Returns the new pid, or None if the
+    spawn itself failed (the caller should not terminate in that case).
+    """
+    import subprocess
+
+    argv = [sys.executable, *sys.argv]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        logger.exception("Failed to spawn replacement process for unsupervised restart")
+        return None
+    logger.warning(
+        "Spawned replacement omlx server process (pid %d) for unsupervised restart",
+        proc.pid,
+    )
+    return proc.pid
+
+
+def _schedule_self_terminate(delay: float = 0.5, respawn: bool = False) -> None:
     """Schedule ``os.kill(getpid(), SIGTERM)`` on the running loop.
 
     Extracted from the restart handler so tests can patch this seam
     instead of mocking ``asyncio.get_running_loop`` globally (which
     interferes with FastAPI's TestClient portal).
+
+    ``respawn=True`` is the unsupervised fallback: a replacement process
+    is spawned immediately before the SIGTERM, since no supervisor exists
+    to do it. ``respawn=False`` (default, used under a supervisor) is
+    unchanged from the original behavior.
     """
     pid = os.getpid()
 
     def _kill() -> None:
+        if respawn:
+            _respawn_self()
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -3482,27 +3520,45 @@ def _schedule_self_terminate(delay: float = 0.5) -> None:
 
 @router.post("/api/server/restart")
 async def restart_server(is_admin: bool = Depends(require_admin)):
-    """Trigger a server restart via the menubar supervisor.
+    """Trigger a server restart.
 
-    The handler does not perform the restart itself — it returns 202 and
-    schedules ``os.kill(os.getpid(), SIGTERM)`` 500ms after the response
-    is queued. The menubar app's ``ServerManager._health_check_loop``
+    Under a supervisor (``OMLX_SUPERVISED`` set), the handler returns 202
+    and schedules ``os.kill(os.getpid(), SIGTERM)`` 500ms after the
+    response is queued. The menubar app's ``ServerManager._health_check_loop``
     detects the process exit and respawns the server with a short
     backoff (~5s).
 
-    Gated by the ``OMLX_SUPERVISED`` environment variable so plain
-    ``omlx serve`` (no supervisor) returns 503 rather than killing the
-    server with no respawn path.
+    Without a supervisor (plain ``omlx serve`` / CLI / ssh), nothing else
+    would respawn the process, so the same SIGTERM would kill the web
+    server permanently (#1814). Instead, a detached replacement process
+    with the same argv is spawned immediately before the SIGTERM, so the
+    restart is self-contained. Set ``OMLX_NO_SELF_RESPAWN=1`` to disable
+    this fallback and restore the old 503 refusal.
     """
     supervisor = os.environ.get("OMLX_SUPERVISED")
+
     if not supervisor:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Server is not running under a supervisor that can "
-                "respawn it. Restart unavailable — use the menu bar "
-                "app's Restart, or restart from your shell."
-            ),
+        if os.environ.get("OMLX_NO_SELF_RESPAWN"):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Server is not running under a supervisor that can "
+                    "respawn it, and OMLX_NO_SELF_RESPAWN disables the "
+                    "self-respawn fallback. Restart unavailable — use the "
+                    "menu bar app's Restart, or restart from your shell."
+                ),
+            )
+
+        _schedule_self_terminate(0.5, respawn=True)
+        logger.warning("Server restart requested (unsupervised, self-respawn fallback)")
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "restarting",
+                "supervisor": "self",
+                "expected_downtime_seconds": 7,
+            },
         )
 
     _schedule_self_terminate(0.5)
