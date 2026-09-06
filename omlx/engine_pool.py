@@ -243,6 +243,23 @@ class EngineEntry:
     load_failure_at: float | None = None
 
 
+def _resolve_local_draft_model_path(
+    pool_entries: dict[str, EngineEntry], draft_ref: str | None
+) -> str | None:
+    """Resolve a bare local draft model name against the discovered pool.
+
+    Mirrors the ``vlm_mtp_draft_model`` resolution (see the VLM MTP load
+    path): a reference that matches a discovered local model id is replaced
+    by its absolute model path, so the value is never passed to dflash-mlx
+    as a Hub repo id (issue #3019). Unmatched values -- HF repo ids or
+    absolute paths -- pass through unchanged.
+    """
+    if not draft_ref:
+        return draft_ref
+    entry = pool_entries.get(draft_ref)
+    return entry.model_path if entry else draft_ref
+
+
 class EnginePool:
     """
     Manages multiple model engines with LRU-based memory management.
@@ -2656,9 +2673,18 @@ class EnginePool:
                     try:
                         from .engine.dflash import DFlashEngine
 
+                        # Bare local model names (the form the admin UI
+                        # accepts) must resolve against the discovered pool
+                        # before reaching dflash-mlx, which otherwise treats
+                        # them as Hub repo ids and calls snapshot_download()
+                        # (issue #3019). Mirrors the vlm_mtp_draft_model
+                        # resolution below; unmatched values pass through.
+                        draft_model_path = _resolve_local_draft_model_path(
+                            self._entries, dflash_draft
+                        )
                         engine = DFlashEngine(
                             model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
+                            draft_model_path=draft_model_path,
                             draft_quant_enabled=getattr(
                                 model_settings, "dflash_draft_quant_enabled", False
                             ),
@@ -2679,7 +2705,7 @@ class EnginePool:
                             ),
                         )
                         logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                            f"DFlash enabled for {model_id}, draft={draft_model_path}"
                         )
                     except ImportError:
                         logger.warning(
