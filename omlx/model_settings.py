@@ -539,6 +539,13 @@ class ModelSettingsManager:
     def get_settings(self, model_id: str) -> ModelSettings:
         """Get settings for a specific model.
 
+        Cluster deployments expose org-prefixed model IDs (``org/name``)
+        while settings are keyed by the bare discovery name (``name``), so
+        an exact miss falls back to the prefix-stripped key. Without this,
+        every per-model setting — thinking budget, chat-template kwargs,
+        sampling defaults, context limits — silently reverts to defaults in
+        distributed mode while standalone serving honors them.
+
         Args:
             model_id: The model identifier.
 
@@ -550,6 +557,12 @@ class ModelSettingsManager:
                 # Return a copy to prevent external modification
                 settings = self._settings[model_id]
                 return ModelSettings.from_dict(settings.to_dict())
+
+            if "/" in model_id:
+                stripped = model_id.split("/", 1)[1]
+                if stripped in self._settings:
+                    settings = self._settings[stripped]
+                    return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
 
