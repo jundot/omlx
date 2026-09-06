@@ -876,8 +876,9 @@ class HFDownloader:
         """Execute a download task.
 
         Waits for the download semaphore (only one download runs at a time),
-        then fetches repo info for total size and runs snapshot_download in a
-        thread while polling the target directory for progress updates.
+        then fetches repo info for total size and runs snapshot_download
+        when failed with metadata matching in a separate thread while polling
+        the target directory for progress updates.
         """
         task = self._tasks[task_id]
 
@@ -942,6 +943,7 @@ class HFDownloader:
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                # Let's use model.safetensors.index.json when present
                 size_estimated = False
                 try:
                     dry_result = await asyncio.wait_for(
@@ -952,7 +954,24 @@ class HFDownloader:
                         ),
                         timeout=30,
                     )
-                    task.total_size = sum(f.file_size for f in dry_result)
+                    if "model.safetensors.index.json" in [f.filename for f in dry_result]:
+                        metadata_dir = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                snapshot_download,
+                                **dl_kwargs,
+                                allow_patterns=["model.safetensors.index.json"],
+                            ),
+                            timeout=30,
+                        )
+                        metadata_path = Path(metadata_dir) / "model.safetensors.index.json"
+                        with open(metadata_path) as f:
+                            index = json.load(f)
+                        # some stupid repo can have duplicate filenames in weight_map
+                        if "weight_map" in index:
+                            dl_kwargs["allow_patterns"] = list(set(index["weight_map"].values()))
+                        task.total_size = index["metadata"]["total_size"]
+                    else:
+                        task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
                     if st_estimate:
                         task.total_size = st_estimate
