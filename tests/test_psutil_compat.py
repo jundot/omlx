@@ -80,3 +80,49 @@ def test_vm_stats_omits_tail_counters_on_short_reply(monkeypatch):
     assert "speculative" not in stats
     # The stable four must still be there — _build_svmem depends on them.
     assert {"free", "active", "inactive", "wired"} <= set(stats)
+
+
+def test_vm_stats_retries_with_kernel_requested_count():
+    calls = []
+
+    class FakeLibc:
+        def host_statistics64(self, host, flavor, stats, count):
+            calls.append(count._obj.value)
+            if len(calls) == 1:
+                count._obj.value = 104
+                return psutil_compat._MIG_ARRAY_TOO_LARGE
+            assert count._obj.value == 104
+            for index, value in enumerate((10, 20, 30, 40)):
+                stats[index] = value
+            count._obj.value = 104
+            return 0
+
+    with (
+        patch.object(psutil_compat, "_libc", FakeLibc()),
+        patch.object(psutil_compat, "_MACH_HOST", 123),
+        patch.object(psutil_compat, "_VM_PAGE_SIZE", 4096),
+    ):
+        stats = psutil_compat.get_macos_vm_stats()
+
+    assert calls == [psutil_compat._HOST_INFO64_INITIAL_COUNT, 104]
+    assert stats == {
+        "free": 10 * 4096,
+        "active": 20 * 4096,
+        "inactive": 30 * 4096,
+        "wired": 40 * 4096,
+        "speculative": 0,
+        "compressed": 0,
+    }
+
+
+def test_vm_stats_rejects_oversized_kernel_requirement():
+    class FakeLibc:
+        def host_statistics64(self, host, flavor, stats, count):
+            count._obj.value = psutil_compat._HOST_INFO64_MAX_COUNT + 1
+            return psutil_compat._MIG_ARRAY_TOO_LARGE
+
+    with (
+        patch.object(psutil_compat, "_libc", FakeLibc()),
+        patch.object(psutil_compat, "_MACH_HOST", 123),
+    ):
+        assert psutil_compat.get_macos_vm_stats() is None

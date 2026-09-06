@@ -108,14 +108,14 @@ def _close_coro(coro):
 class TestMacOSVMStats:
     """Tests for the host_statistics64 telemetry adapter."""
 
-    def test_uses_max_sized_host_info64_buffer(self):
-        """Newer macOS kernels can require a larger vm_statistics64 tail."""
+    def test_uses_layout_compatible_host_info64_count(self):
+        """Request only the fields needed across SDK-specific layouts."""
 
         class FakeLibc:
             def host_statistics64(self, host, flavor, stats, count):
                 assert host == 123
                 assert flavor == psutil_compat._HOST_VM_INFO64
-                assert count._obj.value == psutil_compat._HOST_INFO64_MAX_COUNT
+                assert count._obj.value == psutil_compat._HOST_INFO64_INITIAL_COUNT
                 stats[0] = 10
                 stats[1] = 20
                 stats[2] = 30
