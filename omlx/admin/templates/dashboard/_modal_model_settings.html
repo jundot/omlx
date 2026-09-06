@@ -307,13 +307,13 @@
                                     <select x-model="modelSettings.model_type_override"
                                             class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>
-                                        <option value="llm">LLM</option>
-                                        <option value="vlm">VLM</option>
-                                        <option value="embedding">Embedding</option>
-                                        <option value="reranker">Reranker</option>
-                                        <option value="audio_stt">Audio STT</option>
-                                        <option value="audio_tts">Audio TTS</option>
-                                        <option value="audio_sts">Audio STS</option>
+                                        <option value="llm">{{ t('modal.model_settings.engine_type_llm') }}</option>
+                                        <option value="vlm">{{ t('modal.model_settings.engine_type_vlm') }}</option>
+                                        <option value="embedding">{{ t('modal.model_settings.engine_type_embedding') }}</option>
+                                        <option value="reranker">{{ t('modal.model_settings.engine_type_reranker') }}</option>
+                                        <option value="audio_stt">{{ t('modal.model_settings.engine_type_audio_stt') }}</option>
+                                        <option value="audio_tts">{{ t('modal.model_settings.engine_type_audio_tts') }}</option>
+                                        <option value="audio_sts">{{ t('modal.model_settings.engine_type_audio_sts') }}</option>
                                     </select>
                                 </div>
                                 <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
