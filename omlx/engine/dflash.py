@@ -568,6 +568,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             install_dflash_lifecycle_wrap()
 
+            # Install the Qwen3.5/3.8 class-level prefill patches before the
+            # target loads and before dflash's own class hooks, so dflash's
+            # lifecycle snapshot treats them as pre-existing state instead of
+            # restoring over them (which would drop them while the patch
+            # modules still report themselves installed).
+            try:
+                from ..patches.dflash_qwen35_accel import (
+                    install_dflash_qwen35_class_patches,
+                )
+
+                install_dflash_qwen35_class_patches(self._model_settings)
+            except Exception:
+                logger.debug(
+                    "DFlash Qwen class-level prefill patches not applied",
+                    exc_info=True,
+                )
+
             target_bundle = load_target_bundle(
                 self._model_name,
                 quantize_kv_cache=bool(
@@ -599,6 +616,26 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash target MoE gate+up fusion not applied",
                         exc_info=True,
                     )
+
+            # Instance-level half of the Qwen acceleration stack: the ANE/GPU
+            # prefill split needs the loaded model and must run on the MLX
+            # executor thread, as the batched engines require.
+            try:
+                from ..patches.dflash_qwen35_accel import (
+                    enable_dflash_qwen35_ane,
+                )
+
+                enable_dflash_qwen35_ane(
+                    target_bundle.model,
+                    self._model_settings,
+                    prefill_step_size=int(
+                        getattr(runtime_context.runtime, "prefill_step_size", 2048)
+                        or 2048
+                    ),
+                )
+            except Exception:
+                logger.debug("DFlash Qwen ANE prefill not applied", exc_info=True)
+
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
