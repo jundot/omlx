@@ -54,6 +54,16 @@ class PrefillTransientTracker:
     # above the largest observed legitimate fluctuation and below the
     # observed outlier.
     _EWMA_OUTLIER_RATIO = 8.0
+    # Physically impossible as a per-token cost (KV + SDPA transient of any
+    # served model stays far below this): a reading above it is buffer-pool
+    # growth or load residue divided by a small chunk, and must not seed the
+    # EWMA, blend into it, nor land in last_delta_bytes/last_n_tokens — the
+    # predictor reads that pair as a rate and takes the MAX with the EWMA.
+    # Measured on GLM-5.3-Flash (M1 Ultra): a 14-token warm-up right after
+    # load left 2.2 GB of residue and seeded the EWMA at 157 MB/token, so a
+    # 29K-token prompt ran at the 32-token floor for 186 s; the real cost is
+    # 2.1–5.7 MB/token.
+    _PER_TOKEN_SANITY_BYTES = 32 * 1024**2
 
     def __init__(self, model_id: str = "") -> None:
         self._model_id = model_id
@@ -68,9 +78,19 @@ class PrefillTransientTracker:
         return self._gathered_history if gathered_core is True else self._dense_history
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
-        """Accumulate footprint released since the last positive sample."""
+        """Hold the LARGEST footprint released since the last positive sample.
+
+        The charge prices one reallocation of the pool MLX gave back, so it is
+        bounded by the biggest single release — not by their sum. Summing made
+        the charge grow without limit across a run of negative deltas: measured
+        on GLM-5.3-Flash-oQ2e, a short conversation stacked 22.97GB of charge on
+        top of a 1.02GB computed transient, and every long prompt after it was
+        rejected by the pre-chunk guard at a 124GB ceiling.
+        """
         if reclaimed_bytes > 0:
-            self._recent_reclaim_bytes += int(reclaimed_bytes)
+            self._recent_reclaim_bytes = max(
+                self._recent_reclaim_bytes, int(reclaimed_bytes)
+            )
 
     def clear_reclaim(self) -> None:
         """Drop the charge once any positive measurement confirms realloc.
@@ -120,6 +140,28 @@ class PrefillTransientTracker:
 
         history = self._history(gathered_core)
 
+        # The sanity bound gates the running max too, so it runs FIRST. The
+        # clamp below is on TOTAL bytes, which a small chunk passes at an
+        # impossible rate: measured on GLM-5.3-Flash (M1 Ultra), a 32-token
+        # floor chunk read 3.54GB (110MB/token), cleared the 4GB clamp, and
+        # pinned observed_max_bytes for the rest of the process. Admission
+        # charges that max as a flat floor with no multiplier, so it then
+        # priced 3.54GB where the analytic estimate for the same chunk is
+        # 0.27GB and refused a 159K-token prompt by 250MB.
+        per_token = transient_bytes / n_tokens
+        if per_token > self._PER_TOKEN_SANITY_BYTES:
+            logger.debug(
+                "PrefillTransientTracker(%s): dropped %.1f-byte/token sample "
+                "above the per-token sanity bound (%d)",
+                self._model_id,
+                per_token,
+                self._PER_TOKEN_SANITY_BYTES,
+            )
+            # Not counted as a sample: the next sane reading has to SEED the
+            # EWMA (an EWMA of 0 would reject every later sample as an
+            # outlier against 0 x ratio).
+            return
+
         # The very first sample in each execution regime carries weight
         # page-fault and load-residue noise, so it seeds that regime's EWMA
         # but is excluded from its running max.
@@ -136,8 +178,6 @@ class PrefillTransientTracker:
                     transient_bytes,
                     self._OBSERVED_MAX_CLAMP_BYTES,
                 )
-
-        per_token = transient_bytes / n_tokens
         if history.samples == 0:
             history.ewma_per_token = per_token
         elif per_token > history.ewma_per_token * self._EWMA_OUTLIER_RATIO:
