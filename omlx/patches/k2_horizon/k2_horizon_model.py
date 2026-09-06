@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
@@ -92,6 +93,20 @@ class ModelArgs(BaseModelArgs):
         )
 
 
+@lru_cache(None)
+def _yarn_rotation(dims):
+    def rotate(x, cos, sin):
+        if cos.ndim == 3:
+            cos, sin = cos[:, None], sin[:, None]
+        first, second = x[..., : dims // 2], x[..., dims // 2 : dims]
+        rotated = mx.concatenate(
+            [first * cos - second * sin, second * cos + first * sin], axis=-1
+        )
+        return mx.concatenate([rotated, x[..., dims:]], axis=-1)
+
+    return mx.compile(rotate)
+
+
 class YarnRoPE(nn.Module):
     """Apply the released YaRN frequencies and BF16 cos/sin rounding."""
 
@@ -128,13 +143,18 @@ class YarnRoPE(nn.Module):
         angles = positions[..., None] * self._inv_freq
         cos = (mx.cos(angles) * self.attention_factor).astype(x.dtype)
         sin = (mx.sin(angles) * self.attention_factor).astype(x.dtype)
-        if cos.ndim == 3:
-            cos, sin = cos[:, None], sin[:, None]
-        first, second = x[..., : self.dims // 2], x[..., self.dims // 2 : self.dims]
-        rotated = mx.concatenate(
-            [first * cos - second * sin, second * cos + first * sin], axis=-1
-        )
-        return mx.concatenate([rotated, x[..., self.dims :]], axis=-1)
+        # Keep trigonometry outside compilation to preserve BF16 rounding.
+        return _yarn_rotation(self.dims)(x, cos, sin)
+
+
+@lru_cache(None)
+def _grouped_norm(groups, eps):
+    def normalize(x, weight):
+        grouped = mx.unflatten(x.astype(mx.float32), -1, (groups, -1))
+        normed = mx.flatten(mx.fast.rms_norm(grouped, None, eps), start_axis=-2)
+        return (weight * normed).astype(x.dtype)
+
+    return mx.compile(normalize, shapeless=True)
 
 
 class GroupedRMSNorm(nn.Module):
@@ -147,9 +167,7 @@ class GroupedRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        grouped = x.astype(mx.float32).reshape(*x.shape[:-1], self.groups, -1)
-        normed = mx.fast.rms_norm(grouped, None, self.eps).reshape(x.shape)
-        return (self.weight * normed).astype(x.dtype)
+        return _grouped_norm(self.groups, self.eps)(x, self.weight)
 
 
 def router_logits(
@@ -173,6 +191,19 @@ def router_logits(
     return logits
 
 
+@lru_cache(None)
+def _expert_selection(top_k, scaling_factor):
+    def select(logits, bias):
+        scores = mx.sigmoid(logits)
+        selection = scores + bias.astype(mx.float32)
+        inds = mx.argpartition(-selection, kth=top_k - 1, axis=-1)[..., :top_k]
+        weights = mx.take_along_axis(scores, inds, axis=-1)
+        weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+        return inds, weights * scaling_factor
+
+    return mx.compile(select)
+
+
 def route(
     x: mx.array,
     weight: mx.array,
@@ -183,12 +214,9 @@ def route(
     partitions: int = SOURCE_ROUTER_GEMM_PARTITIONS,
 ) -> tuple[mx.array, mx.array]:
     """Return selected expert indices and their normalized, scaled FP32 weights."""
-    scores = mx.sigmoid(router_logits(x, weight, partitions))
-    selection = scores + bias.astype(mx.float32)
-    inds = mx.argpartition(-selection, kth=top_k - 1, axis=-1)[..., :top_k]
-    weights = mx.take_along_axis(scores, inds, axis=-1)
-    weights = weights / mx.sum(weights, axis=-1, keepdims=True)
-    return inds, weights * scaling_factor
+    return _expert_selection(top_k, scaling_factor)(
+        router_logits(x, weight, partitions), bias
+    )
 
 
 def softplus_beta_ln2(x: mx.array) -> mx.array:

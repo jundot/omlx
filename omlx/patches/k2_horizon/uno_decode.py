@@ -25,8 +25,7 @@ def probabilities(logits, temperature, top_p=1.0, top_k=None):
     if top_p < 1:
         probs = mx.where(mx.cumsum(probs, axis=-1) - probs > top_p, 0, probs)
         probs = probs / mx.sum(probs, axis=-1, keepdims=True)
-    inverse = mx.argsort(order, axis=-1)
-    return mx.take_along_axis(probs, inverse, axis=-1)
+    return mx.put_along_axis(mx.zeros_like(probs), order, probs, axis=-1)
 
 
 def acceptance_and_residual(p, q, proposals, uniforms):
@@ -190,8 +189,10 @@ class UnoDecoder:
             self._trim(cache, len(committed) - 1)
             if finish is None and emitted == max_tokens:
                 finish = "length"
-            mx.synchronize()
-            mx.clear_cache()
+            # Reuse small allocations and reclaim retired KV buffers.
+            if mx.get_cache_memory() > 64 * 1024**2:
+                mx.synchronize()
+                mx.clear_cache()
             yield UnoCycle(
                 tuple(output),
                 min(accepted, len(output) - 1),

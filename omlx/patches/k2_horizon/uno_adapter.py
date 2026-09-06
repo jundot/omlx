@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 
 import mlx.core as mx
@@ -14,6 +15,15 @@ TARGETS = {
     "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
     "mlp": ("gate_proj", "up_proj", "down_proj"),
 }
+
+
+@lru_cache(None)
+def _lora_delta(scale):
+    def delta(x, a, b, row_mask):
+        hidden = (x @ a) * row_mask[..., None].astype(x.dtype)
+        return ((hidden @ b) * scale).astype(x.dtype)
+
+    return mx.compile(delta, shapeless=True)
 
 
 class ConditionalLoRALinear(nn.Module):
@@ -36,9 +46,9 @@ class ConditionalLoRALinear(nn.Module):
             raise ValueError(
                 f"Uno row mask {row_mask.shape} does not match {x.shape[:-1]}"
             )
-        hidden = (x @ self.lora_a) * row_mask[..., None].astype(x.dtype)
-        delta = (hidden @ self.lora_b) * self.scale
-        return self.linear(x) + delta.astype(x.dtype)
+        return self.linear(x) + _lora_delta(self.scale)(
+            x, self.lora_a, self.lora_b, row_mask
+        )
 
 
 def load_uno_adapter(model, path: str | Path, *, base_model_id: str) -> dict:
