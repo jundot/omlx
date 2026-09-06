@@ -59,8 +59,21 @@ class TestEwmaOutlierGuard:
         # ~/.omlx/logs/server.log 16:08:48-16:09:39 (KB/token), replayed as
         # (n_tokens=2048, transient_bytes) pairs.
         baseline_kb_per_token = [
-            1058.0, 1171.0, 1085.0, 1103.0, 1123.1, 1141.3, 991.2, 1131.2,
-            1099.3, 1839.3, 1867.3, 1186.5, 1031.4, 1529.5, 1117.5,
+            1058.0,
+            1171.0,
+            1085.0,
+            1103.0,
+            1123.1,
+            1141.3,
+            991.2,
+            1131.2,
+            1099.3,
+            1839.3,
+            1867.3,
+            1186.5,
+            1031.4,
+            1529.5,
+            1117.5,
         ]
         for kb in baseline_kb_per_token:
             t.update(n_tokens=2048, transient_bytes=int(kb * 1024 * 2048))
@@ -226,3 +239,123 @@ class TestExecutionRegimes:
 
         assert t.observed_max_bytes == 900 * 1024**2
         assert t.observed_max_bytes_for(True) == 40 * 1024**2
+
+
+class TestFlatOverhead:
+    MB = 1024**2
+
+    def test_fixed_overhead_is_not_scaled_by_token_count(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            54,
+            571 * self.MB,
+            static_bytes=self.MB,
+        )
+        assert t.flat_overhead_bytes_for(False) == 570 * self.MB
+        assert t.flat_overhead_charge_for(False) == 0
+
+    def test_only_reclaimed_flat_overhead_is_charged_again(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            28_536 * self.MB,
+            static_bytes=1402 * self.MB,
+        )
+
+        t.observe_flat_overhead(
+            2048,
+            10_000 * self.MB,
+            static_bytes=1402 * self.MB,
+            gathered_core=True,
+        )
+        # The retained 27 GB is already included in current footprint.
+        assert t.flat_overhead_charge_for(False) == 0
+        t.record_flat_reclaim(12500 * self.MB)
+        assert t.flat_overhead_charge_for(False) == 12_500 * self.MB
+        assert t.flat_overhead_charge_for(True) == (10_000 - 1402) * self.MB
+
+        # The next positive delta repays that one-shot reallocation risk.
+        t.observe_flat_overhead(
+            2048,
+            13_902 * self.MB,
+            static_bytes=1402 * self.MB,
+        )
+        assert t.flat_overhead_charge_for(False) == 0
+        assert t.flat_overhead_bytes_for(False) == 27_134 * self.MB
+
+    def test_reclaim_debt_tracks_net_release(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            -600 * self.MB,
+            static_bytes=100 * self.MB,
+        )
+        t.observe_flat_overhead(
+            2048,
+            -400 * self.MB,
+            static_bytes=100 * self.MB,
+        )
+        assert t.reclaim_debt_bytes_for(False) == 1000 * self.MB
+        t.observe_flat_overhead(
+            2048,
+            250 * self.MB,
+            static_bytes=100 * self.MB,
+        )
+        assert t.reclaim_debt_bytes_for(False) == 750 * self.MB
+
+    def test_reallocation_does_not_become_new_flat_overhead(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            4 * 1024 * self.MB,
+            static_bytes=1024 * self.MB,
+        )
+        t.observe_flat_overhead(
+            2048,
+            -16 * 1024 * self.MB,
+            static_bytes=1024 * self.MB,
+        )
+        t.observe_flat_overhead(
+            2048,
+            17 * 1024 * self.MB,
+            static_bytes=1024 * self.MB,
+        )
+        assert t.flat_overhead_bytes_for(False) == 3 * 1024 * self.MB
+        assert t.reclaim_debt_bytes_for(False) == 0
+
+    def test_execution_regimes_are_independent(self):
+        t = PrefillTransientTracker("qwen4")
+        t.observe_flat_overhead(
+            2048,
+            500 * self.MB,
+            static_bytes=100 * self.MB,
+        )
+        assert t.flat_overhead_bytes_for(False) == 400 * self.MB
+        assert t.flat_overhead_bytes_for(True) == 0
+
+
+class TestPoolReleaseAccounting:
+    def test_repeated_releases_accumulate_without_exceeding_observed_overhead(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_flat_overhead(512, 5 * 1024**3, static_bytes=1024**3)
+        tracker.record_flat_reclaim(1024**3)
+        tracker.record_flat_reclaim(1024**3)
+        assert tracker.flat_overhead_charge_for(False) == 2 * 1024**3
+        tracker.record_flat_reclaim(10 * 1024**3)
+        assert tracker.flat_overhead_charge_for(False) == 4 * 1024**3
+        assert tracker.flat_overhead_charge_for(True) == 0
+
+    def test_pool_clear_covers_both_routes_without_sharing_their_overhead(self):
+        tracker = PrefillTransientTracker()
+        tracker.observe_flat_overhead(512, 5 * 1024**3, static_bytes=1024**3)
+        tracker.observe_flat_overhead(
+            512, 2 * 1024**3, static_bytes=1024**3, gathered_core=True
+        )
+        tracker.record_flat_reclaim(3 * 1024**3)
+        assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3
+        assert tracker.flat_overhead_charge_for(True) == 1024**3
+        tracker.observe_flat_overhead(
+            512, 2 * 1024**3, static_bytes=1024**3, gathered_core=True
+        )
+        assert tracker.flat_overhead_charge_for(True) == 0
+        assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3

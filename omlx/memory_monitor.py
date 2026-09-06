@@ -54,6 +54,18 @@ _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # dim-less path and matches the fp16/bf16 majority of MLX inference models.
 _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
+# Bytes/elem the unfused head-dim-256 fallback actually materializes on
+# Metal: MLX keeps the attention score matrix in fp32 even for bf16/fp16
+# models (measured ~33GiB IOAccelerator spike on a 160k-token VLM prefill at
+# head_dim=256). Shared by the sdpa256 route gate
+# (patches/sdpa256_attention._tiled_route_required) and the Qwen4 prefill
+# profile so the router and the guard price the real fallback identically.
+# Kept separate from _SDPA_FALLBACK_SCORE_DTYPE_SIZE: that default covers
+# the dim-less generic path where the compute dtype is unknown and the
+# fp16/bf16 majority is the better prior; widening it globally would
+# re-price unrelated models without evidence.
+SDPA256_UNFUSED_SCORE_DTYPE_SIZE = 4
+
 # Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
 # kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
 # runtime by the kernel patch that installs the route (see
@@ -68,6 +80,7 @@ class _BoundedSDPAPrefillRoute:
     min_query_len: int
     min_kv_len: int
     kv_tile: int
+    supports_array_mask: bool
 
 
 _SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, tuple[_BoundedSDPAPrefillRoute, ...]] = {}
@@ -79,18 +92,20 @@ def register_tiled_prefill_head_dim(
     min_query_len: int = 2,
     min_kv_len: int = 8192,
     kv_tile: int = 1024,
+    supports_array_mask: bool = False,
 ) -> None:
     """Register a bounded long-context route installed for one head dim.
 
     Multiple native routes may cover the same head dimension at different
-    thresholds. Store them independently so combining two registrations can
-    never invent shape coverage that neither route actually guarantees.
+    thresholds and mask capabilities. Store them independently so combining
+    registrations cannot invent coverage no individual route guarantees.
     """
     head_dim = int(head_dim)
     route = _BoundedSDPAPrefillRoute(
         min_query_len=max(2, int(min_query_len)),
         min_kv_len=max(1, int(min_kv_len)),
         kv_tile=max(1, int(kv_tile)),
+        supports_array_mask=bool(supports_array_mask),
     )
     routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(head_dim, ())
     if route not in routes:
@@ -425,6 +440,10 @@ class MemoryMonitor:
         longer be reclaimed. The next load re-prices it via set_model_info.
         """
         self._ane_prefill_transient_bytes = 0
+
+    def set_ane_prefill_transient_bytes(self, value: int) -> None:
+        """Refresh the reservation after VLM ANE compilation."""
+        self._ane_prefill_transient_bytes = max(int(value), 0)
 
     def set_model_info(
         self,
@@ -1295,13 +1314,44 @@ class _Qwen4ExpPrefillMemoryProfile:
         core_kv = kv_len
         if gathered_core and kv_len > self.indexer_budget:
             core_kv = min(kv_len, self.indexer_budget + self.compress_ratio - 1)
+
+        # The head_dim-256 sdpa256 patch keeps long-context prefill O(L):
+        # consult the same bounded-route registry the generic estimator uses
+        # (issue #2204 follow-up). Without it this profile always charges the
+        # dense Q x kv_len matrix, which made the guard shrink VLM chunks to
+        # crawl speed on 160k-context prefills even though the router forces
+        # a bounded kernel there.
         core = estimate_unfused_sdpa_call_bytes(
             self.num_attention_heads,
             query_tokens,
             core_kv,
             self.head_dim,
-            self.score_dtype_size,
+            SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
         )
+        bounded_routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(self.head_dim, ())
+        matching_routes = [
+            route
+            for route in bounded_routes
+            if route.supports_array_mask
+            and query_tokens >= route.min_query_len
+            and core_kv >= route.min_kv_len
+        ]
+        if matching_routes:
+            # Match the generic estimator's O(L) bound: fp32 output plus one
+            # fp32 score tile (largest registered tile). The core_kv is the
+            # K width of the real core-attention call, so a gathered QSA call
+            # whose reduced K is below the route floor stays dense-priced.
+            kv_tile = max(route.kv_tile for route in matching_routes)
+            tile_scores = (
+                self.num_attention_heads
+                * query_tokens
+                * min(kv_tile, core_kv)
+                * SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+            )
+            output = (
+                self.num_attention_heads * query_tokens * self.head_dim * 4
+            )
+            core = int(output + tile_scores)
         return indexer + core
 
 

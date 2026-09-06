@@ -686,11 +686,23 @@ def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
         None,
         False,
     )
-    assert not attention._gathered_text_prefill_eligible(
+    assert attention._gathered_text_prefill_eligible(
         hidden,
         "causal",
         QSAKVCache(),
         identical_mrope,
+        None,
+        False,
+    )
+    unequal_mrope = mx.concatenate(
+        [text_positions[None], text_positions[None], text_positions[None] + 1],
+        axis=0,
+    )
+    assert not attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        unequal_mrope,
         None,
         False,
     )
@@ -725,7 +737,8 @@ def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
     expected_logits = expected @ projection
     mx.eval(actual_logits, expected_logits)
 
-    assert gathered_calls == [True]
+    # Both the 2-D and the broadcast 3-D text positions take the gathered arm.
+    assert gathered_calls == [True, True]
     assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
     assert mx.allclose(
         actual_logits,
