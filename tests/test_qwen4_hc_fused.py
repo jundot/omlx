@@ -75,10 +75,15 @@ def test_fused_matches_canonical_path(bits, rows, use_combine):
     _assert_fused_matches_canonical(_module(bits, use_combine), rows, use_combine)
 
 
+# Sizes the checkpoint never has, chosen so every kernel sees a partial final block:
+#   768  -> down tail 256 for 4/5-bit;                          norm and inject loops exact
+#   1152 -> down tail 128 (all bits), inject tail 128 (4/5-bit), norm tail 128
+#   1344 -> down tail 320 (4/5) / 64 (6/8), inject tail 64,       norm tail 64
+#   512, 1536 -> odd multiples of 512, no tails anywhere
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("hidden,bits", [(512, 4), (1536, 5), (1536, 6)])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("hidden", [512, 768, 1152, 1344, 1536])
 def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits):
-    # Odd multiples of 512 exercise the down kernel's block loop at a size the checkpoint never has.
     mx.random.seed(20260906 + hidden + bits)
     _assert_fused_matches_canonical(_module(bits, True, hidden=hidden), 16, True)
 
@@ -117,22 +122,24 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_fused_norm_is_bit_identical_to_rms_norm():
+@pytest.mark.parametrize("hidden", [HIDDEN, 768, 1152, 1344])
+def test_fused_norm_is_bit_identical_to_rms_norm(hidden):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     mx.random.seed(7)
-    module = _module(4)
-    x = (mx.random.normal((1, 4, WIDTH)) * 3).astype(mx.bfloat16)
-    flat = x.reshape(4, WIDTH)
+    module = _module(4, hidden=hidden)
+    width = HC * hidden
+    x = (mx.random.normal((1, 4, width)) * 3).astype(mx.bfloat16)
+    flat = x.reshape(4, width)
     normed = hc_fused._kernel("omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], hc_fused._N_SOURCE)(
         inputs=[flat, module.hc_norm.weight, hc_fused._eps_array(module)],
-        template=[("T", mx.bfloat16), ("K", WIDTH), ("H", HIDDEN)],
+        template=[("T", mx.bfloat16), ("K", width), ("H", hidden)],
         grid=(256, HC, 4),
         threadgroup=(256, 1, 1),
-        output_shapes=[(4, WIDTH)],
+        output_shapes=[(4, width)],
         output_dtypes=[mx.bfloat16],
     )[0]
-    expected = module.hc_norm(x).reshape(4, WIDTH)
+    expected = module.hc_norm(x).reshape(4, width)
     mx.eval(normed, expected)
     assert mx.array_equal(normed.view(mx.uint16), expected.view(mx.uint16)).item()
 
@@ -151,16 +158,31 @@ def test_gated_residual_call_routes_through_fused_path(monkeypatch):
     assert calls == [(1, 2, WIDTH)]
 
 
-@pytest.mark.parametrize("hidden,bits", [(768, 4), (1280, 5), (768, 6), (1280, 8)])
-def test_compatible_rejects_hidden_not_multiple_of_512(hidden, bits):
-    # The fused down projection walks each K-slice (= hidden) in 512-element blocks for 4/5-bit
-    # weights with no tail handling; hidden=768/4-bit and 1280/5-bit pass the norm kernel's
-    # multiple-of-256 rule yet read past the slice (PR #3469 review).
+@pytest.mark.parametrize("hidden,bits", [(800, 4), (1056, 5)])
+def test_compatible_rejects_hidden_not_multiple_of_64(hidden, bits):
+    # 64 is the quantisation group and the up kernel's grid unit; nothing below it is handled.
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     module = _module(bits, True, hidden=hidden)
     x = mx.random.normal((1, 4, HC * hidden)).astype(mx.bfloat16)
     assert not hc_fused.compatible(module, x)
+
+
+def test_ineligible_model_is_logged_once(monkeypatch, caplog):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
+    module = _module(4, True, hidden=800)
+    x = mx.random.normal((1, 4, HC * 800)).astype(mx.bfloat16)
+    with caplog.at_level("INFO", logger=hc_fused.logger.name):
+        assert not hc_fused.compatible(module, x)
+        assert not hc_fused.compatible(module, x)
+        # Prefill-sized inputs are expected to skip the fused path and must not log.
+        monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
+        assert not hc_fused.compatible(_module(4), mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16))
+    messages = [r.getMessage() for r in caplog.records if "fused hyper-connection kernels not used" in r.getMessage()]
+    assert len(messages) == 1
+    assert "hidden_size=800" in messages[0]
 
 
 def test_compatible_fails_closed():

@@ -17,9 +17,12 @@ row-batched Metal kernels replace it for small row counts:
   normed stream, mean over streams via simd shuffles.
 
 Rows live in the grid (``batch * seq <= 16``). The affine unpack helpers come
-from :mod:`hc_projection`. Results match the canonical path to a few bf16 ULP
-(fp32 is kept through the epilogues); the path fails closed to ``_forward`` on
-any runtime error. Disable with ``OMLX_QWEN4_HC_FUSED=0``.
+from :mod:`hc_projection`. Any ``hidden_size`` that is a multiple of 64 is
+supported: the norm, down and inject loops guard their partial final blocks
+(compiled out for the shipped 2560). Results match the canonical path to a few
+bf16 ULP (fp32 is kept through the epilogues); the path fails closed to
+``_forward`` on any runtime error and logs once when a model's layout keeps it
+on the canonical path. Disable with ``OMLX_QWEN4_HC_FUSED=0``.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ _DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
 _KERNELS: dict[str, object] = {}
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
+_INELIGIBLE_LOGGED = False
 
 _N_SOURCE = r"""
     const uint row = threadgroup_position_in_grid.z;
@@ -54,14 +58,15 @@ _N_SOURCE = r"""
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     threadgroup float part[8];
-    constexpr int PER = H / 256;
+    constexpr int PER = (H + 255) / 256;
     const device T* xp = x + (size_t)row * K + (size_t)s * H;
     const device T* wp = w + (size_t)s * H;
     device T* op = xn + (size_t)row * K + (size_t)s * H;
     float v[PER];
     float ss = 0.0f;
     for (int i = 0; i < PER; ++i) {
-        v[i] = float(xp[t + i * 256]);
+        const int k = t + i * 256;
+        v[i] = (k < H) ? float(xp[k]) : 0.0f;
         ss += v[i] * v[i];
     }
     ss = simd_sum(ss);
@@ -72,7 +77,7 @@ _N_SOURCE = r"""
     const float inv = metal::rsqrt(tot / float(H) + eps[0]);
     for (int i = 0; i < PER; ++i) {
         const int k = t + i * 256;
-        op[k] = T(v[i] * inv * (1.0f + float(wp[k])));
+        if (k < H) op[k] = T(v[i] * inv * (1.0f + float(wp[k])));
     }
 """
 
@@ -106,7 +111,8 @@ _D_SOURCE = r"""
         const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[4] = {0.0f};
         float xv[VPT];
-        for (int k = 0; k < SLICE; k += BLOCK) {
+        constexpr int TAIL = SLICE % BLOCK;
+        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
             float sum = hc_load_vector<T, VPT, BITS_D>(xp, xv);
             for (int r = 0; r < 4; ++r) {
                 result[r] += hc_qdot<VPT, BITS_D>(
@@ -117,6 +123,17 @@ _D_SOURCE = r"""
             sp += BLOCK / 64;
             bp += BLOCK / 64;
             xp += BLOCK;
+        }
+        // Partial final block: only lanes whose VPT elements lie inside the slice take part.
+        // The helpers read exactly VPT values and VPT * BITS / 8 weight bytes, so nothing is
+        // touched past the slice; every lane still joins the simd_sum below.
+        if (TAIL > 0 && int(lane) * VPT < TAIL) {
+            float sum = hc_load_vector<T, VPT, BITS_D>(xp, xv);
+            for (int r = 0; r < 4; ++r) {
+                result[r] += hc_qdot<VPT, BITS_D>(
+                    wp + r * ROW_BYTES, xv,
+                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+            }
         }
         for (int r = 0; r < 4; ++r) {
             float v = simd_sum(result[r]);
@@ -149,9 +166,8 @@ _D_SOURCE = r"""
         const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[HC] = {0.0f};
         float xv[VPT];
-        int k = 0;
-        const int last = (ks == KS - 1) ? (SLICE - BLOCK) : SLICE;
-        for (; k < last; k += BLOCK) {
+        constexpr int TAIL = SLICE % BLOCK;
+        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
             float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
             for (int r = 0; r < HC; ++r) {
                 result[r] += hc_qdot<VPT, BITS_I>(
@@ -163,10 +179,10 @@ _D_SOURCE = r"""
             bp += BLOCK / 64;
             xp += BLOCK;
         }
-        if (ks == KS - 1) {
+        if (TAIL > 0 && int(lane) * VPT < TAIL) {
             float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
             for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot_safe<VPT, BITS_I>(
+                result[r] += hc_qdot<VPT, BITS_I>(
                     wp + r * ROW_BYTES, xv,
                     float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
             }
@@ -257,6 +273,20 @@ def _quantized_ok(projection) -> bool:
     )
 
 
+def _ineligible(reason: str) -> bool:
+    """Record (once per process) why a model stays on the canonical path, so a future
+    checkpoint that misses the fused kernels shows up in the log instead of just running slower."""
+    global _INELIGIBLE_LOGGED
+    if not _INELIGIBLE_LOGGED:
+        _INELIGIBLE_LOGGED = True
+        logger.info(
+            "Qwen4 fused hyper-connection kernels not used for this model (%s); "
+            "the canonical path stays in effect",
+            reason,
+        )
+    return False
+
+
 def compatible(module, hyper_input) -> bool:
     """Whether ``module`` (a Qwen4ExpGatedResidual) can take the fused path for ``hyper_input``."""
     if not enabled():
@@ -271,7 +301,7 @@ def compatible(module, hyper_input) -> bool:
     if hasattr(module, "input_inject_weight") or getattr(
         module, "_omlx_exact_hybrid_projection", False
     ):
-        return False
+        return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
     hidden = getattr(module, "hidden_size", None)
     lowrank = getattr(module, "hc_lowrank", None)
@@ -280,15 +310,17 @@ def compatible(module, hyper_input) -> bool:
         and isinstance(hidden, int)
         and isinstance(lowrank, int)
         and hc_count == 4
-        # The down projection walks each K-slice (= hidden) in blocks of 32 lanes x 2 packs
-        # x 8 values = 512 elements for 4/5-bit weights with no tail handling; the norm
-        # kernel needs a multiple of 256. Require 512 for every bit width.
-        and hidden % 512 == 0
+        # Every kernel walks the hidden axis in 64-element quantisation groups (the up
+        # kernel's grid is hidden // 64); the norm, down and inject loops guard their
+        # partial final blocks, so any multiple of 64 is fine.
+        and hidden % 64 == 0
         and lowrank % 64 == 0
         and lowrank % 8 == 0
         and hyper_input.shape[2] == hc_count * hidden
     ):
-        return False
+        return _ineligible(
+            f"geometry hidden_size={hidden} hc_lowrank={lowrank} hc_count={hc_count}"
+        )
     norm = getattr(module, "hc_norm", None)
     if not (
         norm is not None
@@ -297,14 +329,16 @@ def compatible(module, hyper_input) -> bool:
         and norm.weight.dtype == mx.bfloat16
         and norm.weight.shape == (hc_count * hidden,)
     ):
-        return False
+        return _ineligible("hc_norm layout")
     if not (
         _quantized_ok(getattr(module, "input_mix_weight_down", None))
         and _quantized_ok(getattr(module, "input_mix_weight_up", None))
     ):
-        return False
+        return _ineligible(
+            "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
+        )
     if "block_inject_weight" in module and not _quantized_ok(module.block_inject_weight):
-        return False
+        return _ineligible("block_inject_weight quantisation")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
