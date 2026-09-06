@@ -1473,6 +1473,7 @@ global.window = {
             rdma_available: true,
           }],
           selected_ssh: ['studio'],
+          explicit_selection: true,
           hardware: {
             studio: {
               hostname: 'Studio',
@@ -1977,15 +1978,261 @@ process.stdout.write(JSON.stringify({ available: component.clusterSplitAvailable
     assert result == {"available": False}
 
 
-def test_first_run_adopts_omlx_peers_before_transport_has_been_measured():
+def test_first_run_keeps_discovered_peers_as_suggestions():
     source = _method_source("initializeClusterSetup")
 
-    assert "peer.service === 'oMLX Distributed'" in source
-    assert "omlxPeers.length" in source
-    assert "automaticPeers" in source
-    assert "if (this.clusterWorkerPeers().length" in source
+    assert "const deployedPeers" in source
+    assert "const discovered" in source
+    assert "if (deployedPeers.length)" in source
+    assert "const automaticPeers" not in source
+    assert "peer.service === 'oMLX Distributed'" not in source
+    assert "else if (this.clusterWorkerPeers().length" in source
     assert source.count("await this.measureClusterBudgets()") == 1
     assert "await this.previewClusterWeightBalance()" in source
+
+
+def test_remembered_peer_without_explicit_selection_stays_unselected():
+    result = _run_dashboard_helpers(
+        ("loadClusterKnownNodes",),
+        """
+global.window = {
+  localStorage: {
+    getItem: key => key === 'omlx.cluster.knownNodes'
+      ? JSON.stringify({
+          peers: [{ ssh: 'stale-peer.local', name: 'Stale peer' }],
+          selected_ssh: [],
+          hardware: {},
+        })
+      : null,
+  },
+};
+component.loadClusterKnownNodes();
+process.stdout.write(JSON.stringify({
+  discovered: component.clusterDiscoveredPeers.map(peer => peer.ssh),
+  selected: component.clusterSelectedPeers,
+  peerSsh: component.clusterPeerSsh,
+}));
+""",
+    )
+
+    assert result == {
+        "discovered": ["stale-peer.local"],
+        "selected": [],
+        "peerSsh": "",
+    }
+
+
+def test_legacy_cache_selection_without_marker_is_treated_as_suggestion():
+    result = _run_dashboard_helpers(
+        ("loadClusterKnownNodes",),
+        """
+global.window = {
+  localStorage: {
+    getItem: key => key === 'omlx.cluster.knownNodes'
+      ? JSON.stringify({
+          peers: [{ ssh: 'stale-peer.local', name: 'Stale peer' }],
+          selected_ssh: ['stale-peer.local'],
+          hardware: {},
+        })
+      : null,
+  },
+};
+component.loadClusterKnownNodes();
+process.stdout.write(JSON.stringify({
+  discovered: component.clusterDiscoveredPeers.map(peer => peer.ssh),
+  selected: component.clusterSelectedPeers,
+  peerSsh: component.clusterPeerSsh,
+}));
+""",
+    )
+
+    # Caches written before the explicit-selection marker stored
+    # auto-promoted discoveries. They come back as suggestions only.
+    assert result == {
+        "discovered": ["stale-peer.local"],
+        "selected": [],
+        "peerSsh": "",
+    }
+
+
+def test_explicit_selection_marker_restores_selected_peer():
+    result = _run_dashboard_helpers(
+        ("loadClusterKnownNodes",),
+        """
+global.window = {
+  localStorage: {
+    getItem: key => key === 'omlx.cluster.knownNodes'
+      ? JSON.stringify({
+          peers: [
+            { ssh: 'studio.local', name: 'Studio' },
+            { ssh: 'gone.local', name: 'Retired' },
+          ],
+          selected_ssh: ['studio.local', 'missing.local'],
+          explicit_selection: true,
+          hardware: {},
+        })
+      : null,
+  },
+};
+component.loadClusterKnownNodes();
+process.stdout.write(JSON.stringify({
+  selected: component.clusterSelectedPeers.map(peer => peer.ssh),
+  peerSsh: component.clusterPeerSsh,
+}));
+""",
+    )
+
+    # An explicit selection survives the reload, minus peers that no
+    # longer resolve to a discovered host.
+    assert result == {"selected": ["studio.local"], "peerSsh": "studio.local"}
+
+
+def test_last_good_config_hosts_are_suggestions_only():
+    result = _run_dashboard_helpers(
+        ("loadClusterKnownNodes",),
+        """
+global.window = {
+  localStorage: {
+    getItem: key => key === 'omlx.cluster.lastGoodConfig'
+      ? JSON.stringify({
+          activation: {
+            hosts: [
+              { node_id: 'wnio', ssh: '10.0.0.1' },
+              { node_id: 'local', ssh: '127.0.0.1' },
+            ],
+          },
+        })
+      : null,
+  },
+};
+component.loadClusterKnownNodes();
+process.stdout.write(JSON.stringify({
+  discovered: component.clusterDiscoveredPeers.map(peer => peer.ssh),
+  selected: component.clusterSelectedPeers,
+  peerSsh: component.clusterPeerSsh,
+}));
+""",
+    )
+
+    assert result == {
+        "discovered": ["10.0.0.1"],
+        "selected": [],
+        "peerSsh": "",
+    }
+
+
+def test_initialization_leaves_discovery_unselected_and_probes_nothing():
+    result = _run_dashboard_helpers(
+        ("initializeClusterSetup", "clusterWorkerPeers"),
+        """
+const calls = [];
+Object.assign(component, {
+  clusterStatus: null,
+  clusterDeployments: [],
+  clusterDiscoveredPeers: [
+    { ssh: 'studio.local', name: 'Studio', service: 'oMLX Distributed' },
+  ],
+  clusterSelectedPeers: [],
+  clusterPeerSsh: '',
+  clusterPeerProbe: null,
+  clusterModelInventory: {},
+  clusterModelInventoryLoading: false,
+  clusterPlanModelPath: 'settled',
+  _clusterKnownNodesNeedsSync: false,
+  clusterPeerDisplayName: () => 'studio.local',
+  clusterProbeBackoffActive: () => false,
+  clusterModelCandidates: () => [],
+  clusterRecommendedModels: () => [],
+  syncClusterNodesFromPeers: () => calls.push('sync'),
+  probeClusterPeer: async () => calls.push('probe'),
+  loadClusterTransports: async () => calls.push('transports'),
+  loadClusterPeerHardware: async () => calls.push('hardware'),
+  measureClusterBudgets: async () => calls.push('budgets'),
+  loadClusterModelInventory: async () => calls.push('inventory'),
+  normalizeClusterTensorParallelSize: () => calls.push('normalize'),
+  previewClusterWeightBalance: async () => calls.push('preview'),
+});
+(async () => {
+  await component.initializeClusterSetup({ preview: false });
+  process.stdout.write(JSON.stringify({
+    calls,
+    selected: component.clusterSelectedPeers,
+    peerSsh: component.clusterPeerSsh,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    # Discovery without an explicit selection must not enroll anything
+    # and must not spend an SSH probe on an unselected Mac.
+    assert result == {
+        "calls": ["hardware", "normalize"],
+        "selected": [],
+        "peerSsh": "",
+    }
+
+
+def test_initialization_prefers_deployment_hosts_over_cached_selection():
+    result = _run_dashboard_helpers(
+        ("initializeClusterSetup", "clusterWorkerPeers"),
+        """
+const calls = [];
+Object.assign(component, {
+  clusterStatus: null,
+  clusterDeployments: [{
+    deployment_id: 'Qwen3.8-27B-oQ4e-mtp-b4309a77d9b7',
+    hosts: [
+      { node_id: 'wnomni', ssh: '127.0.0.1' },
+      { node_id: 'wnio', ssh: '10.0.0.1' },
+    ],
+  }],
+  clusterDiscoveredPeers: [
+    { ssh: 'stale-peer.local', name: 'Stale peer', transport: 'rdma' },
+  ],
+  clusterSelectedPeers: [{ ssh: 'stale-peer.local', name: 'Stale peer' }],
+  clusterPeerSsh: 'stale-peer.local',
+  clusterPeerProbe: null,
+  clusterModelInventory: {},
+  clusterModelInventoryLoading: false,
+  clusterPlanModelPath: 'settled',
+  _clusterKnownNodesNeedsSync: false,
+  clusterPeerDisplayName: () => 'stale-peer.local',
+  clusterProbeBackoffActive: () => false,
+  clusterModelCandidates: () => [],
+  clusterRecommendedModels: () => [],
+  syncClusterNodesFromPeers: () => calls.push('sync'),
+  probeClusterPeer: async () => calls.push('probe:' + component.clusterPeerSsh),
+  loadClusterTransports: async () => calls.push('transports'),
+  loadClusterPeerHardware: async () => calls.push('hardware'),
+  measureClusterBudgets: async () => calls.push('budgets'),
+  loadClusterModelInventory: async () => calls.push('inventory'),
+  normalizeClusterTensorParallelSize: () => calls.push('normalize'),
+  previewClusterWeightBalance: async () => calls.push('preview'),
+});
+(async () => {
+  await component.initializeClusterSetup({ preview: false });
+  process.stdout.write(JSON.stringify({
+    calls,
+    selected: component.clusterSelectedPeers.map(peer => peer.ssh),
+    peerSsh: component.clusterPeerSsh,
+  }));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+""",
+    )
+
+    # The live deployment's hosts replace the stale cached selection, so
+    # the probe follows the deployment instead of the remembered peer.
+    assert result["selected"] == ["10.0.0.1"]
+    assert result["peerSsh"] == "10.0.0.1"
+    assert result["calls"][0] == "sync"
+    assert "probe:10.0.0.1" in result["calls"]
+    assert "probe:stale-peer.local" not in result["calls"]
 
 
 def test_initialization_previews_by_default_but_polling_skips_it():
