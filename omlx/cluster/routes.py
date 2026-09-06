@@ -1967,7 +1967,12 @@ async def cluster_discover():
 
 @router.post("/pairing-token")
 async def cluster_pairing_token(request: ClusterPairingTokenRequest):
-    """Generate a pairing token for QR code exchange."""
+    """Generate a pairing token for QR code exchange.
+
+    Advanced (legacy): step 1 of the 3-step copy-paste relay. The cluster v2
+    wizard uses POST /api/cluster/pair/request + /pair/approve instead; this
+    endpoint is kept working unchanged for the legacy flow.
+    """
 
     from .discovery import generate_pairing_token
 
@@ -1982,7 +1987,11 @@ async def cluster_pairing_token(request: ClusterPairingTokenRequest):
 async def cluster_verify_pairing_token(
     request: ClusterPairingTokenVerificationRequest,
 ):
-    """Verify a pairing token received via QR code scan."""
+    """Verify a pairing token received via QR code scan.
+
+    Advanced (legacy): part of the 3-step copy-paste relay; superseded by the
+    cluster v2 code-based pairing flow but kept working unchanged.
+    """
 
     return {
         "valid": verify_pairing_token(
@@ -2232,7 +2241,12 @@ async def cluster_generate_ssh_key(
 async def cluster_generate_key_exchange_token(
     request: ClusterKeyExchangeTokenRequest,
 ):
-    """Generate a key exchange token for pairing with a peer."""
+    """Generate a key exchange token for pairing with a peer.
+
+    Advanced (legacy): step 3 of the copy-paste relay. Cluster v2 pairing
+    (POST /api/cluster/pair/approve) drives the same SSH TOFU primitives
+    programmatically; this endpoint remains for the manual flow.
+    """
 
     from .ssh_keys import generate_key_exchange_for_peer
 
@@ -2252,7 +2266,11 @@ async def cluster_generate_key_exchange_token(
 
 @router.post("/ssh-key/exchange")
 async def cluster_exchange_keys(request: ClusterKeyExchangeRequest):
-    """Exchange SSH keys with a peer using their exchange token."""
+    """Exchange SSH keys with a peer using their exchange token.
+
+    Advanced (legacy): step 3 of the copy-paste relay; kept working unchanged
+    alongside the cluster v2 code-based pairing flow.
+    """
 
     from .ssh_keys import exchange_keys_with_peer
 
