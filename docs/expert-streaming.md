@@ -254,6 +254,26 @@ Measured (GLM-JANG, budget 1 GiB, 3 reps): d1 **+45.7%** (accept 80.8%, 1.85 tok
 
 **VLM MTP adapter fallback** (`tests/test_vlm_mtp_adapter.py`): absent `mtp_clamp_accept` now means no clamp and absent rollback falls back to the non-MTP step (the chain already provides it) — previously a partial draft rejection crashed the request (`LanguageModel has no mtp_clamp_accept`). No change for models with the hook.
 
+## Reference Mac performance
+
+Every number in this doc was measured on one box — MacBook Pro M4 Pro, 48 GB unified memory, checkpoint and `.omlx_spill` on an external ~3.7 GB/s NVMe — with the single-request bench protocol (3 interleaved reps, warm page cache, token-ID gates). The table below consolidates the per-model headline numbers; each row links to the section carrying the full A/B.
+
+| model (checkpoint) | resident dense (streaming) | TTFT | decode, default config | decode, best measured config |
+|---|---|---|---|---|
+| GLM-5.3-Flash 190G (oQ4e) | ~4.8 GB (resident needs ~21 GB) | 18.5 s | **0.697 tok/s** (QD16) | 0.697 tok/s |
+| GLM-5.3-Flash-JANG-MTP 190G | ~4.8 GB | ~11 s | 1.008 tok/s | **2.01 tok/s** (topk 0.85 + prior 2.0 + MTP d3, +99.8%) |
+| Qwen3.8-Flash-Next 99G (oQ4e-mtp) | ~5.7 GB | 8.4–10.7 s | **2.06 tok/s** (48-token decode, QD16) | exact 2.06; HOBBIT 0.25 @3-bit = 1.804 for +11% at +0.21% ppl |
+| Qwen3.8-JANG 4S / 4M | ~5.7 GB | ~8 s | 2.817 / 1.977 tok/s | **3.142 tok/s** (4S, topk 0.85, +11.5%) |
+| DeepSeek-V4-Flash 166G (oQ4e-mtp) | **8.2 GiB** (spill load 3.4 s) | 5.8–6.8 s | 1.48–2.61 tok/s | 2.61 tok/s |
+
+Reading notes:
+
+- **GLM is on the I/O floor** — 13 MB experts, 288 routed/layer: every decode step must read ~30 experts off the SSD, so decode sits near the disk's random-read ceiling and the wins come from cutting bytes/token (topk, cold tier) or not reading at all (MTP accept). Qwen is not: ~2.7 MB experts, 512 routed, top-10 with heavy inter-token reuse — the page cache absorbs most of it, which is why Qwen decode runs 3–4× GLM's and pins/seed pay there.
+- Qwen's speed levers are quality-gated opt-ins, not free: the 3.142 figure costs +3.9% ppl (topk 0.85). The **near-lossless** Qwen config is HOBBIT 0.25 @ 3-bit — 1.804 tok/s for +0.21% ppl (+11% over base 1.622 on the same protocol), with the 2-bit tier at 1.955 (+21% for +0.97%).
+- The GLM 190G row is the box where the page-cache-only default was decided: at budget 0 the OS file cache serves decode better than any app-level LRU measured (4.8 GB vs 11.7 GB RSS, 0.381 vs 0.363 tok/s at the old QD8 pool; QD16 lifts the same config to 0.697).
+- DSV4 decode range spans the battery's config matrix (budget/MTP/topk arms); 2.61 tok/s is the top arm, not a cherry-pick — the battery is in [Model-family notes](#model-family-notes).
+- Numbers move with the SSD: an internal Mac SSD (2×–3× the sequential spec, better random QD) shifts GLM up materially; the ratios between configs are the transferable part.
+
 ## Model-family notes
 
 - **GLM-5.3-Flash**: large experts (13 MB) put decode on the I/O floor; QD16 lifted it 0.381 → **0.697 tok/s (+83%)** and TTFT 23 → 18.5 s. Pins are too sparse to pay (1.25 GiB ≈ 4–5 experts/layer of 288); the levers that pay are QD16, topk 0.85 (+27%), the cold tier (+26–33% at +24% ppl) and HOBBIT 0.25 (+9–11% at +1.3% ppl).
