@@ -73,7 +73,7 @@ def test_prefill_boundaries_are_snapshotted_to_ssd(tmp_path, monkeypatch):
 
 def test_a_later_miss_restores_the_longest_ssd_prefix(tmp_path, monkeypatch):
     mlx_server, ctx = _install(tmp_path, monkeypatch)
-    with ctx:
+    with ctx as telemetry:
         cache = mlx_server.LRUPromptCache()
         first = list(range(8))
         cache.prefetch_nearest_cache(MODEL, first)
@@ -91,9 +91,15 @@ def test_a_later_miss_restores_the_longest_ssd_prefix(tmp_path, monkeypatch):
         longer = list(range(12))
         fresh = mlx_server.LRUPromptCache()
         restored, rest = fresh.prefetch_nearest_cache(MODEL, longer)
+        snapshot = telemetry.snapshot()
 
     assert restored is not None
     assert rest == [8, 9, 10, 11]
+    assert snapshot["cache"]["lookups"] == 2
+    assert snapshot["cache"]["hits"] == 1
+    assert snapshot["cache"]["tokens_reused"] == 8
+    assert snapshot["cache"]["entries"] == 2
+    assert snapshot["cache"]["bytes"] > 0
 
 
 def test_the_fetch_path_alone_carries_the_ssd_tier(tmp_path, monkeypatch):
@@ -222,6 +228,31 @@ def test_teardown_removes_the_snapshot_directory(tmp_path, monkeypatch):
         )
         assert sorted(tmp_path.glob("*.safetensors"))
     assert not tmp_path.exists()
+
+
+def test_persistent_tier_survives_telemetry_teardown(tmp_path, monkeypatch):
+    import mlx_lm.server as mlx_server
+
+    monkeypatch.setattr(mlx_server, "stream_generate", _fake_stream_generate)
+    with install_server_telemetry(
+        _Marker(),
+        ssd_cache_dir=str(tmp_path),
+        ssd_cache_persistent=True,
+        prefill_step_size=STEP,
+    ):
+        tokens = list(range(8))
+        mlx_server.LRUPromptCache().fetch_nearest_cache(MODEL, tokens)
+        list(
+            mlx_server.stream_generate(
+                model=None,
+                prompt=tokens,
+                prompt_cache=_kv(),
+                prompt_progress_callback=None,
+            )
+        )
+
+    assert (tmp_path / "index.json").is_file()
+    assert sorted(tmp_path.glob("*.safetensors"))
 
 
 class _FakeBaseBatchGenerator:

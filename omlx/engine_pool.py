@@ -881,7 +881,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -1223,9 +1223,22 @@ class EnginePool:
         if not callable(has_active_requests):
             return False
         try:
-            return has_active_requests() is True
+            if has_active_requests() is True:
+                return True
         except Exception:
             return True
+        # Do not use instance getattr here: test doubles and dynamic proxies
+        # can manufacture a truthy method for any name. Only engines whose
+        # class explicitly implements rank-side telemetry participate.
+        rank_side = getattr(type(engine), "rank_side_active_requests", None)
+        if callable(rank_side):
+            try:
+                remaining = rank_side(engine)
+            except Exception:
+                remaining = None
+            if remaining:
+                return True
+        return False
 
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
@@ -2333,10 +2346,13 @@ class EnginePool:
             await entry.engine.stop()
         except Exception as e:
             if distributed:
-                # Keep the supervisor reachable and the planned memory
-                # accounted so a later unload can retry process teardown.
+                # The supervisor raises (DistributedTeardownError) when the
+                # final SIGKILL cannot be verified, so this path is now
+                # reachable: keep the supervisor reachable and the planned
+                # memory accounted so a later unload can retry process
+                # teardown instead of releasing the budget over a live rank.
                 logger.error(
-                    f"Distributed teardown failed for {model_id}; "
+                    f"Distributed teardown failed for {model_id} ({e}); "
                     "keeping the engine registered for retry",
                     exc_info=True,
                 )

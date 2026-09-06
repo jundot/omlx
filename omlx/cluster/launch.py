@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -31,9 +32,15 @@ from typing import Any
 from omlx.utils import hardware
 
 from .deployment import ClusterDeployment, validate_ssh_target
-from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
+from .liveness import (
+    _LOOPBACK_TARGETS,
+    marker_owner_is_live,
+    read_marker,
+    read_remote_marker,
+)
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
+from .runtime import read_runtime_markers
 from .ssh_policy import cluster_ssh_options
 from .staging import home_relative_model_path, validate_staged_model
 
@@ -45,10 +52,157 @@ _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+_LAUNCHER_RANK_EXIT_RE = re.compile(
+    r"Node with rank\s+(?P<rank>\d+)\s+exited with code\s+(?P<code>-?\d+)"
+)
+_JACCL_NO_PROGRESS_RE = re.compile(
+    r"\[jaccl\]\s+(?P<reason>[^\r\n]*made no progress[^\r\n]*)",
+    re.IGNORECASE,
+)
+_REBOOT_REQUIRED_GUIDANCE = (
+    "A distributed rank survived SIGKILL and may be stuck in the macOS "
+    "Metal driver. Reboot this Mac before starting another distributed launch."
+)
 
 
 class DistributedLaunchError(RuntimeError):
     """Raised when a distributed job cannot become or remain ready."""
+
+
+class DistributedTeardownError(DistributedLaunchError):
+    """Raised when a distributed job survives a verified teardown attempt.
+
+    A rank that survives SIGKILL (unkillable Metal/JACCL kernel wait,
+    D-state, or a ``PermissionError`` that ``_process_group_alive``
+    deliberately reads as alive) keeps its unified-memory allocation
+    resident. Reporting success anyway was the orphaned-GPU-memory hole:
+    the engine pool released the model's memory budget while the weights
+    were still wired. Callers must treat this as "teardown NOT complete"
+    and keep enough state to retry.
+    """
+
+
+@dataclass(frozen=True)
+class _LocalProcessState:
+    """One read-only row from the macOS/Linux process table."""
+
+    pid: int
+    ppid: int
+    process_group: int
+    status: str
+    rss_kib: int
+    command: str
+
+    @property
+    def zombie(self) -> bool:
+        return self.status.upper().startswith("Z")
+
+
+def _read_local_process_table(
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[tuple[_LocalProcessState, ...] | None, str]:
+    """Read process state; an unreadable table is not teardown evidence."""
+
+    argv = ["ps", "-axo", "pid=,ppid=,pgid=,stat=,rss=,command="]
+    try:
+        completed = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"could not read the local process table: {exc}"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"ps exited {completed.returncode}"
+        return None, f"could not read the local process table: {detail}"
+
+    rows: list[_LocalProcessState] = []
+    for line_number, raw_line in enumerate(completed.stdout.splitlines(), 1):
+        fields = raw_line.strip().split(None, 5)
+        if not fields:
+            continue
+        if len(fields) != 6:
+            return None, (
+                "could not verify the local process table: malformed ps row "
+                f"{line_number}"
+            )
+        pid, ppid, process_group, status, rss_kib, command = fields
+        try:
+            numeric = tuple(int(value) for value in (pid, ppid, process_group, rss_kib))
+        except ValueError:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        if numeric[0] <= 0 or numeric[2] < 0 or numeric[3] < 0:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        rows.append(
+            _LocalProcessState(
+                pid=numeric[0],
+                ppid=numeric[1],
+                process_group=numeric[2],
+                status=status,
+                rss_kib=numeric[3],
+                command=command,
+            )
+        )
+    return tuple(rows), ""
+
+
+def _command_deployment_id(command: str) -> str | None:
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return None
+    for index, argument in enumerate(arguments):
+        if argument == "--deployment-id" and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if argument.startswith("--deployment-id="):
+            return argument.partition("=")[2]
+    return None
+
+
+def _belongs_to_launch(process: _LocalProcessState, *, deployment_id: str) -> bool:
+    return _command_deployment_id(process.command) == deployment_id and (
+        "mlx._distributed_utils.launch" in process.command
+        or "omlx.cluster.inference_worker" in process.command
+    )
+
+
+def _local_launch_survivors(
+    processes: tuple[_LocalProcessState, ...],
+    *,
+    deployment_id: str,
+    process_group: int | None = None,
+    known_pids: set[int] | None = None,
+) -> tuple[_LocalProcessState, ...]:
+    return tuple(
+        process
+        for process in processes
+        if not process.zombie
+        and (
+            (known_pids is not None and process.pid in known_pids)
+            or (process_group is not None and process.process_group == process_group)
+            or _belongs_to_launch(process, deployment_id=deployment_id)
+        )
+    )
+
+
+def _survivor_description(process: _LocalProcessState) -> str:
+    return (
+        f"pid {process.pid} (ppid {process.ppid}, pgid {process.process_group}, "
+        f"state {process.status!r}, rss {process.rss_kib} KiB) survived SIGKILL"
+    )
+
+
+def _is_macos_exit_wedge(process: _LocalProcessState) -> bool:
+    return "E" in process.status.upper() and process.rss_kib == 0
 
 
 @dataclass(frozen=True)
@@ -123,6 +277,671 @@ def _wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
     return True
 
 
+def _pid_alive(pid: int) -> bool:
+    """Local mirror of ``liveness._pid_is_live`` for reaper bookkeeping."""
+
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError):
+        return True
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+_LAUNCH_MANIFEST_PREFIX = "launch-"
+_LOOPBACK_SSH_TARGETS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
+    return (
+        Path(state_dir).expanduser() / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
+    )
+
+
+def _serve_release_path(state_dir: str | Path, deployment_id: str) -> Path:
+    """Coordinator-owned gate that releases loaded ranks into serving."""
+
+    return Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
+
+
+_REMOTE_SERVE_MARKER_SCRIPT = (
+    "import json,os,pathlib,sys;"
+    "p=pathlib.Path(sys.argv[1]).expanduser();"
+    "raw=sys.argv[2];"
+    "p.parent.mkdir(parents=True,exist_ok=True);"
+    "tmp=p.with_name(p.name+'.tmp');"
+    "tmp.write_text(raw,encoding='utf-8');"
+    "os.chmod(tmp,0o600);"
+    "os.replace(tmp,p)"
+)
+
+_REMOTE_CLEAR_SERVE_MARKER_SCRIPT = (
+    "import pathlib,sys;pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
+)
+
+
+def _set_serve_release(
+    deployment: ClusterDeployment,
+    state_dir: str | Path,
+    payload: dict[str, Any] | None,
+    *,
+    runner: SSHRunner = subprocess.run,
+) -> None:
+    """Atomically publish or clear the post-load serve gate on every rank."""
+
+    filename = f"{deployment.deployment_id}-serve.json"
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if payload is not None
+        else None
+    )
+    local_path = _serve_release_path(state_dir, deployment.deployment_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if encoded is None:
+        local_path.unlink(missing_ok=True)
+    else:
+        temporary = local_path.with_name(local_path.name + ".tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+        os.replace(temporary, local_path)
+
+    remote_root = str(state_dir).rstrip("/") or "."
+    remote_path = f"{remote_root}/{filename}"
+    for host in deployment.hosts:
+        if host.ssh in _LOOPBACK_SSH_TARGETS:
+            continue
+        script = (
+            _REMOTE_CLEAR_SERVE_MARKER_SCRIPT
+            if encoded is None
+            else _REMOTE_SERVE_MARKER_SCRIPT
+        )
+        arguments = [remote_path] if encoded is None else [remote_path, encoded]
+        command = " ".join(
+            ["python3", "-c", shlex.quote(script)]
+            + [shlex.quote(item) for item in arguments]
+        )
+        completed = _run_cluster_ssh(
+            host.ssh,
+            command,
+            timeout=15.0,
+            runner=runner,
+        )
+        _raise_for_ssh_transport_failure(host.ssh, completed)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "remote marker update failed"
+            raise DistributedLaunchError(
+                f"Could not update serve gate on {host.ssh}: {detail}"
+            )
+
+
+def _write_launch_manifest(
+    state_dir: str | Path,
+    deployment: ClusterDeployment,
+    *,
+    launcher_pid: int,
+    api_port: int | None,
+) -> Path:
+    """Persist launch identity so a *new* coordinator can reap leftovers.
+
+    Every teardown path lives in the coordinator process, so a SIGKILL or
+    panic of omlx-server strands the launcher and every rank with no owner
+    (G8). The manifest records the process group and the marker directory
+    of the job; ``reap_orphaned_launches`` consumes it at the next server
+    start. It is removed only after verified process-group exit.
+    """
+
+    root = Path(state_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "plan_hash": deployment.plan_hash,
+        # start_new_session=True makes the launcher its own group leader.
+        "launcher_pid": int(launcher_pid),
+        "process_group": int(launcher_pid),
+        "coordinator_pid": os.getpid(),
+        "api_port": api_port,
+        "started_at": time.time(),
+        "hosts": [
+            {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+            for rank, host in enumerate(deployment.hosts)
+        ],
+    }
+    path = _launch_manifest_path(state_dir, deployment.deployment_id)
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+    return path
+
+
+def _read_launch_manifest(path: Path) -> dict[str, Any] | None:
+    """Read one manifest; anything malformed is ignored, never reaped."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    deployment_id = payload.get("deployment_id")
+    launcher_pid = payload.get("launcher_pid")
+    coordinator_pid = payload.get("coordinator_pid")
+    hosts = payload.get("hosts")
+    if not isinstance(deployment_id, str) or not deployment_id:
+        return None
+    if not all(
+        isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+        for pid in (launcher_pid, coordinator_pid)
+    ):
+        return None
+    if not isinstance(hosts, list):
+        return None
+    return payload
+
+
+def _kill_local_pid(pid: int, *, grace: float) -> bool:
+    """SIGTERM, brief grace, then SIGKILL; True once the pid is gone."""
+
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, grace)
+    while _pid_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    if not _pid_alive(pid):
+        return True
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while _pid_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    return not _pid_alive(pid)
+
+
+def _kill_remote_pid(
+    ssh_target: str,
+    pid: int,
+    *,
+    grace: float,
+    runner: SSHRunner = subprocess.run,
+) -> bool:
+    """Best-effort remote TERM->grace->KILL of one rank pid over SSH.
+
+    killpg only reaches the *local* process group (G2): a remote rank whose
+    launcher-parent watchdog never fired keeps its shard resident. The rank
+    pid recorded in its runtime marker gives the coordinator a direct kill
+    path that does not depend on the SSH session teardown chain.
+    """
+
+    command = (
+        f"kill -TERM {pid} 2>/dev/null; sleep {max(0.0, grace):.1f}; "
+        f"kill -KILL {pid} 2>/dev/null; sleep 0.5; "
+        f"if kill -0 {pid} 2>/dev/null; then echo alive; else echo gone; fi"
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=max(5.0, grace) + 15.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        logger.warning("Remote rank kill via %s failed: %s", ssh_target, exc)
+        return False
+    return "gone" in completed.stdout and "alive" not in completed.stdout
+
+
+_REMOTE_WORKER_SCAN_SCRIPT = (
+    "import json,shlex,subprocess,sys;"
+    "dep=sys.argv[1];"
+    "r=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,check=False);"
+    "p=[];"
+    "\nfor line in r.stdout.splitlines():"
+    "\n s=line.strip(); fields=s.split(None,1)"
+    "\n if len(fields)!=2 or not fields[0].isdigit(): continue"
+    "\n try: args=shlex.split(fields[1])"
+    "\n except ValueError: continue"
+    "\n if 'omlx.cluster.inference_worker' not in args: continue"
+    "\n try: i=args.index('--deployment-id')"
+    "\n except ValueError: continue"
+    "\n if i+1<len(args) and args[i+1]==dep: p.append(int(fields[0]))"
+    "\nprint(json.dumps({'returncode':r.returncode,'pids':p},separators=(',',':')))"
+)
+
+
+def _remote_deployment_worker_pids(
+    ssh_target: str,
+    deployment_id: str,
+    *,
+    runner: SSHRunner = subprocess.run,
+) -> tuple[list[int] | None, str]:
+    """Find rank workers even when a hard crash removed their marker."""
+
+    command = " ".join(
+        (
+            "python3",
+            "-c",
+            shlex.quote(_REMOTE_WORKER_SCAN_SCRIPT),
+            shlex.quote(deployment_id),
+        )
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=10.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        return None, str(exc)
+    if len(completed.stdout.encode()) > _REMOTE_OUTPUT_LIMIT:
+        return None, "remote worker scan response was too large"
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"remote worker scan response was invalid: {exc}"
+    pids = payload.get("pids")
+    if payload.get("returncode") != 0 or not isinstance(pids, list):
+        return None, "remote worker process table could not be read"
+    if any(
+        isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids
+    ):
+        return None, "remote worker scan returned an invalid pid"
+    return pids, ""
+
+
+def _rank_marker_matches(
+    marker: dict[str, Any] | None,
+    *,
+    deployment_id: str,
+    plan_hash: str | None,
+    rank: int,
+) -> bool:
+    if not isinstance(marker, dict):
+        return False
+    if marker.get("deployment_id") != deployment_id or marker.get("rank") != rank:
+        return False
+    recorded = marker.get("plan_hash")
+    return not (
+        plan_hash is not None and recorded is not None and recorded != plan_hash
+    )
+
+
+def _sweep_rank_processes(
+    deployment_id: str,
+    hosts: list[dict[str, Any]],
+    *,
+    state_dir: str | Path,
+    plan_hash: str | None = None,
+    process_group: int | None = None,
+    kill_grace: float = 3.0,
+    runner: SSHRunner = subprocess.run,
+) -> list[str]:
+    """Kill rank processes recorded in runtime markers that are still live.
+
+    Returns a bounded list of human-readable failures; empty means no rank
+    of this job remains resident anywhere the sweep could reach.
+    """
+
+    failures: list[str] = []
+    attempted_local_pids: set[int] = set()
+    local_root = Path(state_dir).expanduser()
+    remote_root = str(state_dir).rstrip("/") or "."
+    initial_processes, process_error = _read_local_process_table()
+    processes_by_pid = (
+        {process.pid: process for process in initial_processes}
+        if initial_processes is not None
+        else {}
+    )
+    if initial_processes is None:
+        failures.append(process_error)
+    local_markers: dict[int, dict[str, Any]] = {}
+    try:
+        for job in read_runtime_markers(local_root).get("jobs", []):
+            if job.get("deployment_id") == deployment_id:
+                local_markers[job["rank"]] = job
+    except (OSError, KeyError, TypeError) as exc:
+        failures.append(f"could not read local runtime markers: {exc}")
+
+    for host in hosts:
+        rank = host.get("rank")
+        ssh_target = host.get("ssh")
+        node_id = host.get("node_id", "?")
+        if not isinstance(rank, int) or not isinstance(ssh_target, str):
+            continue
+        filename = f"{deployment_id}-rank-{rank}.json"
+        if ssh_target in _LOOPBACK_SSH_TARGETS:
+            marker = local_markers.get(rank)
+            if marker is None:
+                marker = read_marker(local_root / filename)
+            if not _rank_marker_matches(
+                marker,
+                deployment_id=deployment_id,
+                plan_hash=plan_hash,
+                rank=rank,
+            ):
+                continue
+            if not marker_owner_is_live(marker):
+                continue
+            pid = marker.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                failures.append(f"rank {rank} ({node_id}) marker has an invalid pid")
+                continue
+            process_state = processes_by_pid.get(pid)
+            if process_state is None:
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} is addressable but "
+                    "absent from the process table; refusing an unverified signal"
+                )
+                continue
+            if process_state.zombie:
+                continue
+            if not _belongs_to_launch(
+                process_state,
+                deployment_id=deployment_id,
+            ) and not _is_macos_exit_wedge(process_state):
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} identity changed; "
+                    "refusing to signal a reused PID"
+                )
+                continue
+            attempted_local_pids.add(pid)
+            if _kill_local_pid(pid, grace=kill_grace):
+                logger.warning(
+                    "Reaped leftover rank %d (%s) pid %d of deployment %s",
+                    rank,
+                    node_id,
+                    pid,
+                    deployment_id,
+                )
+            else:
+                failures.append(f"rank {rank} ({node_id}) pid {pid} survived SIGKILL")
+            continue
+        # Remote rank: its marker lives on the peer.
+        marker, process_live, _, error = read_remote_marker(
+            ssh_target,
+            f"{remote_root}/{filename}",
+        )
+        if error:
+            pids, scan_error = _remote_deployment_worker_pids(
+                ssh_target,
+                deployment_id,
+                runner=runner,
+            )
+            if scan_error:
+                failures.append(
+                    f"rank {rank} ({node_id}) marker unreadable ({error}) and "
+                    f"worker scan failed: {scan_error}"
+                )
+                continue
+            for pid in pids or ():
+                if not _kill_remote_pid(
+                    ssh_target,
+                    pid,
+                    grace=kill_grace,
+                    runner=runner,
+                ):
+                    failures.append(
+                        f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
+                    )
+            continue
+        if not _rank_marker_matches(
+            marker,
+            deployment_id=deployment_id,
+            plan_hash=plan_hash,
+            rank=rank,
+        ):
+            continue
+        if process_live is not True:
+            continue
+        pid = marker.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        if _kill_remote_pid(ssh_target, pid, grace=kill_grace, runner=runner):
+            logger.warning(
+                "Reaped leftover remote rank %d (%s) pid %d of deployment %s",
+                rank,
+                node_id,
+                pid,
+                deployment_id,
+            )
+        else:
+            failures.append(
+                f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
+            )
+
+    # Markers and successful signal calls are not exit evidence. Sweep any
+    # markerless local worker by its exact deployment argv, then require a
+    # fresh process-table snapshot to contain neither its PID nor launch group.
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return list(dict.fromkeys(failures))
+    for process in _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+    ):
+        if process.pid in attempted_local_pids:
+            continue
+        attempted_local_pids.add(process.pid)
+        if not _kill_local_pid(process.pid, grace=kill_grace):
+            failures.append("markerless local rank " + _survivor_description(process))
+
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return list(dict.fromkeys(failures))
+    survivors = _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+        process_group=process_group,
+        known_pids=attempted_local_pids,
+    )
+    failures.extend(_survivor_description(process) for process in survivors)
+    if survivors:
+        failures.append(_REBOOT_REQUIRED_GUIDANCE)
+    return list(dict.fromkeys(failures))
+
+
+def stop_deployment_processes(
+    deployment: ClusterDeployment,
+    *,
+    state_dir: str | Path = "~/.omlx/cluster/runtime",
+    kill_grace: float = 3.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Stop and prove exit of one deployment without trusting pool ownership.
+
+    The normal engine path owns a :class:`DistributedJobSupervisor`, but an
+    admin unload can arrive after that Python object was lost while its local
+    or SSH-launched rank still owns unified memory.  This deployment-scoped
+    backstop verifies the persisted launcher identity, terminates its process
+    group when present, sweeps exact worker argv/marker PIDs on every signed
+    host, and returns only after the final process-table checks pass.
+    """
+
+    manifest_path = _launch_manifest_path(state_dir, deployment.deployment_id)
+    manifest = _read_launch_manifest(manifest_path) if manifest_path.exists() else None
+    failures: list[str] = []
+    process_group: int | None = None
+    if manifest_path.exists() and manifest is None:
+        failures.append("launch manifest is unreadable; refusing unverified unload")
+    elif manifest is not None:
+        if manifest.get("deployment_id") != deployment.deployment_id or manifest.get(
+            "plan_hash"
+        ) not in {None, deployment.plan_hash}:
+            failures.append("launch manifest identity does not match deployment")
+        else:
+            candidate_group = int(manifest["process_group"])
+            if _process_group_alive(candidate_group):
+                processes, process_error = _read_local_process_table()
+                if processes is None:
+                    failures.append(process_error)
+                else:
+                    members = tuple(
+                        process
+                        for process in processes
+                        if process.process_group == candidate_group
+                        and not process.zombie
+                    )
+                    foreign = tuple(
+                        process
+                        for process in members
+                        if not _belongs_to_launch(
+                            process,
+                            deployment_id=deployment.deployment_id,
+                        )
+                    )
+                    if foreign:
+                        identities = ", ".join(
+                            f"pid {process.pid} state {process.status!r}"
+                            for process in foreign[:4]
+                        )
+                        failures.append(
+                            "launch process-group identity changed "
+                            f"({identities}); refusing to signal a reused PGID"
+                        )
+                    elif members:
+                        process_group = candidate_group
+                        with suppress(ProcessLookupError):
+                            os.killpg(candidate_group, signal.SIGTERM)
+                        group_gone = _wait_for_process_group_exit(
+                            candidate_group,
+                            max(0.0, kill_grace),
+                        )
+                        if not group_gone:
+                            with suppress(ProcessLookupError):
+                                os.killpg(candidate_group, signal.SIGKILL)
+                            group_gone = _wait_for_process_group_exit(
+                                candidate_group,
+                                2.0,
+                            )
+                        if not group_gone:
+                            failures.append(
+                                f"process group {candidate_group} survived unload"
+                            )
+
+    hosts = [
+        {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+        for rank, host in enumerate(deployment.hosts)
+    ]
+    failures.extend(
+        _sweep_rank_processes(
+            deployment.deployment_id,
+            hosts,
+            state_dir=state_dir,
+            plan_hash=deployment.plan_hash,
+            process_group=process_group,
+            kill_grace=kill_grace,
+            runner=runner,
+        )
+    )
+    failures = list(dict.fromkeys(failures))
+    if failures:
+        detail = "; ".join(failures)
+        if any("survived" in item for item in failures):
+            detail += f". {_REBOOT_REQUIRED_GUIDANCE}"
+        raise DistributedTeardownError(
+            f"distributed unload of {deployment.deployment_id} could not be "
+            f"verified: {detail}"
+        )
+    if manifest_path.exists():
+        try:
+            manifest_path.unlink()
+        except OSError as exc:
+            raise DistributedTeardownError(
+                "rank exit was verified but the launch manifest could not be "
+                f"retired: {exc}"
+            ) from exc
+    return {
+        "verified": True,
+        "deployment_id": deployment.deployment_id,
+        "ranks_checked": len(hosts),
+        "manifest_retired": manifest is not None,
+    }
+
+
+def reap_orphaned_launches(
+    state_dir: str | Path = "~/.omlx/cluster/runtime",
+    *,
+    kill_grace: float = 5.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Reap jobs whose coordinator died without tearing them down (G8).
+
+    Every launch writes a manifest next to the runtime markers. A manifest
+    whose coordinator *and* launcher group are both gone belongs to a
+    crashed predecessor: any rank processes its markers still name are
+    orphans holding unified memory, so kill them and retire the manifest.
+    A manifest with a live coordinator is an active job and is left alone.
+
+    Returns ``{"reaped": [...], "failures": [...], "active": [...]}``.
+    """
+
+    report: dict[str, Any] = {"reaped": [], "failures": [], "active": []}
+    root = Path(state_dir).expanduser()
+    if not root.exists():
+        return report
+    try:
+        manifests = sorted(root.glob(f"{_LAUNCH_MANIFEST_PREFIX}*.json"))
+    except OSError as exc:
+        report["failures"].append(f"runtime state unavailable: {exc}")
+        return report
+
+    for path in manifests:
+        manifest = _read_launch_manifest(path)
+        if manifest is None:
+            continue
+        deployment_id = manifest["deployment_id"]
+        coordinator_pid = manifest["coordinator_pid"]
+        launcher_pid = manifest["launcher_pid"]
+        if _pid_alive(coordinator_pid):
+            report["active"].append(deployment_id)
+            continue
+        # The coordinator is gone. Kill the launcher group if it somehow
+        # survived, then sweep rank processes by their marker pids.
+        if _process_group_alive(launcher_pid):
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(launcher_pid, signal.SIGKILL)
+        failures = _sweep_rank_processes(
+            deployment_id,
+            manifest.get("hosts", []),
+            state_dir=state_dir,
+            plan_hash=manifest.get("plan_hash"),
+            kill_grace=kill_grace,
+            runner=runner,
+        )
+        if failures:
+            report["failures"].extend(
+                f"{deployment_id}: {failure}" for failure in failures
+            )
+            continue
+        report["reaped"].append(deployment_id)
+        with suppress(OSError):
+            path.unlink()
+    return report
+
+
 def _available_launch_ports(
     deployment: ClusterDeployment,
 ) -> tuple[int, int]:
@@ -166,6 +985,23 @@ def _available_launch_ports(
     raise DistributedLaunchError(
         f"could not reserve {collective_count} contiguous collective ports"
     )
+
+
+def _available_control_port(host: str) -> int:
+    """Reserve a rank-zero TCP control port on the verified cluster address."""
+
+    try:
+        address = str(ipaddress.ip_address(host))
+    except ValueError as exc:
+        raise DistributedLaunchError("rank-control host is not an IP address") from exc
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind((address, 0))
+        except OSError as exc:
+            raise DistributedLaunchError(
+                f"could not reserve rank-control port on {address}: {exc}"
+            ) from exc
+        return int(listener.getsockname()[1])
 
 
 def _package_version(name: str) -> str:
@@ -227,9 +1063,7 @@ def _python_minor(version: str) -> tuple[str, str] | None:
     return (parts[0], parts[1])
 
 
-def _interpreter_parity(
-    local: str, remote: Any
-) -> tuple[str | None, str | None]:
+def _interpreter_parity(local: str, remote: Any) -> tuple[str | None, str | None]:
     """Compare the interpreter two ranks will actually run under (#2695).
 
     Returns ``(blocking, warning)``, at most one of which is set.
@@ -284,8 +1118,7 @@ def _rank_python_module_argv(
         for rank, executable in enumerate(executables)
     )
     script = (
-        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; '
-        'exec "$omlx_python" "$@"'
+        f'case "${{MLX_RANK:-}}" in {cases} *) exit 64;; esac; exec "$omlx_python" "$@"'
     )
     return ["/bin/sh", "-c", script, "omlx-rank-python", "-m", module]
 
@@ -299,6 +1132,9 @@ def build_mlx_launch_argv(
     python_executable: str = sys.executable,
     cwd: Path | None = None,
     state_dir: str = "~/.omlx/cluster/runtime",
+    control_host: str | None = None,
+    control_port: int | None = None,
+    control_token: str | None = None,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
 
@@ -326,6 +1162,24 @@ def build_mlx_launch_argv(
             raise ValueError(f"{label} must be between 1 and 65535")
     if api_port == collective_port:
         raise ValueError("API and collective ports must be distinct")
+    control_values = (control_host, control_port, control_token)
+    if any(value is not None for value in control_values) and not all(
+        value is not None for value in control_values
+    ):
+        raise ValueError("rank-control host, port, and token must be provided together")
+    if control_host is not None:
+        try:
+            control_host = str(ipaddress.ip_address(control_host))
+        except ValueError as exc:
+            raise ValueError("rank-control host must be an IP address") from exc
+        if not 1 <= int(control_port) <= 65535:
+            raise ValueError("rank-control port must be between 1 and 65535")
+        try:
+            encoded_control_token = str(control_token).encode("ascii", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("rank-control token must be ASCII") from exc
+        if len(encoded_control_token) != 64:
+            raise ValueError("rank-control token must be 64 ASCII bytes")
     if cwd is not None and not cwd.is_absolute():
         raise ValueError("distributed working directory must be absolute")
 
@@ -398,6 +1252,21 @@ def build_mlx_launch_argv(
             deployment.execution.tuning_reason,
         ]
     )
+    if (
+        control_host is not None
+        and control_port is not None
+        and control_token is not None
+    ):
+        argv.extend(
+            [
+                "--control-host",
+                control_host,
+                "--control-port",
+                str(control_port),
+                "--control-token",
+                control_token,
+            ]
+        )
     if deployment.execution.prompt_cache_bytes is not None:
         argv.extend(
             [
@@ -690,7 +1559,10 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             f"CUDA fabric probe exited with code {completed.returncode}{suffix}"
         )
-    if len(completed.stdout.encode()) + len(completed.stderr.encode()) > _REMOTE_OUTPUT_LIMIT:
+    if (
+        len(completed.stdout.encode()) + len(completed.stderr.encode())
+        > _REMOTE_OUTPUT_LIMIT
+    ):
         raise DistributedLaunchError("CUDA fabric probe output exceeded the safe limit")
     records: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
@@ -705,7 +1577,9 @@ def run_cuda_fabric_probe(
         raise DistributedLaunchError(
             "CUDA fabric probe did not return one result from each worker"
         )
-    observed = min(float(record.get("payload_bytes_per_second") or 0) for record in records)
+    observed = min(
+        float(record.get("payload_bytes_per_second") or 0) for record in records
+    )
     verified = observed >= minimum_bytes_per_second
     identity = "\0".join(sorted(host.ssh for host in hosts)).encode()
     group_id = f"connectx-{hashlib.sha256(identity).hexdigest()[:16]}"
@@ -854,8 +1728,7 @@ def discover_remote_python_executable(
         # bare command name (``python3``) needs ``sys.executable`` to become an
         # absolute path.
         script = (
-            "import os,omlx; print(os.path.expanduser("
-            f"{candidate!r}))"
+            f"import os,omlx; print(os.path.expanduser({candidate!r}))"
             if candidate.startswith(("~", "/"))
             else "import sys,omlx; print(sys.executable)"
         )
@@ -1127,9 +2000,7 @@ def probe_remote_system_host(
         "ssh_reachable": True,
         "status": payload,
         "runtime_compatible": False,
-        "runtime_mismatches": [
-            _RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING
-        ],
+        "runtime_mismatches": [_RUNTIME_UNVERIFIED if evidence else _RUNTIME_MISSING],
         # Same keys as the healthy path, so a caller never has to know which
         # branch produced the result before reading it.
         "runtime_warnings": [],
@@ -1458,7 +2329,10 @@ def preflight_remote_hosts(
     script = _PREFLIGHT_SCRIPT
     local_python_version = platform.python_version()
     results: list[dict[str, Any]] = []
-    local_model_exists = Path(deployment.model).is_dir()
+    # Cluster v2: each rank validates against its own path_map entry; nodes
+    # without an entry share the coordinator path, as before v2.
+    local_model_path = deployment.model_path_for(deployment.hosts[0].node_id)
+    local_model_exists = Path(local_model_path).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
     if len(assignments) != len(deployment.hosts):
         raise DistributedLaunchError(
@@ -1466,7 +2340,7 @@ def preflight_remote_hosts(
         )
     local_validation = (
         validate_staged_model(
-            deployment.model,
+            local_model_path,
             assignments[0].start_layer,
             assignments[0].end_layer,
         )
@@ -1478,9 +2352,7 @@ def preflight_remote_hosts(
         from .memory_guard import ceiling_breakdown
 
         local_admission_ceiling = int(
-            ceiling_breakdown(
-                assignments[0].memory_guard_tier
-            ).get("hard_limit", 0)
+            ceiling_breakdown(assignments[0].memory_guard_tier).get("hard_limit", 0)
         )
     except Exception as exc:
         raise DistributedLaunchError(
@@ -1513,15 +2385,18 @@ def preflight_remote_hosts(
             )
             continue
         remote_python = host.python_executable or python_executable
-        # Send the ~-form: deployment.model is the coordinator's absolute path,
-        # which names nothing on a peer with a different macOS account. The
-        # preflight script expanduser()s it in the peer's own home.
+        # A path_map entry is already absolute on this peer. Without one, send
+        # the portable ~-form so peers with different macOS accounts resolve
+        # the model under their own home directory.
+        remote_model_path = deployment.path_map.get(
+            host.node_id, home_relative_model_path(deployment.model)
+        )
         remote_command = shlex.join(
             [
                 remote_python,
                 "-c",
                 script,
-                home_relative_model_path(deployment.model),
+                remote_model_path,
                 str(assignment.start_layer),
                 str(assignment.end_layer),
                 assignment.memory_guard_tier,
@@ -1573,9 +2448,12 @@ def preflight_remote_hosts(
         runtime_warnings = [warning] if warning is not None else []
         if versions.get("model-exists") is not True:
             mismatches.append(
-                f"model directory is missing on remote host: {deployment.model}"
+                f"model directory is missing on remote host: {remote_model_path}"
             )
-        if local_identity is not None and versions.get("model_identity") != local_identity:
+        if (
+            local_identity is not None
+            and versions.get("model_identity") != local_identity
+        ):
             mismatches.append(
                 "model identity differs from the coordinator "
                 "(config, tokenizer, processor, or weight index)"
@@ -1641,9 +2519,7 @@ def _validate_deployment_admission(
                 0.0,
                 min(
                     1.0,
-                    (
-                        assignment.capacity_bytes - assignment.reserve_bytes
-                    )
+                    (assignment.capacity_bytes - assignment.reserve_bytes)
                     / assignment.capacity_bytes,
                 ),
             )
@@ -1740,6 +2616,8 @@ class DistributedJobSupervisor:
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
         self.collective_port: int | None = None
+        self.control_port: int | None = None
+        self.control_token: str | None = None
         self.ready_event: dict[str, Any] | None = None
         self.rank_ready_events: dict[int, dict[str, Any]] = {}
         self.failure_event: dict[str, Any] | None = None
@@ -1757,12 +2635,27 @@ class DistributedJobSupervisor:
     def start(self) -> dict[str, Any]:
         if self.process is not None:
             raise RuntimeError("distributed job is already started")
+        # A previous coordinator may have died mid-job (G8); reap its
+        # leftover ranks before admitting a new launch against the memory
+        # ceiling. Best effort: reaping must never block a launch.
+        try:
+            orphan_report = reap_orphaned_launches(self.state_dir)
+            if orphan_report["reaped"] or orphan_report["failures"]:
+                logger.warning(
+                    "Reaped orphaned distributed launches: %s", orphan_report
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Orphaned-launch reaper failed: %s", exc)
         self._phase = "preflight"
         if self.preflight:
             preflight_remote_hosts(
                 self.deployment,
                 python_executable=self.python_executable,
             )
+        # A deployment ID and plan hash are stable across reloads. Remove the
+        # prior launch's gate before any rank can mistake it for this launch's
+        # release signal.
+        _set_serve_release(self.deployment, self.state_dir, None)
 
         self._temporary = tempfile.TemporaryDirectory(prefix="omlx-distributed-launch-")
         hostfile = Path(self._temporary.name) / "hostfile.json"
@@ -1776,6 +2669,12 @@ class DistributedJobSupervisor:
             encoding="utf-8",
         )
         self.port, self.collective_port = _available_launch_ports(self.deployment)
+        control_host = self.deployment.hosts[0].ips[0]
+        self.control_port = _available_control_port(control_host)
+        # The plan hash is public deployment identity, not authentication.
+        # Mint a fresh launch-scoped secret so an unauthenticated peer on the
+        # fabric cannot join rank control by reading the signed plan.
+        self.control_token = secrets.token_hex(32)
         argv = build_mlx_launch_argv(
             self.deployment,
             hostfile=hostfile,
@@ -1784,6 +2683,9 @@ class DistributedJobSupervisor:
             python_executable=self.python_executable,
             cwd=self.cwd,
             state_dir=self.state_dir,
+            control_host=control_host,
+            control_port=self.control_port,
+            control_token=self.control_token,
         )
         self._phase = "loading"
         try:
@@ -1803,14 +2705,35 @@ class DistributedJobSupervisor:
                 env=environment,
                 start_new_session=True,
             )
+            self._write_launch_manifest()
             self._start_readers()
             event = self._wait_for_ready()
+            _set_serve_release(
+                self.deployment,
+                self.state_dir,
+                {
+                    "schema_version": 1,
+                    "deployment_id": self.deployment.deployment_id,
+                    "plan_hash": self.deployment.plan_hash,
+                    "world_size": self.deployment.world_size,
+                    "released_at": time.time(),
+                },
+            )
             self._wait_for_listener()
             self._phase = "ready"
             self.ready_event = event
             return event
         except Exception:
-            self._terminate()
+            # A failed start still owns a spawned group; tear it down, but
+            # never mask the launch error with a teardown error.
+            try:
+                self._terminate()
+            except Exception:
+                logger.error(
+                    "Teardown after failed distributed start also failed; "
+                    "the launch manifest lets a later sweep reap the job",
+                    exc_info=True,
+                )
             raise
 
     def _start_readers(self) -> None:
@@ -1853,6 +2776,33 @@ class DistributedJobSupervisor:
                                 self.rank_ready_events[rank] = event
                         elif event.get("reason") or event.get("error"):
                             self.failure_event = event
+                # mlx.launch does not emit a structured event when a native
+                # JACCL watchdog terminates a rank.  Worse, its SSH cleanup
+                # thread can raise after that and leave the launcher itself
+                # exiting with code zero.  Promote the exact native terminal
+                # lines into the same failure surface used by peer_lost so a
+                # dead rank can never remain phase=ready.
+                no_progress = _JACCL_NO_PROGRESS_RE.search(line)
+                if no_progress is not None:
+                    self.failure_event = {
+                        "type": "collective_stall",
+                        "reason": "JACCL " + no_progress.group("reason").strip(),
+                    }
+                rank_exit = _LAUNCHER_RANK_EXIT_RE.search(line)
+                if rank_exit is not None and int(rank_exit.group("code")) != 0:
+                    reason = (
+                        f"rank {rank_exit.group('rank')} exited with code "
+                        f"{rank_exit.group('code')}"
+                    )
+                    prior = self._failure_reason()
+                    if prior and prior not in reason:
+                        reason += f" after {prior}"
+                    self.failure_event = {
+                        "type": "rank_exit",
+                        "rank": int(rank_exit.group("rank")),
+                        "returncode": int(rank_exit.group("code")),
+                        "reason": reason,
+                    }
                 self._condition.notify_all()
 
     def _wait_for_ready(self) -> dict[str, Any]:
@@ -1929,30 +2879,161 @@ class DistributedJobSupervisor:
     def stop(self) -> None:
         self._terminate()
 
+    def _write_launch_manifest(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        try:
+            _write_launch_manifest(
+                self.state_dir,
+                self.deployment,
+                launcher_pid=process.pid,
+                api_port=self.port,
+            )
+        except OSError as exc:
+            # The manifest is the crashed-coordinator recovery path; losing
+            # it must not fail an otherwise healthy launch.
+            logger.warning("Could not write the launch manifest: %s", exc)
+
+    def _remove_launch_manifest(self) -> None:
+        with suppress(OSError):
+            _launch_manifest_path(
+                self.state_dir,
+                self.deployment.deployment_id,
+            ).unlink(missing_ok=True)
+
+    def _sweep_rank_leftovers(
+        self,
+        *,
+        process_group: int | None = None,
+        kill_grace: float = 3.0,
+    ) -> list[str]:
+        """Kill rank processes that outlived the launcher group.
+
+        Returns failure descriptions; empty means nothing resident remains.
+        """
+
+        return _sweep_rank_processes(
+            self.deployment.deployment_id,
+            [
+                {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+                for rank, host in enumerate(self.deployment.hosts)
+            ],
+            state_dir=self.state_dir,
+            plan_hash=self.deployment.plan_hash,
+            process_group=process_group,
+            kill_grace=kill_grace,
+        )
+
     def _terminate(self) -> None:
+        """Tear the job down and *prove* the teardown worked.
+
+        ``stop()`` used to report success after a best-effort SIGKILL: the
+        ``_wait_for_process_group_exit`` result was ignored, so a rank that
+        survived (unkillable Metal/JACCL kernel wait, D-state, or a
+        ``PermissionError`` that ``_process_group_alive`` deliberately reads
+        as alive) kept its unified-memory allocation resident while the
+        engine pool had already released the model's memory budget (G1).
+
+        Teardown now verifies the final SIGKILL, retries once, then sweeps
+        leftover rank processes by their runtime-marker pids — including
+        remote ranks, which killpg can never reach (G2). If anything still
+        survives, ``DistributedTeardownError`` is raised and the process
+        reference is kept so a later ``stop()`` retries the kill instead of
+        dropping all state. The launch manifest is removed only after
+        verified exit, so a crashed coordinator leaves ``reap_orphaned_
+        launches`` enough evidence to finish the job (G8).
+        """
+
         process = self.process
         if process is not None:
             process_group = process.pid
             deadline = time.monotonic() + self.stop_timeout
+            group_signal_denied = False
             if _process_group_alive(process_group):
-                with suppress(ProcessLookupError):
+                try:
                     os.killpg(process_group, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as exc:
+                    # The launcher may already be reaped while macOS has
+                    # recycled its PGID for a foreign process. Never signal a
+                    # group we cannot prove we own. We can still complete a
+                    # safe teardown after waitpid confirms our launcher exited
+                    # and the deployment-marker sweep proves no rank survived.
+                    group_signal_denied = True
+                    logger.warning(
+                        "Could not signal former distributed process group %d "
+                        "(%s); verifying launcher exit and sweeping rank "
+                        "markers instead",
+                        process_group,
+                        exc,
+                    )
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
-                    process.wait(
-                        timeout=max(0.0, deadline - time.monotonic())
-                    )
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
 
             # mlx.launch can exit promptly while a local rank remains blocked
             # in a Metal/JACCL collective. Waiting only for the launcher left
             # that rank orphaned (PPID 1) and its unified-memory allocation
             # resident. Stop is complete only when the entire launch process
             # group has disappeared.
-            remaining = max(0.0, deadline - time.monotonic())
-            if not _wait_for_process_group_exit(process_group, remaining):
-                with suppress(ProcessLookupError):
-                    os.killpg(process_group, signal.SIGKILL)
-                _wait_for_process_group_exit(process_group, 2.0)
+            if group_signal_denied:
+                group_gone = process.poll() is not None
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                group_gone = _wait_for_process_group_exit(process_group, remaining)
+                for attempt in (1, 2):
+                    if group_gone:
+                        break
+                    logger.error(
+                        "Distributed process group %d survived SIGKILL "
+                        "(attempt %d/2); %s",
+                        process_group,
+                        attempt,
+                        "retrying" if attempt == 1 else "sweeping rank markers",
+                    )
+                    try:
+                        os.killpg(process_group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError as exc:
+                        logger.warning(
+                            "Could not SIGKILL distributed process group %d: %s",
+                            process_group,
+                            exc,
+                        )
+                        break
+                    group_gone = _wait_for_process_group_exit(process_group, 2.0)
+
+            # A rank that escaped the group (reparented before the kill)
+            # survives a verified group exit; sweep it by its marker pid.
+            leftovers = self._sweep_rank_leftovers(
+                process_group=None if group_signal_denied else process_group
+            )
+            if (
+                not group_signal_denied
+                and not group_gone
+                and not _process_group_alive(process_group)
+            ):
+                group_gone = True
+            if not group_gone or leftovers:
+                problems = []
+                if not group_gone:
+                    problems.append(
+                        (
+                            f"launcher {process.pid} did not exit after process-group "
+                            "permission denial"
+                        )
+                        if group_signal_denied
+                        else f"process group {process_group} survived SIGKILL twice"
+                    )
+                problems.extend(leftovers)
+                raise DistributedTeardownError(
+                    f"distributed teardown of "
+                    f"{self.deployment.deployment_id} could not be verified: "
+                    + "; ".join(problems)
+                )
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
@@ -1967,10 +3048,15 @@ class DistributedJobSupervisor:
         self.process = None
         self.port = None
         self.collective_port = None
+        self.control_port = None
+        self.control_token = None
         self.ready_event = None
         self.rank_ready_events.clear()
         self.failure_event = None
         self._phase = "stopped"
+        self._remove_launch_manifest()
+        with suppress(Exception):
+            _set_serve_release(self.deployment, self.state_dir, None)
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None
@@ -2104,9 +3190,7 @@ class DistributedJobSupervisor:
                     host.ssh,
                 )
             elif action in ("terminated", "killed"):
-                logger.info(
-                    "reaped remote rank %d on %s (%s)", rank, host.ssh, action
-                )
+                logger.info("reaped remote rank %d on %s (%s)", rank, host.ssh, action)
             elif action:
                 logger.debug(
                     "remote rank reap for rank %d on %s: %s",
@@ -2116,8 +3200,7 @@ class DistributedJobSupervisor:
                 )
             else:
                 logger.warning(
-                    "remote rank reap for rank %d on %s returned no report "
-                    "(exit %s)",
+                    "remote rank reap for rank %d on %s returned no report (exit %s)",
                     rank,
                     host.ssh,
                     completed.returncode,
@@ -2148,9 +3231,7 @@ class DistributedJobSupervisor:
         for rank, host in enumerate(self.deployment.hosts):
             filename = f"{self.deployment.deployment_id}-rank-{rank}.json"
             if host.ssh in _LOOPBACK_TARGETS:
-                marker = read_marker(
-                    Path(self.state_dir).expanduser() / filename
-                )
+                marker = read_marker(Path(self.state_dir).expanduser() / filename)
             else:
                 remote_root = self.state_dir.rstrip("/") or "."
                 marker, _, _, _ = read_remote_marker(
@@ -2163,7 +3244,8 @@ class DistributedJobSupervisor:
                 marker.get("deployment_id") != self.deployment.deployment_id
                 or marker.get("plan_hash") != self.deployment.plan_hash
                 or marker.get("rank") != rank
-                or marker.get("phase") not in {
+                or marker.get("phase")
+                not in {
                     "failed",
                     "peer_lost",
                     "launcher_lost",
@@ -2172,9 +3254,7 @@ class DistributedJobSupervisor:
                 continue
             error = marker.get("error")
             if isinstance(error, str) and error.strip():
-                failures.append(
-                    f"rank {rank} ({host.node_id}): {error.strip()}"
-                )
+                failures.append(f"rank {rank} ({host.node_id}): {error.strip()}")
         return "; ".join(failures)[:_LOG_LINE_LIMIT] or None
 
     def _failure_reason(self) -> str | None:
@@ -2193,12 +3273,27 @@ class DistributedJobSupervisor:
 
     def status(self) -> DistributedJobStatus:
         process = self.process
+        returncode = process.poll() if process is not None else None
+        phase = self._phase
+        failure_reason = self._failure_reason()
+        if phase != "stopped" and (failure_reason or returncode is not None):
+            phase = "failed"
+            if failure_reason is None:
+                failure_reason = self._runtime_failure_reason()
+            if failure_reason is None:
+                # A serving launcher ending is terminal even when mlx.launch
+                # accidentally reports success after a worker's cleanup thread
+                # failed.  Stop/unload clears ``process`` and phase afterwards;
+                # while it remains registered this is always unexpected.
+                failure_reason = (
+                    f"distributed launcher exited unexpectedly with code {returncode}"
+                )
         return DistributedJobStatus(
             deployment_id=self.deployment.deployment_id,
-            phase=self._phase,
+            phase=phase,
             endpoint=self.endpoint,
             pid=process.pid if process is not None else None,
-            returncode=process.poll() if process is not None else None,
+            returncode=returncode,
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
             stderr_tail=tuple(self._stderr)[-20:],

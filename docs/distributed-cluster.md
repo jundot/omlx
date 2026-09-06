@@ -75,6 +75,11 @@ KV cache stays on the rank that owns the corresponding layers. Centralizing KV
 on one Mac would add a network read/write to every layer and generated token,
 so it is not the default.
 
+Each inference rank and synthetic performance worker also holds a kernel-owned
+`flock` lease for the device. The lease releases automatically on crash or
+SIGKILL, so it prevents cross-process races without creating a stale-lock
+recovery problem.
+
 ## Requirements
 
 On every Mac:

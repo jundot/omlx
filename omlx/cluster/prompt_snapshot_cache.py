@@ -29,16 +29,19 @@ write that failed on one rank cannot desync the pipeline) is the caller's job
 and lives in the telemetry integration, which has the collective; this module
 stays pure and unit-testable.
 
-Snapshots are process-lifetime. The digest filenames cannot be re-indexed
-without their token tuples, and a file that is not in the index is invisible to
-hits yet still holds disk, so a new store starts by clearing its directory and
-the telemetry teardown removes it. A rank that restarts simply begins empty,
-which the boundary vote already handles.
+When persistence is enabled, a compact atomic manifest records the digest,
+boundary and byte size of every chain segment. The digest already commits to
+the model identity and exact prefix tokens, so the manifest does not duplicate
+the token arrays (which would grow quadratically at long context). Directories
+are scoped by plan hash and rank by the worker, preventing a changed tensor
+split from ever reading another shard layout. A missing or invalid manifest
+fails closed by clearing otherwise-unindexable files.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import struct
@@ -315,6 +318,7 @@ class _Entry:
     tokens: tuple[int, ...]
     filename: str
     nbytes: int
+    boundary: int
 
 
 def candidate_boundaries(prompt_len: int, step: int) -> tuple[int, ...]:
@@ -377,11 +381,13 @@ class SSDPromptSnapshotStore:
         step: int = 2048,
         max_entries: int = _MAX_ENTRIES_DEFAULT,
         max_bytes: int | None = None,
+        persistent: bool = False,
     ) -> None:
         self.directory = Path(directory)
         self.step = max(1, int(step))
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max_bytes
+        self.persistent = bool(persistent)
         self._lock = threading.RLock()
         # Access-ordered: most-recently-used at the end. The order is advanced
         # only by put/load, both driven by the identical request stream every
@@ -396,13 +402,10 @@ class SSDPromptSnapshotStore:
         self._serialisable = True
         _register_snapshot_classes()
         self.directory.mkdir(parents=True, exist_ok=True)
-        # Snapshots are process-lifetime (see the module docstring): whatever a
-        # dead process left behind is unreachable, so reclaim it up front and
-        # keep the directory exactly as large as the live index says it is.
-        for stale in self.directory.iterdir():
-            if stale.is_file():
-                with suppress(OSError):
-                    stale.unlink()
+        if self.persistent:
+            self._load_manifest_or_reset()
+        else:
+            self._clear_directory()
 
     def __len__(self) -> int:
         with self._lock:
@@ -415,6 +418,108 @@ class SSDPromptSnapshotStore:
 
     def _path(self, key: str) -> Path:
         return self.directory / f"{key}.safetensors"
+
+    @property
+    def _manifest_path(self) -> Path:
+        return self.directory / "index.json"
+
+    def _clear_directory(self) -> None:
+        self._index.clear()
+        self._nbytes = 0
+        for stale in self.directory.iterdir():
+            if stale.is_file():
+                with suppress(OSError):
+                    stale.unlink()
+
+    @staticmethod
+    def _valid_key(value: object) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(ch in "0123456789abcdef" for ch in value)
+        )
+
+    def _load_manifest_or_reset(self) -> None:
+        """Restore the durable LRU, or fail closed on any malformed state."""
+
+        manifest = self._manifest_path
+        if not manifest.is_file():
+            self._clear_directory()
+            self._persist_index_locked()
+            return
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            if payload.get("version") != 1 or int(payload.get("step")) != self.step:
+                raise ValueError("snapshot manifest contract changed")
+            rows = payload.get("entries")
+            if not isinstance(rows, list):
+                raise ValueError("snapshot manifest entries are invalid")
+            indexed_files = {manifest.name}
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("snapshot manifest entry is invalid")
+                key = row.get("key")
+                filename = row.get("filename")
+                boundary = int(row.get("boundary"))
+                nbytes = int(row.get("nbytes"))
+                if (
+                    not self._valid_key(key)
+                    or filename != f"{key}.safetensors"
+                    or boundary <= 0
+                    or boundary % self.step != 0
+                    or nbytes <= 0
+                ):
+                    raise ValueError("snapshot manifest entry is unsafe")
+                path = self.directory / filename
+                if key in self._index:
+                    raise ValueError("snapshot manifest contains a duplicate key")
+                if not path.is_file() or path.stat().st_size != nbytes:
+                    raise ValueError("snapshot manifest file is missing or changed")
+                self._index[key] = _Entry((), filename, nbytes, boundary)
+                self._nbytes += nbytes
+                indexed_files.add(filename)
+            for stale in self.directory.iterdir():
+                if stale.is_file() and stale.name not in indexed_files:
+                    with suppress(OSError):
+                        stale.unlink()
+            self._evict_locked()
+            self._persist_index_locked()
+        except Exception as error:
+            logger.warning("resetting invalid prompt snapshot manifest: %s", error)
+            self._clear_directory()
+            self._persist_index_locked()
+
+    def _persist_index_locked(self) -> None:
+        if not self.persistent:
+            return
+        payload = {
+            "version": 1,
+            "step": self.step,
+            "entries": [
+                {
+                    "key": key,
+                    "filename": entry.filename,
+                    "nbytes": entry.nbytes,
+                    "boundary": entry.boundary,
+                }
+                for key, entry in self._index.items()
+            ],
+        }
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".index.", suffix=".json", dir=self.directory
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._manifest_path)
+        except OSError as error:
+            with suppress(OSError):
+                os.close(descriptor)
+            with suppress(OSError):
+                os.unlink(temporary)
+            logger.warning("could not persist prompt snapshot manifest: %s", error)
 
     def _chain_keys(self, model: Any, tokens: tuple[int, ...]) -> list[str]:
         """Digest per chain boundary, shortest first, sharing one hash walk."""
@@ -450,8 +555,12 @@ class SSDPromptSnapshotStore:
         key = self._chain_keys(model, token_tuple)[-1]
         with self._lock:
             entry = self._index.get(key)
-            if entry is not None and entry.tokens == token_tuple:
+            if entry is not None and (
+                entry.tokens == token_tuple
+                or (not entry.tokens and entry.boundary == boundary)
+            ):
                 self._index.move_to_end(key)
+                self._persist_index_locked()
                 return True
         wrapped = _wrap_for_save(
             cache, boundary=boundary, segment_start=boundary - self.step
@@ -491,10 +600,11 @@ class SSDPromptSnapshotStore:
             previous = self._index.pop(key, None)
             if previous is not None:
                 self._nbytes -= previous.nbytes
-            self._index[key] = _Entry(token_tuple, target.name, size)
+            self._index[key] = _Entry(token_tuple, target.name, size, boundary)
             self._nbytes += size
             self._index.move_to_end(key)
             self._evict_locked()
+            self._persist_index_locked()
         return True
 
     def present_boundaries(self, model: Any, tokens: list[int]) -> tuple[int, ...]:
@@ -512,7 +622,10 @@ class SSDPromptSnapshotStore:
                 entry = self._index.get(key)
                 if (
                     entry is None
-                    or entry.tokens != token_tuple[:boundary]
+                    or (
+                        entry.tokens != token_tuple[:boundary]
+                        and not (not entry.tokens and entry.boundary == boundary)
+                    )
                     or not self._path(key).is_file()
                 ):
                     break
@@ -532,11 +645,16 @@ class SSDPromptSnapshotStore:
             for position, key in enumerate(chain):
                 entry = self._index.get(key)
                 prefix = token_tuple[: (position + 1) * self.step]
-                if entry is None or entry.tokens != prefix:
+                expected_boundary = (position + 1) * self.step
+                if entry is None or (
+                    entry.tokens != prefix
+                    and not (not entry.tokens and entry.boundary == expected_boundary)
+                ):
                     return None
                 if not self._path(key).is_file():
                     self._index.pop(key, None)
                     self._nbytes -= entry.nbytes
+                    self._persist_index_locked()
                     return None
         try:
             files = [load_prompt_cache(str(self._path(key))) for key in chain]
@@ -549,6 +667,7 @@ class SSDPromptSnapshotStore:
             for key in chain:
                 if key in self._index:
                     self._index.move_to_end(key)
+            self._persist_index_locked()
         return assembled
 
     def _evict_locked(self) -> None:

@@ -3,7 +3,11 @@
 
 import contextlib
 import json
+import os
+import signal
+import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,12 +22,56 @@ from omlx.cluster.inference_worker import (
     _server_arguments,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
+    _wait_for_serve_release,
     _watch_launcher_parent,
+    _write_cancel_request,
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    plan_hash = "a" * 64
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": plan_hash,
+                "world_size": 2,
+            }
+        )
+    )
+
+    _wait_for_serve_release(tmp_path, deployment_id, plan_hash, 2, timeout=0)
+
+
+def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": "old",
+                "world_size": 2,
+            }
+        )
+    )
+
+    with pytest.raises(TimeoutError, match="did not release"):
+        _wait_for_serve_release(
+            tmp_path,
+            deployment_id,
+            "new",
+            2,
+            timeout=0,
+        )
 
 
 def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers(
@@ -199,6 +247,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
     updates: list[tuple[str, dict]] = []
     events: list[dict] = []
     exit_codes: list[int] = []
+    releases: list[str] = []
     marker = SimpleNamespace(
         update=lambda phase, **extra: updates.append((phase, extra))
     )
@@ -210,6 +259,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         wait=lambda _seconds: None,
         exit_process=exit_codes.append,
         emit_event=events.append,
+        release_memory=releases.append,
     )
 
     assert updates == [
@@ -224,6 +274,9 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         )
     ]
     assert events[0]["type"] == "launcher_lost"
+    # The Metal release runs before the exit: os._exit skips every
+    # finally/atexit handler, so a skipped release orphans wired memory.
+    assert len(releases) == 1
     assert exit_codes == [1]
 
 
@@ -595,7 +648,12 @@ def _run_rank(
     )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(
-        inference_worker, "_start_launcher_watchdog", lambda _m, _pid: None
+        inference_worker,
+        "_wait_for_serve_release",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        inference_worker, "_start_launcher_watchdog", lambda _m, _pid, **_kw: None
     )
 
     def fake_wired(desired):
@@ -636,6 +694,13 @@ def _run_rank(
         inference_worker,
         "decode_worker_contract",
         lambda _plan: ("a" * 64, assignments, (), 1),
+    )
+    # The fake plan above is not a real encoded contract, so the path_map
+    # decoder it feeds must be faked alongside it (empty = legacy behavior).
+    monkeypatch.setattr(
+        inference_worker,
+        "decode_worker_path_map",
+        lambda _plan: {},
     )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
@@ -1110,6 +1175,263 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
+
+
+def test_launcher_watchdog_fires_on_a_stale_launcher_lease(tmp_path):
+    updates: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    exit_codes: list[int] = []
+    aborts: list[str] = []
+    releases: list[str] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    stale = time.time() - 120.0
+    os.utime(lease, (stale, stale))
+
+    _watch_launcher_parent(
+        42,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=lambda _seconds: None,
+        exit_process=exit_codes.append,
+        emit_event=events.append,
+        on_abort=aborts.append,
+        release_memory=releases.append,
+    )
+
+    assert updates[0][0] == "launcher_lost"
+    assert "stale" in updates[0][1]["error"]
+    # The abort stage ran before the exit stage.
+    assert len(aborts) == 1
+    assert events[0]["type"] == "launcher_lost"
+    assert len(releases) == 1
+    assert exit_codes == [1]
+
+
+def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+
+    polls = [0]
+
+    class StopLoopError(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoopError
+
+    with pytest.raises(StopLoopError):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=lease,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    missing = tmp_path / "not-yet-created-lease.json"
+
+    polls = [0]
+
+    class StopLoopError(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoopError
+
+    with pytest.raises(StopLoopError):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=missing,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
+    _write_cancel_request(
+        str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64
+    )
+
+    payload = json.loads((tmp_path / "dep-9-cancel.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["deployment_id"] == "dep-9"
+    assert payload["plan_hash"] == "e" * 64
+    assert payload["scope"] == "all"
+    assert isinstance(payload["epoch"], int) and payload["epoch"] > 0
+    assert payload["reason"] == "peer watchdog test"
+
+
+def _fake_mlx_core(calls: list[str], *, with_metal: bool = True) -> SimpleNamespace:
+    metal = (
+        SimpleNamespace(clear_cache=lambda: calls.append("metal.clear_cache"))
+        if with_metal
+        else None
+    )
+    fake = SimpleNamespace(
+        set_wired_limit=lambda limit: calls.append(f"set_wired_limit({limit})"),
+        clear_cache=lambda: calls.append("clear_cache"),
+    )
+    if with_metal:
+        fake.metal = metal
+    return fake
+
+
+def _install_fake_mlx_core(monkeypatch, fake_core: SimpleNamespace) -> None:
+    """Make ``import mlx.core as mx`` bind to the fake without real Metal.
+
+    ``import a.b as x`` resolves ``b`` as an attribute of package ``a``, so
+    the fake package must expose ``core`` — a bare sys.modules entry is not
+    enough.
+    """
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=fake_core))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+
+
+def test_release_metal_memory_unwires_before_clearing(monkeypatch):
+    calls: list[str] = []
+    _install_fake_mlx_core(monkeypatch, _fake_mlx_core(calls))
+
+    inference_worker._release_metal_memory("test")
+
+    # Unwiring is the load-bearing call — the cache flush alone leaves the
+    # wired model weights stranded when os._exit skips every cleanup handler.
+    assert calls == [
+        "set_wired_limit(0)",
+        "clear_cache",
+        "metal.clear_cache",
+    ]
+
+
+def test_release_metal_memory_tolerates_a_missing_metal_module(monkeypatch):
+    calls: list[str] = []
+    _install_fake_mlx_core(monkeypatch, _fake_mlx_core(calls, with_metal=False))
+
+    inference_worker._release_metal_memory("test")
+
+    assert calls == ["set_wired_limit(0)", "clear_cache"]
+
+
+def test_release_metal_memory_survives_failures(monkeypatch):
+    def fail(*_args):
+        raise RuntimeError("wedged")
+
+    fake = SimpleNamespace(
+        set_wired_limit=fail,
+        clear_cache=fail,
+        metal=SimpleNamespace(clear_cache=fail),
+    )
+    _install_fake_mlx_core(monkeypatch, fake)
+
+    # Must not raise: the force-exit behind this hook has to happen regardless.
+    inference_worker._release_metal_memory("test")
+
+
+def test_release_metal_memory_without_mlx_is_a_noop(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+
+    inference_worker._release_metal_memory("test")
+
+
+def test_sigterm_handler_releases_metal_before_interrupt(monkeypatch):
+    releases: list[str] = []
+    monkeypatch.setattr(inference_worker, "_release_metal_memory", releases.append)
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_alrm = signal.getsignal(signal.SIGALRM)
+    try:
+        inference_worker._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGTERM)
+        with pytest.raises(KeyboardInterrupt):
+            handler(signal.SIGTERM, None)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGALRM, previous_alrm)
+
+    # The rank releases its own wired memory on SIGTERM, while it still can —
+    # the coordinator's SIGKILL escalation behind it cannot unwire anything.
+    assert len(releases) == 1
+    assert "SIGTERM" in releases[0]
+
+
+def test_peer_watchdog_on_lost_releases_metal_before_exit(monkeypatch, tmp_path):
+    captured: dict[str, Any] = {}
+
+    class FakePeerWatchdog:
+        def __init__(self, _hosts, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(inference_worker, "PeerWatchdog", FakePeerWatchdog)
+    monkeypatch.setattr(inference_worker, "_emit_event", lambda _event: None)
+    order: list[str] = []
+    monkeypatch.setattr(
+        inference_worker,
+        "_release_metal_memory",
+        lambda _reason: order.append("release"),
+    )
+    monkeypatch.setattr(os, "_exit", lambda code: order.append(f"exit:{code}"))
+    assignments = [
+        PipelineAssignment(
+            node_id=node,
+            rank=rank,
+            start_layer=0,
+            end_layer=1,
+            layer_weight_bytes=10,
+            fixed_weight_bytes=10,
+            reserve_bytes=10,
+            capacity_bytes=100,
+        )
+        for rank, node in enumerate(("local", "studio"))
+    ]
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: None,
+        payload={"deployment_id": "dep-9", "plan_hash": "e" * 64},
+    )
+
+    watchdog = inference_worker._start_peer_watchdog(
+        marker,
+        assignments,
+        ["127.0.0.1", "user@studio.local"],
+        "dep-9",
+        str(tmp_path),
+        rank=0,
+    )
+
+    assert isinstance(watchdog, FakePeerWatchdog)
+    captured["on_lost"]("peer vanished")
+    assert order == ["release", "exit:1"]
 
 
 class _ThinkTokenizer:

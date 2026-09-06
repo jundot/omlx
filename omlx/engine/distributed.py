@@ -8,6 +8,8 @@ import json
 import logging
 import math
 import os
+import shlex
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -17,19 +19,41 @@ from typing import Any
 import httpx
 
 from ..cluster.deployment import ClusterDeployment
-from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
-from ..cluster.liveness import check_peers, describe_failure
+from ..cluster.launch import (
+    DistributedJobSupervisor,
+    DistributedLaunchError,
+    _run_cluster_ssh,
+)
+from ..cluster.liveness import check_peers, describe_failure, read_marker
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+_request_clock = time.monotonic
 
 # How long one per-rank marker health read stays authoritative. Every request
 # preflights the cluster, so this bounds both the added latency (one SSH read
 # per peer, paid once per window) and how long a half-dead cluster can keep
 # answering 200s before requests start failing cleanly (#2708).
 _PEER_HEALTH_TTL = 10.0
+_MAX_TARGETED_CANCEL_REQUESTS = 256
+_MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+
+
+def _valid_transport_request_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > _MAX_TRANSPORT_REQUEST_ID_BYTES:
+        return False
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+    )
+    return all(character in allowed for character in value)
 
 
 def _reasoning_effort_retry_payloads(
@@ -81,13 +105,9 @@ def _reasoning_effort_retry_payloads(
     if candidate is not None and candidate != normalized:
         variants.append(_variant(candidate))
     logger.info(
-        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
-        "without it",
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then without it",
         value,
-        [
-            var["chat_template_kwargs"]["reasoning_effort"]
-            for var in variants
-        ],
+        [var["chat_template_kwargs"]["reasoning_effort"] for var in variants],
     )
 
     dropped_kwargs = {
@@ -108,8 +128,36 @@ class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
 
+class DistributedRequestAborted(DistributedInferenceError):  # noqa: N818
+    """Raised into a proxied request the coordinator has aborted."""
+
+
+class _DistributedRequestState:
+    """Coordinator-side tracking for one proxied request.
+
+    The local engine path has per-request abort and an orphan-collector
+    reaper through AsyncEngineCore; the distributed path had neither (G3/G4).
+    This record is the handle ``abort_request`` acts on and the evidence the
+    orphan reaper sweeps: ``finished_at`` stamps the moment the *backend*
+    finished, so a consumer that abandoned the generator instead of closing
+    it can be reaped after a grace period — pop-only, mirroring
+    ``AsyncEngineCore._reap_orphaned_collectors``.
+    """
+
+    __slots__ = ("request_id", "started_at", "finished_at", "response", "aborted")
+
+    def __init__(self, request_id: str, started_at: float) -> None:
+        self.request_id = request_id
+        self.started_at = started_at
+        self.finished_at: float | None = None
+        self.response: Any | None = None
+        self.aborted = False
+
+
 class DistributedBatchedEngine(BatchedEngine):
     """Keep oMLX's API/tokenizer layer while proxying model work to MLX ranks."""
+
+    supports_request_scoped_abort = True
 
     # The coordinator does not own a local Scheduler: each rank process
     # creates and enforces its own prefill guard from the signed deployment.
@@ -128,6 +176,8 @@ class DistributedBatchedEngine(BatchedEngine):
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
         request_read_timeout: float | None = None,
+        abort_drain_timeout: float = 15.0,
+        orphan_reap_grace: float = 5.0,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -143,6 +193,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "distributed request read timeout must be a finite positive "
                 f"number, got {request_read_timeout!r}"
             )
+        if abort_drain_timeout < 0 or orphan_reap_grace < 0:
+            raise ValueError("distributed abort timeouts must be non-negative")
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -168,6 +220,35 @@ class DistributedBatchedEngine(BatchedEngine):
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
         self._peer_health_lock = asyncio.Lock()
+        self._abort_drain_timeout = float(abort_drain_timeout)
+        self._orphan_reap_grace = float(orphan_reap_grace)
+        self._request_states: dict[str, _DistributedRequestState] = {}
+        self._next_request_seq = 0
+        self._last_cancel_epoch = 0
+        self._runtime_failed_reason: str | None = None
+
+    @property
+    def runtime_failed_reason(self) -> str | None:
+        """Terminal worker failure observed by the coordinator, if any."""
+
+        if self._runtime_failed_reason is None and self._loaded:
+            status = self._supervisor.status()
+            reason = status.failure_reason
+            if reason is None and status.returncode is not None:
+                reason = f"distributed job exited with code {status.returncode}"
+            if reason:
+                self._mark_runtime_failed(reason)
+        return self._runtime_failed_reason
+
+    def _mark_runtime_failed(self, reason: str) -> None:
+        reason = str(reason).strip()[:2000] or "distributed worker stopped"
+        if self._runtime_failed_reason is None:
+            self._runtime_failed_reason = reason
+            logger.error(
+                "Distributed runtime is no longer serviceable (%s): %s",
+                self.deployment.deployment_id,
+                reason,
+            )
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -203,10 +284,137 @@ class DistributedBatchedEngine(BatchedEngine):
 
         return self._supervisor.status().to_dict()
 
+    async def clear_prompt_caches(
+        self,
+        *,
+        ssd: bool = False,
+        hot: bool = False,
+    ) -> dict[str, Any]:
+        """Quiescence-gated cache clear executed on every inference rank."""
+
+        if not ssd and not hot:
+            return {"status": "ok", "ranks": [], "ssd_deleted": 0, "hot_cleared": 0}
+        if not self._loaded or self._client is None or self._supervisor.port is None:
+            raise DistributedInferenceError("distributed engine is not loaded")
+        async with self._active_lock:
+            if self._active_requests:
+                raise DistributedInferenceError(
+                    "distributed cache clear refused while requests are active"
+                )
+        mode = "all" if ssd and hot else "ssd" if ssd else "hot"
+        path = f"/omlx/internal/cache/{mode}/clear"
+        headers = {"X-oMLX-Plan-Hash": self.deployment.plan_hash}
+        maintenance_epoch = time.time_ns()
+
+        async def clear_rank_zero() -> dict[str, Any]:
+            response = await self._client.post(path, headers=headers)
+            if response.status_code >= 400:
+                raise DistributedInferenceError(
+                    "rank 0 cache clear failed: "
+                    f"HTTP {response.status_code} {response.text[:300]}"
+                )
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                raise DistributedInferenceError(
+                    "rank 0 returned invalid cache-clear JSON"
+                )
+            return payload
+
+        def clear_remote(rank: int, ssh_target: str) -> dict[str, Any]:
+            state_root = str(self._supervisor.state_dir).rstrip("/") or "."
+            request_path = (
+                f"{state_root}/{self.deployment.deployment_id}-cache-clear.json"
+            )
+            ack_path = (
+                f"{state_root}/{self.deployment.deployment_id}"
+                f"-cache-clear-rank-{rank}.json"
+            )
+            request_payload = json.dumps(
+                {
+                    "epoch": maintenance_epoch,
+                    "deployment_id": self.deployment.deployment_id,
+                    "plan_hash": self.deployment.plan_hash,
+                    "ssd": bool(ssd),
+                    "hot": bool(hot),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            script = r"""
+import json, os, sys, time
+from pathlib import Path
+request_path = Path(sys.argv[1]).expanduser()
+ack_path = Path(sys.argv[2]).expanduser()
+payload = json.loads(sys.argv[3])
+request_path.parent.mkdir(parents=True, exist_ok=True)
+temporary = request_path.with_name(request_path.name + '.tmp')
+descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+    json.dump(payload, stream, separators=(',', ':'), sort_keys=True)
+os.replace(temporary, request_path)
+deadline = time.monotonic() + 40.0
+while time.monotonic() < deadline:
+    try:
+        if ack_path.is_file() and ack_path.stat().st_size <= 65536:
+            ack = json.loads(ack_path.read_text(encoding='utf-8'))
+            if int(ack.get('epoch', 0)) == int(payload['epoch']):
+                print(json.dumps(ack, separators=(',', ':'), sort_keys=True))
+                raise SystemExit(0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    time.sleep(0.1)
+print('rank cache-clear acknowledgement timed out', file=sys.stderr)
+raise SystemExit(2)
+""".strip()
+            command = shlex.join(
+                [
+                    "python3",
+                    "-c",
+                    script,
+                    request_path,
+                    ack_path,
+                    request_payload,
+                ]
+            )
+            completed = _run_cluster_ssh(
+                ssh_target,
+                command,
+                timeout=45.0,
+                runner=subprocess.run,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise DistributedInferenceError(
+                    f"rank {rank} cache clear failed over SSH: {detail[:300]}"
+                )
+            try:
+                payload = json.loads(completed.stdout)
+            except json.JSONDecodeError as exc:
+                raise DistributedInferenceError(
+                    f"rank {rank} returned invalid cache-clear JSON"
+                ) from exc
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                raise DistributedInferenceError(
+                    f"rank {rank} returned an invalid cache-clear result"
+                )
+            return payload
+
+        tasks = [clear_rank_zero()]
+        for rank, host in enumerate(self.deployment.hosts[1:], start=1):
+            tasks.append(asyncio.to_thread(clear_remote, rank, host.ssh))
+        reports = await asyncio.gather(*tasks)
+        return {
+            "status": "ok",
+            "ranks": reports,
+            "ssd_deleted": sum(int(item.get("ssd_deleted", 0)) for item in reports),
+            "hot_cleared": sum(int(item.get("hot_cleared", 0)) for item in reports),
+        }
+
     async def start(self) -> None:
         if self._loaded:
             return
         self._validate_model_settings()
+        self._runtime_failed_reason = None
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
         # are loaded here.
@@ -303,8 +511,16 @@ class DistributedBatchedEngine(BatchedEngine):
             if tail and tail not in detail:
                 detail = f"{detail} · Worker log: {tail}" if detail else tail
             suffix = f": {detail}" if detail else ""
+            self._mark_runtime_failed(
+                detail or f"distributed job exited with code {status.returncode}"
+            )
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
+            )
+        if status.failure_reason:
+            self._mark_runtime_failed(status.failure_reason)
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
             )
         return client
 
@@ -599,13 +815,269 @@ class DistributedBatchedEngine(BatchedEngine):
             return f"<think>{reasoning_text}</think>{content_text}"
         return content_text
 
-    async def _enter_request(self) -> None:
+    async def _enter_request(self, request_id: str | None = None) -> str:
         async with self._active_lock:
             self._active_requests += 1
+            self._next_request_seq += 1
+            if (
+                not _valid_transport_request_id(request_id)
+                or request_id in self._request_states
+            ):
+                request_id = f"{self.deployment.deployment_id}-{self._next_request_seq}"
+            self._request_states[request_id] = _DistributedRequestState(
+                request_id,
+                _request_clock(),
+            )
+            return request_id
 
-    async def _leave_request(self) -> None:
+    @staticmethod
+    def _backend_request_headers(request_id: str) -> dict[str, str]:
+        return {"X-oMLX-Request-ID": request_id}
+
+    async def _leave_request(self, request_id: str | None = None) -> None:
         async with self._active_lock:
             self._active_requests = max(0, self._active_requests - 1)
+            if request_id is not None:
+                self._request_states.pop(request_id, None)
+
+    def _request_state(self, request_id: str) -> _DistributedRequestState | None:
+        return self._request_states.get(request_id)
+
+    def _raise_if_aborted(self, request_id: str) -> None:
+        state = self._request_states.get(request_id)
+        if state is not None and state.aborted:
+            raise DistributedRequestAborted(
+                f"distributed request {request_id} aborted by the coordinator"
+            )
+
+    def _mark_backend_finished(self, request_id: str) -> None:
+        """Stamp backend completion so the orphan reaper can sweep strays."""
+
+        state = self._request_states.get(request_id)
+        if state is not None and state.finished_at is None:
+            state.finished_at = _request_clock()
+
+    def reap_orphaned_generators(
+        self,
+        *,
+        now: float | None = None,
+        grace: float | None = None,
+    ) -> int:
+        """Drop requests whose backend finished but whose consumer vanished.
+
+        Parallel to ``AsyncEngineCore._reap_orphaned_collectors``: when the
+        SSE generator chain is abandoned rather than closed, the ``finally``
+        that calls ``_leave_request`` only runs at GC time, so
+        ``_active_requests`` leaks and quiescence-gated unload blocks (G4) —
+        or worse, unblocks spuriously. Pop-only: any request whose backend
+        finished more than ``grace`` ago but is still tracked is reaped. A
+        live consumer drains in the same event-loop turn the backend
+        finishes, so the grace period cannot race it.
+        """
+
+        if not self._request_states:
+            return 0
+        current = _request_clock() if now is None else now
+        limit = self._orphan_reap_grace if grace is None else grace
+        stale = [
+            request_id
+            for request_id, state in self._request_states.items()
+            if state.finished_at is not None and current - state.finished_at >= limit
+        ]
+        for request_id in stale:
+            self._request_states.pop(request_id, None)
+            self._active_requests = max(0, self._active_requests - 1)
+        if stale:
+            logger.warning(
+                "Reaped %d orphaned distributed request(s) after consumer "
+                "abandonment: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
+
+    def rank_side_active_requests(self) -> int | None:
+        """Active requests as rank zero's telemetry reports them, if known.
+
+        The coordinator's own counter only proves the httpx side closed;
+        the rank-0 marker's ``metrics.active_requests`` is the rank-side
+        quiescence evidence an abort or unload should wait for (G5).
+        """
+
+        marker = read_marker(
+            Path(self._supervisor.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-rank-0.json"
+        )
+        if not isinstance(marker, dict):
+            return None
+        metrics = marker.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        active = metrics.get("active_requests")
+        if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
+            return active
+        return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one proxied request and close only its backend connection.
+
+        The abort flag ends the local generator at the next yield boundary;
+        closing the request's own connection makes the rank-0 handler reach
+        its ``finally`` and cancel the generation context through MLX-LM's
+        batch-loop removal — a step boundary every rank reaches, never a
+        mid-collective sever. Other in-flight requests keep their
+        connections (the old whole-client close in abort_all_requests is
+        retained there only as the nuclear option).
+        """
+
+        state = self._request_states.get(request_id)
+        if state is None:
+            return False
+        state.aborted = True
+        self._write_rank_cancel_request(
+            reason=reason or error_code,
+            request_id=request_id,
+        )
+        response = state.response
+        if response is not None:
+            with suppress(Exception):
+                await response.aclose()
+        logger.info(
+            "Aborted distributed request %s (%s)",
+            request_id,
+            reason or error_code or "no reason given",
+        )
+        return True
+
+    def _write_rank_cancel_request(
+        self,
+        *,
+        reason: str | None,
+        request_id: str | None = None,
+    ) -> Path | None:
+        """Ask rank zero to cancel request(s) at a shared step boundary.
+
+        The rank's telemetry heartbeat consumes this file and cancels through
+        ``BatchGenerator.remove`` — MLX-LM's own cancel path, which the batch
+        loop applies at a step boundary and shares with peer ranks. This is
+        the backstop for a handler wedged in a collective that never reaches
+        its disconnect ``finally`` (G3).
+        """
+
+        root = Path(self._supervisor.state_dir).expanduser()
+        path = root / f"{self.deployment.deployment_id}-cancel.json"
+        if request_id is not None and not _valid_transport_request_id(request_id):
+            logger.warning("Refusing malformed targeted cancel id")
+            return None
+
+        pending_request_ids: set[str] = set()
+        scope = "all" if request_id is None else "requests"
+        if request_id is not None:
+            pending_request_ids.add(request_id)
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing = None
+        ack_path = path.with_name(path.stem + "-ack.json")
+        try:
+            ack = json.loads(ack_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            ack = None
+        ack_epoch = (
+            int(ack.get("epoch", -1))
+            if isinstance(ack, dict)
+            and ack.get("deployment_id") == self.deployment.deployment_id
+            and ack.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(ack.get("epoch"), int)
+            and not isinstance(ack.get("epoch"), bool)
+            else -1
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("deployment_id") == self.deployment.deployment_id
+            and existing.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(existing.get("epoch"), int)
+            and not isinstance(existing.get("epoch"), bool)
+            # Only merge a marker written by this engine lifetime. A stale
+            # pre-restart `scope=all` file is a startup watermark, not pending
+            # work, and must never widen a new targeted disconnect.
+            and int(existing["epoch"]) == self._last_cancel_epoch
+            and int(existing["epoch"]) > ack_epoch
+        ):
+            if existing.get("scope") == "all":
+                scope = "all"
+            elif scope != "all":
+                candidates = existing.get("request_ids")
+                if existing.get("scope") == "request":
+                    candidates = [existing.get("request_id")]
+                if isinstance(candidates, list):
+                    pending_request_ids.update(
+                        candidate
+                        for candidate in candidates
+                        if _valid_transport_request_id(candidate)
+                    )
+
+        self._last_cancel_epoch = max(
+            int(time.time() * 1000),
+            self._last_cancel_epoch + 1,
+        )
+        payload = {
+            "schema_version": 1,
+            "deployment_id": self.deployment.deployment_id,
+            "plan_hash": self.deployment.plan_hash,
+            "epoch": self._last_cancel_epoch,
+            "scope": scope,
+            "reason": reason or "coordinator abort_all_requests",
+        }
+        if scope == "requests":
+            newest = [request_id] if request_id in pending_request_ids else []
+            older = sorted(pending_request_ids.difference(newest))
+            payload["request_ids"] = (newest + older)[:_MAX_TARGETED_CANCEL_REQUESTS]
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True)
+            os.replace(temporary, path)
+        except OSError as exc:
+            logger.warning("Could not write the rank cancel request: %s", exc)
+            return None
+        return path
+
+    async def _wait_for_backend_drain(self, *, timeout: float) -> bool:
+        """Wait for local generators AND rank-side telemetry to reach zero.
+
+        Client close alone never proved the ranks stopped generating (G5).
+        Drain is confirmed only when the coordinator counter is zero and the
+        rank-0 marker reports no active requests.
+        """
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            self.reap_orphaned_generators()
+            local_active = self._active_requests
+            rank_active = self.rank_side_active_requests()
+            if local_active == 0 and rank_active == 0:
+                return True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Distributed backend drain unconfirmed after %.1fs "
+                    "(local active=%d, rank-zero active=%s)",
+                    timeout,
+                    local_active,
+                    "unknown" if rank_active is None else rank_active,
+                )
+                return False
+            await asyncio.sleep(0.1)
 
     async def chat(
         self,
@@ -640,6 +1112,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -654,23 +1127,31 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/chat/completions", json=payload)
+            response = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/chat/completions", json=retry_payload
+                        "/v1/chat/completions",
+                        json=retry_payload,
+                        headers=headers,
                     )
                     if response.status_code < 400:
                         break
             self._raise_for_backend(response)
+            self._raise_if_aborted(request_id)
             body = response.json()
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -680,7 +1161,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend returned invalid chat JSON"
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         try:
             choice = body["choices"][0]
@@ -745,6 +1227,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -769,7 +1252,8 @@ class DistributedBatchedEngine(BatchedEngine):
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
 
-        await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # A client that always sends an unsupported reasoning_effort must
             # never turn this into an unbounded retry loop: `attempts` is
@@ -780,8 +1264,14 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/chat/completions", json=attempt_payload
+                    "POST",
+                    "/v1/chat/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
+                    state = self._request_state(request_id)
+                    if state is not None:
+                        state.response = response
                     if response.status_code >= 400:
                         await response.aread()
                         if attempt_index == 0:
@@ -796,6 +1286,7 @@ class DistributedBatchedEngine(BatchedEngine):
                             continue
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
+                        self._raise_if_aborted(request_id)
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
@@ -874,9 +1365,9 @@ class DistributedBatchedEngine(BatchedEngine):
                                 if isinstance(function.get("name"), str):
                                     target["function"]["name"] += function["name"]
                                 if isinstance(function.get("arguments"), str):
-                                    target["function"]["arguments"] += (
-                                        function["arguments"]
-                                    )
+                                    target["function"]["arguments"] += function[
+                                        "arguments"
+                                    ]
 
                         new_text = ""
                         reasoning = delta.get("reasoning") or delta.get(
@@ -924,14 +1415,17 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend emitted invalid chat token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         pending_final_text = ""
         if reasoning_open:
@@ -979,6 +1473,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -992,23 +1487,31 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/completions", json=payload)
+            response = await client.post(
+                "/v1/completions", json=payload, headers=headers
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/completions", json=retry_payload
+                        "/v1/completions",
+                        json=retry_payload,
+                        headers=headers,
                     )
                     if response.status_code < 400:
                         break
             self._raise_for_backend(response)
+            self._raise_if_aborted(request_id)
             body = response.json()
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -1018,7 +1521,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend returned invalid completion JSON"
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         try:
             choice = body["choices"][0]
@@ -1056,6 +1560,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1078,7 +1583,8 @@ class DistributedBatchedEngine(BatchedEngine):
         first_token_at: float | None = None
         request_started_at = time.monotonic()
 
-        await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # See stream_chat for the retry-bound rationale.
             attempts = [payload]
@@ -1086,8 +1592,14 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/completions", json=attempt_payload
+                    "POST",
+                    "/v1/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
+                    state = self._request_state(request_id)
+                    if state is not None:
+                        state.response = response
                     if response.status_code >= 400:
                         await response.aread()
                         if attempt_index == 0:
@@ -1102,6 +1614,7 @@ class DistributedBatchedEngine(BatchedEngine):
                             continue
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
+                        self._raise_if_aborted(request_id)
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
@@ -1181,14 +1694,17 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend emitted invalid token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
@@ -1311,9 +1827,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
             async with self._peer_health_lock:
                 cached = self._peer_health
-                if cached is None or (
-                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
-                ):
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
                     hosts_by_rank = {
                         rank: (host.node_id, host.ssh)
                         for rank, host in enumerate(self.deployment.hosts)
@@ -1340,9 +1854,7 @@ class DistributedBatchedEngine(BatchedEngine):
                         )
                     self._peer_health = cached
         if not cached[1]:
-            raise DistributedInferenceError(
-                f"cluster is not serving: {cached[2]}"
-            )
+            raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
 
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
@@ -1355,7 +1867,28 @@ class DistributedBatchedEngine(BatchedEngine):
         return None
 
     def has_active_requests(self) -> bool:
+        # Sweep finished-but-abandoned requests first so a leaked generator
+        # cannot hold quiescence-gated unload open forever (G4).
+        self.reap_orphaned_generators()
         return self._active_requests > 0
+
+    def _cancel_backend_after_timeout(self, request_id: str) -> None:
+        """Follow a read timeout with a rank-side cancel (G5).
+
+        httpx closing its side never proved the rank stopped generating; a
+        stalled rank keeps the request alive (KV growth, prompt-cache churn)
+        with nobody reading. A 300 s inactivity bound means the rank is
+        stalled, not merely slow — keepalive frames rule that out — so the
+        coordinator-level cancel file is the proportionate follow-up.
+        """
+
+        state = self._request_states.get(request_id)
+        if state is not None:
+            state.aborted = True
+        self._write_rank_cancel_request(
+            reason=f"read timeout on {request_id}; possible rank stall",
+            request_id=request_id,
+        )
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -1376,13 +1909,30 @@ class DistributedBatchedEngine(BatchedEngine):
         reason: str | None = None,
         error_code: str | None = None,
     ) -> int:
-        # Closing the private client disconnects all rank-zero handlers. The
-        # MLX-LM handler cancels their generation contexts in ``finally``.
+        """Abort everything in flight and confirm the backend drained.
+
+        Three layers, in order: (1) flag every tracked request so its local
+        generator stops at the next yield boundary; (2) drop the rank-side
+        cancel file so rank 0 force-cancels through ``BatchGenerator.remove``
+        at a batch step boundary even if a handler is wedged in a collective
+        and never reaches its disconnect ``finally``; (3) close the shared
+        client, disconnecting every rank-zero handler. Then wait — bounded —
+        for both the coordinator counter and rank-side telemetry to report
+        zero active requests instead of trusting the client close (G5).
+        """
+
+        self.reap_orphaned_generators()
         active = self._active_requests
+        for state in self._request_states.values():
+            state.aborted = True
+        self._write_rank_cancel_request(reason=reason or error_code)
         client, self._client = self._client, None
         if client is not None:
             await client.aclose()
             endpoint = self._supervisor.endpoint
             if endpoint is not None and self._loaded:
                 self._client = self._new_client(endpoint)
+        rank_active = self.rank_side_active_requests()
+        if active or (rank_active or 0) > 0:
+            await self._wait_for_backend_drain(timeout=self._abort_drain_timeout)
         return active

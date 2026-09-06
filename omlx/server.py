@@ -46,7 +46,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -422,6 +422,24 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
+    # Reap distributed ranks orphaned by a crashed previous coordinator
+    # (G8): all teardown used to live in-process, so a SIGKILL/panic of
+    # omlx-server stranded loaded ranks with no owner. The launch manifest
+    # written at spawn lets this new coordinator finish the teardown.
+    # Best effort: a reaping failure must never block server startup.
+    try:
+        from .cluster.launch import reap_orphaned_launches
+
+        orphan_report = await asyncio.to_thread(reap_orphaned_launches)
+        if orphan_report["reaped"] or orphan_report["failures"]:
+            logger.warning(
+                "Reaped orphaned distributed launches from a previous "
+                "coordinator: %s",
+                orphan_report,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Orphaned-launch reaper failed at startup: %s", exc)
+
     # Publish the interpreter another Mac's coordinator discovers over SSH.
     # Without it a packaged-app peer fails every discovery candidate and gets
     # reported as "worker runtime is not installed" (#2680). Best effort: a
@@ -464,6 +482,48 @@ async def lifespan(app: FastAPI):
                     break
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
+
+    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # manual + Tailscale). Best-effort: discovery failures must never block
+    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    discovery_service = None
+    if (
+        distributed_inference_enabled()
+        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        try:
+            from .cluster.discovery import (
+                DiscoveryConfig,
+                DiscoveryService,
+                configure_discovery_service,
+                load_cluster_name,
+            )
+            from .cluster.identity import get_node_identity
+            from .cluster.registry import get_device_registry
+
+            cluster_base = (
+                Path(_server_state.global_settings.base_path)
+                if _server_state.global_settings is not None
+                else Path.home() / ".omlx"
+            )
+            discovery_service = DiscoveryService(
+                get_node_identity(),
+                get_device_registry(),
+                DiscoveryConfig(
+                    cluster_name=load_cluster_name(cluster_base),
+                    http_port=(
+                        _server_state.global_settings.server.port
+                        if _server_state.global_settings is not None
+                        else 8000
+                    )
+                ),
+            )
+            configure_discovery_service(discovery_service)
+            await asyncio.to_thread(discovery_service.start)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to start: %s", exc)
+            discovery_service = None
 
     # Start process memory enforcer if configured
     if (
@@ -571,6 +631,14 @@ async def lifespan(app: FastAPI):
             await bonjour_task
     if bonjour_publisher is not None:
         bonjour_publisher.stop()
+    if discovery_service is not None:
+        try:
+            from .cluster.discovery import configure_discovery_service
+
+            await asyncio.to_thread(discovery_service.stop)
+            configure_discovery_service(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to stop: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -677,12 +745,51 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster v2 model-sync manifest: admin-gated like the rest of the
+    # cluster surface; peers use it to compare model contents before sync.
+    from .cluster.modelsync import manifest_router as cluster_manifest_router
+    from .cluster.modelsync import set_modelsync_getters
+
+    set_modelsync_getters(get_engine_pool)
+    app.include_router(
+        cluster_manifest_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
     # command. Claim/source/complete authenticate with one-time enrollment
     # credentials, not the browser's admin cookie.
     app.include_router(
         cluster_join_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # rate-limited probe peers use to verify announced addresses before any
+    # pairing trust exists; /api/cluster/devices requires admin per-route.
+    from .cluster.discovery_routes import discovery_router
+
+    app.include_router(
+        discovery_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # verifier bound to the node and SSH identities; pair/status returns a
+    # code-encrypted cluster key only after admin approval. Approve, deny, and
+    # unpair are admin-only like every other cluster mutation.
+    from .cluster.pairing_routes import pair_admin_router, pair_router
+
+    app.include_router(
+        pair_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    app.include_router(
+        pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
     )
     _cluster_routes_registered = True
 
@@ -1062,6 +1169,93 @@ class DebugRequestLoggingMiddleware:
         await self.app(scope, cached_receive, send)
 
 
+_DISCONNECT_SIGNAL_SCOPE_KEY = "omlx.client_disconnect_signal"
+_disconnect_callback_tasks: set[asyncio.Task] = set()
+
+
+class _ClientDisconnectSignal:
+    """Fan one ASGI disconnect message out to request-owned cleanup hooks.
+
+    Starlette's ``StreamingResponse`` and ``Request.is_disconnected()`` both
+    consume the same one-shot ``http.disconnect`` receive message.  Whichever
+    one wins used to hide it from the other.  In particular, a real Uvicorn
+    socket could close while a long distributed prefill kept running because
+    the response generator never reached its nested ``aclose()`` chain.
+
+    The outer ASGI middleware records the message before either consumer sees
+    it, then schedules request-scoped callbacks outside Starlette's response
+    cancellation scope.  A callback is keyed by the inference request id, so
+    cancelling one client can never fall back to aborting every active request.
+    """
+
+    def __init__(self) -> None:
+        self._disconnected = False
+        self._next_token = 0
+        self._callbacks: dict[int, Callable[[], Awaitable[None]]] = {}
+
+    def register(self, callback: Callable[[], Awaitable[None]]) -> int:
+        self._next_token += 1
+        token = self._next_token
+        if self._disconnected:
+            self._spawn(callback)
+        else:
+            self._callbacks[token] = callback
+        return token
+
+    def unregister(self, token: int) -> None:
+        self._callbacks.pop(token, None)
+
+    def disconnect(self) -> None:
+        if self._disconnected:
+            return
+        self._disconnected = True
+        callbacks = tuple(self._callbacks.values())
+        self._callbacks.clear()
+        for callback in callbacks:
+            self._spawn(callback)
+
+    @staticmethod
+    def _spawn(callback: Callable[[], Awaitable[None]]) -> None:
+        async def run_callback() -> None:
+            try:
+                await callback()
+            except Exception:
+                logger.exception("Request-scoped disconnect callback failed")
+
+        task = asyncio.create_task(run_callback())
+        # asyncio only holds weak task references.  Retain the detached abort
+        # until it completes; Starlette may already be cancelling the response
+        # task that observed the disconnect.
+        _disconnect_callback_tasks.add(task)
+        task.add_done_callback(_disconnect_callback_tasks.discard)
+
+
+class ClientDisconnectTrackingMiddleware:
+    """Record ``http.disconnect`` before competing ASGI consumers receive it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        signal = _ClientDisconnectSignal()
+        scope[_DISCONNECT_SIGNAL_SCOPE_KEY] = signal
+
+        async def tracked_receive():
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                signal.disconnect()
+            return message
+
+        await self.app(scope, tracked_receive, send)
+
+
+# Keep this outside response middleware so every consumer of ASGI ``receive``
+# passes through the same one-shot disconnect fan-out.
+app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
 
 
@@ -1979,15 +2173,48 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
-    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
-    from .cluster.registry import configure_cluster_registry
+    from .cluster.pairing import configure_pairing_manager
+    from .cluster.registry import (
+        configure_cluster_registry,
+        configure_device_registry,
+        get_device_registry,
+    )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+    # Cluster v2: stable node identity + trusted device inventory. Best
+    # effort — a failure here must never block local inference. Configured
+    # before the pairing manager so pairing approvals persist into the real
+    # device registry instead of the schema-compatible fallback store.
+    try:
+        from .cluster.identity import configure_node_identity
+
+        configure_node_identity(base_path)
+        configure_device_registry(base_path / "cluster" / "devices.json")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+    try:
+        device_registry = get_device_registry()
+    except RuntimeError:
+        device_registry = None
+    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # available (DeviceRegistryBridge adapts the API and fails loudly on
+    # drift); otherwise the schema-compatible fallback store is used. Resolve
+    # capabilities lazily because the discovery service starts later.
+    from .cluster.discovery import announced_addrs, announced_caps
+
+    configure_pairing_manager(
+        base_path,
+        registry=device_registry,
+        enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
+        address_provider=announced_addrs,
+    )
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
@@ -2191,6 +2418,56 @@ async def _safe_anext(ait):
         return await ait.__anext__()
     except StopAsyncIteration:
         return _KEEPALIVE_SENTINEL
+
+
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Close an async generator when the response transport ends."""
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
+
+
+def _request_abort_id(engine: BaseEngine) -> str | None:
+    """Mint an opaque id only for engines with targeted abort semantics."""
+
+    if not getattr(engine, "supports_request_scoped_abort", False):
+        return None
+    abort = getattr(engine, "abort_request", None)
+    if not callable(abort):
+        return None
+    return f"transport-{uuid.uuid4().hex}"
+
+
+async def _with_request_disconnect_abort(
+    generator: AsyncIterator[str],
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    request_id: str | None,
+) -> AsyncIterator[str]:
+    """Bind one public response transport to one inference request."""
+
+    signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    token: int | None = None
+    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
+        abort = getattr(engine, "abort_request")
+
+        async def abort_disconnected_request() -> None:
+            await abort(
+                request_id,
+                reason="public client transport disconnected",
+                error_code="client_disconnected",
+            )
+
+        token = signal.register(abort_disconnected_request)
+
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        await _aclose_async_iterator(generator)
 
 
 async def _with_sse_keepalive(
@@ -3368,6 +3645,7 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3376,18 +3654,24 @@ async def create_completion(
                 keepalive = _completion_keepalive_chunk(response_id)
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            model_load_duration=model_load_duration,
-                            prompt_token_ids=prompt_token_ids_by_prompt[0],
-                            resolved_model=resolved_model,
-                            response_id=response_id,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_completion(
+                                engine,
+                                prompts[0],
+                                request,
+                                model_load_duration=model_load_duration,
+                                prompt_token_ids=prompt_token_ids_by_prompt[0],
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                inference_request_id=inference_request_id,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -3903,6 +4187,9 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -3916,18 +4203,23 @@ async def create_chat_completion(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_chat_completion(
-                            engine,
-                            messages,
-                            request,
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_id=response_id,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_chat_completion(
+                                engine,
+                                messages,
+                                request,
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -4482,6 +4774,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    inference_request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -5851,20 +6144,28 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_anthropic_messages(
-                            engine,
-                            messages,
-                            request,
-                            resolved_model=resolved_model,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_anthropic_messages(
+                                engine,
+                                messages,
+                                request,
+                                resolved_model=resolved_model,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("anthropic"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("anthropic"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -6363,6 +6664,9 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
@@ -6370,21 +6674,26 @@ async def create_response(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_responses_api(
-                            engine,
-                            messages,
-                            request,
-                            input_messages=current_input_messages,
-                            store_response=_should_store_response(request.store),
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_format=response_format,
-                            native_reasoning=native_reasoning,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_responses_api(
+                                engine,
+                                messages,
+                                request,
+                                input_messages=current_input_messages,
+                                store_response=_should_store_response(request.store),
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_format=response_format,
+                                native_reasoning=native_reasoning,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("openai_responses"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("openai_responses"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),

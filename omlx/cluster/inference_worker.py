@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import signal
@@ -13,14 +14,19 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract
+from .control_plane import RankControlPlane
+from .deployment import (
+    decode_worker_contract,
+    decode_worker_path_map,
+)
+from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -42,12 +48,56 @@ from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 
+logger = logging.getLogger(__name__)
+
 
 def _emit_event(payload: dict[str, Any]) -> None:
     print(
         _EVENT_PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":")),
         flush=True,
     )
+
+
+def _wait_for_serve_release(
+    state_dir: str | Path,
+    deployment_id: str,
+    plan_hash: str,
+    world_size: int,
+    *,
+    timeout: float = 120.0,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> None:
+    """Wait for the supervisor to confirm that every rank finished loading.
+
+    Ranks cannot use a JACCL collective as this barrier: the first Mac may be
+    fully wired while a smaller peer is still materializing layers, and an
+    early all-reduce then times out and destroys an otherwise healthy load.
+    Every rank publishes ``rank_ready`` first; the supervisor observes all of
+    them and atomically writes this local release marker on every host.
+    """
+
+    path = Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
+    deadline = float(clock()) + max(0.0, float(timeout))
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and payload.get("deployment_id") == deployment_id
+            and payload.get("plan_hash") == plan_hash
+            and payload.get("world_size") == world_size
+        ):
+            return
+        remaining = deadline - float(clock())
+        if remaining <= 0:
+            raise TimeoutError(
+                "supervisor did not release all loaded ranks into serving"
+            )
+        sleep(min(0.05, remaining))
 
 
 def _cross_thread_generation_stream(mx: Any) -> Any:
@@ -470,23 +520,117 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
-    Kept beside the runtime markers and scoped by deployment and rank, so two
-    deployments never read each other's snapshots and a rank only ever loads its
-    own layer slice.
+    Kept beside the runtime markers and scoped by deployment, signed plan and
+    rank, so a changed tensor split can never restore another shard layout.
     """
 
     if not args.prompt_cache_ssd:
         return None
     root = Path(args.state_dir).expanduser() / "prompt-cache-ssd"
-    return str(root / f"{args.deployment_id}-rank-{rank}")
+    plan_hash = str(getattr(args, "plan_hash", "") or "unplanned")
+    return str(root / args.deployment_id / plan_hash / f"rank-{rank}")
+
+
+def _release_metal_memory(reason: str) -> None:
+    """Best-effort Metal release before a force-exit.
+
+    Ported from ThunderMLX's ``clear_mlx_cache`` (run_with_watchdog.py), the
+    fix for "176 GB wired with no owning process": ``clear_cache()`` alone only
+    drops the Metal *cache pool* — the wired model weights stay stranded in
+    kernel wired memory when ``os._exit`` skips every finally/atexit handler.
+    ``set_wired_limit(0)`` unwires the model allocation so the OS reclaims it
+    on process death. Every step is guarded: a rank whose MLX import or Metal
+    queue is already broken must still reach its exit.
+    """
+
+    try:
+        import mlx.core as mx
+    except Exception:
+        # MLX never imported (or unimportable): nothing is wired, nothing to do.
+        return
+    try:
+        # Unwire first: this is what actually releases the memory the weights
+        # hold. A safe no-op when nothing is wired.
+        mx.set_wired_limit(0)
+    except Exception as exc:
+        logger.warning("set_wired_limit(0) failed (%s): %s", reason, exc)
+    with suppress(Exception):
+        mx.clear_cache()
+    metal = getattr(mx, "metal", None)
+    metal_clear = getattr(metal, "clear_cache", None)
+    if metal_clear is not None:
+        with suppress(Exception):
+            metal_clear()
 
 
 def _install_signal_handlers() -> None:
-    def interrupt(_signum: int, _frame: Any) -> None:
+    def hard_exit(signum: int, _frame: Any) -> None:
+        # The Metal release hung on a wedged GPU queue; the cleanup path must
+        # not itself stall the SIGKILL escalation waiting behind it.
+        name = signal.Signals(signum).name
+        sys.stderr.write(f"[RANK] {name} while releasing Metal memory; hard-exiting\n")
+        sys.stderr.flush()
+        os._exit(128 + signum)
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        name = signal.Signals(signum).name
+        # Release wired Metal memory while the rank can still do it itself —
+        # the coordinator escalates a wedged rank from SIGTERM to SIGKILL, and
+        # a SIGKILL cannot unwire anything (ThunderMLX's TERM/INT handlers in
+        # run_with_watchdog.py, alarm escape hatch included). The graceful
+        # KeyboardInterrupt path is unchanged for a rank that answers promptly.
+        try:
+            signal.signal(signal.SIGALRM, hard_exit)
+            signal.alarm(
+                int(os.environ.get("OMLX_CLUSTER_SIGNAL_CLEAR_TIMEOUT", "10") or "10")
+            )
+        except Exception:
+            pass
+        _release_metal_memory(f"rank received {name}")
+        with suppress(Exception):
+            signal.alarm(0)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+
+
+def _write_cancel_request(
+    state_dir: str,
+    deployment_id: str,
+    reason: str,
+    *,
+    plan_hash: str | None = None,
+) -> None:
+    """Ask this rank's telemetry to force-cancel in-flight requests.
+
+    Best effort and silent on failure: the file is consumed by the rank's
+    telemetry heartbeat, which cancels through ``BatchGenerator.remove`` at
+    a batch step boundary shared with peer ranks. Writing it before a
+    watchdog exit lets in-flight work unwind instead of being severed
+    mid-collective.
+    """
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "deployment_id": deployment_id,
+        "epoch": int(time.time() * 1000),
+        "scope": "all",
+        "reason": reason,
+    }
+    if plan_hash:
+        payload["plan_hash"] = plan_hash
+    try:
+        root = Path(state_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{deployment_id}-cancel.json"
+        temporary = path.with_name(path.name + ".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("Could not write the rank cancel request: %s", exc)
 
 
 def _watch_launcher_parent(
@@ -494,10 +638,14 @@ def _watch_launcher_parent(
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
+    watched_marker_path: Any = None,
+    marker_stale_after: float = 45.0,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
     exit_process: Any = os._exit,
     emit_event: Any = _emit_event,
+    on_abort: Any = None,
+    release_memory: Any = _release_metal_memory,
 ) -> None:
     """Fail fast if MLX's launcher exits without reaping this rank.
 
@@ -505,23 +653,58 @@ def _watch_launcher_parent(
     after its main thread handles SIGTERM. The launcher is the lifetime owner
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
+
+    Two conditions are watched: the parent pid changing (the original check),
+    and — when ``watched_marker_path`` is configured — a launcher- or
+    coordinator-maintained lease file going stale for ``marker_stale_after``
+    seconds, which catches a launcher that is alive but wedged (its ranks
+    would otherwise wait in a collective forever). ``os._exit`` stays the
+    last resort: ``on_abort`` fires first so in-flight requests can be
+    cancelled at a step boundary, and ``release_memory`` unwires the rank's
+    Metal allocations before the process disappears — ``os._exit`` skips
+    every finally/atexit handler, and a skipped release strands wired memory
+    until the Mac is rebooted.
     """
 
+    watched = Path(watched_marker_path) if watched_marker_path else None
     while True:
         wait(poll_interval)
-        if get_parent_pid() == parent_pid:
+        reason = None
+        if get_parent_pid() != parent_pid:
+            current_parent = get_parent_pid()
+            reason = (
+                f"rank launcher parent changed from {parent_pid} to "
+                f"{current_parent}; the rank cannot safely continue"
+            )
+        elif watched is not None and marker_stale_after > 0:
+            try:
+                age = time.time() - watched.stat().st_mtime
+            except OSError:
+                age = None
+            # A lease that never appeared yet is not stale; the launcher may
+            # still be starting. Once it exists, it must stay fresh.
+            if age is not None and age > marker_stale_after:
+                reason = (
+                    f"launcher lease {watched} is stale ({age:.1f}s > "
+                    f"{marker_stale_after:.1f}s); the launcher is wedged"
+                )
+        if reason is None:
             continue
-        current_parent = get_parent_pid()
-        reason = (
-            f"rank launcher parent changed from {parent_pid} to "
-            f"{current_parent}; the rank cannot safely continue"
-        )
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
         # failure to "heartbeat missing" with no explanation.
         marker.update("launcher_lost", error=reason)
+        if on_abort is not None:
+            try:
+                on_abort(reason)
+            except Exception:
+                logger.warning("Launcher watchdog abort stage failed", exc_info=True)
         emit_event({"type": "launcher_lost", "reason": reason})
+        try:
+            release_memory(f"launcher watchdog exit: {reason}")
+        except Exception:
+            logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
 
@@ -592,13 +775,32 @@ def _start_peer_watchdog(
     def on_lost(reason: str) -> None:
         marker.update("peer_lost", error=reason)
         _emit_event({"type": "peer_lost", "reason": reason})
+        # Unwire and release Metal memory before the force-exit: os._exit
+        # skips every finally/atexit handler, and a skipped release strands
+        # the rank's wired allocation until the Mac is rebooted.
+        with suppress(Exception):
+            _release_metal_memory(f"peer watchdog exit: {reason}")
         os._exit(1)
 
+    def on_abort(reason: str) -> None:
+        # The cancel file is consumed by this rank's telemetry heartbeat,
+        # which cancels in-flight requests through BatchGenerator.remove at
+        # a batch step boundary shared with every rank — never mid-collective.
+        _write_cancel_request(
+            state_dir,
+            deployment_id,
+            f"peer watchdog aborting before teardown: {reason}",
+            plan_hash=marker.payload.get("plan_hash"),
+        )
+
+    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
+        on_abort=on_abort,
+        abort_grace=abort_grace,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -607,10 +809,35 @@ def _start_peer_watchdog(
     return watchdog
 
 
-def _start_launcher_watchdog(marker: RuntimeMarker, parent_pid: int) -> None:
+def _start_launcher_watchdog(
+    marker: RuntimeMarker,
+    parent_pid: int,
+    *,
+    state_dir: str | None = None,
+) -> None:
+    # Optional coordinator/launcher lease file: when configured (and once
+    # it exists), the watchdog also fires if it goes stale — covering a
+    # launcher that is alive but wedged, which the parent-pid check alone
+    # cannot see. Off by default, preserving the original PPID-only watch.
+    lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
+    deployment_id = str(marker.payload.get("deployment_id") or "")
+
+    def on_abort(reason: str) -> None:
+        if state_dir and deployment_id:
+            _write_cancel_request(
+                state_dir,
+                deployment_id,
+                reason,
+                plan_hash=marker.payload.get("plan_hash"),
+            )
+
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
+        kwargs={
+            "watched_marker_path": lease or None,
+            "on_abort": on_abort,
+        },
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -666,9 +893,9 @@ def _validate_loaded_stage(
         and start in (None, 0)
         and end in (None, len(layers))
     )
-    if (
-        not expected_complete_tensor_stage
-        and (start, end) != (assignment.start_layer, assignment.end_layer)
+    if not expected_complete_tensor_stage and (start, end) != (
+        assignment.start_layer,
+        assignment.end_layer,
     ):
         raise RuntimeError(
             "loaded model pipeline range does not match the approved plan: "
@@ -959,7 +1186,17 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
-    group = mx.distributed.init(backend=init_backend, strict=True)
+    jaccl_lease = (
+        acquire_jaccl_communicator_lease(
+            deployment_id=args.deployment_id,
+            state_dir=args.state_dir,
+        )
+        if init_backend == "jaccl"
+        else None
+    )
+    from .jaccl_side_channel import init_cluster_group
+
+    group = init_cluster_group(mx, backend=init_backend, strict=True)
     rank = group.rank()
     world_size = group.size()
     if world_size != len(assignments):
@@ -969,6 +1206,15 @@ def run_worker(args: argparse.Namespace) -> int:
         )
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
+
+    # Cluster v2: a deployment may give each node its own absolute model path.
+    # The rank's path comes from the signed contract's path_map; nodes without
+    # an entry keep the shared --model argument, the pre-v2 behavior.
+    path_map = decode_worker_path_map(args.plan)
+    if path_map:
+        rank_model_path = path_map.get(assignments[rank].node_id)
+        if rank_model_path and rank_model_path != args.model:
+            args.model = rank_model_path
 
     marker = RuntimeMarker(
         state_dir=args.state_dir,
@@ -987,7 +1233,7 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     marker.start_heartbeat()
     _install_signal_handlers()
-    _start_launcher_watchdog(marker, launcher_parent_pid)
+    _start_launcher_watchdog(marker, launcher_parent_pid, state_dir=args.state_dir)
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
@@ -1103,25 +1349,28 @@ def run_worker(args: argparse.Namespace) -> int:
             # it is checked again against what the rank actually holds, all the
             # way through the load. A rank that overruns dies here rather than
             # taking the Mac with it.
-            with watch_rank_load(
-                load_budget,
-                rank=rank,
-                node_id=getattr(assignment, "node_id", ""),
-                on_sample=lambda observed: marker.update(
-                    "loading",
-                    load_stage="loading_weights",
-                    load_memory_bytes=observed,
+            with (
+                watch_rank_load(
+                    load_budget,
+                    rank=rank,
+                    node_id=getattr(assignment, "node_id", ""),
+                    on_sample=lambda observed: marker.update(
+                        "loading",
+                        load_stage="loading_weights",
+                        load_memory_bytes=observed,
+                    ),
                 ),
-            ), install_progressive_loader(
-                mlx_server,
-                progress=lambda progress: marker.update(
-                    "loading",
-                    load_stage=progress.get("phase", "materializing_layers"),
-                    **{
-                        key: value
-                        for key, value in progress.items()
-                        if key != "phase"
-                    },
+                install_progressive_loader(
+                    mlx_server,
+                    progress=lambda progress: marker.update(
+                        "loading",
+                        load_stage=progress.get("phase", "materializing_layers"),
+                        **{
+                            key: value
+                            for key, value in progress.items()
+                            if key != "phase"
+                        },
+                    ),
                 ),
             ):
                 provider.load_default()
@@ -1200,20 +1449,37 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                _wait_for_serve_release(
+                    args.state_dir,
+                    args.deployment_id,
+                    plan_hash,
+                    world_size,
+                )
+                control_context = (
+                    RankControlPlane(
+                        rank=rank,
+                        world_size=world_size,
+                        host=args.control_host,
+                        port=args.control_port,
+                        token=args.control_token,
+                    )
+                    if args.control_host and args.control_port and args.control_token
+                    else nullcontext(None)
+                )
                 with (
+                    control_context as control_plane,
                     install_server_telemetry(
                         marker,
                         execution=execution,
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
+                        ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
                             rank=rank,
                             node_id=getattr(assignment, "node_id", ""),
-                            layer_count=(
-                                assignment.end_layer - assignment.start_layer
-                            ),
+                            layer_count=(assignment.end_layer - assignment.start_layer),
                             tensor_parallel_size=assignment.tensor_parallel_size,
                             memory_guard_tier=guard_tier,
                             # The attention peak is set by the prefill chunk, so the
@@ -1221,6 +1487,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             # really use, not from mlx-lm's 2048 default.
                             prefill_step_size=args.prefill_step_size,
                         ),
+                        control_plane=control_plane,
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,
@@ -1253,6 +1520,8 @@ def run_worker(args: argparse.Namespace) -> int:
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()
+        if jaccl_lease is not None:
+            jaccl_lease.close()
     return 0
 
 
@@ -1301,6 +1570,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="~/.omlx/cluster/runtime",
         help="Local state directory shown by the oMLX GUI on each node",
     )
+    parser.add_argument("--control-host", default="")
+    parser.add_argument("--control-port", type=int, default=0)
+    parser.add_argument("--control-token", default="")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--execution-profile",
@@ -1335,6 +1607,17 @@ def main(argv: list[str] | None = None) -> int:
     args.model = str(Path(args.model).expanduser())
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
+    control_values = (
+        bool(args.control_host),
+        bool(args.control_port),
+        bool(args.control_token),
+    )
+    if any(control_values) and not all(control_values):
+        raise SystemExit(
+            "--control-host, --control-port and --control-token are required together"
+        )
+    if args.control_port and not 1 <= args.control_port <= 65535:
+        raise SystemExit("--control-port must be between 1 and 65535")
     for name in (
         "decode_concurrency",
         "prompt_concurrency",
