@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 import mmap
@@ -7,6 +8,8 @@ import os
 import struct
 import weakref
 from bisect import bisect_right
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -1877,6 +1880,21 @@ class _SafeTensorMMap:
             self._file = None
 
 
+_PLE_DTYPES = {
+    "BF16": (np.dtype("<u2"), mx.bfloat16),
+    "F16": (np.dtype("<f2"), mx.float16),
+    "F32": (np.dtype("<f4"), mx.float32),
+    "U32": (np.dtype("<u4"), mx.uint32),
+    "F8_E4M3": (np.dtype("u1"), None),
+}
+
+
+def _ple_batched_gather() -> bool:
+    return os.environ.get("OMLX_QWEN4_PLE_GATHER", "").strip().lower() not in (
+        "0", "false", "no", "off"
+    )
+
+
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
@@ -2030,7 +2048,145 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
+    # ---- fast sharded gather ------------------------------------------------
+    # The stock __call__ below evaluates the id tensor and reads it back with
+    # .tolist(), draining the GPU mid-forward, then walks one Python loop per id
+    # Bucket ids by shard with searchsorted, warm every shard in one threaded
+    # pread, dequantize once, and keep a bounded hot-row LRU.
+    # OMLX_QWEN4_PLE_GATHER=0 restores the upstream row-at-a-time path.
+    def _fast_state(self):
+        st = getattr(self, "_omlx_ple_fast", None)
+        if st is not None:
+            return st
+        io, views = [], []
+        for i in range(len(self.shard_sizes)):
+            wk, sk, bk, _bits, _group = self._shard_specs[i]
+            tio, tv = [], []
+            for key in (wk, sk, bk):
+                if key is None:
+                    tio.append(None)
+                    tv.append(None)
+                    continue
+                rd = self._tensor_readers[key]
+                entry = rd._header[key]
+                npdt, view_dt = _PLE_DTYPES.get(str(entry["dtype"]), (None, None))
+                if npdt is None:
+                    raise TypeError(
+                        f"SSD-backed Qwen4 PLE does not support {entry['dtype']}"
+                    )
+                shp = tuple(entry["shape"])
+                off = rd._data_start + entry["data_offsets"][0]
+                tv.append((np.frombuffer(rd._mapping, dtype=npdt,
+                                         count=shp[0] * shp[1],
+                                         offset=off).reshape(shp), view_dt))
+                tio.append((rd._file.fileno(), off,
+                            shp[1] * np.dtype(npdt).itemsize))
+            io.append(tio)
+            views.append(tv)
+        try:
+            hot_mb = int(os.environ.get("OMLX_QWEN4_PLE_HOT_MB", "1024"))
+        except ValueError:
+            hot_mb = 1024
+        row_bytes = max(1, sum(rb for spec in io[0] if spec for _, _, rb in [spec]))
+        st = {
+            "io": io,
+            "views": views,
+            "hot": OrderedDict(),
+            "cap": (max(0, hot_mb) * 2 ** 20) // row_bytes,
+            "pool": ThreadPoolExecutor(max_workers=16,
+                                       thread_name_prefix="ple-warm"),
+        }
+        self._omlx_ple_fast = st
+        return st
+
+    def _gather_host(self, host, shape):
+        offsets = np.asarray(self.shard_offsets, dtype=np.int64)
+        if host.size and (host.min() < 0 or host.max() >= offsets[-1]):
+            raise IndexError("embedding index is outside the sharded vocabulary")
+        uniq, inverse = np.unique(host, return_inverse=True)
+        st = self._fast_state()
+        io, views, hot, cap = st["io"], st["views"], st["hot"], st["cap"]
+
+        miss = (np.array([r for r in uniq if int(r) not in hot], dtype=np.int64)
+                if cap else uniq)
+        if miss.size:
+            shard = np.searchsorted(offsets, miss, side="right") - 1
+            local = miss - offsets[shard]
+            order = np.argsort(shard, kind="stable")
+            shard_s, local_s, miss_s = shard[order], local[order], miss[order]
+            work = []
+            for si, lr in zip(shard_s, local_s):
+                for spec in io[int(si)]:
+                    if spec is not None:
+                        fd, base, rb = spec
+                        work.append((fd, base + int(lr) * rb, rb))
+            if work:
+                step = max(1, (len(work) + 15) // 16)
+
+                def _touch(chunk):
+                    for fd, off, rb in chunk:
+                        os.pread(fd, rb, off)
+
+                list(st["pool"].map(
+                    _touch,
+                    [work[k:k + step] for k in range(0, len(work), step)]))
+            bounds = np.searchsorted(shard_s, np.arange(len(self.shard_sizes) + 1))
+            for si in np.unique(shard_s):
+                lo, hi = bounds[si], bounds[si + 1]
+                rows_l = local_s[lo:hi]
+                (wv, _wd), sv_p, bv_p = views[int(si)]
+                sv = sv_p[0] if sv_p else None
+                bv = bv_p[0] if bv_p else None
+                w = np.ascontiguousarray(wv[rows_l])
+                sc = np.ascontiguousarray(sv[rows_l]) if sv is not None else None
+                bi = np.ascontiguousarray(bv[rows_l]) if bv is not None else None
+                for j, gid in enumerate(miss_s[lo:hi]):
+                    # .copy() so a cached row owns its bytes; a view would pin
+                    # the whole fetched block and unbound OMLX_QWEN4_PLE_HOT_MB.
+                    hot[int(gid)] = (w[j].copy(),
+                                     None if sc is None else sc[j].copy(),
+                                     None if bi is None else bi[j].copy())
+        self.last_touched_shards = tuple(
+            int(x) for x in np.unique(
+                np.searchsorted(offsets, uniq, side="right") - 1)
+        )
+        rows = []
+        for r in uniq:
+            k = int(r)
+            rows.append(hot[k])
+            if cap:
+                hot.move_to_end(k)
+        while cap and len(hot) > cap:
+            hot.popitem(last=False)
+        if not cap:
+            hot.clear()
+
+        _, _, _, bits, group_size = self._shard_specs[0]
+        (_, w_view), sp, bp = views[0]
+        w = mx.array(np.stack([r[0] for r in rows]))
+        if bits is not None:
+            sc = mx.array(np.stack([r[1] for r in rows])).view(sp[1])
+            bi = mx.array(np.stack([r[2] for r in rows])).view(bp[1])
+            values = mx.dequantize(w, sc, bi, group_size=group_size, bits=bits,
+                                   mode="affine")
+        elif w_view is None:
+            values = mx.from_fp8(w, dtype=mx.bfloat16)
+        else:
+            values = w.view(w_view)
+        values = values.astype(mx.bfloat16) * self.weight_scale
+        self.rows_read = int(uniq.size)
+        out = values[mx.array(inverse.astype(np.int32))]
+        return out.reshape(*shape, self.dims)
+
+    def _call_fast(self, indices: mx.array) -> mx.array:
+        shape = indices.shape
+        flat = indices.reshape(-1)
+        mx.eval(flat)
+        return self._gather_host(np.asarray(flat, dtype=np.int64), shape)
+
     def __call__(self, indices: mx.array) -> mx.array:
+        if _ple_batched_gather():
+            return self._call_fast(indices)
         shape = indices.shape
         flat = indices.reshape(-1)
         mx.eval(flat)
@@ -2077,6 +2233,20 @@ class DiskBackedShardedEmbedding(nn.Module):
         return result.reshape(*shape, self.dims)
 
     def close(self):
+        # The fast path keeps numpy views into each mmap; they must be dropped
+        # before the readers close or the buffer stays exported.
+        state = getattr(self, "_omlx_ple_fast", None)
+        if state is not None:
+            state["views"].clear()
+            state["io"].clear()
+            state["hot"].clear()
+            state["pool"].shutdown(wait=False)
+            try:
+                delattr(self, "_omlx_ple_fast")
+            except AttributeError:
+                self.__dict__.pop("_omlx_ple_fast", None)
+            del state
+            gc.collect()
         for reader in self._readers.values():
             reader.close()
         self._readers.clear()

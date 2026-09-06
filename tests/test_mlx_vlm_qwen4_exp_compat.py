@@ -1532,3 +1532,52 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def _write_fp8_ple_shard(model_path, key, rows, dims):
+    """Emit a one-shard safetensors file holding a dense F8_E4M3 PLE table."""
+
+    payload = bytes((index * 7 + 3) % 256 for index in range(rows * dims))
+    header = json.dumps(
+        {
+            key: {
+                "dtype": "F8_E4M3",
+                "shape": [rows, dims],
+                "data_offsets": [0, len(payload)],
+            }
+        }
+    ).encode()
+    shard = model_path / "model-00001.safetensors"
+    shard.write_bytes(
+        len(header).to_bytes(8, "little") + header + payload
+    )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: shard.name}})
+    )
+
+
+def test_qwen4_ssd_ple_gathers_fp8_shards(tmp_path, monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    rows, dims = 8, 4
+    _write_fp8_ple_shard(tmp_path, "ple.shard_0.weight", rows, dims)
+    indices = mx.array([0, 3, 5, 3], dtype=mx.int32)
+
+    def gather():
+        embedding = language.DiskBackedShardedEmbedding(
+            tmp_path, "ple", rows, dims, 1
+        )
+        try:
+            return embedding(indices)
+        finally:
+            embedding.close()
+
+    monkeypatch.delenv("OMLX_QWEN4_PLE_GATHER", raising=False)
+    batched = gather()
+    monkeypatch.setenv("OMLX_QWEN4_PLE_GATHER", "0")
+    upstream = gather()
+    mx.eval(batched, upstream)
+
+    assert batched.shape == (4, dims)
+    assert mx.array_equal(batched, upstream).item()
