@@ -47,6 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.boundary_retention import select_spaced_boundaries
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
@@ -1568,6 +1569,9 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
+    # Interior recurrent-state checkpoints retained per prefill, newest excluded
+    # (it is always retained). 0 = keep every boundary.
+    boundary_snapshot_retention: int = 0
     max_cache_blocks: int | None = (
         None  # Auto-calculated from available KV cache memory
     )
@@ -6439,6 +6443,38 @@ class Scheduler:
             )
             return
 
+        # Budget the retained checkpoints before capturing anything. A restore
+        # lands on the deepest retained checkpoint and re-prefills the gap, so
+        # capturing a boundary that will not be retained costs 115MB of resident
+        # state (measured on a hybrid GDN model at block_size 2048) and buys
+        # nothing: the store path will not persist a non-sliceable block without
+        # its checkpoint anyway. Deciding here also frees the boundaries that
+        # fall out of the budget as prefill runs, which is what bounds the
+        # long-context resident peak.
+        # Duck-typed configs (tests, embedded harnesses) carry only the fields
+        # they care about; an absent budget means the historical behavior.
+        retention = getattr(self.config, "boundary_snapshot_retention", 0)
+        recorded = self._boundary_cache_snapshots[request_id]
+        if retention > 0:
+            retained = select_spaced_boundaries(
+                sorted([*recorded, token_count]),
+                token_count,
+                block_size,
+                retention,
+            )
+            if token_count not in retained:
+                self._boundary_snapshot_diagnostics.record(
+                    "capture_skipped",
+                    reason="retention_thinned",
+                    request_id=request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                    source="prefill",
+                )
+                return
+            for tc in [tc for tc in recorded if tc not in retained]:
+                del recorded[tc]
+
         # Offload snapshot to SSD if store is available, keeping only a
         # None marker in the dict.  Falls back to in-memory storage when
         # the SSD store is unavailable or the write fails.
@@ -6854,6 +6890,32 @@ class Scheduler:
 
         if request.request_id not in self._boundary_cache_snapshots:
             self._boundary_cache_snapshots[request.request_id] = {}
+
+        # Same budget as the prefill-side recorder: this path captures at every
+        # block boundary crossed while decoding, so without it a long generation
+        # re-accumulates the checkpoints prefill just released. The lattice is
+        # laid out over the cacheable prefix, not over the emitted count: a
+        # decoding request captures past the end of the prompt, and those depths
+        # are not storable (the store filters to the cacheable sequence), so
+        # letting them set the stride evicts the in-range boundary the next turn
+        # resumes from -- which costs every subsequent hit.
+        retention = getattr(self.config, "boundary_snapshot_retention", 0)
+        if retention > 0:
+            recorded = self._boundary_cache_snapshots[request.request_id]
+            if getattr(request, "needs_think_prefix", False):
+                limit = len(request.prompt_token_ids)
+            else:
+                limit = total_tokens
+            retained = select_spaced_boundaries(
+                sorted([*recorded, total_tokens]),
+                limit,
+                block_size,
+                retention,
+            )
+            if total_tokens not in retained:
+                return
+            for tc in [tc for tc in recorded if tc not in retained]:
+                del recorded[tc]
 
         # Offload to SSD with in-memory fallback.
         if self._boundary_snapshot_store is not None:

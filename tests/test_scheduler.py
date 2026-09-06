@@ -2582,6 +2582,58 @@ class TestSchedulerRemoveFinishedRequest:
 class TestSchedulerBoundarySnapshots:
     """Tests for boundary cache snapshots on non-sliceable cache models."""
 
+    def test_decode_captures_beyond_the_prompt_keep_the_resume_boundary(
+        self, mock_model, mock_tokenizer
+    ):
+        """A long generation must not evict the boundary the next turn resumes at.
+
+        Regression for the retention budget: it laid the lattice out over the
+        newest capture, but a decoding request captures past the end of the
+        prompt while the store filters those depths out (``cacheable_sequence``).
+        Once the emitted count widened the stride, the deepest in-range boundary
+        was pruned -- leaving a store whose only surviving boundary is unusable
+        (refused: ``reason=boundary_snapshot_unavailable available_boundaries=1``)
+        and a following turn that re-prefills the entire prompt despite matching
+        it token for token. Seen with a 126,670-token prompt emitting a few
+        hundred reasoning tokens per turn; shrunk to block_size 4 here.
+        """
+        config = SchedulerConfig(
+            paged_cache_block_size=4, boundary_snapshot_retention=1
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        mock_layer_cache = MagicMock()
+        type(mock_layer_cache).__name__ = "BatchArraysCache"
+        scheduler.batch_generator = MagicMock()
+
+        request = Request(
+            request_id="req-drift",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(12))
+        request.num_prompt_tokens = 12
+        request.needs_think_prefix = True  # only the prompt is cacheable
+
+        # Boundaries prefill already captured inside the prompt.
+        scheduler._boundary_cache_snapshots["req-drift"] = {4: "s4", 8: "s8", 12: "s9"}
+
+        for total in (16, 20):
+            mock_layer_cache.offset = total
+            scheduler.batch_generator.extract_cache.return_value = {
+                123: ([mock_layer_cache], list(range(12, total)))
+            }
+            request.output_token_ids = list(range(12, total))
+            scheduler._maybe_capture_boundary_snapshot(request, 123)
+
+        recorded = scheduler._boundary_cache_snapshots["req-drift"]
+        # The depth the next turn resumes from, and the store's only usable one.
+        assert 12 in recorded, recorded
+        # Nothing above the cacheable prompt can serve a store of this request.
+        assert all(tc % 4 == 0 for tc in recorded)
+
     def test_capture_boundary_snapshot_at_block_boundary(
         self, mock_model, mock_tokenizer
     ):
@@ -2620,6 +2672,7 @@ class TestSchedulerBoundarySnapshots:
         assert diagnostics["capture_attempts"] == 1
         assert diagnostics["captures"] == 1
         assert diagnostics["captures_memory"] == 1
+
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
         # The in-memory fallback pre-extracts eagerly (retaining raw cache
         # objects kept the full KV member of pm-eligible CacheLists alive

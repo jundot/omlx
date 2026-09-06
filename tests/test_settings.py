@@ -364,9 +364,7 @@ class TestSchedulerSettings:
         """Defaults on; explicit false round-trips."""
         assert SchedulerSettings.from_dict({}).decode_fairness is True
         assert (
-            SchedulerSettings.from_dict(
-                {"decode_fairness": False}
-            ).decode_fairness
+            SchedulerSettings.from_dict({"decode_fairness": False}).decode_fairness
             is False
         )
 
@@ -467,6 +465,7 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "boundary_snapshot_retention": 0,
         }
 
     def test_from_dict(self):
@@ -504,9 +503,7 @@ class TestCacheSettings:
     def test_from_dict_preserves_legacy_mode_and_fp32_default(
         self, legacy_split, expected_mode
     ):
-        settings = CacheSettings.from_dict(
-            {"gdn_ssd_split_enabled": legacy_split}
-        )
+        settings = CacheSettings.from_dict({"gdn_ssd_split_enabled": legacy_split})
         assert settings.gdn_ssd_split_enabled is legacy_split
         assert settings.get_gdn_snapshot_storage() == expected_mode
         assert settings.gdn_sidecar_state_dtype == "fp32"
@@ -527,7 +524,9 @@ class TestCacheSettings:
             }
         )
         global_settings = GlobalSettings(cache=settings)
-        assert any("gdn_snapshot_storage" in error for error in global_settings.validate())
+        assert any(
+            "gdn_snapshot_storage" in error for error in global_settings.validate()
+        )
 
     def test_auto_policy_embeds_when_cache_is_disabled_or_hot_only(self):
         settings = CacheSettings(enabled=False)
@@ -1564,9 +1563,7 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert not any("gdn_sidecar_state_dtype" in e for e in errors)
 
-    @pytest.mark.parametrize(
-        "dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"]
-    )
+    @pytest.mark.parametrize("dtype", ["fp32", "bf16", "int8", "rht_int8", "rht_int16"])
     def test_validate_accepts_every_dtype_with_split_enabled(self, dtype):
         settings = GlobalSettings()
         settings.cache.gdn_ssd_split_enabled = True
@@ -2282,9 +2279,7 @@ class TestResolveDefaultBasePath:
         self, monkeypatch, tmp_path
     ):
         resolved = tmp_path / "resolved-base"
-        monkeypatch.setattr(
-            "omlx.settings.resolve_default_base_path", lambda: resolved
-        )
+        monkeypatch.setattr("omlx.settings.resolve_default_base_path", lambda: resolved)
 
         settings = GlobalSettings.load()
 
@@ -2813,3 +2808,32 @@ class TestCORSMiddleware:
             assert resp.status_code == 200
             assert "access-control-allow-origin" in resp.headers
             assert resp.headers["access-control-allow-origin"] == "*"
+
+
+def test_boundary_snapshot_retention_survives_settings_round_trip(tmp_path):
+    """The retention budget must reach the scheduler across a restart.
+
+    ``CacheSettings`` persists through an explicit to_dict/from_dict pair rather
+    than ``**data``, so a field added to the dataclass but not to both halves of
+    that pair is accepted in memory and then silently dropped on load. That is
+    what happened on the first real-machine run of this feature: the settings
+    file said 4, the scheduler read 0, and a 261k-token prefill captured all 127
+    checkpoints as if the feature were not installed.
+    """
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.cache.boundary_snapshot_retention = 4
+    gs.save()
+
+    restored = GlobalSettings.load(base_path=tmp_path)
+    assert restored.cache.boundary_snapshot_retention == 4
+    assert restored.to_scheduler_config().boundary_snapshot_retention == 4
+
+
+def test_boundary_snapshot_retention_defaults_to_retaining_everything(tmp_path):
+    """A settings file written before this feature keeps the old behavior."""
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.save()
+
+    restored = GlobalSettings.load(base_path=tmp_path)
+    assert restored.cache.boundary_snapshot_retention == 0
+    assert restored.to_scheduler_config().boundary_snapshot_retention == 0
