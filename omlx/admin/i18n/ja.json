@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (default, OpenClaw / WorkBuddy compatible)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (legacy : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (no keepalive)",
+  "settings.advanced.vision_tower_text_only": "ビジョンタワーを外す (テキスト専用モード)",
+  "settings.advanced.vision_tower_text_only_hint": "画像を送らないエージェント向け: 読み込み後にビジョンタワーの重みを解放し (GLM-5.3-Flash: 347 テンソル、1.12 GB)、画像入力は明確なエラーで拒否します。M1 Ultra で計測 (05/09): 229k トークンのプロンプトが 180k 付近でメモリガードの目標に約 0.4 GB で達し 2 回停止しました。目標の下に留まる最も安価な方法です。次のモデル読み込みから適用。",
   "settings.language.section_label": "言語",
   "settings.language.label": "インターフェース言語",
   "settings.language.en": "English",

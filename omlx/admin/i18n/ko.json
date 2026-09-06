@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (default, OpenClaw / WorkBuddy compatible)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (legacy : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (no keepalive)",
+  "settings.advanced.vision_tower_text_only": "비전 타워 제거(텍스트 전용 모드)",
+  "settings.advanced.vision_tower_text_only_hint": "이미지를 보내지 않는 에이전트용: 로드 후 비전 타워 가중치를 해제하고(GLM-5.3-Flash: 347 텐서, 1.12GB) 이미지 입력은 명확한 오류로 거부합니다. M1 Ultra에서 측정(05/09): 229k 토큰 프롬프트가 180k 근처에서 메모리 가드 목표에 약 0.4GB 차이로 닿아 두 번 멈췄습니다. 목표 아래에 머무는 가장 저렴한 방법입니다. 다음 모델 로드부터 적용.",
   "settings.language.section_label": "언어",
   "settings.language.label": "인터페이스 언어",
   "settings.language.en": "English",

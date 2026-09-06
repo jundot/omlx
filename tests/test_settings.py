@@ -83,6 +83,7 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "vision_tower_text_only": False,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
         }

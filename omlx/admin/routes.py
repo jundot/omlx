@@ -258,6 +258,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    vision_tower_text_only: bool | None = None  # applies on next load
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -3563,6 +3564,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 "preserve_mid_system_cache",
                 True,
             ),
+            "vision_tower_text_only": getattr(global_settings.server, "vision_tower_text_only", False),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -3812,6 +3814,14 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.vision_tower_text_only is not None:
+        global_settings.server.vision_tower_text_only = bool(request.vision_tower_text_only)
+        import os as _os
+
+        if request.vision_tower_text_only:
+            _os.environ["OMLX_VISION_TOWER_TEXT_ONLY"] = "1"
+        else:
+            _os.environ.pop("OMLX_VISION_TOWER_TEXT_ONLY", None)
     if request.preserve_mid_system_cache is not None:
         global_settings.server.preserve_mid_system_cache = (
             request.preserve_mid_system_cache

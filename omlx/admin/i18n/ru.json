@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (по умолчанию, совместимо с OpenClaw / WorkBuddy)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (устаревший : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (без keep-alive)",
+  "settings.advanced.vision_tower_text_only": "Убрать башню зрения (режим только текст)",
+  "settings.advanced.vision_tower_text_only_hint": "Для агентов, которые не отправляют изображения: после загрузки веса башни зрения освобождаются (GLM-5.3-Flash: 347 тензоров, 1,12 ГБ), а ввод с изображениями отклоняется с понятной ошибкой. Измерено на M1 Ultra (05/09): промпт на 229k токенов упёрся в цель охранника памяти около 180k с запасом ~0,4 ГБ и дважды приостанавливался; это самый дешёвый способ остаться ниже. Применяется при следующей загрузке.",
   "settings.language.section_label": "Язык",
   "settings.language.label": "Язык интерфейса",
   "settings.language.en": "Английский",

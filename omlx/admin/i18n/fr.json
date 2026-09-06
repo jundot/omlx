@@ -528,6 +528,8 @@
   "settings.advanced.sse_keepalive_mode_chunk": "Chunk (default, OpenClaw / WorkBuddy compatible)",
   "settings.advanced.sse_keepalive_mode_comment": "Comment (legacy : keep-alive)",
   "settings.advanced.sse_keepalive_mode_off": "Off (no keepalive)",
+  "settings.advanced.vision_tower_text_only": "Retirer la tour de vision (mode texte seul)",
+  "settings.advanced.vision_tower_text_only_hint": "Pour les agents qui n'envoient jamais d'image : après le chargement, les poids de la tour de vision sont libérés (GLM-5.3-Flash : 347 tenseurs, 1,12 Go) et les entrées avec image sont refusées avec une erreur claire. Mesuré sur M1 Ultra (05/09) : un prompt de 229k jetons a atteint la cible du garde mémoire vers 180k à ~0,4 Go près et a fait deux pauses ; c'est le moyen le moins cher de rester en dessous. S'applique au prochain chargement.",
   "settings.language.section_label": "Langue",
   "settings.language.label": "Langue de l'interface",
   "settings.language.en": "English",
