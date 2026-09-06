@@ -77,6 +77,13 @@
     const REASONING_EFFORT_PRESETS = new Set([
         'low', 'medium', 'high', 'xhigh', 'max',
     ]);
+    // Assistant-style MTP drafters, whose model_type carries no "_mtp" suffix
+    // and so cannot be matched by rule. Suffixed families (qwen3_5_mtp,
+    // inkling_mtp, deepseek_v4_mtp, glm4_moe_lite_mtp, ...) are additionally
+    // matched by suffix in isVlmMtpDraftModel(), because mlx-vlm keeps adding
+    // them (DRAFTER_KIND_BY_MODEL_TYPE in
+    // mlx_vlm/speculative/drafters/__init__.py) and an exhaustive list here
+    // silently hides every family added after this file was last touched.
     const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
         'gemma4_assistant',
         'gemma4_unified_assistant',
@@ -7251,7 +7258,11 @@
             isVlmMtpDraftModel(model) {
                 const configType = String(model?.config_model_type || '').toLowerCase();
                 if (configType) {
-                    return VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType);
+                    // Checked first: muse_glimmer_assistant is a DFlash drafter
+                    // shipped under an "-assistant" name.
+                    if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) return false;
+                    return VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType)
+                        || configType.endsWith('_mtp');
                 }
                 return /assistant|(^|[-_/\s])mtp($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },

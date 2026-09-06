@@ -56,6 +56,28 @@ def test_dflash_draft_filter_claims_muse_glimmer_assistant():
     )[1].split("])", 1)[0]
 
 
+def test_vlm_mtp_draft_filter_matches_mtp_suffix_model_types():
+    """A recognized ``*_mtp`` model_type must not be excluded by the set.
+
+    ``config_model_type`` is present for every drafter oMLX has parsed, so the
+    typed branch decides on its own — the name-based fallback never runs. With
+    an exhaustive set, correctly identifying a drafter (e.g. ``inkling_mtp``)
+    was what removed it from the picker.
+    """
+    js = _dashboard_js()
+    body = _method_block(
+        js,
+        "isVlmMtpDraftModel(model) {",
+        "isSpecPrefillDraftModel(",
+    )
+
+    assert "configType.endsWith('_mtp')" in body
+    # DFlash must win: muse_glimmer_assistant is an "-assistant" DFlash drafter.
+    assert body.index("DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)") < body.index(
+        "configType.endsWith('_mtp')"
+    )
+
+
 def test_vlm_mtp_set_does_not_claim_muse_glimmer_assistant():
     js = _dashboard_js()
     vlm_mtp_set = js.split(

@@ -620,6 +620,20 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+        # Separate statement, not chained onto the branch above: the model
+        # compat returns False once already applied, and the drafter patch
+        # must still run on later loads. It depends on that compat having
+        # installed mlx_vlm.models.inkling, so it stays second.
+        from ..patches.mlx_vlm_inkling_mtp_compat import (
+            apply_mlx_vlm_inkling_mtp_compat_patch,
+        )
+
+        if apply_mlx_vlm_inkling_mtp_compat_patch():
+            logger.info(
+                "Inkling MTP drafter compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type == "muse_glimmer":
         from ..patches.mlx_vlm_muse_glimmer_compat import (
             apply_mlx_vlm_muse_glimmer_compat_patch,
