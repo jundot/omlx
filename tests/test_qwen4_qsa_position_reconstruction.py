@@ -8,7 +8,16 @@ from omlx.cache.type_handlers import Qwen4QSAKVCacheHandler
 
 
 def _state(positions):
-    return {"states": (None, None, None, positions)}
+    batch = positions.shape[0]
+    length = positions.shape[-1]
+    return {
+        "states": (
+            mx.zeros((batch, 1, length, 1)),
+            mx.zeros((batch, 1, length, 1)),
+            mx.zeros((batch, length, 1)),
+            positions,
+        )
+    }
 
 
 def _text(value, length, batch=1):
@@ -86,8 +95,17 @@ def test_unsupported_channel_count_is_rejected_in_every_state(segments):
 
 
 def test_incompatible_batch_shape_is_rejected():
+    first = _state(_text(1, 2, batch=1))
+    second = _state(_mrope((2, 3, 4), 2, batch=2))
+    second["states"] = (
+        mx.zeros((1, 1, 2, 1)),
+        mx.zeros((1, 1, 2, 1)),
+        mx.zeros((1, 2, 1)),
+        second["states"][3],
+    )
+
     with pytest.raises(ValueError, match="consistent batch dimension"):
-        _positions(_text(1, 2, batch=1), _mrope((2, 3, 4), 2, batch=2))
+        Qwen4QSAKVCacheHandler().concatenate_states([first, second])
 
 
 @pytest.mark.parametrize(
@@ -102,6 +120,44 @@ def test_non_serialized_position_shape_is_rejected_in_every_state(segments):
         _positions(*segments)
 
 
+def test_partial_auxiliary_state_is_rejected():
+    full = _state(_text(1, 4))
+    missing_auxiliary = {
+        "states": (
+            mx.zeros((1, 1, 4, 1)),
+            mx.zeros((1, 1, 4, 1)),
+            None,
+            None,
+        )
+    }
+
+    with pytest.raises(ValueError, match="complete QSA auxiliary state"):
+        Qwen4QSAKVCacheHandler().concatenate_states([full, missing_auxiliary])
+
+
+def test_empty_cache_block_is_rejected_in_non_empty_prefix():
+    with pytest.raises(ValueError, match="cannot contain empty cache blocks"):
+        Qwen4QSAKVCacheHandler().concatenate_states(
+            [_state(_text(1, 4)), {"states": (None, None, None, None)}]
+        )
+
+
+def test_direct_deserialize_rejects_unsupported_position_channels():
+    state = _state(mx.zeros((1, 2, 4), dtype=mx.int32))["states"]
+
+    with pytest.raises(ValueError, match="require 1 text channel or 3 MRoPE"):
+        Qwen4QSAKVCacheHandler().deserialize_state(state)
+
+
+def test_state_info_lists_every_qsa_state_element():
+    assert Qwen4QSAKVCacheHandler().get_state_info().state_keys == (
+        "keys",
+        "values",
+        "index_keys",
+        "index_position_ids",
+    )
+
+
 def test_card_572_fourteen_block_topology_reconstructs_exact_prefix():
     block_size = 2048
     segments = [_text(block, block_size) for block in range(14)]
@@ -111,9 +167,7 @@ def test_card_572_fourteen_block_topology_reconstructs_exact_prefix():
 
     assert result.shape == (1, 3, 28_672)
     # Text blocks on either side are duplicated into every MRoPE coordinate.
-    expected_text_prefix = [
-        block for block in range(9) for _ in range(block_size)
-    ]
+    expected_text_prefix = [block for block in range(9) for _ in range(block_size)]
     for channel in range(3):
         assert result[0, channel, : 9 * block_size].tolist() == expected_text_prefix
         assert result[0, channel, 10 * block_size : 11 * block_size].tolist() == (

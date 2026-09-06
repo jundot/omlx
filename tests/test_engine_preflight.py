@@ -181,10 +181,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
+        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -229,6 +231,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-next",
+        text_only=True,
     )
     evict.assert_not_awaited()
 

@@ -499,6 +499,11 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._get_admission_soft_target = (
             enforcer.get_admission_soft_target
         )
+        # Resident-vs-mmap is a throughput call and must not read the
+        # instantaneous ceiling, which dips right after a model swap.
+        _server_state.engine_pool._get_residency_ceiling = (
+            enforcer.get_residency_ceiling
+        )
         enforcer.start()
 
     # Startup: Preload pinned models in the background so uvicorn binds the

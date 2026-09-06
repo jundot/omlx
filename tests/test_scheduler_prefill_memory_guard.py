@@ -949,7 +949,7 @@ def test_preflight_charges_observed_max_transient():
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits
 
-    scheduler._prefill_transient_tracker._observed_max_bytes = (
+    scheduler._prefill_transient_tracker._dense_history.observed_max_bytes = (
         est.transient + 2 * 1024**3
     )
     with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
@@ -989,3 +989,134 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def _qwen4_prefill_profile():
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    return make_prefill_memory_profile(
+        SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        ),
+        compute_dtype_size=2,
+    )
+
+
+def _attach_qwen4_profile(scheduler: Scheduler) -> None:
+    profile = _qwen4_prefill_profile()
+    scheduler.memory_monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        compute_dtype_size=2,
+        prefill_memory_profile=profile,
+    )
+
+
+def test_qwen4_text_admission_uses_gathered_transient():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    assert gathered.kv_exact == dense.kv_exact
+    assert gathered.transient * 4 < dense.transient
+    assert scheduler._qwen4_text_gathered_pricing(True) is True
+    assert scheduler._qwen4_text_gathered_pricing(False) is False
+
+
+def test_qwen4_preflight_doors_use_gathered_for_text_only():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    cap = (dense.estimated + gathered.estimated) // 2
+    scheduler._memory_hard_limit_bytes = cap
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(
+                num_prompt_tokens=233_472, text_only=False
+            )
+        scheduler.preflight_or_raise(num_prompt_tokens=233_472, text_only=True)
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=233_472, text_only=True
+            )
+            is None
+        )
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=233_472, text_only=False
+            )
+            is not None
+        )
+
+
+def test_qwen4_image_request_preflight_stays_dense():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    dense = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=False,
+    )
+    gathered = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+        text_only=True,
+    )
+    assert dense is not None and gathered is not None
+    scheduler._memory_hard_limit_bytes = (dense.estimated + gathered.estimated) // 2
+    scheduler._memory_abort_limit_bytes = 10**18
+    request = _make_request(233_472)
+    request.vlm_inputs_embeds = object()
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        rejection = scheduler._preflight_memory_check(request)
+    assert rejection is not None

@@ -491,7 +491,7 @@ struct ModelCardSheet: View {
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 20)
         .padding(.vertical, 12)
     }
 

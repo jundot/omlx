@@ -30,7 +30,10 @@ import weakref
 
 import mlx.core as mx
 
-from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
+from omlx.memory_monitor import (
+    SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+    estimate_unfused_sdpa_call_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,17 @@ def _parse_force_tiled_env() -> bool | None:
     return None
 
 
+def _notify_bounded_route(provider, active: bool) -> None:
+    """Let the scheduler retire measurements from the previous route."""
+    try:
+        owner = getattr(provider, "__self__", None)
+        callback = getattr(owner, "_sdpa256_bounded_route_changed", None)
+        if callable(callback):
+            callback(active)
+    except Exception:
+        logger.debug("sdpa256 route notification failed", exc_info=True)
+
+
 def _tiled_route_required(queries, keys) -> bool:
     """Decide forced-fused vs default for a matched call (True = force).
 
@@ -113,12 +127,13 @@ def _tiled_route_required(queries, keys) -> bool:
     (issues #2155 / #2204), so force the fused path only when the unfused
     transient would not fit under the guard ceiling — or when no headroom
     info is available, keeping the memory-safe #2025 behavior."""
+    provider = _get_unfused_headroom_provider()
     if _FORCE_TILED is not None:
         if _FORCE_TILED:
             _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
+        _notify_bounded_route(provider, _FORCE_TILED)
         return _FORCE_TILED
     try:
-        provider = _get_unfused_headroom_provider()
         if provider is None:
             _note_tiled_route(
                 "no-provider",
@@ -133,6 +148,7 @@ def _tiled_route_required(queries, keys) -> bool:
                 "memory ceiling not available (enforcer state not yet "
                 "propagated)",
             )
+            _notify_bounded_route(provider, True)
             return True
         batch, n_q, q_len, _ = queries.shape
         transient = estimate_unfused_sdpa_call_bytes(
@@ -140,17 +156,22 @@ def _tiled_route_required(queries, keys) -> bool:
             q_len,
             keys.shape[-2],
             HEAD_DIM,
-            score_dtype_size=queries.dtype.size,
+            # The unfused fallback materializes fp32 scores even for bf16
+            # inputs (issue #2204 follow-up): pricing it at the query dtype
+            # halves the predicted matrix and admits OOM spikes at long
+            # context. Shared with the guard via the memory_monitor constant.
+            score_dtype_size=SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
         )
-        if transient > headroom:
+        bounded = transient > headroom
+        _notify_bounded_route(provider, bounded)
+        if bounded:
             _note_tiled_route(
                 "insufficient-headroom",
                 f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
                 f"guard headroom ~{headroom / 2**20:.0f}MiB at "
                 f"kv_len={keys.shape[-2]}",
             )
-            return True
-        return False
+        return bounded
     except Exception:
         _note_tiled_route("probe-error", "guard headroom probe failed")
         logger.debug("sdpa256 headroom probe failed", exc_info=True)
@@ -244,7 +265,15 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
 
 
 def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
-    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere."""
+    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere.
+
+    Explicit array masks never take the native fused call: MLX's fused
+    array-mask support is unproven and may silently fall back to the
+    unfused fp32 score matrix, which is exactly the O(L^2) spike this patch
+    exists to bound. The array-tiled implementation already handles bool and
+    additive masks, so route them there directly."""
+    if isinstance(mask, mx.array):
+        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
         isinstance(mask, str)
         and mask == "causal"
@@ -308,6 +337,7 @@ def _register_bounded_route(min_kv_len: int) -> bool:
             min_query_len=_SDPA256_MIN_Q_LEN,
             min_kv_len=min_kv_len,
             kv_tile=_KV_TILE,
+            supports_array_mask=True,
         )
     except Exception:
         logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)

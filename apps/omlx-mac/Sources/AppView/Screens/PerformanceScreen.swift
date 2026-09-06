@@ -27,8 +27,7 @@ struct PerformanceScreen: View {
             MemoryLifecycleSection(vm: vm)
             CacheSection(vm: vm)
 
-            HStack {
-                Spacer()
+            FooterBar(error: vm.lastError) {
                 Button(String(localized: "performance.button.apply",
                               defaultValue: "Apply",
                               comment: "Apply button at the bottom of the Performance screen")) {
@@ -36,16 +35,6 @@ struct PerformanceScreen: View {
                 }
                 .buttonStyle(.omlx(.primary))
                 .disabled(!vm.hasPendingChanges || vm.isSaving)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
             }
         }
         .task { await vm.load(client: services.client) }
@@ -76,7 +65,7 @@ private struct SchedulerSection: View {
                                  defaultValue: "Cap on simultaneous /v1 requests.",
                                  comment: "Sublabel for max concurrent requests")
             ) {
-                TextInput(text: $vm.maxConcurrentText, mono: true, width: 90)
+                TextInput(text: $vm.maxConcurrentText, mono: true, width: .controlNarrow)
             }
             Row(
                 label: String(localized: "performance.scheduler.embedding_batch_size",
@@ -86,7 +75,7 @@ private struct SchedulerSection: View {
                                  defaultValue: "Max input texts per embedding forward pass.",
                                  comment: "Sublabel for embedding batch size")
             ) {
-                TextInput(text: $vm.embeddingBatchSizeText, mono: true, width: 90)
+                TextInput(text: $vm.embeddingBatchSizeText, mono: true, width: .controlNarrow)
             }
             Row(
                 label: String(localized: "performance.scheduler.chunked_prefill",
@@ -96,8 +85,7 @@ private struct SchedulerSection: View {
                                  defaultValue: "Split long prompts across scheduler ticks so other requests can interleave.",
                                  comment: "Sublabel for chunked prefill toggle")
             ) {
-                Toggle("", isOn: $vm.chunkedPrefill)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.chunkedPrefill)
             }
             Row(
                 label: String(localized: "performance.scheduler.prefill_priority",
@@ -122,7 +110,6 @@ private struct SchedulerSection: View {
                     ],
                     icons: ["arrow.up.left.and.arrow.down.right", "speedometer"]
                 )
-                .frame(width: 240)
             }
         }
     }
@@ -153,8 +140,7 @@ private struct MemoryLifecycleSection: View {
                                  defaultValue: "Preflight prefill memory before kicking the engine and defer generation scheduling near the ceiling.",
                                  comment: "Sublabel for prefill memory guard")
             ) {
-                Toggle("", isOn: $vm.prefillMemoryGuard)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.prefillMemoryGuard)
             }
             Row(
                 label: String(localized: "performance.memory.guard_tier",
@@ -164,7 +150,7 @@ private struct MemoryLifecycleSection: View {
             ) {
                 Popup(
                     selection: $vm.memoryGuardTier,
-                    width: 150,
+                    width: .controlMedium,
                     options: [
                         ("safe",
                          String(localized: "performance.memory.guard_tier.safe",
@@ -202,7 +188,7 @@ private struct MemoryLifecycleSection: View {
                                             comment: "Placeholder for custom memory guard ceiling"),
                         mono: true,
                         suffix: "GB",
-                        width: 110
+                        width: .controlCompact
                     )
                 }
             }
@@ -224,7 +210,7 @@ private struct MemoryLifecycleSection: View {
                                         comment: "Placeholder text for the idle timeout field when disabled"),
                     mono: true,
                     suffix: "s",
-                    width: 110
+                    width: .controlCompact
                 )
             }
             Row(
@@ -236,8 +222,7 @@ private struct MemoryLifecycleSection: View {
                                  comment: "Sublabel for model fallback toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: $vm.modelFallback)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.modelFallback)
             }
         }
     }
@@ -307,8 +292,7 @@ private struct CacheSection: View {
                                  defaultValue: "Master switch for the engine's KV cache subsystem.",
                                  comment: "Sublabel for the master cache enable toggle")
             ) {
-                Toggle("", isOn: $vm.cacheEnabled)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.cacheEnabled)
             }
             Row(
                 label: String(localized: "performance.cache.hot_only",
@@ -318,8 +302,7 @@ private struct CacheSection: View {
                                  defaultValue: "Skip SSD spillover. Useful on fast machines with abundant RAM.",
                                  comment: "Sublabel for hot cache only toggle")
             ) {
-                Toggle("", isOn: $vm.hotCacheOnly)
-                    .labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $vm.hotCacheOnly)
                     .disabled(!vm.cacheEnabled)
             }
             Row(
@@ -334,7 +317,7 @@ private struct CacheSection: View {
                     text: $vm.hotCacheMaxSize,
                     placeholder: "0",
                     mono: true,
-                    width: 140
+                    width: .controlCompact
                 )
                 .disabled(!vm.cacheEnabled)
             }
@@ -350,7 +333,7 @@ private struct CacheSection: View {
                     text: $vm.ssdCacheDir,
                     placeholder: "<base_path>/cache",
                     mono: true,
-                    width: 280
+                    width: .controlWide
                 )
                 .disabled(!vm.cacheEnabled || vm.hotCacheOnly)
             }
@@ -368,7 +351,7 @@ private struct CacheSection: View {
                                         defaultValue: "auto",
                                         comment: "Memory field placeholder meaning automatic"),
                     mono: true,
-                    width: 140
+                    width: .controlCompact
                 )
                 .disabled(!vm.cacheEnabled || vm.hotCacheOnly)
             }
@@ -387,7 +370,7 @@ private struct CacheSection: View {
                                         defaultValue: "auto",
                                         comment: "Memory field placeholder meaning automatic"),
                     mono: true,
-                    width: 110
+                    width: .controlCompact
                 )
                 .disabled(!vm.cacheEnabled)
             }

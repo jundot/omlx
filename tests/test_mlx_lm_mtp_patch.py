@@ -2821,3 +2821,152 @@ class TestLoopTaxHygiene:
         assert tracker.recently_active(3.0)  # just-finished counts
         tracker.clear()
         assert not tracker.recently_active(3.0)
+
+
+class TestReconcileChunked:
+    def test_reconcile_re_prefills_in_scheduler_chunks(self, monkeypatch):
+        """The reconcile re-prefill uses the generator's prefill step, never a
+        single forward over the whole context: memory and sparse-attention
+        paths differ from the chunked prefill the request already had."""
+        from collections import deque
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+        import numpy as np
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        shapes = []
+
+        class _FakeCache:
+            def __init__(self):
+                self.offset = 0
+                self._mtp_undo = None
+
+        def fake_backbone(model, inputs, cache, n_confirmed=0):
+            shapes.append(int(inputs.shape[1]))
+            cache[0].offset += int(inputs.shape[1])
+            arr = np.full((1, int(inputs.shape[1]), 8), -10.0, dtype=np.float32)
+            arr[0, -1, 5] = 10.0
+            return mx.array(arr), None, None
+
+        monkeypatch.setattr(batch_generator, "_rebuild_singleton_cache", lambda m: [_FakeCache()])
+        monkeypatch.setattr(batch_generator, "_call_backbone", fake_backbone)
+        tokens = list(range(1300))
+        state = batch_generator._MtpState(uid=1, queue=deque())
+        batch = SimpleNamespace(
+            model=object(),
+            uids=[1],
+            tokens=[tokens],
+            _num_tokens=[len(tokens)],
+            samplers=[None],
+            fallback_sampler=lambda lp: mx.argmax(lp, axis=-1).astype(mx.uint32),
+            logits_processors=[],
+            _next_tokens=mx.array([999]),
+            _next_logprobs=[],
+            _token_context=[],
+            prompt_cache=[object()],
+            _omlx_mtp_state=state,
+            prefill_step_size=512,
+        )
+        assert batch_generator._reconcile_mtp_to_standard(batch, state) is True
+        assert shapes == [512, 512, 276], shapes
+        assert batch.prompt_cache[0].offset == 1300
+        assert batch._next_tokens.tolist() == [5]
+
+    @pytest.mark.parametrize("step", [128, 256])
+    @pytest.mark.parametrize("queued", [False, True])
+    def test_reconcile_inherits_generator_chunk_size(self, step, queued):
+        from collections import deque
+
+        import mlx.core as mx
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.models.llama import Model, ModelArgs
+
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        class ProbeModel(Model):
+            def __init__(self):
+                super().__init__(
+                    ModelArgs(
+                        model_type="llama",
+                        hidden_size=32,
+                        num_hidden_layers=2,
+                        intermediate_size=64,
+                        num_attention_heads=4,
+                        rms_norm_eps=1e-5,
+                        vocab_size=64,
+                    )
+                )
+                self.reconcile_shapes = []
+
+            def __call__(self, inputs, cache=None, return_hidden=False):
+                logits = super().__call__(inputs, cache=cache)
+                if return_hidden:
+                    self.reconcile_shapes.append(int(inputs.shape[1]))
+                    return logits, None
+                return logits
+
+        batch_generator.apply()
+        model = ProbeModel()
+        generator = BatchGenerator(model, prefill_step_size=step, max_tokens=16)
+        try:
+            generator.insert([[i % 64 for i in range(1300)]])
+            for _ in range(32):
+                generator.next()
+                if generator._generation_batch.uids:
+                    break
+            batch = generator._generation_batch
+            assert batch.uids
+            assert batch.prefill_step_size == step
+            history = list(batch.tokens[0])
+            queue = deque([(7, mx.zeros((64,)), "draft")]) if queued else deque()
+            state = batch_generator._MtpState(uid=batch.uids[0], queue=queue)
+            # Exercise the row projection used by multi-row reconciliation too.
+            row = batch_generator._make_row_batch(batch, 0, state=state)
+            assert row.prefill_step_size == step
+            target = row if queued else batch
+            assert batch_generator._reconcile_mtp_to_standard(target, state)
+            expected = [step] * (len(history) // step)
+            if len(history) % step:
+                expected.append(len(history) % step)
+            assert model.reconcile_shapes == expected
+            assert target.tokens[0] == history
+
+            reference = batch_generator._rebuild_singleton_cache(model)
+            tokens = mx.array(history, dtype=mx.uint32)
+            for start in range(0, len(history), step):
+                logits = model(tokens[None, start : start + step], cache=reference)
+                mx.eval(logits)
+            for actual, wanted in zip(target.prompt_cache, reference):
+                for a, b in zip(actual.state, wanted.state):
+                    assert mx.allclose(a, b).item()
+            expected_token = 7 if queued else mx.argmax(logits[:, -1, :]).item()
+            assert target._next_tokens.item() == expected_token
+        finally:
+            generator.close()
+
+
+def test_chain_rollback_finds_the_method_behind_the_vlm_adapter():
+    """On the server the batch does not see the LanguageModel: it sees
+    ``VLMModelAdapter``, which does not forward ``mtp_partial_rollback``. The
+    chain rollback looked only at the wrapper, found nothing, and EVERY reject
+    fell through to "cache layer rejects chain rollback" plus a reconcile —
+    measured on a GLM-5.3 vision checkpoint at 2 tok/s with cycles=0. It now
+    looks at the inner model too.
+    """
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    calls = []
+
+    class _Language:
+        def mtp_partial_rollback(self, cache, accepted, num_drafts):
+            calls.append((accepted, num_drafts))
+            return True
+
+    class _Adapter:
+        def __init__(self):
+            self._language_model = _Language()
+
+    assert bg._chain_rollback(_Adapter(), [], 1, 3, None) is True
+    assert calls == [(1, 3)]

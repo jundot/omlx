@@ -54,6 +54,18 @@ _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # dim-less path and matches the fp16/bf16 majority of MLX inference models.
 _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
+# Bytes/elem the unfused head-dim-256 fallback actually materializes on
+# Metal: MLX keeps the attention score matrix in fp32 even for bf16/fp16
+# models (measured ~33GiB IOAccelerator spike on a 160k-token VLM prefill at
+# head_dim=256). Shared by the sdpa256 route gate
+# (patches/sdpa256_attention._tiled_route_required) and the Qwen4 prefill
+# profile so the router and the guard price the real fallback identically.
+# Kept separate from _SDPA_FALLBACK_SCORE_DTYPE_SIZE: that default covers
+# the dim-less generic path where the compute dtype is unknown and the
+# fp16/bf16 majority is the better prior; widening it globally would
+# re-price unrelated models without evidence.
+SDPA256_UNFUSED_SCORE_DTYPE_SIZE = 4
+
 # Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
 # kernel instead of the unfused O(L^2) score-matrix fallback. Populated at
 # runtime by the kernel patch that installs the route (see
@@ -68,6 +80,7 @@ class _BoundedSDPAPrefillRoute:
     min_query_len: int
     min_kv_len: int
     kv_tile: int
+    supports_array_mask: bool
 
 
 _SDPA_TILED_PREFILL_HEAD_DIMS: dict[int, tuple[_BoundedSDPAPrefillRoute, ...]] = {}
@@ -79,18 +92,20 @@ def register_tiled_prefill_head_dim(
     min_query_len: int = 2,
     min_kv_len: int = 8192,
     kv_tile: int = 1024,
+    supports_array_mask: bool = False,
 ) -> None:
     """Register a bounded long-context route installed for one head dim.
 
     Multiple native routes may cover the same head dimension at different
-    thresholds. Store them independently so combining two registrations can
-    never invent shape coverage that neither route actually guarantees.
+    thresholds and mask capabilities. Store them independently so combining
+    registrations cannot invent coverage no individual route guarantees.
     """
     head_dim = int(head_dim)
     route = _BoundedSDPAPrefillRoute(
         min_query_len=max(2, int(min_query_len)),
         min_kv_len=max(1, int(min_kv_len)),
         kv_tile=max(1, int(kv_tile)),
+        supports_array_mask=bool(supports_array_mask),
     )
     routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(head_dim, ())
     if route not in routes:
@@ -249,7 +264,6 @@ class MemoryMonitor:
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
-
         # PagedCacheManager for KV cache memory measurement
         self._paged_cache_manager: Optional["PagedCacheManager"] = None
         self._block_size: int = 256  # Default block size
@@ -426,6 +440,10 @@ class MemoryMonitor:
         longer be reclaimed. The next load re-prices it via set_model_info.
         """
         self._ane_prefill_transient_bytes = 0
+
+    def set_ane_prefill_transient_bytes(self, value: int) -> None:
+        """Refresh the reservation after VLM ANE compilation."""
+        self._ane_prefill_transient_bytes = max(int(value), 0)
 
     def set_model_info(
         self,
@@ -688,8 +706,11 @@ class MemoryMonitor:
         if num_tokens <= 0:
             return 0
         if self._prefill_memory_profile is not None:
-            return self._prefill_memory_profile.estimate_resident_kv_bytes(
-                num_tokens, chunk_tokens=chunk_tokens
+            return (
+                self._prefill_memory_profile.estimate_resident_kv_bytes(
+                    num_tokens, chunk_tokens=chunk_tokens
+                )
+                + self._fixed_state_bytes
             )
         total = self.estimate_prompt_kv_bytes(num_tokens)
 
@@ -837,7 +858,19 @@ class MemoryMonitor:
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
         return attn + kv + self._ane_prefill_transient_bytes
 
-    def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
+    def is_qwen4_gathered_prefill_profile(self) -> bool:
+        """True when this monitor prices Qwen4 QSA gathered-core prefill."""
+        return isinstance(
+            self._prefill_memory_profile, _Qwen4ExpPrefillMemoryProfile
+        )
+
+    def estimate_chunk_transient_bytes(
+        self,
+        n_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+    ) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
 
         Isolates the per-chunk attention transient — the spike that drives
@@ -852,11 +885,19 @@ class MemoryMonitor:
         and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
+
+        ``gathered_core`` prices Qwen4 QSA as a gathered core instead of
+        dense Q×kv_len.
         """
         if self._prefill_memory_profile is not None:
-            return self._prefill_memory_profile.estimate_prefill_transient_bytes(
-                n_tokens, kv_len
-            )
+            profile = self._prefill_memory_profile
+            if isinstance(profile, _Qwen4ExpPrefillMemoryProfile):
+                return profile.estimate_prefill_transient_bytes(
+                    n_tokens,
+                    kv_len,
+                    gathered_core=gathered_core,
+                )
+            return profile.estimate_prefill_transient_bytes(n_tokens, kv_len)
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
@@ -1221,14 +1262,165 @@ class _DeepSeekV4PrefillMemoryProfile:
         return max(candidates, default=0)
 
 
+@dataclass(frozen=True)
+class _Qwen4ExpPrefillMemoryProfile:
+    """Prefill estimator for Qwen4 / Flash-Next hybrid GDN + QSA.
+
+    GDN layers keep a fixed recurrent state. QSA core attention, once the
+    gathered path is active, attends at most ``indexer_budget`` tokens.
+    The indexer still scores every compressed block (``kv_len / r``).
+    Dense ``Q x kv_len`` SDPA is the wrong price for that core.
+    """
+
+    qsa_layers: int
+    num_attention_heads: int
+    num_kv_heads: int
+    head_dim: int
+    indexer_n_heads: int
+    indexer_head_dim: int
+    indexer_budget: int
+    compress_ratio: int
+    dtype_size: float
+    score_dtype_size: float
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        if num_tokens <= 0 or self.qsa_layers <= 0:
+            return 0
+        per_layer = (
+            2 * self.num_kv_heads * self.head_dim * self.dtype_size
+            + self.indexer_head_dim * self.dtype_size
+            + 3 * 8
+        )
+        return int(self.qsa_layers * per_layer * int(num_tokens))
+
+    def estimate_prefill_transient_bytes(
+        self,
+        query_tokens: int,
+        kv_len: int,
+        *,
+        gathered_core: bool = False,
+    ) -> int:
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+        query_tokens = int(query_tokens)
+        kv_len = int(kv_len)
+        pooled = max(kv_len // max(self.compress_ratio, 1), 1)
+        indexer = int(
+            self.indexer_n_heads * query_tokens * pooled * 4
+            + self.indexer_n_heads * query_tokens * self.indexer_head_dim * 4
+        )
+        core_kv = kv_len
+        if gathered_core and kv_len > self.indexer_budget:
+            core_kv = min(kv_len, self.indexer_budget + self.compress_ratio - 1)
+
+        # The head_dim-256 sdpa256 patch keeps long-context prefill O(L):
+        # consult the same bounded-route registry the generic estimator uses
+        # (issue #2204 follow-up). Without it this profile always charges the
+        # dense Q x kv_len matrix, which made the guard shrink VLM chunks to
+        # crawl speed on 160k-context prefills even though the router forces
+        # a bounded kernel there.
+        core = estimate_unfused_sdpa_call_bytes(
+            self.num_attention_heads,
+            query_tokens,
+            core_kv,
+            self.head_dim,
+            SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+        )
+        bounded_routes = _SDPA_TILED_PREFILL_HEAD_DIMS.get(self.head_dim, ())
+        matching_routes = [
+            route
+            for route in bounded_routes
+            if route.supports_array_mask
+            and query_tokens >= route.min_query_len
+            and core_kv >= route.min_kv_len
+        ]
+        if matching_routes:
+            # Match the generic estimator's O(L) bound: fp32 output plus one
+            # fp32 score tile (largest registered tile). The core_kv is the
+            # K width of the real core-attention call, so a gathered QSA call
+            # whose reduced K is below the route floor stays dense-priced.
+            kv_tile = max(route.kv_tile for route in matching_routes)
+            tile_scores = (
+                self.num_attention_heads
+                * query_tokens
+                * min(kv_tile, core_kv)
+                * SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+            )
+            output = (
+                self.num_attention_heads * query_tokens * self.head_dim * 4
+            )
+            core = int(output + tile_scores)
+        return indexer + core
+
+
+def _make_qwen4_exp_prefill_memory_profile(
+    config: Any,
+    *,
+    compute_dtype_size: float,
+) -> PrefillMemoryProfile | None:
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    num_attention_heads = _cfg_get(config, "num_attention_heads")
+    num_kv_heads = _cfg_get(config, "num_key_value_heads")
+    head_dim = _cfg_get(config, "head_dim")
+    indexer_n_heads = _cfg_get(config, "indexer_n_heads")
+    indexer_head_dim = _cfg_get(config, "indexer_head_dim")
+    indexer_budget = _cfg_get(config, "indexer_budget")
+    compress_ratio = _cfg_get(config, "indexer_compress_ratio")
+    required = (
+        num_layers,
+        num_attention_heads,
+        num_kv_heads,
+        head_dim,
+        indexer_n_heads,
+        indexer_head_dim,
+        indexer_budget,
+        compress_ratio,
+    )
+    if not all(_pos_int(value) for value in required):
+        return None
+    if not isinstance(compute_dtype_size, (int, float)) or compute_dtype_size <= 0:
+        return None
+    layer_types = _cfg_get(config, "layer_types") or ()
+    qsa_layers = sum(
+        1
+        for kind in layer_types
+        if kind in {"qwen_sparse_attention", "full_attention"}
+    )
+    if qsa_layers <= 0:
+        interval = _cfg_get(config, "full_attention_interval") or 4
+        if not _pos_int(interval):
+            return None
+        qsa_layers = int(num_layers) // int(interval)
+    if qsa_layers <= 0:
+        return None
+    return _Qwen4ExpPrefillMemoryProfile(
+        qsa_layers=qsa_layers,
+        num_attention_heads=int(num_attention_heads),
+        num_kv_heads=int(num_kv_heads),
+        head_dim=int(head_dim),
+        indexer_n_heads=int(indexer_n_heads),
+        indexer_head_dim=int(indexer_head_dim),
+        indexer_budget=int(indexer_budget),
+        compress_ratio=int(compress_ratio),
+        dtype_size=float(compute_dtype_size),
+        score_dtype_size=float(compute_dtype_size),
+    )
+
+
 def make_prefill_memory_profile(
     config: Any,
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
 ) -> PrefillMemoryProfile | None:
-    """Build the one model-specific prefill strategy currently required."""
+    """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
+    if model_type.startswith("qwen4_exp"):
+        return _make_qwen4_exp_prefill_memory_profile(
+            config, compute_dtype_size=compute_dtype_size
+        )
     if not model_type.startswith("deepseek_v4"):
         return None
 

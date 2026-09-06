@@ -71,6 +71,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
+    text_only: bool = False,
 ) -> None:
     """Run route preflight after transient post-request cleanup settles.
 
@@ -91,11 +92,13 @@ async def _run_scheduler_preflight_with_cleanup_retry(
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
+            text_only=text_only,
         )
         if eviction_request is None:
             scheduler.preflight_or_raise(
                 num_prompt_tokens=num_prompt_tokens,
                 request_id=request_id,
+                text_only=text_only,
             )
             return
 
@@ -150,6 +153,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
+            text_only=text_only,
         )
         return
 

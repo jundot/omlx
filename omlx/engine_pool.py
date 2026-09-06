@@ -285,6 +285,7 @@ class EnginePool:
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server
         self._get_admission_soft_target: object | None = None  # Set by server
+        self._get_residency_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
@@ -293,8 +294,9 @@ class EnginePool:
         # rung can "succeed" marginally on every pass of a long prompt while
         # the durable rung behind it (ANE bank release) is never reached; a
         # request coming back for more headroom escalates instead of
-        # reclaiming again first. Bounded FIFO — request ids are transient.
-        self._prefill_headroom_recurring: OrderedDict[str, None] = OrderedDict()
+        # reclaiming again first. Values count callback attempts per request
+        # (>1 = recurring). Bounded FIFO — request ids are transient.
+        self._prefill_headroom_recurring: OrderedDict[str, int] = OrderedDict()
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
@@ -379,6 +381,8 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -398,10 +402,26 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
-        ceiling = self._fallback_admission_ceiling()
-        if ceiling <= 0:
-            ceiling = self._current_ceiling()
+        # Normal residency calls use the stable ceiling so a post-unload
+        # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
+        # pass its earlier live ceiling explicitly when only mmap fits.
+        if ceiling is None:
+            ceiling = self._residency_ceiling()
+            if ceiling <= 0:
+                ceiling = self._fallback_admission_ceiling()
+            if ceiling <= 0:
+                ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
+        if forced:
+            logger.warning(
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
+                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
+                "roughly 2.5x slower than a resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -411,10 +431,16 @@ class EnginePool:
         self,
         entry: EngineEntry,
         settings: object | None,
+        *,
+        ceiling: int | None = None,
     ) -> object | None:
         """Apply a forced mmap decision without mutating persisted settings."""
 
-        enabled, forced, _ = self._qwen4_ple_offload_status(entry, settings)
+        enabled, forced, _ = self._qwen4_ple_offload_status(
+            entry,
+            settings,
+            ceiling=ceiling,
+        )
         if not enabled or not forced or settings is None:
             return settings
         effective = copy.copy(settings)
@@ -465,6 +491,22 @@ class EnginePool:
         pools admit unconditionally).
         """
         cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _residency_ceiling(self) -> int:
+        """Stable ceiling for the resident-vs-mmap call (#PLE residency).
+
+        Wired to `enforcer.get_residency_ceiling`, which drops the vm_stat
+        component so a model swap does not push a table that fits onto SSD.
+        Returns 0 when no callback is wired up; callers fall back to the
+        admission ceiling.
+        """
+        cb = self._get_residency_ceiling
         if cb is None:
             return 0
         try:
@@ -1483,6 +1525,16 @@ class EnginePool:
                 model_id,
                 runtime_settings,
             )
+            qwen4_admission_ceiling = None
+            if (
+                (entry.config_model_type or "").replace("-", "_").lower()
+                == "qwen4_exp"
+            ):
+                candidate = self._current_ceiling()
+                if candidate <= 0:
+                    candidate = self._fallback_admission_ceiling()
+                if candidate > 0:
+                    qwen4_admission_ceiling = candidate
             unloaded_for_admission = False
 
             # Already loaded - just update access time
@@ -1570,9 +1622,18 @@ class EnginePool:
                 get_settings = getattr(self._settings_manager, "get_settings", None)
                 if callable(get_settings):
                     admission_settings = get_settings(model_id)
-            admission_size = self._entry_runtime_resident_size(
+            load_settings = self._effective_qwen4_model_settings(
                 entry,
                 admission_settings,
+                ceiling=qwen4_admission_ceiling,
+            )
+            qwen4_admission_override = load_settings is not admission_settings
+            runtime_load_settings = (
+                load_settings if qwen4_admission_override else runtime_settings
+            )
+            admission_size = self._entry_runtime_resident_size(
+                entry,
+                load_settings,
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
@@ -1716,10 +1777,15 @@ class EnginePool:
             await self._load_engine(
                 model_id,
                 force_lm=force_lm,
-                runtime_settings=runtime_settings,
+                runtime_settings=runtime_load_settings,
             )
 
             loaded = self._entries[model_id]
+            if qwen4_admission_override and expected_signature is not None:
+                # Automatic mmap is local to this admission attempt. Keep the
+                # user's requested variant as the reuse key so the next request
+                # does not reload the model merely because pressure recovered.
+                loaded.runtime_settings_signature = expected_signature
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
@@ -1915,43 +1981,61 @@ class EnginePool:
             return False
 
         evicted_any = False
+        evicted_count = 0
         reclaim_attempted = False
         ane_release_attempted = False
-        # Snapshot once per call: "a PREVIOUS pass for this request already
-        # got a reclaim". Marking inside this call must not flip it.
-        recurring = request_id in self._prefill_headroom_recurring
+        reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
-            while True:
-                current = max(
-                    mx.get_active_memory(),
-                    get_phys_footprint(),
-                    self._current_model_memory,
+            attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
+            self._prefill_headroom_recurring[request_id] = attempt
+            while len(self._prefill_headroom_recurring) > 512:
+                self._prefill_headroom_recurring.popitem(last=False)
+            # Count no-op calls too so another attempt prioritizes bank release.
+            recurring = attempt > 1
+
+            def _log_decision(outcome: str) -> None:
+                if ane_release_attempted:
+                    action = "release_ane"
+                elif reclaim_attempted:
+                    action = "reclaim_pool"
+                elif evicted_any:
+                    action = "evict_model"
+                else:
+                    action = "already_fit"
+                logger.info(
+                    "[prefill-eviction] request=%s retry=%d reason=%s "
+                    "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
+                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "predicted=%.2fGB target=%.2fGB evicted=%d",
+                    request_id,
+                    attempt,
+                    reason,
+                    action,
+                    outcome,
+                    recurring,
+                    active / 1024**3,
+                    footprint / 1024**3,
+                    self._current_model_memory / 1024**3,
+                    predicted / 1024**3,
+                    target / 1024**3,
+                    evicted_count,
                 )
+
+            while True:
+                active = mx.get_active_memory()
+                footprint = get_phys_footprint()
+                current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
-                    # A model eviction and/or the pooled-buffer reclaim below
-                    # created enough headroom; signal the caller to re-admit.
-                    # reclaim_attempted stands in for "the reclaim freed
-                    # memory": the helper's own footprint delta is
-                    # process-wide and can be masked by concurrent
-                    # allocation, but reaching this check with headroom
-                    # after an attempt means admission will now succeed.
+                    # Use the same sample for admission and its decision log.
+                    _log_decision("headroom_available")
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
-                    # No idle model left to evict -- the "No idle model
-                    # evicted" case that used to reject outright even when
-                    # tens of GB were reclaimable. Two rungs remain: the
-                    # cheap pooled-buffer reclaim, and shedding the
-                    # requesting model's own ANE prefill banks. Ordering
-                    # matters: prefill continuously refills MLX's buffer
-                    # cache, so on a long prompt the reclaim can "succeed"
-                    # by a marginal few GB on every pass while the durable
-                    # rung is never reached — a request that already had a
-                    # reclaim pass and is back for more headroom escalates
-                    # straight to the bank release instead.
+                    # Reclaim pooled buffers first, unless this request has
+                    # already tried to obtain headroom in a previous callback.
                     if recurring and not ane_release_attempted:
                         ane_release_attempted = True
                         await self._release_ane_prefill_for_headroom(
@@ -1968,9 +2052,6 @@ class EnginePool:
                         # requesting engine's own MLX thread, then let the
                         # loop re-measure.
                         reclaim_attempted = True
-                        self._prefill_headroom_recurring[request_id] = None
-                        while len(self._prefill_headroom_recurring) > 512:
-                            self._prefill_headroom_recurring.popitem(last=False)
                         await self._reclaim_pooled_buffers_for_prefill(
                             exclude_model_id, request_id
                         )
@@ -2008,6 +2089,8 @@ class EnginePool:
                             format_size(predicted),
                             format_size(target),
                         )
+                    # The scheduler may still fit a smaller chunk.
+                    _log_decision("insufficient_headroom")
                     return evicted_any
 
                 logger.info(
@@ -2021,6 +2104,7 @@ class EnginePool:
                 )
                 await self._unload_engine(victim)
                 evicted_any = True
+                evicted_count += 1
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:

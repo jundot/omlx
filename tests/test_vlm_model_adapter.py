@@ -392,6 +392,13 @@ class TestPerRequestMRoPEDecode:
         vlm.config.text_config.rope_parameters = None
         return vlm
 
+    def _make_qwen4_mrope_vlm_model(self):
+        """Create the exact root/text model types shipped by Flash Next."""
+        vlm = self._make_mrope_vlm_model()
+        vlm.config.model_type = "qwen4_exp"
+        vlm.config.text_config.model_type = "qwen4_exp_text"
+        return vlm
+
     def test_mrope_decode_uses_language_model_with_position_ids(self):
         """mRoPE decode with batch_rope_deltas should use language_model with position_ids."""
         import mlx.core as mx
@@ -484,6 +491,95 @@ class TestPerRequestMRoPEDecode:
         pos_ids = call_kwargs["position_ids"]
         assert pos_ids.shape == (3, 1, 1)
         assert pos_ids[0, 0, 0].item() == 16384.0
+
+    def test_qwen4_b1_text_prefill_uses_canonical_rank_two_positions(self):
+        """Three broadcast-identical text planes stay in QSA's proven shape."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_qwen4_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter.model_type == "qwen4_exp"
+
+        adapter.set_text_prefill_rope_delta(0.0)
+        cache_layer = MagicMock()
+        cache_layer.offset = 16384
+        adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
+
+        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
+        assert position_ids.shape == (1, 4)
+        assert position_ids.tolist() == [[16384, 16385, 16386, 16387]]
+
+    def test_qwen4_text_prefill_proof_is_one_shot_after_failed_call(self):
+        """An exception cannot leak the text-only proof into the next call."""
+        import mlx.core as mx
+        import pytest
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_qwen4_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        cache_layer = MagicMock()
+        cache_layer.offset = 64
+        vlm.language_model.side_effect = [RuntimeError("cancelled"), MagicMock()]
+
+        adapter.set_text_prefill_rope_delta(0.0)
+        with pytest.raises(RuntimeError, match="cancelled"):
+            adapter(mx.zeros((1, 2), dtype=mx.int32), cache=[cache_layer])
+
+        # No rebind at all: the old delta array is still present, but the
+        # stronger text-only capability must have been consumed by the failed
+        # call and therefore cannot affect this later generic request.
+        adapter(mx.zeros((1, 2), dtype=mx.int32), cache=[cache_layer])
+        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
+        assert position_ids.shape == (3, 1, 2)
+
+    def test_qwen4_text_prefill_b2_remains_rank_three(self):
+        """The text proof is not widened to an unqualified batched QSA path."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_qwen4_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter.set_text_prefill_rope_delta(0.0)
+        # A synthetic second delta demonstrates that the adapter refuses to
+        # reinterpret the one-row proof when the model call is batched.
+        adapter._batch_rope_deltas = mx.array([0.0, 0.0])
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array([128, 96])
+        adapter(mx.zeros((2, 2), dtype=mx.int32), cache=[cache_layer])
+
+        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
+        assert position_ids.shape == (3, 2, 2)
+
+    def test_qwen4_media_positions_remain_divergent_rank_three(self):
+        """True mRoPE media planes bypass text canonicalization unchanged."""
+        import mlx.core as mx
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_qwen4_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        divergent = mx.array(
+            [
+                [[10, 11, 12]],
+                [[10, 10, 11]],
+                [[7, 8, 8]],
+            ],
+            dtype=mx.int32,
+        )
+        adapter(
+            mx.zeros((1, 3), dtype=mx.int32),
+            cache=[MagicMock()],
+            inputs_embeds=mx.zeros((1, 3, 8)),
+            vlm_extra_kwargs={"position_ids": divergent},
+        )
+
+        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
+        assert position_ids.shape == (3, 1, 3)
+        assert mx.array_equal(position_ids, divergent).item()
 
     def test_non_minimax_mrope_mismatched_delta_size_keeps_existing_path(self):
         """Non-MiniMax mRoPE models keep prior no-position_ids mismatch behavior."""
@@ -581,6 +677,9 @@ class TestPerRequestMRoPEDecode:
         adapter = VLMModelAdapter(vlm)
 
         vlm.language_model._rope_deltas = mx.array(-42.0)
+        assert adapter.get_last_rope_deltas() == -42.0
+
+        vlm.language_model._rope_deltas = mx.array([[-42.0], [-7.0]])
         assert adapter.get_last_rope_deltas() == -42.0
 
         vlm.language_model._rope_deltas = None
