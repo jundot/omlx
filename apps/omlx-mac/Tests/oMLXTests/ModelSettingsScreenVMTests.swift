@@ -440,6 +440,22 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings.unoAdapterModel, "Uno-Q4")
     }
 
+    func testThinkingPatchCanClearK2SettingWithoutChangingOtherWireValues() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let cases: [(Bool??, String)] = [
+            (nil, "{}"),
+            (.some(nil), #"{"enable_thinking":null}"#),
+            (true, #"{"enable_thinking":true}"#),
+            (false, #"{"enable_thinking":false}"#),
+        ]
+        for (value, expected) in cases {
+            var patch = ModelSettingsPatch()
+            patch.enableThinking = value
+            XCTAssertEqual(String(decoding: try encoder.encode(patch), as: UTF8.self), expected)
+        }
+    }
+
     private func makeModel(id: String, configModelType: String?, unoBaseModelId: String? = nil) -> ModelDTO {
         ModelDTO(
             id: id,

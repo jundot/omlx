@@ -868,6 +868,7 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
+        if isK2Base { patch.enableThinking = .some(nil) }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
             self.lastError = nil

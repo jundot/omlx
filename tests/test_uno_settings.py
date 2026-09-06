@@ -138,9 +138,13 @@ async def test_admin_validates_pair_before_saving(models, tmp_path, monkeypatch)
             )
     assert not manager.list_profiles(base.name)
 
-    request.uno_adapter_model = adapter.name
+    manager.set_settings(base.name, ModelSettings(enable_thinking=False))
+    request = routes.ModelSettingsRequest(
+        uno_enabled=True, uno_adapter_model=adapter.name, enable_thinking=None
+    )
     await routes.update_model_settings(base.name, request, is_admin=True)
     assert manager.get_settings(base.name).uno_adapter_model == adapter.name
+    assert manager.get_settings(base.name).enable_thinking is None
     await routes.update_model_settings(
         base.name, routes.ModelSettingsRequest(uno_enabled=False), is_admin=True
     )
@@ -162,13 +166,17 @@ async def test_adapter_is_not_a_standalone_api_model(models, tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_closing_stream_waits_for_worker_and_releases_request(monkeypatch):
+@pytest.mark.parametrize("memory_abort", [False, True])
+async def test_closing_stream_waits_for_worker_and_releases_request(
+    monkeypatch, memory_abort
+):
     import asyncio
     import threading
     from unittest.mock import MagicMock
 
     from omlx.engine.base import GenerationOutput
     from omlx.engine.uno import UnoEngine
+    from omlx.exceptions import PrefillMemoryAbortedError
 
     engine = UnoEngine("base", adapter_path="adapter")
     engine._prefill_guard = MagicMock()
@@ -187,7 +195,13 @@ async def test_closing_stream_waits_for_worker_and_releases_request(monkeypatch)
     stream = engine.stream_generate("prompt")
     await anext(stream)
     assert engine.has_active_requests()
-    await asyncio.wait_for(stream.aclose(), timeout=2)
+    if memory_abort:
+        assert await engine.abort_all_requests() == 1
+        assert await engine.abort_all_requests() == 0
+        with pytest.raises(PrefillMemoryAbortedError, match="process memory limit"):
+            await asyncio.wait_for(anext(stream), timeout=2)
+    else:
+        await asyncio.wait_for(stream.aclose(), timeout=2)
     assert ended.is_set() and not engine._lock.locked()
     assert not engine.has_active_requests()
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .patches.k2_horizon.checkpoint import checkpoint_files
 
+# Context limits: https://github.com/ifm-ai/uno/tree/main/examples (uno_1B and uno_8B).
 _BASES = {
     (1536, 28, 5120, 64256): ("IFM/K2-Horizon-0.9B", 131072),
     (4096, 36, 12288, 250624): ("IFM/K2-Horizon-7B", 262144),

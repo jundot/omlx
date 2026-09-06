@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native MLX linear two-pass Uno decoding with request-owned KV and RNG."""
 
+# Psi-Spec reference: https://github.com/ifm-ai/uno/blob/main/nano_vllm_uno/engine/two_pass_decoding.py
+
 from __future__ import annotations
 
 import math
@@ -34,7 +36,7 @@ def acceptance_and_residual(p, q, proposals, uniforms):
     accepted = uniforms < mx.minimum(ratio, 1)
     residual = mx.maximum(p - q, 0)
     mass = mx.sum(residual, axis=-1, keepdims=True)
-    # Matches the reference's degenerate-residual rule; p == q always accepts.
+    # Psi-Spec returns p when correction mass is zero.
     residual = mx.where(mass > 0, residual / mx.where(mass > 0, mass, 1), p)
     return accepted, residual
 
@@ -66,6 +68,7 @@ class UnoDecoder:
     ):
         if not getattr(model, "_uno_adapter_loaded", False):
             raise ValueError("Uno decoding requires a validated conditional adapter")
+        # The released Uno recipes use eight-token blocks. Tails may be shorter.
         if type(block_size) is not int or not 1 <= block_size <= 8:
             raise ValueError("Uno block_size must be in [1, 8]")
         if not math.isfinite(temperature) or temperature < 0:
@@ -104,7 +107,7 @@ class UnoDecoder:
             if layer.offset != length:
                 raise RuntimeError("Uno KV rollback failed")
 
-    def generate(self, prompt, *, max_tokens, cancelled=None):
+    def generate(self, prompt, *, max_tokens, cancelled=None, prompt_cache=None):
         if not prompt or type(max_tokens) is not int or max_tokens < 0:
             raise ValueError(
                 "Uno requires a nonempty prompt and nonnegative max_tokens"
@@ -115,14 +118,19 @@ class UnoDecoder:
         ):
             raise ValueError("Uno prompt token outside vocabulary")
         committed = list(prompt)
-        cache = make_prompt_cache(self.model)
+        cache = make_prompt_cache(self.model) if prompt_cache is None else prompt_cache
+        offset = cache[0].offset
+        if not 0 <= offset < len(prompt) or any(c.offset != offset for c in cache):
+            raise ValueError("Uno prefix cache must leave at least one uncached token")
         if len(prompt) > 1 and max_tokens:
-            for start in range(0, len(prompt) - 1, self.prefill_step_size):
+            for start in range(offset, len(prompt) - 1, self.prefill_step_size):
                 if cancelled is not None and cancelled():
                     return
                 end = min(len(prompt) - 1, start + self.prefill_step_size)
                 self.model(mx.array([prompt[start:end]]), cache=cache)
                 mx.eval([layer.state for layer in cache])
+                mx.synchronize()
+                mx.clear_cache()
         emitted = 0
         while emitted < max_tokens:
             if cancelled is not None and cancelled():
@@ -131,6 +139,7 @@ class UnoDecoder:
             frontier = len(committed)
             if any(layer.offset != frontier - 1 for layer in cache):
                 raise RuntimeError("Uno draft must start with one uncached seed")
+            # Upstream noise.py uses [1, mask_token_id). Released K2 masks equal vocab_size.
             noise = mx.random.randint(
                 1, self.model.args.vocab_size, shape=(length - 1,), key=self._key()
             )
@@ -181,6 +190,8 @@ class UnoDecoder:
             self._trim(cache, len(committed) - 1)
             if finish is None and emitted == max_tokens:
                 finish = "length"
+            mx.synchronize()
+            mx.clear_cache()
             yield UnoCycle(
                 tuple(output),
                 min(accepted, len(output) - 1),

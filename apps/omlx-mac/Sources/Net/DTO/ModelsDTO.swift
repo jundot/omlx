@@ -178,7 +178,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var presencePenalty: Double? = nil
     var repetitionPenalty: Double? = nil
     var ttlSeconds: Int? = nil
-    var enableThinking: Bool? = nil
+    var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil

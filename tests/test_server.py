@@ -369,6 +369,23 @@ class TestGetSamplingParams:
         _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(None, None)
         assert rep_penalty == 1.3
 
+    def test_uno_reports_inherited_penalty_and_accepts_neutral_override(self):
+        from omlx.engine.uno import UnoEngine
+        from omlx.exceptions import InvalidRequestError
+
+        self._state.sampling = SamplingDefaults(repetition_penalty=1.05)
+        settings = ModelSettings(uno_enabled=True, uno_adapter_model="uno")
+        with patch("omlx.server.get_model_settings_for_request", return_value=settings):
+            penalty = get_sampling_params(None, None)[3]
+            with pytest.raises(
+                InvalidRequestError, match="repetition_penalty=1.0.*global sampling"
+            ):
+                UnoEngine._validate_options(repetition_penalty=penalty)
+            settings.repetition_penalty = 1.0
+            penalty = get_sampling_params(None, None)[3]
+            UnoEngine._validate_options(repetition_penalty=penalty)
+        assert self._state.sampling.repetition_penalty == 1.05
+
     def test_force_sampling(self):
         """Test force_sampling ignores sampling params but honors max_tokens."""
         self._state.sampling = SamplingDefaults(
