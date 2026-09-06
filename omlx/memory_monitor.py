@@ -1550,8 +1550,20 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
     dtype_size: float,
+    kv_dtype_size: float | None = None,
 ) -> float | None:
-    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions."""
+    """Price Qwen4 QSA K/V plus its raw index keys and MRoPE positions.
+
+    ``dtype_size`` prices the *indexer* keys and positions, which are always
+    full precision (the QSA block selection is a discrete fp32 top-k; quantizing
+    its inputs would flip selections -- Fix 2). ``kv_dtype_size`` prices the
+    quantized-capable K/V and defaults to ``dtype_size`` (the pre-Fix-2 bf16
+    reality). Callers pass the TurboQuant fractional width (``bits/8 +
+    2/head_dim``) here ONLY when KV is quantized *during* prefill (empty-init
+    mode); post-prefill conversion leaves the prefill peak at bf16, so the
+    caller must keep the bf16 width or preflight will over-admit and OOM
+    mid-prefill.
+    """
     if not str(_cfg_get(config, "model_type", "")).startswith("qwen4_exp"):
         return None
     if cache_list is None:
@@ -1580,10 +1592,11 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     # QSA keeps ordinary K/V, one raw index-key vector, and up to three int64
     # MRoPE coordinates for every cached token. Text-only positions use one
     # coordinate, but charging all three keeps image requests conservative.
+    kv_width = float(dtype_size if kv_dtype_size is None else kv_dtype_size)
     per_layer = (
-        2 * num_kv_heads * head_dim * float(dtype_size)
-        + indexer_head_dim * float(dtype_size)
-        + 3 * 8
+        2 * num_kv_heads * head_dim * kv_width  # K/V: quantized-capable width
+        + indexer_head_dim * float(dtype_size)  # index keys: always full precision
+        + 3 * 8  # MRoPE positions: int64
     )
     return float(qsa_layers * per_layer)
 

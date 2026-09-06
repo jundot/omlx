@@ -1237,6 +1237,12 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         # index state must not be copied into every boundary snapshot.
         "QSAKVCache",
         "QSAQuantizedKVCache",
+        # TurboQuant-quantized QSA singleton (Fix 2). Its handler dequantizes
+        # K/V to dense on store and slices the dense keys/values/index arrays
+        # along the token axis, exactly like QSAQuantizedKVCache. The batch
+        # variant (BatchQSATurboQuantKVCache) is intentionally omitted, matching
+        # BatchQSAKVCache: decode-side boundary capture keeps its full state.
+        "QSATurboQuantKVCache",
     }
 )
 
@@ -1245,6 +1251,12 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
     {
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        # Qwen4-Exp QSA full-attention layers, TurboQuant-quantized (Fix 2).
+        # These subclass TurboQuantKVCache / BatchTurboQuantKVCache and carry a
+        # full-precision indexer side-band; for TQ recognition (sizing,
+        # skip-last) they behave exactly like the base TQ caches.
+        "QSATurboQuantKVCache",
+        "BatchQSATurboQuantKVCache",
     }
 )
 
@@ -1255,7 +1267,31 @@ def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
 
 def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     """Cache layer counted by TurboQuant's skip-last full-attention rule."""
-    return isinstance(cache_obj, _MLXKVCache) or _is_turboquant_kv_cache(cache_obj)
+    return (
+        isinstance(cache_obj, _MLXKVCache)
+        or _is_turboquant_kv_cache(cache_obj)
+        # Pre-conversion QSA layers are counted so skip-last enumerates the
+        # 12 QSA full-attention layers before they are quantized (Fix 2).
+        or type(cache_obj).__name__ == "QSAKVCache"
+    )
+
+
+def _qsa_turboquant_cls() -> type | None:
+    """``QSATurboQuantKVCache`` if the qwen4_exp TurboQuant path is available.
+
+    Returns None in environments without the vendored qwen4_exp model or the
+    TurboQuant kernels; callers then leave QSA layers as full-precision
+    QSAKVCache (pre-Fix-2 behavior), never a lossy blanket TurboQuantKVCache
+    that would drop the indexer side-band.
+    """
+    try:
+        from mlx_vlm.models.qwen4_exp.language import (  # noqa: PLC0415
+            QSATurboQuantKVCache,
+        )
+
+        return QSATurboQuantKVCache
+    except Exception:  # noqa: BLE001 - optional model / acceleration path
+        return None
 
 
 class _BoundaryStoreUnavailable(Exception):
@@ -1810,6 +1846,17 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
+        # Fix 2 phase B (OFF by default): quantize QSA K/V *during* the cold
+        # prefill (empty-init) instead of after it, so the first-prefill peak
+        # holds quantized KV and the ceiling can rise toward the native 262k.
+        # Quality-affecting on a 2-bit-weight checkpoint (later chunks read
+        # quantized earlier-chunk KV), so it stays behind an explicit setting
+        # pending a coherence A/B. When off, QSA KV is quantized post-prefill
+        # (phase A) and the first-prefill ceiling is unchanged.
+        self._qsa_tq_empty_init: bool = (
+            os.environ.get("OMLX_QWEN4_QSA_TQ_EMPTY_INIT", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
         self._glm_dsa_adaptive_prefill = None
@@ -3301,6 +3348,29 @@ class Scheduler:
                 "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
+                # Qwen4-Exp QSA full-attention layers (Fix 2). QSAKVCache
+                # subclasses the *vendored* qwen4_exp KVCache, not mlx_lm's, so
+                # it fails the isinstance(KVCache) gate above and must be
+                # allowlisted by name. Its K/V is an ordinary contiguous
+                # [B, n_kv, T, D] tensor; the indexer side-band is orthogonal to
+                # what TurboQuant quantizes. The conversion sites map it to
+                # QSATurboQuantKVCache (not a blanket TurboQuantKVCache, which
+                # would drop update_indexer). QSATurboQuantKVCache itself is
+                # listed so an already-converted warm/restored cache stays
+                # eligible.
+                "QSAKVCache",
+                "QSATurboQuantKVCache",
+                # Qwen4-Exp's 36 GDN/linear-attention layers use the *vendored*
+                # qwen4_exp ArraysCache (an independent _BaseCache subclass), not
+                # mlx_lm's, so they fail the isinstance(ArraysCache) gate above
+                # (Fix 2). Without this name entry ALL 48 layers must pass _ok,
+                # but the 36 vendored ArraysCache layers do not -> eligibility
+                # returns False -> QSA KV is never quantized. ArraysCache is a
+                # pass-through recurrent-state cache TurboQuant never converts
+                # (the conversion sites touch only KVCache/QSAKVCache/CacheList),
+                # so allowlisting it by name only lets the hybrid pass; the QSA
+                # layers still carry the conversion.
+                "ArraysCache",
             ):
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
@@ -3349,8 +3419,17 @@ class Scheduler:
 
         converted = 0
         bits = float(self._turboquant_kv_bits)
+        qsa_tq_cls = _qsa_turboquant_cls()
         for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
+            if type(cache_obj).__name__ == "QSAKVCache":
+                # Qwen4-Exp QSA layer (Fix 2). QSAKVCache is not an mlx_lm
+                # KVCache, so it must be handled before the isinstance branch;
+                # map to QSATurboQuantKVCache to preserve update_indexer.
+                if i == last_kv_idx or qsa_tq_cls is None:
+                    continue
+                prompt_cache[i] = qsa_tq_cls(bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache(bits=bits)
@@ -3391,8 +3470,16 @@ class Scheduler:
 
         converted = 0
         bits = float(self._turboquant_kv_bits)
+        qsa_tq_cls = _qsa_turboquant_cls()
         for i, cache_obj in enumerate(prompt_cache):
-            if isinstance(cache_obj, KVCache):
+            if type(cache_obj).__name__ == "QSAKVCache":
+                # Qwen4-Exp QSA layer (Fix 2): quantize K/V, copy the indexer
+                # keys/positions across at full precision.
+                if i == last_kv_idx or qsa_tq_cls is None:
+                    continue
+                prompt_cache[i] = qsa_tq_cls.from_cache(cache_obj, bits=bits)
+                converted += 1
+            elif isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
@@ -3492,6 +3579,24 @@ class Scheduler:
             prompt_cache = existing_cache
         else:
             prompt_cache = make_prompt_cache(self.model)
+
+        # Fix 2.B (setting-gated, OFF by default): quantize the QSA K/V *during*
+        # the cold prefill by seeding empty QSATurboQuantKVCache layers, so the
+        # first-prefill peak holds quantized KV. Only for fresh QSA prefills;
+        # phase A (post-prefill convert, below) is the default and leaves the
+        # first-prefill ceiling unchanged.
+        if (
+            self._qsa_tq_empty_init
+            and existing_cache is None
+            and self._turboquant_kv_bits is not None
+            and any(type(c).__name__ == "QSAKVCache" for c in prompt_cache)
+            and self._turboquant_eligible(prompt_cache)
+        ):
+            self._apply_turboquant_kv_empty(prompt_cache)
+            logger.info(
+                "Fix 2.B: QSA empty-init quantized prefill active (%s-bit)",
+                self._turboquant_kv_bits,
+            )
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -5506,6 +5611,48 @@ class Scheduler:
                 else ""
             ),
         )
+
+        # Diagnostic memory-breakdown trace (opt-in, OMLX_QWEN4_MEM_TRACE=1).
+        # Isolates the per-chunk composition of the prefill peak: phys footprint
+        # vs Metal active vs Metal pool vs summed KV+index cache bytes, so the
+        # real per-token marginal cost (and which term scales) is measurable.
+        _memtrace = os.environ.get("OMLX_QWEN4_MEM_TRACE")
+        if _memtrace:
+            try:
+                kv_nbytes = 0
+                for _c in state.cache or []:
+                    nb = getattr(_c, "nbytes", None)
+                    if isinstance(nb, int):
+                        kv_nbytes += nb
+                _phys = get_phys_footprint() / 1024**3
+                _active = mx.get_active_memory() / 1024**3
+                _pool = mx.get_cache_memory() / 1024**3
+                _peak = mx.get_peak_memory() / 1024**3
+                _extra = ""
+                # Level 2: synchronously drain the free Metal pool and
+                # re-measure phys, to prove how much of the footprint is
+                # reclaimable-but-uncredited vs genuinely live.
+                if _memtrace == "2":
+                    _sync_and_clear_cache(self._stream)
+                    _extra = " phys_after_clear=%.2fGB pool_after=%.2fGB" % (
+                        get_phys_footprint() / 1024**3,
+                        mx.get_cache_memory() / 1024**3,
+                    )
+                    mx.reset_peak_memory()
+                logger.info(
+                    "[memtrace] tok=%d chunk=%d phys=%.2fGB active=%.2fGB "
+                    "pool=%.2fGB peak=%.2fGB kv=%.2fGB%s",
+                    state.tokens_processed,
+                    n,
+                    _phys,
+                    _active,
+                    _pool,
+                    _peak,
+                    kv_nbytes / 1024**3,
+                    _extra,
+                )
+            except Exception:
+                pass
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
         # pool and IOAccelerator-backed allocations that don't show up in
@@ -13011,7 +13158,7 @@ class Scheduler:
                 except Exception:
                     pass
 
-            if (
+            tq_active = (
                 self._turboquant_kv_bits is not None
                 and isinstance(head_dim, int)
                 and not isinstance(head_dim, bool)
@@ -13025,7 +13172,8 @@ class Scheduler:
                         self._model_uses_mla() or self._model_uses_attention_sinks()
                     )
                 )
-            ):
+            )
+            if tq_active:
                 tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
                 if (
                     self._turboquant_skip_last
@@ -13038,12 +13186,38 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
+            # QSA K/V is only quantized *during* prefill (so the prefill-peak
+            # estimate may drop) under the empty-init setting (Fix 2.B). With
+            # post-prefill conversion (2.A, default) the prefill peak holds bf16
+            # KV, so the estimator must keep the bf16 width or preflight would
+            # over-admit and OOM mid-prefill.
+            qsa_kv_width = None
+            if tq_active and getattr(self, "_qsa_tq_empty_init", False):
+                tq_w = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                qsa_layers = sum(
+                    1
+                    for c in (cache_list_for_tq or [])
+                    if type(c).__name__
+                    in ("QSAKVCache", "QSATurboQuantKVCache", "BatchQSAKVCache")
+                )
+                if (
+                    self._turboquant_skip_last
+                    and not isinstance(qsa_layers, bool)
+                    and qsa_layers > 1
+                ):
+                    qsa_kv_width = (
+                        (qsa_layers - 1) * tq_w + base_dtype_size
+                    ) / qsa_layers
+                else:
+                    qsa_kv_width = tq_w
+
             kv_bytes_per_token = None
             if estimate_qwen4_exp_kv_bytes_per_token is not None:
                 kv_bytes_per_token = estimate_qwen4_exp_kv_bytes_per_token(
                     config,
                     cache_list_for_tq,
                     base_dtype_size,
+                    kv_dtype_size=qsa_kv_width,
                 )
             if (
                 kv_bytes_per_token is None

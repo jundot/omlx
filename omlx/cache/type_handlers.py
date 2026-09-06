@@ -43,6 +43,7 @@ class CacheType(Enum):
     QWEN4_QSA_KVCACHE = "QSAKVCache"
     QWEN4_QSA_QUANTIZED_KVCACHE = "QSAQuantizedKVCache"
     QWEN4_BATCH_QSA_KVCACHE = "BatchQSAKVCache"
+    QWEN4_QSA_TURBOQUANT_KVCACHE = "QSATurboQuantKVCache"
 
 
 @dataclass
@@ -1748,6 +1749,35 @@ class Qwen4QSAQuantizedKVCacheHandler(Qwen4QSAKVCacheHandler):
         )
         self._validate_serialized_state(elements)
         return elements
+
+
+class Qwen4QSATurboQuantKVCacheHandler(Qwen4QSAKVCacheHandler):
+    """Store TurboQuant-quantized QSA caches as dense APC-compatible blocks.
+
+    Fix 2. The TurboQuant K/V state is dequantized to dense bf16 on store (the
+    same strategy Qwen4QSAQuantizedKVCacheHandler uses for the affine variant),
+    so slicing/concat and the restored cache reuse the plain-QSAKVCache paths
+    unchanged; the scheduler re-quantizes the restored dense cache on the next
+    insert. The full-precision indexer keys/positions are stored verbatim.
+    """
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_QSA_TURBOQUANT_KVCACHE
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        if getattr(cache_obj, "keys", None) is None:
+            dense_keys = dense_values = None
+        else:
+            dense_keys, dense_values = cache_obj.dequantize()
+            dense_keys = dense_keys.astype(mx.bfloat16)
+            dense_values = dense_values.astype(mx.bfloat16)
+        return (
+            dense_keys,
+            dense_values,
+            cache_obj.index_keys,
+            _serialize_qsa_positions(cache_obj.index_position_ids),
+        )
 
 
 class Qwen4BatchQSAKVCacheHandler(CacheTypeHandler):

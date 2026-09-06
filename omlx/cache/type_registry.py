@@ -21,6 +21,7 @@ from .type_handlers import (
     Qwen4BatchQSAKVCacheHandler,
     Qwen4QSAKVCacheHandler,
     Qwen4QSAQuantizedKVCacheHandler,
+    Qwen4QSATurboQuantKVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -79,6 +80,10 @@ class CacheTypeRegistry:
         "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
         "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
         "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
+        # Fix 2: TurboQuant-quantized QSA singleton. Stored as dense blocks by
+        # its handler; the batch variant is not stored (extracted to singletons
+        # before storage, like BatchQSAKVCache).
+        "QSATurboQuantKVCache": CacheType.QWEN4_QSA_TURBOQUANT_KVCACHE,
     }
 
     # Default handler instance
@@ -271,6 +276,7 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(MiniMaxM3BatchKVCacheHandler())
     CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
     CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4QSATurboQuantKVCacheHandler())
     CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
 
 

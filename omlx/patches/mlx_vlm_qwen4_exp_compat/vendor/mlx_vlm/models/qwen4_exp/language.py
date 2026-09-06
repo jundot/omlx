@@ -33,6 +33,21 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 
+# TurboQuant KV quantization for the QSA full-attention layers (Fix 2). The
+# import is guarded because the TurboQuant kernels live in mlx_vlm/omlx and may
+# be unavailable in stripped environments; when absent, QSATurboQuantKVCache is
+# simply never defined and the scheduler's conversion sites skip QSA layers
+# (KV stays bf16, i.e. pre-Fix-2 behavior).
+try:
+    from mlx_vlm.turboquant import TurboQuantKVCache as _TQKVCache
+    from omlx.turboquant_kv import BatchTurboQuantKVCache as _BatchTQKVCache
+
+    _QSA_TURBOQUANT_AVAILABLE = True
+except Exception:  # noqa: BLE001 - optional acceleration path
+    _TQKVCache = object  # type: ignore[assignment,misc]
+    _BatchTQKVCache = object  # type: ignore[assignment,misc]
+    _QSA_TURBOQUANT_AVAILABLE = False
+
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
@@ -1007,6 +1022,269 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
     def nbytes(self):
         size = 0 if self.keys is None else super().nbytes
         return size + self.indexer_nbytes
+
+
+if _QSA_TURBOQUANT_AVAILABLE:
+
+    class QSATurboQuantKVCache(_TQKVCache):
+        """TurboQuant-quantized QSA cache; indexer state stays full precision.
+
+        Fix 2. K/V are MSE-quantized by the inherited ``TurboQuantKVCache``
+        machinery; the raw indexer keys and MRoPE positions ride alongside in
+        bf16/int64. The QSA block selection is a discrete fp32 top-k
+        (``Qwen4ExpQSAIndexer`` scores in float32), so quantizing its inputs
+        would flip which blocks are attended -- a structural error, not a smooth
+        one. They are cheap (~280 B/token/layer) and become the KV floor.
+
+        Subclassing ``TurboQuantKVCache`` is deliberate: the omlx SDPA and
+        MTP-verify patches (``omlx/patches/turboquant_attention.py``) dispatch on
+        ``isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache))``, so
+        this cache inherits both -- including the fix for the non-subscriptable
+        ``_QuantizedStateProxy`` in the verify per-row loop -- with no patch
+        change.
+
+        ``state`` is intentionally *not* overridden to a 4-tuple: the batch
+        merge path (``BatchTurboQuantKVCache.merge``) unpacks ``ks, vs =
+        c.state``, so the indexer side-band travels as attributes instead and is
+        serialized by the dedicated cache-type handler.
+        """
+
+        preserve_auxiliary_kv_state = True
+
+        def __init__(self, bits: float = 4.0, seed: int = 0):
+            super().__init__(bits=bits, seed=seed)
+            self.index_keys = None
+            self.index_position_ids = None
+
+        def update_indexer(self, keys: mx.array, position_ids: mx.array):
+            if self.index_keys is None:
+                self.index_keys = keys
+                self.index_position_ids = position_ids
+            else:
+                self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
+                self.index_position_ids = _append_indexer_positions(
+                    self.index_position_ids, position_ids
+                )
+            return self.index_keys, self.index_position_ids
+
+        @classmethod
+        def from_cache(cls, cache, bits: float, seed: int = 0):
+            """Quantize a populated ``QSAKVCache``; copy indexer state as-is."""
+            tq = cls(bits=bits, seed=seed)
+            base = cache.state
+            keys, values = base[0], base[1]
+            if keys is not None:
+                tq.update_and_fetch(keys, values)
+            tq.index_keys = getattr(cache, "index_keys", None)
+            tq.index_position_ids = getattr(cache, "index_position_ids", None)
+            return tq
+
+        @property
+        def index_state(self):
+            """Indexer side-band, for the serialization handler."""
+            return self.index_keys, self.index_position_ids
+
+        def trim(self, n):
+            n = super().trim(n)
+            if self.index_keys is not None:
+                self.index_keys = self.index_keys[:, : self.offset]
+                self.index_position_ids = self.index_position_ids[..., : self.offset]
+            return n
+
+        @classmethod
+        def merge(cls, caches):
+            return BatchQSATurboQuantKVCache.merge(caches)
+
+        @property
+        def nbytes(self):
+            size = super().nbytes
+            if self.index_keys is not None:
+                size += self.index_keys.nbytes + self.index_position_ids.nbytes
+            return size
+
+    class BatchQSATurboQuantKVCache(_BatchTQKVCache):
+        """Batch TurboQuant QSA cache for continuous batching (Fix 2).
+
+        Inherits all axis-0 K/V machinery from ``BatchTurboQuantKVCache`` and
+        carries the indexer side-band with the same padding/roll/filter
+        semantics ``BatchQSAKVCache`` uses -- reusing its pure
+        ``_pad_index`` helper so the index logic is single-sourced.
+        """
+
+        preserve_auxiliary_kv_state = True
+
+        def __init__(self, left_padding, bits: float = 4.0, seed: int = 0):
+            super().__init__(left_padding, bits=bits, seed=seed)
+            self.index_keys = None
+            self.index_position_ids = None
+            self.index_offset = 0
+
+        def update_indexer(self, keys: mx.array, position_ids: mx.array):
+            if self.index_keys is None:
+                self.index_keys = keys
+                self.index_position_ids = position_ids
+            else:
+                self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
+                self.index_position_ids = _append_indexer_positions(
+                    self.index_position_ids, position_ids
+                )
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        @property
+        def index_state(self):
+            return (
+                None if self.index_keys is None else self.index_keys[:, : self.index_offset],
+                None
+                if self.index_position_ids is None
+                else self.index_position_ids[..., : self.index_offset],
+            )
+
+        def finalize(self):
+            right_padding = getattr(self, "_right_padding", None)
+            super().finalize()
+            if right_padding is None or self.index_keys is None:
+                return
+            self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
+            if self.index_position_ids.ndim == 3:
+                self.index_position_ids = dynamic_roll(
+                    self.index_position_ids, right_padding[None], axis=2
+                )
+            else:
+                self.index_position_ids = dynamic_roll(
+                    self.index_position_ids, right_padding, axis=1
+                )
+
+        def filter(self, batch_indices):
+            pre_left = self.left_padding[batch_indices]
+            min_left = int(pre_left.min().item()) if pre_left.size else 0
+            super().filter(batch_indices)
+            if self.index_keys is None:
+                return
+            self.index_keys = self.index_keys[batch_indices]
+            if self.index_position_ids.ndim == 3:
+                self.index_position_ids = self.index_position_ids[:, batch_indices]
+            else:
+                self.index_position_ids = self.index_position_ids[batch_indices]
+            if min_left > 0:
+                self.index_keys = self.index_keys[:, min_left:]
+                self.index_position_ids = self.index_position_ids[..., min_left:]
+                self.index_offset -= min_left
+
+        def extend(self, other):
+            if not isinstance(other, BatchQSATurboQuantKVCache):
+                raise TypeError(
+                    f"Cannot extend BatchQSATurboQuantKVCache with {type(other)}"
+                )
+            super().extend(other)
+            sample_keys = (
+                self.index_keys if self.index_keys is not None else other.index_keys
+            )
+            sample_positions = (
+                self.index_position_ids
+                if self.index_position_ids is not None
+                else other.index_position_ids
+            )
+            if sample_keys is None:
+                return
+            target = max(self.index_offset, other.index_offset)
+            left = BatchQSAKVCache._pad_index(
+                _QSAIndexView(self), target, sample_keys, sample_positions
+            )
+            right = BatchQSAKVCache._pad_index(
+                _QSAIndexView(other), target, sample_keys, sample_positions
+            )
+            self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+            position_axis = 1 if sample_positions.ndim == 3 else 0
+            self.index_position_ids = mx.concatenate(
+                [left[1], right[1]], axis=position_axis
+            )
+            self.index_offset = target
+
+        def extract(self, idx: int):
+            base = super().extract(idx)  # TurboQuantKVCache
+            cache = QSATurboQuantKVCache(bits=base.bits, seed=base.seed)
+            cache.keys = base.keys
+            cache.values = base.values
+            cache.offset = base.offset
+            cache.key_codec = base.key_codec
+            cache.value_codec = base.value_codec
+            if self.index_keys is not None:
+                padding = int(self.left_padding[idx].item())
+                cache.index_keys = mx.contiguous(
+                    self.index_keys[idx : idx + 1, padding : self.index_offset]
+                )
+                if self.index_position_ids.ndim == 3:
+                    cache.index_position_ids = mx.contiguous(
+                        self.index_position_ids[
+                            :, idx : idx + 1, padding : self.index_offset
+                        ]
+                    )
+                else:
+                    cache.index_position_ids = mx.contiguous(
+                        self.index_position_ids[
+                            idx : idx + 1, padding : self.index_offset
+                        ]
+                    )
+            return cache
+
+        @classmethod
+        def merge(cls, caches):
+            caches = list(caches)
+            out = super().merge(caches)  # cls-typed; TQ K/V merged, index=None
+            sample = next(
+                (c for c in caches if getattr(c, "index_keys", None) is not None),
+                None,
+            )
+            if sample is None:
+                return out
+            target = max(int(c.offset) for c in caches)
+            rows = [
+                BatchQSAKVCache._pad_index(
+                    _QSAIndexView(
+                        c,
+                        offset=mx.array([int(c.offset)]),
+                        index_offset=int(c.offset),
+                    ),
+                    target,
+                    sample.index_keys,
+                    sample.index_position_ids,
+                )
+                for c in caches
+            ]
+            out.index_keys = mx.concatenate([r[0] for r in rows], axis=0)
+            position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+            out.index_position_ids = mx.concatenate(
+                [r[1] for r in rows], axis=position_axis
+            )
+            out.index_offset = target
+            return out
+
+        @property
+        def nbytes(self):
+            size = super().nbytes
+            if self.index_keys is not None:
+                size += self.index_keys.nbytes + self.index_position_ids.nbytes
+            return size
+
+
+class _QSAIndexView:
+    """Adapter exposing the four fields ``BatchQSAKVCache._pad_index`` reads.
+
+    ``_pad_index`` is a pure helper that only touches ``index_keys``,
+    ``index_position_ids``, ``index_offset`` and ``offset`` -- none of the K/V
+    representation -- so it works identically for TurboQuant-backed caches.
+    """
+
+    def __init__(self, cache, *, offset=None, index_offset=None):
+        self.index_keys = getattr(cache, "index_keys", None)
+        self.index_position_ids = getattr(cache, "index_position_ids", None)
+        self.index_offset = (
+            index_offset
+            if index_offset is not None
+            else getattr(cache, "index_offset", 0)
+        )
+        self.offset = offset if offset is not None else getattr(cache, "offset", None)
 
 
 class Qwen4ExpRMSNorm(nn.Module):
