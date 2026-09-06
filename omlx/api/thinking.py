@@ -22,12 +22,26 @@ _MINIMAX_OPEN_TAG = "<mm:think>"
 _MINIMAX_CLOSE_TAG = "</mm:think>"
 _HY3_OPEN_TAG = "<think:opensource>"
 _HY3_CLOSE_TAG = "</think:opensource>"
+# IFM / K2-Horizon think tags (from IFM chat template)
+_IFM_OPEN_TAGS = (
+    "<ifm|think>",
+    "<ifm|think_fast>",
+    "<ifm|think_faster>",
+)
+_IFM_CLOSE_TAGS = (
+    "</ifm|think>",
+    "</ifm|think_fast>",
+    "</ifm|think_faster>",
+)
 
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
-# (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+# IFM / K2-Horizon think tags
+_IFM_THINK_PATTERN = re.compile(
+    r'<\|ifm\|think(?:_fast|_faster)?>(.*?)</ifm\|think(?:_fast|_faster)?>', re.DOTALL
+)
 
 
 def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
@@ -178,6 +192,10 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
 
+    # Normalize IFM/K2-Horizon tags to standard <think> format
+    for open_tag, close_tag in zip(_IFM_OPEN_TAGS, _IFM_CLOSE_TAGS):
+        text = text.replace(open_tag, _OPEN_TAG).replace(close_tag, _CLOSE_TAG)
+
     thinking_parts = []
     remaining = text
 
@@ -283,6 +301,17 @@ class ThinkingParser:
                     i += len(_HY3_OPEN_TAG)
                     continue
 
+                # Try to match IFM/K2-Horizon tags
+                ifm_matched = False
+                for ifm_open in _IFM_OPEN_TAGS:
+                    if remaining.startswith(ifm_open):
+                        self._in_thinking = True
+                        i += len(ifm_open)
+                        ifm_matched = True
+                        break
+                if ifm_matched:
+                    continue
+
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
                     self._in_thinking = False
@@ -294,6 +323,18 @@ class ThinkingParser:
                     self._in_thinking = False
                     self._close_seen = True
                     i += len(_HY3_CLOSE_TAG)
+                    continue
+
+                # Try to match IFM/K2-Horizon close tags
+                ifm_matched = False
+                for ifm_close in _IFM_CLOSE_TAGS:
+                    if remaining.startswith(ifm_close):
+                        self._in_thinking = False
+                        self._close_seen = True
+                        i += len(ifm_close)
+                        ifm_matched = True
+                        break
+                if ifm_matched:
                     continue
 
                 # Check if it could be a partial tag (not enough chars yet)

@@ -656,6 +656,182 @@ def _parse_xml_tool_calls(
     return cleaned, tool_calls
 
 
+def _parse_ifm_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Parse IFM/K2-Horizon tool call format.
+
+    K2-Horizon uses a custom XML format for tool calls:
+    <ifm|tool_calls>
+    <ifm|tool_call>{"name": "func", "arguments": {...}}</ifm|tool_call>
+    <ifm|tool_call>func_name
+    <ifm|arg_key>param_name</ifm|arg_key>
+    <ifm|arg_value>param_value</ifm|arg_value>
+    </ifm|tool_call>
+    </ifm|tool_calls>
+
+    The model also supports JSON format within <ifm|tool_call> tags.
+    """
+    tool_calls = []
+    # Extract content between <ifm|tool_calls> and </ifm|tool_calls>
+    calls_match = re.search(
+        r"<ifm\|tool_calls>(.*?)</ifm\|tool_calls>", text, re.DOTALL
+    )
+    if not calls_match:
+        return text, None
+
+    calls_content = calls_match.group(1)
+
+    # Try to find individual <ifm|tool_call> blocks
+    call_blocks = _marker_payloads(calls_content, "<ifm|tool_call>", "</ifm|tool_call>")
+
+    for block in call_blocks:
+        content = block.strip()
+
+        # Try JSON format first: {"name": "func", "arguments": {...}}
+        try:
+            parsed = json.loads(content, strict=False)
+            name = parsed.get("name", "")
+            arguments = parsed.get("arguments", {})
+            _built = _build_tool_call(name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
+            continue
+        except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
+            pass
+
+        # XML format: func_name<ifm|arg_key>k</ifm|arg_key><ifm|arg_value>v</ifm|arg_value>...
+        arg_keys = re.findall(r"<ifm\|arg_key>(.*?)</ifm\|arg_key>", content, re.DOTALL)
+        arg_values = re.findall(r"<ifm\|arg_value>(.*?)</ifm\|arg_value>", content, re.DOTALL)
+
+        if arg_keys:
+            # Function name is the text before the first <ifm|arg_key>
+            name_match = re.match(r"^(.*?)<ifm\|arg_key>", content, re.DOTALL)
+            func_name = (
+                name_match.group(1).strip()
+                if name_match
+                else content.split("<")[0].strip()
+            )
+            arguments = {}
+            for k, v in zip(arg_keys, arg_values):
+                # Try to parse as JSON, fallback to string
+                try:
+                    arguments[k] = json.loads(v.strip())
+                except (json.JSONDecodeError, ValueError):
+                    arguments[k] = v.strip()
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
+
+    if not tool_calls:
+        return text, None
+
+    # Remove the entire <ifm|tool_calls>...</ifm|tool_calls> block
+    cleaned = re.sub(
+        r"<ifm\|tool_calls>.*?</ifm\|tool_calls>", "", text, flags=re.DOTALL
+    ).strip()
+
+    # Also remove any orphaned tags
+    cleaned = re.sub(r"<ifm\|tool_call>.*?</ifm\|tool_call>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"</?ifm\|(tool_calls|tool_call|arg_key|arg_value|arg_type)>", "", cleaned)
+
+    return cleaned.strip(), tool_calls
+
+
+def _parse_ifm_plain_text_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Parse IFM/K2-Horizon plain text tool call format.
+
+    When tools are available, K2-Horizon emits tool calls as plain text:
+    tool_name
+    arg_key
+    arg_value
+    arg_key
+    arg_value
+    ...
+
+    The model may emit prose before or after the tool calls. This parser
+    scans for tool call blocks anywhere in the text.
+    """
+    tool_calls = []
+    lines = text.split("\n")
+    tool_names = _extract_tool_names(tools) if tools else set()
+
+    i = 0
+    while i < len(lines):
+        # Skip prose until we find a tool name
+        func_name = lines[i].strip()
+        if func_name not in tool_names:
+            i += 1
+            continue
+
+        # Found a tool name, parse its arguments
+        arguments = {}
+        i += 1
+        while i < len(lines):
+            key = lines[i].strip()
+            if not key:
+                i += 1
+                continue
+            # Check if this is another tool name (start of next call)
+            if key in tool_names:
+                break
+            # Check if next line exists and is a value
+            if i + 1 < len(lines):
+                value = lines[i + 1].strip()
+                # If value is a tool name, this key has no value
+                if value in tool_names:
+                    arguments[key] = ""
+                    i += 1
+                else:
+                    # Try to parse as JSON, fallback to string
+                    try:
+                        arguments[key] = json.loads(value)
+                    except (json.JSONDecodeError, ValueError):
+                        arguments[key] = value
+                    i += 2
+            else:
+                arguments[key] = ""
+                i += 1
+
+        if arguments:
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
+
+    if not tool_calls:
+        return text, None
+
+    # Reconstruct the text without tool call blocks
+    cleaned_lines = []
+    i = 0
+    while i < len(lines):
+        func_name = lines[i].strip()
+        if func_name in tool_names:
+            # Skip this tool call block
+            i += 1  # skip tool name
+            while i < len(lines):
+                key = lines[i].strip()
+                if not key:
+                    i += 1
+                    continue
+                if key in tool_names:
+                    break  # next tool call
+                if i + 1 < len(lines) and lines[i + 1].strip() not in tool_names:
+                    i += 2  # skip key-value pair
+                else:
+                    i += 1  # skip key with no value
+        else:
+            cleaned_lines.append(lines[i])
+            i += 1
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned, tool_calls
+
+
 def _parse_namespaced_tool_calls(
     text: str, namespace: str, tools: Optional[List] = None
 ) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1699,6 +1875,17 @@ def _parse_tool_calls_impl(
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
         return _parse_bracket_tool_calls(cleaned_text)
+
+    # Fallback: IFM/K2-Horizon tool calls
+    # Try XML format first: <ifm|tool_calls>...</ifm|tool_calls>
+    if "<ifm|tool_calls>" in cleaned_text:
+        return _parse_ifm_tool_calls(cleaned_text, tools)
+    # Try plain text format when tools are provided.
+    # K2-Horizon may emit prose before tool calls, so we scan the full text.
+    if tools:
+        result = _parse_ifm_plain_text_tool_calls(cleaned_text, tools)
+        if result[1] is not None:
+            return result
 
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers

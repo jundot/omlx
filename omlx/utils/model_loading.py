@@ -547,6 +547,12 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2-Horizon pre-load patch applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
