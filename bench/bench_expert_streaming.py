@@ -324,6 +324,9 @@ def find_streaming_cache(vlm_model):
         return None
     for layer in layers:
         mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            # deepseek_v4 nests the MoE under layer.ffn, not layer.mlp.
+            mlp = getattr(layer, "ffn", None)
         sm = getattr(mlp, "switch_mlp", None) if mlp else None
         if sm is None:
             continue
@@ -755,6 +758,8 @@ async def run(
     _memtrace_summary = None
     _ctx_fb = None
     _pin_out = None
+    mtp_adapter_stats = None
+    chain_mtp_stats = None
     if cache is not None:
         stats = {
             "hits": cache.stats.hits,
