@@ -53,7 +53,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
-        case mtpEnabled
+        case mtpEnabled, unoEnabled, unoAdapterModel
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
@@ -325,6 +325,8 @@ final class ModelSettingsScreenVM {
     var dflashSsdCacheGib: String = "20"
 
     // Experimental: native MTP
+    var unoEnabled: Bool = false
+    var unoAdapterModel: String = ""
     var mtpEnabled: Bool = false
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
@@ -370,6 +372,55 @@ final class ModelSettingsScreenVM {
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
         return Self.diffusionConfigModelTypes.contains(type)
+    }
+
+    var isK2Base: Bool { model?.configModelType == "k2_horizon" }
+
+    var reasoningEffortPresets: [String] {
+        isK2Base ? ["low", "medium", "high"] : ChatTemplateKwargsCodec.reasoningEffortPresets
+    }
+
+    var unoAdapterCandidates: [ModelDTO] {
+        guard isK2Base, let base = model?.unoBaseModelId else { return [] }
+        return allModels.filter {
+            $0.configModelType == "k2_horizon_uno" && $0.unoBaseModelId == base
+        }
+    }
+
+    func unoAdapterModelOptions() -> [(String, String)] {
+        [("", String(localized: "settings.uno.select", defaultValue: "Select a Uno adapter"))]
+            + unoAdapterCandidates.map { ($0.id, $0.displayName ?? $0.id) }
+    }
+
+    var unoConflictReason: String? {
+        let penalties = [(minP, 0.0), (repetitionPenalty, 1.0), (presencePenalty, 0.0)]
+        if mtpEnabled || vlmMtpEnabled || dflashEnabled || specprefillEnabled
+            || turboquantKvEnabled || qwen35AnePrefillEnabled || thinkingBudgetEnabled
+            || model?.settings?.guidedGrammarEnabled == true
+            || penalties.contains(where: { !$0.0.isEmpty && Double($0.0) != $0.1 }) {
+            return String(localized: "settings.uno.conflict",
+                          defaultValue: "Disable other decode accelerators, grammar constraints and thinking budgets. Clear Min P and penalty settings.")
+        }
+        return nil
+    }
+
+    var unoUnavailableReason: String? {
+        unoConflictReason ?? (unoAdapterCandidates.isEmpty
+            ? String(localized: "settings.uno.missing", defaultValue: "No compatible Uno adapter is available.")
+            : nil)
+    }
+
+    func validateUnoWorkingSettings() -> Bool {
+        guard unoEnabled else { return true }
+        if let reason = unoConflictReason {
+            lastError = reason
+            return false
+        }
+        guard unoAdapterCandidates.contains(where: { $0.id == unoAdapterModel }) else {
+            lastError = String(localized: "settings.uno.select", defaultValue: "Select a Uno adapter")
+            return false
+        }
+        return true
     }
 
     var isQwen4Exp: Bool {
@@ -425,7 +476,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashSsdCache, .dflashSsdCacheGib:
             return true
-        case .mtpEnabled, .vlmMtpEnabled, .vlmMtpDraftModel:
+        case .mtpEnabled, .unoEnabled, .unoAdapterModel, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
         case .vlmMtpDraftBlockSize:
             return true
@@ -577,6 +628,8 @@ final class ModelSettingsScreenVM {
                 self.dflashSsdCache = s?.dflashSsdCache ?? false
                 self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
                     .map(String.init) ?? "20"
+                self.unoEnabled = s?.unoEnabled ?? false
+                self.unoAdapterModel = s?.unoAdapterModel ?? ""
                 self.mtpEnabled = s?.mtpEnabled ?? false
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
@@ -807,10 +860,15 @@ final class ModelSettingsScreenVM {
         case .dflashSsdCacheGib:
             patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
         case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .unoEnabled, .unoAdapterModel:
+            guard isK2Base, validateUnoWorkingSettings() else { return }
+            patch.unoEnabled = unoEnabled
+            patch.unoAdapterModel = unoAdapterModel
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
+        if isK2Base { patch.enableThinking = .some(nil) }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
             self.lastError = nil
@@ -919,6 +977,7 @@ final class ModelSettingsScreenVM {
     // MARK: - Chat-template kwarg list mutation
 
     func addKwarg(_ kind: ChatTemplateKwargEntryKind) {
+        if isK2Base && kind == .enableThinking { return }
         if isDiffusionModel {
             switch kind {
             case .enableThinking, .reasoningEffort:
@@ -930,7 +989,7 @@ final class ModelSettingsScreenVM {
         let defaultValue: String
         switch kind {
         case .enableThinking:  defaultValue = "true"
-        case .reasoningEffort: defaultValue = "low"
+        case .reasoningEffort: defaultValue = isK2Base ? "high" : "low"
         case .custom:          defaultValue = ""
         }
         chatTemplateEntries.append(
@@ -1124,7 +1183,7 @@ final class ModelSettingsScreenVM {
 
         // Universal — thinking / tool / reasoning
         if !isDiffusion {
-            putBool(ProfileSettingsKey.enableThinking, enableThinking)
+            if !isK2Base { putBool(ProfileSettingsKey.enableThinking, enableThinking) }
             putBool(ProfileSettingsKey.thinkingBudgetEnabled, thinkingBudgetEnabled)
             putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
             putBool(ProfileSettingsKey.forceSampling, forceSampling)
@@ -1214,6 +1273,10 @@ final class ModelSettingsScreenVM {
                 if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
                     out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
                 }
+            }
+            if isK2Base {
+                putBool(ProfileSettingsKey.unoEnabled, unoEnabled)
+                putString(ProfileSettingsKey.unoAdapterModel, unoAdapterModel)
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
             putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
@@ -1352,7 +1415,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateUnoWorkingSettings(), validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1399,7 +1462,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
-        guard validateQwenAneWorkingSettings() else { return }
+        guard validateUnoWorkingSettings(), validateQwenAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {

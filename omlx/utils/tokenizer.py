@@ -536,6 +536,12 @@ def _is_laguna_model(model_name: str) -> bool:
     return config is not None and config.get("model_type") == "laguna"
 
 
+def _is_k2_horizon_model(model_name: str) -> bool:
+    """Return True only for a local checkpoint declaring ``model_type: k2_horizon``."""
+    config = _read_json_file(Path(model_name) / "config.json")
+    return config is not None and config.get("model_type") == "k2_horizon"
+
+
 def _is_mistral_common_model(model_name: str) -> bool:
     """True for local model dirs transformers would route to MistralCommonBackend.
 
@@ -593,6 +599,11 @@ def get_tokenizer_config(
             "Laguna detected: enabling the Mistral tokenizer regex fix and "
             "the laguna tool parser"
         )
+
+    if _is_k2_horizon_model(model_name):
+        # Register IFM markers that mlx-lm's parser detection does not recognize.
+        config.setdefault("tool_parser_type", "k2_horizon")
+        logger.debug("K2 Horizon detected: setting tool_parser_type to k2_horizon")
 
     if _is_mistral_common_model(model_name):
         # MistralCommonBackend renders chat templates whose output cannot be

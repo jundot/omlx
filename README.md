@@ -213,6 +213,15 @@ Load LLMs, VLMs, embedding models, and rerankers within the same server. Models 
 - **Per-model TTL**: Set an idle timeout per model to auto-unload after a period of inactivity.
 - **Process memory enforcement**: Total memory limit (default: system RAM - 8GB) prevents system-wide OOM.
 
+### IFM K2 Horizon
+
+K2 Horizon supports serving and oQ quantization. Use **Chat Template Kwargs**
+to set `reasoning_effort` to `low`, `medium`, or `high` (default).
+**Thinking Budget** limits reasoning. A budget of 1 forces immediate closure and can reduce answer quality.
+For a compatible K2 base, enable **Uno** and select its local adapter.
+Uno is off by default, shares the base model's SSD prefix cache, and does not support thinking budgets.
+Uno implements the linear Psi-Spec sampler from the [paper](https://arxiv.org/abs/2609.04010) and [reference code](https://github.com/ifm-ai/uno).
+
 ### Per-Model Settings
 
 Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.

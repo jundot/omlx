@@ -68,6 +68,55 @@ class CohereTokenizer:
         return "".join(self._token_map[token_id] for token_id in token_ids)
 
 
+def test_k2_reasoning_modes_and_tool_envelopes():
+    from omlx.patches.k2_horizon.tool_parser import parse_tool_call
+
+    markers = [
+        f"{prefix}ifm|{name}>"
+        for name in ("think", "think_fast", "think_faster", "tool_calls")
+        for prefix in ("<", "</")
+    ]
+    ids = {marker: i + 10 for i, marker in enumerate(markers)}
+
+    class Tokenizer(CohereTokenizer):
+        has_tool_calling = True
+        tool_call_start, tool_call_end = markers[-2:]
+        tool_parser = staticmethod(parse_tool_call)
+
+        def convert_tokens_to_ids(self, text):
+            return ids.get(text, -1)
+
+        def encode(self, text, **kwargs):
+            return [ids[text]] if text in ids else []
+
+    tokenizer = Tokenizer(
+        {
+            **{value: key for key, value in ids.items()},
+            1: "reason",
+            2: "answer",
+            3: '<ifm|tool_call>{"name":"weather","arguments":{"city":"Paris"}}</ifm|tool_call>',
+        }
+    )
+    factory = detect_output_parser("k2", tokenizer, {"model_type": "k2_horizon"})
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    for mode in ("think", "think_fast", "think_faster"):
+        session = factory.create_session_with_tools(tokenizer, tools)
+        tokens = [
+            ids[f"<ifm|{mode}>"],
+            1,
+            ids[f"</ifm|{mode}>"],
+            2,
+            ids[markers[-2]],
+            3,
+            ids[markers[-1]],
+        ]
+        text = "".join(session.process_token(token).stream_text for token in tokens)
+        final = session.finalize()
+        assert text + final.stream_text == "<think>\nreason</think>answer"
+        assert final.tool_calls[0]["name"] == "weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+
 class DeepSeekV4Tokenizer(CohereTokenizer):
     has_tool_calling = True
     tool_call_start = "<｜DSML｜tool_calls>"

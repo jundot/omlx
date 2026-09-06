@@ -12,6 +12,7 @@ from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
     _is_helper_checkpoint,
+    _is_hf_cache_mlx_compatible,
     _is_unsupported_model,
     _read_model_context_length,
     _register_model,
@@ -1894,6 +1895,24 @@ class TestHfCacheDiscovery:
 
         models = discover_models(tmp_path)
         assert len(models) == 0
+
+    @pytest.mark.parametrize("raw", [b"{", b"\xff", b"null", b"[]"])
+    def test_k2_detection_preserves_legacy_hf_cache_heuristics(self, tmp_path, raw):
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "Model")
+        (snapshot / "config.json").write_bytes(raw)
+        (snapshot / "model.safetensors").write_bytes(b"fixture")
+        assert _is_hf_cache_mlx_compatible(snapshot, "mlx-community/Model")
+        if raw == b"{":
+            assert "mlx-community--Model" in discover_models(tmp_path)
+
+    def test_incomplete_k2_checkpoint_cannot_use_mlx_name_heuristic(self, tmp_path):
+        _, snapshot = self._make_hf_cache_entry(tmp_path, "mlx-community", "K2")
+        (snapshot / "config.json").write_text('{"model_type": "k2_horizon"}')
+        (snapshot / "model.safetensors").write_bytes(b"fixture")
+        (snapshot / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"weight": "missing.safetensors"}}'
+        )
+        assert not _is_hf_cache_mlx_compatible(snapshot, "mlx-community/K2")
 
     def test_hf_cache_bad_helper_schema_is_skipped(self, tmp_path):
         """A malformed helper-looking schema must not abort HF cache discovery."""
