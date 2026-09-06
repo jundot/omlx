@@ -10,13 +10,16 @@ import pytest
 from omlx.utils.hardware import (
     DEFAULT_MEMORY_BYTES,
     HardwareInfo,
+    default_oq_dtype,
     format_bytes,
+    get_chip_generation,
     get_chip_name,
     get_max_working_set_bytes,
     get_total_memory_bytes,
     get_total_memory_gb,
     is_apple_silicon,
     is_mlx_available,
+    supports_native_bfloat16,
 )
 
 
@@ -239,3 +242,66 @@ class TestDefaultMemoryBytes:
     def test_default_memory_bytes_value(self):
         """Test that DEFAULT_MEMORY_BYTES is 8 GB."""
         assert DEFAULT_MEMORY_BYTES == 8 * 1024**3
+
+
+class TestChipGenerationAndOqDtype:
+    """Tests for chip generation and chip-aware oQ dtype defaults."""
+
+    @pytest.mark.parametrize(
+        ("chip_name", "generation"),
+        [
+            ("Apple M1", 1),
+            ("Apple M2 Max", 2),
+            ("Apple M3 Pro", 3),
+            ("Apple M4 Ultra", 4),
+        ],
+    )
+    def test_get_chip_generation(self, chip_name, generation):
+        with patch("omlx.utils.hardware.get_chip_name", return_value=chip_name):
+            assert get_chip_generation() == generation
+
+    def test_get_chip_generation_unknown(self):
+        with patch(
+            "omlx.utils.hardware.parse_chip_info",
+            return_value=("Apple Silicon", ""),
+        ):
+            assert get_chip_generation() is None
+
+    def test_get_chip_generation_brand_fallback_is_m1(self):
+        with patch("omlx.utils.hardware.get_chip_name", return_value="Apple Silicon"):
+            assert get_chip_generation() == 1
+
+    @pytest.mark.parametrize(
+        ("chip_name", "supports_bf16"),
+        [
+            ("Apple M1", False),
+            ("Apple M2 Max", False),
+            ("Apple M3 Pro", True),
+            ("Apple M4", True),
+        ],
+    )
+    def test_supports_native_bfloat16(self, chip_name, supports_bf16):
+        with patch("omlx.utils.hardware.get_chip_name", return_value=chip_name):
+            assert supports_native_bfloat16() is supports_bf16
+
+    def test_supports_native_bfloat16_unknown_chip(self):
+        with patch(
+            "omlx.utils.hardware.parse_chip_info",
+            return_value=("Apple Silicon", ""),
+        ):
+            assert supports_native_bfloat16() is True
+
+    def test_supports_native_bfloat16_brand_fallback_is_m1(self):
+        with patch("omlx.utils.hardware.get_chip_name", return_value="Apple Silicon"):
+            assert supports_native_bfloat16() is False
+
+    @pytest.mark.parametrize(
+        ("chip_name", "dtype"),
+        [
+            ("Apple M2 Max", "float16"),
+            ("Apple M3 Pro", "bfloat16"),
+        ],
+    )
+    def test_default_oq_dtype(self, chip_name, dtype):
+        with patch("omlx.utils.hardware.get_chip_name", return_value=chip_name):
+            assert default_oq_dtype() == dtype

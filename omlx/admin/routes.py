@@ -356,6 +356,9 @@ class GlobalSettingsRequest(BaseModel):
     # UI settings
     ui_language: str | None = None
 
+    # Quantization defaults
+    default_oq_dtype: str | None = None
+
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
 
@@ -407,7 +410,7 @@ class OQStartRequest(BaseModel):
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
-    dtype: str = "bfloat16"
+    dtype: str | None = None
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
     enhanced: bool = False
@@ -1475,7 +1478,19 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
     Returns:
         HTML dashboard page with server status and model list.
     """
-    return templates.TemplateResponse(request, "dashboard.html", {})
+    default_oq_dtype = "float16"
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        default_oq_dtype = global_settings.quantization.default_oq_dtype
+    else:
+        from ..utils.hardware import default_oq_dtype as hardware_default_oq_dtype
+
+        default_oq_dtype = hardware_default_oq_dtype()
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"default_oq_dtype": default_oq_dtype},
+    )
 
 
 @router.get("/chat", response_class=HTMLResponse)
@@ -3705,6 +3720,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "ui": {
             "language": global_settings.ui.language,
         },
+        "quantization": {
+            "default_oq_dtype": global_settings.quantization.default_oq_dtype,
+        },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
@@ -4564,6 +4582,15 @@ async def update_global_settings(
         runtime_applied.append("ui_language")
         _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
+
+    if request.default_oq_dtype is not None:
+        if request.default_oq_dtype not in ("bfloat16", "float16"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid default_oq_dtype (must be 'bfloat16' or 'float16')",
+            )
+        global_settings.quantization.default_oq_dtype = request.default_oq_dtype
+        runtime_applied.append("default_oq_dtype")
 
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)
@@ -7574,7 +7601,11 @@ async def start_oq_quantization(
             status_code=400,
             detail=f"Invalid oQ level. Must be one of {sorted(OQ_LEVELS)}",
         )
-    if request.dtype not in ("bfloat16", "float16"):
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    dtype = request.dtype or global_settings.quantization.default_oq_dtype
+    if dtype not in ("bfloat16", "float16"):
         raise HTTPException(
             status_code=400,
             detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
@@ -7606,7 +7637,7 @@ async def start_oq_quantization(
             group_size=request.group_size,
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
-            dtype=request.dtype,
+            dtype=dtype,
             preserve_mtp=request.preserve_mtp,
             auto_proxy_sensitivity=request.auto_proxy_sensitivity,
             enhanced=request.enhanced,
