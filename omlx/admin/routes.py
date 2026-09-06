@@ -696,7 +696,7 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     from ..utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
-        _is_mtp_compatible,
+        _is_mtp_settable,
     )
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
@@ -717,13 +717,11 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
-    # the dedicated VLM path in omlx.utils.model_loading (vendored mlx-vlm
-    # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
-    # mlx-lm ``_is_mtp_compatible`` whitelist, which gates the generic
-    # text-model patch. Mirroring the runtime, the admin gate accepts
-    # qwen4_exp and relies on the embedded ``mtp.*`` weight check below —
-    # the same condition the runtime path uses.
-    if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
+    # the dedicated VLM path and never goes through the mlx-lm whitelist;
+    # _is_mtp_settable names that acceptance (the dashboard gate), while
+    # _is_mtp_compatible stays the runtime question. The embedded ``mtp.*``
+    # weight check below is unchanged.
+    if not _is_mtp_settable(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
@@ -2710,7 +2708,7 @@ async def update_model_settings(
 
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
+                _is_mtp_settable,
             )
 
             cfg_path = Path(entry.model_path) / "config.json"
@@ -2731,9 +2729,9 @@ async def update_model_settings(
                 )
             model_type = cfg.get("model_type")
             # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
+            # (see _mtp_compat_for_model); the named dashboard gate carries
+            # that acceptance, and the mtp.* weight check below stays.
+            if not _is_mtp_settable(cfg, model_type):
                 raise HTTPException(
                     status_code=400,
                     detail=(
