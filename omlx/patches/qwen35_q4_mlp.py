@@ -34,7 +34,37 @@ _LM_GDN_PREFILL_BACKEND: (
     | None
 ) = None
 _SUPPORTED_QMM_BITS = frozenset((2, 4, 5, 6, 8))
+_QMM_MIN_TOKENS = 128
 _Q8_MIN_TOKENS = 16384
+_DEFAULT_QMM_VARIANT = 8
+_BF16_QMM_VARIANT = 9
+
+
+def _variant_override(env_name: str) -> int | None:
+    value = os.environ.get(env_name)
+    return int(value) if value is not None else None
+
+
+def _qmm_variant_for(
+    bits: int | None,
+    dtype: mx.Dtype,
+    variant_override: int | None,
+) -> int:
+    """Select the classic Metal tile while preserving explicit overrides."""
+    if variant_override is not None:
+        return variant_override
+    if bits != 8 and dtype == mx.bfloat16:
+        return _BF16_QMM_VARIANT
+    return _DEFAULT_QMM_VARIANT
+
+
+def _variant_log_value(variant_override: int | None) -> str:
+    if variant_override is not None:
+        return str(variant_override)
+    return (
+        f"auto(bf16={_BF16_QMM_VARIANT},"
+        f"fp16={_DEFAULT_QMM_VARIANT},q8={_DEFAULT_QMM_VARIANT})"
+    )
 
 
 def register_qwen35_lm_gdn_prefill_backend(
@@ -189,7 +219,11 @@ def _quantized_linear_output_dim(linear: Any) -> int | None:
     return int(weight.shape[0])
 
 
-def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.array:
+def _linear_qmm(
+    linear: nn.QuantizedLinear,
+    x: mx.array,
+    variant_override: int | None,
+) -> mx.array:
     bits = getattr(linear, "bits", None)
     qmm = _native_qmm_for_bits(int(bits)) if bits is not None else None
     if qmm is None:
@@ -197,6 +231,7 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
     if not _is_supported_affine_linear(linear, x):
         return linear(x)
     gs = int(getattr(linear, "group_size", 64))
+    variant = _qmm_variant_for(bits, x.dtype, variant_override)
     return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
@@ -216,7 +251,7 @@ def _post_ane_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
 
 def _make_patched_mlp(
     orig_call: Callable[..., mx.array],
-    variant: int,
+    variant: int | None,
     min_tokens: int,
     q8_min_tokens: int,
 ):
@@ -264,7 +299,7 @@ def _make_patched_mlp(
 def _patch_class(
     module_name: str,
     class_name: str,
-    variant: int,
+    variant: int | None,
     min_tokens: int,
     q8_min_tokens: int,
 ) -> bool:
@@ -292,8 +327,10 @@ def apply_qwen35_q4_mlp_patch() -> bool:
         logger.debug("Qwen MLP native qmm unavailable; patch skipped")
         return False
 
-    variant = int(os.environ.get("OMLX_QWEN35_Q4_MLP_VARIANT", "8"))
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", "2048"))
+    variant = _variant_override("OMLX_QWEN35_Q4_MLP_VARIANT")
+    min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", str(_QMM_MIN_TOKENS))
+    )
     q8_min_tokens = int(
         os.environ.get("OMLX_QWEN35_Q8_MLP_MIN_TOKENS", str(_Q8_MIN_TOKENS))
     )
@@ -316,8 +353,8 @@ def apply_qwen35_q4_mlp_patch() -> bool:
     if patched:
         logger.info(
             "Qwen quantized MLP prefill patch applied "
-            "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
-            variant,
+            "(variant=%s, min_tokens=%d, q8_min_tokens=%d)",
+            _variant_log_value(variant),
             min_tokens,
             q8_min_tokens,
         )
@@ -350,8 +387,10 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
     if orig_linear is None or orig_linears is None:
         return False
 
-    variant = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
+    variant = _variant_override("OMLX_QWEN35_Q4_LINEAR_VARIANT")
+    min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", str(_QMM_MIN_TOKENS))
+    )
     q8_min_tokens = int(
         os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
     )
@@ -400,8 +439,8 @@ def apply_qwen35_q4_prefill_linear_patch() -> bool:
     _LINEAR_PATCHED = True
     logger.info(
         "Qwen quantized prefill linear patch applied "
-        "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
-        variant,
+        "(variant=%s, min_tokens=%d, q8_min_tokens=%d)",
+        _variant_log_value(variant),
         min_tokens,
         q8_min_tokens,
     )
@@ -423,8 +462,10 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
     except Exception:
         return False
 
-    variant = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_VARIANT", "8"))
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
+    variant = _variant_override("OMLX_QWEN35_Q4_LINEAR_VARIANT")
+    min_tokens = int(
+        os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", str(_QMM_MIN_TOKENS))
+    )
     q8_min_tokens = int(
         os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
     )
@@ -658,8 +699,8 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
     if patched:
         logger.info(
             "Qwen mlx-lm quantized prefill linear patch applied "
-            "(variant=%d, min_tokens=%d, q8_min_tokens=%d)",
-            variant,
+            "(variant=%s, min_tokens=%d, q8_min_tokens=%d)",
+            _variant_log_value(variant),
             min_tokens,
             q8_min_tokens,
         )
