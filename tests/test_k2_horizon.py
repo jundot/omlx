@@ -87,15 +87,17 @@ def test_model_cache_and_quantization(kind):
         assert not isinstance(model.layers[0].mlp.gate, nn.QuantizedLinear)
 
 
-def test_grouped_norm_and_oq_protection():
+@pytest.mark.parametrize("groups", [1, 2, 4])
+@pytest.mark.parametrize("length", [1, 8, 512])
+def test_grouped_norm_and_oq_protection(groups, length):
     from omlx.oq import universal_quant_predicate
 
-    x = mx.arange(64).reshape(1, 64).astype(mx.bfloat16)
-    actual = GroupedRMSNorm(64, 2, 1e-5)(x)
-    groups = x.astype(mx.float32).reshape(1, 2, 32)
+    x = mx.arange(length * 64).reshape(1, length, 64).astype(mx.bfloat16)
+    actual = GroupedRMSNorm(64, groups, 1e-5)(x)
+    grouped = x.astype(mx.float32).reshape(1, length, groups, 64 // groups)
     expected = (
-        groups * mx.rsqrt(mx.mean(groups**2, -1, keepdims=True) + 1e-5)
-    ).reshape(1, 64)
+        grouped * mx.rsqrt(mx.mean(grouped**2, -1, keepdims=True) + 1e-5)
+    ).reshape(x.shape)
     assert mx.allclose(actual.astype(mx.float32), expected, atol=0.01).item()
     config = {"model_type": "k2_horizon"}
     layer = nn.Linear(64, 64)
@@ -292,6 +294,63 @@ def test_mova_router_preserves_source_partition_rounding():
     assert full.tolist() == [[1 / 256, 1 / 512]]
     assert mx.argmax(partial).item() == 1
     assert mx.argmax(full).item() == 0
+
+
+def test_yarn_rotation_uses_each_batch_offset():
+    from omlx.patches.k2_horizon.k2_horizon_model import YarnRoPE
+
+    rope = YarnRoPE(
+        SimpleNamespace(
+            rope_head_dim=16,
+            rope_theta=10000,
+            rope_parameters=dict(
+                attention_factor=1.0,
+                original_max_position_embeddings=128,
+                beta_fast=32,
+                beta_slow=1,
+                factor=4,
+            ),
+        )
+    )
+    x = mx.arange(2 * 4 * 8 * 16).reshape(2, 4, 8, 16).astype(mx.bfloat16)
+    for length in (1, 8):
+        values = x[:, :, :length]
+        actual = rope(values, offset=mx.array([4096, 8192]))
+        expected = mx.concatenate(
+            [
+                rope(values[i : i + 1], offset=offset)
+                for i, offset in enumerate((4096, 8192))
+            ]
+        )
+        assert mx.array_equal(actual, expected).item()
+
+
+def test_router_bias_only_changes_selection():
+    from omlx.patches.k2_horizon.k2_horizon_model import route
+
+    x = mx.ones((2, 1, 4), mx.bfloat16)
+    weight = mx.zeros((3, 4), mx.bfloat16)
+    bias = mx.array([0.0, 0.1, 0.2])
+    for top_k, scale in [(1, 1.0), (2, 2.5), (1, 3.0)]:
+        indices, weights = route(x, weight, bias, top_k, scale)
+        expected = mx.broadcast_to(mx.arange(3 - top_k, 3), indices.shape)
+        assert mx.array_equal(mx.sort(indices), expected).item()
+        assert mx.all(weights == scale / top_k).item()
+
+
+@pytest.mark.parametrize(
+    "top_k, expected",
+    [
+        (None, [[0.625, 0.375, 0, 0], [0, 0, 3 / 7, 4 / 7]]),
+        (1, [[1, 0, 0, 0], [0, 0, 0, 1]]),
+    ],
+)
+def test_uno_probabilities_restore_vocabulary_order(top_k, expected):
+    from omlx.patches.k2_horizon.uno_decode import probabilities
+
+    logits = mx.log(mx.array([[0.5, 0.3, 0.2, 0], [0.1, 0.2, 0.3, 0.4]]))
+    actual = probabilities(logits, temperature=1, top_p=0.6, top_k=top_k)
+    assert mx.allclose(actual, mx.array(expected), atol=1e-6).item()
 
 
 def test_uno_rejects_untrained_block_size():
