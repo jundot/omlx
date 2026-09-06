@@ -396,6 +396,47 @@ class TestParserBackedThinkingBudgetWiring:
         assert budget_processors[0]._think_end_ids == [200]
         assert budget_processors[0]._force_sequence == [200, 201, 202, 203, 204, 205]
 
+    def test_native_reasoning_template_without_synthetic_prefix_attaches_processor(self):
+        # When a model uses a native reasoning chat template (e.g. Qwen 3.6/3.8 with preserve_thinking),
+        # the prompt does not require a synthetic think prefix (needs_think_prefix=False).
+        # The scheduler must still attach ThinkingBudgetProcessor when thinking_budget is provided.
+        scheduler = self._make_scheduler(None, {})
+        scheduler.tokenizer.think_end_id = 42
+        scheduler.tokenizer.think_start_id = 41
+        request = self._make_request()
+        request.needs_think_prefix = False
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._think_end_ids == [42]
+        assert budget_processors[0]._budget == 512
+
+    def test_non_reasoning_model_without_think_tokens_does_not_attach_processor(self):
+        # If a model has no think tokens or parser markers, budget processor is not attached.
+        scheduler = self._make_scheduler(None, {})
+        scheduler.tokenizer.think_end_id = None
+        scheduler.tokenizer.think_end = None
+        scheduler.tokenizer.convert_tokens_to_ids.side_effect = lambda t: getattr(
+            scheduler.tokenizer, "unk_token_id", None
+        )
+        scheduler.tokenizer.encode.side_effect = Exception("no marker")
+        request = self._make_request()
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 0
+
 
 # ---------------------------------------------------------------------------
 # _resolve_thinking_budget (server.py helper)
