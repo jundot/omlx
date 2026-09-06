@@ -159,6 +159,11 @@ class ExecutionSettings:
     prefill_step_size: int = 2048
     prompt_cache_size: int = 8
     prompt_cache_bytes: int | None = None
+    # The slot count the operator or profile asked for, before the headroom
+    # tuner clamped it. Tuning can run more than once on the activation path
+    # (plan-time budgets, then measured rank profiles); clamping from the
+    # already-clamped value would pin the first tier's slot count forever.
+    requested_prompt_cache_size: int | None = None
     max_kv_size: int | None = None
     pipeline_microbatch_size: int = 4
     cache_affinity: bool = True
@@ -195,7 +200,11 @@ class ExecutionSettings:
             raise ValueError(
                 f"ring connections per IP cannot exceed {_MAX_CONNECTIONS_PER_IP}"
             )
-        for name in ("prompt_cache_bytes", "max_kv_size"):
+        for name in (
+            "prompt_cache_bytes",
+            "requested_prompt_cache_size",
+            "max_kv_size",
+        ):
             value = getattr(self, name)
             if value is not None and (
                 not isinstance(value, int) or isinstance(value, bool) or value <= 0
@@ -213,6 +222,7 @@ class ExecutionSettings:
             "prefill_step_size": self.prefill_step_size,
             "prompt_cache_size": self.prompt_cache_size,
             "prompt_cache_bytes": self.prompt_cache_bytes,
+            "requested_prompt_cache_size": self.requested_prompt_cache_size,
             "max_kv_size": self.max_kv_size,
             "pipeline_microbatch_size": self.pipeline_microbatch_size,
             "cache_affinity": self.cache_affinity,
@@ -298,28 +308,37 @@ def tune_execution_settings(
 ) -> ExecutionSettings:
     """Bound concurrency while keeping distributed prompt caches coherent.
 
-    MLX-LM's prompt cache evicts independently on every rank. A byte limit is
-    therefore unsafe for unequal pipeline stages: the same prompt occupies
-    different bytes on each Mac, so one rank can retain a prefix another rank
-    evicts. The next request then starts at different token offsets and blocks
-    forever in the first unmatched collective.
+    MLX-LM keeps a prompt cache on every rank, so cache state must stay
+    identical across ranks or a request starts at different token offsets on
+    each rank and blocks forever in the first unmatched collective. Two
+    conditions guarantee that:
 
-    Keep exactly one shared conversation prefix and disable byte-based
-    eviction. The sequence-count policy is deterministic across ranks and one
-    slot still accelerates the common follow-up-chat path. This correctness
-    invariant applies even when the user disables the other automatic tuning.
+    - Which entry is evicted must match on every rank. Eviction order is pure
+      recency over the insert/fetch event stream, and every rank observes the
+      same stream in the same order, so count-based LRU stays in lockstep for
+      any slot count.
+    - Whether an eviction happens must not depend on rank-local accounting:
+      the same tokens occupy different bytes on different pipeline stages, so
+      a byte budget crosses its threshold at different requests on different
+      ranks and the ranks then retain different prefixes. Byte budgets are
+      therefore always disabled.
+
+    The slot count tiers with minimum stage headroom. Slots accrue lazily as
+    requests run, so nothing is reserved up front. The slot count bounds how
+    many prefixes are retained, not their byte cost: a slot holding a
+    near-limit-context prefix costs that prefix's full KV, and byte budgets
+    stay disabled for rank coherence, so total cache pressure is bounded by
+    the memory guard rather than by this policy. This correctness invariant
+    applies even when the user disables the other automatic tuning.
     """
 
-    synchronized_cache = {
-        "prompt_cache_size": 1,
-        "prompt_cache_bytes": None,
-    }
     if not settings.auto_tune or not assignments:
         return replace(
             settings,
-            **synchronized_cache,
+            prompt_cache_size=1,
+            prompt_cache_bytes=None,
             tuning_reason=(
-                f"{settings.tuning_reason}; synchronized single-prefix cache"
+                f"{settings.tuning_reason}; synchronized single-slot prompt cache"
             ),
         )
     minimum_headroom = min(
@@ -327,12 +346,15 @@ def tune_execution_settings(
     )
     if minimum_headroom < 4 * _GIB:
         caps = (2, 1, 512, 2, 1)
+        slot_cap = 1
         tier = "critical headroom"
     elif minimum_headroom < 8 * _GIB:
         caps = (4, 2, 1024, 4, 2)
+        slot_cap = 1
         tier = "low headroom"
     elif minimum_headroom < 16 * _GIB:
         caps = (8, 4, 2048, 8, 4)
+        slot_cap = 2
         tier = "moderate headroom"
     else:
         caps = (
@@ -342,6 +364,7 @@ def tune_execution_settings(
             settings.prompt_cache_size,
             settings.pipeline_microbatch_size,
         )
+        slot_cap = 4
         tier = "ample headroom"
 
     decode = min(settings.decode_concurrency, caps[0])
@@ -349,18 +372,31 @@ def tune_execution_settings(
     prefill = min(settings.prefill_step_size, caps[2])
     microbatch = min(settings.pipeline_microbatch_size, caps[4], decode)
     connections = settings.ring_connections_per_ip if backend == "ring" else 1
+    # Clamp from the requested slot count, not the resolved one. Tuning runs
+    # again after the performance probe against measured headroom, and an
+    # earlier pass with tighter planned budgets may have held the slot count
+    # down; clamping an already-clamped value could never raise it back to
+    # the tier the measured headroom supports.
+    requested_slots = (
+        settings.requested_prompt_cache_size
+        if settings.requested_prompt_cache_size is not None
+        else settings.prompt_cache_size
+    )
+    cache_slots = max(1, min(requested_slots, slot_cap))
     return replace(
         settings,
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache,
+        prompt_cache_size=cache_slots,
+        prompt_cache_bytes=None,
+        requested_prompt_cache_size=requested_slots,
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
             f"{settings.profile} profile auto-tuned for {tier}; "
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
-            "synchronized single-prefix cache"
+            f"synchronized {cache_slots}-slot prompt cache"
         ),
     )
 
