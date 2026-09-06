@@ -179,6 +179,8 @@ enum ProfileSettingsKey {
     static let dflashInMemoryCacheMaxEntries = "dflash_in_memory_cache_max_entries"
     static let dflashSsdCache = "dflash_ssd_cache"
     static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
+    static let unoEnabled = "uno_enabled"
+    static let unoAdapterModel = "uno_adapter_model"
     static let mtpEnabled = "mtp_enabled"
     static let vlmMtpEnabled = "vlm_mtp_enabled"
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"

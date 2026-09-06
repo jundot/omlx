@@ -541,6 +541,12 @@ def maybe_apply_pre_load_patches(
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
 
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
+
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
 
