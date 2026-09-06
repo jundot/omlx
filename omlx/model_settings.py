@@ -158,6 +158,7 @@ class ModelSettings:
         dflash_in_memory_cache_max_bytes: L1 cache byte budget.
         dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
         dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
+        dflash_max_snapshot_tokens: Prompt-token cap for prefix-snapshot inserts; None = dflash default, 0 = no cap.
         dflash_draft_window_size: Draft model sliding-attention window
             (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
@@ -289,6 +290,10 @@ class ModelSettings:
         False  # Requires in-memory cache and an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
+    # Prompt-token threshold above which dflash-mlx skips inserting a prefix snapshot. None keeps the
+    # dflash-mlx default (32_000); 0 disables the cap. A long-prompt agent workload needs it raised or
+    # disabled, or its prefix never enters the cache and every turn re-prefills from scratch.
+    dflash_max_snapshot_tokens: int | None = None
     # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
     # sliding_window when present; sink size defaults to no attention-sink tokens.
     dflash_draft_window_size: Optional[int] = None

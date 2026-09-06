@@ -181,6 +181,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_in_memory_cache_max_bytes: int | None = None
     dflash_ssd_cache: bool | None = None
     dflash_ssd_cache_max_bytes: int | None = None
+    dflash_max_snapshot_tokens: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_block_size: int | None = None
@@ -558,6 +559,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_quant_activation_bits",
         "dflash_draft_quant_group_size",
         "dflash_max_ctx",
+        "dflash_max_snapshot_tokens",
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
         "dflash_block_size",
@@ -665,6 +667,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
     settings.dflash_ssd_cache = False
     settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
+    settings.dflash_max_snapshot_tokens = None
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
     settings.dflash_block_size = None
@@ -2669,6 +2672,17 @@ async def update_model_settings(
     if "dflash_ssd_cache_max_bytes" in sent and request.dflash_ssd_cache_max_bytes:
         current_settings.dflash_ssd_cache_max_bytes = int(
             request.dflash_ssd_cache_max_bytes
+        )
+    if "dflash_max_snapshot_tokens" in sent:
+        # Unlike the sliding-window knobs below, 0 is MEANINGFUL here and must survive: dflash-mlx
+        # gates the snapshot insert on `max_snapshot_tokens > 0`, so 0 lifts the cap entirely while
+        # None keeps its 32_000 default. Collapsing 0 to None — the shape the neighbouring fields use —
+        # would silently restore the default and make the setting unreachable through the dashboard,
+        # which is the whole reason it is being exposed. Negative is not a value dflash defines, so it
+        # falls back to the default rather than being stored.
+        value = request.dflash_max_snapshot_tokens
+        current_settings.dflash_max_snapshot_tokens = (
+            int(value) if value is not None and value >= 0 else None
         )
     if "dflash_draft_window_size" in sent:
         # 0 / None / negative → use config.sliding_window when present.
