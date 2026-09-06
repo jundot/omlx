@@ -1302,3 +1302,46 @@ def maybe_load_custom_quantization(
         return None
 
     return model, processor
+
+
+_VISION_SUBTREES = ("vision_model", "vision_tower")
+
+
+def cast_vision_f32_params_to_fp16(model: Any) -> int:
+    """Recast the float32 leaves of a VLM's vision tower to float16.
+
+    The oQ float16 recipe stores vision/audio passthrough tensors in float32
+    (upstream #1682, measured on Gemma 4 with no activation numbers). On
+    GLM-5.3-Flash the tower's SwiGLU is clamped at +-10, its peak activation
+    is ~228 against float16's 65504, and — measured token by token against
+    the float32 tower on real screenshots — float16 lands 4-5x CLOSER to
+    float32 than bfloat16 does (the dtype the model was trained in and that
+    every non-oQ build serves). The float32 copy costs ~1 GB resident on a
+    104 GB model for nothing. Runs in the same bounded chunks as
+    materialize_lazy_state so the float32 originals are released as we go.
+
+    Returns the number of tensors recast.
+    """
+    from mlx.utils import tree_unflatten
+
+    keys = [
+        key
+        for key, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array)
+        and value.dtype == mx.float32
+        and key.split(".", 1)[0] in _VISION_SUBTREES
+    ]
+    params = dict(tree_flatten(model.parameters()))
+    for start in range(0, len(keys), _MATERIALIZE_EVAL_CHUNK):
+        chunk = [(key, params.pop(key).astype(mx.float16)) for key in keys[start : start + _MATERIALIZE_EVAL_CHUNK]]
+        mx.eval([value for _, value in chunk])
+        model.update(tree_unflatten(chunk))
+        del chunk
+    del params
+    if keys:
+        # Only now are the float32 originals unreferenced. Clearing the pool
+        # with them still held by a local (the first version did) cleared
+        # nothing, and the load-time "actual" read ~1 GB HIGHER (104.9 vs
+        # 103.9 GB, measured 04/09): both copies sat in memory.
+        mx.clear_cache()
+    return len(keys)
