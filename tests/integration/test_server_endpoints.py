@@ -10,6 +10,7 @@ import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2437,3 +2438,58 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+
+class TestNonStreamingUsageDurations:
+    """Non-streaming responses must publish the same timing split the streaming
+    path already does. Without it every non-streaming consumer falls back to
+    total_time and charges prompt processing to the decode clock — measured on
+    GLM-5.3-Flash: 1.62 s of a 6.69 s request (24%) misattributed."""
+
+    @staticmethod
+    def _output_with_first_token(**kw):
+        import time as _time
+
+        async def _side_effect(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            out = MockGenerationOutput(**kw)
+            out.first_token_at = _time.perf_counter()  # same clock as the handler
+            await asyncio.sleep(0.02)
+            return out
+
+        return AsyncMock(side_effect=_side_effect)
+
+    def test_chat_completion_publishes_timing_split(self, client, mock_llm_engine):
+        mock_llm_engine.chat = self._output_with_first_token(
+            text="Chat response.", prompt_tokens=26, completion_tokens=5
+        )
+        mock_llm_engine.generate = mock_llm_engine.chat
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        assert response.status_code == 200
+        usage = response.json()["usage"]
+        assert usage["time_to_first_token"] > 0
+        assert usage["prompt_eval_duration"] == usage["time_to_first_token"]
+        assert usage["generation_duration"] > 0
+        assert usage["prompt_eval_duration"] + usage["generation_duration"] == pytest.approx(
+            usage["total_time"], abs=0.02
+        )
+
+    def test_completion_publishes_timing_split(self, client, mock_llm_engine):
+        mock_llm_engine.generate = self._output_with_first_token(
+            text="Generated response.", prompt_tokens=26, completion_tokens=5
+        )
+
+        response = client.post(
+            "/v1/completions", json={"model": "test-model", "prompt": "hi"}
+        )
+
+        assert response.status_code == 200
+        usage = response.json()["usage"]
+        assert usage["time_to_first_token"] > 0
+        assert usage["prompt_eval_duration"] == usage["time_to_first_token"]
+        assert usage["generation_duration"] > 0

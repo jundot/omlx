@@ -3514,6 +3514,16 @@ async def create_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
+                    # The streaming path already publishes the timing split; the
+                    # values are computed above for the metrics recorder either
+                    # way. Without them every non-streaming consumer falls back
+                    # to total_time and charges prompt processing to the decode
+                    # clock (measured on GLM-5.3-Flash: 1.62 s of 6.69 s, 24%).
+                    time_to_first_token=(
+                        round(prefill_duration, 2) if prefill_duration > 0 else None
+                    ),
+                    prompt_eval_duration=round(prefill_duration, 2),
+                    generation_duration=round(gen_duration, 2),
                     total_time=round(elapsed, 2),
                 ),
             ).model_dump_json(exclude_none=True)
@@ -4051,6 +4061,16 @@ async def create_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
+                    # The streaming path already publishes the timing split; the
+                    # values are computed above for the metrics recorder either
+                    # way. Without them every non-streaming consumer falls back
+                    # to total_time and charges prompt processing to the decode
+                    # clock (measured on GLM-5.3-Flash: 1.62 s of 6.69 s, 24%).
+                    time_to_first_token=(
+                        round(ttft, 2) if ttft > 0 else None
+                    ),
+                    prompt_eval_duration=round(metric_prefill_duration, 2),
+                    generation_duration=round(metric_gen_duration, 2),
                     total_time=round(elapsed, 2),
                 ),
             ).model_dump_json(exclude_none=True)
