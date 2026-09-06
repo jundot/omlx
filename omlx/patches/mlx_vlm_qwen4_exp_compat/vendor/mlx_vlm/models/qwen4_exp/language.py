@@ -19,6 +19,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.memory_monitor import (
+    qwen4_gathered_min_query_tokens as _gathered_min_query_tokens,
+)
+from omlx.memory_monitor import qwen4_gathered_prefill_route
+
 from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
@@ -90,17 +95,6 @@ def _rank_two_text_position_ids(
         and position_ids.ndim == 2
         and tuple(position_ids.shape) == (1, length)
     )
-
-
-def _gathered_min_query_tokens() -> int:
-    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
-    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
-    if raw:
-        try:
-            return max(2, int(raw))
-        except ValueError:
-            pass
-    return 16
 
 
 def _split_text_mrope_positions(
@@ -1284,10 +1278,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if not (
             x.ndim == 3
             and x.shape[0] == 1
-            # Narrow multi-row windows (Lightning MTP history/verify passes)
-            # are cheaper on the official masked path; see
-            # _gathered_min_query_tokens.
-            and x.shape[1] >= _gathered_min_query_tokens()
             and causal_mask
             and type(cache) is QSAKVCache
             and isinstance(cache.offset, int)
@@ -1296,11 +1286,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and self._batch_one_text_position_ids(position_ids, x.shape[1])
         ):
             return False
-        return bool(
-            # Below the QSA budget the official path attends the complete
-            # prefix directly and is faster than building gathered blocks.
-            # Switch only after sparse selection can reduce actual work.
-            cache.offset + x.shape[1] > self.indexer.token_budget
+        return qwen4_gathered_prefill_route(
+            x.shape[1], cache.offset, self.indexer.token_budget
         )
 
     def _gathered_text_decode_eligible(
