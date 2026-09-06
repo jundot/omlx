@@ -1121,7 +1121,6 @@ class HFDownloader:
                             task.repo_id,
                             token=hf_token or None,
                             files_metadata=True,
-                            expand=["safetensors"],
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )

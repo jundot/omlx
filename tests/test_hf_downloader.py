@@ -838,6 +838,61 @@ class TestHFDownloader:
         assert task.downloaded_size == 0
 
     @pytest.mark.asyncio
+    async def test_run_download_model_info_omits_expand(self, model_dir):
+        """files_metadata and expand together raise in huggingface_hub."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-no-expand", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_info = MagicMock()
+        mock_info.safetensors = {
+            "parameters": {"BF16": 7_000_000_000},
+            "total": 7_000_000_000,
+        }
+        mock_info.siblings = None
+
+        def model_info(*args, **kwargs):
+            if kwargs.get("expand") and (
+                kwargs.get("files_metadata") or kwargs.get("securityStatus")
+            ):
+                raise ValueError(
+                    "`expand` cannot be used if `securityStatus` or "
+                    "`files_metadata` are set."
+                )
+            return mock_info
+
+        mock_api = MagicMock()
+        mock_api.model_info.side_effect = model_info
+        snapshot_calls = []
+
+        def fake_snapshot_download(**kwargs):
+            snapshot_calls.append(kwargs)
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        info_kwargs = mock_api.model_info.call_args.kwargs
+        assert info_kwargs.get("files_metadata") is True
+        assert "expand" not in info_kwargs
+        assert snapshot_calls
+        assert snapshot_calls[0]["ignore_patterns"] == [
+            "*.bin",
+            "original/**",
+            "consolidated.*.pth",
+        ]
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
     async def test_dry_run_failure_u32_uses_sibling_blob_size(self, model_dir):
         """U32 histograms must not be billed at 4 bytes/param for the estimate."""
         model_dir.mkdir(parents=True, exist_ok=True)
