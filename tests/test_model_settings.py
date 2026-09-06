@@ -49,6 +49,31 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.is_favorite is True
 
+    def test_moe_expert_offload_defaults(self):
+        """Expert offload is opt-in, at 25% residency."""
+        settings = ModelSettings()
+        assert settings.moe_expert_offload_enabled is False
+        assert settings.moe_expert_offload_resident_fraction == 0.25
+
+    def test_moe_expert_offload_roundtrip(self):
+        """Both offload fields survive to_dict -> from_dict."""
+        original = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+        )
+        d = original.to_dict()
+        assert d["moe_expert_offload_enabled"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.moe_expert_offload_enabled is True
+        assert restored.moe_expert_offload_resident_fraction == 0.5
+
+    def test_moe_expert_offload_fraction_out_of_range_rejected(self):
+        """Residency outside (0, 1] fails at construction, not at load."""
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=1.5)
+
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
         settings = ModelSettings()

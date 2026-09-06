@@ -415,6 +415,58 @@ class TestEnginePoolErrors:
             asyncio.run(pool.get_engine("model-a"))
         assert pool._entries["model-a"].engine is mock_engine
 
+    def test_moe_offload_admits_oversized_moe(self, small_mock_model_dir):
+        """An MoE checkpoint over the ceiling must admit by the offload-
+        adjusted estimate when expert offload is enabled for the model, and
+        still refuse when it is not (#2595 review). The estimator only counts
+        containers where all three projections carry weight AND scales — an
+        unquantized or partial container wraps nothing — and floors capacity
+        at 8 experts, so the fixture is a 32-expert quantized container:
+        2400 expert bytes at 25% residency keeps 8 of 32 and saves 1800,
+        so the 2000-byte model admits under the 1500 ceiling."""
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+
+        experts = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.weight"] = mx.zeros(
+                (32, 5, 4), dtype=mx.uint8
+            )
+            experts[f"model.layers.0.mlp.switch_glu.{proj}.scales"] = mx.zeros(
+                (32, 5, 1), dtype=mx.uint8
+            )
+        mx.save_safetensors(
+            str(small_mock_model_dir / "model-a" / "model.safetensors"),
+            {
+                **experts,
+                "model.layers.0.attn.q_proj.weight": mx.zeros((20, 20), dtype=mx.uint8),
+            },
+        )
+        pool = _make_pool(ceiling=1500)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.estimated_size = 2000
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+        ):
+            with pytest.raises(ModelTooLargeError):
+                asyncio.run(pool.get_engine("model-a"))
+
+            pool._settings_manager = SimpleNamespace(
+                get_settings=lambda mid: SimpleNamespace(
+                    moe_expert_offload_enabled=True,
+                    moe_expert_offload_resident_fraction=0.25,
+                )
+            )
+            mock_engine = MagicMock()
+            mock_engine.start = AsyncMock()
+            with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+                asyncio.run(pool.get_engine("model-a"))
+            assert pool._entries["model-a"].engine is mock_engine
+
     def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
         """A deleted model directory is removed and reported as not found."""
         pool = _make_pool(ceiling=10 * 1024**3)
