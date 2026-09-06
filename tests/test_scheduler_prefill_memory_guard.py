@@ -1044,8 +1044,19 @@ def test_qwen4_text_admission_uses_gathered_transient():
     assert dense is not None and gathered is not None
     assert gathered.kv_exact == dense.kv_exact
     assert gathered.transient * 4 < dense.transient
-    assert scheduler._qwen4_text_gathered_pricing(True) is True
-    assert scheduler._qwen4_text_gathered_pricing(False) is False
+
+
+def test_qwen4_pricing_tracks_execution_route(monkeypatch):
+    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    route = scheduler._qwen4_text_gathered_pricing
+
+    assert route(True, query_tokens=2048, cache_tokens=0) is False
+    assert route(True, query_tokens=2048, cache_tokens=2048) is True
+    assert route(True, query_tokens=15, cache_tokens=2048) is False
+    assert route(True, query_tokens=16, cache_tokens=2048) is True
+    assert route(False, query_tokens=2048, cache_tokens=2048) is False
 
 
 def test_qwen4_preflight_doors_use_gathered_for_text_only():
