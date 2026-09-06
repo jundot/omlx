@@ -1284,7 +1284,7 @@
 
                     <!-- ==================== QUANTIZER TAB ==================== -->
                     <div x-show="modelsTab === 'quantizer'" x-cloak
-                         x-effect="oqSelectedModelPath; oqLevel; oqRefreshEstimate()">
+                         x-effect="oqSelectedModelPath; oqLevel; oqGroupSize; oqAttentionBitsCap; oqPreserveMtp; oqMtpBitsFloor; oqRefreshEstimate()">
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.oq.section_label') }}</h2>
@@ -1491,6 +1491,68 @@
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
                                                 </button>
+                                            </div>
+                                        </div>
+                                        <!-- Attention bit ceiling -->
+                                        <div class="flex items-center justify-between gap-4 mt-3">
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.attn_cap_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.attn_cap_help') }}</p>
+                                            </div>
+                                            <div class="flex gap-1.5 shrink-0">
+                                                <template x-for="cap in [0, 6, 5, 4]" :key="cap">
+                                                    <button type="button" @click="oqAttentionBitsCap = cap"
+                                                            :class="oqAttentionBitsCap === cap ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
+                                                            x-text="cap === 0 ? '{{ t('models.oq.attn_cap_none') }}' : cap + ' bits'"></button>
+                                                </template>
+                                            </div>
+                                        </div>
+                                        <!-- Expert group size -->
+                                        <div class="flex items-center justify-between gap-4 mt-3">
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.group_size_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.group_size_help') }}</p>
+                                            </div>
+                                            <div class="flex gap-1.5 shrink-0">
+                                                <template x-for="gs in [64, 128]" :key="gs">
+                                                    <button type="button" @click="oqGroupSize = gs"
+                                                            :class="oqGroupSize === gs ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
+                                                            x-text="gs"></button>
+                                                </template>
+                                            </div>
+                                        </div>
+                                        <!-- MTP head bit floor (only when the head is kept) -->
+                                        <div class="flex items-center justify-between gap-4 mt-3"
+                                             x-show="oqSelectedModelHasMtp() && oqPreserveMtp" x-cloak>
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.mtp_floor_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.mtp_floor_help') }}</p>
+                                            </div>
+                                            <div class="flex gap-1.5 shrink-0">
+                                                <template x-for="floor in [4, 0]" :key="floor">
+                                                    <button type="button" @click="oqMtpBitsFloor = floor"
+                                                            :class="oqMtpBitsFloor === floor ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
+                                                            x-text="floor === 0 ? '{{ t('models.oq.mtp_floor_none') }}' : floor + ' bits'"></button>
+                                                </template>
+                                            </div>
+                                        </div>
+                                        <!-- Vision tower dtype (VLM + float16 only) -->
+                                        <div class="flex items-center justify-between gap-4 mt-3"
+                                             x-show="oqSelectedModelIsVLM() && oqDtype === 'float16'" x-cloak>
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.vision_dtype_label') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.vision_dtype_help') }}</p>
+                                            </div>
+                                            <div class="flex gap-1.5 shrink-0">
+                                                <template x-for="vd in ['auto', 'float16', 'float32']" :key="vd">
+                                                    <button type="button" @click="oqVisionDtype = vd"
+                                                            :class="oqVisionDtype === vd ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
+                                                            x-text="vd"></button>
+                                                </template>
                                             </div>
                                         </div>
                                     </div>
