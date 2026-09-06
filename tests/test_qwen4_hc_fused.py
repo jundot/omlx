@@ -180,6 +180,11 @@ def test_ineligible_model_is_logged_once(monkeypatch, caplog):
         # Prefill-sized inputs are expected to skip the fused path and must not log.
         monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
         assert not hc_fused.compatible(_module(4), mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16))
+        # Upstream's exact hybrid projection is a deliberate runtime choice, not a layout gap.
+        monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
+        hybrid = _module(4)
+        hybrid._omlx_exact_hybrid_projection = True
+        assert not hc_fused.compatible(hybrid, mx.random.normal((1, 1, WIDTH)).astype(mx.bfloat16))
     messages = [r.getMessage() for r in caplog.records if "fused hyper-connection kernels not used" in r.getMessage()]
     assert len(messages) == 1
     assert "hidden_size=800" in messages[0]

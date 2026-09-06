@@ -298,9 +298,12 @@ def compatible(module, hyper_input) -> bool:
         and 1 <= hyper_input.shape[0] * hyper_input.shape[1] <= MAX_ROWS
     ):
         return False
-    if hasattr(module, "input_inject_weight") or getattr(
-        module, "_omlx_exact_hybrid_projection", False
-    ):
+    if getattr(module, "_omlx_exact_hybrid_projection", False):
+        # Upstream's exact hybrid projection (installed at load time for serial decode)
+        # keeps its own compiled single-token path; that is a runtime choice, not a
+        # checkpoint layout, so it is not logged.
+        return False
+    if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
     hidden = getattr(module, "hidden_size", None)
