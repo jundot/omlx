@@ -85,6 +85,7 @@ class TestServerSettings:
             "preserve_mid_system_cache": True,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
+            "gpu_keepwarm": True,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):

@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Téléchargement démarré : {repo_id}",
   "js.success.settings_saved": "Paramètres enregistrés avec succès",
   "settings.mcp.expose_tools": "Exposer les outils MCP du backend aux clients",
-  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP."
+  "settings.mcp.expose_tools_hint": "Fusionne les outils MCP du backend dans les réponses. Désactivez si votre client possède ses propres serveurs MCP.",
+  "settings.advanced.gpu_keepwarm": "Garder le GPU au chaud pendant l'inactivité",
+  "settings.advanced.gpu_keepwarm_hint": "Le GPU baisse sa fréquence lorsqu'il est inactif, et la requête suivante paie la remontée. Mesuré sur M1 Ultra avec GLM-5.3-Flash (04/09) : avec 8 s entre les requêtes, 17,5-18,5 tok/s sans et 23,8-24,5 avec. Coûte de l'énergie au repos, pas de la qualité. S'applique au prochain démarrage du serveur."
 }
