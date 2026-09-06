@@ -784,13 +784,13 @@ class BlockAwarePrefixCache(CacheManager):
         if not tokens:
             return None
 
-        # Check if cache_data contains extracted tensor states
+        # Recognize extracted payloads even when the first state is missing,
+        # so malformed ring captures cannot bypass validation below.
         is_tensor_data = (
             cache_data
             and isinstance(cache_data, list)
             and len(cache_data) > 0
             and isinstance(cache_data[0], dict)
-            and "state" in cache_data[0]
         )
 
         # Extract cache type information for SSD storage
@@ -821,6 +821,33 @@ class BlockAwarePrefixCache(CacheManager):
             layer_meta_states = [
                 layer_state.get("meta_state", ()) for layer_state in cache_data
             ]
+
+        if is_tensor_data:
+            # The OCR handler exports only intact prompt KV, not overwritten
+            # decode slots. Do not label it with the full generated sequence
+            # or allocate blocks past its valid prefix (including partials).
+            for idx, type_name in enumerate(layer_cache_types or []):
+                if CacheTypeRegistry.is_ring_family(type_name):
+                    if idx >= len(cache_data):
+                        # Refuse incomplete captures before allocating blocks.
+                        return None
+                    state = cache_data[idx].get("state")
+                    if not isinstance(state, (tuple, list)) or len(state) != 2:
+                        return None
+                    keys, values = state
+                    # Match the reconstruction contract before slicing or
+                    # allocating blocks. K/V feature widths may differ.
+                    if (
+                        getattr(keys, "ndim", None) != 4
+                        or getattr(values, "ndim", None) != 4
+                        or keys.shape[:3] != values.shape[:3]
+                        or keys.shape[0] != 1
+                        or keys.shape[2] <= 0
+                    ):
+                        return None
+                    tokens = tokens[: keys.shape[2]]
+            if not tokens:
+                return None
 
         split_gdn_layout = self._gdn_split_layout_supported(layer_cache_types)
 
@@ -3377,6 +3404,74 @@ class BlockAwarePrefixCache(CacheManager):
                     cache_type_name = layer_cache_types[layer_idx]
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
+
+                if CacheTypeRegistry.is_ring_family(cache_type_name):
+                    # A deduplicated chain may start with a valid prefill
+                    # capture and end with old overwritten decode-ring slots.
+                    # Validate every block, not just the first block's metadata
+                    # passed to reconstruct_cache for ordinary sliceable KV.
+                    window = None
+                    prefix_end = 0
+                    for block_idx, data in enumerate(all_block_data):
+                        if block_idx >= len(block_table.block_ids):
+                            raise ValueError(
+                                f"Missing Unlimited-OCR block ID at index {block_idx}"
+                            )
+                        block_id = block_table.block_ids[block_idx]
+                        block = self.paged_cache.allocated_blocks.get(block_id)
+                        if block is None:
+                            raise ValueError(
+                                f"Unlimited-OCR block {block_id} is no longer allocated"
+                            )
+                        if block_idx >= len(all_block_meta_states):
+                            raise ValueError(
+                                f"Missing Unlimited-OCR metadata for block {block_idx}"
+                            )
+                        metadata = all_block_meta_states[block_idx]
+                        if (
+                            not isinstance(metadata, (list, tuple))
+                            or layer_idx >= len(metadata)
+                        ):
+                            raise ValueError(
+                                f"Missing Unlimited-OCR metadata for layer {layer_idx} "
+                                f"in block {block_idx}"
+                            )
+                        block_window, stored_length = handler.validate_prefix_metadata(
+                            metadata[layer_idx]
+                        )
+                        if (
+                            not isinstance(data, (list, tuple))
+                            or layer_idx >= len(data)
+                        ):
+                            raise ValueError(
+                                f"Missing Unlimited-OCR layer {layer_idx} in block {block_idx}"
+                            )
+                        if (
+                            not isinstance(data[layer_idx], (list, tuple))
+                            or len(data[layer_idx]) != 2
+                        ):
+                            raise ValueError(
+                                f"Invalid Unlimited-OCR K/V pair for layer {layer_idx} "
+                                f"in block {block_idx}"
+                            )
+                        keys, values = data[layer_idx]
+                        expected_length = block.token_count
+                        if (
+                            keys is None
+                            or values is None
+                            or keys.ndim != 4
+                            or values.ndim != 4
+                            or keys.shape[:3] != values.shape[:3]
+                            or keys.shape[0] != 1
+                            or keys.shape[2] != expected_length
+                        ):
+                            raise ValueError("Invalid Unlimited-OCR prefix block length")
+                        prefix_end += expected_length
+                        if stored_length < prefix_end or (
+                            window is not None and block_window != window
+                        ):
+                            raise ValueError("Incompatible Unlimited-OCR prefix blocks")
+                        window = block_window
 
                 # === CacheList: dedicated branch (before standard 2-tuple unpack) ===
                 if cache_type_name == "CacheList":

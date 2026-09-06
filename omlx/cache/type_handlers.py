@@ -43,6 +43,7 @@ class CacheType(Enum):
     QWEN4_QSA_KVCACHE = "QSAKVCache"
     QWEN4_QSA_QUANTIZED_KVCACHE = "QSAQuantizedKVCache"
     QWEN4_BATCH_QSA_KVCACHE = "BatchQSAKVCache"
+    RING_SLIDING_KVCACHE = "RingSlidingKVCache"
 
 
 @dataclass
