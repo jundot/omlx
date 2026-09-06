@@ -834,7 +834,7 @@ def maybe_apply_pre_load_patches(
                             "weights to bind)",
                             model_name,
                         )
-                if apply_mlx_vlm_mtp_runtime_patch():
+                if apply_mlx_vlm_mtp_runtime_patch(model_type):
                     if not has_mtp_weights:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
@@ -1113,6 +1113,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"

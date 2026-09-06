@@ -18,6 +18,7 @@ building the VLM sanitizer. The patches are idempotent.
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ def set_mtp_attach_enabled(enabled: bool) -> None:
 def is_mtp_attach_enabled() -> bool:
     return _MTP_ATTACH_ENABLED
 
+
 def apply_mlx_vlm_mtp_patch() -> bool:
     """Apply the mlx-vlm MTP sanitize monkey-patches.
 
@@ -77,7 +79,71 @@ def apply_mlx_vlm_mtp_patch() -> bool:
     return True
 
 
-def apply_mlx_vlm_mtp_runtime_patch() -> bool:
+# The unscoped sweep, in the order it has always run. Every entry in
+# ``_RUNTIME_PATCHES_BY_TYPE`` below is drawn from this tuple.
+_RUNTIME_PATCHES: tuple[str, ...] = (
+    "qwen35_moe_vlm_runtime",
+    "qwen35_vlm_runtime",
+    "gemma4_vlm_runtime",
+    "inkling_vlm_runtime",
+    "glm5_next_vlm_runtime",
+)
+
+# Which runtime sub-patch belongs to which ``model_type``. These patches
+# rebind methods on shared parent classes and other architectures subclass
+# them, so applying all of them reaches models this load has nothing to do
+# with. An empty tuple means the architecture manages its own MTP and must
+# never receive the sweep. A model_type that is not listed keeps the
+# historical apply-everything behaviour.
+_RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "qwen3_5": ("qwen35_vlm_runtime",),
+    "qwen3_5_moe": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
+    "gemma4": ("gemma4_vlm_runtime",),
+    "gemma4_unified": ("gemma4_vlm_runtime",),
+    "inkling": ("inkling_vlm_runtime",),
+    "inkling_mm_model": ("inkling_vlm_runtime",),
+    "glm5_next": ("glm5_next_vlm_runtime",),
+    "qwen4_exp": (),
+}
+
+
+def _patches_for(
+    model_type: str | None,
+    table: dict[str, tuple[str, ...]],
+    kind: str,
+) -> tuple[str, ...] | None:
+    """Sub-patches owning ``model_type``, or None to keep the historical sweep.
+
+    Exact match first, then the longest declared prefix: family variants
+    (``qwen3_5_moe_*`` and friends, which ``_is_mtp_compatible`` admits by
+    prefix) subclass the same shared parents as the family they extend, so
+    the family's entry owns them. Without the prefix step such a variant
+    falls through to the apply-everything sweep and rebinds architectures
+    this load has nothing to do with, which is the failure the table exists
+    to prevent.
+    """
+    if not model_type:
+        return None
+    if model_type in table:
+        return table[model_type]
+    family = max(
+        (k for k in table if model_type.startswith(k)), key=len, default=None
+    )
+    if family is not None:
+        return table[family]
+    # _is_mtp_compatible admits model_type prefixes (qwen3_5*, qwen3_6*), so a
+    # variant can reach this with no entry and no declared family, and fall
+    # back to the unscoped sweep. Say so rather than doing it silently.
+    logger.debug(
+        "mlx-vlm MTP %s patch: no entry for model_type=%s, applying every "
+        "architecture's patch",
+        kind,
+        model_type,
+    )
+    return None
+
+
+def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
     """Apply the mlx-vlm runtime MTP patches (attach MTPModule, mtp_forward).
 
     Distinct from ``apply_mlx_vlm_mtp_patch``: that one only patches
@@ -85,35 +151,34 @@ def apply_mlx_vlm_mtp_runtime_patch() -> bool:
     the runtime infrastructure so VLMBatchedEngine can actually invoke
     the MTP head at inference time.
 
-    Covers Qwen3.5-MoE (qwen3_5_moe), dense Qwen3.5/3.6 (qwen3_5) and
-    Gemma 4 merged-assistant (gemma4 and gemma4_unified) VLM families. Each
-    sub-patch tracks
-    its own ``_APPLIED`` flag, so calling repeatedly is cheap once all
-    have settled. Returns True if at least one sub-patch applied
+    Covers Qwen3.5-MoE (qwen3_5_moe), dense Qwen3.5/3.6 (qwen3_5), Gemma 4
+    merged-assistant (gemma4 and gemma4_unified) and GLM-5.3-Flash
+    (glm5_next) VLM families. Each sub-patch tracks its own ``_APPLIED``
+    flag, so calling repeatedly is cheap once all have settled. Returns True if at least one sub-patch applied
     successfully — a given model only needs whichever matches its
     model_type.
 
     Should be called *before* ``mlx_vlm.utils.load(...)`` so the
     instantiated LanguageModel picks up the patched ``__init__``.
+
+    ``model_type`` scopes the sweep to the architecture being loaded.
+    qwen4_exp's LanguageModel, gated delta net and attention all subclass
+    qwen3_5's, so applying the qwen3_5 runtime while a qwen4_exp model is
+    resident rewrites that live model's trunk ``__call__`` and its next
+    request fails with "Qwen4 Lightning MTP expects hidden shape
+    [batch, tokens, hc_count * hidden_size]" until the server restarts.
     """
-    from . import (
-        gemma4_vlm_runtime,
-        inkling_vlm_runtime,
-        qwen35_moe_vlm_runtime,
-        qwen35_vlm_runtime,
-    )
+    scoped = _patches_for(model_type, _RUNTIME_PATCHES_BY_TYPE, "runtime")
+    if scoped is not None:
+        logger.debug(
+            "mlx-vlm MTP runtime patch scoped to model_type=%s", model_type
+        )
 
-    moe_ok = qwen35_moe_vlm_runtime.apply()
-    if not moe_ok:
-        logger.debug("Qwen3.5-MoE VLM runtime MTP patch did not apply")
-    dense_ok = qwen35_vlm_runtime.apply()
-    if not dense_ok:
-        logger.debug("Qwen3.5 (dense) VLM runtime MTP patch did not apply")
-    gemma4_ok = gemma4_vlm_runtime.apply()
-    if not gemma4_ok:
-        logger.debug("Gemma 4 VLM runtime MTP patch did not apply")
-    inkling_ok = inkling_vlm_runtime.apply()
-    if not inkling_ok:
-        logger.debug("Inkling VLM runtime MTP patch did not apply")
+    applied = False
+    for name in _RUNTIME_PATCHES if scoped is None else scoped:
+        if importlib.import_module(f".{name}", __name__).apply():
+            applied = True
+        else:
+            logger.debug("%s MTP runtime patch did not apply", name)
 
-    return moe_ok or dense_ok or gemma4_ok or inkling_ok
+    return applied
