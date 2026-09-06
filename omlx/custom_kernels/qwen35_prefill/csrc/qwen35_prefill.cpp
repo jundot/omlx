@@ -744,7 +744,9 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
       return true;
     }
     const int topk = scores.shape(-1);
-    if ((topk != 6 && topk != 8) || x_sorted.shape(0) != scores.size() ||
+    // Instantiated top-k widths: Qwen3.5/3.6 (8), GLM-style 6, Qwen4-Exp (10).
+    if ((topk != 6 && topk != 8 && topk != 10) ||
+        x_sorted.shape(0) != scores.size() ||
         inv_order.size() != scores.size()) {
       return true;
     }

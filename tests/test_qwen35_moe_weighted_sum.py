@@ -66,6 +66,12 @@ def test_moe_weighted_sum_route_gate(monkeypatch):
     assert not patch._should_route(_Block(), x[:, :1], False, min_tokens=1024)
     assert not patch._should_route(_Block(), x, True, min_tokens=1024)
 
+    # Qwen4-Exp routes ten experts per token (issue: the kernel used to gate
+    # on 6/8 only, silently leaving Qwen4 on the stock scatter path).
+    qwen4_topk = _Block()
+    qwen4_topk.top_k = 10
+    assert patch._should_route(qwen4_topk, x, False, min_tokens=1024)
+
     bad_topk = _Block()
     bad_topk.top_k = 2
     assert not patch._should_route(bad_topk, x, False, min_tokens=1024)
@@ -196,3 +202,92 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch):
     y_decode = block(x[:, :1])
     mx.eval(y_decode)
     assert calls["count"] == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+@pytest.mark.parametrize("topk", [6, 8, 10])
+def test_native_weighted_sum_matches_reference_for_each_topk(topk):
+    """Every instantiated top-k width (incl. Qwen4-Exp's 10) matches fp32."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not fast.has_symbol("qwen35_moe_weighted_sum"):
+        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
+
+    tokens, dim = 64, 256
+    rows = tokens * topk
+    keys = mx.random.split(mx.random.key(topk), 3)
+    x_sorted = mx.random.normal((rows, 1, dim), key=keys[0]).astype(mx.bfloat16)
+    inv_order = mx.random.permutation(rows, key=keys[1]).astype(mx.uint32)
+    scores = mx.softmax(mx.random.normal((tokens, topk), key=keys[2]), axis=-1)
+
+    out = fast.qwen35_moe_weighted_sum(x_sorted, inv_order, scores)
+    ref = (
+        x_sorted[inv_order].reshape(tokens, topk, dim).astype(mx.float32)
+        * scores[..., None]
+    ).sum(axis=1)
+    assert out.shape == (tokens, dim)
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    assert err < 2e-2, f"topk={topk}: max err {err}"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+def test_qwen4_shaped_top10_block_routes_and_matches_stock(monkeypatch):
+    """A Qwen4-Exp style top-10 Qwen3.5-MoE VLM block takes the native path."""
+    try:
+        from mlx_vlm.models.qwen3_5_moe import language as q35_moe
+    except Exception:  # noqa: BLE001
+        pytest.skip("mlx_vlm qwen3_5_moe unavailable")
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.patches.qwen35_moe_weighted_sum import (
+        apply_qwen35_moe_weighted_sum_patch,
+    )
+
+    if not fast.has_symbol("qwen35_moe_weighted_sum"):
+        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
+
+    cls = q35_moe.Qwen3_5MoeSparseMoeBlock
+    orig_call = cls.__call__
+    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1")
+    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "16")
+
+    args = types.SimpleNamespace(
+        hidden_size=128,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        num_experts=32,
+        num_experts_per_tok=10,
+    )
+    block = cls(args)
+    x = mx.random.normal((1, 64, 128), key=mx.random.key(10)).astype(mx.bfloat16)
+    y_ref = orig_call(block, x)
+    mx.eval(y_ref)
+
+    calls = {"count": 0}
+    orig_weighted_sum = fast.qwen35_moe_weighted_sum
+
+    def spy(*a, **kw):
+        calls["count"] += 1
+        return orig_weighted_sum(*a, **kw)
+
+    monkeypatch.setattr(fast, "qwen35_moe_weighted_sum", spy)
+    try:
+        assert apply_qwen35_moe_weighted_sum_patch() is True
+        y = block(x)
+        mx.eval(y)
+        assert calls["count"] == 1
+        diff = mx.abs(y.astype(mx.float32) - y_ref.astype(mx.float32))
+        assert mx.max(diff).item() <= 2e-2
+
+        calls["count"] = 0
+        y_verify = block(x, target_verify=True)
+        mx.eval(y_verify)
+        assert calls["count"] == 0
+    finally:
+        cls.__call__ = orig_call
+        for name in (
+            "_omlx_qwen_moe_weighted_sum_patched",
+            "_omlx_qwen_moe_weighted_sum_original_call",
+        ):
+            if hasattr(cls, name):
+                delattr(cls, name)
