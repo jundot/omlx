@@ -79,6 +79,7 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._prefill_shape_warmup = None
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -576,6 +577,50 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
+        # DS4's first long prompt otherwise pays for Metal pipeline compilation
+        # inside user-visible TTFT. Run the same bounded, cache-safe 1K shape
+        # warmup used by cluster ranks on this engine's own serialized MLX
+        # executor and stream. Unknown model families remain unchanged until
+        # they pass the same live latency and cache-safety qualification.
+        from ..utils.prefill_warmup import (
+            planned_local_prefill_shape_warmup_tokens,
+            run_prefill_shape_warmup,
+        )
+
+        warmup_tokens = planned_local_prefill_shape_warmup_tokens(self.model_type)
+        if warmup_tokens:
+
+            def _warmup_prefill_shape():
+                import mlx.core as mx
+
+                with mx.stream(self._engine.engine._mlx_stream):
+                    return run_prefill_shape_warmup(
+                        mx,
+                        self._model,
+                        tokens=warmup_tokens,
+                        max_kv_size=None,
+                    )
+
+            try:
+                self._prefill_shape_warmup = await loop.run_in_executor(
+                    self._engine.engine._mlx_executor,
+                    _warmup_prefill_shape,
+                )
+                logger.info(
+                    "Prefill shape warmup completed: model_type=%s tokens=%d "
+                    "elapsed=%.2fs",
+                    self.model_type,
+                    warmup_tokens,
+                    self._prefill_shape_warmup["elapsed_seconds"],
+                )
+            except Exception as exc:
+                self._prefill_shape_warmup = {
+                    "active": False,
+                    "tokens": warmup_tokens,
+                    "reason": str(exc),
+                }
+                logger.warning("Prefill shape warmup skipped after failure: %s", exc)
+
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
         if ane_prefill_sequence_length:
@@ -679,6 +724,7 @@ class BatchedEngine(BaseEngine):
             false_attrs=("_grammar_compiler_init_attempted",),
         )
         self._loaded = False
+        self._prefill_shape_warmup = None
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -1286,6 +1332,7 @@ class BatchedEngine(BaseEngine):
             "model_name": self._model_name,
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
+            "prefill_shape_warmup": self._prefill_shape_warmup,
         }
         if self._engine:
             stats.update(self._engine.get_stats())
