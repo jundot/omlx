@@ -752,3 +752,19 @@ class TestVlmMtpProcessorExclusivity:
             assert loaded.max_context_window == 8192
             assert loaded.is_pinned is True
             assert loaded.vlm_mtp_draft_model == "gemma-assistant"
+
+
+class TestNgramSpecSettings:
+    def test_ngram_requires_mtp(self):
+        import pytest
+
+        from omlx.model_settings import ModelSettings
+
+        with pytest.raises(ValueError, match="ngram_spec_enabled requires"):
+            ModelSettings(ngram_spec_enabled=True, mtp_enabled=False)
+
+    def test_ngram_with_mtp_is_valid(self):
+        from omlx.model_settings import ModelSettings
+
+        s = ModelSettings(mtp_enabled=True, ngram_spec_enabled=True)
+        assert s.ngram_spec_enabled is True

@@ -99,7 +99,7 @@
   "status.active_models.generating": "生成中...",
   "status.active_models.unload": "モデルをアンロード",
   "status.active_models.enforcer_disabled": "Enforcer disabled",
-  "status.active_models.dflash_label": "DFlash",
+  "status.active_models.dflash_label": "投機的デコード",
   "status.active_models.dflash_fallback_ar": "fallback AR",
   "status.active_models.dflash_draft_share": "draft share",
   "status.active_models.dflash_accepted_draft_per_cycle": "accepted draft/cycle",
@@ -1130,5 +1130,15 @@
   "js.success.download_started": "ダウンロード開始: {repo_id}",
   "js.success.settings_saved": "設定が保存されました",
   "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
-  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。"
+  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。",
+  "modal.model_settings.ngram_spec": "Prompt Lookup Drafting",
+  "modal.model_settings.ngram_spec_hint": "Copy draft tokens from this request's own prompt and output when recent tokens repeat, verified losslessly. Speeds up code rewriting and agent loops; falls back to Lightning MTP when nothing matches.",
+  "modal.model_settings.ngram_spec_requires_mtp": "Requires Lightning MTP: the n-gram drafter rides the MTP draft+verify cycle.",
+  "modal.model_settings.ngram_spec_match_len": "Match window (tokens)",
+  "modal.model_settings.ngram_spec_draft_max": "Max draft length",
+  "modal.model_settings.ngram_spec_draft_max_hint": "Verify width is memory-bound; 16 is the safe default on 128 GB. Larger values can exhaust Metal memory on long generations.",
+  "modal.model_settings.ngram_spec_draft_min": "Min draft length",
+  "status.active_models.ngram_share": "history-copy cycles",
+  "modal.model_settings.ngram_spec_freq_rule": "Frequency-scaled copy length",
+  "modal.model_settings.ngram_spec_freq_rule_hint": "Copy length follows how often the recent tokens repeated: suffixes seen 3+ times buy the full draft, ones seen once are halved. Off keeps the fixed per-window rule."
 }

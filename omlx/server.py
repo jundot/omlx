@@ -486,6 +486,12 @@ async def lifespan(app: FastAPI):
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
         )
         _server_state.process_memory_enforcer = enforcer
+        try:
+            from .patches.mlx_lm_mtp import set_ngram_pressure_probe
+
+            set_ngram_pressure_probe(enforcer.get_pressure_level)
+        except Exception:  # noqa: BLE001 — drafter probe is best-effort
+            pass
         _server_state.engine_pool._process_memory_enforcer = enforcer
         # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
