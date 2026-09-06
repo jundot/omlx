@@ -290,6 +290,12 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
+    # Paged-cache block AND prefill step for hybrid (recurrent + attention)
+    # models. 0 = automatic (the scheduler picks its own target).
+    # Measured 05/09 on GLM-5.3-Flash oQ2e at 110k tokens of context: 1024
+    # gave 181 tok/s (94 whole chunks, no cuts) against 163 with 512; at 7k
+    # tokens it is +5-7% for +6 GB of peak. Applies to the next model load.
+    hybrid_cache_block: int = 0
     # When True (default), prefill yields GPU time to running decodes:
     # prompts are force-chunked under contention, chunks are capped while
     # any engine decodes, and each chunk accrues a decode time debt repaid
@@ -321,6 +327,7 @@ class SchedulerSettings:
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            hybrid_cache_block=int(data.get("hybrid_cache_block", 0) or 0),
         )
 
 
@@ -1714,6 +1721,7 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            hybrid_cache_block=int(self.scheduler.hybrid_cache_block or 0),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

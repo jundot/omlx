@@ -281,6 +281,7 @@ class GlobalSettingsRequest(BaseModel):
     embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
+    hybrid_cache_block: int | None = None  # 0 = automatic; 512 | 1024 | 2048; next load
     decode_fairness: bool | None = None
 
     # Cache settings
@@ -3602,6 +3603,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
+            "hybrid_cache_block": int(getattr(global_settings.scheduler, "hybrid_cache_block", 0) or 0),
             "decode_fairness": global_settings.scheduler.decode_fairness,
         },
         "cache": {
@@ -3984,6 +3986,14 @@ async def update_global_settings(
         )
 
     # Apply prefill priority setting (Live)
+    if request.hybrid_cache_block is not None:
+        if request.hybrid_cache_block not in (0, 512, 1024, 2048):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid hybrid_cache_block: must be 0 (automatic), 512, 1024 or 2048",
+            )
+        # Read when a hybrid model's scheduler is built: applies to the next load.
+        global_settings.scheduler.hybrid_cache_block = int(request.hybrid_cache_block)
     if request.prefill_priority is not None:
         value = request.prefill_priority.strip().lower()
         if value not in ("context", "speed"):

@@ -567,6 +567,21 @@
                                         </button>
                                     </div>
                                 </div>
+                                <!-- Hybrid cache block -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.resource.hybrid_cache_block.label') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.hybrid_cache_block.description') }}</p>
+                                    </div>
+                                    <div class="flex gap-1.5 shrink-0">
+                                        <template x-for="b in [0, 512, 1024, 2048]" :key="b">
+                                            <button type="button" @click="globalSettings.scheduler.hybrid_cache_block = b"
+                                                    :class="(parseInt(globalSettings.scheduler.hybrid_cache_block) || 0) === b ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
+                                                    class="px-3 py-1.5 text-xs font-medium rounded-full border border-neutral-200 transition-colors"
+                                                    x-text="b === 0 ? '{{ t('settings.resource.hybrid_cache_block.auto') }}' : b"></button>
+                                        </template>
+                                    </div>
+                                </div>
                                 <!-- Idle Timeout -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
