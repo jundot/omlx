@@ -1,0 +1,185 @@
+                <!-- Storage roofline tab -->
+                <div x-show="benchTab === 'storage'" x-cloak>
+                <div class="animate-fade-in-up">
+                    <!-- Header -->
+                    <div class="mb-8">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('bench.storage.section_label') }}</h2>
+                        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('bench.storage.heading') }}</h3>
+                        <p class="text-sm text-neutral-500 mt-2">{{ t('bench.storage.description') }}</p>
+                    </div>
+
+                    <!-- Configuration Card -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.storage.config.section_label') }}</span>
+                            </div>
+                            <span x-show="storageAutoParams?.available"
+                                  x-cloak
+                                  class="px-2.5 py-1 rounded-full text-xs font-medium bg-green-50 text-green-700"
+                                  x-text="storageAutoParams?.derived_at ? ('{{ t('bench.storage.badge.measured') }}' + ' · ' + storageAutoParams.derived_at.slice(0, 10)) : '{{ t('bench.storage.badge.measured') }}'"></span>
+                            <span x-show="storageAutoParams && !storageAutoParams.available"
+                                  x-cloak
+                                  class="px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-100 text-neutral-500">{{ t('bench.storage.badge.default') }}</span>
+                        </div>
+
+                        <div class="px-6 py-5 space-y-5">
+                            <!-- Model Selector -->
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.storage.config.model') }}</label>
+                                <select x-model="storageBenchModelId"
+                                        @change="loadStorageAutoParams()"
+                                        :disabled="storageBenchRunning"
+                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
+                                    <option value="">{{ t('bench.storage.config.model_placeholder') }}</option>
+                                    <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
+                                        <option :value="m.id" x-text="m.id"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Derived parameters -->
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                    <div class="text-xs text-neutral-500">{{ t('bench.storage.params.tok_per_cycle') }}</div>
+                                    <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                         x-text="storageAutoParams?.tok_per_cycle != null ? Number(storageAutoParams.tok_per_cycle).toFixed(2) : '—'"></div>
+                                </div>
+                                <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                    <div class="text-xs text-neutral-500">{{ t('bench.storage.params.verify_mult') }}</div>
+                                    <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                         x-text="storageAutoParams?.verify_byte_mult != null ? Number(storageAutoParams.verify_byte_mult).toFixed(2) + '×' : '—'"></div>
+                                </div>
+                                <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                    <div class="text-xs text-neutral-500">{{ t('bench.storage.params.measured_slowdown') }}</div>
+                                    <div class="text-lg font-semibold mt-0.5"
+                                         :class="(storageAutoParams?.measured_mtp_slowdown ?? 1) < 1 ? 'text-green-600' : 'text-orange-600'"
+                                         x-text="storageAutoParams?.measured_mtp_slowdown != null ? Number(storageAutoParams.measured_mtp_slowdown).toFixed(2) + '×' : '—'"></div>
+                                </div>
+                            </div>
+                            <p class="text-xs text-neutral-500" x-show="storageAutoParams && !storageAutoParams.available">
+                                {{ t('bench.storage.params.none_hint') }}
+                            </p>
+
+                            <!-- Actions -->
+                            <div class="flex flex-wrap items-center gap-3 pt-1">
+                                <button @click="storagePredict()"
+                                        :disabled="!storageBenchModelId || storageBenchRunning"
+                                        class="px-5 py-2 text-sm font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-900 transition-all disabled:opacity-50">
+                                    {{ t('bench.storage.button.predict') }}
+                                </button>
+                                <button @click="startStorageBench()"
+                                        :disabled="!storageBenchModelId || storageBenchRunning"
+                                        class="px-5 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-50">
+                                    {{ t('bench.storage.button.run') }}
+                                </button>
+                                <span x-show="storageBenchError" x-cloak class="text-sm text-red-600" x-text="storageBenchError"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Progress -->
+                    <div x-show="storageBenchRunning" x-cloak class="bg-white rounded-2xl border border-neutral-200 p-6 mb-6">
+                        <div class="flex items-center justify-between mb-3">
+                            <div class="flex items-center gap-2">
+                                <div class="w-2 h-2 rounded-full bg-neutral-900 animate-pulse"></div>
+                                <span class="text-sm font-medium text-neutral-900"
+                                      x-text="storageBenchProgress?.phase ? t('bench.storage.progress.' + storageBenchProgress.phase) : t('bench.storage.progress.starting')"></span>
+                            </div>
+                            <span class="text-sm text-neutral-500"
+                                  x-text="storageBenchProgress && storageBenchProgress.total > 0 ? Math.round(storageBenchProgress.done / storageBenchProgress.total * 100) + '%' : ''"></span>
+                        </div>
+                        <div class="h-2 bg-neutral-100 rounded-full overflow-hidden">
+                            <div class="h-full bg-neutral-900 rounded-full transition-all duration-300"
+                                 :style="'width:' + (storageBenchProgress && storageBenchProgress.total > 0 ? Math.min(100, storageBenchProgress.done / storageBenchProgress.total * 100) : 0) + '%'"></div>
+                        </div>
+                    </div>
+
+                    <!-- Results -->
+                    <template x-if="storagePrediction">
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                            <div class="px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.storage.results.section_label') }}</span>
+                                </div>
+                            </div>
+                            <div class="px-6 py-5 space-y-5">
+                                <!-- Volume -->
+                                <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+                                    <span class="text-neutral-500">{{ t('bench.storage.results.volume') }}:</span>
+                                    <span class="font-medium text-neutral-900" x-text="storagePrediction?.volume?.media_name || storagePrediction?.volume?.mount || '—'"></span>
+                                    <span class="text-neutral-400" x-text="storagePrediction?.volume?.protocol"></span>
+                                </div>
+
+                                <!-- Measurement grid -->
+                                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.seq') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.measurement ? (storagePrediction.measurement.seq_read_Bps / 1e9).toFixed(2) + ' GB/s' : '—'"></div>
+                                    </div>
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.rand') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.measurement ? (storagePrediction.measurement.rand_read_Bps / 1e9).toFixed(2) + ' GB/s' : '—'"></div>
+                                    </div>
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.bytes_per_step') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.profile ? (storagePrediction.profile.bytes_per_step / 1048576).toFixed(0) + ' MB' : '—'"></div>
+                                    </div>
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.data_source') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.profile?.data_source ? t('bench.storage.source.' + storagePrediction.profile.data_source) : '—'"></div>
+                                    </div>
+                                </div>
+
+                                <!-- Ceilings + verdict -->
+                                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.ceiling_base') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.prediction ? storagePrediction.prediction.ceiling_base_tok_s.toFixed(2) + ' tok/s' : '—'"></div>
+                                    </div>
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.ceiling_effective') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.prediction?.ceiling_effective_tok_s ? storagePrediction.prediction.ceiling_effective_tok_s.toFixed(2) + ' tok/s' : '—'"></div>
+                                    </div>
+                                    <div class="bg-neutral-50 rounded-xl px-4 py-3">
+                                        <div class="text-xs text-neutral-500">{{ t('bench.storage.results.ceiling_mtp') }}</div>
+                                        <div class="text-lg font-semibold text-neutral-900 mt-0.5"
+                                             x-text="storagePrediction?.prediction ? storagePrediction.prediction.ceiling_mtp_tok_s.toFixed(2) + ' tok/s' : '—'"></div>
+                                    </div>
+                                    <div class="rounded-xl px-4 py-3"
+                                         :class="(storagePrediction?.prediction?.measured_mtp_pays ?? storagePrediction?.prediction?.mtp_profitable) ? 'bg-green-50' : 'bg-orange-50'">
+                                        <div class="text-xs" :class="(storagePrediction?.prediction?.measured_mtp_pays ?? storagePrediction?.prediction?.mtp_profitable) ? 'text-green-600' : 'text-orange-600'">{{ t('bench.storage.results.verdict') }}</div>
+                                        <div class="text-lg font-semibold mt-0.5"
+                                             :class="(storagePrediction?.prediction?.measured_mtp_pays ?? storagePrediction?.prediction?.mtp_profitable) ? 'text-green-700' : 'text-orange-700'"
+                                             x-text="(storagePrediction?.prediction?.measured_mtp_pays ?? storagePrediction?.prediction?.mtp_profitable) ? t('bench.storage.verdict.pays') : t('bench.storage.verdict.loses')"></div>
+                                    </div>
+                                </div>
+
+                                <!-- Explanation -->
+                                <p class="text-sm text-neutral-600 bg-neutral-50 rounded-xl px-4 py-3"
+                                   x-text="storagePrediction?.prediction?.explanation"></p>
+
+                                <!-- Warnings (volume mismatch, cache) -->
+                                <div x-show="storagePrediction?.warnings?.length" x-cloak class="space-y-2">
+                                    <template x-for="w in (storagePrediction?.warnings || [])" :key="w">
+                                        <p class="text-sm text-orange-700 bg-orange-50 rounded-lg px-4 py-2" x-text="w"></p>
+                                    </template>
+                                </div>
+
+                                <!-- Params source -->
+                                <p class="text-xs text-neutral-400"
+                                   x-show="storagePrediction?.params_source"
+                                   x-text="storagePrediction ? (t('bench.storage.results.params_source') + ': ' + storagePrediction.params_source) : ''"></p>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+                </div>

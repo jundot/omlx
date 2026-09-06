@@ -1012,3 +1012,55 @@ class TestExposeAsModelAPI:
         assert "modal.model_settings.profiles.expose_as_model" in html
         assert "modal.model_settings.profiles.exposed_as" in en
         assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
+
+
+class TestStreamingIoSettings:
+    """Fase H: per-model expert-streaming IO knobs (autotune)."""
+
+    def test_put_streaming_io_settings_roundtrip(self, client):
+        c, mgr = client
+        r = c.put(
+            "/admin/api/models/model-a/settings",
+            json={
+                "expert_streaming_io_depth": 32,
+                "expert_streaming_coalesce": False,
+                "expert_streaming_readahead": False,
+                "expert_streaming_seed": False,
+            },
+        )
+        assert r.status_code == 200, r.text
+        s = mgr.get_settings("model-a")
+        assert s.expert_streaming_io_depth == 32
+        assert s.expert_streaming_coalesce is False
+        assert s.expert_streaming_readahead is False
+        assert s.expert_streaming_seed is False
+
+    def test_put_streaming_io_depth_validation(self, client):
+        c, _ = client
+        for bad in (0, -1, 65):
+            r = c.put(
+                "/admin/api/models/model-a/settings",
+                json={"expert_streaming_io_depth": bad},
+            )
+            assert r.status_code == 400, (bad, r.status_code)
+
+    def test_put_streaming_io_unset_keeps_defaults(self, client):
+        c, mgr = client
+        r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.7})
+        assert r.status_code == 200, r.text
+        s = mgr.get_settings("model-a")
+        assert s.expert_streaming_io_depth is None
+        assert s.expert_streaming_coalesce is None
+        assert s.expert_streaming_readahead is None
+        assert s.expert_streaming_seed is None
+
+    def test_streaming_io_fields_excluded_from_profiles(self):
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+        for field in (
+            "expert_streaming_io_depth",
+            "expert_streaming_coalesce",
+            "expert_streaming_readahead",
+            "expert_streaming_seed",
+        ):
+            assert field in EXCLUDED_FROM_PROFILES

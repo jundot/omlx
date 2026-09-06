@@ -119,6 +119,7 @@ struct AppView: View {
         case .throughputBench: ThroughputBenchScreen(vm: services.throughputBench)
         case .accuracyBench:   AccuracyBenchScreen(vm: services.accuracyBench)
         case .contextBench:    ContextBenchScreen(vm: services.contextBench)
+        case .storageRoofline: StorageRooflineScreen()
         case .security:     SecurityScreen()
         case .about:        AboutScreen()
         }

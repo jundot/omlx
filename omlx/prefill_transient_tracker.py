@@ -12,10 +12,42 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_PRIOR_DIR = Path(os.environ.get("OMLX_PREFILL_PRIOR_DIR", "") or Path.home() / ".cache" / "omlx")
+
+
+def _prior_path(model_id: str, model_path: str | Path | None = None) -> Path | None:
+    if not model_id:
+        return None
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_id)[:80]
+    # Fase K F10: resolve from the REAL model path the scheduler already
+    # knows (no hardcoded device roots, no iterdir scan per load). The
+    # .omlx dir next to the model is created on save; a read-only model
+    # dir falls back to the env/cache dir below.
+    if model_path:
+        try:
+            base = Path(model_path)
+            if base.is_dir():
+                cand = base / ".omlx" / "prefill_transient_prior.json"
+                try:
+                    if cand.parent.is_dir():
+                        return cand
+                    # writable check: can we create parent? best-effort probe
+                    cand.parent.mkdir(parents=True, exist_ok=True)
+                    if cand.parent.is_dir():
+                        return cand
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return _PRIOR_DIR / f"prefill_prior_{safe}.json"
 
 
 @dataclass
@@ -57,8 +89,10 @@ class PrefillTransientTracker:
     _EWMA_OUTLIER_RATIO = 8.0
     _FLAT_OVERHEAD_NOISE_BYTES = 64 * 1024**2
 
-    def __init__(self, model_id: str = "") -> None:
+    def __init__(self, model_id: str = "", model_path: str | Path | None = None) -> None:
         self._model_id = model_id
+        # Real model dir used by _prior_path (no hardcoded device roots).
+        self._model_path = model_path
         self._dense_history = _TransientHistory()
         self._gathered_history = _TransientHistory()
         # Net process footprint released by negative post-chunk deltas. MLX may
@@ -303,3 +337,102 @@ class PrefillTransientTracker:
         self.reset_history()
         self.reset_history(gathered_core=True)
         self._recent_reclaim_bytes = 0
+
+    def save_prior(self) -> None:
+        """Persist both execution regimes' EWMA priors next to the model.
+
+        The prior seeds the next load's EWMA but never its sample counts
+        (see ``load_prior``): a restored prior is not measurement.
+        """
+        if not self._model_id:
+            return
+        path = _prior_path(self._model_id, self._model_path)
+        if path is None:
+            return
+        dense = self._dense_history
+        gathered = self._gathered_history
+        if (dense.samples == 0 and gathered.samples == 0) or (
+            dense.ewma_per_token <= 0 and gathered.ewma_per_token <= 0
+        ):
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            data = {
+                "model_id": self._model_id,
+                "dense": {
+                    "bytes_per_token": dense.ewma_per_token,
+                    "samples": dense.samples,
+                    "observed_max_bytes": dense.observed_max_bytes,
+                    "last_delta_bytes": dense.last_delta_bytes,
+                    "last_n_tokens": dense.last_n_tokens,
+                },
+                "gathered": {
+                    "bytes_per_token": gathered.ewma_per_token,
+                    "samples": gathered.samples,
+                    "observed_max_bytes": gathered.observed_max_bytes,
+                    "last_delta_bytes": gathered.last_delta_bytes,
+                    "last_n_tokens": gathered.last_n_tokens,
+                },
+            }
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(path)
+            logger.info(
+                "PrefillTransientTracker(%s): saved prior "
+                "(dense %.1f B/tok, gathered %.1f B/tok) to %s",
+                self._model_id,
+                dense.ewma_per_token,
+                gathered.ewma_per_token,
+                path,
+            )
+        except Exception as e:
+            logger.debug("save_prior failed %s: %s", path, e)
+
+    def load_prior(self) -> bool:
+        path = _prior_path(self._model_id, self._model_path)
+        if path is None or not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text())
+
+            def _restore(history: _TransientHistory, raw: object) -> None:
+                if not isinstance(raw, dict):
+                    return
+                bpt = float(raw.get("bytes_per_token", 0))
+                if bpt <= 0 or bpt > 100 * 1024 * 1024:  # sanity: 100 MB/tok
+                    return
+                # Seed the EWMA but do NOT inherit the sample count — a
+                # regime change (e.g. cold tier toggled on/off, which shifts
+                # bytes/token by ~2x) must not need dozens of chunks to move
+                # the EWMA. Samples are clamped to 0 so the first measured
+                # chunk of the new session REPLACES the prior (update()
+                # seeds when samples == 0). The restored prior is NOT
+                # measurement: last_delta_bytes / last_n_tokens are zeroed
+                # so the scheduler cannot price the first chunk from a stale
+                # prior (a changed regime would underestimate the first
+                # chunk and risk the Metal peak/OOM the throttle exists to
+                # prevent). The first chunk sizes against the static
+                # estimate — the exact pre-prior fallback — until the first
+                # real update().
+                history.ewma_per_token = bpt
+                history.samples = 0
+                history.observed_max_bytes = int(raw.get("observed_max_bytes", 0))
+                history.last_delta_bytes = 0
+                history.last_n_tokens = 0
+
+            # Legacy single-regime prior (bytes_per_token at the top level).
+            legacy_bpt = float(data.get("bytes_per_token", 0))
+            if legacy_bpt > 0:
+                _restore(self._dense_history, data)
+            else:
+                _restore(self._dense_history, data.get("dense"))
+                _restore(self._gathered_history, data.get("gathered"))
+            logger.info(
+                "PrefillTransientTracker(%s): loaded prior from %s",
+                self._model_id,
+                path,
+            )
+            return True
+        except Exception as e:
+            logger.debug("load_prior failed %s: %s", path, e)
+            return False

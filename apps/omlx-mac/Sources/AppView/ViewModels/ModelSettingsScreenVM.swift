@@ -28,7 +28,7 @@ final class ModelSettingsScreenVM {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload
+        case enableThinking, qwen4PleSsdOffload, expertStreamingEnabled, expertStreamingBudgetGib, expertStreamingBudgetAuto, expertStreamingTopkThreshold, expertStreamingCachePrior, expertStreamingPerLayerEval, expertStreamingPins, expertStreamingPinGib, expertStreamingPinSync, expertStreamingPinRegime, expertStreamingColdTier, expertStreamingHotFraction, expertStreamingCachePolicy, expertStreamingDynamic, expertStreamingDynamicMaxGib
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -241,6 +241,26 @@ final class ModelSettingsScreenVM {
     var qwen4PleSsdOffload: Bool = false
     var qwen4PleSsdOffloadSupported: Bool = false
     var qwen4PleSsdOffloadForced: Bool = false
+    var expertStreamingEnabled: Bool = false
+    var expertStreamingSupported: Bool = false
+    var expertStreamingForced: Bool = false
+    var expertStreamingBudgetGib: String = ""
+    var expertStreamingBudgetAuto: Bool = false
+    var expertStreamingTopkThreshold: String = ""
+    var expertStreamingCachePrior: String = ""
+    var expertStreamingPerLayerEval: Bool = true
+    var expertStreamingPins: Bool = false
+    var expertStreamingPinGib: String = ""
+    var expertStreamingPinSync: Bool = false
+    var expertStreamingPinRegime: String = ""
+    var expertStreamingColdTier: String = ""
+    var expertStreamingColdTierPresent: Bool = false
+    var expertStreamingHotFraction: String = ""
+    // Cache policy (lru/s3fifo, empty = default) and the dynamic-residency
+    // governor (nil tri-state: nil = env default, true/false = explicit).
+    var expertStreamingCachePolicy: String = ""
+    var expertStreamingDynamic: Bool? = nil
+    var expertStreamingDynamicMaxGib: String = ""
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -378,11 +398,20 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    var isExpertStreamingSupported: Bool {
+        expertStreamingSupported
+    }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .qwen4PleSsdOffload,
+        case .enableThinking, .qwen4PleSsdOffload, .expertStreamingEnabled, .expertStreamingBudgetGib, .expertStreamingBudgetAuto,
+             .expertStreamingTopkThreshold, .expertStreamingCachePrior, .expertStreamingPerLayerEval, .expertStreamingPins, .expertStreamingPinGib,
+             .expertStreamingPinSync, .expertStreamingPinRegime,
+             .expertStreamingColdTier,
+             .expertStreamingHotFraction,
+             .expertStreamingCachePolicy, .expertStreamingDynamic, .expertStreamingDynamicMaxGib,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -516,6 +545,27 @@ final class ModelSettingsScreenVM {
                     m.qwen4PleSsdOffloadSupported ?? false
                 self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
                     || (s?.qwen4PleSsdOffload ?? false)
+                self.expertStreamingForced = m.expertStreamingForced ?? false
+                self.expertStreamingSupported = m.expertStreamingSupported ?? false
+                self.expertStreamingEnabled = self.expertStreamingForced
+                    || (s?.expertStreamingEnabled ?? false)
+                self.expertStreamingBudgetGib = s?.expertStreamingBudgetGib.map { String($0) } ?? ""
+                self.expertStreamingBudgetAuto = s?.expertStreamingBudgetAuto ?? true
+                self.expertStreamingTopkThreshold = s?.expertStreamingTopkThreshold.map { String($0) } ?? ""
+                self.expertStreamingCachePrior = s?.expertStreamingCachePrior.map { String($0) } ?? ""
+                // Null means the env/built-in default, which is on — show the
+                // effective state so the toggle is never a lie.
+                self.expertStreamingPerLayerEval = s?.expertStreamingPerLayerEval ?? true
+                self.expertStreamingPins = s?.expertStreamingPins ?? false
+                self.expertStreamingPinGib = s?.expertStreamingPinGib.map { String($0) } ?? ""
+                self.expertStreamingPinSync = s?.expertStreamingPinSync ?? false
+                self.expertStreamingPinRegime = s?.expertStreamingPinRegime ?? ""
+                self.expertStreamingColdTier = s?.expertStreamingColdTier ?? ""
+                self.expertStreamingColdTierPresent = m.expertStreamingColdTierPresent ?? false
+                self.expertStreamingHotFraction = s?.expertStreamingHotFraction.map { String($0) } ?? ""
+                self.expertStreamingCachePolicy = s?.expertStreamingCachePolicy ?? ""
+                self.expertStreamingDynamic = s?.expertStreamingDynamic
+                self.expertStreamingDynamicMaxGib = s?.expertStreamingDynamicMaxGib.map { String($0) } ?? ""
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -660,6 +710,117 @@ final class ModelSettingsScreenVM {
             guard isQwen4Exp, qwen4PleSsdOffloadSupported,
                   !qwen4PleSsdOffloadForced else { return }
             patch.qwen4PleSsdOffload = qwen4PleSsdOffload
+        case .expertStreamingEnabled:
+            guard expertStreamingSupported, !expertStreamingForced else { return }
+            patch.expertStreamingEnabled = expertStreamingEnabled
+        case .expertStreamingBudgetGib:
+            guard expertStreamingSupported else { return }
+            if expertStreamingBudgetGib.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingBudgetGib = nil
+            } else if let v = Double(expertStreamingBudgetGib), v >= 0, v <= 64 {
+                patch.expertStreamingBudgetGib = v
+            } else {
+                lastError = "Cache budget must be between 0 and 64 GiB"
+                return
+            }
+        case .expertStreamingTopkThreshold:
+            guard expertStreamingSupported else { return }
+            if expertStreamingTopkThreshold.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingTopkThreshold = nil
+            } else if let v = Double(expertStreamingTopkThreshold), v >= 0.05, v <= 1.0 {
+                patch.expertStreamingTopkThreshold = v < 1.0 ? v : nil
+            } else {
+                lastError = "Top-k threshold must be between 0.05 and 1.0"
+                return
+            }
+        case .expertStreamingCachePrior:
+            guard expertStreamingSupported else { return }
+            if expertStreamingCachePrior.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingCachePrior = nil
+            } else if let v = Double(expertStreamingCachePrior), v >= 0.0, v <= 10.0 {
+                patch.expertStreamingCachePrior = v > 0 ? v : nil
+            } else {
+                lastError = "Cache-prior bonus must be between 0.0 and 10.0"
+                return
+            }
+        case .expertStreamingPerLayerEval:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPerLayerEval = expertStreamingPerLayerEval
+        case .expertStreamingPins:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPins = expertStreamingPins
+        case .expertStreamingPinGib:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            if expertStreamingPinGib.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                patch.expertStreamingPinGib = nil
+            } else if let v = Double(expertStreamingPinGib), v >= 0, v <= 64 {
+                patch.expertStreamingPinGib = v
+            }
+        case .expertStreamingBudgetAuto:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingBudgetAuto = expertStreamingBudgetAuto
+        case .expertStreamingPinSync:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            patch.expertStreamingPinSync = expertStreamingPinSync
+        case .expertStreamingPinRegime:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            let regime = expertStreamingPinRegime.trimmingCharacters(in: .whitespacesAndNewlines)
+            if regime.isEmpty {
+                patch.expertStreamingPinRegime = nil
+            } else if regime == "decode" || regime == "prefill" {
+                patch.expertStreamingPinRegime = regime
+            } else {
+                lastError = "Pin budget must be between 0 and 64 GiB"
+                return
+            }
+        case .expertStreamingColdTier:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingColdTierPresent else { return }
+            let tier = expertStreamingColdTier.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tier.isEmpty {
+                patch.expertStreamingColdTier = nil
+            } else if let v = Double(tier), v >= 2, v <= 8 {
+                patch.expertStreamingColdTier = String(Int(v))
+            } else {
+                lastError = "Cold tier must be 2 through 8"
+                return
+            }
+        case .expertStreamingHotFraction:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingColdTierPresent else { return }
+            let frac = expertStreamingHotFraction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if frac.isEmpty {
+                patch.expertStreamingHotFraction = nil
+            } else if let v = Double(frac), v >= 0, v <= 1 {
+                patch.expertStreamingHotFraction = v
+            } else {
+                lastError = "Hot fraction must be between 0 and 1"
+                return
+            }
+        case .expertStreamingCachePolicy:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            let policy = expertStreamingCachePolicy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if policy.isEmpty {
+                patch.expertStreamingCachePolicy = nil
+            } else if policy == "lru" || policy == "s3fifo" {
+                patch.expertStreamingCachePolicy = policy
+            } else {
+                lastError = "Cache policy must be lru or s3fifo"
+                return
+            }
+        case .expertStreamingDynamic:
+            guard expertStreamingSupported, expertStreamingEnabled else { return }
+            // Tri-state: nil keeps the env default; true/false is explicit.
+            patch.expertStreamingDynamic = expertStreamingDynamic
+        case .expertStreamingDynamicMaxGib:
+            guard expertStreamingSupported, expertStreamingEnabled, expertStreamingDynamic == true else { return }
+            let gib = expertStreamingDynamicMaxGib.trimmingCharacters(in: .whitespacesAndNewlines)
+            if gib.isEmpty {
+                patch.expertStreamingDynamicMaxGib = nil
+            } else if let v = Double(gib), v > 0, v <= 64 {
+                patch.expertStreamingDynamicMaxGib = v
+            } else {
+                lastError = "Governor max must be between 0 and 64 GiB"
+                return
+            }
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:

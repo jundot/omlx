@@ -76,6 +76,21 @@ class VLMModelAdapter(nn.Module):
         # the proof and retain the ordinary rank-three fail-closed path.
         self._qwen4_text_prefill_positions = False
 
+        # MTP accept telemetry for the storage-roofline verdict: the
+        # chain calls mtp_clamp_accept once per verify cycle with the
+        # number of accepted positions, and mtp_partial_rollback with
+        # False meaning 'fall back to a non-MTP step' (a wasted draft).
+        # Native Lightning MTP (single-stage forward inside the model)
+        # does not pass through these hooks, so native runs leave these
+        # zeros - the derivator treats that as 'no data', never as a
+        # zero-accept measurement.
+        self.mtp_stats: Dict[str, int] = {
+            'cycles': 0,
+            'accepted': 0,
+            'drafted': 0,
+            'fallbacks': 0,
+        }
+
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
         close = getattr(self._vlm_model, "close", None)
@@ -125,6 +140,64 @@ class VLMModelAdapter(nn.Module):
             accepted,
             block_size,
         )
+
+    def mtp_partial_rollback(self, caches, accepted, num_drafts):
+        """Delegate to the language model's chain-rollback (glm5_next / qwen35).
+
+        The chain's ``_chain_rollback`` looks for this method on the host
+        model when the forward produced no ``gdn_states``; the adapter is
+        that host for mlx-vlm builds, so pass it through verbatim.
+        Models without the hook (qwen4_exp Lightning MTP) report False
+        so the caller falls back to the standard non-MTP step instead of
+        crashing the request — a missing rollback is recoverable, and the
+        chain already treats False as fallback.
+        """
+        fn = getattr(self._language_model, "mtp_partial_rollback", None)
+        if not callable(fn):
+            stats = getattr(self, "mtp_stats", None)
+            if isinstance(stats, dict):
+                stats["fallbacks"] += 1
+            return False
+        return fn(caches, accepted, num_drafts)
+
+    def mtp_clamp_accept(self, cache, accepted, num_drafts):
+        """Delegate the accept-count clamp (layers bound what rolls back).
+
+        The hook is optional (batch_generator skips a missing clamp); when
+        the inner model has no bound to enforce (qwen4_exp rolls any prefix
+        back via ``rollback_speculative_cache``), return ``accepted``
+        unchanged rather than raising — raising here turned every partial
+        draft rejection into a hard request failure.
+        """
+        fn = getattr(self._language_model, "mtp_clamp_accept", None)
+        self._record_mtp_accept(int(accepted), int(num_drafts))
+        if not callable(fn):
+            return accepted
+        clamped = fn(cache, accepted, num_drafts)
+        # The hook may clamp below the chain's provisional accept - count
+        # the clamped value, which is what actually rolls forward.
+        if int(clamped) < int(accepted):
+            self.mtp_stats["accepted"] -= int(accepted) - int(clamped)
+        return clamped
+
+    def _record_mtp_accept(self, accepted: int, drafted: int) -> None:
+        """One verify cycle: accepted positions out of drafted proposals.
+
+        Defensive against instances built without __init__ (tests,
+        partial adapters): telemetry never turns a missing hook into
+        a failure.
+        """
+        stats = getattr(self, "mtp_stats", None)
+        if not isinstance(stats, dict):
+            stats = self.mtp_stats = {
+                "cycles": 0,
+                "accepted": 0,
+                "drafted": 0,
+                "fallbacks": 0,
+            }
+        stats["cycles"] += 1
+        stats["accepted"] += max(0, accepted)
+        stats["drafted"] += max(0, drafted)
 
     # Runtime family patches use this marker to avoid installing an older,
     # model-specific copy of the same adapter plumbing.

@@ -195,9 +195,13 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
 
+### Expert Streaming (SSD)
+
+Run MoE models larger than your Mac's RAM: dense weights (attention, shared experts, embeddings) stay resident while routed expert banks stream from SSD via parallel demand reads with coalesced runs (QD16). The OS page cache serves expert reuse by default, with an optional bounded LRU (`budget_auto` scales it to free RAM) and opt-in levers — learned pins, a low-precision cold tier with a HOBBIT hot/cold split, top-k mass truncation, cache-prior reranking, and MTP where draft weights ship — each measured and quality-gated with a perplexity harness. Auto-enabled when the resident model would exceed the memory ceiling; streaming models serve one request at a time, and prefill reuses the paged SSD KV cache. Supported `model_type`s: `glm5_next`, `qwen4_exp`, `glm_moe_dsa`, `deepseek_v4(_mtp)`, `deepseek_v32`, `qwen3_moe`, `qwen2_moe`, `deepseek_v3`, `glm4_moe` — see [docs/expert-streaming.md](docs/expert-streaming.md).
+
 ### Continuous Batching
 
-Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
+Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel. Streaming MoE models run single-stream while the feature is active.
 
 ### Claude Code Optimization
 

@@ -127,5 +127,17 @@ tq_batch_memory.md
 # Local working notes and session tooling — never part of a PR
 .audit/
 .claude/
+.zcode/
 issues.md
 clusterPlan.md
+
+# Expert-streaming bench artifacts (machine-specific measurement outputs)
+bench/results/
+
+# Local knowledge-graph index
+.codegraph/
+
+# Session handoff/plan notes
+HANDOFF-*.md
+PLAN-*.md
+.workbuddy-ai/

@@ -541,6 +541,26 @@ private struct ActiveNowList: View {
                     Row(label: model.id, isLast: index == models.count - 1) {
                         HStack(spacing: 12) {
                             modelStateBadge(for: model)
+                            if let health = model.expertStreamingHealth {
+                                Text("MoE-stream")
+                                    .font(.omlxMono(9))
+                                    .foregroundStyle(theme.textTertiary)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(theme.groupBg, in: RoundedRectangle(cornerRadius: 3))
+                                Text(String(format: "LRU %.0f%%", (health.lruHitRate ?? 0) * 100))
+                                    .font(.omlxMono(10))
+                                    .foregroundStyle(theme.textTertiary)
+                                Text((health.cachePolicy ?? "lru").uppercased())
+                                    .font(.omlxMono(10))
+                                    .foregroundStyle(theme.textTertiary)
+                                if health.dynamicEnabled == true, let gov = health.governor {
+                                    Text("gov \(gov.actions ?? 0)")
+                                        .font(.omlxMono(10))
+                                        .foregroundStyle(theme.textTertiary)
+                                }
+                            }
+                            Spacer(minLength: 0)
                             Text(model.estimatedSizeFormatted ?? "—")
                                 .font(.omlxMono(11))
                                 .foregroundStyle(theme.textSecondary)

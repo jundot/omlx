@@ -37,6 +37,7 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
         importlib.import_module("mlx_vlm.models.qwen4_exp")
         _patch_prompt_utils()
+        _patch_jangq_load_config()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
         return False
@@ -61,6 +62,46 @@ def _patch_prompt_utils() -> None:
 
     get_message_json._omlx_qwen4_exp = True
     prompt_utils.get_message_json = get_message_json
+
+
+def _patch_jangq_load_config() -> None:
+    """Rebuild the quantization policy for JANGQ-packed checkpoints.
+
+    JANGQ checkpoints carry mixed-precision U32/scales/biases triples but
+    no quantization metadata. mlx-vlm would load every projection at the
+    global default and fail on shape mismatch. The wrapper detects that
+    layout in ``load_config`` and injects the reconstructed policy (cached
+    under ``~/.cache/omlx/jangq``) without touching the model folder.
+    """
+    import mlx_vlm.utils as vlm_utils
+
+    current = vlm_utils.load_config
+    if getattr(current, "_omlx_jangq", False):
+        return
+
+    def load_config(model_path, **kwargs):
+        config = current(model_path, **kwargs)
+        try:
+            root = model_path if isinstance(model_path, Path) else Path(str(model_path))
+            model_type = config.get("model_type")
+            architectures = config.get("architectures") or []
+            is_qwen4_exp = model_type == "qwen4_exp" or any(
+                "qwen4_exp" in str(a).lower() or "qwen4exp" in str(a).lower()
+                for a in architectures
+            )
+            if root.is_dir() and is_qwen4_exp:
+                from .jangq import quantization_for_model
+
+                policy = quantization_for_model(root)
+                if policy is not None:
+                    config["quantization"] = policy
+                    config["quantization_config"] = policy
+        except Exception:  # noqa: BLE001
+            logger.debug("JANGQ load_config injection failed", exc_info=True)
+        return config
+
+    load_config._omlx_jangq = True  # type: ignore[attr-defined]
+    vlm_utils.load_config = load_config
 
 
 def is_applied() -> bool:

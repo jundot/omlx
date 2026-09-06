@@ -75,3 +75,14 @@ e2e test against `mlx-community/DeepSeek-V4-Flash-mxfp8`.
 - prefix-cache dedup is disabled for `PoolingCache` (the pool is compressed
   in fixed-ratio windows, partial slicing is meaningless). SSD eviction
   still works via the registered handlers.
+
+## Expert streaming (feature branch)
+
+On the `feature/expert-streaming` branch, `model_type.startswith("deepseek_v4")`
+checkpoints are eligible for SSD expert streaming: the converter walks
+`layer.ffn.switch_mlp` (43 main layers) **and** `mtp.<stage>[.block].ffn.switch_mlp`
+(DSpark draft stages), copying the original `LimitedSwiGLU` activation so
+output stays bit-exact. `BatchedEngine` loads these checkpoints with
+`lazy=True` and converts **before** `materialize_lazy_state`, so the ~160 GB
+of expert banks never materialize. See `docs/expert-streaming.md`
+("DeepSeek V4 Flash") for budget guidance.

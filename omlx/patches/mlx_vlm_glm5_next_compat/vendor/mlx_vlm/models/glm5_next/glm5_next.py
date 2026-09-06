@@ -128,15 +128,60 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # HF container: Glm5NextForConditionalGeneration -> model.{visual,language_model} + lm_head
+        # JANG-MTP raw-transformers export: bare model.* LLM (no language_model
+        # level), hc_base/hc_fn/hc_scale params, bare q/k/v_conv1d, bare o_norm,
+        # and a layer-45 draft head (eh_proj/shared_head/enorm/hnorm).
+        draft_layer = None
+        try:
+            draft_layer = self.language_model.args.num_hidden_layers
+        except AttributeError:
+            draft_layer = None
+        n_mtp = int(
+            getattr(self.language_model.args, "num_nextn_predict_layers", 0) or 0
+        )
+        # The draft layer only survives as mtp.<i>.* when the language model
+        # carries an attached MTP head (the glm5_next_model patch attaches it
+        # when num_nextn_predict_layers>0 and MTP is active). Otherwise the
+        # head never runs — keep dropping the extra layer's weights.
+        keep_draft = bool(getattr(self.language_model, "mtp", None)) and n_mtp > 0
+        mtp_special = {
+            "eh_proj": "eh_proj",
+            "enorm": "enorm",
+            "hnorm": "hnorm",
+            "shared_head.norm": "norm",
+        }
         remapped = {}
         for k, v in weights.items():
             nk = k
+            if draft_layer is not None and nk.startswith(
+                f"model.layers.{draft_layer}."
+            ):
+                if not keep_draft:
+                    # Draft/MTP head never runs in the non-MTP path — drop it.
+                    continue
+                rest = nk[len(f"model.layers.{draft_layer}.") :]
+                if rest.startswith(("shared_head.head.", "embed_tokens.")):
+                    # Duplicates of the shared lm_head / embeddings some
+                    # nextn checkpoints carry; the modules are shared.
+                    continue
+                special_key = next(
+                    (s for s in mtp_special if rest.startswith(s + ".")), None
+                )
+                if special_key is not None:
+                    nk = f"language_model.mtp.0.{mtp_special[special_key]}." + rest[
+                        len(special_key) + 1 :
+                    ]
+                else:
+                    nk = f"language_model.mtp.0.block.{rest}"
             if nk.startswith("model.visual."):
                 nk = "vision_model." + nk[len("model.visual.") :]
             elif nk.startswith("visual."):
                 nk = "vision_model." + nk[len("visual.") :]
             elif nk.startswith("model.language_model."):
                 nk = "language_model.model." + nk[len("model.language_model.") :]
+            elif nk.startswith("model."):
+                # Raw-transformers layout: the LLM sits at bare model.*.
+                nk = "language_model.model." + nk[len("model.") :]
             elif nk.startswith("lm_head."):
                 nk = "language_model." + nk
             remapped[nk] = v

@@ -91,7 +91,7 @@
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
-    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context', 'storage']);
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
@@ -759,6 +759,16 @@
             ctxBenchResult: null,
             ctxBenchError: '',
             ctxBenchEventSource: null,
+
+            // Storage roofline state
+            storageBenchModelId: '',
+            storageBenchRunning: false,
+            storageBenchJobId: null,
+            storageBenchProgress: null,  // { phase, done, total }
+            storagePrediction: null,
+            storageBenchError: '',
+            storageAutoParams: null,
+            storageBenchPollTimer: null,
 
             // Accuracy benchmark state
             accModelId: '',
@@ -7378,6 +7388,33 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    expert_streaming_enabled: model?.expert_streaming_forced === true
+                        || s.expert_streaming_enabled === true,
+                    expert_streaming_supported:
+                        model?.expert_streaming_supported === true,
+                    expert_streaming_forced:
+                        model?.expert_streaming_forced === true,
+                    expert_streaming_budget_gib: s.expert_streaming_budget_gib ?? null,
+                    expert_streaming_budget_auto: s.expert_streaming_budget_auto ?? true,
+                    expert_streaming_topk_threshold: s.expert_streaming_topk_threshold ?? null,
+                    expert_streaming_cache_prior: s.expert_streaming_cache_prior ?? null,
+                    expert_streaming_per_layer_eval: s.expert_streaming_per_layer_eval ?? true,
+                    expert_streaming_pins: s.expert_streaming_pins ?? false,
+                    expert_streaming_pin_gib: s.expert_streaming_pin_gib ?? null,
+                    expert_streaming_pin_sync: s.expert_streaming_pin_sync ?? false,
+                    expert_streaming_pin_regime: s.expert_streaming_pin_regime ?? null,
+                    expert_streaming_cold_tier_present: model?.expert_streaming_cold_tier_present === true,
+                    expert_streaming_cold_tier: s.expert_streaming_cold_tier ?? null,
+                    expert_streaming_hot_fraction: s.expert_streaming_hot_fraction ?? null,
+                    expert_streaming_cache_policy: s.expert_streaming_cache_policy ?? null,
+                    expert_streaming_dynamic: s.expert_streaming_dynamic ?? null,
+                    expert_streaming_dynamic_max_gib: s.expert_streaming_dynamic_max_gib ?? null,
+                    expert_streaming_health: model?.expert_streaming_health ?? null,
+                    expert_dense_bytes: model?.expert_dense_bytes || 0,
+                    expert_total_bytes: model?.expert_total_bytes || 0,
+                    expert_moe_layers: model?.expert_moe_layers || 0,
+                    experts_per_layer: model?.experts_per_layer || 0,
+                    per_expert_bytes: model?.per_expert_bytes || 0,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -8300,6 +8337,41 @@
                                 enable_thinking: this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                expert_streaming_enabled: !!this.modelSettings.expert_streaming_enabled,
+                                expert_streaming_budget_gib: this.modelSettings.expert_streaming_budget_gib != null && String(this.modelSettings.expert_streaming_budget_gib).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_budget_gib)
+                                    : null,
+                                expert_streaming_budget_auto: !!this.modelSettings.expert_streaming_budget_auto,
+                                expert_streaming_topk_threshold: this.modelSettings.expert_streaming_topk_threshold != null && String(this.modelSettings.expert_streaming_topk_threshold).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_topk_threshold)
+                                    : null,
+                                expert_streaming_cache_prior: this.modelSettings.expert_streaming_cache_prior != null && String(this.modelSettings.expert_streaming_cache_prior).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_cache_prior)
+                                    : null,
+                                expert_streaming_per_layer_eval: !!this.modelSettings.expert_streaming_per_layer_eval,
+                                expert_streaming_pins: !!this.modelSettings.expert_streaming_pins,
+                                expert_streaming_pin_gib: this.modelSettings.expert_streaming_pin_gib != null && String(this.modelSettings.expert_streaming_pin_gib).length
+                                    ? parseFloat(this.modelSettings.expert_streaming_pin_gib)
+                                    : null,
+                                expert_streaming_pin_sync: !!this.modelSettings.expert_streaming_pin_sync,
+                                expert_streaming_pin_regime: (this.modelSettings.expert_streaming_pin_regime === "decode" || this.modelSettings.expert_streaming_pin_regime === "prefill")
+                                    ? this.modelSettings.expert_streaming_pin_regime
+                                    : null,
+                                expert_streaming_cold_tier: (this.modelSettings.expert_streaming_cold_tier != null && String(this.modelSettings.expert_streaming_cold_tier).length && Number(this.modelSettings.expert_streaming_cold_tier) >= 2)
+                                    ? String(Math.min(8, Math.floor(Number(this.modelSettings.expert_streaming_cold_tier))))
+                                    : null,
+                                expert_streaming_hot_fraction: (this.modelSettings.expert_streaming_hot_fraction != null && Number(this.modelSettings.expert_streaming_hot_fraction) > 0)
+                                    ? Math.min(1, Number(this.modelSettings.expert_streaming_hot_fraction))
+                                    : null,
+                                expert_streaming_cache_policy: (this.modelSettings.expert_streaming_cache_policy === 'lru' || this.modelSettings.expert_streaming_cache_policy === 's3fifo')
+                                    ? this.modelSettings.expert_streaming_cache_policy
+                                    : null,
+                                expert_streaming_dynamic: (this.modelSettings.expert_streaming_dynamic === true)
+                                    ? true
+                                    : (this.modelSettings.expert_streaming_dynamic === false ? false : null),
+                                expert_streaming_dynamic_max_gib: (this.modelSettings.expert_streaming_dynamic_max_gib != null && Number(this.modelSettings.expert_streaming_dynamic_max_gib) > 0)
+                                    ? Math.min(64, Number(this.modelSettings.expert_streaming_dynamic_max_gib))
+                                    : null,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -9557,6 +9629,95 @@
             },
 
             // Context benchmark functions
+            // ---- Storage roofline ----
+
+            async loadStorageAutoParams() {
+                if (!this.storageBenchModelId) { this.storageAutoParams = null; return; }
+                try {
+                    const response = await fetch('/admin/api/bench/storage/auto-params?model_id=' + encodeURIComponent(this.storageBenchModelId));
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) return;
+                    this.storageAutoParams = await response.json();
+                } catch (err) {
+                    console.error('Failed to load storage auto params:', err);
+                }
+            },
+
+            async storagePredict() {
+                if (!this.storageBenchModelId || this.storageBenchRunning) return;
+                this.storageBenchError = '';
+                try {
+                    const response = await fetch('/admin/api/bench/storage/predict?model_id=' + encodeURIComponent(this.storageBenchModelId));
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.storageBenchError = data.detail || '';
+                        return;
+                    }
+                    this.storagePrediction = await response.json();
+                } catch (err) {
+                    console.error('Failed to predict storage roofline:', err);
+                }
+            },
+
+            async startStorageBench() {
+                if (!this.storageBenchModelId || this.storageBenchRunning) return;
+                this.storageBenchRunning = true;
+                this.storageBenchProgress = null;
+                this.storageBenchError = '';
+                this.storageBenchJobId = null;
+                try {
+                    const response = await fetch('/admin/api/bench/storage/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model_id: this.storageBenchModelId }),
+                    });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.storageBenchError = data.detail || window.t('js.error.start_bench_failed');
+                        this.storageBenchRunning = false;
+                        return;
+                    }
+                    const data = await response.json();
+                    this.storageBenchJobId = data.job_id;
+                    this.pollStorageBench();
+                } catch (err) {
+                    console.error('Failed to start storage benchmark:', err);
+                    this.storageBenchError = window.t('js.error.start_bench_failed');
+                    this.storageBenchRunning = false;
+                }
+            },
+
+            pollStorageBench() {
+                if (this.storageBenchPollTimer) clearTimeout(this.storageBenchPollTimer);
+                const poll = async () => {
+                    if (!this.storageBenchJobId) return;
+                    try {
+                        const response = await fetch('/admin/api/bench/storage/' + this.storageBenchJobId + '/results');
+                        if (response.status === 401) { window.location.href = '/admin'; return; }
+                        if (response.ok) {
+                            const data = await response.json();
+                            if (data.progress) this.storageBenchProgress = data.progress;
+                            if (data.status === 'completed' || data.status === 'failed') {
+                                this.storageBenchRunning = false;
+                                if (data.status === 'failed') {
+                                    this.storageBenchError = data.error || window.t('js.error.start_bench_failed');
+                                } else if (data.report) {
+                                    this.storagePrediction = data.report;
+                                    this.loadStorageAutoParams();
+                                }
+                                return; // terminal: stop polling
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Storage bench poll failed:', err);
+                    }
+                    this.storageBenchPollTimer = setTimeout(poll, 1000);
+                };
+                poll();
+            },
+
             async startContextBenchmark() {
                 if (!this.ctxBenchModelId || this.ctxBenchRunning) return;
 
@@ -10044,6 +10205,12 @@
                     // refresh in case it changed on the Settings tab or in
                     // another window.
                     this.loadGlobalSettings();
+                }
+                if (tab === 'storage') {
+                    // Lazy-load derived params + the latest report so the
+                    // tab is never empty on revisit.
+                    this.loadStorageAutoParams();
+                    this.storagePredict();
                 }
             },
 

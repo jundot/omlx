@@ -54,6 +54,10 @@ def _candidate_keys(config: dict):
             "ngram_embedding",
             f"language_model.model.layers.{layer_index}.ple.ple_embedding."
             "ngram_embedding",
+            # JANGQ layout: one level shallower, with or without model.
+            f"model.language_model.layers.{layer_index}.ple.ngram_embedding",
+            f"language_model.model.layers.{layer_index}.ple.ngram_embedding",
+            f"language_model.layers.{layer_index}.ple.ngram_embedding",
         )
         for shard_index in range(num_shards):
             for prefix in prefixes:

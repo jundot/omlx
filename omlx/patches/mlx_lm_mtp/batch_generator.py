@@ -1971,6 +1971,24 @@ class _DepthController:
         self._ms_probe += cycle_ms
         self._ms_explore += cycle_ms
 
+        # TEMP DETERMINISM (revert after the 8k probe): pin the trajectory.
+        # Runs after the acceptance/time EMA updates (those are measurements,
+        # not decisions) and returns before every decision path — warmup
+        # sweep, probe burst, and the per-cycle re-decide — so `cur` can
+        # never be moved off the pin while the env is set. A garbage value
+        # falls through to normal adaptive behavior.
+        _fixed = __import__("os").environ.get("OMLX_MTP_FIXED_DEPTH")
+        if _fixed is not None:
+            try:
+                _cur = max(0, min(self.max_depth, int(_fixed)))
+            except ValueError:
+                _cur = None
+            if _cur is not None:
+                self._warmup = []
+                self.probe_left = 0
+                self.cur = _cur
+                return
+
         if self._speculation_losing():
             self.exit_streak += 1
         else:
@@ -2817,6 +2835,63 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
 
+# ---------------------------------------------------------------------------
+# Module-level MTP aggregate (roofline derivation support).
+#
+# _log_mtp_stats fires once per finished sequence with EXACT cycle/accept
+# numbers (the adapter clamp hook only fires on partial accepts). The
+# bench resets this before a run and snapshots it after, giving the
+# storage-roofline derivator authoritative tok/cycle inputs.
+# ---------------------------------------------------------------------------
+
+
+class _MtpAggregate:
+    """Sum of per-request MTP stats across a bench arm."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.cycles = 0
+        self.emits = 0
+        self.accepts = 0
+        self.drafted = 0
+        self.reject_cycles = 0
+        self.zero_cycles = 0
+
+    def aggregate(self, stats: "_MtpStats", total_emits: int, total_drafted: int) -> None:
+        self.requests += 1
+        self.cycles += stats.cycles
+        self.emits += total_emits
+        self.accepts += stats.accepts
+        self.drafted += total_drafted
+        self.reject_cycles += stats.rejects
+        self.zero_cycles += stats.zero_cycles
+
+    def snapshot(self) -> dict:
+        return {
+            "requests": self.requests,
+            "cycles": self.cycles,
+            "emits": self.emits,
+            "accepts": self.accepts,
+            "drafted": self.drafted,
+            "reject_cycles": self.reject_cycles,
+            "zero_cycles": self.zero_cycles,
+        }
+
+
+_MTP_AGG = _MtpAggregate()
+
+
+def mtp_stats_reset() -> None:
+    """Zero the module-level aggregate (bench arm start)."""
+    global _MTP_AGG
+    _MTP_AGG = _MtpAggregate()
+
+
+def mtp_stats_snapshot() -> dict:
+    """Copy of the module-level aggregate (bench arm end)."""
+    return _MTP_AGG.snapshot()
+
+
 def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
 
@@ -2825,11 +2900,17 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
       MTP[<uid>] finish=<reason> tokens=<N> cycles=<C> accept=<A>/<C> (<rate>%)
         emits[init=<i>,draft=<d>,bonus=<b>,verify=<v>]
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
+
+    Also feeds the module-level ``mtp_stats_snapshot()`` aggregator so
+    callers (bench / storage-roofline derivation) get EXACT per-cycle
+    numbers — the adapter-side clamp hook only fires on partial accepts
+    and undercounts full-accept cycles.
     """
     total_emits = (
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )
     total_drafted = sum(stats.depth_drafted) or stats.cycles
+    _MTP_AGG.aggregate(stats, total_emits, total_drafted)
     if total_drafted > 0:
         rate_str = f"{stats.accepts / total_drafted * 100:.1f}%"
     else:
@@ -2963,6 +3044,9 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         draft_ids: List[int] = []
         emit_last_id = int(step_tok.tolist()[0])
         emit_last_lp = combined_lp[0]
+        # TEMP FORENSICS (revert with the k>0 log above).
+        if __import__("os").environ.get("OMLX_MTP_DIV_LOG"):
+            logger.info("MTP div k=0 plain=%d", emit_last_id)
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         state.stats.zero_cycles += 1
@@ -2976,6 +3060,15 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         m = int(host[0])
         target_ids = host[1 : k + 2]
         draft_ids = host[k + 2 :]
+        # TEMP FORENSICS (revert after the 8k divergence probe).
+        if __import__("os").environ.get("OMLX_MTP_DIV_LOG"):
+            logger.info(
+                "MTP div k=%d m=%d drafts=%s targets=%s",
+                k,
+                m,
+                draft_ids,
+                target_ids,
+            )
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         emit_last_id = target_ids[m] if m < k else target_ids[k]

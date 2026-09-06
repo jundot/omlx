@@ -356,8 +356,59 @@ class EnginePool:
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )
-        if qwen4_offload and qwen4_estimate is not None:
+        # Track individual PLE state for combined handling below
+        qwen4_active = qwen4_offload and qwen4_estimate is not None and qwen4_estimate.supported
+        if qwen4_active:
             base = min(base, qwen4_estimate.mmap_bytes)
+        # Expert streaming reduces resident to dense + cache budget
+        exp_enabled = False
+        exp_est = None
+        exp_streaming_bytes = None
+        try:
+            exp_enabled, _, exp_est = self._expert_streaming_status(entry, runtime_settings)
+            if exp_enabled and exp_est is not None and exp_est.supported:
+                budget_bytes = self._streaming_budget_bytes(runtime_settings)
+                exp_streaming_bytes = exp_est.streaming_bytes_for_budget(budget_bytes)
+                # Use the smaller of current base and streaming estimate (streaming is a ceiling reduction)
+                base = min(base, exp_streaming_bytes)
+        except Exception:
+            pass
+        # When both PLE mmap and expert streaming are active, combine savings:
+        # dense_without_both = checkpoint - ple - expert; streaming+ple = dense_without_both*1.05 + cache
+        # Both estimates' checkpoint_bytes overlap (PLE may have separate artifact), so use max.
+        # Force PLE mmap when streaming is active for qwen4_exp (saves ~30G) even if ceiling wouldn't force it.
+        if not qwen4_active and exp_enabled and (entry.config_model_type or "").replace("-", "_").lower() == "qwen4_exp":
+            # streaming implies PLE should also be mmap to stay enxuto
+            try:
+                from .patches.mlx_vlm_qwen4_exp_compat.residency import qwen4_exp_residency_estimate
+                qest = qwen4_exp_residency_estimate(entry.model_path)
+                if qest.supported:
+                    qwen4_active = True
+                    qwen4_estimate = qest
+                    base = min(base, qest.mmap_bytes)
+            except Exception:
+                pass
+        try:
+            if qwen4_active and exp_enabled and exp_est is not None and exp_est.supported:
+                # Recompute cache for combined (same budget)
+                budget_bytes = self._streaming_budget_bytes(runtime_settings)
+                slots = exp_est.slots_for_budget(budget_bytes)
+                cache = slots * exp_est.num_moe_layers * exp_est.per_expert_bytes if slots else 0
+                chk = max(qwen4_estimate.checkpoint_bytes, exp_est.checkpoint_bytes)
+                ple = qwen4_estimate.ple_bytes
+                expert = exp_est.expert_bytes
+                # P3: single overhead source (was a 1.05 literal drifting
+                # from residency._MODEL_OVERHEAD_FACTOR).
+                from .patches.expert_streaming.residency import (
+                    _MODEL_OVERHEAD_FACTOR as _OVERHEAD,
+                )
+
+                overhead = _OVERHEAD
+                dense_without_both = max(0, chk - ple - expert)
+                combined = int(dense_without_both * overhead + cache)
+                base = min(base, combined)
+        except Exception:
+            pass
         extra = _qwen35_cpu_share_estimated_bytes(entry.model_path, runtime_settings)
         if extra is None:
             # An enabled CPU path with unreadable geometry must not silently
@@ -446,6 +497,222 @@ class EnginePool:
         effective = copy.copy(settings)
         setattr(effective, "qwen4_ple_ssd_offload", True)
         return effective
+
+    def _expert_streaming_status(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> tuple[bool, bool, object | None]:
+        """Resolve requested/forced expert streaming for this process."""
+
+        try:
+            from .patches.expert_streaming.residency import expert_streaming_estimate
+
+            est = expert_streaming_estimate(entry.model_path)
+        except Exception:
+            return False, False, None
+        if not est.supported:
+            return False, False, est
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        # P0: charge one per-layer expert bank as the streaming transient
+        # (the peak the scheduler guard accounts per layer) so a ceiling
+        # that fits streaming_bytes but not its transient is refused.
+        transient = int(getattr(est, "per_layer_expert_bytes", 0) or 0)
+        forced = est.force_streaming(ceiling, transient)
+        requested = bool(
+            settings is not None and getattr(settings, "expert_streaming_enabled", False)
+        )
+        return requested or forced, forced, est
+
+    def _effective_expert_streaming_settings(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> object | None:
+        enabled, forced, est = self._expert_streaming_status(entry, settings)
+        if not enabled or settings is None:
+            return settings
+        effective = settings
+        if forced and not getattr(settings, "expert_streaming_enabled", False):
+            effective = copy.copy(settings)
+            setattr(effective, "expert_streaming_enabled", True)
+        # None follows the default (on); only an explicit False opts out.
+        if getattr(effective, "expert_streaming_budget_auto", True) is not False:
+            auto_bytes = self._resolve_auto_budget_bytes(effective, est, entry)
+            if auto_bytes:
+                if effective is settings:
+                    effective = copy.copy(settings)
+                setattr(effective, "expert_streaming_budget_gib", auto_bytes / 1024**3)
+                logger.info(
+                    "Expert streaming: auto budget %.2f GiB for %s "
+                    "(ceiling-scaled LRU; manual budget unset)",
+                    auto_bytes / 1024**3,
+                    getattr(entry, "model_id", "?"),
+                )
+        return effective
+
+    # Default-on RAM-scaled expert cache (expert_streaming_budget_auto):
+    # commit a fraction of the post-load headroom to the app-level LRU so
+    # bigger machines keep more experts resident instead of streaming
+    # everything. Only False opts out; an explicit budget (even 0) wins.
+    _AUTO_BUDGET_FRACTION = 0.5
+    _AUTO_BUDGET_RESERVE_BYTES = 2 * 1024**3  # headroom kept free past streaming bytes
+    _AUTO_BUDGET_MAX_BYTES = 8 * 1024**3  # default cap without autotune knee data
+    _AUTO_BUDGET_KNEE_FILENAME = "expert_budget_knee.json"
+
+    @staticmethod
+    def _budget_knee_bytes(model_path: object) -> int | None:
+        """Autotuned LRU knee for this checkpoint, if the autotuner wrote one.
+
+        Reads ``<model>/.omlx/expert_budget_knee.json`` (written by
+        bench/autotune_expert_streaming.py --apply): the smallest budget
+        reaching ~95% of the best measured score. None when absent or
+        unreadable — the caller then falls back to the default cap.
+        """
+        try:
+            raw = json.loads(
+                (Path(str(model_path)) / ".omlx" / EnginePool._AUTO_BUDGET_KNEE_FILENAME).read_text()
+            )
+            knee_gib = float(raw.get("knee_gib", 0.0))
+        except Exception:
+            return None
+        if knee_gib < 0:
+            return None
+        return int(knee_gib * 1024**3)
+
+    # P3: default knee per family when the autotuner never wrote one —
+    # mid-size checkpoints otherwise all share the 8 GiB cap regardless
+    # of how little cache they can actually use.
+    _AUTO_BUDGET_FAMILY_KNEE_GIB = {
+        "glm_moe_dsa": 6.0,
+        "glm5_next": 6.0,
+        "glm5_next_text": 6.0,
+        "deepseek_v4": 6.0,
+        "deepseek_v4_mtp": 6.0,
+        "deepseek_v3": 4.0,
+        "deepseek_v32": 4.0,
+        "qwen4_exp": 2.0,
+        "qwen4_exp_text": 2.0,
+        "qwen3_moe": 2.0,
+        "qwen2_moe": 1.0,
+        "glm4_moe": 2.0,
+    }
+
+    @staticmethod
+    def _auto_streaming_budget_bytes(
+        manual_gib: object,
+        streaming_bytes: int,
+        ceiling_bytes: int,
+        knee_bytes: int | None = None,
+        reserve_bytes: int | None = None,
+        model_type: str | None = None,
+    ) -> int | None:
+        """Pure auto-budget formula. None = leave settings untouched.
+
+        Any explicit ``manual_gib`` — including 0 (= page-cache only) —
+        always wins (explicit operator choice); auto only sizes the cache
+        when the budget is unset. A missing ceiling or no post-reserve
+        headroom also declines. Otherwise half the headroom past streaming
+        bytes + reserve, capped at min(8 GiB, knee). P3: the reserve
+        scales with the configured context (activation per token) and the
+        knee falls back to a per-family default when autotune data is
+        absent — both params optional so existing callers/tests hold.
+        """
+        if manual_gib is not None:
+            return None
+        if ceiling_bytes <= 0 or streaming_bytes <= 0:
+            return None
+        reserve = (
+            int(reserve_bytes)
+            if reserve_bytes is not None and int(reserve_bytes) > 0
+            else EnginePool._AUTO_BUDGET_RESERVE_BYTES
+        )
+        headroom = ceiling_bytes - streaming_bytes - reserve
+        if headroom <= 0:
+            return None
+        cap = EnginePool._AUTO_BUDGET_MAX_BYTES
+        knee = knee_bytes
+        if (knee is None or knee < 0) and model_type:
+            fam = str(model_type).replace("-", "_").lower()
+            if fam in EnginePool._AUTO_BUDGET_FAMILY_KNEE_GIB:
+                knee = int(EnginePool._AUTO_BUDGET_FAMILY_KNEE_GIB[fam] * 1024**3)
+        if knee is not None and knee >= 0:
+            cap = min(cap, int(knee))
+        auto = min(int(headroom * EnginePool._AUTO_BUDGET_FRACTION), cap)
+        auto = (auto // (1024 * 1024)) * (1024 * 1024)  # whole MiB
+        return auto or None
+
+    def _resolve_auto_budget_bytes(
+        self,
+        settings: object,
+        est: object | None,
+        entry: EngineEntry,
+    ) -> int | None:
+        """Resolve the auto budget against the live ceiling and knee data."""
+        streaming_bytes = int(getattr(est, "streaming_bytes", 0) or 0) if est is not None else 0
+        if not streaming_bytes or not getattr(est, "supported", False):
+            return None
+        ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            ceiling = self._current_ceiling()
+        # P3: scale the free reserve with the configured context window —
+        # the fixed 2 GiB ignores long-context KV. Activation per token is
+        # 2*hidden_size (same term the prefill guard charges per token).
+        reserve: int | None = None
+        try:
+            hidden = int(getattr(est, "hidden_size", 0) or 0)
+            max_ctx = int(getattr(settings, "max_tokens", 0) or 0) or int(
+                getattr(settings, "context_length", 0) or 0
+            )
+            if hidden > 0 and max_ctx > 0:
+                reserve = max(
+                    EnginePool._AUTO_BUDGET_RESERVE_BYTES,
+                    2 * hidden * max_ctx * 2,
+                )
+        except Exception:
+            reserve = None
+        return self._auto_streaming_budget_bytes(
+            getattr(settings, "expert_streaming_budget_gib", None),
+            streaming_bytes,
+            ceiling,
+            self._budget_knee_bytes(getattr(entry, "model_path", "")),
+            reserve,
+            getattr(est, "model_type", None),
+        )
+
+    def _dflash_blocked_by_expert_streaming(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+    ) -> bool:
+        """True when expert streaming wins over DFlash for this entry.
+
+        DFlash's own pipeline loads the target fully resident and never
+        applies the oMLX streaming patches, so the two are mutually
+        exclusive — an explicitly requested or memory-forced streaming
+        model must not be silently loaded resident (GLM-5.3 at 190G on a
+        48GiB machine would OOM inside DFlashEngine.start()).
+        """
+        enabled, forced, _ = self._expert_streaming_status(entry, settings)
+        return enabled or forced
+
+    @staticmethod
+    def _streaming_budget_bytes(settings: object | None) -> int:
+        """Expert LRU budget in bytes from settings.
+
+        None (unset) -> 0 = page-cache only (default: rely on the OS file
+        cache for expert reuse — measured A/B beats the app-level LRU);
+        explicit 0 -> page-cache only; >0 -> fixed LRU budget.
+        """
+        gib = getattr(settings, "expert_streaming_budget_gib", None) if settings else None
+        if gib is None:
+            return 0
+        try:
+            return max(0, int(float(gib) * 1024**3))
+        except Exception:
+            return 0
 
     @property
     def current_model_memory(self) -> int:
@@ -638,6 +905,42 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            exp_enabled, _, _ = self._expert_streaming_status(entry, settings)
+            add("expert_streaming_enabled", exp_enabled)
+            if exp_enabled:
+                add("expert_streaming_budget_gib", data.get("expert_streaming_budget_gib"))
+                # Approximate routing changes outputs — part of the runtime
+                # signature so a threshold change triggers reload.
+                thr = data.get("expert_streaming_topk_threshold", None)
+                if thr is not None and float(thr) < 1.0:
+                    add("expert_streaming_topk_threshold", thr)
+                prior = data.get("expert_streaming_cache_prior", None)
+                if prior is not None and float(prior) > 0:
+                    add("expert_streaming_cache_prior", prior)
+                # IO-layer tuning knobs (autotune): the IO pool depth is fixed
+                # at conversion time and warmer/prefetcher attach is decided
+                # at load, so any of these changes must rebuild the engine.
+                for _io_key in (
+                    "expert_streaming_io_depth",
+                    "expert_streaming_coalesce",
+                    "expert_streaming_readahead",
+                    "expert_streaming_seed",
+                    "expert_streaming_per_layer_eval",
+                    "expert_streaming_pins",
+                    "expert_streaming_pin_gib",
+                    "expert_streaming_pin_sync",
+                    "expert_streaming_pin_regime",
+                    "expert_streaming_cold_tier",
+                    "expert_streaming_hot_fraction",
+                    "expert_streaming_cache_policy",
+                    "expert_streaming_dynamic",
+                ):
+                    add(_io_key, data.get(_io_key))
+                if bool(data.get("expert_streaming_dynamic", False)):
+                    add(
+                        "expert_streaming_dynamic_max_gib",
+                        data.get("expert_streaming_dynamic_max_gib"),
+                    )
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -1631,9 +1934,17 @@ class EnginePool:
             runtime_load_settings = (
                 load_settings if qwen4_admission_override else runtime_settings
             )
+            # Resolve budget_auto before accounting: the auto LRU grows
+            # resident size, so admission must see the same effective
+            # settings the loader will use (else it admits by the smaller
+            # page-cache-only size and the load over-commits). Base on
+            # load_settings so the qwen4 SSD-offload override is priced too.
+            admission_settings = self._effective_expert_streaming_settings(
+                entry, load_settings
+            )
             admission_size = self._entry_runtime_resident_size(
                 entry,
-                load_settings,
+                admission_settings,
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
@@ -2621,6 +2932,7 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            model_settings = self._effective_expert_streaming_settings(entry, model_settings)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)
@@ -2672,44 +2984,58 @@ class EnginePool:
                         model_id,
                     )
                 elif dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
+                    if self._dflash_blocked_by_expert_streaming(entry, model_settings):
+                        logger.warning(
+                            "Expert streaming is active for %s; DFlash would load "
+                            "the target fully resident and bypass streaming — "
+                            "skipping DFlash and using the native engine",
+                            model_id,
+                        )
+                    else:
+                        try:
+                            from .engine.dflash import DFlashEngine
 
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
-                            draft_quant_enabled=getattr(
-                                model_settings, "dflash_draft_quant_enabled", False
-                            ),
-                            draft_quant_weight_bits=getattr(
-                                model_settings, "dflash_draft_quant_weight_bits", 4
-                            ),
-                            draft_quant_activation_bits=getattr(
-                                model_settings, "dflash_draft_quant_activation_bits", 16
-                            ),
-                            draft_quant_group_size=getattr(
-                                model_settings, "dflash_draft_quant_group_size", 64
-                            ),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                            omlx_ssd_cache_dir=getattr(
-                                self._scheduler_config, "paged_ssd_cache_dir", None
-                            ),
-                        )
-                        logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
-                        )
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
+                            engine = DFlashEngine(
+                                model_name=entry.model_path,
+                                draft_model_path=dflash_draft,
+                                draft_quant_enabled=getattr(
+                                    model_settings, "dflash_draft_quant_enabled", False
+                                ),
+                                draft_quant_weight_bits=getattr(
+                                    model_settings, "dflash_draft_quant_weight_bits", 4
+                                ),
+                                draft_quant_activation_bits=getattr(
+                                    model_settings,
+                                    "dflash_draft_quant_activation_bits",
+                                    16,
+                                ),
+                                draft_quant_group_size=getattr(
+                                    model_settings,
+                                    "dflash_draft_quant_group_size",
+                                    64,
+                                ),
+                                model_settings=model_settings,
+                                fallback_engine_type=effective_type,
+                                scheduler_config=self._scheduler_config,
+                                omlx_ssd_cache_dir=getattr(
+                                    self._scheduler_config,
+                                    "paged_ssd_cache_dir",
+                                    None,
+                                ),
+                            )
+                            logger.info(
+                                f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                            )
+                        except ImportError:
+                            logger.warning(
+                                f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
+                                f"Falling back to default engine."
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"DFlash init failed for {model_id}: {e}. "
+                                f"Falling back to default engine."
+                            )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py

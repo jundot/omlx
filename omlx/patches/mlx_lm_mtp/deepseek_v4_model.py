@@ -24,9 +24,21 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
 from . import deepseek_v4_dspark, prompt_priming
+
+
+def _spill_armed() -> bool:
+    """True when spill-stacking may run for this load.
+
+    Requires a recorded checkpoint path (model_loading sets it from the
+    load_config wrapper) and no explicit opt-out via OMLX_DSV4_SPILL=0.
+    """
+    from ..deepseek_v4.spill import spill_disabled, spill_model_path
+
+    return spill_model_path() is not None and not spill_disabled()
 
 logger = logging.getLogger(__name__)
 
@@ -761,8 +773,15 @@ def _patch_model(dsv4: Any) -> None:
 
         top_remap = {
             "embed.weight": "model.embed_tokens.weight",
+            # JANG quantizes the bookends (8-bit affine): the quant
+            # tensors ride along or the strict load fails with
+            # "parameters not in model" (oQ4e bookends were fp).
+            "embed.scales": "model.embed_tokens.scales",
+            "embed.biases": "model.embed_tokens.biases",
             "norm.weight": "model.norm.weight",
             "head.weight": "lm_head.weight",
+            "head.scales": "lm_head.scales",
+            "head.biases": "lm_head.biases",
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",
@@ -822,24 +841,126 @@ def _patch_model(dsv4: Any) -> None:
             remapped[nk] = v
         weights = remapped
 
-        # Stack routed expert weights for backbone layers.
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.ffn.experts"
-            for src, dst in (
-                ("w1", "gate_proj"),
-                ("w2", "down_proj"),
-                ("w3", "up_proj"),
-            ):
-                for suffix in ("weight", "scales", "biases"):
-                    key0 = f"{prefix}.0.{src}.{suffix}"
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[
-                            f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-                        ] = mx.stack(stacked)
+        # Stack routed expert weights for backbone layers. Per-expert
+        # JANGQ checkpoints stack 256 experts x 43 layers (~64 GiB); the
+        # in-RAM mx.stack graphs below would materialize all at once at
+        # load-time eval (SIGKILL on a 48 GiB box), so spill them per layer
+        # to mmap-backed shards instead (see ..deepseek_v4.spill).
+        if "model.layers.0.ffn.experts.0.w1.weight" in weights and _spill_armed():
+            from ..deepseek_v4.spill import (
+                load_spill_into,
+                spill_dir_for,
+                spill_is_valid,
+                spill_model_path,
+                stack_layer_to_spill,
+                write_manifest,
+            )
+
+            _spill_src = Path(spill_model_path())  # type: ignore[arg-type]
+            _spill_dir = spill_dir_for(_spill_src)
+            _valid = spill_is_valid(_spill_src)
+            if _valid is not None:
+                load_spill_into(weights, _valid)
+                # The raw per-expert keys are superseded by the spilled
+                # stacked banks; drop them so strict load sees no extras.
+                for _k in [
+                    k
+                    for k in weights
+                    if ".ffn.experts." in k and k.startswith("model.layers.")
+                ]:
+                    del weights[_k]
+                logger.info(
+                    "dsv4 spill hit: %s serves stacked banks (no re-spill)",
+                    _valid,
+                )
+            else:
+                from ..deepseek_v4.spill import spill_layer_ok
+
+                import mlx.core as _mx_spill
+
+                logger.info(
+                    "dsv4 spill miss: stacking %d layers to %s",
+                    n_layers,
+                    _spill_dir,
+                )
+                _n_exp = int(self.args.n_routed_experts)
+                for layer_idx in range(n_layers):
+                    if spill_layer_ok(_spill_dir, layer_idx):
+                        # Resumed shard from an interrupted spill: serve
+                        # it directly instead of re-stacking.
+                        weights.update(
+                            dict(
+                                _mx_spill.load(
+                                    str(
+                                        _spill_dir
+                                        / f"spill_layer_{layer_idx:02d}.safetensors"
+                                    )
+                                )
+                            )
+                        )
+                        # The raw per-expert keys are still in weights;
+                        # drop them so strict load sees only stacked banks.
+                        _pfx = f"model.layers.{layer_idx}.ffn.experts"
+                        for _k in [
+                            k for k in weights if k.startswith(_pfx + ".")
+                        ]:
+                            del weights[_k]
+                    else:
+                        weights.update(
+                            stack_layer_to_spill(
+                                weights,
+                                layer_idx=layer_idx,
+                                n_experts=_n_exp,
+                                spill_dir=_spill_dir,
+                            )
+                        )
+                    if layer_idx % 8 == 7:
+                        logger.info(
+                            "dsv4 spill progress: %d/%d layers",
+                            layer_idx + 1,
+                            n_layers,
+                        )
+                import re as _re
+
+                _key_to_file: dict[str, str] = {}
+                for k in weights:
+                    if ".ffn.switch_mlp." not in k or not k.startswith(
+                        "model.layers."
+                    ):
+                        continue
+                    _m = _re.search(r"model\.layers\.(\d+)\.", k)
+                    if _m:
+                        _key_to_file[k] = "spill_layer_%02d.safetensors" % int(
+                            _m.group(1)
+                        )
+                _files = sorted(
+                    p.name
+                    for p in _spill_dir.glob("spill_layer_*.safetensors")
+                )
+                write_manifest(_spill_dir, _spill_src, _files, _key_to_file)
+                logger.info(
+                    "dsv4 spill miss: stacked %d layers to %s",
+                    n_layers,
+                    _spill_dir,
+                )
+        else:
+            for layer_idx in range(n_layers):
+                prefix = f"model.layers.{layer_idx}.ffn.experts"
+                for src, dst in (
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ):
+                    for suffix in ("weight", "scales", "biases"):
+                        key0 = f"{prefix}.0.{src}.{suffix}"
+                        if key0 in weights:
+                            stacked = [
+                                weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                                for e in range(self.args.n_routed_experts)
+                            ]
+                            weights[
+                                f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
+                            ] = mx.stack(stacked)
 
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers.
         for layer_idx in range(n_layers):

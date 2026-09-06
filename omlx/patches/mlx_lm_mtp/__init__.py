@@ -103,6 +103,7 @@ def apply_mlx_lm_mtp_patch() -> bool:
         cache_rollback,
         deepseek_v4_model,
         gemma4_text_model,
+        glm5_next_model,
         glm_moe_dsa_model,
         nemotron_h_chain,
         nemotron_h_model,
@@ -122,6 +123,10 @@ def apply_mlx_lm_mtp_patch() -> bool:
         logger.debug("DeepSeek-V4 MTP patch did not apply (likely missing base patch)")
     if not glm_moe_dsa_model.apply():
         logger.debug("GLM-5.2 MTP patch did not apply (likely missing base patch)")
+    if not glm5_next_model.apply():
+        logger.debug(
+            "GLM-5.3 (glm5_next) MTP patch did not apply (module not registered)"
+        )
     if not step3p7_model.apply():
         logger.debug("Step-3.7 MTP patch did not apply (likely missing base patch)")
     if not nemotron_h_model.apply():
@@ -136,10 +141,14 @@ def apply_mlx_lm_mtp_patch() -> bool:
 
     # Verify-shape qmm kernels. Optional: inert unless armed around an MTP
     # verify forward, and strictly shape-gated at call time.
+    # TEMP BISECT (revert): OMLX_MTP_NOVERIFY_QMM=1 skips for the 8k probe.
+    import os as _os_verify_bisect
+
     try:
         from ..qwen35_verify_qmm import apply_verify_qmm_patch
 
-        apply_verify_qmm_patch()
+        if not _os_verify_bisect.environ.get("OMLX_MTP_NOVERIFY_QMM"):
+            apply_verify_qmm_patch()
     except Exception:
         logger.debug("verify qmm patch not applied", exc_info=True)
 

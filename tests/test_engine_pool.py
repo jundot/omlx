@@ -4114,3 +4114,61 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "dynamic memory ceiling" in message
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
+
+
+class TestStreamingIoRuntimeSignature:
+    """Fase H: autotune IO knobs are load-relevant only while streaming."""
+
+    def _pool_with_streaming_entry(self):
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        entry = EngineEntry(
+            model_id="moe-model",
+            model_path="/fake/moe-model",
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="glm_moe_dsa",
+            estimated_size=1000,
+        )
+        pool._entries[entry.model_id] = entry
+        return pool
+
+    def test_io_knob_change_changes_signature_when_streaming(self):
+        from omlx.model_settings import ModelSettings
+
+        pool = self._pool_with_streaming_entry()
+        pool._expert_streaming_status = lambda e, s: (True, False, None)
+
+        base = pool._engine_runtime_signature(
+            "moe-model", ModelSettings(expert_streaming_enabled=True)
+        )
+        tuned = pool._engine_runtime_signature(
+            "moe-model",
+            ModelSettings(expert_streaming_enabled=True, expert_streaming_io_depth=32),
+        )
+        assert tuned is not None
+        assert base != tuned
+
+        coalesce = pool._engine_runtime_signature(
+            "moe-model",
+            ModelSettings(
+                expert_streaming_enabled=True, expert_streaming_coalesce=False
+            ),
+        )
+        assert coalesce != base
+
+    def test_io_knobs_inert_without_streaming(self):
+        from omlx.model_settings import ModelSettings
+
+        pool = self._pool_with_streaming_entry()
+        pool._expert_streaming_status = lambda e, s: (False, False, None)
+
+        with_knob = pool._engine_runtime_signature(
+            "moe-model",
+            ModelSettings(expert_streaming_enabled=False, expert_streaming_io_depth=32),
+        )
+        without = pool._engine_runtime_signature(
+            "moe-model", ModelSettings(expert_streaming_enabled=False)
+        )
+        assert with_knob == without

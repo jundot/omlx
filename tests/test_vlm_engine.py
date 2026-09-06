@@ -208,6 +208,7 @@ class TestVLMToolForwarding:
     def _output(*, streaming=False):
         return SimpleNamespace(
             output_text="ok",
+            output_token_ids=[11, 22] if streaming else [11, 22],
             new_text="ok" if streaming else "",
             prompt_tokens=1,
             completion_tokens=1,
@@ -270,13 +271,16 @@ class TestVLMToolForwarding:
                 "_process_chat_messages",
                 side_effect=self._process_chat_messages,
             ):
-                async for _ in engine.stream_chat(
-                    [{"role": "user", "content": "write json"}], tools=self.tools
-                ):
-                    pass
+                outputs = [
+                    output
+                    async for output in engine.stream_chat(
+                        [{"role": "user", "content": "write json"}], tools=self.tools
+                    )
+                ]
         finally:
             executor.shutdown(wait=False)
 
+        assert outputs[-1].tokens == [11, 22]
         assert core.add_request.call_args.kwargs["tools"] == self.tools
 
 
@@ -2518,6 +2522,7 @@ class TestVLMEngineFrequencyPenalty:
     def _fake_output():
         return SimpleNamespace(
             output_text="hi",
+            output_token_ids=[101, 202],
             prompt_tokens=5,
             completion_tokens=2,
             finish_reason="stop",
@@ -2536,8 +2541,9 @@ class TestVLMEngineFrequencyPenalty:
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        await engine.generate("a prompt", frequency_penalty=0.7)
+        result = await engine.generate("a prompt", frequency_penalty=0.7)
 
+        assert result.tokens == [101, 202]
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert call_kwargs["sampling_params"].frequency_penalty == 0.7
 

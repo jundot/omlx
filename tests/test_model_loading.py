@@ -770,6 +770,7 @@ class TestExpandPerLayerQuantKeys:
         assert cfg["quantization"]["language_model.lm_head"] == {
             "bits": 8,
             "group_size": 64,
+            "mode": "affine",
         }
 
     def test_adds_swapped_prefix_variant_for_model_language_model_key(self):
@@ -807,14 +808,16 @@ class TestExpandPerLayerQuantKeys:
 
         model_loading.expand_per_layer_quant_keys(cfg)
 
-        assert (
-            cfg["quantization"]["model.layers.1.mlp.gate.proj"]
-            == {"bits": 8, "group_size": 64}
-        )
-        assert (
-            cfg["quantization"]["model.layers.2.mlp.gate.proj"]
-            == {"bits": 8, "group_size": 64}
-        )
+        assert cfg["quantization"]["model.layers.1.mlp.gate.proj"] == {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+        }
+        assert cfg["quantization"]["model.layers.2.mlp.gate.proj"] == {
+            "bits": 8,
+            "group_size": 64,
+            "mode": "affine",
+        }
         # The original key is preserved (other code paths may still use it)
         assert "model.layers.1.mlp.gate" in cfg["quantization"]
 
@@ -834,6 +837,172 @@ class TestExpandPerLayerQuantKeys:
         model_loading.expand_per_layer_quant_keys(cfg)
 
         assert cfg["quantization"][f"inner.{gate}"] == spec
+
+    def test_adds_runtime_variant_for_jangq_shallow_key(self):
+        """JANGQ publisher specs nest text keys one level shallower.
+
+        ``language_model.layers.N.*`` lives at
+        ``language_model.model.layers.N.*`` at runtime; without the deep
+        variant nn.quantize falls back to the global bits and strict
+        loading fails on shape mismatch.
+        """
+        key = "language_model.layers.0.mlp.switch_mlp.gate_proj"
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                key: {"bits": 3, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        deep = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
+        assert cfg["quantization"][deep] == {
+            "bits": 3,
+            "group_size": 64,
+            "mode": "affine",
+        }
+
+    def test_skips_runtime_variant_for_ple_keys(self):
+        """PLE shards are mmap-served, never quantized modules."""
+        key = "language_model.layers.0.ple.ngram_embedding.weight"
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                key: {"bits": 2, "group_size": 32},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert "language_model.model.layers.0.ple.ngram_embedding.weight" not in cfg[
+            "quantization"
+        ]
+
+    def test_dsv4_bit_plan_synthesizes_switch_mlp_specs(self):
+        """JANGQ DeepSeek-V4 mixes MoE precision per projection/layer.
+
+        w2/down is gs32 while w1/w3 are gs64, and w1 is 3-bit on a few
+        layers. sanitize stacks experts.{i}.w* into
+        model.layers.N.ffn.switch_mlp.{gate,down,up}_proj; without
+        runtime-path specs the predicate falls back to the global bits
+        and the strict load fails on shape mismatch.
+        """
+        cfg = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 3,
+            "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "mode": "affine",
+                "routed_expert_bit_plan": {
+                    "default_bits": 2,
+                    "codec": "affine",
+                    "routed_projection_group_sizes": {
+                        "w1": 64,
+                        "w2": 32,
+                        "w3": 64,
+                    },
+                    "routed_projection_layer_bits": {"w1": {"2": 3}},
+                },
+            },
+        }
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        quant = cfg["quantization"]
+        assert quant["model.layers.0.ffn.switch_mlp.down_proj"] == {
+            "group_size": 32,
+            "bits": 2,
+            "mode": "affine",
+        }
+        assert quant["model.layers.0.ffn.switch_mlp.gate_proj"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+        # Layer 2 w1 is 3-bit per the plan.
+        assert quant["model.layers.2.ffn.switch_mlp.gate_proj"]["bits"] == 3
+        assert quant["model.layers.1.ffn.switch_mlp.up_proj"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+
+    def test_dsv4_shared_expert_specs_follow_runtime_names(self):
+        """Shared-expert bare specs copy to the sanitized proj names."""
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 1,
+            "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "routed_expert_bit_plan": {"default_bits": 2},
+                "layers.0.ffn.shared_experts.w1": dict(spec),
+                "layers.0.ffn.shared_experts.w2": dict(spec),
+            },
+        }
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        quant = cfg["quantization"]
+        assert quant["model.layers.0.ffn.shared_experts.gate_proj"] == spec
+        assert quant["model.layers.0.ffn.shared_experts.down_proj"] == spec
+
+    def test_dsv4_normalizer_ignores_other_model_types(self):
+        cfg = {"model_type": "qwen3", "quantization": {"bits": 2}}
+
+        model_loading.normalize_dsv4_mixed_moe_quant(cfg)
+
+        assert cfg["quantization"] == {"bits": 2}
+
+    def test_leaves_runtime_keys_without_variant(self):
+        key = "language_model.model.layers.0.q_proj"
+        spec = {"bits": 4, "group_size": 64, "mode": "affine"}
+        cfg = {"quantization": {"bits": 4, "group_size": 64, key: spec}}
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][key] == spec
+
+    def test_adds_split_variants_for_fused_experts_overrides(self):
+        """Fused experts.gate_up_proj policy covers the split halves.
+
+        Fused-quantized MoE banks (JANGQ MTP head) publish one override
+        for experts.gate_up_proj, but sanitize splits it into
+        switch_mlp.gate_proj + switch_mlp.up_proj before nn.quantize
+        runs. Without a variant per half, the lookup misses and the
+        halves are built at the global bits (wrong width).
+        """
+        cfg = {
+            "quantization": {
+                "bits": 8,
+                "group_size": 64,
+                "mtp.layers.0.mlp.experts.gate_up_proj": {
+                    "bits": 4,
+                    "group_size": 64,
+                },
+                "mtp.layers.0.mlp.experts.down_proj": {
+                    "bits": 4,
+                    "group_size": 64,
+                },
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        expected = {"bits": 4, "group_size": 64, "mode": "affine"}
+        for stem in (
+            "mtp.layers.0.mlp",
+            "language_model.mtp.layers.0.mlp",
+        ):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                assert cfg["quantization"][f"{stem}.switch_mlp.{proj}"] == (
+                    expected
+                )
 
 
 class TestMaterializeLazyState:

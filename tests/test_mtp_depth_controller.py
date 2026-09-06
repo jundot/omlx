@@ -39,6 +39,53 @@ def test_observe_signature_is_three_positional():
     assert c.cycles == 1
 
 
+def test_fixed_depth_env_pins_before_decision_paths(monkeypatch):
+    """OMLX_MTP_FIXED_DEPTH must pin `cur` on the FIRST cycle.
+
+    Regression: the pin used to sit at the tail of observe(), after the
+    warmup-sweep and probe-burst early-returns, so a pinned run kept
+    walking the warmup sweep (5 -> 4 -> 3 -> ...) instead of holding the
+    requested depth from cycle one."""
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "3")
+    c = _DepthController(5)
+    # First observe: pin must land immediately, cancelling the warmup walk.
+    c.observe(5, 5, 30.0)
+    assert c.cur == 3
+    assert c.probe_left == 0
+    assert c._warmup == []
+    # The pin holds across further cycles (no re-decide, no probe burst).
+    c.observe(3, 3, 12.0)
+    c.observe(3, 1, 12.0)
+    assert c.cur == 3
+    # A pin above max_depth clamps to max_depth.
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "9")
+    c2 = _DepthController(2)
+    c2.observe(2, 2, 20.0)
+    assert c2.cur == 2
+    # Acceptance EMAs still update under the pin (measurement continues).
+    assert c.cycles == 3
+
+
+def test_fixed_depth_env_garbage_falls_through(monkeypatch):
+    """A non-integer pin value is ignored: adaptive behavior is untouched."""
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "banana")
+    c = _DepthController(3)
+    c.observe(3, 3, 30.0)
+    # Warmup sweep proceeds as if no pin existed.
+    assert c.cur == 2
+    assert c._warmup != []
+
+
+def test_fixed_depth_env_absent_is_adaptive(monkeypatch):
+    """No env: the controller never pins (guard against env leakage)."""
+    monkeypatch.delenv("OMLX_MTP_FIXED_DEPTH", raising=False)
+    c = _DepthController(3)
+    c.observe(3, 3, 30.0)
+    assert c.cur == 2
+    c.observe(2, 2, 20.0)
+    assert c.cur == 1
+
+
 def test_warmup_measures_every_depth_once():
     c = _DepthController(3)
     assert c.cur == 3  # sweep walks 3 -> 2 -> 1 -> 0,0,0 (plain-step baseline)
