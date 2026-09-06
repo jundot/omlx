@@ -245,6 +245,13 @@ class DistributedBatchedEngine(BatchedEngine):
         if endpoint is None:
             await asyncio.to_thread(self._supervisor.stop)
             raise DistributedLaunchError("distributed endpoint was not created")
+        try:
+            await asyncio.to_thread(self._require_cluster_ready)
+        except Exception:
+            await asyncio.to_thread(self._supervisor.stop)
+            self._tokenizer = None
+            self._model_type = None
+            raise
         self._client = self._new_client(endpoint)
         self._loaded = True
         logger.info(
@@ -254,6 +261,42 @@ class DistributedBatchedEngine(BatchedEngine):
             self.deployment.backend,
             self.deployment.plan_hash[:16],
         )
+
+    def _require_cluster_ready(self) -> None:
+        """Fail fast when rank-zero or any cluster rank is not ready.
+
+        A rank can stay alive (``returncode is None``) while its HTTP listener
+        is gone or another rank lost its connection. Checking /health and
+        verifying that the supervisor observed all ranks reporting ready prevents
+        returning an empty 200 stream on dead deployments.
+        """
+        endpoint = self._supervisor.endpoint
+        if not endpoint:
+            return
+        try:
+            response = httpx.get(f"{endpoint}/health", timeout=5.0)
+            if response.status_code == 404:
+                response = httpx.get(f"{endpoint}/v1/models", timeout=5.0)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise DistributedInferenceError(
+                "distributed rank-zero is not reachable "
+                f"({endpoint}): {type(exc).__name__}"
+            ) from exc
+
+        status = self._supervisor.status()
+        if status.returncode is not None:
+            detail = status.failure_reason or f"exit code {status.returncode}"
+            raise DistributedInferenceError(f"distributed job exited: {detail}")
+        if status.failure_reason:
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
+            )
+        if len(status.ranks) < self.deployment.world_size:
+            raise DistributedInferenceError(
+                f"distributed cluster incomplete: {len(status.ranks)} of "
+                f"{self.deployment.world_size} ranks reported ready"
+            )
 
     def _validate_model_settings(self) -> None:
         settings = self._model_settings
@@ -305,6 +348,10 @@ class DistributedBatchedEngine(BatchedEngine):
             suffix = f": {detail}" if detail else ""
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
+            )
+        if status.failure_reason:
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
             )
         return client
 
@@ -933,6 +980,22 @@ class DistributedBatchedEngine(BatchedEngine):
         finally:
             await self._leave_request()
 
+        if (
+            not full_text
+            and not backend_tool_calls
+            and finish_reason is None
+            and completion_tokens == 0
+        ):
+            status = self._supervisor.status()
+            detail = status.failure_reason
+            if not detail and status.returncode is not None:
+                detail = f"distributed job exited with code {status.returncode}"
+            if not detail:
+                detail = "distributed backend closed stream without generating tokens"
+            raise DistributedInferenceError(
+                f"rank-zero inference stream failed: {detail}"
+            )
+
         pending_final_text = ""
         if reasoning_open:
             pending_final_text = "</think>"
@@ -1189,6 +1252,17 @@ class DistributedBatchedEngine(BatchedEngine):
             ) from exc
         finally:
             await self._leave_request()
+
+        if not full_text and finish_reason is None and completion_tokens == 0:
+            status = self._supervisor.status()
+            detail = status.failure_reason
+            if not detail and status.returncode is not None:
+                detail = f"distributed job exited with code {status.returncode}"
+            if not detail:
+                detail = "distributed backend closed stream without generating tokens"
+            raise DistributedInferenceError(
+                f"rank-zero inference stream failed: {detail}"
+            )
 
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
