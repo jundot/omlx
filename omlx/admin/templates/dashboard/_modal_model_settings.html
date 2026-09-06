@@ -496,6 +496,26 @@
                                 </div>
                             </div>
 
+                            <!-- Reasoning Effort -->
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                                 x-show="!modelSettings.is_diffusion_model" x-cloak>
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.reasoning_effort') }}</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.reasoning_effort_hint') }}</p>
+                                    </div>
+                                    <select x-model="modelSettings.reasoning_effort"
+                                            class="px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="">{{ t('modal.model_settings.reasoning_effort_default') }}</option>
+                                        <option value="low">low</option>
+                                        <option value="medium">medium</option>
+                                        <option value="high">high</option>
+                                        <option value="xhigh">xhigh</option>
+                                        <option value="max">max</option>
+                                    </select>
+                                </div>
+                            </div>
+
                             <!-- Guided Grammar -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>

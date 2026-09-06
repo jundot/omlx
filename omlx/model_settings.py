@@ -225,6 +225,9 @@ class ModelSettings:
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    reasoning_effort: Optional[str] = (
+        None  # "low", "medium", "high", "xhigh", "max" (None = use model default)
+    )
     reasoning_parser: Optional[str] = (
         None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
     )

@@ -2223,6 +2223,25 @@
                     </p>
                 </div>
 
+                <!-- Reasoning Effort -->
+                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
+                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('modal.model_settings.reasoning_effort') }}</label>
+                    <select x-model="modelSettings.reasoning_effort" @change="onModelSettingsChange()"
+                        class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                        style="color: var(--text-primary);">
+                        <option value="">{{ t('modal.model_settings.reasoning_effort_default') }}</option>
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                        <option value="xhigh">xhigh</option>
+                        <option value="max">max</option>
+                    </select>
+                    <p class="text-[10px]" style="color: var(--text-tertiary);">
+                        {{ t('modal.model_settings.reasoning_effort_hint') }}
+                    </p>
+                </div>
+
             </div>
 
             <!-- ==================== SETTINGS TAB ==================== -->
@@ -2712,6 +2731,7 @@
                 enable_thinking: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
+                reasoning_effort: null,
             },
 
             defaultModelSettings() {
@@ -2726,6 +2746,7 @@
                     enable_thinking: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
+                    reasoning_effort: null,
                 };
             },
 
@@ -3409,13 +3430,20 @@
                 for (const key of scalarKeys) {
                     if (s[key] != null) gen[key] = s[key];
                 }
+                const ctk = {};
                 if (s.enable_thinking === true) {
-                    gen.chat_template_kwargs = { enable_thinking: true };
+                    ctk.enable_thinking = true;
                     if (s.thinking_budget_enabled) {
                         gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
                     }
                 } else if (s.enable_thinking === false) {
-                    gen.chat_template_kwargs = { enable_thinking: false };
+                    ctk.enable_thinking = false;
+                }
+                if (s.reasoning_effort) {
+                    ctk.reasoning_effort = s.reasoning_effort;
+                }
+                if (Object.keys(ctk).length > 0) {
+                    gen.chat_template_kwargs = ctk;
                 }
                 return Object.keys(gen).length ? gen : null;
             },
@@ -4901,6 +4929,9 @@
                 thinking_budget_tokens: (s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0))
                     ? this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens)
                     : null,
+                reasoning_effort: s.reasoning_effort
+                    ?? s.chat_template_kwargs?.reasoning_effort
+                    ?? null,
             };
             this.speculativeEngine = 'none';
             this.speculativeDraftModel = '';

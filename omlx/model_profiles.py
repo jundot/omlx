@@ -32,6 +32,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "preserve_thinking",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "reasoning_effort",
     "reasoning_parser",
     "guided_grammar_enabled",
     "guided_grammar",
