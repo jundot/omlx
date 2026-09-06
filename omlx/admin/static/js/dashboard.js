@@ -131,7 +131,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, steer_classifier_requests: false, classifier_model_tier: 'haiku' },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -6612,6 +6612,10 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+                        // Baseline for saveClaudeCodeSettings() to revert to on a
+                        // failed save — must be captured from the server response,
+                        // not from the optimistically-mutated live object.
+                        this._lastGoodClaudeCode = { ...this.globalSettings.claude_code };
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -8794,6 +8798,12 @@
             },
 
             async saveClaudeCodeSettings() {
+                // The caller has already applied its change optimistically
+                // (toggle flipped, select updated) before calling this, so on
+                // a rejected or failed save the control must be reverted to
+                // the last value the server actually confirmed — not to
+                // anything captured here, since by this point the live
+                // object already holds the new, unconfirmed value.
                 try {
                     const response = await fetch('/admin/api/global-settings', {
                         method: 'POST',
@@ -8803,13 +8813,19 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_steer_classifier_requests: this.globalSettings.claude_code.steer_classifier_requests,
+                            claude_code_classifier_model_tier: this.globalSettings.claude_code.classifier_model_tier,
                         }),
                     });
                     if (!response.ok) {
                         console.error('Failed to save Claude Code settings');
+                        Object.assign(this.globalSettings.claude_code, this._lastGoodClaudeCode);
+                    } else {
+                        this._lastGoodClaudeCode = { ...this.globalSettings.claude_code };
                     }
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                    Object.assign(this.globalSettings.claude_code, this._lastGoodClaudeCode);
                 }
             },
 

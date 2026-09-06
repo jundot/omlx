@@ -86,6 +86,9 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     except (OSError, json.JSONDecodeError) as e:
         return False, f"failed to read config.json: {e}"
 
+    if not isinstance(cfg, dict):
+        return False, f"config.json at {config_path} is not a JSON object"
+
     model_type = str(cfg.get("model_type") or "").lower()
 
     is_qwen = "qwen" in model_type
