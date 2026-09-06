@@ -6736,12 +6736,19 @@ class Scheduler:
             ):
                 continue
             plan = cachelist_pm_member_plan([str(n) for n in meta[0]], state)
-            if plan is None:
+            if plan is not None:
+                layer["state"] = [
+                    () if mode == "slice" else sub_state
+                    for mode, sub_state in zip(plan, state)
+                ]
                 continue
-            layer["state"] = [
-                () if mode == "slice" else sub_state
-                for mode, sub_state in zip(plan, state)
-            ]
+            # Not per-member-block eligible (e.g. DeepSeek-V4's
+            # CacheList(RotatingKVCache, PoolingCache)): the legacy store
+            # path persists the snapshot as-is and the legacy restore takes
+            # the last block's FULL state, so every member must stay
+            # cumulative here. Blanking a sliceable member on such a layer
+            # would store refilled per-block slices whose restore silently
+            # truncates the KV sequence to the last block.
         return extracted, tokens
 
     def _decode_boundary_snapshot_value(
