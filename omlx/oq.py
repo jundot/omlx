@@ -529,6 +529,9 @@ def universal_quant_predicate(
     if path_l.endswith("sconv.conv"):
         return False
 
+    if config.get("model_type") == "k2_horizon" and _is_k2_horizon_protected(path):
+        return bits(8)
+
     boost_map = config.get("_oq_boost_map") or {}
     if path in boost_map:
         return dict(boost_map[path])
@@ -687,7 +690,7 @@ def _is_audio_tensor(name: str) -> bool:
 
 def _is_moe_router(path: str) -> bool:
     """Detect MoE router/gate layers (distinct from gate_proj)."""
-    if path.endswith(("mlp.gate", ".router", ".router.layer")):
+    if path.endswith(("mlp.gate", ".router", ".router.layer", ".v_router")):
         return True
     if path.endswith(".gate") and "gate_proj" not in path:
         return True
@@ -828,6 +831,15 @@ def _collect_named_weight_shapes_from_weights(
             continue
         named_shapes[norm_name] = tuple(tensor.shape)
     return named_shapes
+
+
+def _is_k2_horizon_protected(path: str) -> bool:
+    """K2 Horizon keeps attention, dense MLPs, routed down_proj, and the head at Q8."""
+    if _is_routed_expert(path):
+        return "down_proj" in path
+    if any(p in path for p in ("self_attn.", "lm_head", "embed_tokens")):
+        return True
+    return ".mlp." in path and "experts" not in path
 
 
 def _is_routed_expert(path: str) -> bool:
@@ -7654,6 +7666,27 @@ def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
     return name in collector.entries
 
 
+def _collect_k2_horizon_lm_head_imatrix(model, hidden, collector) -> bool:
+    """Capture the untied output head omitted by the trunk-layer walk."""
+    if str(getattr(model, "model_type", "")) != "k2_horizon":
+        return False
+
+    core = getattr(model, "model", None)
+    norm = getattr(core, "norm", None)
+    if core is None or norm is None:
+        return False
+
+    name = "lm_head"
+    module = collector._original_modules.get(name)
+    if module is None:
+        return False
+
+    if getattr(hidden, "ndim", 0) == 4:
+        hidden = hidden.mean(axis=2)
+    collector.collect_dense(name, module, norm(hidden))
+    return name in collector.entries
+
+
 def _collect_mtp_head_imatrix(
     model,
     batch,
@@ -7914,6 +7947,7 @@ def _collect_imatrix_from_model(
                     mx.clear_cache()
 
                 _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+                _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
 
                 # MTP-head pass: the layer walk above leaves ``inputs`` as
                 # the final-layer hidden states; feed them (post-norm) plus

@@ -320,6 +320,52 @@ class TestParserBackedThinkingBudgetWiring:
         request.needs_think_prefix = False
         return request
 
+    @pytest.mark.parametrize("kind", ["k2_horizon", "legacy"])
+    def test_prompt_markers_bind_request_budget(self, kind):
+        pairs = tuple(
+            (f"<ifm|{mode}>", f"</ifm|{mode}>")
+            for mode in ("think", "think_fast", "think_faster")
+        )
+        ids = {text: 10 + i for i, text in enumerate(sum(pairs, ()))}
+        factory = OutputParserFactory(
+            kind=kind,
+            create_session=MagicMock(),
+            thinking_start_text=pairs[0][0],
+            thinking_end_text=pairs[0][1],
+            thinking_marker_pairs=pairs if kind == "k2_horizon" else (),
+        )
+        scheduler = self._make_scheduler(factory, {k: [v] for k, v in ids.items()})
+        scheduler.tokenizer.convert_tokens_to_ids.side_effect = ids.get
+        scheduler.tokenizer.think_start_id = ids[pairs[0][0]]
+        scheduler.tokenizer.think_end_id = ids[pairs[0][1]]
+        if kind == "k2_horizon":
+            scheduler._resolve_think_end_token_ids = MagicMock(
+                side_effect=AssertionError
+            )
+        requests = []
+        for start, end in pairs if kind == "k2_horizon" else pairs[:1]:
+            request = self._make_request()
+            request.prompt_token_ids = [1, ids[start], 2]
+            request.sampling_params.thinking_budget = 1
+            request.needs_think_prefix = Scheduler._detect_needs_think_prefix(
+                scheduler, request
+            )
+            assert request.needs_think_prefix
+            requests.append((request, ids[end]))
+        for request, end in reversed(requests):
+            _, processors = scheduler._build_sampler_and_processors(
+                request.sampling_params, request
+            )
+            budget = next(
+                p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+            )
+            logits = budget(request.prompt_token_ids, mx.zeros((1, 32)))
+            assert mx.argmax(logits).item() == end
+            request.prompt_token_ids.append(end)
+            assert not Scheduler._detect_needs_think_prefix(scheduler, request)
+        request.prompt_token_ids = []
+        assert not Scheduler._detect_needs_think_prefix(scheduler, request)
+
     def test_gemma4_uses_parser_thinking_close_marker(self):
         factory = OutputParserFactory(
             kind="gemma4",

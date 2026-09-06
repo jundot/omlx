@@ -33,6 +33,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
     /// `glm_moe_dsa`). Used to gate the IndexCache row to DSA models.
     let configModelType: String?
+    let unoBaseModelId: String?
     /// Native context window from the model's config.json. The Context
     /// Bench target selector hides presets beyond it.
     let modelContextLength: Int?
@@ -151,6 +152,9 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashDraftSinkSize: Int?
     let dflashBlockSize: Int?
     let dflashVerifyMode: String?
+    let unoEnabled: Bool?
+    let unoAdapterModel: String?
+    let guidedGrammarEnabled: Bool?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
     // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
@@ -232,6 +236,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashDraftSinkSize: Int? = nil
     var dflashBlockSize: Int? = nil
     var dflashVerifyMode: String? = nil
+    var unoEnabled: Bool? = nil
+    var unoAdapterModel: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
     // Experimental: VLM MTP

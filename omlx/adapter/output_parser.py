@@ -71,6 +71,8 @@ class OutputParserFactory:
     thinking_start_output_text: str | None = None
     thinking_end_text: str | None = None
     thinking_end_trailing_text: str | None = None
+    # Alternative (open, close) pairs when the prompt selects one of several.
+    thinking_marker_pairs: tuple[tuple[str, str], ...] = ()
     # Marker strings that must survive special-token stripping so the
     # parser session can see them in the text stream.  Engines that strip
     # special tokens during detokenization (e.g. the serial diffusion
@@ -1228,6 +1230,145 @@ class Cohere2MoeOutputParserSession:
         )
 
 
+_K2_THINK_MARKERS = (
+    ("<ifm|think>", "</ifm|think>"),
+    ("<ifm|think_fast>", "</ifm|think_fast>"),
+    ("<ifm|think_faster>", "</ifm|think_faster>"),
+)
+_K2_TOOL_CALLS_START = "<ifm|tool_calls>"
+_K2_TOOL_CALLS_END = "</ifm|tool_calls>"
+_K2_MARKERS = tuple(marker for pair in _K2_THINK_MARKERS for marker in pair) + (
+    _K2_TOOL_CALLS_START,
+    _K2_TOOL_CALLS_END,
+)
+
+
+class K2HorizonOutputParserSession:
+    """Normalize IFM reasoning markers to ``<think>`` and hide tool envelopes."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        marker_ids: dict[str, int],
+        model_path: str | None = None,
+        tools: list[dict] | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._open_ids = {marker_ids[start] for start, _ in _K2_THINK_MARKERS}
+        self._close_ids = {marker_ids[end] for _, end in _K2_THINK_MARKERS}
+        self._literal_texts = {
+            marker_ids[_K2_TOOL_CALLS_START]: _K2_TOOL_CALLS_START,
+            marker_ids[_K2_TOOL_CALLS_END]: _K2_TOOL_CALLS_END,
+        }
+        self._tools = tools
+        self._in_reasoning = False
+        self._raw_text = ""
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+        from ..api.tool_calling import ToolCallStreamFilter
+
+        self._tool_filter = ToolCallStreamFilter(tokenizer)
+
+    def notify_prefilled_thought(self) -> None:
+        self._in_reasoning = True
+
+    def _decode_token(self, token_id: int) -> str:
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+        try:
+            return self._tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            return self._tokenizer.decode([token_id])
+
+    def _emit(self, text: str) -> OutputParserTokenResult:
+        self._raw_text += text
+        visible = self._tool_filter.feed(text)
+        return OutputParserTokenResult(
+            stream_text=visible, visible_text=visible, record_token=True
+        )
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        if token_id in self._open_ids:
+            if self._in_reasoning:
+                return OutputParserTokenResult(record_token=True)
+            self._in_reasoning = True
+            return self._emit("<think>\n")
+        if token_id in self._close_ids:
+            if not self._in_reasoning:
+                return OutputParserTokenResult(record_token=True)
+            self._in_reasoning = False
+            return self._emit("</think>")
+
+        literal = self._literal_texts.get(token_id)
+        text = literal if literal is not None else self._decode_token(token_id)
+        if literal == _K2_TOOL_CALLS_START and self._in_reasoning:
+            self._in_reasoning = False
+            text = "</think>" + text
+        return self._emit(text)
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        text = ""
+        if self._detokenizer is not None:
+            self._detokenizer.finalize()
+            final_text = self._detokenizer.last_segment
+            self._raw_text += final_text
+            text = self._tool_filter.feed(final_text)
+        text += self._tool_filter.finish()
+
+        tool_calls: list[dict[str, str]] = []
+        if self._tools:
+            try:
+                from ..api.tool_calling import parse_tool_calls
+
+                _, parsed_calls = parse_tool_calls(
+                    self._raw_text, self._tokenizer, self._tools
+                )
+                valid_names = {
+                    function["name"]
+                    for tool in self._tools
+                    if isinstance(tool, dict)
+                    and isinstance((function := tool.get("function")), dict)
+                    and isinstance(function.get("name"), str)
+                    and function["name"]
+                }
+                for call in parsed_calls or []:
+                    if call.function.name not in valid_names:
+                        logger.warning(
+                            "Dropping unregistered K2 Horizon tool call %r",
+                            call.function.name,
+                        )
+                        continue
+                    tool_calls.append(
+                        {
+                            "id": getattr(call, "id", ""),
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        }
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("K2 Horizon tool-call parse failed: %s", e)
+
+        return OutputParserFinalizeResult(
+            stream_text=text,
+            visible_text=text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else None,
+        )
+
+
+def _k2_horizon_marker_ids(tokenizer: Any) -> dict[str, int]:
+    marker_ids = {}
+    for marker in _K2_MARKERS:
+        token_id = _token_id_for_text(tokenizer, marker)
+        if token_id is None:
+            raise ValueError(f"K2 Horizon tokenizer lacks the {marker!r} token")
+        marker_ids[marker] = token_id
+    return marker_ids
+
+
 def detect_output_parser(
     model_name: str,
     tokenizer: Any,
@@ -1272,6 +1413,30 @@ def detect_output_parser(
                 thinking_start_output_text="<think>\n",
                 protocol_marker_texts=_BAILING_ROLE_MARKERS,
             )
+
+    if model_type == "k2_horizon":
+        marker_ids = _k2_horizon_marker_ids(tokenizer)
+        return OutputParserFactory(
+            kind="k2_horizon",
+            create_session=lambda session_tokenizer: K2HorizonOutputParserSession(
+                session_tokenizer,
+                marker_ids,
+                model_path=session_model_path,
+            ),
+            create_session_with_tools=lambda session_tokenizer, tools: (
+                K2HorizonOutputParserSession(
+                    session_tokenizer,
+                    marker_ids,
+                    model_path=session_model_path,
+                    tools=tools,
+                )
+            ),
+            thinking_start_text=_K2_THINK_MARKERS[0][0],
+            thinking_start_output_text="<think>\n",
+            thinking_end_text=_K2_THINK_MARKERS[0][1],
+            thinking_marker_pairs=_K2_THINK_MARKERS,
+            protocol_marker_texts=_K2_MARKERS,
+        )
 
     if is_harmony_model(model_name, model_config):
         temp_parser = HarmonyStreamingParser(tokenizer)
@@ -1461,6 +1626,11 @@ def detect_message_extractor(
         from .gemma4 import extract_gemma4_messages
 
         return extract_gemma4_messages
+
+    if model_config and model_config.get("model_type") == "k2_horizon":
+        from ..api.utils import extract_k2_horizon_messages
+
+        return extract_k2_horizon_messages
 
     # Default: caller decides between extract_text_content and
     # extract_multimodal_content based on engine type (VLM vs text).

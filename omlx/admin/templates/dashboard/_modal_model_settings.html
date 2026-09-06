@@ -431,15 +431,15 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.enable_thinking') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.enable_thinking_hint') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="isK2Model() ? window.t('modal.model_settings.k2_thinking_hint') : window.t('modal.model_settings.enable_thinking_hint')"></p>
                                     </div>
-                                    <button type="button" @click="
+                                    <button type="button" :disabled="isK2Model()" @click="
                                             const effective = modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false);
                                             modelSettings.enable_thinking = !effective;
                                         "
-                                            :class="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'bg-black' : 'bg-neutral-200'"
+                                            :class="(isK2Model() || (modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false))) ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                        <span :class="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'translate-x-5' : 'translate-x-0'"
+                                        <span :class="(isK2Model() || (modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false))) ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
@@ -481,9 +481,9 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.thinking_budget_hint') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="modelSettings.uno_enabled ? window.t('modal.model_settings.uno_budget_hint') : window.t('modal.model_settings.thinking_budget_hint')"></p>
                                     </div>
-                                    <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                    <button type="button" :disabled="modelSettings.uno_enabled && !modelSettings.enableThinkingBudget" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
@@ -491,7 +491,7 @@
                                     </button>
                                 </div>
                                 <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
-                                    <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
+                                    <input type="number" :disabled="modelSettings.uno_enabled" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
@@ -593,12 +593,12 @@
                                         <div x-show="addOpen" @click.away="addOpen = false" x-transition
                                              class="absolute right-0 mt-1 w-44 bg-white border border-neutral-200 rounded-lg shadow-lg z-10 py-1">
                                             <button type="button"
-                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
+                                                    x-show="!modelSettings.is_diffusion_model && !isK2Model() && !modelSettings.ctKwargEntries.some(e => e.type === 'enable_thinking')"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
                                                     x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort' || (e.type === 'custom' && e.key && e.key.trim() === 'reasoning_effort'))"
-                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', custom: false, customValue: '', force: false}); addOpen = false"
+                                                    @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: isK2Model() ? 'high' : 'low', custom: false, customValue: '', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'custom', key: '', value: '', force: false}); addOpen = false"
@@ -642,15 +642,15 @@
                                                         <option value="low">low</option>
                                                         <option value="medium">medium</option>
                                                         <option value="high">high</option>
-                                                        <option value="xhigh">xhigh</option>
-                                                        <option value="max">max</option>
+                                                        <option value="xhigh" x-show="!isK2Model()" :disabled="isK2Model()">xhigh</option>
+                                                        <option value="max" x-show="!isK2Model()" :disabled="isK2Model()">max</option>
                                                     </select>
                                                     <input x-show="entry.custom" type="text" x-model="entry.customValue"
                                                            placeholder="0.9"
                                                            class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <div class="flex items-center gap-3">
                                                         <label class="inline-flex items-center gap-1">
-                                                            <input type="checkbox" x-model="entry.custom"
+                                                            <input type="checkbox" :disabled="isK2Model() && !entry.custom" x-model="entry.custom"
                                                                    class="w-3.5 h-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
                                                             <span class="text-xs text-neutral-400">{{ t('modal.model_settings.kwarg_custom') }}</span>
                                                         </label>
@@ -1309,6 +1309,37 @@
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">Disk budget for L2 spill; oldest entries are evicted when exceeded.</p>
                                         </div>
+                                    </div>
+                                </div>
+
+                                <div x-show="selectedModel?.config_model_type === 'k2_horizon' && !selectedModel?.is_helper"
+                                     class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div>
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.uno') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.uno_hint') }}</p>
+                                            <p x-show="!unoAdapterCandidates().length" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.uno_missing') }}</p>
+                                            <p x-show="unoConflict()" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.uno_conflict') }}</p>
+                                        </div>
+                                        <button type="button" role="switch" :aria-checked="!!modelSettings.uno_enabled"
+                                                aria-label="{{ t('modal.model_settings.uno') }}"
+                                                @click="modelSettings.uno_enabled = !modelSettings.uno_enabled"
+                                                :disabled="!modelSettings.uno_enabled && (!unoAdapterCandidates().length || unoConflict())"
+                                                :class="modelSettings.uno_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                class="relative flex-shrink-0 w-11 h-6 rounded-full disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-black">
+                                            <span :class="modelSettings.uno_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.uno_enabled">
+                                        <label for="uno-adapter" class="block text-xs font-medium text-neutral-600">{{ t('modal.model_settings.uno_adapter') }}</label>
+                                        <select id="uno-adapter" x-model="modelSettings.uno_adapter_model"
+                                                class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-black bg-white">
+                                            <option value="">{{ t('modal.model_settings.uno_select') }}</option>
+                                            <template x-for="m in unoAdapterCandidates()" :key="m.id">
+                                                <option :value="m.id" x-text="m.id"></option>
+                                            </template>
+                                        </select>
                                     </div>
                                 </div>
 

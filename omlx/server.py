@@ -2925,6 +2925,9 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         excluded_model_ids: set[str] = set()
         for m in status["models"]:
             model_id = m["id"]
+            if m.get("config_model_type") == "k2_horizon_uno":
+                excluded_model_ids.add(model_id)
+                continue
             display_id = model_id
             ms = None
             if settings_manager:
@@ -3364,9 +3367,48 @@ async def create_completion(
         # log line and the FastAPI handler trace correlate with whatever
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
+        preflight_options = {}
+        if getattr(engine, "is_uno_model", False):
+            sampling = get_sampling_params(
+                request.temperature,
+                request.top_p,
+                request.model,
+                req_top_k=getattr(request, "top_k", None),
+                req_repetition_penalty=getattr(request, "repetition_penalty", None),
+                req_min_p=getattr(request, "min_p", None),
+                req_presence_penalty=getattr(request, "presence_penalty", None),
+                req_frequency_penalty=getattr(request, "frequency_penalty", None),
+                req_max_tokens=request.max_tokens,
+                req_xtc_probability=getattr(request, "xtc_probability", None),
+                req_xtc_threshold=getattr(request, "xtc_threshold", None),
+            )
+            preflight_options = dict(
+                zip(
+                    (
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "repetition_penalty",
+                        "min_p",
+                        "presence_penalty",
+                        "frequency_penalty",
+                        "max_tokens",
+                        "xtc_probability",
+                        "xtc_threshold",
+                    ),
+                    sampling,
+                )
+            )
+            preflight_options.update(
+                stop=request.stop,
+                seed=request.seed,
+                thinking_budget=_resolve_thinking_budget(request, request.model),
+            )
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(
+                prompt, request_id=upstream_request_id, **preflight_options
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -4122,6 +4164,23 @@ def _reject_diffusion_structured_outputs(
     structured_outputs=None,
     guided_grammar: str | None = None,
 ) -> None:
+    if getattr(engine, "is_uno_model", False):
+        format_type = (
+            response_format.get("type")
+            if isinstance(response_format, dict)
+            else getattr(response_format, "type", None)
+        )
+        if (
+            structured_outputs is not None
+            or guided_grammar
+            or format_type not in (None, "text")
+        ):
+            raise InvalidRequestError(
+                "Uno does not yet support grammar-constrained output; both proposal "
+                "and verification distributions need the same grammar constraints.",
+                field="response_format",
+            )
+        return
     if not getattr(engine, "is_diffusion_model", False):
         return
     # ``response_format`` (json_object / json_schema) is NOT rejected here:
@@ -6107,6 +6166,15 @@ async def create_response(
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+
+        if getattr(engine, "is_uno_model", False) and (
+            request.top_logprobs is not None
+            or "message.output_text.logprobs" in (request.include or [])
+        ):
+            raise InvalidRequestError(
+                "Uno does not yet expose verified output logprobs",
+                field="top_logprobs",
+            )
 
         resolved_model = _serving_model_id(lease, request.model)
 

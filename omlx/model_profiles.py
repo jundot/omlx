@@ -80,6 +80,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "mtp_enabled",
     "mtp_num_draft_tokens",
     "vlm_mtp_enabled",
+    "uno_enabled",
+    "uno_adapter_model",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
     "specprefill_enabled",

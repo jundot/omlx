@@ -699,10 +699,14 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
                                   comment: "Row label for the enable-thinking toggle"),
-                    sublabel: String(localized: "settings.advanced.enable_thinking.sub",
+                    sublabel: vm.isK2Base ? String(
+                        localized: "settings.k2.thinking_hint",
+                        defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
+                        : String(localized: "settings.advanced.enable_thinking.sub",
                                      defaultValue: "Enable reasoning/thinking mode for this model",
                                      comment: "Sublabel for the enable-thinking toggle")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.enableThinking))
+                    RowSwitch(isOn: vm.isK2Base ? .constant(true) : vm.bindProfile($vm.enableThinking))
+                        .disabled(vm.isK2Base)
                 }
                 if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
                     Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
@@ -729,15 +733,20 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
-                    sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                    sublabel: vm.unoEnabled ? String(
+                        localized: "settings.uno.budget_hint",
+                        defaultValue: "Uno does not support thinking budgets.")
+                        : String(localized: "settings.advanced.thinking_budget.sub",
                                      defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
                                      comment: "Sublabel for the thinking budget field")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
                                       mono: true, suffix: "tk", width: .controlCompact)
+                                .disabled(vm.unoEnabled)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
+                            .disabled(vm.unoEnabled && !vm.thinkingBudgetEnabled)
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -889,7 +898,7 @@ private struct ChatTemplateKwargsEditor: View {
             // `enable_thinking` and `reasoning_effort` are server-side
             // singletons — once added, the menu hides them so the user
             // can't push duplicate keys into `chat_template_kwargs`.
-            if !vm.isDiffusionModel,
+            if !vm.isDiffusionModel, !vm.isK2Base,
                !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
                 Button("enable_thinking") {
                     vm.addKwarg(.enableThinking)
@@ -1046,6 +1055,7 @@ private struct EntryEditor: View {
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
+        .disabled(vm.isK2Base && !entry.usesCustomReasoningEffort)
     }
 
     @ViewBuilder
@@ -1061,7 +1071,7 @@ private struct EntryEditor: View {
             Popup(
                 selection: vm.bindProfile(binding.value),
                 width: Self.reasoningEffortValueWidth,
-                options: ChatTemplateKwargsCodec.reasoningEffortPresets.map {
+                options: vm.reasoningEffortPresets.map {
                     ($0, $0)
                 }
             )
@@ -1641,6 +1651,27 @@ private struct ExperimentalSection: View {
                                          comment: "Sublabel for the DFlash SSD cache size field")) {
                         TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
                                   placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
+                    }
+                }
+            }
+
+            if vm.isK2Base {
+                Row(label: String(localized: "settings.uno.enable", defaultValue: "Enable Uno"),
+                    sublabel: vm.unoUnavailableReason ?? String(
+                        localized: "settings.uno.hint",
+                        defaultValue: "Use a conditional diffusion adapter with this base model.")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.unoEnabled))
+                        .disabled(!vm.unoEnabled && vm.unoUnavailableReason != nil)
+                        .accessibilityLabel(String(localized: "settings.uno.enable", defaultValue: "Enable Uno"))
+                        .accessibilityHint(vm.unoUnavailableReason ?? "")
+                        .accessibilityIdentifier("uno.enabled")
+                }
+                .help(vm.unoUnavailableReason ?? "")
+                if vm.unoEnabled {
+                    Row(label: String(localized: "settings.uno.adapter", defaultValue: "Uno adapter")) {
+                        Popup("settings.uno.adapter", selection: vm.bindProfile($vm.unoAdapterModel),
+                              width: .controlWide, options: vm.unoAdapterModelOptions())
+                            .accessibilityIdentifier("uno.adapter")
                     }
                 }
             }

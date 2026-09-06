@@ -151,6 +151,9 @@ class BatchedEngine(BaseEngine):
                     model_config = {"model_type": cfg.model_type}
                 elif isinstance(cfg, dict):
                     model_config = cfg
+            if model_config is None and (model_type := self.model_type) is not None:
+                # mlx-lm models expose ``args`` rather than ``config``.
+                model_config = {"model_type": model_type}
             return detect_message_extractor(self._model_name, model_config)
         except Exception:
             return None
@@ -724,6 +727,10 @@ class BatchedEngine(BaseEngine):
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
 
+            if self.model_type == "k2_horizon":
+                from ..patches.k2_horizon import validate_chat_template_kwargs
+
+                validate_chat_template_kwargs(template_kwargs)
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
                     self._tokenizer,
