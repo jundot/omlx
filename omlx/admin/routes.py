@@ -257,6 +257,7 @@ class GlobalSettingsRequest(BaseModel):
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
+    prefill_warmup: bool | None = None  # applies on restart
     preserve_mid_system_cache: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
@@ -3558,6 +3559,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "prefill_warmup": getattr(global_settings.server, "prefill_warmup", True),
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
@@ -3809,6 +3811,8 @@ async def update_global_settings(
                     cfg.decode_burst_budget_single_s = single_s
         runtime_applied.append("burst_decode_mode")
         logger.info(f"Burst Decode mode set to '{mode}'")
+    if request.prefill_warmup is not None:
+        global_settings.server.prefill_warmup = bool(request.prefill_warmup)
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")

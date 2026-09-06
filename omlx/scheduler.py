@@ -4984,6 +4984,43 @@ class Scheduler:
             self._prefill_transient_tracker.samples_for(gathered_core),
         )
 
+    def warmup_prefill(self, n_tokens: int = 512) -> int:
+        """Run one throwaway prefill chunk so the first real prompt finds a warm pool.
+
+        Measured on M1 Ultra with GLM-5.3-Flash (04/09, servidor-*.log of the
+        two-round judge runs): the first 512-token chunk after a fresh load
+        grows the process footprint by ~14.500 MB, the first chunk of every
+        later request by ~2.000-2.300 MB. The difference is MLX's Metal buffer
+        pool being filled once. The prefill throttle reads that footprint
+        delta (``_record_chunk_transient``), so the cold chunk (a) pushed the
+        103 GB production model over the 115,5 GB hard watermark and aborted
+        the user's first prompt in 2 of 4 loads, and (b) made the predictor
+        refuse the second chunk of a 1024-token step. Paying it here, before
+        traffic, costs one forward (~3-4 s) at load time.
+
+        Runs on the engine's MLX thread. The cache is built fresh and dropped;
+        nothing is recorded in the throttle tracker — the first real request
+        then measures the warm cost. Returns the footprint growth in bytes.
+        """
+        antes = get_phys_footprint()
+        t0 = time.perf_counter()
+        cache = make_prompt_cache(self.model)
+        ids = (mx.arange(int(n_tokens), dtype=mx.int32) % 4096 + 1000)[None, :]
+        kwargs: dict[str, Any] = {}
+        if self._supports_skip_lm_head():
+            kwargs["skip_lm_head"] = True
+        with mx.stream(self._stream):
+            self.model(ids, cache=cache, **kwargs)
+            mx.eval([c.state for c in cache])
+        del cache
+        delta = max(0, get_phys_footprint() - antes)
+        logger.info(
+            "Prefill warmup: %d tokens in %.1fs, footprint +%s (the cold first chunk "
+            "is paid here, not on the user's first prompt)",
+            int(n_tokens), time.perf_counter() - t0, f"{delta / 1e9:.2f} GB",
+        )
+        return delta
+
     def _supports_skip_lm_head(self) -> bool:
         """Whether the loaded model accepts ``skip_lm_head=True``.
 
