@@ -1309,3 +1309,46 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+def test_release_metal_memory_reports_freed_bytes(monkeypatch, capsys):
+    readings = iter([300 * 1048576, 100 * 1048576])
+    monkeypatch.setattr(
+        inference_worker, "get_phys_footprint", lambda pid=None: next(readings)
+    )
+    calls = []
+    monkeypatch.setattr(
+        inference_worker,
+        "_sync_and_clear_cache",
+        lambda stream=None: calls.append(stream),
+    )
+
+    inference_worker._release_metal_memory()
+
+    assert calls == [None]
+    out = capsys.readouterr().out
+    assert "200.0 MiB returned to the OS" in out
+    assert "300.0 -> 100.0 MiB" in out
+
+
+def test_release_metal_memory_swallows_sync_errors(monkeypatch):
+    def boom(stream=None):
+        raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+
+    monkeypatch.setattr(inference_worker, "_sync_and_clear_cache", boom)
+    monkeypatch.setattr(inference_worker, "get_phys_footprint", lambda pid=None: 5)
+
+    inference_worker._release_metal_memory()
+
+
+def test_release_metal_memory_swallows_footprint_errors(monkeypatch, capsys):
+    def denied(pid=None):
+        raise OSError("operation not permitted")
+
+    monkeypatch.setattr(inference_worker, "get_phys_footprint", denied)
+    monkeypatch.setattr(
+        inference_worker, "_sync_and_clear_cache", lambda stream=None: None
+    )
+
+    inference_worker._release_metal_memory()
+    assert capsys.readouterr().out == ""
