@@ -299,3 +299,125 @@ def test_uno_rejects_untrained_block_size():
         UnoDecoder(
             SimpleNamespace(_uno_adapter_loaded=True), eos_token_ids={0}, block_size=9
         )
+
+
+def test_uno_prefill_does_not_accumulate_retired_kv_buffers():
+    class BufferedModel(_ScriptedModel):
+        def __call__(self, inputs, cache=None, lora_mask=None):
+            values = mx.broadcast_to(
+                inputs[:, None, :, None], (1, 8, inputs.shape[1], 64)
+            ).astype(mx.float32)
+            cache[0].update_and_fetch(values, values)
+            return mx.zeros((1, inputs.shape[1], 128))
+
+    model = BufferedModel()
+    decoder = UnoDecoder(model, eos_token_ids=[], prefill_step_size=256)
+    cached_bytes = []
+    mx.clear_cache()
+
+    def cancelled():
+        mx.synchronize()
+        cached_bytes.append(mx.get_cache_memory())
+        return model.cache[0].offset >= 8192
+
+    assert list(decoder.generate([2] * 8194, max_tokens=1, cancelled=cancelled)) == []
+    resident_bytes = sum(value.nbytes for value in model.cache[0].state)
+    assert max(cached_bytes) < 2 * resident_bytes
+
+
+@pytest.mark.parametrize("cancel_warm", [False, True])
+def test_uno_reuses_ssd_prefix_after_reload(tmp_path, cancel_warm):
+    import threading
+
+    from omlx.engine.uno import UnoEngine, _UnoPrefillGuard
+    from omlx.memory_monitor import MemoryMonitor, set_model_info_from_model
+    from omlx.scheduler import SchedulerConfig
+
+    model = _ScriptedModel()
+    model.layers = [None]
+    model.args.num_hidden_layers = 1
+    model.args.num_key_value_heads = model.args.num_attention_heads = 1
+    model.args.head_dim = model.args.hidden_size = 1
+    monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+    set_model_info_from_model(monitor, model)
+    config = SchedulerConfig(
+        model_name="k2-base",
+        paged_ssd_cache_dir=str(tmp_path),
+        paged_ssd_cache_max_size=1024**2,
+        paged_cache_block_size=4,
+    )
+    options = dict(max_tokens=8, temperature=0, top_p=1, top_k=0, seed=0)
+    prompt = list(range(2, 19))
+    results = []
+    for attempt in range(3 if cancel_warm else 2):
+        engine = UnoEngine("base", adapter_path="unused", scheduler_config=config)
+        engine._model = model
+        engine._bundle = SimpleNamespace(block_size=4)
+        engine._prefill_guard = _UnoPrefillGuard(monitor, 512)
+        engine._executor_tokenizer = SimpleNamespace(
+            decode=lambda ids: "", eos_token_ids=set()
+        )
+        engine._output_parser_factory = SimpleNamespace(
+            thinking_marker_pairs=[],
+            create_session_with_tools=lambda *_: SimpleNamespace(
+                process_token=lambda token: SimpleNamespace(
+                    stream_text=str(token), is_stop=False
+                ),
+                finalize=lambda: SimpleNamespace(
+                    stream_text="", finish_reason=None, tool_calls=[]
+                ),
+            ),
+        )
+        prefix = engine._prefix_cache = engine._init_prefix_cache(model, monitor)
+        output = []
+        cancelled = threading.Event()
+
+        def publish(
+            value, output=output, event=cancelled, abort=cancel_warm and attempt == 1
+        ):
+            output.append(value)
+            if abort:
+                event.set()
+
+        try:
+            engine._run(prompt, options, [], cancelled, publish)
+            results.append(output[-1])
+            stats = engine.get_runtime_cache_stats()
+            assert stats["block_size"] == 4
+            assert stats["prefix_cache"].hits == int(attempt > 0)
+            assert not prefix.paged_cache.request_tables
+            assert not prefix._request_tables
+            assert all(
+                block.ref_count == 0
+                for block in prefix.paged_cache.allocated_blocks.values()
+                if not block.is_null
+            )
+        finally:
+            prefix.paged_ssd_cache.close()
+        assert prefix.paged_ssd_cache.get_stats().num_files > 0
+    assert results[0].cached_tokens == 0
+    assert results[-1].cached_tokens == 16
+    assert results[0].tokens == results[-1].tokens
+    if cancel_warm:
+        assert not results[1].finished
+        assert results[1].tokens == results[0].tokens[: len(results[1].tokens)]
+    config.model_name = "another-base"
+    isolated = UnoEngine("other", adapter_path="unused", scheduler_config=config)
+    prefix = isolated._init_prefix_cache(model, monitor)
+    try:
+        assert prefix.fetch_cache("other", prompt)[0] is None
+    finally:
+        prefix.paged_ssd_cache.close()
+
+
+@pytest.mark.parametrize("reject_at", [None, 2])
+def test_uno_restored_prefix_preserves_only_verified_kv(reject_at):
+    model = _ScriptedModel(reject_at)
+    prompt = [2, 3, 4, 5, 6]
+    cache = model.make_cache()
+    model(mx.array([prompt[:3]]), cache=cache)
+    decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
+    cycles = list(decoder.generate(prompt, max_tokens=9, prompt_cache=cache))
+    emitted = [token for cycle in cycles for token in cycle.tokens]
+    assert cache[0].state[0][0, 0, :, 0].tolist() == prompt + emitted[:-1]
+    assert cache[0].offset == len(prompt) + len(emitted) - 1

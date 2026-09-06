@@ -1423,14 +1423,21 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
         return False
     try:
         config = json.loads((model_dir / "config.json").read_text())
-        if config.get("model_type") == "k2_horizon" and not config.get("model_file"):
+    except (OSError, ValueError):
+        config = {}
+    if (
+        isinstance(config, dict)
+        and config.get("model_type") == "k2_horizon"
+        and not config.get("model_file")
+    ):
+        try:
             from .patches.k2_horizon.checkpoint import checkpoint_files
 
             checkpoint_files(model_dir)
             return True
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
-        return False
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+            return False
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False
@@ -1458,7 +1465,7 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
 def _register_uno(
     models, model_dir, model_id, *, source_type="local", source_repo_id=None
 ):
-    """Expose Uno adapters as helpers, like external MTP drafters."""
+    """Require an Uno name: PEFT metadata cannot identify conditional training."""
     from .uno_bundle import uno_base_id
 
     weights = model_dir / "adapter_model.safetensors"
