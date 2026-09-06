@@ -1145,8 +1145,8 @@ async def test_start_stops_supervisor_and_clears_state_on_dead_rank_zero(monkeyp
         def load_tokenizer(*args, **kwargs):
             return _Tokenizer()
 
-    import types
     import sys
+    import types
 
     monkeypatch.setitem(
         sys.modules,
