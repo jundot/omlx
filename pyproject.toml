@@ -8,7 +8,7 @@ requires = [
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
-    "nanobind==2.15.0",
+    "nanobind==3.0.1",
     "mlx==0.32.2",
 ]
 build-backend = "setuptools.build_meta"
