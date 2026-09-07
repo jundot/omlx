@@ -616,3 +616,57 @@ def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
     for locale_path in i18n_dir.glob("*.json"):
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"
+
+
+def test_active_models_rows_carry_the_callers_request_id_only_when_sent():
+    """A request that sent ``X-Request-ID`` is reported with ``client_request_id``.
+
+    Rows for requests that sent no header keep their existing shape, so the
+    key is absent rather than null.
+    """
+    running_request = SimpleNamespace(
+        request_id="gen-1",
+        client_request_id="caller-gen",
+        generation_started_at=100.0,
+        last_activity_at=109.5,
+        num_output_tokens=20,
+        num_prompt_tokens=12,
+        max_tokens=64,
+    )
+    prefilling_request = SimpleNamespace(
+        request_id="prefill-1", client_request_id="caller-prefill"
+    )
+    waiting_request = SimpleNamespace(
+        request_id="wait-1",
+        arrival_time=105.0,
+        num_prompt_tokens=30,
+    )
+    scheduler = SimpleNamespace(
+        snapshot_for_admin=lambda: {
+            "running_by_id": {"gen-1": running_request, "prefill-1": prefilling_request},
+            "waiting": [waiting_request],
+        },
+    )
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=FakePool(scheduler)),
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=FakePrefillTracker()),
+        patch("time.monotonic", return_value=110.0),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    model = data["models"][0]
+    assert model["prefilling"] == [
+        {
+            "request_id": "prefill-1",
+            "processed": 10,
+            "total": 20,
+            "client_request_id": "caller-prefill",
+        }
+    ]
+    assert model["generating"][0]["request_id"] == "gen-1"
+    assert model["generating"][0]["client_request_id"] == "caller-gen"
+    assert "client_request_id" not in model["waiting"][0]

@@ -194,6 +194,7 @@ from .exceptions import (
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .request import client_request_id_from_headers, current_client_request_id
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -1062,7 +1063,34 @@ class DebugRequestLoggingMiddleware:
         await self.app(scope, cached_receive, send)
 
 
+class ClientRequestIdMiddleware:
+    """Pure ASGI middleware exposing the caller's ``X-Request-ID`` downstream.
+
+    Lets a client correlate its own request with the row the activity API
+    reports for it: the engine mints its request id internally and never
+    returns it, so without this the two cannot be matched under concurrency.
+
+    Must be pure ASGI rather than ``BaseHTTPMiddleware``. The latter runs the
+    endpoint in a separate task and returns before a streaming body is
+    iterated, so the value would already be gone by the time the engine
+    registers the request — which happens lazily, during iteration.
+
+    Requests that send no header are untracked, exactly as before.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            current_client_request_id.set(
+                client_request_id_from_headers(scope.get("headers") or ())
+            )
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(DebugRequestLoggingMiddleware)
+app.add_middleware(ClientRequestIdMiddleware)
 
 
 # =============================================================================

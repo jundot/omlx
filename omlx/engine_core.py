@@ -42,7 +42,12 @@ from .exceptions import (
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .request import Request, RequestOutput, SamplingParams
+from .request import (
+    Request,
+    RequestOutput,
+    SamplingParams,
+    current_client_request_id,
+)
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.hardware import format_bytes
@@ -613,6 +618,9 @@ class EngineCore:
             skip_cache_store=skip_cache_store,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
+            # Every engine path (streaming or not, LLM or VLM) mints its id
+            # here, so this is the one place the caller's id can be attached.
+            client_request_id=current_client_request_id.get(),
         )
 
         # SpecPrefill: resolve per-request settings.

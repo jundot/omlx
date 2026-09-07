@@ -9,8 +9,34 @@ request management system, simplified for MLX backend.
 
 import enum
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+
+# Longest caller-supplied request id the activity API will echo back. Bounds
+# what an arbitrary header can pin in memory for the life of a request.
+CLIENT_REQUEST_ID_MAX_LEN = 128
+
+# Carries the caller's ``X-Request-ID`` from the HTTP layer to the point where
+# an engine mints its own request id, without threading a parameter through
+# every engine signature. Each request runs in its own task, so the value
+# cannot leak between concurrent requests.
+current_client_request_id: ContextVar[Optional[str]] = ContextVar(
+    "omlx_client_request_id", default=None
+)
+
+
+def client_request_id_from_headers(headers) -> Optional[str]:
+    """Return a usable ``X-Request-ID`` from raw ASGI headers, or None.
+
+    Whitespace-only values count as absent; long values are truncated to
+    ``CLIENT_REQUEST_ID_MAX_LEN``.
+    """
+    for key, value in headers:
+        if key.lower() == b"x-request-id":
+            text = value.decode("latin-1").strip()
+            return text[:CLIENT_REQUEST_ID_MAX_LEN] or None
+    return None
 
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
@@ -149,6 +175,12 @@ class Request:
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
     benchmark_ane_sequence_length: int = 0
+    # The caller's own ``X-Request-ID``, when it sent one. The engine mints
+    # ``request_id`` internally and never returns it over HTTP, so this is the
+    # only handle a client has for finding its row on the activity API while
+    # the request is in flight. Display-only: never used for scheduling,
+    # caching, or identity.
+    client_request_id: Optional[str] = None
     # Effective prefill widths observed by the scheduler. These are populated
     # only for benchmark_trace requests so the benchmark summary can distinguish
     # a requested scheduler step from the model calls actually delivered after
