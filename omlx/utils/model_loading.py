@@ -1213,6 +1213,12 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     Returns:
         The (possibly patched) model.
     """
+    from ..patches.nvfp4_prefill import apply_nvfp4_prefill
+
+    projections = apply_nvfp4_prefill(model)
+    if projections:
+        logger.info("NVFP4 BF16 prefill enabled for %d projections", projections)
+
     # t5 bias recovery for text-engine loads (~420 MB on Bonsai-27B).
     # VLMBatchedEngine calls free_t5_biases explicitly; this covers the
     # BatchedEngine / LLM path, and is a no-op for non-t5 models.

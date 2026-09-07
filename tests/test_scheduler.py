@@ -6551,7 +6551,7 @@ class TestBuildStateMachineStopStrings:
         return Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
     def _assert_matches(self, matcher, tokens):
-        if hasattr(matcher, "match"):
+        if not hasattr(matcher, "_states"):
             root = matcher.make_state()
             state = root
             for token in tokens:

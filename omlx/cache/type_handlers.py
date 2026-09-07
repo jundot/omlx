@@ -777,8 +777,24 @@ class ArraysCacheHandler(CacheTypeHandler):
         # we return an empty tuple to signal "no fixed schema".
         return ()
 
+    @staticmethod
+    def _portable_state(cache_obj: Any):
+        inner = cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        state = inner.state if hasattr(inner, "state") else inner.cache
+        if len(state) == 3 and isinstance(state[0], (list, tuple)):
+            return state
+        padding = getattr(inner, "left_padding", None)
+        lengths = getattr(inner, "lengths", None)
+        if padding is not None or lengths is not None:
+            return (
+                list(state),
+                mx.array([]) if padding is None else padding,
+                mx.array([]) if lengths is None else lengths,
+            )
+        return state
+
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
-        state = super().serialize_state(cache_obj)
+        state = self._portable_state(cache_obj)
         if len(state) == 3 and isinstance(state[0], (list, tuple)):
             # Boundary snapshots store flat tensors. Retain both batch metadata
             # tensors after the recurrent slots, identified by meta_state.
@@ -786,7 +802,7 @@ class ArraysCacheHandler(CacheTypeHandler):
         return state
 
     def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
-        state = getattr(cache_obj, "state", ())
+        state = self._portable_state(cache_obj)
         if len(state) == 3 and isinstance(state[0], (list, tuple)):
             return ("omlx_arrays_v1", len(state[0]))
         return super().serialize_meta_state(cache_obj)
@@ -797,7 +813,7 @@ class ArraysCacheHandler(CacheTypeHandler):
         inner = (
             cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
         )
-        state_list = inner.state if hasattr(inner, "state") else inner.cache
+        state_list = self._portable_state(inner)
 
         return {
             "states": list(state_list) if state_list else [],
@@ -851,7 +867,7 @@ class ArraysCacheHandler(CacheTypeHandler):
 
         Args:
             state: State dictionary with 'states' key.
-            meta_state: Optional metadata (unused for ArraysCache).
+            meta_state: Optional portable snapshot schema and slot count.
             token_count: Number of tokens this cache represents.
                 Used by SizedArraysCache wrapper for correct size() return.
 
@@ -879,13 +895,19 @@ class ArraysCacheHandler(CacheTypeHandler):
             if slots < 0 or len(states) != slots + 2:
                 raise ValueError("Invalid ArraysCache snapshot slot count")
             cache = ArraysCache(size=slots)
-            cache.state = (list(states[:slots]), states[-2], states[-1])
+            cache.cache = list(states[:slots])
+            cache.left_padding, cache.lengths = states[-2], states[-1]
         elif len(states) == 3 and isinstance(states[0], (list, tuple)):
             cache = ArraysCache(size=len(states[0]))
-            cache.state = (list(states[0]), states[1], states[2])
+            cache.cache = list(states[0])
+            cache.left_padding, cache.lengths = states[1], states[2]
         else:
             cache = ArraysCache(size=len(states))
             cache.cache = list(states)
+
+        for name in ("left_padding", "lengths"):
+            if getattr(getattr(cache, name, None), "size", None) == 0:
+                setattr(cache, name, None)
 
         # Wrap with SizedArraysCache to provide correct size()
         return SizedArraysCache(cache, token_count)
