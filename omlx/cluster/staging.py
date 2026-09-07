@@ -32,6 +32,38 @@ _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+
+def _validate_safe_relative_filename(filename: str) -> None:
+    """Reject a path that escapes the model root or names an absolute location.
+
+    A one-level subdirectory is legitimate — OptiQ VLM checkpoints index
+    ``optiq/optiq_vision.safetensors`` alongside the numbered decoder shards —
+    so only ``..`` traversal and absolute paths are refused, not every
+    filename with a ``/`` in it.
+    """
+
+    path = Path(filename)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"unsafe filename: {filename!r}")
+
+
+def _is_auxiliary_shard(filename: str) -> bool:
+    """Whether ``filename`` sits outside the flat, pipeline-splittable shard set.
+
+    Every decoder shard this module has ever staged lives flat in the model
+    root — that assumption is load-bearing throughout this file. A nested
+    path is therefore never a decoder shard by construction: it is an
+    auxiliary weight file the publisher deliberately separated out (e.g.
+    OptiQ's ``optiq/optiq_vision.safetensors``, a vision encoder). Its tensor
+    names cannot be trusted to carry a decoder layer index — a vision encoder
+    commonly reuses "blocks.N"/"layers.N" naming with its own, unrelated
+    numbering, so running it through ``_LAYER`` would attribute it to a
+    decoder layer by coincidence, not by fact.
+    """
+
+    return len(Path(filename).parts) > 1
+
+
 # Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
 # command line so the peer's shell expands ``~`` to its own home.
 DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
@@ -115,6 +147,7 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
     files = sorted(root.glob("*.safetensors"))
     if not files:
         raise ValueError(f"no safetensors files in {root}")
+    file_names = {path.name for path in files}
 
     names_by_file: dict[str, list[str]] = {}
     index = root / "model.safetensors.index.json"
@@ -122,13 +155,36 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
         weight_map = json.loads(index.read_text()).get("weight_map", {})
         if isinstance(weight_map, dict):
             for tensor, filename in weight_map.items():
-                names_by_file.setdefault(str(filename), []).append(str(tensor))
+                filename = str(filename)
+                _validate_safe_relative_filename(filename)
+                names_by_file.setdefault(filename, []).append(str(tensor))
+                # The index may reference an auxiliary file outside the flat
+                # top-level glob above — e.g. OptiQ's
+                # optiq/optiq_vision.safetensors. Pick it up here so it is
+                # promised for staging rather than silently dropped.
+                if filename not in file_names and (root / filename).is_file():
+                    files.append(root / filename)
+                    file_names.add(filename)
 
     shards = []
     for path in files:
-        names = names_by_file.get(path.name)
+        rel_name = str(path.relative_to(root))
+        names = names_by_file.get(rel_name) or names_by_file.get(path.name)
         if names is None:
             names = _safetensors_tensor_names(path)
+        if _is_auxiliary_shard(rel_name):
+            # See the matching comment in _indexed_shards: not part of the
+            # numbered decoder-shard set, so _LAYER below would attribute its
+            # tensor names to a decoder layer by coincidence, not by fact.
+            shards.append(
+                ShardInfo(
+                    name=rel_name,
+                    size_bytes=path.stat().st_size,
+                    layers=frozenset(),
+                    has_shared_tensors=True,
+                )
+            )
+            continue
         layers = set()
         shared = False
         for name in names:
@@ -139,7 +195,7 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
                 shared = True
         shards.append(
             ShardInfo(
-                name=path.name,
+                name=rel_name,
                 size_bytes=path.stat().st_size,
                 layers=frozenset(layers),
                 has_shared_tensors=shared,
@@ -227,13 +283,30 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     names_by_file: dict[str, list[str]] = {}
     for tensor, raw_filename in weight_map.items():
         filename = str(raw_filename)
-        if Path(filename).name != filename:
-            raise ValueError(f"unsafe safetensors filename in index: {filename!r}")
+        _validate_safe_relative_filename(filename)
         names_by_file.setdefault(filename, []).append(str(tensor))
 
     shards: list[ShardInfo] = []
     for filename, names in sorted(names_by_file.items()):
         path = root / filename
+        if _is_auxiliary_shard(filename):
+            # An index entry outside the numbered decoder-shard set — e.g.
+            # OptiQ's optiq/optiq_vision.safetensors. model_discovery.py
+            # excludes these from completeness checks for the same reason
+            # (#2742): a vision encoder commonly reuses "blocks.N"/"layers.N"
+            # naming with its own unrelated numbering, so running its tensor
+            # names through _LAYER below would attribute them to a decoder
+            # layer by coincidence, not by fact. Ship the whole file to every
+            # rank instead, the same as any other non-layer-specific tensor.
+            shards.append(
+                ShardInfo(
+                    name=filename,
+                    size_bytes=path.stat().st_size if path.is_file() else 0,
+                    layers=frozenset(),
+                    has_shared_tensors=True,
+                )
+            )
+            continue
         layers: set[int] = set()
         shared = False
         for name in names:
@@ -396,7 +469,11 @@ def remote_model_staging_inventory(
             shared = item["has_shared_tensors"] is True
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid shard entry from {ssh_target}") from exc
-        if Path(name).name != name or size_bytes < 0 or min(layers, default=0) < 0:
+        try:
+            _validate_safe_relative_filename(name)
+        except ValueError as exc:
+            raise RuntimeError(f"unsafe shard entry from {ssh_target}") from exc
+        if size_bytes < 0 or min(layers, default=0) < 0:
             raise RuntimeError(f"unsafe shard entry from {ssh_target}")
         shards.append(
             ShardInfo(
@@ -605,6 +682,10 @@ _REMOTE_INSTALL_SNIPPET = (
     "actual=os.path.getsize(temporary);"
     "\nif expected >= 0 and actual != expected:"
     "\n raise SystemExit(f'transferred size {actual} != expected {expected}')"
+    # final may nest one directory deep (e.g. optiq/optiq_vision.safetensors)
+    # — the initial mkdir -p only ever covered the model root.
+    "\nparent=os.path.dirname(final)"
+    "\nif parent: os.makedirs(parent, exist_ok=True)"
     "\nos.replace(temporary,final)"
 )
 _REMOTE_DISCARD_SNIPPET = (
@@ -718,8 +799,7 @@ def scp_push(
 ) -> None:
     """Push one local model file to the Mac that needs it."""
 
-    if Path(filename).name != filename:
-        raise ValueError(f"staging filename must be a basename: {filename!r}")
+    _validate_safe_relative_filename(filename)
     source = Path(source_dir).expanduser() / filename
     if not source.is_file():
         raise RuntimeError(f"source model file is missing: {source}")
@@ -783,14 +863,26 @@ def scp_push(
 
 
 def _local_file_sizes(model_dir: str | Path) -> dict[str, int]:
+    """Every model file's size, keyed by its path relative to ``model_dir``.
+
+    One level deep only — a safetensors index can reference an auxiliary
+    shard in a subdirectory (e.g. OptiQ's optiq/optiq_vision.safetensors),
+    but nothing in the staging contract needs more than that, and unbounded
+    recursion would walk into .cache/huggingface's download bookkeeping.
+    """
+
     root = Path(model_dir).expanduser()
     if not root.is_dir():
         return {}
-    return {
-        path.name: path.stat().st_size
-        for path in root.iterdir()
-        if path.is_file()
-    }
+    sizes: dict[str, int] = {}
+    for path in root.iterdir():
+        if path.is_file():
+            sizes[path.name] = path.stat().st_size
+        elif path.is_dir() and not path.name.startswith("."):
+            for nested in path.iterdir():
+                if nested.is_file():
+                    sizes[f"{path.name}/{nested.name}"] = nested.stat().st_size
+    return sizes
 
 
 def scp_copy(
@@ -805,8 +897,7 @@ def scp_copy(
 ) -> None:
     """Copy one model file between any two enrolled cluster nodes."""
 
-    if Path(filename).name != filename:
-        raise ValueError(f"staging filename must be a basename: {filename!r}")
+    _validate_safe_relative_filename(filename)
     source_local = is_local_host(source_host)
     destination_local = is_local_host(destination_host)
     if source_local and destination_local:
@@ -850,7 +941,9 @@ def scp_copy(
                 timeout=timeout,
             )
             if result.returncode == 0:
-                os.replace(temporary, destination / filename)
+                final_local = destination / filename
+                final_local.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary, final_local)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -954,8 +1047,16 @@ def stage_files_from_source(
     expected = dict(expected_sizes)
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
+    def _unsafe_name(name: str) -> bool:
+        try:
+            _validate_safe_relative_filename(name)
+        except ValueError:
+            return True
+        return False
+
     if any(
-        Path(name).name != name
+        not isinstance(name, str)
+        or _unsafe_name(name)
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size < 0
@@ -1112,8 +1213,18 @@ _REMOTE_FILE_SIZES_SNIPPET = (
     "import json,sys;"
     "from pathlib import Path;"
     "p=Path(sys.argv[1]).expanduser();"
-    "files=p.iterdir() if p.is_dir() else ();"
-    "print(json.dumps({f.name:f.stat().st_size for f in files if f.is_file()}))"
+    "sizes={};"
+    "\nif p.is_dir():"
+    "\n for f in p.iterdir():"
+    "\n  if f.is_file(): sizes[f.name]=f.stat().st_size"
+    # One level deep only — matches _local_file_sizes: a safetensors index can
+    # reference an auxiliary shard in a subdirectory (e.g. OptiQ's
+    # optiq/optiq_vision.safetensors), but recursing further would walk into
+    # .cache/huggingface's download bookkeeping.
+    "\n  elif f.is_dir() and not f.name.startswith('.'):"
+    "\n   for n in f.iterdir():"
+    "\n    if n.is_file(): sizes[f'{f.name}/{n.name}']=n.stat().st_size"
+    "\nprint(json.dumps(sizes))"
 )
 
 

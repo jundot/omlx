@@ -15,6 +15,9 @@ from omlx.cluster.staging import (
     _REMOTE_FILE_SIZES_SNIPPET,
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
+    _indexed_shards,
+    _local_file_sizes,
+    _validate_safe_relative_filename,
     index_shards,
     plan_cluster_staging,
     plan_staging,
@@ -74,6 +77,74 @@ def test_uses_the_index_when_present(tmp_path):
     root = _model(tmp_path / "m", layers=8, per_file=2, with_index=True)
     shards = index_shards(root)
     assert sorted(next(s for s in shards if "00004" in s.name).layers) == [4, 5]
+
+
+def _add_nested_auxiliary_shard(root):
+    """OptiQ-style optiq/optiq_vision.safetensors, indexed but nested.
+
+    Its tensor names deliberately reuse "blocks.N" — the same naming a
+    decoder layer would use — to prove the nested file is never attributed
+    to a decoder layer by coincidence.
+    """
+
+    (root / "optiq").mkdir()
+    vision_tensors = [f"vision_tower.blocks.{i}.attn.qkv.weight" for i in range(3)]
+    _write_shard(root / "optiq", "optiq_vision.safetensors", vision_tensors)
+    index_path = root / "model.safetensors.index.json"
+    payload = json.loads(index_path.read_text())
+    for tensor in vision_tensors:
+        payload["weight_map"][tensor] = "optiq/optiq_vision.safetensors"
+    index_path.write_text(json.dumps(payload))
+
+
+def test_index_shards_treats_a_nested_index_entry_as_auxiliary(tmp_path):
+    root = _model(tmp_path / "m", layers=8, per_file=2, with_index=True)
+    _add_nested_auxiliary_shard(root)
+
+    shards = index_shards(root)
+    aux = next(s for s in shards if s.name == "optiq/optiq_vision.safetensors")
+    assert aux.layers == frozenset()
+    assert aux.has_shared_tensors is True
+    # A decoder layer file's own layer numbers must be untouched by the
+    # vision file's "blocks.N" tensor names, which reuse the same 0-2 range.
+    layered = {s.name: sorted(s.layers) for s in shards if s.layers}
+    assert layered["model-00000.safetensors"] == [0, 1]
+
+
+def test_indexed_shards_does_not_reject_a_nested_index_entry(tmp_path):
+    """Reproduces the "unsafe safetensors filename in index" crash directly."""
+
+    root = _model(tmp_path / "m", layers=8, per_file=2, with_index=True)
+    _add_nested_auxiliary_shard(root)
+
+    shards = _indexed_shards(root)
+    aux = next(s for s in shards if s.name == "optiq/optiq_vision.safetensors")
+    assert aux.has_shared_tensors is True
+    assert aux.size_bytes > 0
+
+
+def test_indexed_shards_still_rejects_path_traversal(tmp_path):
+    root = _model(tmp_path / "m", layers=2, per_file=2, with_index=True)
+    index_path = root / "model.safetensors.index.json"
+    payload = json.loads(index_path.read_text())
+    payload["weight_map"]["evil.weight"] = "../../etc/passwd"
+    index_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="unsafe"):
+        _indexed_shards(root)
+
+
+def test_validate_safe_relative_filename_allows_one_level_of_nesting():
+    _validate_safe_relative_filename("optiq/optiq_vision.safetensors")  # no raise
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["../escape.safetensors", "/etc/passwd", "a/../../b.safetensors", ""],
+)
+def test_validate_safe_relative_filename_rejects_traversal_and_absolute(filename):
+    with pytest.raises(ValueError, match="unsafe"):
+        _validate_safe_relative_filename(filename)
 
 
 def test_a_stage_gets_only_its_shards_plus_shared(tmp_path):
@@ -238,6 +309,68 @@ def test_remote_install_atomically_replaces_final_after_size_validation(tmp_path
 
     assert final.read_bytes() == b"complete"
     assert not temporary.exists()
+
+
+def test_remote_install_creates_a_missing_nested_parent_directory(tmp_path):
+    """final may nest one directory deep, e.g. optiq/optiq_vision.safetensors —
+    the initial ``mkdir -p`` on the model root does not cover it."""
+
+    temporary = tmp_path / ".omlx-stage-test.part"
+    final = tmp_path / "optiq" / "optiq_vision.safetensors"
+    temporary.write_bytes(b"complete")
+    assert not final.parent.exists()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REMOTE_INSTALL_SNIPPET,
+            str(temporary),
+            str(final),
+            str(len(b"complete")),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert final.read_bytes() == b"complete"
+
+
+def test_local_file_sizes_finds_a_one_level_nested_shard(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "model-00000.safetensors").write_bytes(b"12345")
+    (root / "optiq").mkdir()
+    (root / "optiq" / "optiq_vision.safetensors").write_bytes(b"123")
+    (root / ".cache").mkdir()
+    (root / ".cache" / "ignored").write_bytes(b"x")
+
+    sizes = _local_file_sizes(root)
+
+    assert sizes["model-00000.safetensors"] == 5
+    assert sizes["optiq/optiq_vision.safetensors"] == 3
+    assert not any(name.startswith(".cache") for name in sizes)
+
+
+def test_remote_file_sizes_snippet_finds_a_one_level_nested_shard(tmp_path):
+    root = tmp_path / "m"
+    root.mkdir()
+    (root / "model-00000.safetensors").write_bytes(b"12345")
+    (root / "optiq").mkdir()
+    (root / "optiq" / "optiq_vision.safetensors").write_bytes(b"123")
+
+    result = subprocess.run(
+        [sys.executable, "-c", _REMOTE_FILE_SIZES_SNIPPET, str(root)],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    sizes = json.loads(result.stdout)
+    assert sizes["model-00000.safetensors"] == 5
+    assert sizes["optiq/optiq_vision.safetensors"] == 3
 
 
 def test_rank_validation_allows_unrelated_indexed_shards_to_be_absent(tmp_path):
