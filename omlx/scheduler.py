@@ -3840,6 +3840,7 @@ class Scheduler:
                 requested_step=prefill_step_size,
                 gathered_core=gathered_core,
             )
+            self._trace_prefill_memory(request, prompt_cache, "before_reclaim")
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
             # consumption point is the end-of-step cleanup, but this loop
@@ -3965,6 +3966,7 @@ class Scheduler:
             Scheduler._clear_cache(self)
             if vlm_embeds is None:
                 self._accrue_decode_debt(time.perf_counter() - _trace_chunk_start)
+            self._trace_prefill_memory(request, prompt_cache, "after_reclaim")
             if getattr(request, "benchmark_trace", False):
                 _trace_total_ms = (
                     time.perf_counter() - _trace_chunk_start
@@ -4762,6 +4764,24 @@ class Scheduler:
             hot_cache_bytes = Scheduler._hot_cache_cpu_bytes(self)
         phys = max(0, int(get_phys_footprint()) - hot_cache_bytes)
         return max(active, phys)
+
+    def _trace_prefill_memory(self, request, prompt_cache, phase: str) -> None:
+        """Separate cache residency, allocator buffers and physical footprint."""
+        if not getattr(request, "benchmark_trace", False):
+            return
+        logger.info(
+            "[benchmark-memory] rid=%s phase=%s context=%d cache_bytes=%d "
+            "mlx_active_bytes=%d mlx_pool_bytes=%d phys_footprint_bytes=%d "
+            "hot_cache_cpu_bytes=%d",
+            request.request_id,
+            phase,
+            _cache_base_sizes(prompt_cache),
+            sum(int(getattr(c, "nbytes", 0)) for c in prompt_cache),
+            mx.get_active_memory(),
+            mx.get_cache_memory(),
+            get_phys_footprint(),
+            self._hot_cache_cpu_bytes(),
+        )
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
         """Return hot-cache block hashes owned by active in-flight requests."""
@@ -5625,6 +5645,7 @@ class Scheduler:
             requested_step=prefill_step_size,
             gathered_core=actual_gathered_core,
         )
+        self._trace_prefill_memory(state.request, state.cache, "before_reclaim")
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
 
@@ -5721,6 +5742,7 @@ class Scheduler:
 
         if self._should_clear_after_chunk():
             Scheduler._clear_cache(self)
+            self._trace_prefill_memory(state.request, state.cache, "after_reclaim")
         chunk_dt = time.perf_counter() - _t_chunk_start
         if getattr(state.request, "benchmark_trace", False):
             _ane_sequence = int(

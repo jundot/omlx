@@ -213,7 +213,7 @@ def test_incremental_prefill_matches_explicit_cache_updates(
     reference = make_prompt_cache(model)
     scheduler._prepare_affine4_prefill_cache(reference)
     for start in range(0, 512, 128):
-        mx.eval(model(mx.array([prompt[start:start + 128]]), cache=reference))
+        mx.eval(model(mx.array([prompt[start : start + 128]]), cache=reference))
     expected = model(mx.array([prompt[-1:]]), cache=reference)
     mx.eval(expected)
     updates = []
@@ -238,7 +238,10 @@ def test_incremental_prefill_matches_explicit_cache_updates(
     assert all(count == 128 for _, count in updates)
     if architecture == "qwen3_5":
         assert [type(cache) for cache in caches] == [
-            ArraysCache, Affine4KVCache, ArraysCache, KVCache
+            ArraysCache,
+            Affine4KVCache,
+            ArraysCache,
+            KVCache,
         ]
     actual = model(mx.array([last]), cache=caches)
     mx.eval(actual)

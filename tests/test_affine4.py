@@ -191,9 +191,7 @@ def test_native_long_uniform_attention_stays_finite(tokens):
     cache.key_codec = Affine4Codec(dim, 0)
     cache.value_codec = Affine4Codec(dim, 1)
     scales = mx.ones((1, heads, tokens))
-    keys = TurboQuantMSEState(
-        scales, mx.zeros((1, heads, tokens, dim // 8), mx.uint32)
-    )
+    keys = TurboQuantMSEState(scales, mx.zeros((1, heads, tokens, dim // 8), mx.uint32))
     values = TurboQuantMSEState(
         scales, mx.full((1, heads, tokens, dim // 8), 0x88888888, mx.uint32)
     )

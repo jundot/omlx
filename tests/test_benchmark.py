@@ -344,6 +344,7 @@ class TestComputeMetrics:
         assert metrics["completion_tokens"] == 128
         assert metrics["cached_tokens"] == 0
         assert metrics["peak_memory_bytes"] == 4 * 1024 * 1024 * 1024
+        assert metrics["peak_memory_source"] == "mlx_active"
 
         # Gen TPS = 128 / 1.28 = 100 tok/s
         assert metrics["gen_tps"] == pytest.approx(100.0, abs=0.1)
@@ -1903,6 +1904,7 @@ class TestRunExternalBenchmark:
         assert result["prompt_tokens"] == 3900
         assert result["completion_tokens"] == 128
         assert result["peak_memory_bytes"] is None
+        assert result["peak_memory_source"] is None
         # gen duration 1.0s (first 0.5 → last 1.5) with 128 tokens
         assert result["gen_tps"] == 128.0
         assert result["ttft_ms"] == 500.0

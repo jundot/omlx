@@ -62,6 +62,13 @@ also reserves one unpacked layer and bounded attention workspace, including
 when the prefill chunk is small. Memory-pressure resumes retain absolute
 context lengths even with prefix caching disabled.
 
+Benchmark `peak_memory_bytes` measures active MLX allocations; it is not total
+process memory. `system_metrics.memory` separately samples physical footprint,
+active allocations and the free allocator pool in GiB. Benchmark memory traces
+record these components and actual cache bytes before and after chunk reclaim.
+The guard continues to use the larger of active MLX memory and physical
+footprint after the existing shared CPU hot-cache adjustment.
+
 ## Storage and correctness
 
 Keys and values have independent deterministic orthogonal rotations. Power-of-two
