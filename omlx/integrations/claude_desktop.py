@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Auto-configure Claude Desktop (macOS) to use oMLX as a gateway.
 
-When the ``Claude Desktop`` switch (``claude_code.desktop_enabled``, T-001)
+When the ``Claude Desktop`` switch (``claude_code.desktop_enabled``)
 is enabled, oMLX writes the Claude Desktop JSON configs so the app talks
 **directly** to the oMLX server in gateway mode — no external reverse proxy
 (ollama-switcher) needed. When disabled, the previous configuration is
@@ -23,11 +23,11 @@ in the field), adapted to point at oMLX itself:
    - ``inferenceGatewayAuthScheme: "bearer"``
    - ``disableDeploymentModeChooser: true``
 
-Gateway format note (T-002 verification, done first):
+Gateway format note verification:
 Claude Desktop in gateway mode calls ``GET /v1/models`` and needs the
 Anthropic family metadata (``display_name``, ``created_at``,
 ``anthropic_family_tier``, ``is_family_default``, ``max_tokens``) — see
-``docs/task/references/ModelMap.swift::catalog()``. After T-001, oMLX
+``ollama-switcher` ModelMap.swift::catalog()`. With tier aliases exposed, oMLX
 ``/v1/models`` (``response_model_exclude_none=True``) already returns all
 five fields on the tier slot entries, and bearer auth works on
 ``/v1/models`` and ``/v1/messages`` (``verify_api_key`` accepts the main /

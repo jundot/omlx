@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Claude Desktop auto-configuration (T-002).
+"""Tests for Claude Desktop auto-configuration.
 
-When the ``Claude Desktop`` switch (``claude_code.desktop_enabled``, T-001)
+When the ``Claude Desktop`` switch (``claude_code.desktop_enabled``)
 is enabled, oMLX writes the macOS Claude Desktop JSON configs so the app
 talks directly to the oMLX gateway (no external reverse proxy). Disabling
 restores the previous configuration.
@@ -45,7 +45,7 @@ def _read(path: Path) -> dict:
 class TestProfileId:
     def test_stable_and_distinct_from_ollama_switcher(self):
         assert PROFILE_ID != OLLAMA_SWITCHER_PROFILE
-        # Valid UUID shape (the T-002 prompt placeholder with "MLX"
+        # Valid UUID shape (the design placeholder with "MLX"
         # characters is not a valid UUID, so a fixed v4 value is used).
         parts = PROFILE_ID.split("-")
         assert [len(p) for p in parts] == [8, 4, 4, 4, 12]
@@ -231,7 +231,7 @@ class TestIsConfigured:
 
 
 class TestGatewayModelFormat:
-    """T-002 gateway check: /v1/models tier entries must carry the five
+    """Gateway check: /v1/models tier entries must carry the five
     Anthropic family fields ModelMap.swift::catalog() requires."""
 
     def test_model_info_exposes_anthropic_fields(self):
