@@ -1051,6 +1051,14 @@ def test_qwen4_admission_prices_the_gathered_route():
 
 
 def test_qwen4_pricing_tracks_execution_route(monkeypatch):
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        QSAKVCache,
+        QSAQuantizedKVCache,
+    )
+
     monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
@@ -1072,6 +1080,21 @@ def test_qwen4_pricing_tracks_execution_route(monkeypatch):
     differing[2] = differing[2] + 1
     assert route(query_tokens=n, cache_tokens=2048, position_ids=equal) is True
     assert route(query_tokens=n, cache_tokens=2048, position_ids=differing) is False
+
+    # Runtime requires the exact floating-point QSA cache type. Quantized QSA
+    # caches use the official dense path and must be priced that way before it runs.
+    assert route(
+        query_tokens=n,
+        cache_tokens=2048,
+        position_ids=equal,
+        prompt_cache=[QSAKVCache()],
+    ) is True
+    assert route(
+        query_tokens=n,
+        cache_tokens=2048,
+        position_ids=equal,
+        prompt_cache=[QSAQuantizedKVCache()],
+    ) is False
 
 
 def test_qwen4_preflight_doors_admit_at_the_gathered_price():

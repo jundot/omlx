@@ -3489,6 +3489,7 @@ class Scheduler:
         query_tokens: int,
         cache_tokens: int,
         position_ids: Any = None,
+        prompt_cache: list[Any] | None = None,
     ) -> bool:
         """Predict the Qwen4 prefill route for one concrete chunk.
 
@@ -3501,6 +3502,18 @@ class Scheduler:
         its actual position_ids, so an image-bearing tail is still caught
         before Metal sees it.
         """
+        if prompt_cache is not None:
+            try:
+                from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+            except ImportError:
+                return False
+            qsa_caches = [
+                cache
+                for cache in prompt_cache
+                if callable(getattr(cache, "reserve_index_capacity", None))
+            ]
+            if not qsa_caches or any(type(cache) is not QSAKVCache for cache in qsa_caches):
+                return False
         monitor = getattr(self, "memory_monitor", None)
         checker = getattr(monitor, "qwen4_gathered_prefill_route", None)
         if not (callable(checker) and checker(query_tokens, cache_tokens) is True):
@@ -3688,6 +3701,7 @@ class Scheduler:
                 query_tokens=n_tokens,
                 cache_tokens=cache_tokens,
                 position_ids=sliced.get("position_ids"),
+                prompt_cache=prompt_cache,
             )
 
         while input_arr.shape[1] > 0:
@@ -5548,7 +5562,9 @@ class Scheduler:
 
         def qwen4_route(query_tokens: int) -> bool:
             return qwen4_accounting and self._qwen4_text_gathered_pricing(
-                query_tokens=query_tokens, cache_tokens=cache_tokens
+                query_tokens=query_tokens,
+                cache_tokens=cache_tokens,
+                prompt_cache=state.cache,
             )
 
         gathered_core = qwen4_route(n)
