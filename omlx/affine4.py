@@ -272,7 +272,7 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 template <int Dim, int Repeats, int QueryLength, int PaddedRows, int Warps,
-          int NumKvHeads, typename Accumulator, typename ScalePtr>
+          int NumKvHeads, typename Accumulator, bool HasMask, typename ScalePtr>
 METAL_FUNC void affine4_attention_impl(
     device uchar* keys,
     ScalePtr key_scales,
@@ -400,9 +400,9 @@ METAL_FUNC void affine4_attention_impl(
                             absolute_token >= tile_valid_start &&
                             absolute_token < tile_valid_end &&
                             absolute_token < row_valid_end &&
-                            mask[(row / QueryLength) * mask_head_stride +
+                            (!HasMask || mask[(row / QueryLength) * mask_head_stride +
                                  position * mask_query_stride +
-                                 absolute_token * mask_token_stride]
+                                 absolute_token * mask_token_stride])
                         ? score_tile[i] * query_scales[row] * attention_scale *
                               float(key_scales[absolute_token * key_scale_stride])
                         : -INFINITY;
@@ -528,7 +528,7 @@ _MPP_ATTENTION_SOURCE = r"""
     int value_scale_offset = batch * int(value_scales_strides[0]) +
         kv_head * int(value_scales_strides[1]);
     affine4_attention_impl<
-        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Accumulator>(
+        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Accumulator, HasMask>(
         (device uchar*)(keys + key_word_offset),
         key_scales + key_scale_offset,
         (device uchar*)(values + value_word_offset),
@@ -664,9 +664,11 @@ def _padded_rows(active_rows: int) -> int:
     return max(8, ((active_rows + 7) // 8) * 8)
 
 
-def _attention_blocks(tokens: int, kv_heads: int, dim: int) -> int:
+def _attention_blocks(tokens: int, kv_heads: int, dim: int, rows: int = 1) -> int:
     token_tiles = (tokens + 63) // 64
     target_groups = 256 if dim <= 64 else 168
+    if dim == 256 and rows == 32 and kv_heads <= 2 and tokens >= 150000:
+        target_groups = 336
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
 
 
@@ -746,6 +748,7 @@ def _native_attention(
         else mx.zeros((batch,), dtype=mx.int32)
     )
     causal = isinstance(mask, str) and mask == "causal"
+    has_mask = isinstance(mask, mx.array)
     if isinstance(mask, mx.array):
         if mask.dtype != mx.bool_:
             return None
@@ -756,7 +759,7 @@ def _native_attention(
     mask = mx.broadcast_to(mask, (batch, query_heads, query_length, tokens))
     valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
-    blocks = _attention_blocks(tokens, kv_heads, dim)
+    blocks = _attention_blocks(tokens, kv_heads, dim, padded_rows if batch == 1 else 1)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
     # Normalized probabilities are <= 1 and signed codes have magnitude <= 8.
     # Limit half partials to 49,152, leaving headroom for accumulation rounding.
@@ -768,7 +771,7 @@ def _native_attention(
     rotated = cache.key_codec.prepare_queries(grouped)
     rows = batch * query_heads * query_length
     geometry = (dim, repeats, query_length, padded_rows, warps, kv_heads)
-    signature = (*geometry, keys_state.norms.dtype, accumulator)
+    signature = (*geometry, keys_state.norms.dtype, accumulator, has_mask)
     if _NATIVE_LAUNCHABLE.get(signature) is False:
         return None
 
@@ -794,6 +797,7 @@ def _native_attention(
                 ("Warps", warps),
                 ("NumKvHeads", kv_heads),
                 ("Accumulator", accumulator),
+                ("HasMask", has_mask),
             ],
             output_shapes=[
                 (rows, blocks, dim),
