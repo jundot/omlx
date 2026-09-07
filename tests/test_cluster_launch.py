@@ -440,13 +440,13 @@ def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
             stderr="",
         )
 
-    ceiling = launch.probe_remote_admission_ceiling(
+    probe = launch.probe_remote_admission_ceiling(
         "user@studio.local",
         python_executable="/opt/omlx/bin/python",
         runner=runner,
     )
 
-    assert ceiling == 213 * 1024**3
+    assert probe.ceiling_bytes == 213 * 1024**3
     argv, kwargs = calls[0]
     assert "BatchMode=yes" in argv
     assert "StrictHostKeyChecking=accept-new" in argv
@@ -458,6 +458,110 @@ def test_remote_memory_probe_is_fast_and_uses_prompt_free_ssh():
     assert "9000" in argv[-1]
     assert "/health" in argv[-1]
     assert kwargs["timeout"] == 8.0
+
+
+def test_remote_memory_probe_targets_the_advertised_admin_port():
+    """C5: a peer that advertised its admin port is probed there, not guessed."""
+
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "admission_ceiling_bytes": 213 * 1024**3,
+                    "fast_probe_ok": True,
+                    "fast_probe_error": "",
+                }
+            ),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        admin_port=8123,
+        runner=runner,
+    )
+
+    assert probe.ceiling_bytes == 213 * 1024**3
+    assert probe.fast_probe_ok is True
+    assert probe.fast_probe_error == ""
+    script = calls[0][-1]
+    # Exactly the advertised port — no legacy 9000 guess alongside it.
+    assert "(8123,)" in script
+    assert "9000" not in script
+    # The compat key stays top-level in the script's JSON (the argv is
+    # shlex-joined, so match without the shell-escaped quotes).
+    assert "admission_ceiling_bytes" in script
+    assert "fast_probe_ok" in script and "fast_probe_error" in script
+
+
+def test_remote_memory_probe_without_advertised_port_keeps_legacy_guesses(
+    monkeypatch,
+):
+    """admin_port=0 must behave exactly like today: local port, then 9000."""
+
+    class _Settings:
+        class server:
+            port = 8000
+
+    monkeypatch.setattr("omlx.settings.get_settings", lambda: _Settings)
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"admission_ceiling_bytes": 5}),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        runner=runner,
+    )
+
+    assert probe.ceiling_bytes == 5
+    # No confession fields in the reply parses as a clean fast path (the
+    # script is ours, so absence is a reply-shape surprise, not a failure).
+    assert probe.fast_probe_ok is True
+    assert "(8000, 9000)" in calls[0][-1]
+
+
+def test_remote_memory_probe_confesses_a_dead_fast_path():
+    """C5: the fast /health miss returns the slow-path ceiling and says so."""
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "admission_ceiling_bytes": 100 * 1024**3,
+                    "fast_probe_ok": False,
+                    "fast_probe_error": "port 8123: Connection refused",
+                }
+            ),
+            stderr="",
+        )
+
+    probe = launch.probe_remote_admission_ceiling(
+        "user@studio.local",
+        python_executable="/opt/omlx/bin/python",
+        admin_port=8123,
+        runner=runner,
+    )
+
+    # The slow-path ceiling arrives whole — no exception, no silence.
+    assert probe.ceiling_bytes == 100 * 1024**3
+    assert probe.fast_probe_ok is False
+    assert "Connection refused" in probe.fast_probe_error
 
 
 def test_preflight_refuses_a_stage_above_the_live_rank_ceiling():
@@ -1108,7 +1212,7 @@ def test_admission_ceiling_probe_discovers_the_peer_interpreter_when_unknown():
         runner=ceiling_runner,
     )
 
-    assert ceiling == 213 * 1024**3
+    assert ceiling.ceiling_bytes == 213 * 1024**3
     assert commands[-1].startswith(_PEER_SHIM)
 
 
@@ -1132,7 +1236,7 @@ def test_admission_ceiling_probe_rediscovers_when_the_known_interpreter_broke():
         runner=ceiling_runner,
     )
 
-    assert ceiling == 7
+    assert ceiling.ceiling_bytes == 7
     assert commands[0].startswith(_BUNDLED_PYTHON)
     assert commands[-1].startswith(_PEER_SHIM)
 
