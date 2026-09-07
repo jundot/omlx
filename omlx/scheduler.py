@@ -34,18 +34,21 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
     PromptProcessingBatch,
-    SequenceStateMachine,
 )
-from mlx_lm.models.cache import (
-    KVCache as _MLXKVCache,
-)
-from mlx_lm.models.cache import (
-    RotatingKVCache as _MLXRotatingKVCache,
-)
-from mlx_lm.models.cache import (
-    make_prompt_cache,
-)
+from mlx_lm.models.cache import KVCache as _MLXKVCache
+from mlx_lm.models.cache import RotatingKVCache as _MLXRotatingKVCache
+from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors
+
+try:
+    from mlx_lm.generate import SequenceStateMachine
+
+    _MLX_LM_USES_STOP_MATCHERS = False
+except ImportError:
+    from mlx_lm.generate import StopSequenceMatcher
+
+    SequenceStateMachine = StopSequenceMatcher
+    _MLX_LM_USES_STOP_MATCHERS = True
 
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
@@ -925,14 +928,22 @@ if _TQ_SINGLETON_CACHE_TYPE is not None:
         _TQ_SINGLETON_CACHE_TYPE.extend = _regular_cache_extend_singleton
 
 _mlx_lm_generate_module = importlib.import_module("mlx_lm.generate")
-_original_make_cache = _mlx_lm_generate_module._make_cache
+_original_make_cache = getattr(_mlx_lm_generate_module, "_make_cache", None)
 _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
 _REGULAR_SINGLETON_CACHE_TYPES = (_MLXKVCache, _MLXRotatingKVCache)
 
 
+def _batch_generator_stop_options(stop_handler: Any) -> dict[str, list[Any]]:
+    """Return the stop keyword used by the installed mlx-lm generation API."""
+    key = "stop_matchers" if _MLX_LM_USES_STOP_MATCHERS else "state_machines"
+    return {key: [stop_handler]}
+
+
 def _patched_make_cache(model, left_padding, max_kv_size):
     """Honor model-owned batch conversion before MLX-LM's fallbacks."""
+    if _original_make_cache is None:
+        raise RuntimeError("the installed mlx-lm does not expose _make_cache")
     if not hasattr(model, "make_cache"):
         return _original_make_cache(model, left_padding, max_kv_size)
 
@@ -1005,6 +1016,17 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
 
 
 def _extend_cache_layer(cache_a: Any, cache_b: Any) -> Any:
+    # BatchPagedKVCache exposes its rows through ``caches`` as an
+    # implementation detail. Extend the batch object itself so independent
+    # page tables are joined without asking singleton PagedKVCache rows to
+    # implement a physical tensor concatenate operation.
+    if (
+        type(cache_a).__name__ == "BatchPagedKVCache"
+        and type(cache_b) is type(cache_a)
+    ):
+        cache_a.extend(cache_b)
+        return cache_a
+
     sub_a = getattr(cache_a, "caches", None)
     sub_b = getattr(cache_b, "caches", None)
     if isinstance(sub_a, (list, tuple)) and isinstance(sub_b, (list, tuple)):
@@ -1059,7 +1081,10 @@ def _patched_ppb_split(self, indices):
         # Defensive: normalise None → [] to avoid mlx-lm crash in _step
         lps = self.logits_processors if self.logits_processors is not None else []
         new_batch.logits_processors = lps
-        new_batch.state_machines = self.state_machines
+        if _MLX_LM_USES_STOP_MATCHERS:
+            new_batch.stop_matchers = self.stop_matchers
+        else:
+            new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
         if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
             new_batch._omlx_glm_dsa_adaptive_prefill = (
@@ -1071,13 +1096,17 @@ def _patched_ppb_split(self, indices):
         self.tokens = []
         self.samplers = []
         self.logits_processors = []
-        self.state_machines = []
+        if _MLX_LM_USES_STOP_MATCHERS:
+            self.stop_matchers = []
+        else:
+            self.state_machines = []
         self.max_tokens = []
         return new_batch
     return _original_ppb_split(self, indices)
 
 
-_mlx_lm_generate_module._make_cache = _patched_make_cache
+if _original_make_cache is not None:
+    _mlx_lm_generate_module._make_cache = _patched_make_cache
 _mlx_lm_generate_module._merge_caches = _patched_merge_caches
 _mlx_lm_generate_module._extend_cache = _patched_extend_cache
 PromptProcessingBatch.split = _patched_ppb_split
@@ -1227,6 +1256,7 @@ PromptProcessingBatch.prompt = _patched_ppb_prompt
 _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
     {
         "KVCache",
+        "PagedKVCache",
         "BatchKVCache",
         "QuantizedKVCache",
         "TurboQuantKVCache",
@@ -1294,6 +1324,14 @@ def _first_leaf_cache_offset(cache_obj: Any) -> int | None:
         return int(offset)
     except Exception:
         return None
+
+
+def _eval_prompt_cache(prompt_cache: list[Any]) -> None:
+    # Paged caches expose physical pages without a contiguous KV gather.
+    mx.eval([
+        cache.eval_state if hasattr(cache, "eval_state") else cache.state
+        for cache in prompt_cache
+    ])
 
 
 def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
@@ -1575,6 +1613,12 @@ class SchedulerConfig:
     initial_cache_blocks: int = (
         256  # Starting blocks (grows dynamically to max_cache_blocks)
     )
+
+    # ECO native GPU Paged KV. None keeps mlx-lm's standard cache path.
+    native_paged_kv_cache_pages: int | None = None
+    native_paged_kv_page_size: int = 64
+    native_paged_attention_mode: str = "auto"
+    native_paged_prefix_cache_pages: int = 0
 
     # paged SSD cache settings (oMLX only supports paged SSD-based caching)
     # When paged_ssd_cache_dir is set, oMLX stores KV cache on paged SSD for prefix reuse.
@@ -2093,6 +2137,8 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: BatchGenerator | None = None
         self._current_sampler_params: tuple | None = None
+        self.native_paged_kv_manager: Any | None = None
+        self.native_paged_prefix_cache: Any | None = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
         # request_id -> {token_count -> snapshot_cache_or_None}
         # Multiple snapshots per request to support per-block ArraysCache state storage.
@@ -2103,6 +2149,39 @@ class Scheduler:
         # SSD store for offloading boundary snapshots (initialized in _init_tiered_cache).
         self._boundary_snapshot_store: BoundarySnapshotSSDStore | None = None
         self._boundary_snapshot_diagnostics = BoundarySnapshotDiagnostics()
+
+        if self.config.native_paged_kv_cache_pages is not None:
+            from .native_paged_kv import create_native_paged_kv_manager
+
+            self.native_paged_kv_manager = create_native_paged_kv_manager(
+                model,
+                capacity_pages=self.config.native_paged_kv_cache_pages,
+                page_size=self.config.native_paged_kv_page_size,
+                attention_mode=self.config.native_paged_attention_mode,
+                batch_generator_cls=BatchGenerator,
+            )
+            if self.native_paged_kv_manager is not None:
+                native_stats = self.native_paged_kv_manager.stats()
+                logger.info(
+                    "native GPU Paged KV enabled: pages=%d page_size=%d "
+                    "full_attention_layers=%d attention=%s",
+                    self.config.native_paged_kv_cache_pages,
+                    self.config.native_paged_kv_page_size,
+                    native_stats.full_attention_layers,
+                    native_stats.attention_mode,
+                )
+
+        if (
+            self.config.native_paged_prefix_cache_pages
+            and self.config.paged_ssd_cache_dir is None
+        ):
+            from .native_paged_kv import NativePagedPrefixCache
+            if self.native_paged_kv_manager is None:
+                raise ValueError("native prefix sharing requires native Paged KV")
+            self.native_paged_prefix_cache = NativePagedPrefixCache(
+                self.native_paged_kv_manager,
+                self.config.native_paged_prefix_cache_pages,
+            )
 
         # paged SSD cache for KV state persistence (oMLX only supports paged SSD-based caching)
         self.paged_cache_manager: PagedCacheManager | None = None
@@ -3094,6 +3173,16 @@ class Scheduler:
             stop_tokens_set.update(sampling_params.stop_token_ids)
         stop_tokens_seq = [[t] for t in stop_tokens_set] if stop_tokens_set else None
 
+        native_paged_kwargs: dict[str, Any] = {}
+        if self.native_paged_kv_manager is not None:
+            manager = self.native_paged_kv_manager
+            native_paged_kwargs = {
+                "cache_factory": lambda uid: manager.make_cache(
+                    sequence_id=str(uid)
+                ),
+                "admission_controller": manager,
+            }
+
         bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
@@ -3104,6 +3193,7 @@ class Scheduler:
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
+            **native_paged_kwargs,
         )
 
         return bg
@@ -3441,6 +3531,14 @@ class Scheduler:
         ]
         return all(routes) if routes else predicted
 
+    def _make_request_prompt_cache(self, request_id: str) -> list[Any]:
+        """Create an empty cache owned by the active runtime."""
+        if self.native_paged_kv_manager is not None:
+            return self.native_paged_kv_manager.make_cache(
+                sequence_id=request_id
+            )
+        return make_prompt_cache(self.model)
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -3473,7 +3571,9 @@ class Scheduler:
         gathered_core = self._qwen4_text_gathered_pricing(vlm_embeds is None)
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is.
-            cache = existing_cache or make_prompt_cache(self.model)
+            cache = existing_cache or self._make_request_prompt_cache(
+                request.request_id
+            )
             # TurboQuant: a TQ cache here makes _merge_caches() build a
             # BatchTurboQuantKVCache (via the monkey-patched merge), so the
             # one decode token quantizes against TQ history. An empty fresh
@@ -3491,7 +3591,7 @@ class Scheduler:
         if existing_cache is not None:
             prompt_cache = existing_cache
         else:
-            prompt_cache = make_prompt_cache(self.model)
+            prompt_cache = self._make_request_prompt_cache(request.request_id)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
@@ -3686,7 +3786,7 @@ class Scheduler:
                     cache=prompt_cache,
                     **model_kwargs,
                 )
-                mx.eval([c.state for c in prompt_cache])
+                _eval_prompt_cache(prompt_cache)
                 input_arr = input_arr[:, n_to_process:]
                 if embeds_array is not None:
                     embeds_array = embeds_array[:, n_to_process:]
@@ -3910,6 +4010,7 @@ class Scheduler:
             with mx.stream(self._stream):
                 _materialize_cache_storage(prompt_cache)
 
+        self._store_native_prefix(request, prompt_cache)
         return prompt_cache, last_token
 
     # ------------------------------------------------------------------
@@ -5299,7 +5400,7 @@ class Scheduler:
         prompt_cache = (
             existing_cache
             if existing_cache is not None
-            else make_prompt_cache(self.model)
+            else self._make_request_prompt_cache(request.request_id)
         )
 
         block_size = self.config.paged_cache_block_size
@@ -5446,7 +5547,7 @@ class Scheduler:
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
             else:
                 self.model(chunk, cache=state.cache)
-            mx.eval([c.state for c in state.cache])
+            _eval_prompt_cache(state.cache)
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
         actual_gathered_core = gathered_core
@@ -5628,6 +5729,7 @@ class Scheduler:
         self, request: "Request", prompt_cache: list[Any] | None
     ) -> None:
         """Mirror external prefill's post-prefill cache epilogue."""
+        self._store_native_prefix(request, prompt_cache)
         if not prompt_cache or self._turboquant_kv_bits is None:
             return
         if not self._turboquant_eligible(prompt_cache):
@@ -5706,7 +5808,7 @@ class Scheduler:
                 all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[state.sampler],
                 logits_processors=[per_row_lps],
-                state_machines=[state.sm],
+                **_batch_generator_stop_options(state.sm),
             )
         if uids:
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
@@ -5861,8 +5963,8 @@ class Scheduler:
 
         self.prefilling = still_prefilling
 
-    def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
-        """Build a SequenceStateMachine for per-request stop tokens.
+    def _build_state_machine(self, request: "Request") -> Any:
+        """Build the mlx-lm stop matcher for one request.
 
         Combines base stop tokens (EOS, Harmony) with request-specific
         stop_token_ids and tokenized stop strings into a single state
@@ -5873,9 +5975,7 @@ class Scheduler:
         if request.sampling_params.stop_token_ids:
             stop_tokens_set.update(request.sampling_params.stop_token_ids)
 
-        transitions: dict[str, list] = {
-            "normal": [([t], None) for t in stop_tokens_set]
-        }
+        stop_sequences = [(int(token),) for token in stop_tokens_set]
         stop_sequence_strings: dict[tuple[int, ...], str] = {}
 
         # Tokenize stop strings into token sequences. mlx-lm's
@@ -5892,7 +5992,7 @@ class Scheduler:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
                 token_sequence = tuple(int(token) for token in seq)
-                transitions["normal"].append((list(token_sequence), None))
+                stop_sequences.append(token_sequence)
                 stop_sequence_strings[token_sequence] = stop_str
 
         # Response-side buffering is request-local so normal completion,
@@ -5901,9 +6001,13 @@ class Scheduler:
             strings=stop_sequence_strings
         )
 
-        if transitions["normal"]:
-            return SequenceStateMachine(transitions, initial="normal")
-        return SequenceStateMachine({}, initial="normal")
+        if _MLX_LM_USES_STOP_MATCHERS:
+            return SequenceStateMachine(stop_sequences)
+
+        transitions = {
+            "normal": [(list(sequence), None) for sequence in stop_sequences]
+        }
+        return SequenceStateMachine(transitions, initial="normal")
 
     def _buffer_stop_sequence_output(
         self,
@@ -5935,6 +6039,18 @@ class Scheduler:
             if output.finish_reason == "stop" and reported_match in state.strings
             else None
         )
+        if matched_sequence is None and output.finish_reason == "stop":
+            # mlx-lm >= 0.32 reports only the stop decision. Recover the
+            # concrete request stop sequence from the suffix already buffered
+            # by oMLX so stop strings remain absent from streamed output.
+            suffix_matches = [
+                sequence
+                for sequence in state.strings
+                if len(sequence) <= len(pending_tokens)
+                and pending_tokens[-len(sequence) :] == sequence
+            ]
+            if suffix_matches:
+                matched_sequence = max(suffix_matches, key=len)
         if matched_sequence is not None:
             terminal_output = output
             matched_outputs = []
@@ -7885,6 +8001,11 @@ class Scheduler:
         if not raw_cache:
             return [], None
 
+        from .native_paged_kv import persistent_cache_view
+
+        with mx.stream(getattr(self, "_stream", mx.default_stream(mx.gpu))):
+            raw_cache = persistent_cache_view(raw_cache)
+
         # Build ModelCacheConfig for type information.
         # Skip if raw_cache contains None entries (boundary snapshots with
         # sliceable layers replaced by None) — from_cache_list expects real
@@ -8027,12 +8148,15 @@ class Scheduler:
                     continue
 
                 if hasattr(layer_cache, "state"):
-                    if handler is not None and class_name in (
-                        "MiniMaxM3KVCache",
-                        "MiniMaxM3BatchKVCache",
-                        "QSAKVCache",
-                        "QSAQuantizedKVCache",
-                        "BatchQSAKVCache",
+                    if handler is not None and (
+                        CacheTypeRegistry.is_arrays_family(class_name)
+                        or class_name in (
+                            "MiniMaxM3KVCache",
+                            "MiniMaxM3BatchKVCache",
+                            "QSAKVCache",
+                            "QSAQuantizedKVCache",
+                            "BatchQSAKVCache",
+                        )
                     ):
                         state = handler.serialize_state(layer_cache)
                         meta = handler.serialize_meta_state(layer_cache)
@@ -8480,12 +8604,39 @@ class Scheduler:
         self._unreconstructible_cache_model = result
         return result
 
+    def _native_prefix_eligible(self, request: Request) -> bool:
+        return (
+            getattr(self, "native_paged_prefix_cache", None) is not None
+            and getattr(request, "vlm_inputs_embeds", None) is None
+            and not getattr(request, "vlm_extra_keys_for_cache", None)
+            and getattr(request, "specprefill_indices", None) is None
+        )
+
+    def _store_native_prefix(self, request: Request, prompt_cache) -> None:
+        if (
+            self._native_prefix_eligible(request)
+            and prompt_cache
+            and not getattr(request, "skip_cache_store", False)
+        ):
+            with mx.stream(self._stream):
+                self.native_paged_prefix_cache.store(
+                    request.prompt_token_ids[:-1], prompt_cache
+                )
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
 
-        # Check support before lookup, including partial prefix hits.
-        if (
+        # Check prefix cache for cached KV state
+        if self._native_prefix_eligible(request):
+            hit = self.native_paged_prefix_cache.acquire(
+                request.prompt_token_ids, request_id=request.request_id,
+                max_tokens=request.sampling_params.max_tokens,
+            )
+            request.prompt_cache = hit.caches
+            request.cached_tokens = hit.matched_tokens
+            request.remaining_tokens = list(hit.remaining_tokens)
+        elif (
             self.block_aware_cache is not None
             and not self._model_has_unreconstructible_cache()
         ):
@@ -8638,6 +8789,32 @@ class Scheduler:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 
+        manager = getattr(self, "native_paged_kv_manager", None)
+        if (
+            manager is not None
+            and request.prompt_cache
+            and self.block_aware_cache is not None
+        ):
+            from mlx_lm.models.paged_cache import PageAllocationError
+
+            from .native_paged_kv import restore_native_cache
+
+            try:
+                request.prompt_cache = restore_native_cache(
+                    manager, request.prompt_cache, sequence_id=request.request_id
+                )
+            except (PageAllocationError, ValueError) as exc:
+                # A failed import releases its partial pages and falls back to admission.
+                logger.warning(
+                    "Native prefix restore skipped for %s: %s", request.request_id, exc
+                )
+                self.paged_cache_manager.delete_block_table(request.request_id)
+                request.prompt_cache = None
+                request.block_table = None
+                request.cached_tokens = 0
+                request.shared_prefix_blocks = 0
+                request.remaining_tokens = request.prompt_token_ids
+
         # Lightning-MTP has a small prompt-history cache separate from the
         # backbone KV restored above.  Bind an exact full-block sidecar (when
         # one exists) to this singleton timeline before any uncached suffix is
@@ -8714,7 +8891,7 @@ class Scheduler:
         # Keep the immediate preflight only when no prefix cache lookup can
         # change cached_tokens. With a block-aware cache, the in-stream
         # _preflight_memory_check runs after lookup with the final cache state.
-        if self.block_aware_cache is None:
+        if self.block_aware_cache is None and not self._native_prefix_eligible(request):
             request.remaining_tokens = request.prompt_token_ids
             try:
                 self.preflight_or_raise(
@@ -9015,7 +9192,7 @@ class Scheduler:
                     return_hidden=True,
                     return_shared_kv=True,
                 )
-                mx.eval([c.state for c in prefilled_cache])
+                _eval_prompt_cache(prefilled_cache)
         except Exception as e:
             logger.warning(
                 "vlm_mtp final-prefill forward failed (%s); falling back "
@@ -11119,7 +11296,7 @@ class Scheduler:
                     all_tokens=[_batch_generator_all_tokens(request)],
                     samplers=[sampler],
                     logits_processors=[per_row_lps],
-                    state_machines=[sm],
+                    **_batch_generator_stop_options(sm),
                 )
             if uids:
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
@@ -12636,6 +12813,14 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        if self.native_paged_kv_manager is not None:
+            native_stats = self.native_paged_kv_manager.stats()
+            stats["native_paged_kv"] = {
+                name: getattr(native_stats, name)
+                for name in native_stats.__dataclass_fields__
+            }
+        if self.native_paged_prefix_cache is not None:
+            stats["native_paged_prefix_cache"] = self.native_paged_prefix_cache.stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -12706,6 +12891,8 @@ class Scheduler:
         self._boundary_snapshot_required = None
 
         # Clear caches
+        if self.native_paged_prefix_cache is not None:
+            self.native_paged_prefix_cache.clear()
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
@@ -12764,6 +12951,8 @@ class Scheduler:
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
         self.block_aware_cache = None
+        self.native_paged_kv_manager = None
+        self.native_paged_prefix_cache = None
         self.memory_monitor = None
         self._boundary_snapshot_store = None
 

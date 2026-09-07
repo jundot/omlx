@@ -777,6 +777,20 @@ class ArraysCacheHandler(CacheTypeHandler):
         # we return an empty tuple to signal "no fixed schema".
         return ()
 
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        state = super().serialize_state(cache_obj)
+        if len(state) == 3 and isinstance(state[0], (list, tuple)):
+            # Boundary snapshots store flat tensors. Retain both batch metadata
+            # tensors after the recurrent slots, identified by meta_state.
+            return (*state[0], state[1], state[2])
+        return state
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        state = getattr(cache_obj, "state", ())
+        if len(state) == 3 and isinstance(state[0], (list, tuple)):
+            return ("omlx_arrays_v1", len(state[0]))
+        return super().serialize_meta_state(cache_obj)
+
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from ArraysCache object."""
         # Unwrap if wrapped in SizedArraysCache
@@ -851,9 +865,27 @@ class ArraysCacheHandler(CacheTypeHandler):
             return None
 
         states = state.get("states", [])
-        cache = ArraysCache(size=len(states))
-        for i, s in enumerate(states):
-            cache.cache[i] = s
+        if (
+            len(states) == 3
+            and states[0] is None
+            and all(getattr(value, "size", -1) == 0 for value in states[1:])
+        ):
+            logger.warning("Rejecting ArraysCache snapshot with missing recurrent state")
+            return None
+        # mlx-lm 0.32 stores (arrays, left_padding, lengths); older snapshots
+        # contain only the flat list of recurrent arrays.
+        if meta_state and meta_state[0] == "omlx_arrays_v1":
+            slots = int(meta_state[1])
+            if slots < 0 or len(states) != slots + 2:
+                raise ValueError("Invalid ArraysCache snapshot slot count")
+            cache = ArraysCache(size=slots)
+            cache.state = (list(states[:slots]), states[-2], states[-1])
+        elif len(states) == 3 and isinstance(states[0], (list, tuple)):
+            cache = ArraysCache(size=len(states[0]))
+            cache.state = (list(states[0]), states[1], states[2])
+        else:
+            cache = ArraysCache(size=len(states))
+            cache.cache = list(states)
 
         # Wrap with SizedArraysCache to provide correct size()
         return SizedArraysCache(cache, token_count)

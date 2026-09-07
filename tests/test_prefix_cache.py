@@ -3582,8 +3582,8 @@ class TestTurboQuantFormatMismatchRecovery:
         assert result is not None
         assert isinstance(result[0], SizedArraysCache)
         assert result[0].size() == 4
-        assert len(result[0].state) == 4
-        for expected, actual in zip(states, result[0].state):
+        assert len(result[0].cache) == 4
+        for expected, actual in zip(states, result[0].cache):
             assert mx.array_equal(expected, actual).item()
 
 

@@ -164,7 +164,7 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         assert hit_table.num_tokens == 12
         assert restored[0].state[0].shape[2] == 12
         assert restored[1].size() == 12
-        assert float(restored[1].state[0][0, 0, 0]) == pytest.approx(12.0)
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(12.0)
         latest_diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
         assert latest_diagnostic["chosen_endpoint_tokens"] == 12
         assert latest_diagnostic["walkback_blocks"] == 0
@@ -189,7 +189,7 @@ def test_split_store_restores_one_sidecar_and_walks_back(tmp_path):
         assert hit_table.num_tokens == 8
         assert restored[0].state[0].shape[2] == 8
         assert restored[1].size() == 8
-        assert float(restored[1].state[0][0, 0, 0]) == pytest.approx(8.0)
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(8.0)
         assert prefix._gdn_checkpoint_loads == 2
         assert prefix._gdn_checkpoint_walkbacks == 1
         walkback_diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
@@ -421,7 +421,7 @@ def test_split_dedup_recreates_evicted_sidecar(tmp_path):
         restored = prefix.reconstruct_cache(hit_table)
         assert restored is not None
         assert hit_table.num_tokens == 12
-        assert float(restored[1].state[0][0, 0, 0]) == 12.0
+        assert float(restored[1].cache[0][0, 0, 0]) == 12.0
         prefix.release_cache("dedup-restored")
     finally:
         boundary.shutdown()
@@ -507,7 +507,7 @@ def test_split_restore_walks_back_from_structurally_invalid_sidecar(tmp_path):
         assert hit_table.num_tokens == 8
         assert restored[0].state[0].shape[2] == 8
         assert restored[1].size() == 8
-        assert float(restored[1].state[0][0, 0, 0]) == 8.0
+        assert float(restored[1].cache[0][0, 0, 0]) == 8.0
         assert not ssd.has_gdn_checkpoint(hashes[-1], signature)
         diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
         assert diagnostic["chosen_endpoint_tokens"] == 8
@@ -796,7 +796,7 @@ def test_split_restore_retries_legacy_candidate_at_the_same_endpoint(tmp_path):
         # The endpoint is kept, not walked back.
         assert hit_table.num_tokens == 12
         assert restored[1].size() == 12
-        assert float(restored[1].state[0][0, 0, 0]) == pytest.approx(12.0)
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(12.0)
 
         diagnostic = prefix.get_stats_dict()["gdn_last_restore"]
         assert diagnostic["chosen_endpoint_tokens"] == 12
@@ -907,7 +907,7 @@ def test_split_restore_retry_budget_is_one_per_block(tmp_path):
         # No legacy candidate exists, so the newest block is attempted once and
         # the loop falls back to the previous boundary.
         assert hit_table.num_tokens == 8
-        assert float(restored[1].state[0][0, 0, 0]) == pytest.approx(8.0)
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(8.0)
         assert attempts.count(newest_path) == 1
         assert prefix._gdn_checkpoint_walkbacks == 1
         diagnostic = prefix.get_stats_dict()["gdn_last_restore"]

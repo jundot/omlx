@@ -727,9 +727,58 @@ class TestArraysCacheHandler:
         restored = handler.deserialize_state(elements)
 
         assert isinstance(restored, SizedArraysCache)
-        assert len(restored.state) == 4
-        for expected, actual in zip(elements, restored.state):
+        assert len(restored.cache) == 4
+        for expected, actual in zip(elements, restored.cache):
             assert mx.array_equal(expected, actual).item()
+
+    @pytest.mark.parametrize("with_metadata", [False, True])
+    def test_structured_state_survives_batch_shrink(self, handler, with_metadata):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        original = ArraysCache(2)
+        original[0] = mx.arange(24).reshape(3, 2, 4)
+        original[1] = mx.arange(18).reshape(3, 2, 3)
+        if with_metadata:
+            original.left_padding = mx.array([0, 2, 5])
+            original.lengths = mx.array([13, 9, 4])
+
+        restored = handler.reconstruct_cache(handler.extract_state(original), token_count=4096)
+        restored.filter([2, 0])
+
+        assert restored.size() == 4096
+        assert len(restored.cache) == 2
+        for actual, expected in zip(restored.cache, original.cache):
+            assert mx.array_equal(actual, expected[[2, 0]]).item()
+        for name in ("left_padding", "lengths"):
+            actual, expected = getattr(restored, name), getattr(original, name)
+            if expected is None:
+                assert actual is None
+            else:
+                assert mx.array_equal(actual, expected[[2, 0]]).item()
+
+    def test_flat_snapshot_retains_recurrent_slots_and_metadata(self, handler):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        original = ArraysCache(2)
+        original[0] = mx.arange(24).reshape(3, 2, 4)
+        original[1] = mx.arange(18).reshape(3, 2, 3)
+        original.left_padding = mx.array([0, 2, 5])
+        original.lengths = mx.array([13, 9, 4])
+        elements = handler.serialize_state(original)
+        assert all(isinstance(e, mx.array) for e in elements)
+        restored = handler.deserialize_state(elements, handler.serialize_meta_state(original))
+        restored.filter([1])
+        for actual, expected in zip(restored.cache, original.cache):
+            assert mx.array_equal(actual, expected[1:2]).item()
+        assert restored.left_padding.tolist() == [2]
+        assert restored.lengths.tolist() == [9]
+
+    def test_rejects_snapshot_with_lost_nested_state(self, handler):
+        import mlx.core as mx
+
+        assert handler.deserialize_state((None, mx.array([]), mx.array([]))) is None
 
     def test_state_keys(self, handler):
         """Test state keys."""
