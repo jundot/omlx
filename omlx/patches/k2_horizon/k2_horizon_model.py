@@ -356,6 +356,9 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dims, dims, bias=False)
 
     def __call__(self, x: mx.array, lora_mask=None) -> mx.array:
+        ane = getattr(self, "_omlx_ane_prefill", None)
+        if ane is not None and ane.active and lora_mask is None:
+            return ane(x)
         h = swiglu(
             _project(self.gate_proj, x, lora_mask), _project(self.up_proj, x, lora_mask)
         )
@@ -390,8 +393,17 @@ class SparseMoeBlock(nn.Module):
             self.scaling_factor,
             partitions=self.router_partitions,
         )
-        routed = self.experts(x, inds) * weights.astype(x.dtype)[..., None]
-        return routed.sum(axis=-2) + self.shared_experts(x)
+        ane = getattr(self.shared_experts, "_omlx_ane_prefill", None)
+        prepared = ane.prepare(x) if ane is not None and ane.active else None
+        routed = (self.experts(x, inds) * weights.astype(x.dtype)[..., None]).sum(
+            axis=-2
+        )
+        shared = (
+            self.shared_experts(x)
+            if prepared is None
+            else ane.finish(prepared, alongside=routed)
+        )
+        return routed + shared
 
 
 class DecoderLayer(nn.Module):

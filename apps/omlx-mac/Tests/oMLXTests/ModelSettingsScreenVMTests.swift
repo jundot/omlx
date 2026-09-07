@@ -222,6 +222,24 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
     }
 
+    func testMovaAneRecommendationUsesK2ProfileFields() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
+        let data = Data(#"{"tuning_id":"k2","model_id":"mova","status":"completed","phase":"completed","message":"Done","current":1,"total":1,"results":[],"recommendation":{"backend":"k2","enabled":true,"mlp_fraction":0.3333333333333333,"shared_fraction":1,"gdn_enabled":false,"processing_tps":100,"speedup_percent":4,"sequence_length":2048}}"#.utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.aneTuningStatus = try decoder.decode(ANETuningStatusResponse.self, from: data)
+        vm.applyANETuningRecommendation()
+        XCTAssertTrue(vm.isK2Base)
+        XCTAssertTrue(vm.k2AnePrefillEnabled)
+        XCTAssertFalse(vm.qwen35AnePrefillEnabled)
+        XCTAssertEqual(Double(vm.k2AnePrefillFraction), 1.0 / 3.0)
+        XCTAssertEqual(Double(vm.k2AnePrefillSharedFraction), 1)
+        XCTAssertTrue(vm.profileDirty)
+        let fields = vm.currentSettingsDict()
+        XCTAssertNotNil(fields[ProfileSettingsKey.k2AnePrefillEnabled])
+    }
+
     func testQwenAneCompatibilityUsesQwenConfigFamily() {
         let vm = ModelSettingsScreenVM()
         vm.model = makeModel(id: "qwen", configModelType: "qwen3_5_moe")

@@ -308,6 +308,10 @@ class ModelSettings:
     mtp_num_draft_tokens: Optional[int] = None
 
     uno_enabled: bool = False
+    k2_ane_prefill_enabled: bool = False
+    k2_ane_prefill_fraction: float = 1 / 3
+    k2_ane_prefill_shared_fraction: float = 1.0
+    k2_ane_prefill_sequence_length: int = 2048
     uno_adapter_model: str | None = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
@@ -342,6 +346,26 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        if self.k2_ane_prefill_enabled:
+            for name in (
+                "qwen35_ane_prefill_enabled",
+                "dflash_enabled",
+                "specprefill_enabled",
+                "mtp_enabled",
+                "vlm_mtp_enabled",
+            ):
+                if getattr(self, name, False):
+                    raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
+        if not 0 <= self.k2_ane_prefill_shared_fraction <= 1:
+            raise ValueError("K2 ANE shared fraction must be between zero and one.")
+        if not 0 < self.k2_ane_prefill_fraction <= 1:
+            raise ValueError("K2 ANE prefill fraction must be between zero and one.")
+        if (
+            type(self.k2_ane_prefill_sequence_length) is not int
+            or self.k2_ane_prefill_sequence_length < 32
+            or self.k2_ane_prefill_sequence_length % 32
+        ):
+            raise ValueError("K2 ANE prefill tile must be a positive multiple of 32.")
         if self.uno_enabled:
             if not self.uno_adapter_model:
                 raise ValueError("Enable Uno requires an adapter selection.")

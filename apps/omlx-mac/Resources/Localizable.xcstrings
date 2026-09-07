@@ -1,6 +1,91 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.experimental.k2_ane.label" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 ANE Prompt Processing"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обработка промпта K2 на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Takes effect after reload."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использует ANE для предзаполнения плотных MLP и общих экспертов. Внимание и декодирование остаются на GPU. Применяется после перезагрузки модели."
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.dense" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dense MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Плотные MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.shared" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Shared MLP on ANE"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общие MLP на ANE"
+          }
+        }
+      }
+    },
+    "settings.experimental.k2_ane.tuner.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Compare GPU and ANE prompt processing on this Mac. Use the result, then save the profile."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сравнить обработку промпта на GPU и ANE на этом Mac. Примените результат и сохраните профиль."
+          }
+        }
+      }
+    },
     "" : {
       "localizations" : {
         "ru" : {

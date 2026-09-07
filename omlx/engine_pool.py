@@ -380,6 +380,16 @@ class EnginePool:
             if adapter is None or adapter.config_model_type != "k2_horizon_uno":
                 raise ValueError("Select an available Uno adapter.")
             base = entry.estimated_size + adapter.estimated_size
+        if getattr(runtime_settings, "k2_ane_prefill_enabled", False):
+            from .patches.k2_horizon.ane_prefill import prefill_memory_reservation
+
+            config = json.loads((Path(entry.model_path) / "config.json").read_text())
+            extra += prefill_memory_reservation(
+                config,
+                fraction=runtime_settings.k2_ane_prefill_fraction,
+                shared_fraction=runtime_settings.k2_ane_prefill_shared_fraction,
+                width=runtime_settings.k2_ane_prefill_sequence_length,
+            )
         return base + extra
 
     def _qwen4_ple_offload_status(
@@ -767,6 +777,14 @@ class EnginePool:
         add("uno_enabled", bool(data.get("uno_enabled", False)))
         if data.get("uno_enabled"):
             add("uno_adapter_model", data.get("uno_adapter_model"))
+        add("k2_ane_prefill_enabled", bool(data.get("k2_ane_prefill_enabled", False)))
+        if data.get("k2_ane_prefill_enabled"):
+            for key, default in (
+                ("k2_ane_prefill_fraction", 1 / 3),
+                ("k2_ane_prefill_shared_fraction", 1.0),
+                ("k2_ane_prefill_sequence_length", 2048),
+            ):
+                add(key, data.get(key, default))
         return tuple(signature)
 
     @property

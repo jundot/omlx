@@ -1148,23 +1148,45 @@ private struct ExperimentalSection: View {
         // edits. Applying a profile persists the load-time settings and the
         // engine picks them up when it reloads.
         ListGroup {
-            if vm.isQwen35AnePrefillModel {
-                Row(label: String(localized: "settings.experimental.qwen_ane.label",
-                                  defaultValue: "Qwen ANE Prefill",
-                                  comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.sub",
-                                     defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
-                                     comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+            if vm.isQwen35AnePrefillModel || vm.isK2Base {
+                if vm.isK2Base {
+                    Row(label: String(localized: "settings.experimental.k2_ane.label", defaultValue: "K2 ANE Prompt Processing"),
+                        sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Takes effect after reload.")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.k2AnePrefillEnabled))
+                    }
+                    if vm.k2AnePrefillEnabled {
+                        Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label", defaultValue: "ANE Prompt Block")) {
+                            TextInput(text: vm.bindProfile($vm.k2AnePrefillSequenceLength), placeholder: "2048", mono: true,
+                                      isNumeric: true, range: 1024...262_144, step: 64, width: .controlCompact)
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.dense", defaultValue: "Dense MLP on ANE")) {
+                            TextInput(text: vm.bindProfile($vm.k2AnePrefillFraction), placeholder: "0.3333333333333333", mono: true,
+                                      isNumeric: true, range: 0.05...1, step: 0.01, width: .controlCompact)
+                        }
+                        Row(label: String(localized: "settings.experimental.k2_ane.shared", defaultValue: "Shared MLP on ANE")) {
+                            TextInput(text: vm.bindProfile($vm.k2AnePrefillSharedFraction), placeholder: "1", mono: true,
+                                      isNumeric: true, range: 0...1, step: 0.01, width: .controlCompact)
+                        }
+                    }
+                }
+                if vm.isQwen35AnePrefillModel {
+                    Row(label: String(localized: "settings.experimental.qwen_ane.label",
+                                      defaultValue: "Qwen ANE Prefill",
+                                      comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.sub",
+                                         defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
+                                         comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")) {
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
+                    }
                 }
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Compare GPU and ANE prompt processing on this Mac. Use the result, then save the profile.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
-                        if !vm.aneTuningIsRunning {
+                        if !vm.aneTuningIsRunning && !vm.isK2Base {
                             Menu("Tuner overrides") {
                                 Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
                                 Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
@@ -1273,7 +1295,7 @@ private struct ExperimentalSection: View {
                     }
                     .frame(minWidth: 285, alignment: .trailing)
                 }
-                if vm.qwen35AnePrefillEnabled {
+                if vm.qwen35AnePrefillEnabled && vm.isQwen35AnePrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label",
                                       defaultValue: "ANE Prompt Block",
                                       comment: "Row label for the fixed Qwen ANE prompt block size"),
@@ -1792,6 +1814,11 @@ private struct ExperimentalSection: View {
                 return "GPU-only recommended"
             }
             return String(format: "GPU-only recommended (%.1f tok/s)", tps)
+        }
+        if recommendation.backend == "k2" {
+            return String(format: "Dense %.0f%% · shared %.0f%% · %.1f tok/s",
+                          (recommendation.mlpFraction ?? 0) * 100,
+                          (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
         var parts = [

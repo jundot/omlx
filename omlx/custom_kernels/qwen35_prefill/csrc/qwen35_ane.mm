@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "mlx/allocator.h"
+#include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
@@ -1104,7 +1105,11 @@ public:
     ++submitted_;
     id<MTLCommandBuffer> buffer =
         (__bridge id<MTLCommandBuffer>)(static_cast<void *>(command_buffer));
-    [buffer encodeSignalEvent:event_ value:ready];
+    if (command_buffer) {
+      [buffer encodeSignalEvent:event_ value:ready];
+    } else {
+      [event_ setSignaledValue:ready];
+    }
     return {ready, done};
   }
 
@@ -1260,6 +1265,12 @@ MTL::Buffer *AneLinearModel::input_buffer() const {
 }
 MTL::Buffer *AneLinearModel::output_buffer() const {
   return reinterpret_cast<MTL::Buffer *>(impl_->output_buffer_);
+}
+void *AneLinearModel::input_host_data() const {
+  return IOSurfaceGetBaseAddress(impl_->input_surface_);
+}
+void *AneLinearModel::output_host_data() const {
+  return IOSurfaceGetBaseAddress(impl_->output_surface_);
 }
 AneLinearModel::Ticket
 AneLinearModel::begin(MTL::CommandBuffer *command_buffer) {
@@ -1596,6 +1607,104 @@ qwen35_ane_compile_fp16_linear(const array &weight, int sequence_length) {
       weight.data<float>(), static_cast<int>(weight.shape(0)),
       static_cast<int>(weight.shape(1)), sequence_length, true);
   return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
+}
+
+class K2AnePlanarPrimitive : public Primitive {
+public:
+  K2AnePlanarPrimitive(Stream stream, std::shared_ptr<AneLinearModel> model)
+      : Primitive(stream), model_(std::move(model)) {}
+
+  void eval_cpu(const std::vector<array> &inputs, std::vector<array> &outputs) override {
+    const auto x = inputs[0];
+    auto output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    outputs[0] = output;
+    cpu::get_command_encoder(stream()).dispatch([x, output, model = model_]() mutable {
+      const bool profiling = ane_profile_enabled();
+      const uint64_t start = profiling ? profile_now_ns() : 0;
+      if (profiling) profile_add(0, kOperations, 1);
+      auto *input = model->input_host_data();
+      auto *result = model->output_host_data();
+      if (!input || !result) throw std::runtime_error("ANE surfaces are not host accessible");
+      auto ticket = model->begin(nullptr);
+      std::memcpy(input, x.data<void>(), x.nbytes());
+      const uint64_t ready = profiling ? profile_now_ns() : 0;
+      try {
+        std::thread([model, ticket] { model->execute(ticket); }).detach();
+      } catch (...) {
+        model->cancel_ticket(ticket);
+        throw;
+      }
+      model->wait(ticket);
+      std::memcpy(output.data<void>(), result, output.nbytes());
+      if (profiling) {
+        profile_add(0, kPackNs, ready - start);
+        profile_add(0, kAne0EvalNs, profile_now_ns() - ready);
+      }
+    });
+  }
+
+  void eval_gpu(const std::vector<array> &, std::vector<array> &) override {
+    throw std::runtime_error("K2 planar transfer requires the CPU stream");
+  }
+  DEFINE_NAME(K2AnePlanarPrimitive);
+  bool is_equivalent(const Primitive &other) const override {
+    return model_ == static_cast<const K2AnePlanarPrimitive &>(other).model_;
+  }
+private:
+  std::shared_ptr<AneLinearModel> model_;
+};
+
+array ane_planar(const array &x, const std::shared_ptr<AneLinearModel> &model) {
+  if (!model || x.ndim() != 2 || x.dtype() != float16 || !row_contiguous(x) ||
+      x.shape(0) != model->input_dim() || x.shape(1) != model->sequence_length() ||
+      model->sequence_length() % 32) {
+    throw std::invalid_argument("ANE planar I/O requires contiguous FP16 [channels, tile] input");
+  }
+  if (model->has_error()) throw std::runtime_error("ANE program has a prior execution failure");
+  return array({model->output_dim(), model->sequence_length()}, float16,
+      std::make_shared<K2AnePlanarPrimitive>(to_stream(Device::cpu), model), {x});
+}
+
+std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
+    const std::string &mil_source, const array &weight_blob,
+    const std::vector<int> &input_dims, const std::vector<int> &output_dims,
+    int sequence_length) {
+  if (!qwen35_ane_available()) throw std::runtime_error("Private ANE runtime is unavailable.");
+  if (mil_source.empty() || weight_blob.dtype() != mlx::core::uint8 || weight_blob.ndim() != 1 ||
+      !row_contiguous(weight_blob) || weight_blob.size() < 128 ||
+      input_dims.empty() || input_dims.size() > 256 ||
+      input_dims.size() != output_dims.size() || sequence_length < 2 ||
+      sequence_length % 32 ||
+      std::any_of(input_dims.begin(), input_dims.end(), [](int n) { return n <= 0; }) ||
+      std::any_of(output_dims.begin(), output_dims.end(), [](int n) { return n <= 0; })) {
+    throw std::invalid_argument("Invalid generated ANE program bank.");
+  }
+  @autoreleasepool {
+    NSData *mil = [NSData dataWithBytes:mil_source.data() length:mil_source.size()];
+    NSData *blob = [NSData dataWithBytes:weight_blob.data<uint8_t>() length:weight_blob.size()];
+    NSDictionary *weights = @{@"@model_path/weights/weight.bin" : @{@"offset" : @0, @"data" : blob}};
+    Class descriptors = NSClassFromString(@"_ANEInMemoryModelDescriptor");
+    Class models = NSClassFromString(@"_ANEInMemoryModel");
+    id descriptor = ((id (*)(Class, SEL, id, id, id))objc_msgSend)(
+        descriptors, @selector(modelWithMILText:weights:optionsPlist:), mil, weights, nil);
+    id model = ((id (*)(Class, SEL, id))objc_msgSend)(
+        models, @selector(inMemoryModelWithDescriptor:), descriptor);
+    if (!model) throw std::runtime_error("Generated ANE bank creation failed.");
+    id identifier = ((id (*)(id, SEL))objc_msgSend)(model, @selector(hexStringIdentifier));
+    NSDictionary *options = ane_execution_options(0);
+    AneLoadResult loaded = load_or_compile_ane_model(
+        model, identifier, 0, options, mil, @{@"weight.bin" : blob},
+        @"K2 ANE bank", @"K2 ANE bank");
+    auto program = std::make_shared<SharedAneProgram>(model, loaded, options);
+    std::vector<std::shared_ptr<AneLinearModel>> result;
+    for (size_t index = 0; index < input_dims.size(); ++index) {
+      auto impl = std::make_unique<AneLinearModel::Impl>(
+          program, input_dims[index], output_dims[index], sequence_length, index);
+      result.emplace_back(new AneLinearModel(std::move(impl)));
+    }
+    return result;
+  }
 }
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(

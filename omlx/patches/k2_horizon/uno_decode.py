@@ -64,6 +64,7 @@ class UnoDecoder:
         top_k=None,
         seed=0,
         prefill_step_size=512,
+        prefill=None,
     ):
         if not getattr(model, "_uno_adapter_loaded", False):
             raise ValueError("Uno decoding requires a validated conditional adapter")
@@ -86,6 +87,7 @@ class UnoDecoder:
         if type(prefill_step_size) is not int or prefill_step_size <= 0:
             raise ValueError("Uno prefill_step_size must be a positive integer")
         self.prefill_step_size = prefill_step_size
+        self.prefill = model if prefill is None else prefill
 
     def _key(self):
         self.key, key = mx.random.split(self.key)
@@ -126,7 +128,7 @@ class UnoDecoder:
                 if cancelled is not None and cancelled():
                     return
                 end = min(len(prompt) - 1, start + self.prefill_step_size)
-                self.model(mx.array([prompt[start:end]]), cache=cache)
+                self.prefill(mx.array([prompt[start:end]]), cache=cache)
                 mx.eval([layer.state for layer in cache])
                 mx.synchronize()
                 mx.clear_cache()

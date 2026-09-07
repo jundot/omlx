@@ -29,6 +29,8 @@ public:
   int sequence_length() const;
   MTL::Buffer *input_buffer() const;
   MTL::Buffer *output_buffer() const;
+  void *input_host_data() const;
+  void *output_host_data() const;
 
   struct Ticket {
     uint64_t ready;
@@ -58,6 +60,9 @@ private:
   explicit AneLinearModel(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 
+  friend std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
+      const std::string &, const mlx::core::array &, const std::vector<int> &,
+      const std::vector<int> &, int);
   friend class AneLinearBankBuilder;
   friend class AneFusedBankBuilder;
   friend std::shared_ptr<AneLinearModel>
@@ -162,6 +167,13 @@ mlx::core::array qwen35_ane_cpu_fp16_affine_qmm_t(
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_fp16_linear(
     const mlx::core::array &weight, int sequence_length);
+
+mlx::core::array ane_planar(const mlx::core::array &x,
+    const std::shared_ptr<AneLinearModel> &model);
+std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
+    const std::string &mil, const mlx::core::array &weight_blob,
+    const std::vector<int> &input_dims, const std::vector<int> &output_dims,
+    int sequence_length);
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const mlx::core::array &gate_weight,

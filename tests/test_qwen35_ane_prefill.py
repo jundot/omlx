@@ -3113,10 +3113,9 @@ def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
     assert 'strcmp(value, "1") == 0' in gate.group()
 
 
-def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
-    """Individual linear, single fused SwiGLU/down, linear banks, and fused
-    banks use one content-hash cache/fallback implementation."""
-    assert ane_mm.count("load_or_compile_ane_model(") == 5
+def test_compile_cache_covers_all_five_native_compile_sites(ane_mm):
+    """Qwen and K2 compile sites share the content-hash cache."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 6
     assert ane_mm.count("model, identifier, ane_instance") == 4
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
 

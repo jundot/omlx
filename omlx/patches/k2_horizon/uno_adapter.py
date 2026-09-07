@@ -54,8 +54,8 @@ class ConditionalLoRALinear(nn.Module):
 def load_uno_adapter(model, path: str | Path, *, base_model_id: str) -> dict:
     path = Path(path)
     config = json.loads((path / "adapter_config.json").read_text())
-    if base_model_id not in ("IFM/K2-Horizon-0.9B", "IFM/K2-Horizon-7B"):
-        raise ValueError(f"No released K2 Uno adapter for {base_model_id}")
+    if not base_model_id.startswith("IFM/K2-Horizon-"):
+        raise ValueError(f"Uno requires an IFM K2 base: {base_model_id}")
     if config.get("base_model_name_or_path") != base_model_id:
         raise ValueError(
             "Uno adapter base_model_name_or_path does not match the selected base"

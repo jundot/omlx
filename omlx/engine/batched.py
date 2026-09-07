@@ -412,6 +412,19 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        if getattr(self._model_settings, "k2_ane_prefill_enabled", False):
+            from ..patches.k2_horizon.ane_prefill import enable_ane_prefill
+
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: enable_ane_prefill(
+                    self._model,
+                    fraction=self._model_settings.k2_ane_prefill_fraction,
+                    shared_fraction=self._model_settings.k2_ane_prefill_shared_fraction,
+                    width=self._model_settings.k2_ane_prefill_sequence_length,
+                ),
+            )
+
         ane_prefill_sequence_length = 0
         if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
             try:
@@ -578,6 +591,11 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        signature = getattr(self._model, "_omlx_k2_ane_signature", None)
+        if signature:
+            scheduler_config.model_name = (
+                (scheduler_config.model_name or self._model_name) + ":" + signature
+            )
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

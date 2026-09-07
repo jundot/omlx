@@ -272,6 +272,10 @@ class ModelSettingsRequest(BaseModel):
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     uno_enabled: bool | None = None
+    k2_ane_prefill_enabled: bool | None = None
+    k2_ane_prefill_fraction: float | None = None
+    k2_ane_prefill_shared_fraction: float | None = None
+    k2_ane_prefill_sequence_length: int | None = None
     uno_adapter_model: str | None = None
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -2915,6 +2919,8 @@ async def update_model_settings(
 
     if "uno_enabled" in sent:
         current_settings.uno_enabled = bool(request.uno_enabled)
+    if "k2_ane_prefill_enabled" in sent:
+        current_settings.k2_ane_prefill_enabled = bool(request.k2_ane_prefill_enabled)
     if "uno_adapter_model" in sent:
         current_settings.uno_adapter_model = request.uno_adapter_model or None
 
@@ -2928,6 +2934,26 @@ async def update_model_settings(
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
     _validate_k2_settings(entry, current_settings.to_dict())
+    for key, default in (
+        ("k2_ane_prefill_fraction", 1 / 3),
+        ("k2_ane_prefill_shared_fraction", 1.0),
+        ("k2_ane_prefill_sequence_length", 2048),
+    ):
+        if key in sent:
+            value = getattr(request, key)
+            setattr(current_settings, key, default if value is None else value)
+    if current_settings.k2_ane_prefill_enabled or any(
+        k.startswith("k2_ane_prefill_") for k in sent
+    ):
+        try:
+            current_settings.__post_init__()
+            if (
+                current_settings.k2_ane_prefill_enabled
+                and entry.config_model_type != "k2_horizon"
+            ):
+                raise ValueError("ANE prefill requires a K2 model.")
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     if current_settings.uno_enabled:
         from ..uno_bundle import resolve_uno_bundle
 
@@ -7027,7 +7053,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune the model’s ANE/GPU split without changing persisted settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -7087,6 +7113,7 @@ async def start_ane_tuning(
             detail=f"Model {tuning_request.model_id} is not a supported language model",
         )
 
+    tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
     run.task = asyncio.create_task(run_tuning(run, engine_pool))

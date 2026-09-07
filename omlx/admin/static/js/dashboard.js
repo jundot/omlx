@@ -66,6 +66,10 @@
         'dflash_verify_mode',
         'mtp_enabled',
         'uno_enabled',
+        'k2_ane_prefill_enabled',
+        'k2_ane_prefill_fraction',
+        'k2_ane_prefill_shared_fraction',
+        'k2_ane_prefill_sequence_length',
         'uno_adapter_model',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -7463,6 +7467,10 @@
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
+                    k2_ane_prefill_enabled: s.k2_ane_prefill_enabled || false,
+                    k2_ane_prefill_fraction: s.k2_ane_prefill_fraction ?? 1 / 3,
+                    k2_ane_prefill_shared_fraction: s.k2_ane_prefill_shared_fraction ?? 1,
+                    k2_ane_prefill_sequence_length: s.k2_ane_prefill_sequence_length ?? 2048,
                     uno_enabled: s.uno_enabled || false,
                     uno_adapter_model: s.uno_adapter_model || '',
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
@@ -7866,6 +7874,9 @@
                 if (!recommendation.enabled) {
                     return `GPU only${speedSuffix}`;
                 }
+                if (recommendation.backend === 'k2') {
+                    return `MLP ${Math.round(recommendation.mlp_fraction * 100)}% · shared ${Math.round(recommendation.shared_fraction * 100)}%${speedSuffix}`;
+                }
                 const parts = [
                     `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
                 ];
@@ -7947,7 +7958,7 @@
                         body: JSON.stringify({
                             model_id: modelId,
                             sequence_length: parseInt(
-                                this.modelSettings.qwen35_ane_prefill_sequence_length
+                                this.isK2Model() ? this.modelSettings.k2_ane_prefill_sequence_length : this.modelSettings.qwen35_ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
                             allow_cpu: this.aneTuningOverrides.allowCpu,
@@ -8083,6 +8094,15 @@
                     }
                 }
 
+                if (recommendation.backend === 'k2') {
+                    for (const key of Object.keys(patch)) delete patch[key];
+                    patch.k2_ane_prefill_enabled = !!recommendation.enabled;
+                    patch.k2_ane_prefill_sequence_length = Number(recommendation.sequence_length);
+                    if (recommendation.enabled) {
+                        patch.k2_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                        patch.k2_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
+                    }
+                }
                 this.aneTuning.applying = true;
                 this.aneTuning.error = '';
                 try {
@@ -8432,6 +8452,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                k2_ane_prefill_enabled: this.isK2Model() && !!this.modelSettings.k2_ane_prefill_enabled,
+                                k2_ane_prefill_fraction: Number(this.modelSettings.k2_ane_prefill_fraction),
+                                k2_ane_prefill_shared_fraction: Number(this.modelSettings.k2_ane_prefill_shared_fraction),
+                                k2_ane_prefill_sequence_length: Number(this.modelSettings.k2_ane_prefill_sequence_length),
                                 uno_enabled: !!this.modelSettings.uno_enabled,
                                 uno_adapter_model: this.modelSettings.uno_adapter_model || null,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,

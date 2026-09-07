@@ -131,6 +131,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         self._events = {}
         self._closing = False
         self._prefill_step = 512
+        self._prefill = None
         self._last_speculation = {}
 
     @property
@@ -158,6 +159,11 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         from ..cache.prefix_cache import BlockAwarePrefixCache
 
         name = config.model_name or self._model_name
+        signature = getattr(model, "_omlx_k2_ane_signature", None)
+        if signature:
+            name += ":" + signature
+        elif getattr(model, "_omlx_k2_compiled", False):
+            name += ":k2-compiled-v1"
         block_size = config.paged_cache_block_size
         paged = PagedCacheManager(
             block_size=block_size,
@@ -194,6 +200,26 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
             model, bundle.adapter_path, base_model_id=bundle.base_model_id
         )
         mx.eval(model.parameters())
+        ane_enabled = bool(getattr(self._settings, "k2_ane_prefill_enabled", False))
+        from ..patches.k2_horizon.compiled import (
+            can_compile_blocks,
+            install_compiled_blocks,
+        )
+
+        if can_compile_blocks(model):
+            install_compiled_blocks(model)
+            model._omlx_k2_compiled = True
+            self._prefill_step = 2048
+        if ane_enabled:
+            from ..patches.k2_horizon.ane_prefill import enable_ane_prefill
+
+            self._prefill_step = self._settings.k2_ane_prefill_sequence_length
+            self._prefill = enable_ane_prefill(
+                model,
+                fraction=self._settings.k2_ane_prefill_fraction,
+                shared_fraction=self._settings.k2_ane_prefill_shared_fraction,
+                width=self._prefill_step,
+            )
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
         set_model_info_from_model(monitor, model)
         guard = _UnoPrefillGuard(monitor, self._prefill_step)
@@ -210,9 +236,14 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
                 return
             bundle = resolve_uno_bundle(self._model_name, self._adapter_path)
 
-            result = await asyncio.get_running_loop().run_in_executor(
-                get_mlx_executor(), self._load_model, bundle
-            )
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    get_mlx_executor(), self._load_model, bundle
+                )
+            except Exception:
+                self._prefill = None
+                self._prefill_step = 512
+                raise
             (
                 self._model,
                 self._tokenizer,
@@ -235,6 +266,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
                 if self._prefix_cache is not None:
                     self._prefix_cache.paged_ssd_cache.close()
                     self._prefix_cache = None
+                self._prefill = None
                 self._model = self._executor_tokenizer = self._tokenizer = None
                 self._output_parser_factory = self._prefill_guard = None
                 gc.collect()
@@ -420,6 +452,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
                 else secrets.randbits(32)
             ),
             prefill_step_size=self._prefill_step,
+            prefill=self._prefill,
         )
         buffer = _StopBuffer(stops)
         text = ""

@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/vector.h>
 
@@ -127,6 +128,10 @@ NB_MODULE(_ext, m) {
       "weight"_a,
       "sequence_length"_a,
       nb::call_guard<nb::gil_scoped_release>());
+  m.def("ane_planar", &omlx::qwen35_prefill_kernels::ane_planar, "x"_a, "model"_a);
+  m.def("ane_compile_program_bank", &omlx::qwen35_prefill_kernels::ane_compile_program_bank,
+        "mil"_a, "weight_blob"_a, "input_dims"_a, "output_dims"_a,
+        "sequence_length"_a, nb::call_guard<nb::gil_scoped_release>());
   m.def(
       "qwen35_ane_compile_swiglu_down",
       &omlx::qwen35_prefill_kernels::qwen35_ane_compile_swiglu_down,

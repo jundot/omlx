@@ -10,6 +10,7 @@ Persisted model settings are never changed by a tuning run.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import statistics
 import time
@@ -17,7 +18,8 @@ import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator
 
@@ -42,6 +44,7 @@ _REFINE_SLOT = 5
 
 class ANETuningRequest(BaseModel):
     model_id: str
+    backend: Literal["qwen", "k2"] = "qwen"
     sequence_length: int = 2048
     repeats: int = 2
     allow_cpu: bool = True
@@ -80,6 +83,8 @@ class _Candidate:
     fused_down: bool = False
     cpu_threads: int | None = None
     stage: str = "verification"
+    backend: str = "qwen"
+    shared_fraction: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -256,6 +261,8 @@ def run_snapshot(run: ANETuningRun) -> dict[str, Any]:
 
 def _empty_result(candidate: _Candidate) -> dict[str, Any]:
     return {
+        "backend": candidate.backend,
+        "shared_fraction": candidate.shared_fraction,
         "label": candidate.label,
         "detail": None,
         "stage": candidate.stage,
@@ -417,6 +424,22 @@ async def _measure_result_slot(
 
 def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Candidate):
     settings = replace(base)
+    if candidate.backend == "k2":
+        settings.k2_ane_prefill_enabled = candidate.enabled
+        settings.k2_ane_prefill_sequence_length = request.sequence_length
+        settings.k2_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
+        settings.k2_ane_prefill_shared_fraction = candidate.shared_fraction
+        for field in (
+            "uno_enabled",
+            "qwen35_ane_prefill_enabled",
+            "dflash_enabled",
+            "specprefill_enabled",
+            "mtp_enabled",
+            "vlm_mtp_enabled",
+        ):
+            setattr(settings, field, False)
+        settings.__post_init__()
+        return settings
     settings.qwen35_ane_prefill_enabled = candidate.enabled
     settings.qwen35_ane_prefill_fused_down = bool(
         candidate.enabled and candidate.fused_down
@@ -535,6 +558,7 @@ def _ane_is_active(engine: Any) -> bool:
     return bool(
         getattr(model, "_omlx_ane_mlp_prefill_count", 0)
         or getattr(model, "_omlx_ane_gdn_prefill_count", 0)
+        or getattr(model, "_omlx_k2_ane_prefill_count", 0)
     )
 
 
@@ -552,7 +576,7 @@ async def _measure_candidate(
     )
     if candidate.enabled and not _ane_is_active(engine):
         raise RuntimeError(
-            "The ANE candidate loaded, but no eligible Qwen MLP/GDN layers were compiled"
+            "The ANE candidate loaded, but no eligible ANE layers were compiled"
         )
 
     tokenizer = engine.tokenizer
@@ -620,7 +644,7 @@ async def _measure_candidate(
                             else 0
                         ),
                     }
-                    if candidate.enabled
+                    if candidate.enabled and candidate.backend == "qwen"
                     else None
                 ),
             )
@@ -636,6 +660,13 @@ async def _measure_candidate(
     finally:
         if profile_enabled and fast is not None:
             fast.qwen35_ane_profile_set_enabled(False)
+
+    if candidate.backend == "k2" and candidate.enabled:
+        if (
+            not profile_enabled
+            or sum(group.get("operations", 0) for group in profile.values()) <= 0
+        ):
+            raise RuntimeError("K2 ANE candidate did not record native execution")
 
     observations = [
         _ane_execution_observed(
@@ -669,6 +700,8 @@ async def _measure_candidate(
         )
 
     return {
+        "backend": candidate.backend,
+        "shared_fraction": candidate.shared_fraction,
         "label": candidate.label,
         "enabled": candidate.enabled,
         "mlp_fraction": candidate.mlp_fraction,
@@ -1997,6 +2030,9 @@ def _calibrate_components_sync(
 
 
 async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    if run.request.backend == "k2":
+        await _run_k2_tuning(run, engine_pool)
+        return
     # The serve path skips ANE gracefully when the private runtime is
     # missing, but the tuner used to find out only deep inside the
     # bank-split ladder — failing the run and leaving the model unloaded
@@ -2306,3 +2342,97 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 await engine_pool._unload_engine(run.request.model_id)
         except Exception:
             logger.warning("Failed to unload model after ANE tuning", exc_info=True)
+
+
+def _k2_candidates(config: dict[str, Any]) -> list[_Candidate]:
+    dense_layers = set(config.get("mlp_only_layers", []))
+    sparse = [
+        bool(
+            config.get("num_experts", 0)
+            and i not in dense_layers
+            and (i + 1) % config.get("decoder_sparse_step", 1) == 0
+        )
+        for i in range(config["num_hidden_layers"] - 1)
+    ]
+    candidates = [_Candidate("GPU only", False, backend="k2")]
+    shares = (
+        [(1 / 3, 0), (1 / 3, 1 / 3), (1 / 3, 1), (0.5, 1)]
+        if any(sparse)
+        else [(1 / 3, 1), (0.5, 1)]
+    )
+    seen = set()
+    for dense, shared in shares:
+        if all(sparse) and shared == 0:
+            continue
+        key = (dense if not all(sparse) else 0, shared if any(sparse) else 0)
+        if key in seen:
+            continue
+        seen.add(key)
+        label = (
+            f"Dense {dense:.0%}, shared {shared:.0%}"
+            if any(sparse)
+            else f"Dense {dense:.0%}"
+        )
+        candidates.append(
+            _Candidate(label, True, dense, backend="k2", shared_fraction=shared)
+        )
+    return candidates
+
+
+async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
+    run.results = []
+    run.total = run.current = 0
+    previous = _pin_speed_priority(engine_pool)
+    try:
+        from ..custom_kernels.qwen35_prefill import fast
+
+        if not fast.qwen35_ane_available() or not hasattr(
+            fast._ext, "ane_compile_program_bank"
+        ):
+            raise RuntimeError("K2 tuning requires the native ANE extension")
+        manager = getattr(engine_pool, "_settings_manager", None)
+        if manager is None:
+            raise RuntimeError("Model settings are unavailable")
+        base = manager.get_settings(run.request.model_id)
+        entry = engine_pool.get_entry(run.request.model_id)
+        config = json.loads((Path(entry.model_path) / "config.json").read_text())
+        candidates = _k2_candidates(config)
+        run.results = [_empty_result(candidate) for candidate in candidates]
+        run.total = len(candidates)
+        for model_id in list(engine_pool.get_loaded_model_ids()):
+            await engine_pool._unload_engine(model_id)
+        for slot, candidate in enumerate(candidates):
+            await _measure_result_slot(run, slot, engine_pool, base, candidate)
+        baseline = run.results[0]
+        best = max(run.results, key=lambda row: row["processing_tps"])
+        if best["processing_tps"] < baseline["processing_tps"] * 1.03:
+            best = baseline
+        run.recommendation = {
+            key: best.get(key)
+            for key in (
+                "backend",
+                "enabled",
+                "mlp_fraction",
+                "shared_fraction",
+                "processing_tps",
+                "speedup_percent",
+            )
+        }
+        run.recommendation["sequence_length"] = run.request.sequence_length
+        run.recommendation["gdn_enabled"] = False
+        run.status = run.phase = "completed"
+        run.message = "Tuning complete"
+    except asyncio.CancelledError:
+        run.status = run.phase = "cancelled"
+        run.message = run.termination_reason = "Tuning cancelled"
+    except Exception as exc:
+        run.status = run.phase = "error"
+        run.error_message = run.termination_reason = _exception_reason(exc)
+        run.message = "K2 tuning stopped"
+    finally:
+        _restore_speed_priority(engine_pool, previous)
+        try:
+            if run.request.model_id in engine_pool.get_loaded_model_ids():
+                await engine_pool._unload_engine(run.request.model_id)
+        except Exception:
+            logger.warning("Failed to unload model after K2 tuning", exc_info=True)
