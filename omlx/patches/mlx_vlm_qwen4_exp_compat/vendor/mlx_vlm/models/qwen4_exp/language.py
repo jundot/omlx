@@ -7,6 +7,7 @@ import os
 import struct
 import weakref
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -1816,6 +1817,26 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+# SSD-backed PLE row lookups hit a ~40GB mmap'd table with ~16 scattered
+# rows per token. When a page is already resident the mmap gather is a pure
+# memcpy; when it is not, the access blocks ~100us on a synchronous page
+# fault (MADV_RANDOM is correct here: rows are random, so readahead mostly
+# fetches bytes nobody asked for). Only the cold phase needs help: a
+# per-reader seen-page bitmap remembers which pages this process already
+# pulled in, and the first time a page is needed the whole batch of missing
+# pages is pread() concurrently from a thread pool so the SSD controller's
+# parallelism overlaps the waits (~4096-row gather: ~12ms parallel vs ~400ms
+# serialized page faults measured on Apple Silicon). A fully-warm call pays
+# only a bitmap probe and keeps the original memcpy gather speed; a page the
+# OS evicted after we marked it seen falls back to a single minor fault,
+# which is the pre-existing steady-state cost. (mincore() would detect
+# eviction precisely but costs ~4.5ms per call over a shard-sized span,
+# dwarfing the gather it protects.) Threads (not asyncio/io_uring) because
+# os.pread releases the GIL for the syscall duration, which is enough here.
+_PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+_PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
 class _SafeTensorMMap:
     """Read selected dense or affine-packed rows without resident weights."""
 
@@ -1826,6 +1847,9 @@ class _SafeTensorMMap:
         self._header = json.loads(self._file.read(header_size))
         self._data_start = 8 + header_size
         self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        self._seen_pages = bytearray(
+            1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
+        )
         try:
             self._mapping.madvise(mmap.MADV_RANDOM)
         except (AttributeError, OSError):
@@ -1854,19 +1878,55 @@ class _SafeTensorMMap:
         np_dtype, item_size = dtype_info
         if len(shape) != 2 or end - start != math.prod(shape) * item_size:
             raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
-        view = np.ndarray(
-            shape,
-            dtype=np_dtype,
-            buffer=self._mapping,
-            offset=self._data_start + start,
-        )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        row_indices = np.asarray(rows, dtype=np.intp)
+        if row_indices.size == 0:
+            copied = np.empty((0, shape[1]), dtype=np_dtype)
+        else:
+            if row_indices.size > 8:
+                self._prefetch_missing_pages(
+                    row_indices,
+                    self._data_start + start,
+                    shape[1] * item_size,
+                )
+            view = np.ndarray(
+                shape,
+                dtype=np_dtype,
+                buffer=self._mapping,
+                offset=self._data_start + start,
+            )
+            copied = np.array(view[row_indices], copy=True)
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
+
+    def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes):
+        offsets = base_offset + row_indices * row_bytes
+        needed_pages = np.unique(
+            np.concatenate(
+                (offsets // _PLE_PAGE_SIZE, (offsets + row_bytes - 1) // _PLE_PAGE_SIZE)
+            )
+        )
+        seen = np.frombuffer(self._seen_pages, dtype=np.uint8)
+        fresh = needed_pages[seen[needed_pages] == 0]
+        if fresh.size == 0:
+            return
+        fd = self._file.fileno()
+
+        def touch(page: int) -> None:
+            offset = int(page) * _PLE_PAGE_SIZE
+            remaining = _PLE_PAGE_SIZE
+            while remaining > 0:
+                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        list(_PLE_IO_POOL.map(touch, (int(page) for page in fresh.tolist())))
+        for page in fresh.tolist():
+            self._seen_pages[page] = 1
 
     def close(self):
         if self._mapping is not None:

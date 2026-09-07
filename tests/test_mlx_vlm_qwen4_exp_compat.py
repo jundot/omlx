@@ -1257,6 +1257,68 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     embedding.close()
 
 
+def test_disk_backed_ple_page_prefetch_returns_identical_rows(tmp_path):
+    """mincore+pread cold prefetch must not perturb gathered bytes.
+
+    Regression guard for the cold-only prefetch path in _SafeTensorMMap:
+    166-byte rows over a multi-page span straddle page boundaries often,
+    so any page-math mistake surfaces as corrupted rows.
+    """
+    import numpy as np
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        _PLE_PAGE_SIZE,
+        DiskBackedShardedEmbedding,
+    )
+
+    prefix = (
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    )
+    rows, dims = 4096, 83
+    dense = (
+        mx.arange(rows * dims, dtype=mx.float32).reshape(rows, dims) / 3.0
+    ).astype(mx.bfloat16)
+    filename = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(
+        str(tmp_path / filename),
+        {f"{prefix}.shard_0.weight": dense},
+        metadata={"format": "mlx"},
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {f"{prefix}.shard_0.weight": filename}}),
+        encoding="utf-8",
+    )
+
+    embedding = DiskBackedShardedEmbedding(
+        tmp_path, prefix, num_embeddings=rows, dims=dims, num_shards=1
+    )
+    try:
+        reader = next(iter(embedding._readers.values()))
+        assert reader._seen_pages is not None
+        rng = np.random.default_rng(7)
+        idx = np.sort(rng.integers(0, rows, size=512))
+        values = embedding(mx.array(idx.reshape(1, -1), dtype=mx.int32))
+        expected = dense[mx.array(idx.tolist(), dtype=mx.int32)][None]
+        assert mx.array_equal(values, expected).item()
+        # Gathered pages are marked seen so warm repeats skip the pool.
+        start = reader._data_start + reader._header[
+            f"{prefix}.shard_0.weight"
+        ]["data_offsets"][0]
+        offs = start + idx * (dims * 2)
+        needed = np.unique(
+            np.concatenate(
+                (offs // _PLE_PAGE_SIZE, (offs + dims * 2 - 1) // _PLE_PAGE_SIZE)
+            )
+        )
+        assert all(reader._seen_pages[page] == 1 for page in needed.tolist())
+        # Fully-warm repeat call takes the bitmap-hit shortcut.
+        warm = embedding(mx.array(idx.reshape(1, -1), dtype=mx.int32))
+        assert mx.array_equal(warm, expected).item()
+    finally:
+        embedding.close()
+
+
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
