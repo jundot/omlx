@@ -182,6 +182,29 @@ def test_actual_native_matches_portable(
     close(native, portable, atol=6e-3 if dtype == mx.bfloat16 else 2e-3)
 
 
+@pytest.mark.parametrize("tokens", [24576, 24832, 32768])
+def test_native_long_uniform_attention_stays_finite(tokens):
+    if not affine4._m5_mpp_available():
+        pytest.skip("Signed-int4 attention requires M5")
+    heads, dim = 64, 32
+    cache = Affine4KVCache()
+    cache.key_codec = Affine4Codec(dim, 0)
+    cache.value_codec = Affine4Codec(dim, 1)
+    scales = mx.ones((1, heads, tokens))
+    keys = TurboQuantMSEState(
+        scales, mx.zeros((1, heads, tokens, dim // 8), mx.uint32)
+    )
+    values = TurboQuantMSEState(
+        scales, mx.full((1, heads, tokens, dim // 8), 0x88888888, mx.uint32)
+    )
+    queries = mx.zeros((1, heads, 1, dim), mx.bfloat16)
+    output = affine4._native_attention(cache, queries, keys, values, dim**-0.5, None)
+    assert output is not None
+    assert mx.all(mx.isfinite(output)).item()
+    expected = cache.value_codec._rotate_inverse(mx.full(queries.shape, -8.0))
+    close(output, expected.astype(queries.dtype), atol=0.02)
+
+
 def test_native_large_values():
     if not affine4._m5_mpp_available():
         pytest.skip("Signed-int4 attention requires M5")

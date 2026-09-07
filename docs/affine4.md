@@ -56,6 +56,15 @@ head dimensions use a randomized Hadamard transform; other dimensions use a
 deterministic orthogonal matrix. Signed nibbles are packed into `uint32` words.
 Each token/head vector has its own float32 scale. Keeping scales in float32
 preserves small and large finite values across portable and native execution.
+Native attention uses float16 value accumulation for bounded partitions and
+float32 for larger partitions. Value-scale normalization keeps the bound
+independent of input magnitude; softmax statistics and partition reduction
+remain float32.
+The [paired accumulator measurements](../benchmarks/results/affine4_decode_optimized.json)
+compare this path with the FP32 baseline and both earlier implementations.
+At 200K tokens, dense single-row attention fell from 2.90 to 1.78 ms and
+MoE single-row attention from 1.61 to 1.06 ms. The earlier VLM kernels measured
+1.58 and 0.99 ms respectively in the same run.
 For a head dimension of 256, a compressed K or V vector occupies 132 bytes,
 compared with 512 bytes in float16; the retained full-precision layers reduce
 the whole-model compression ratio.

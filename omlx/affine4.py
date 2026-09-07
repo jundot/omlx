@@ -264,7 +264,7 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 template <int Dim, int Repeats, int QueryLength, int PaddedRows, int Warps,
-          int NumKvHeads, typename ScalePtr>
+          int NumKvHeads, typename Accumulator, typename ScalePtr>
 METAL_FUNC void affine4_attention_impl(
     device uchar* keys,
     ScalePtr key_scales,
@@ -346,7 +346,7 @@ METAL_FUNC void affine4_attention_impl(
     auto v_first = v_tensor.template slice<OutDim, BK>(
         int(sg) * OutDim, tile_begin * BK);
     auto output_tile = av_op.template get_destination_cooperative_tensor<
-        decltype(p_tensor), decltype(v_first), float>();
+        decltype(p_tensor), decltype(v_first), Accumulator>();
     for (short i = 0; i < output_tile.get_capacity(); ++i)
         output_tile[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -520,7 +520,7 @@ _MPP_ATTENTION_SOURCE = r"""
     int value_scale_offset = batch * int(value_scales_strides[0]) +
         kv_head * int(value_scales_strides[1]);
     affine4_attention_impl<
-        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads>(
+        Dim, Repeats, QueryLength, PaddedRows, Warps, NumKvHeads, Accumulator>(
         (device uchar*)(keys + key_word_offset),
         key_scales + key_scale_offset,
         (device uchar*)(values + value_word_offset),
@@ -749,6 +749,10 @@ def _native_attention(
     valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
     blocks = _attention_blocks(tokens, kv_heads, dim)
+    partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
+    # Normalized probabilities are <= 1 and signed codes have magnitude <= 8.
+    # Limit half partials to 49,152, leaving headroom for accumulation rounding.
+    accumulator = mx.float16 if partition_tiles <= 96 else mx.float32
     params = mx.array(
         [tokens, blocks, _float_bits(float(scale)), int(causal)], dtype=mx.uint32
     )
@@ -756,7 +760,7 @@ def _native_attention(
     rotated = cache.key_codec.prepare_queries(grouped)
     rows = batch * query_heads * query_length
     geometry = (dim, repeats, query_length, padded_rows, warps, kv_heads)
-    signature = (*geometry, keys_state.norms.dtype)
+    signature = (*geometry, keys_state.norms.dtype, accumulator)
     if _NATIVE_LAUNCHABLE.get(signature) is False:
         return None
 
@@ -781,6 +785,7 @@ def _native_attention(
                 ("PaddedRows", padded_rows),
                 ("Warps", warps),
                 ("NumKvHeads", kv_heads),
+                ("Accumulator", accumulator),
             ],
             output_shapes=[
                 (rows, blocks, dim),
