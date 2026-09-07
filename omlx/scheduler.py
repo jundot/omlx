@@ -1005,7 +1005,10 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         return cache_obj.merge([cache_obj])
     if (
         _TQ_SINGLETON_CACHE_TYPE is not None
-        and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+        and (
+            type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
+            or type(cache_obj).__name__ == "Affine4KVCache"
+        )
     ):
         return cache_obj.merge([cache_obj])
     # Model-owned singletons (e.g. qwen4_exp QSAKVCache) declare their batch
@@ -1246,6 +1249,8 @@ _KNOWN_SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         # Both QSA handlers support block slicing, so their growing KV and
@@ -1260,6 +1265,8 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
     {
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
     }
 )
 
@@ -1874,6 +1881,7 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
+        self._turboquant_kv_scheme = "turboquant"
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
@@ -3360,7 +3368,10 @@ class Scheduler:
 
         if self._model_uses_mla():
             return False
-        if self._model_uses_attention_sinks():
+        if (
+            getattr(self, "_turboquant_kv_scheme", "turboquant") != "affine4"
+            and self._model_uses_attention_sinks()
+        ):
             return False
 
         def _ok(c: Any) -> bool:
@@ -3377,6 +3388,8 @@ class Scheduler:
                 "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
+                "Affine4KVCache",
+                "BatchAffine4KVCache",
             ):
                 return True
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
@@ -3415,7 +3428,11 @@ class Scheduler:
         last KVCache layer if turboquant_skip_last is set.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3429,13 +3446,13 @@ class Scheduler:
             if isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache(bits=bits)
+                prompt_cache[i] = cache_class(bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache(bits=bits))
+                        new_caches.append(cache_class(bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3443,7 +3460,7 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: {converted}/{len(prompt_cache)} "
+                f"{scheme}: {converted}/{len(prompt_cache)} "
                 f"cache layers set to {bits}-bit{skip_msg}"
             )
 
@@ -3457,7 +3474,11 @@ class Scheduler:
         quantized on the fly during prefill and corrupted hidden states.
         """
         from mlx_lm.models.cache import CacheList, KVCache
-        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        from .turboquant_kv import quantized_cache_class
+
+        scheme = getattr(self, "_turboquant_kv_scheme", "turboquant")
+        cache_class = quantized_cache_class(scheme)
 
         kv_indices = [
             i for i, c in enumerate(prompt_cache) if _is_turboquant_kv_family_cache(c)
@@ -3471,13 +3492,13 @@ class Scheduler:
             if isinstance(cache_obj, KVCache):
                 if i == last_kv_idx:
                     continue
-                prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
+                prompt_cache[i] = cache_class.from_cache(cache_obj, bits=bits)
                 converted += 1
             elif isinstance(cache_obj, CacheList):
                 new_caches = []
                 for c in cache_obj.caches:
                     if isinstance(c, KVCache):
-                        new_caches.append(TurboQuantKVCache.from_cache(c, bits=bits))
+                        new_caches.append(cache_class.from_cache(c, bits=bits))
                         converted += 1
                     else:
                         new_caches.append(c)
@@ -3485,7 +3506,7 @@ class Scheduler:
         if converted > 0:
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
-                f"TurboQuant: converted {converted}/{len(prompt_cache)} "
+                f"{scheme}: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
@@ -13379,7 +13400,11 @@ class Scheduler:
         last_kv_idx = kv_indices[-1] if skip_last else -1
         for idx in kv_indices:
             if idx != last_kv_idx and idx < len(layer_cache_types):
-                layer_cache_types[idx] = "TurboQuantKVCache"
+                layer_cache_types[idx] = (
+                    "Affine4KVCache"
+                    if getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
+                    else "TurboQuantKVCache"
+                )
 
         # The depth is keyed off the same eligibility gate the request path
         # uses, not the rewritten names: models whose convertible caches sit

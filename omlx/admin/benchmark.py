@@ -273,7 +273,12 @@ def _sample_window(run: "BenchmarkRun", window_start: float) -> Optional[dict]:
 def _detect_experimental_features(model_settings: Any) -> list[str]:
     """Return benchmark-skewing model features enabled in settings."""
     return [
-        spec.legacy
+        (
+            "affine4"
+            if spec.attr == "turboquant_kv_enabled"
+            and getattr(model_settings, "turboquant_kv_scheme", "turboquant") == "affine4"
+            else spec.legacy
+        )
         for spec in _FEATURE_FLAG_SPECS
         if getattr(model_settings, spec.attr, False)
     ]
@@ -302,6 +307,10 @@ def _derive_feature_flags(model_settings: Any) -> list[dict]:
         if not getattr(model_settings, spec.attr, False):
             continue
         key, label = spec.key, spec.label
+        if spec.attr == "turboquant_kv_enabled" and getattr(
+            model_settings, "turboquant_kv_scheme", "turboquant"
+        ) == "affine4":
+            key, label = "affine4_kv", "Affine4 KV"
         if spec.detail_attr:
             bits = _format_bits(getattr(model_settings, spec.detail_attr, None))
             if bits:
@@ -342,6 +351,7 @@ _UPLOADED_SETTING_FIELDS = (
     "model_type_override",
     "index_cache_freq",
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "specprefill_enabled",
@@ -427,6 +437,9 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
             for spec in _FEATURE_FLAG_SPECS
             if spec.attr in filtered
         }
+        for key in ("turboquant_kv_scheme", "turboquant_kv_bits"):
+            if key in raw:
+                filtered[key] = raw[key]
     return filtered
 
 

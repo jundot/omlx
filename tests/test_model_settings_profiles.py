@@ -15,6 +15,35 @@ def mgr(tmp_path):
 
 
 class TestProfilesCRUD:
+    def test_affine4_profile_save_load_and_apply(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        settings = {"turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 4}
+        manager.save_profile("m", "affine", "Affine4", None, settings)
+        manager = ModelSettingsManager(tmp_path)
+        assert manager.get_profile("m", "affine")["settings"] == settings
+        applied = manager.apply_profile("m", "affine")
+        assert applied.turboquant_kv_scheme == "affine4"
+        assert applied.turboquant_kv_bits == 4
+
+    def test_invalid_profile_update_preserves_saved_profile(self, mgr):
+        mgr.save_profile("m", "kv", "KV", None, {"turboquant_kv_scheme": "affine4"})
+        original = mgr.get_profile("m", "kv")
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.update_profile("m", "kv", settings={
+                "turboquant_kv_scheme": "affine4", "turboquant_kv_bits": 3,
+            })
+        assert mgr.get_profile("m", "kv") == original
+
+    def test_partial_profile_validates_against_base_settings(self, mgr):
+        mgr.save_profile("m", "bits", "Bits", None, {"turboquant_kv_bits": 3})
+        mgr.set_settings("m", ModelSettings(turboquant_kv_scheme="affine4"))
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.apply_profile("m", "bits")
+        assert mgr.get_settings("m").turboquant_kv_scheme == "affine4"
+        assert mgr.get_settings("m").turboquant_kv_bits == 4
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.save_profile("m", "bad", "Bad", None, {"turboquant_kv_bits": 3})
+
     def test_list_profiles_empty_by_default(self, mgr):
         assert mgr.list_profiles("model-a") == []
 

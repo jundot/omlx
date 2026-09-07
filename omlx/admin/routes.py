@@ -43,6 +43,7 @@ from ..model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
     merge_chat_template_kwargs,
+    validate_kv_compression_settings,
 )
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
@@ -244,8 +245,9 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
     mtp_num_draft_tokens: int | None = None
-    # TurboQuant KV cache (mlx-vlm backend)
+    # KV cache compression
     turboquant_kv_enabled: bool | None = None
+    turboquant_kv_scheme: str | None = None
     turboquant_kv_bits: float | None = None
     turboquant_skip_last: bool | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
@@ -684,6 +686,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["thinking_budget_enabled"] = False
     settings["guided_grammar_enabled"] = False
     settings["turboquant_kv_enabled"] = False
+    settings["turboquant_kv_scheme"] = "turboquant"
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
@@ -761,6 +764,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 
     settings.index_cache_freq = None
     settings.turboquant_kv_enabled = False
+    settings.turboquant_kv_scheme = "turboquant"
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
@@ -2456,6 +2460,32 @@ async def update_model_settings(
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
+    kv_scheme = current_settings.turboquant_kv_scheme
+    kv_bits = current_settings.turboquant_kv_bits
+    if "turboquant_kv_scheme" in sent:
+        kv_scheme = (
+            "turboquant" if request.turboquant_kv_scheme is None
+            else request.turboquant_kv_scheme
+        )
+    if "turboquant_kv_bits" in sent:
+        kv_bits = 4 if request.turboquant_kv_bits is None else request.turboquant_kv_bits
+    try:
+        validate_kv_compression_settings(kv_scheme, kv_bits)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    kv_enabled = (
+        bool(request.turboquant_kv_enabled) if "turboquant_kv_enabled" in sent
+        else current_settings.turboquant_kv_enabled
+    )
+    vlm_mtp_enabled = (
+        bool(request.vlm_mtp_enabled) if "vlm_mtp_enabled" in sent
+        else current_settings.vlm_mtp_enabled
+    )
+    if not _entry_is_diffusion_model(entry) and kv_enabled and vlm_mtp_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="vlm_mtp_enabled and KV cache compression cannot both be enabled.",
+        )
     prev_engine_type = entry.engine_type  # Track for requires_reload check
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
@@ -2603,11 +2633,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
-    # TurboQuant KV cache settings
+    # KV cache compression settings
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    current_settings.turboquant_kv_scheme = kv_scheme
+    current_settings.turboquant_kv_bits = kv_bits
     if "turboquant_skip_last" in sent:
         # null = clear to the model default (True); bool(None) would flip it
         # to False and silently disable the skip-last corruption guard.
@@ -3031,7 +3061,7 @@ async def update_model_settings(
                 ("dflash_enabled", "DFlash"),
                 ("specprefill_enabled", "SpecPrefill"),
                 ("mtp_enabled", "MTP"),
-                ("turboquant_kv_enabled", "TurboQuant KV"),
+                ("turboquant_kv_enabled", "KV cache compression"),
             ):
                 other_after = (
                     bool(getattr(request, other_field))

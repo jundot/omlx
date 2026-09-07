@@ -1,7 +1,11 @@
 """Regression tests for admin model-settings UI gates."""
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def _model_settings_template() -> str:
@@ -30,7 +34,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
 
     turboquant = _section(
         html,
-        "<!-- TurboQuant KV Cache -->",
+        "<!-- KV Cache Compression -->",
         "<!-- MoE Expert Offload -->",
     )
     lightning_mtp = _section(
@@ -52,6 +56,59 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
+
+
+def test_kv_compression_format_controls():
+    section = _section(
+        _model_settings_template(),
+        "<!-- KV Cache Compression -->",
+        "<!-- IndexCache (DSA models only) -->",
+    )
+    assert "t('modal.model_settings.kv_compression')" in section
+    assert 'x-model="modelSettings.turboquant_kv_scheme"' in section
+    assert '<option value="turboquant">' in section
+    assert '<option value="affine4">' in section
+    assert "if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4" in section
+    assert 'x-show="modelSettings.turboquant_kv_scheme === \'turboquant\'"' in section
+    assert 'x-model.number="modelSettings.turboquant_kv_bits"' in section
+    assert "modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled" in section
+
+
+def test_kv_compression_dashboard_state_and_profile_serialization():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+""" + _dashboard_script() + """
+const app = dashboard();
+const legacy = app.buildModelSettingsState({}, {turboquant_kv_enabled: true, turboquant_kv_bits: 2.5});
+assert.equal(legacy.turboquant_kv_scheme, 'turboquant');
+assert.equal(legacy.turboquant_kv_bits, 2.5);
+const settings = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine4', turboquant_kv_bits: 4};
+app.modelSettings = app.buildModelSettingsState({}, settings);
+app.profileFields = {universal: [], model_specific: ['turboquant_kv_enabled', 'turboquant_kv_scheme', 'turboquant_kv_bits']};
+assert.deepEqual(app.formValuesForProfile(), settings);
+for (const model of [{is_paroquant: true}, {config_model_type: 'diffusion_gemma'}]) {
+    const state = app.buildModelSettingsState(model, settings);
+    assert.equal(state.turboquant_kv_enabled, false);
+    assert.equal(state.turboquant_kv_scheme, 'turboquant');
+    assert.equal(state.turboquant_kv_bits, 4);
+}
+assert.equal(app.isDiffusionUnsupportedProfileField('turboquant_kv_scheme'), true);
+"""
+    result = subprocess.run([node], input=script, cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_kv_compression_scheme_is_saved_and_reset():
+    script = _dashboard_script()
+    assert "turboquant_kv_scheme: this.modelSettings.turboquant_kv_scheme" in script
+    assert "&& this.modelSettings.turboquant_kv_scheme !== 'affine4'" in script
+    assert "turboquant_kv_scheme: 'turboquant'" in script
+    assert "this.modelSettings.turboquant_kv_scheme = 'turboquant';" in script
 
 
 def test_apply_profile_surfaces_server_validation_error():
@@ -208,7 +265,7 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     section = _section(
         html,
         "<!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->",
-        "<!-- TurboQuant KV Cache -->",
+        "<!-- KV Cache Compression -->",
     )
 
     for field in (
