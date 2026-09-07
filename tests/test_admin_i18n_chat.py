@@ -42,7 +42,7 @@ def test_locale_loader_uses_english_fallback_for_missing_keys(tmp_path, monkeypa
     assert locale["chat.future_key"] == "English fallback"
 
 
-def test_kv_compression_english_copy_falls_back_in_other_locales():
+def test_kv_compression_copy_is_loaded_from_each_locale():
     keys = (
         "kv_compression", "kv_compression_hint", "kv_compression_format",
         "kv_compression_turboquant", "kv_compression_affine4",
@@ -50,10 +50,12 @@ def test_kv_compression_english_copy_falls_back_in_other_locales():
     )
     english = admin_routes._load_locale("en")
     for path in admin_routes._i18n_dir.glob("*.json"):
+        translations = json.loads(path.read_text(encoding="utf-8"))
         locale = admin_routes._load_locale(path.stem)
         for key in keys:
             full_key = f"modal.model_settings.{key}"
-            assert locale[full_key] == english[full_key]
+            assert translations[full_key].strip(), path.name
+            assert locale[full_key] == translations[full_key]
     hint = english["modal.model_settings.kv_compression_affine4_hint"]
     assert "M5" in hint and "automatically" in hint and "portable fallback" in hint
 
