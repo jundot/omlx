@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
 
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
@@ -374,6 +375,48 @@ class TestSetModelInfoTurboQuantDtype:
 
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         assert kwargs["dtype_size"] == 2
+
+    @pytest.mark.parametrize("dim", [63, 256])
+    @pytest.mark.parametrize("skip_last", [False, True])
+    def test_affine4_prefill_prices_packed_words_and_fp32_scales(self, dim, skip_last):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        from omlx.affine4 import Affine4KVCache
+
+        config = SimpleNamespace(
+            num_hidden_layers=64, num_key_value_heads=4,
+            num_attention_heads=24, head_dim=dim,
+        )
+        sched = self._make_sched_with_config(config)
+        sched.model.make_cache.return_value = [
+            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(64)
+        ]
+        sched._turboquant_kv_bits = 4.0
+        sched._turboquant_kv_scheme = "affine4"
+        sched._turboquant_skip_last = skip_last
+        sched.memory_monitor = MemoryMonitor(None, eviction_enabled=False)
+        sched._set_model_info_for_monitor()
+        native = KVCache()
+        native.update_and_fetch(
+            mx.ones((1, 4, 256, dim), mx.bfloat16),
+            mx.ones((1, 4, 256, dim), mx.bfloat16),
+        )
+        packed = Affine4KVCache.from_cache(native)
+        expected = (15 * packed.nbytes + native.nbytes) if skip_last else 16 * packed.nbytes
+        assert sched.memory_monitor.estimate_prompt_kv_bytes(256) == expected
+        assert sched.memory_monitor.estimate_block_memory(256) == expected
+        # Even a tiny query needs one layer's full unpacked history.
+        workspace = sched.memory_monitor.estimate_chunk_transient_bytes(32, 200000)
+        assert workspace >= 2 * 4 * 200000 * dim * 4
+        assert workspace < 2 * 4 * 200000 * dim * 4 + 128 * 1024**2
+
+    def test_turboquant_cold_prefill_prices_native_residency(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched.memory_monitor = MemoryMonitor(None, eviction_enabled=False)
+        sched._set_model_info_for_monitor()
+        native = 200000 * 40 * 8 * 128 * 2 * 2
+        assert sched.memory_monitor.estimate_prompt_kv_bytes(200000) == native
+        assert sched.memory_monitor.estimate_block_memory(200000) < native / 3
 
     def test_turboquant_4bit_without_skip_last_uses_quantized_dtype(self):
         sched = self._make_sched_with_config(_PlainLMConfig())

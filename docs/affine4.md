@@ -55,6 +55,13 @@ Recurrent and sliding-window state retains its native representation. Unlike
 TurboQuant's cold-prefill policy, Affine4 quantization also affects prefill
 hidden states, so cache format and prefill chunk size can change generated text.
 
+Admission distinguishes storage size from prefill residency: TurboQuant cold
+prefill is priced at the model's native KV width, while Affine4 uses packed
+words plus four-byte vector scales and the retained native layers. Affine4
+also reserves one unpacked layer and bounded attention workspace, including
+when the prefill chunk is small. Memory-pressure resumes retain absolute
+context lengths even with prefix caching disabled.
+
 ## Storage and correctness
 
 Keys and values have independent deterministic orthogonal rotations. Power-of-two

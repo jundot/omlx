@@ -3622,7 +3622,7 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
         # in a restored RotatingKVCache (e.g. shared layer_meta_states from
@@ -5433,7 +5433,7 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         if (
             boundary_enabled
             and hasattr(request, "cached_tokens")
@@ -13217,6 +13217,8 @@ class Scheduler:
                 except Exception:
                     pass
 
+            affine4_prefill = False
+            prefill_kv_dtype_size = base_dtype_size
             if (
                 self._turboquant_kv_bits is not None
                 and isinstance(head_dim, int)
@@ -13232,7 +13234,14 @@ class Scheduler:
                     )
                 )
             ):
-                tq_dtype_size = float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                affine4_prefill = (
+                    getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
+                )
+                tq_dtype_size = (
+                    (((head_dim + 7) // 8) * 4 + 4) / head_dim
+                    if affine4_prefill
+                    else float(self._turboquant_kv_bits) / 8.0 + (2.0 / head_dim)
+                )
                 if (
                     self._turboquant_skip_last
                     and not isinstance(actual_kv_cache_layers, bool)
@@ -13243,6 +13252,8 @@ class Scheduler:
                     ) / actual_kv_cache_layers
                 else:
                     dtype_size = tq_dtype_size
+                if affine4_prefill:
+                    prefill_kv_dtype_size = dtype_size
 
             kv_bytes_per_token = None
             if estimate_qwen4_exp_kv_bytes_per_token is not None:
@@ -13286,6 +13297,8 @@ class Scheduler:
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype_size=dtype_size,
+                    prefill_kv_dtype_size=prefill_kv_dtype_size,
+                    affine4_prefill=affine4_prefill,
                     num_attention_heads=num_attention_heads,
                     num_kv_cache_layers=num_kv_cache_layers,
                     # SDPA scores are materialized at the compute/activation
