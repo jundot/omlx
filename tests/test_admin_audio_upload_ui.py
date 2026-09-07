@@ -1,5 +1,6 @@
-import json
 from pathlib import Path
+
+from omlx.admin import routes as admin_routes
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_TEMPLATE = ROOT / "omlx/admin/templates/dashboard/_settings.html"
@@ -39,6 +40,6 @@ def test_audio_upload_i18n_keys_exist_in_every_locale():
     i18n_dir = ROOT / "omlx/admin/i18n"
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
-        missing_keys = AUDIO_UPLOAD_I18N_KEYS - translations.keys()
+        locale = admin_routes._load_locale(locale_path.stem)
+        missing_keys = AUDIO_UPLOAD_I18N_KEYS - locale.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
