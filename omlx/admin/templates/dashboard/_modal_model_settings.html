@@ -1031,7 +1031,7 @@
                                             <input type="checkbox" x-model="modelSettings.k2_ane_prefill_enabled" class="rounded border-neutral-300">
                                         </label>
                                         <p class="text-xs text-neutral-500">{{ t('modal.model_settings.k2_ane_hint') }}</p>
-                                        <div x-show="modelSettings.k2_ane_prefill_enabled" class="grid grid-cols-3 gap-3">
+                                        <div x-show="modelSettings.k2_ane_prefill_enabled" class="grid grid-cols-1 gap-3">
                                             <label class="text-xs text-neutral-600">{{ t('modal.model_settings.qwen_ane_prompt_block') }}
                                                 <input type="number" x-model.number="modelSettings.k2_ane_prefill_sequence_length" min="1024" step="64" class="w-full p-2 border rounded-lg">
                                             </label>
