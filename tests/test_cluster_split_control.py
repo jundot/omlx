@@ -33,7 +33,7 @@ def _model(total_gib=225, layers=60, kv_per_layer=2048):
         layer_weight_bytes=tuple(
             base + (1 if index < remainder else 0) for index in range(layers)
         ),
-        kv_bytes_per_token_per_layer=kv_per_layer,
+        kv_bytes_per_token_by_layer=(kv_per_layer,) * layers,
         supports_pipeline=True,
     )
 

@@ -672,7 +672,7 @@ def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch
             source=str(path),
             fixed_weight_bytes=gib,
             layer_weight_bytes=(gib,) * 8,
-            kv_bytes_per_token_per_layer=64 * 1024,
+            kv_bytes_per_token_by_layer=(64 * 1024,) * 8,
             supports_pipeline=True,
         ),
     )

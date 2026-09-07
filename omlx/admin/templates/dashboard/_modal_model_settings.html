@@ -338,6 +338,18 @@
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <!-- Largest context that actually fits in this Mac's memory,
+                                                 computed by the same planner the cluster picker uses.
+                                                 Hidden while unknown (fetch pending/failed, layout unreadable). -->
+                                            <button type="button" x-cloak
+                                                    x-show="Number(modelSettingsAutoContext?.max_context_tokens) > 0"
+                                                    @click="applyAutoContext()"
+                                                    :class="Number(modelSettings.max_context_window) === Number(modelSettingsAutoContext?.max_context_tokens)
+                                                        ? 'text-neutral-900 border-neutral-900'
+                                                        : 'text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
+                                                    class="mt-2 px-2.5 py-1 border rounded-lg text-xs font-medium transition-all"
+                                                    :title="'{{ t('modal.model_settings.auto_context_hint')|replace('\\', '\\\\')|replace("'", "\\'") }}'"
+                                                    x-text="'{{ t('modal.model_settings.auto_context')|replace('\\', '\\\\')|replace("'", "\\'") }} · ' + clusterTokens(modelSettingsAutoContext?.max_context_tokens) + ' {{ t('modal.model_settings.auto_context_tokens')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>

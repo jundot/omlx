@@ -287,11 +287,14 @@ def largest_context_that_fits(
     stages and per-node reserves, and would disagree with any shortcut here.
     """
 
-    if not layout.kv_bytes_per_token_per_layer:
+    if not any(layout.kv_bytes_per_token_by_layer):
         # Nothing is known about this model's KV growth — a synthetic layout
         # built from a download size, typically. Bisecting would return the
         # top of the ladder for every model, which is not an answer, it is a
-        # promise the cluster has no basis for. Say we do not know.
+        # promise the cluster has no basis for. Say we do not know. (A tuple
+        # that is all zero reads the same as empty here — deliberately, since
+        # this module has no test case distinguishing "no KV data at all"
+        # from "every layer happens to be constant-state.")
         return 0
 
     ladder = [
@@ -391,10 +394,10 @@ def assess_model(
             workload_profile=workload_profile,
         )
         warnings: list[str] = []
-        if not context and layout.kv_bytes_per_token_per_layer:
+        if not context and any(layout.kv_bytes_per_token_by_layer):
             # Weights fit at the smallest context but nothing above it.
             context = _MIN_CONTEXT_TOKENS
-        if not layout.kv_bytes_per_token_per_layer:
+        if not any(layout.kv_bytes_per_token_by_layer):
             warnings.append(
                 "Context length is unknown: this model was planned from its "
                 "size, not its config. Download it for an exact answer."
@@ -459,7 +462,7 @@ def assess_model(
                 ceiling_tokens=declared_context_tokens,
                 workload_profile=workload_profile,
             )
-            if not standalone_context and layout.kv_bytes_per_token_per_layer:
+            if not standalone_context and any(layout.kv_bytes_per_token_by_layer):
                 standalone_context = _MIN_CONTEXT_TOKENS
             break
 

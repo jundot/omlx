@@ -1513,7 +1513,7 @@ def test_a_planned_workstation_reaches_the_rank_as_a_workstation(tmp_path):
         source="test",
         fixed_weight_bytes=1 * GIB,
         layer_weight_bytes=(1536 * 1024 * 1024,) * 40,
-        kv_bytes_per_token_per_layer=16 * 1024,
+        kv_bytes_per_token_by_layer=(16 * 1024,) * 40,
     )
     plan = plan_unequal_pipeline(
         model,

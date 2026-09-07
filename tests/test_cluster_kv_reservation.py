@@ -29,7 +29,7 @@ def _model(layers=32, layer_gib=2, kv_per_token_per_layer=0, heads=48,
         layer_weight_bytes=(layer_gib * GIB,) * layers,
         tensor_parallel_heads=heads,
         supports_tensor_parallel=True,
-        kv_bytes_per_token_per_layer=kv_per_token_per_layer,
+        kv_bytes_per_token_by_layer=(kv_per_token_per_layer,) * layers,
         kv_replicated_across_tp=kv_replicated,
     )
 
@@ -207,7 +207,7 @@ def test_performance_rebalancing_never_moves_kv_beyond_a_nodes_memory():
         source="test",
         fixed_weight_bytes=0,
         layer_weight_bytes=(10,) * 8,
-        kv_bytes_per_token_per_layer=10,
+        kv_bytes_per_token_by_layer=(10,) * 8,
     )
     plan = plan_unequal_pipeline(
         model,
@@ -287,7 +287,7 @@ def test_a_replicated_cache_that_only_fits_divided_is_refused():
             tensor_parallel_heads=64,
             supports_tensor_parallel=True,
             # 16 GiB whole-model cache at 8192 tokens.
-            kv_bytes_per_token_per_layer=64 * 1024,
+            kv_bytes_per_token_by_layer=(64 * 1024,) * 32,
             kv_replicated_across_tp=replicated,
         )
 
