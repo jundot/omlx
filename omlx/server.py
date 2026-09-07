@@ -2119,12 +2119,12 @@ _KEEPALIVE_COMPLETION_CHUNK = (
 )
 
 
-def _completion_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id."""
+def _completion_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive frame that shares the stream's completion and model identity."""
     return (
         'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
-        '"model":"keepalive",'
-        '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
+        + '"model":' + json.dumps(model) + ','
+        + '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
@@ -2156,8 +2156,8 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     return None
 
 
-def _chat_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id.
+def _chat_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive frame that shares the stream's completion and model identity.
 
     The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
     (``chatcmpl-keepalive``) that differs from the real completion chunks.
@@ -2175,8 +2175,8 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
-        '"created":0,"model":"keepalive",'
-        '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+        + '"created":0,"model":' + json.dumps(model) + ','
+        + '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
         '"finish_reason":null}]}\n\n'
     )
 
@@ -2839,7 +2839,7 @@ async def _create_markitdown_chat_completion(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
-            keepalive = _chat_keepalive_chunk(response_id)
+            keepalive = _chat_keepalive_chunk(response_id, request.model)
         markdown_chunks = stream_messages_to_markdown_async(
             request.messages,
             global_settings=_server_state.global_settings,
@@ -3373,7 +3373,7 @@ async def create_completion(
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_completion")
             if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
-                keepalive = _completion_keepalive_chunk(response_id)
+                keepalive = _completion_keepalive_chunk(response_id, request.model)
             return StreamingResponse(
                 _release_after_stream(
                     _with_sse_keepalive(
@@ -3910,7 +3910,7 @@ async def create_chat_completion(
             response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
+                keepalive = _chat_keepalive_chunk(response_id, request.model)
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
