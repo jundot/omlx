@@ -824,7 +824,14 @@ _nax_available_cache: bool | None = None
 _stock_nax_cache: bool | None = None
 _qmm_nax_cache: bool | None = None
 
-QMM_NAX_VARIANT = int(os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0"))
+# Explicit tile override. When unset, the first NAX qmm dispatch runs a short
+# on-device autotune over the candidate tiles and caches the fastest for this
+# chip (see _resolve_qmm_nax_variant).
+_QMM_NAX_VARIANT_OVERRIDE = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT")
+QMM_NAX_VARIANT = (
+    int(_QMM_NAX_VARIANT_OVERRIDE) if _QMM_NAX_VARIANT_OVERRIDE is not None else 0
+)
+_qmm_nax_variant_resolved: int | None = None
 
 
 def _nax_available_fallback(
@@ -934,17 +941,86 @@ def _qmm_use_nax() -> bool:
                 and bool(_ext.nax_qmm_kernels_built())
             )
         if _qmm_nax_cache:
-            logger.info(
-                "Qwen qmm NAX dispatch enabled (nax_variant=%d)",
-                QMM_NAX_VARIANT,
-            )
+            logger.info("Qwen qmm NAX dispatch enabled")
     return _qmm_nax_cache
+
+
+def _autotune_qmm_nax_variant() -> int:
+    """Measure the candidate NAX tiles on this chip and return the fastest.
+
+    Runs once, on the first NAX qmm dispatch, on a prefill-sized GEMM. The
+    optimum tile varies with the tensor-unit count, so it is probed on device
+    rather than assumed. Returns the MLX-shipped tile (0) on any failure.
+    """
+    import time
+
+    if _ext is None or not hasattr(_ext, "qwen35_q4_affine_qmm_t"):
+        return 0
+    m, k, n = 2048, 5120, 17408
+    # Probe the viable tile variants and keep the fastest on this chip rather
+    # than assuming one fits all M5 tiers. (bm=32 / bk=32 tiles are skipped:
+    # this kernel only runs at prefill M >= 2048, where they lose.) ~0.3s
+    # one-time cost on first NAX qmm dispatch.
+    candidates = (0, 2, 3, 5, 6)
+    try:
+        x = mx.random.uniform(shape=(m, k)).astype(mx.float16)
+        w = mx.random.uniform(shape=(n, k)).astype(mx.float16)
+        wq, scales, biases = mx.quantize(w, group_size=64, bits=4)
+        mx.eval(x, wq, scales, biases)
+    except Exception:
+        logger.debug("NAX qmm autotune setup failed; using tile 0", exc_info=True)
+        return 0
+    best_variant, best_time = 0, float("inf")
+    for variant in candidates:
+        def run(v=variant):
+            return _ext.qwen35_q4_affine_qmm_t(
+                x,
+                wq,
+                scales,
+                biases,
+                8,
+                use_nax=True,
+                nax_variant=v,
+                group_size=64,
+            )
+        try:
+            y = run()
+            mx.eval(y)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                y = run()
+                mx.eval(y)
+            dt = (time.perf_counter() - t0) / 3
+        except Exception:
+            logger.debug(
+                "NAX qmm autotune: tile %d failed", variant, exc_info=True
+            )
+            continue
+        if dt < best_time:
+            best_variant, best_time = variant, dt
+    return best_variant
+
+
+def _resolve_qmm_nax_variant() -> int:
+    """Return the NAX tile variant: explicit env override, else autotune once."""
+    global _qmm_nax_variant_resolved, QMM_NAX_VARIANT
+    if _QMM_NAX_VARIANT_OVERRIDE is not None:
+        return int(_QMM_NAX_VARIANT_OVERRIDE)
+    if _qmm_nax_variant_resolved is None:
+        _qmm_nax_variant_resolved = _autotune_qmm_nax_variant()
+        QMM_NAX_VARIANT = _qmm_nax_variant_resolved
+        logger.info(
+            "Qwen qmm NAX tile autotuned -> variant %d", _qmm_nax_variant_resolved
+        )
+    return _qmm_nax_variant_resolved
 
 
 def _qmm_nax_kwargs() -> dict[str, object]:
     if not _EXT_HAS_NAX:
         return {}
-    return {"use_nax": _qmm_use_nax(), "nax_variant": QMM_NAX_VARIANT}
+    if not _qmm_use_nax():
+        return {"use_nax": False, "nax_variant": 0}
+    return {"use_nax": True, "nax_variant": _resolve_qmm_nax_variant()}
 
 
 def is_native_available() -> bool:
