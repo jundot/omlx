@@ -985,6 +985,15 @@ def install() -> bool:
             try:
                 from . import prompt_priming as _pp
 
+                # Merge-time adoption: _ADOPT_QUEUE is only consumed inside
+                # _batched_next, which _eligible reaches only with the mode
+                # enabled AND at least two rows. Stashing (and dropping) the
+                # priming ctx in any other case strands it — with the mode
+                # disabled (the default) that cold-started the MTP head on
+                # every request (see omlx #3494).
+                uids = getattr(self, "uids", None)
+                if not (_enabled() and uids and len(uids) >= 2):
+                    return out
                 host_x = _mtp_host(self.model)
                 cand = _pp._find_ctx(host_x) if host_x else None
                 if (
