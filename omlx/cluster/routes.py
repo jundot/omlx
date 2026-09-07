@@ -50,7 +50,7 @@ from .discovery import (
     verify_pairing_token,
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
-from .guidance import explain
+from .guidance import explain, explain_code
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
@@ -97,6 +97,7 @@ from .staging import (
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
+    home_relative_model_path,
     plan_staging,
     remote_file_sizes,
     remote_model_dir,
@@ -1479,9 +1480,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
 
 
 class ClusterGuidanceRequest(BaseModel):
-    """A failure message the dashboard wants turned into next steps."""
+    """A failure message the dashboard wants turned into next steps.
+
+    ``code`` is the structured key (Guidance.code / readiness-ladder state
+    codes); when present it wins over message-regex matching.
+    """
 
     message: str = Field(default="", max_length=4096)
+    code: str | None = Field(default=None, max_length=128)
 
 
 @router.post("/guidance")
@@ -1493,7 +1499,7 @@ async def cluster_guidance(request: ClusterGuidanceRequest):
     already depend on, and an explanation is only ever needed after a failure.
     """
 
-    return explain(request.message).to_dict()
+    return explain_code(request.code, request.message).to_dict()
 
 
 class ClusterStageRequest(BaseModel):

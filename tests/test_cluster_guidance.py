@@ -122,3 +122,51 @@ def test_specific_rules_win_over_general_ones():
     assert "rejected" in explain("Permission denied (publickey).").title.lower()
     # 'not found on this peer' must not be swallowed by the version rule.
     assert "model" in explain("/models/llama was not found on this peer").title.lower()
+
+
+# ---------------------------------------------------------------------------
+# Structured codes (B3): regex and code lookups converge on the same copy.
+# ---------------------------------------------------------------------------
+
+
+def test_explain_code_returns_structured_copy():
+    from omlx.cluster.guidance import explain_code
+
+    guidance = explain_code("stale_link_address")
+
+    assert guidance.code == "stale_link_address"
+    assert "self-assigned" in guidance.title.lower() or "169.254" in guidance.explanation
+    assert any("Fabric Doctor" in step for step in guidance.steps)
+
+
+def test_explain_code_and_regex_land_on_the_same_object():
+    from omlx.cluster.guidance import explain_code
+
+    by_code = explain_code("stale_link_address")
+    by_message = explain(
+        "hostfile address 169.254.42.1 is self-assigned and unusable"
+    )
+
+    assert by_code is by_message
+
+
+def test_unknown_code_falls_back_through_the_regex_path():
+    from omlx.cluster.guidance import explain_code
+
+    guidance = explain_code(
+        "no_such_code", "Permission denied (publickey)."
+    )
+    assert "rejected" in guidance.title.lower()
+
+    # No code and no message still never returns None (explain's contract).
+    fallback = explain_code(None, None)
+    assert fallback.title and fallback.steps
+
+
+def test_every_rule_has_a_unique_code():
+    from omlx.cluster.guidance import _FALLBACK, _RULES
+
+    codes = [guidance.code for _pattern, guidance in _RULES]
+    assert all(codes), "a rule shipped without a code"
+    assert len(set(codes)) == len(codes), "duplicate guidance codes"
+    assert _FALLBACK.code == "unknown_failure"
