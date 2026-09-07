@@ -25,10 +25,14 @@ from omlx.cluster.liveness import (
 HOSTS = {0: ("test-mbp", "127.0.0.1"), 1: ("mac-studio", "Studio.local")}
 
 
-def _marker(state_dir, deployment, rank, *, age_seconds=0.0, phase="ready", pid=None):
+def _marker(
+    state_dir, deployment, rank, *, age_seconds=0.0, phase="ready", pid=None, metrics=None
+):
     stamp = datetime.now(UTC) - timedelta(seconds=age_seconds)
     payload = {"phase": phase, "updated_at": stamp.isoformat(), "rank": rank}
     payload["pid"] = os.getpid() if pid is None else pid
+    if metrics is not None:
+        payload["metrics"] = metrics
     (state_dir / f"{deployment}-rank-{rank}.json").write_text(json.dumps(payload))
 
 
@@ -132,6 +136,113 @@ def test_a_remote_rank_without_a_local_marker_is_not_called_stale(tmp_path):
     assert remote.seconds_since_heartbeat is None
     assert remote.stale is False
     assert remote.healthy is True
+
+
+def test_a_successful_marker_read_skips_the_separate_probe(tmp_path):
+    """C3: a marker read already proves reachability -- don't pay for both."""
+
+    _marker(tmp_path, "d", 0, age_seconds=0)
+    _marker(tmp_path, "d", 1, age_seconds=0)
+
+    def explode(_target):
+        raise AssertionError("probe_peer must not run when the marker read succeeded")
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=explode, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+
+    assert all(h.reachable for h in health)
+    assert all(h.healthy for h in health)
+
+
+def test_a_failed_marker_read_falls_back_to_the_probe(tmp_path):
+    """A marker problem on an otherwise-reachable Mac must not read as a cable pull."""
+
+    probed = []
+
+    def probe(target):
+        probed.append(target)
+        return True
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=probe, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "not found"),
+    )
+
+    assert probed == ["Studio.local"], "the fallback probe must still run"
+    assert health[0].reachable is True
+    assert "no observable runtime heartbeat" in health[0].detail
+
+
+def test_a_failed_marker_read_and_a_failed_probe_is_still_a_cable_pull(tmp_path):
+    """Both signals failing must still report host-down, not a marker problem."""
+
+    health = check_peers(
+        {1: ("mac-studio", "Studio.local")},
+        state_dir=str(tmp_path), deployment_id="d",
+        probe=lambda _target: False, require_heartbeat=True,
+        remote_reader=lambda _target, _path: (None, None, None, "connection refused"),
+    )
+
+    assert health[0].reachable is False
+    assert "Studio.local did not answer" in health[0].detail
+
+
+# --- §A1 part 2 / 2.2: raw progress metrics carried through from the marker.
+
+
+def test_progress_metrics_are_read_from_the_marker(tmp_path):
+    _marker(tmp_path, "d", 0, metrics={"active_requests": 1, "progress_ticks": 5})
+    _marker(tmp_path, "d", 1, metrics={"active_requests": 2, "progress_ticks": 17})
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    by_rank = {h.rank: h for h in health}
+
+    assert by_rank[0].active_requests == 1
+    assert by_rank[0].progress_ticks == 5
+    assert by_rank[1].active_requests == 2
+    assert by_rank[1].progress_ticks == 17
+    # A bare check_peers() call has no cross-poll history to judge staleness
+    # from -- only a caller holding that history (PeerWatchdog) may set it.
+    assert by_rank[0].stalled is False
+    assert by_rank[1].stalled is False
+
+
+def test_a_marker_with_no_metrics_yet_defaults_sensibly(tmp_path):
+    """A rank that has never served a request (or an older marker format
+    from before this field existed) must not be misread as "0 progress,
+    something's wrong" -- progress_ticks stays None (unknown), not 0."""
+
+    _marker(tmp_path, "d", 0)
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    rank0 = next(h for h in health if h.rank == 0)
+
+    assert rank0.active_requests == 0
+    assert rank0.progress_ticks is None
+
+
+def test_malformed_progress_metrics_are_ignored_not_crashed_on(tmp_path):
+    _marker(
+        tmp_path,
+        "d",
+        0,
+        metrics={"active_requests": "two", "progress_ticks": None},
+    )
+
+    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
+                         probe=lambda t: True, require_heartbeat=True,
+                         remote_reader=_remote_reader(tmp_path))
+    rank0 = next(h for h in health if h.rank == 0)
+
+    assert rank0.active_requests == 0
+    assert rank0.progress_ticks is None
 
 
 def test_marker_age_survives_a_missing_or_broken_timestamp():
@@ -268,6 +379,307 @@ def test_a_healthy_cluster_keeps_the_watchdog_quiet(tmp_path):
             watchdog.stop()
 
     watchdog.run(sleep=fake_sleep)
+    assert losses == []
+
+
+# ---------------------------------------------------------------------------
+# §A1 part 2 / 2.2: cross-poll stall detection is observability, not control.
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _active(rank, ticks, *, node_id="peer", phase="ready"):
+    return PeerHealth(
+        node_id,
+        rank,
+        True,
+        1.0,
+        phase=phase,
+        heartbeat_required=True,
+        active_requests=1,
+        progress_ticks=ticks,
+    )
+
+
+def test_observe_marks_stalled_once_ticks_are_unchanged_past_the_threshold(tmp_path):
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    first = watchdog.observe((_active(1, 5),), now=0.0)
+    assert first[0].stalled is False
+
+    second = watchdog.observe((_active(1, 5),), now=0.5)
+    assert second[0].stalled is False, "not past the threshold yet"
+
+    third = watchdog.observe((_active(1, 5),), now=1.5)
+    assert third[0].stalled is True
+
+
+def test_observe_does_not_mark_stalled_while_ticks_advance(tmp_path):
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    for moment, ticks in ((0.0, 1), (2.0, 2), (4.0, 3), (6.0, 4)):
+        health = watchdog.observe((_active(1, ticks),), now=moment)
+        assert health[0].stalled is False
+
+
+def test_observe_never_flags_an_idle_rank_as_stalled(tmp_path):
+    """active_requests == 0 means there is nothing to make progress on --
+    unchanged ticks there is normal, not a wedge."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+    idle = PeerHealth(
+        "peer", 1, True, 1.0, heartbeat_required=True,
+        active_requests=0, progress_ticks=5,
+    )
+
+    watchdog.observe((idle,), now=0.0)
+    health = watchdog.observe((idle,), now=5.0)
+
+    assert health[0].stalled is False
+
+
+def test_observe_forgets_history_once_a_rank_goes_idle(tmp_path):
+    """Going idle then becoming active again must not inherit a stale
+    "last changed at" timestamp from a completely different request."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+    idle = PeerHealth(
+        "peer", 1, True, 1.0, heartbeat_required=True,
+        active_requests=0, progress_ticks=5,
+    )
+
+    watchdog.observe((_active(1, 5),), now=0.0)
+    watchdog.observe((idle,), now=100.0)  # goes idle; history should clear
+    health = watchdog.observe((_active(1, 5),), now=100.1)  # active again, same ticks
+
+    assert health[0].stalled is False, "fresh history, not 100s of fake staleness"
+
+
+def test_stalled_never_influences_healthy_or_status(tmp_path):
+    """Purely observational: run()'s failure-tolerance tracking must not
+    change behavior based on this signal."""
+
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0,
+    )
+
+    watchdog.observe((_active(1, 5),), now=0.0)
+    health = watchdog.observe((_active(1, 5),), now=5.0)
+
+    assert health[0].stalled is True
+    assert health[0].healthy is True
+    assert health[0].status == "healthy"
+
+
+def test_run_populates_last_health_with_the_observed_snapshot(tmp_path):
+    clock = _Clock()
+    watchdog = PeerWatchdog(
+        HOSTS, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0, clock=clock,
+    )
+    calls = [0]
+
+    def fake_run_once():
+        calls[0] += 1
+        return (_active(1, 5),)
+
+    watchdog.run_once = fake_run_once  # type: ignore[method-assign]
+
+    def fake_sleep(_seconds):
+        clock.value += 2.0
+        if calls[0] >= 3:
+            watchdog.stop()
+
+    watchdog.run(sleep=fake_sleep)
+
+    assert watchdog.last_health[0].rank == 1
+    assert watchdog.last_health[0].stalled is True, (
+        "unchanged ticks across every poll, well past the threshold"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §C1/2.3: SSH green, fabric down. Kill only combined with no progress.
+# ---------------------------------------------------------------------------
+
+
+_PEER_ONLY = {1: ("mac-studio", "Studio.local")}
+
+
+def _watchdog(tmp_path, clock, *, check_data_plane, failure_tolerance=2, on_lost=None):
+    return PeerWatchdog(
+        _PEER_ONLY,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        stalled_after=1.0,
+        clock=clock,
+        failure_tolerance=failure_tolerance,
+        peer_ips_by_rank={1: ("10.0.1.2",)},
+        check_data_plane=check_data_plane,
+        on_lost=on_lost,
+    )
+
+
+def _run_ticks(watchdog, clock, poll_count, *, stop_after=None):
+    calls = [0]
+
+    def fake_sleep(_seconds):
+        calls[0] += 1
+        clock.value += 2.0
+        if stop_after is not None and calls[0] >= stop_after:
+            watchdog.stop()
+        elif calls[0] > poll_count:
+            raise AssertionError("watchdog never settled")
+
+    watchdog.run(sleep=fake_sleep)
+
+
+def test_watchdog_kills_on_data_plane_down_while_stalled(tmp_path):
+    """The headline scenario: SSH green (every marker fresh), fabric down,
+    and no generation progress -- the C1 wedge, on any backend, by
+    construction."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric path to peer is down" in losses[0]
+    assert "SSH still answers" in losses[0]
+
+
+def test_watchdog_does_not_kill_while_progress_is_advancing(tmp_path):
+    """A failed ping alone -- ICMP dropped on a saturated link mid-
+    collective -- must not kill a cluster that is demonstrably still
+    working."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    ticks = [0]
+
+    def fake_run_once():
+        ticks[0] += 1
+        return (_active(1, ticks[0]),)  # progress_ticks advances every poll
+
+    watchdog.run_once = fake_run_once  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 5, stop_after=6)
+
+    assert losses == []
+
+
+def test_watchdog_kills_on_data_plane_down_while_still_loading(tmp_path):
+    """No progress signal exists before the deployment finishes loading --
+    the load-window exemption from the stalled gate, not a bypass of it."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = _watchdog(
+        tmp_path, clock, check_data_plane=lambda ip: (False, "did not answer"), on_lost=losses.append
+    )
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        _active(1, None, phase="loading"),
+    )
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric path to peer is down" in losses[0]
+
+
+def test_watchdog_tolerates_a_transient_data_plane_blip(tmp_path):
+    """Fewer than failure_tolerance consecutive failures must not kill --
+    and a later success resets the count, matching the SSH-side
+    _consecutive_failures pattern this mirrors."""
+
+    clock = _Clock()
+    losses = []
+    answers = iter(
+        [False, True, False, True, False, True, False, True, False, True]
+    )
+    watchdog = _watchdog(
+        tmp_path,
+        clock,
+        check_data_plane=lambda ip: (
+            next(answers, True),
+            "did not answer",
+        ),
+    )
+    watchdog._on_lost = losses.append
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 10, stop_after=11)
+
+    assert losses == []
+
+
+def test_watchdog_skips_the_data_plane_check_when_ssh_is_already_unhealthy(
+    tmp_path,
+):
+    clock = _Clock()
+    losses = []
+    checked = []
+    watchdog = _watchdog(
+        tmp_path,
+        clock,
+        check_data_plane=lambda ip: checked.append(ip) or (False, "unreachable"),
+        failure_tolerance=1,
+    )
+    watchdog._on_lost = losses.append
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        PeerHealth("peer", 1, False, None, heartbeat_required=True, detail="gone"),
+    )
+
+    _run_ticks(watchdog, clock, 5)
+
+    assert len(losses) == 1
+    assert "fabric" not in losses[0], "the SSH-side failure already explains it"
+    assert checked == []
+
+
+def test_watchdog_ignores_ranks_with_no_recorded_ips(tmp_path):
+    """peer_ips_by_rank is optional -- a rank missing from it (older
+    launcher argv, no hostfile IPs recorded) must not crash, just skip."""
+
+    clock = _Clock()
+    losses = []
+    watchdog = PeerWatchdog(
+        _PEER_ONLY, deployment_id="d", state_dir=str(tmp_path), interval=0.0,
+        stalled_after=1.0, clock=clock, failure_tolerance=1, on_lost=losses.append,
+    )
+    watchdog.run_once = lambda: (_active(1, 5),)  # type: ignore[method-assign]
+
+    _run_ticks(watchdog, clock, 3, stop_after=4)
+
     assert losses == []
 
 

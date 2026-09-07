@@ -5,13 +5,30 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
+from omlx.cluster.prefill_guard import is_lockstep_safe, mark_lockstep_safe
 from omlx.cluster.telemetry import (
     RuntimeTelemetry,
     _TelemetryQueue,
     install_server_telemetry,
 )
+
+
+class _FakeGroup:
+    """Stands in for ``mx.distributed`` -- just enough to report a size."""
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self.distributed = self
+
+    def init(self):
+        return self
+
+    def size(self):
+        return self._size
 
 
 class _Clock:
@@ -71,6 +88,34 @@ def test_telemetry_calculates_ttft_prefill_and_decode_rates():
     assert request["decode_tps"] == 0.5
     assert request["end_to_end_tps"] == 2 / 3
     assert marker.updates[-1][0] == "ready"
+
+
+def test_progress_ticks_advance_on_both_the_sequential_and_batched_paths():
+    """§A1 part 2 / 2.2: _batch_steps alone only advances on the batched
+    path -- a healthy sequential request would look permanently stalled to
+    a reader using it. progress_ticks must advance on both, so "unchanged
+    for N heartbeats" means the same thing regardless of which path a
+    request took."""
+
+    marker = _Marker()
+    telemetry = RuntimeTelemetry(marker, publish_interval=0)
+    request_id = telemetry.begin_request()
+
+    assert telemetry.snapshot()["progress_ticks"] == 0
+
+    telemetry.observe_token(request_id)  # sequential-path progress
+    assert telemetry.snapshot()["progress_ticks"] == 1
+
+    telemetry.observe_batch_step(
+        prompt_responses=1, generation_responses=1, elapsed_seconds=0.1
+    )  # batched-path progress
+    assert telemetry.snapshot()["progress_ticks"] == 2
+
+    telemetry.observe_token(request_id)
+    assert telemetry.snapshot()["progress_ticks"] == 3
+    # _batch_steps only reflects the one batched call, not the two tokens --
+    # confirms this is a genuinely separate counter, not a rename.
+    assert telemetry.snapshot()["pipeline"]["batch_steps"] == 1
 
 
 def test_telemetry_publishes_live_mlx_lm_prefill_progress():
@@ -193,6 +238,26 @@ def test_queue_observer_preserves_mlx_lm_queue_contract():
     assert snapshot["completion_tokens_total"] == 1
 
 
+def test_the_queue_routes_every_baseexception_item_through_fail_stop():
+    """§A1/2.1: _TelemetryQueue.put is the hook mlx_lm's own per-request
+    handlers funnel a caught exception through -- confirm it's wired to the
+    fail-stop check, not just to bookkeeping. fail_stop_if_unilateral's own
+    marking/world-size logic is covered directly above; this only checks
+    the item reaches it."""
+
+    marker = _Marker()
+    telemetry = RuntimeTelemetry(marker, publish_interval=0)
+    calls = []
+    telemetry.fail_stop_if_unilateral = calls.append
+    queue = _TelemetryQueue(_Queue(), telemetry)
+
+    exc = RuntimeError("generation thread died")
+    queue.put(exc)
+
+    assert calls == [exc]
+    assert telemetry.snapshot()["requests_failed"] == 1
+
+
 def test_telemetry_marker_failure_never_interrupts_inference():
     class BrokenMarker:
         def update(self, phase, **extra):
@@ -206,6 +271,80 @@ def test_telemetry_marker_failure_never_interrupts_inference():
     telemetry.finish_request(request_id)
 
     assert telemetry.snapshot()["requests_completed"] == 1
+
+
+# --- §A1/2.1: fail-stop on a unilateral generation failure. -----------------
+
+
+def test_fail_stop_fires_for_an_unmarked_exception_on_a_distributed_rank():
+    marker = _Marker()
+    exited = []
+    telemetry = RuntimeTelemetry(
+        marker, publish_interval=0, exit_process=exited.append
+    )
+
+    telemetry.fail_stop_if_unilateral(
+        RuntimeError("generation thread died unexpectedly"),
+        mx_module=_FakeGroup(2),
+    )
+
+    assert exited == [1]
+    assert marker.updates[-1][0] == "failed"
+    assert "RuntimeError" in marker.updates[-1][1]["error"]
+
+
+def test_fail_stop_does_not_fire_for_a_lockstep_safe_exception():
+    """The mark, not the type -- a TypeError that already went through
+    check_collective's vote must not fail-stop a still-synced rank."""
+
+    marker = _Marker()
+    exited = []
+    telemetry = RuntimeTelemetry(
+        marker, publish_interval=0, exit_process=exited.append
+    )
+    exc = mark_lockstep_safe(TypeError("already voted and left together"))
+
+    telemetry.fail_stop_if_unilateral(exc, mx_module=_FakeGroup(2))
+
+    assert exited == []
+    assert not any(phase == "failed" for phase, _extra in marker.updates)
+
+
+def test_fail_stop_does_not_fire_below_world_size_two():
+    """No peers, nothing to desync -- a caught exception here is just a
+    recoverable per-request failure, same as single-node."""
+
+    marker = _Marker()
+    exited = []
+    telemetry = RuntimeTelemetry(
+        marker, publish_interval=0, exit_process=exited.append
+    )
+
+    telemetry.fail_stop_if_unilateral(
+        RuntimeError("solo process, no cluster"), mx_module=_FakeGroup(1)
+    )
+
+    assert exited == []
+
+
+def test_fail_stop_writes_the_marker_before_exiting():
+    """Order matters: exit_process ends the process, so the marker write
+    must already be durable by the time it's called."""
+
+    marker = _Marker()
+    order = []
+    marker.update = lambda phase, **extra: order.append(("marker", phase))
+
+    def exit_process(code):
+        order.append(("exit", code))
+
+    telemetry = RuntimeTelemetry(
+        marker, publish_interval=0, exit_process=exit_process
+    )
+
+    telemetry.fail_stop_if_unilateral(RuntimeError("boom"), mx_module=_FakeGroup(2))
+
+    assert order == [("marker", "failed"), ("exit", 1)]
 
 
 def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
@@ -366,6 +505,106 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
 
     assert mlx_server.ResponseGenerator is FakeResponseGenerator
     assert mlx_server.BatchGenerator is FakeBatchGenerator
+
+
+def test_a_tokenize_failure_is_marked_lockstep_safe(monkeypatch):
+    """§A1 hole #1: a tokenization failure is deterministic across every
+    rank (same broadcast request, same tokenizer) -- without this mark,
+    2.1's fail-stop hook would kill the whole cluster over one malformed
+    request instead of just rejecting it."""
+
+    import mlx_lm.server as mlx_server
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = None
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            raise ValueError("malformed chat template args")
+
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    marker = _Marker()
+
+    with install_server_telemetry(marker):
+        generator = mlx_server.ResponseGenerator()
+        with pytest.raises(ValueError) as excinfo:
+            generator._tokenize(None, None, None)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_a_prefill_guard_rejection_from_tokenize_is_still_lockstep_safe(monkeypatch):
+    """The other _tokenize exit: super()._tokenize() succeeds, but
+    check_collective (already marked internally) rejects. The outer
+    try/except's bare re-raise must not strip the mark."""
+
+    import mlx_lm.server as mlx_server
+
+    class FakePromptCache:
+        def prefetch_nearest_cache(self, _model, tokens):
+            return "cache", tokens[2:]
+
+        def discard_prefetched_cache(self):
+            pass
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = FakePromptCache()
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            prompt = [1, 2, 3, 4]
+            return prompt, [prompt], ["assistant"], "normal"
+
+    class _Rejected(RuntimeError):
+        pass
+
+    def rejecting_check_collective(*_args, **_kwargs):
+        from omlx.cluster.prefill_guard import mark_lockstep_safe
+
+        raise mark_lockstep_safe(_Rejected("rejected by rank 1"))
+
+    guard = SimpleNamespace(check_collective=rejecting_check_collective)
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    marker = _Marker()
+
+    with install_server_telemetry(marker, prefill_guard=guard):
+        generator = mlx_server.ResponseGenerator()
+        with pytest.raises(_Rejected) as excinfo:
+            generator._tokenize(None, None, None)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_an_escape_from_generate_fail_stops_when_unmarked(monkeypatch):
+    """§A1 hole #2: fetch_nearest_cache/_make_state_machine/insert_segments/
+    _share_object -- anything that escapes _generate despite MLX-LM's own
+    per-request handlers -- is unambiguously worse than a caught, voted
+    rejection. The doc's proposed next()-only hook would miss all of these;
+    wrapping the whole _generate thread target does not."""
+
+    import mlx_lm.server as mlx_server
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            pass
+
+        def _generate(self):
+            raise RuntimeError("insert_segments blew up")
+
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    marker = _Marker()
+
+    with install_server_telemetry(marker) as telemetry:
+        calls = []
+        telemetry.fail_stop_if_unilateral = lambda exc, **_kw: calls.append(exc)
+        generator = mlx_server.ResponseGenerator()
+        with pytest.raises(RuntimeError, match="insert_segments blew up"):
+            generator._generate()
+
+    assert len(calls) == 1
+    assert not is_lockstep_safe(calls[0])
 
 
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(

@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from omlx.cluster.prefill_guard import RankPrefillGuard, build_guard, rank_monitor
+from omlx.cluster.prefill_guard import (
+    RankPrefillGuard,
+    build_guard,
+    is_lockstep_safe,
+    rank_monitor,
+)
 from omlx.exceptions import PrefillMemoryExceededError
 
 GiB = 1024**3
@@ -75,6 +80,83 @@ def test_a_stage_accepts_a_prompt_the_whole_model_would_refuse():
     with pytest.raises(PrefillMemoryExceededError):
         _guard(ceiling=ceiling).check(tokens, current_usage_bytes=usage)
     _guard(layer_count=16, ceiling=ceiling).check(tokens, current_usage_bytes=usage)
+
+
+def _fake_set_model_info_from_model(kv_bytes_per_token):
+    """Stand in for the real extraction: hand the monitor a KV override
+    directly, so the MLA test doesn't need a real ``make_cache()`` cache
+    list just to reach the code path under test."""
+
+    def fake(monitor, _model):
+        monitor.set_model_info(
+            num_layers=4,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=2,
+            num_attention_heads=64,
+            num_kv_cache_layers=4,
+            kv_bytes_per_token=kv_bytes_per_token,
+        )
+
+    return fake
+
+
+class _MLAConfig:
+    num_hidden_layers = 4
+    num_key_value_heads = 8
+    num_attention_heads = 64
+    head_dim = 128
+    hidden_size = 5120
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+
+
+class _MLAModel:
+    args = _MLAConfig()
+
+
+def test_an_mla_shaped_models_kv_override_is_not_divided_by_tp(monkeypatch):
+    """B2/1.6: kv_lora_rank + qk_rope_head_dim means every TP member holds
+    the full latent KV cache, not a per-head shard of it -- dividing a
+    kv_bytes_per_token override by tp under-charges prefill by that factor
+    and admits a prompt that OOMs. ``model.args`` is an attribute object,
+    not a dict, so this also guards against a dict-shaped predicate that
+    would silently no-op here via getattr-vs-get."""
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.set_model_info_from_model",
+        _fake_set_model_info_from_model(576.0),
+    )
+
+    monitor = rank_monitor(_MLAModel(), tensor_parallel_size=2)
+
+    assert monitor is not None
+    assert monitor._kv_bytes_per_token_override == pytest.approx(576.0)
+
+
+def test_a_non_mla_models_kv_override_is_still_divided_by_tp(monkeypatch):
+    """The MLA carve-out must not blind the guard to genuine per-head
+    KV overrides (e.g. a quantized-KV byte count)."""
+
+    class _Config:
+        num_hidden_layers = 4
+        num_key_value_heads = 8
+        num_attention_heads = 64
+        head_dim = 128
+        hidden_size = 5120
+
+    class _Model:
+        args = _Config()
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.set_model_info_from_model",
+        _fake_set_model_info_from_model(576.0),
+    )
+
+    monitor = rank_monitor(_Model(), tensor_parallel_size=2)
+
+    assert monitor is not None
+    assert monitor._kv_bytes_per_token_override == pytest.approx(288.0)
 
 
 def test_a_tensor_parallel_rank_is_charged_for_its_head_shard():
@@ -155,6 +237,110 @@ def test_collective_admission_allows_every_rank_to_continue():
         current_usage_bytes=1 * GiB,
         mx_module=mx,
     )
+
+
+def test_unexpected_local_exception_still_casts_a_vote_before_reraising(
+    monkeypatch,
+):
+    """A2: an exception from check() other than PrefillMemoryExceededError
+    (a malformed monitor field, a stripped-worker import error) must still
+    cast this rank's rejection vote before propagating -- skipping the
+    collective here leaves peer ranks blocked in all_sum forever."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+
+    captured_votes = {}
+
+    class _RecordingMX(_CollectiveMX):
+        def all_sum(self, value):
+            captured_votes["value"] = list(value)
+            return super().all_sum(value)
+
+    mx = _RecordingMX(rank=0, votes=[1, 0])
+
+    with pytest.raises(TypeError, match="malformed monitor field"):
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert captured_votes["value"] == [1, 0]
+
+
+def test_unexpected_local_exception_on_single_node_reraises_without_a_collective(
+    monkeypatch,
+):
+    """world_size==1 skips the collective entirely; the original exception
+    must still surface (not get swallowed or replaced)."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+    mx = _CollectiveMX(rank=0, votes=[0])
+
+    with pytest.raises(TypeError, match="malformed monitor field"):
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+
+# --- §A1/2.1: every exception check_collective raises is lockstep-safe. ----
+
+
+def test_a_peer_rejection_error_is_lockstep_safe():
+    """2.1's fail-stop hook must not kill a rank that voted and left the
+    request together with its peers -- only a genuinely unilateral failure."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    mx = _CollectiveMX(rank=0, votes=[0, 1])
+
+    with pytest.raises(PrefillMemoryExceededError) as excinfo:
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_an_unexpected_exception_after_the_vote_is_lockstep_safe(monkeypatch):
+    """The re-raised exception keeps its original type (TypeError here, not
+    PrefillMemoryExceededError) -- a type-based allowlist downstream would
+    miss this. The mark is instance-based specifically so it doesn't."""
+
+    guard = _guard(ceiling=64 * GiB, rank=0)
+    monkeypatch.setattr(
+        guard,
+        "check",
+        lambda *a, **kw: (_ for _ in ()).throw(TypeError("malformed monitor field")),
+    )
+    mx = _CollectiveMX(rank=0, votes=[1, 0])
+
+    with pytest.raises(TypeError) as excinfo:
+        guard.check_collective(2048, current_usage_bytes=1 * GiB, mx_module=mx)
+
+    assert is_lockstep_safe(excinfo.value)
+
+
+def test_bare_check_does_not_mark_but_check_collective_does():
+    """``check()`` has no notion of a cluster and never marks its raise --
+    only ``check_collective`` (world_size<=1 included: vacuously safe, no
+    peers to desync) does. 2.1's hook independently no-ops below world_size
+    2 anyway, but the mark should be correct on its own terms."""
+
+    guard = _guard(ceiling=4 * GiB)
+    with pytest.raises(PrefillMemoryExceededError) as bare:
+        guard.check(200_000, current_usage_bytes=3 * GiB)
+    assert not is_lockstep_safe(bare.value)
+
+    mx = _CollectiveMX(rank=0, votes=[0])
+    with pytest.raises(PrefillMemoryExceededError) as collective:
+        guard.check_collective(200_000, current_usage_bytes=3 * GiB, mx_module=mx)
+    assert is_lockstep_safe(collective.value)
+
+
+def test_an_unmarked_exception_is_not_lockstep_safe():
+    assert not is_lockstep_safe(RuntimeError("never went through check_collective"))
 
 
 def test_an_unreadable_model_disables_the_guard():
