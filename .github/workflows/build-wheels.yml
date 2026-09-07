@@ -45,7 +45,7 @@ jobs:
         # we build against the job's Python and pin it for CMake explicitly.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==2.13.0" "mlx==0.32.0"
+          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==2.15.0" "mlx==0.32.2"
           export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
           python -m build --wheel --no-isolation
 
@@ -60,14 +60,46 @@ jobs:
           cd /tmp
           /tmp/wheel-smoke/bin/python - <<'PY'
           import importlib
+          import mlx.core as mx
+
           failed = []
-          for pkg in ("bonsai", "glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+          for pkg in (
+              "bonsai",
+              "decode_fast",
+              "glm_moe_dsa",
+              "minimax_m3",
+              "qwen35_prefill",
+          ):
               fast = importlib.import_module(f"omlx.custom_kernels.{pkg}.fast")
               ok = bool(fast.is_native_available())
               print(f"{pkg}: native_available={ok} import_error={fast.import_error()}")
               if not ok:
                   failed.append(pkg)
-          raise SystemExit(f"native kernels missing from wheel: {failed}" if failed else 0)
+          if failed:
+              raise SystemExit(f"native kernels missing from wheel: {failed}")
+
+          # Exercise a real primitive from the newest native package, not just
+          # its nanobind ABI probe, so the wheel also proves dylib/metallib
+          # lookup and MLX 0.32.2 runtime dispatch.
+          from omlx.custom_kernels.decode_fast import fast as decode_fast
+
+          mx.random.seed(3142)
+          q = mx.random.normal((1, 4, 1, 64)).astype(mx.float16)
+          k = mx.random.normal((1, 2, 128, 64)).astype(mx.float16)
+          v = mx.random.normal((1, 2, 128, 64)).astype(mx.float16)
+          if not decode_fast._ext.sdpa_decode_supported(q, k, v):
+              raise SystemExit("decode_fast rejected the wheel smoke shape")
+          out = decode_fast.sdpa_decode(q, k, v, 64 ** -0.5)
+          ref = mx.fast.scaled_dot_product_attention(
+              q, k, v, scale=64 ** -0.5
+          )
+          mx.eval(out, ref)
+          error = mx.max(
+              mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))
+          ).item()
+          print(f"decode_fast: shape={out.shape} max_abs={error}")
+          if error >= 5e-3:
+              raise SystemExit(f"decode_fast mismatch: max_abs={error}")
           PY
 
       - name: Upload wheel artifact

@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 HEAD_HIDDEN_POST_NORM = True
 
 _CTX_ATTR = "_omlx_mtp_prime_ctx"
+_PLAN_ATTR = "_omlx_mtp_prime_plan"
 
 _SUPPRESS = threading.local()
 
@@ -131,6 +132,52 @@ class _PrimeCtx:
     # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
     # lightweight marker so later small chunks cannot restart priming.
     window_exceeded: bool = False
+    # Absolute MTP history is ``folded``; this counter is only the work folded
+    # by the current request.  A warm prefix restore starts at a nonzero
+    # absolute history but must still apply OMLX_MTP_PRIME_WINDOW to the small
+    # uncached suffix, preserving the option's documented meaning.
+    folded_this_request: int = 0
+    # Request/prefix-cache metadata used to publish and restore one exact
+    # full-block MTP boundary snapshot.  The cache itself remains generic and
+    # treats the snapshot as an opaque sidecar.
+    request_id: Optional[str] = None
+    prompt_tokens: Optional[tuple[int, ...]] = None
+    block_size: int = 0
+    prefix_cache: Any = None
+    extra_keys: Optional[tuple[Any, ...]] = None
+    extra_key_token_start: Optional[int] = None
+    extra_key_ranges: Optional[list[tuple[int, tuple[Any, ...]]]] = None
+    snapshot_candidate: Any = None
+
+
+@dataclass
+class _PrimePlan:
+    """Scheduler-owned metadata for the next singleton prompt timeline."""
+
+    request_id: str
+    prompt_tokens: tuple[int, ...]
+    block_size: int
+    prefix_cache: Any
+    extra_keys: Optional[tuple[Any, ...]] = None
+    extra_key_token_start: Optional[int] = None
+    extra_key_ranges: Optional[list[tuple[int, tuple[Any, ...]]]] = None
+
+
+@dataclass
+class _MtpPrefixSnapshot:
+    """Detached MTP-head state at a backbone full-block boundary."""
+
+    boundary_tokens: int
+    mtp_cache: List[Any]
+    pending_hidden: Any
+
+
+@dataclass
+class _MtpBoundaryCandidate:
+    """Cheap boundary marker retained until activation publishes a snapshot."""
+
+    boundary_tokens: int
+    pending_hidden: Any
 
 
 def _read_offset(entry: Any) -> Optional[int]:
@@ -246,26 +293,111 @@ def _find_ctx(model: Any) -> Optional[_PrimeCtx]:
     return None
 
 
+def _find_plan(model: Any) -> Optional[_PrimePlan]:
+    for host in _host_candidates(model):
+        plan = getattr(host, _PLAN_ATTR, None)
+        if isinstance(plan, _PrimePlan):
+            return plan
+    return None
+
+
 def drop_ctx(model: Any) -> None:
-    """Remove any priming context from the model's host slot."""
+    """Remove any priming context/plan from the model's host slots."""
     if model is None:
         return
     for host in _host_candidates(model):
-        if getattr(host, _CTX_ATTR, None) is not None:
-            try:
-                delattr(host, _CTX_ATTR)
-            except AttributeError:
-                pass
+        for attr in (_CTX_ATTR, _PLAN_ATTR):
+            if getattr(host, attr, None) is not None:
+                try:
+                    delattr(host, attr)
+                except AttributeError:
+                    pass
 
 
 def _host_eligible(host: Any) -> bool:
     get_mtp = getattr(host, "get_mtp_module", None)
     mtp = get_mtp() if callable(get_mtp) else getattr(host, "mtp", None)
-    return bool(
-        getattr(host, "_omlx_mtp_decode_enabled", False)
-        and getattr(host, "_omlx_mtp_chain", False)
+    return (
+        getattr(host, "_omlx_mtp_decode_enabled", False) is True
+        and getattr(host, "_omlx_mtp_chain", False) is True
         and mtp is not None
     )
+
+
+def _eligible_host(model: Any) -> Any | None:
+    for host in _host_candidates(model):
+        if _host_eligible(host):
+            return host
+    return None
+
+
+def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
+    """Detach an MTP cache so later decode writes cannot mutate a snapshot."""
+    import copy
+
+    import mlx.core as mx
+
+    def clone_one(entry: Any) -> Any:
+        if entry is None:
+            return None
+        subs = getattr(entry, "caches", None)
+        if subs is not None:
+            return type(entry)(*[clone_one(sub) for sub in subs])
+        clone = copy.copy(entry)
+        for attr, value in vars(entry).items():
+            if isinstance(value, mx.array):
+                setattr(clone, attr, value + 0)
+            elif isinstance(value, list):
+                setattr(clone, attr, list(value))
+        return clone
+
+    return [clone_one(entry) for entry in cache]
+
+
+def _flat_cache_entries(cache: List[Any]):
+    for entry in cache:
+        subs = getattr(entry, "caches", None)
+        if subs is None:
+            yield entry
+        else:
+            yield from subs
+
+
+def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
+    """Return a detached, exactly trimmed MTP cache or fail closed."""
+    if target < 0 or not cache:
+        return None
+    cloned = _clone_mtp_cache(cache)
+    saw_offset = False
+    for entry in _flat_cache_entries(cloned):
+        current = _read_offset(entry)
+        if current is None:
+            continue
+        saw_offset = True
+        if current < target:
+            return None
+        extra = current - target
+        if extra:
+            trim = getattr(entry, "trim", None)
+            if not callable(trim) or int(trim(extra)) != extra:
+                return None
+        if _read_offset(entry) != target:
+            return None
+    return cloned if saw_offset else None
+
+
+def _snapshot_arrays(snapshot: _MtpPrefixSnapshot) -> list[Any]:
+    """Arrays that must be materialized to sever the live prefill graph."""
+    import mlx.core as mx
+
+    arrays: list[Any] = []
+    if isinstance(snapshot.pending_hidden, mx.array):
+        arrays.append(snapshot.pending_hidden)
+    for entry in _flat_cache_entries(snapshot.mtp_cache):
+        for value in vars(entry).values():
+            if isinstance(value, mx.array):
+                arrays.append(value)
+    return arrays
 
 
 def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
@@ -283,6 +415,213 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
         and cache is not None
         and _host_eligible(host)
     )
+
+
+def prepare_prefix_context(
+    model: Any,
+    *,
+    request_id: str,
+    prompt_tokens: list[int],
+    cached_tokens: int,
+    prefix_cache: Any,
+    extra_keys: Optional[tuple[Any, ...]] = None,
+    extra_key_token_start: Optional[int] = None,
+    extra_key_ranges: Optional[list[tuple[int, tuple[Any, ...]]]] = None,
+) -> bool:
+    """Prepare exact MTP priming for one scheduler-owned prompt timeline.
+
+    ``cached_tokens`` is the final reconstructed backbone offset (after any
+    exact-hit trim).  A matching sidecar restores the MTP-head KV at
+    ``cached_tokens - 1`` plus the pending trunk hidden at the boundary, so
+    the uncached suffix can continue folding without replaying the trunk.
+    Missing, stale, VLM-range-keyed, or shape-incompatible snapshots fail
+    closed to the existing unprimed path.
+
+    Returns True only when a warm sidecar was restored.  Repeating the call
+    for the same request is idempotent and never double-primes a live suffix.
+    """
+    host = _eligible_host(model)
+    if host is None or not priming_enabled() or prefix_cache is None:
+        drop_ctx(model)
+        return False
+
+    tokens = tuple(int(token) for token in prompt_tokens)
+    cached_tokens = max(0, int(cached_tokens))
+    existing = _find_ctx(model)
+    plan = _find_plan(model)
+    if (
+        (existing is not None and existing.request_id == request_id)
+        or (
+            plan is not None
+            and plan.request_id == request_id
+            and plan.prompt_tokens == tokens
+        )
+    ):
+        return existing is not None and existing.expected_offset >= cached_tokens
+
+    drop_ctx(model)
+    plan = _PrimePlan(
+        request_id=request_id,
+        prompt_tokens=tokens,
+        block_size=max(0, int(getattr(prefix_cache, "block_size", 0) or 0)),
+        prefix_cache=prefix_cache,
+        extra_keys=extra_keys,
+        extra_key_token_start=extra_key_token_start,
+        extra_key_ranges=(
+            list(extra_key_ranges) if extra_key_ranges is not None else None
+        ),
+    )
+    setattr(host, _PLAN_ATTR, plan)
+    if cached_tokens <= 0:
+        return False
+
+    restore = getattr(prefix_cache, "restore_mtp_prefix_snapshot", None)
+    if not callable(restore):
+        return False
+    try:
+        snapshot = restore(
+            list(tokens),
+            cached_tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+    except Exception as exc:
+        logger.debug("MTP prefix sidecar lookup failed closed: %s", exc)
+        return False
+    if not isinstance(snapshot, _MtpPrefixSnapshot):
+        return False
+    if snapshot.boundary_tokens != cached_tokens or cached_tokens < 2:
+        return False
+
+    target_offset = cached_tokens - 1
+    try:
+        restored_cache = _cache_at_offset(snapshot.mtp_cache, target_offset)
+        if restored_cache is None or snapshot.pending_hidden is None:
+            return False
+
+        import mlx.core as mx
+
+        pending_hidden = snapshot.pending_hidden + 0
+    except Exception as exc:
+        logger.debug("MTP prefix sidecar restore failed closed: %s", exc)
+        return False
+    ctx = _PrimeCtx(
+        mtp_cache=restored_cache,
+        pending_hidden=pending_hidden,
+        folded=target_offset,
+        expected_offset=cached_tokens,
+        request_id=request_id,
+        prompt_tokens=tokens,
+        block_size=plan.block_size,
+        prefix_cache=prefix_cache,
+        extra_keys=extra_keys,
+        extra_key_token_start=extra_key_token_start,
+        extra_key_ranges=plan.extra_key_ranges,
+    )
+    setattr(host, _CTX_ATTR, ctx)
+    try:
+        arrays = [pending_hidden, *_snapshot_arrays(snapshot)]
+        if arrays:
+            mx.async_eval(arrays)
+    except Exception as exc:
+        drop_ctx(model)
+        logger.debug("MTP prefix sidecar materialization failed closed: %s", exc)
+        return False
+    logger.debug(
+        "MTP prompt history restored at %d cached tokens for %s",
+        cached_tokens,
+        request_id,
+    )
+    return True
+
+
+def _capture_boundary_candidate(
+    ctx: _PrimeCtx,
+    normed: Any,
+    *,
+    seq_start: int,
+    seq_end: int,
+) -> None:
+    """Detach the newest full-block MTP boundary crossed by this chunk."""
+    block = int(ctx.block_size or 0)
+    if (
+        block <= 0
+        or ctx.prefix_cache is None
+        or not ctx.prompt_tokens
+        or seq_end < block
+    ):
+        return
+    boundary = (seq_end // block) * block
+    if boundary <= seq_start or boundary > len(ctx.prompt_tokens):
+        return
+    previous = ctx.snapshot_candidate
+    if (
+        isinstance(previous, _MtpBoundaryCandidate)
+        and previous.boundary_tokens >= boundary
+    ):
+        return
+
+    # A backbone boundary at C tokens needs MTP pairs through C-1 and keeps
+    # hidden(token[C-1]) pending for the next token.  ``normed`` spans
+    # [seq_start, seq_end), so the boundary row is available without replay.
+    if boundary <= 1 or ctx.folded < boundary - 1:
+        return
+    row = boundary - seq_start - 1
+    if row < 0 or row >= int(normed.shape[1]):
+        return
+    try:
+        import mlx.core as mx
+
+        candidate = _MtpBoundaryCandidate(
+            boundary_tokens=boundary,
+            pending_hidden=normed[:, row : row + 1] + 0,
+        )
+        mx.async_eval(candidate.pending_hidden)
+    except Exception as exc:
+        logger.debug("MTP prefix boundary capture failed closed: %s", exc)
+        return
+    ctx.snapshot_candidate = candidate
+
+
+def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
+    candidate = ctx.snapshot_candidate
+    store = getattr(ctx.prefix_cache, "store_mtp_prefix_snapshot", None)
+    if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
+        return
+    try:
+        snapshot_cache = _cache_at_offset(
+            ctx.mtp_cache, candidate.boundary_tokens - 1
+        )
+        if snapshot_cache is None:
+            return
+        snapshot = _MtpPrefixSnapshot(
+            boundary_tokens=candidate.boundary_tokens,
+            mtp_cache=snapshot_cache,
+            pending_hidden=candidate.pending_hidden,
+        )
+        arrays = _snapshot_arrays(snapshot)
+        if arrays:
+            import mlx.core as mx
+
+            mx.async_eval(arrays)
+        stored = store(
+            list(ctx.prompt_tokens or ()),
+            snapshot.boundary_tokens,
+            snapshot,
+            extra_keys=ctx.extra_keys,
+            extra_key_token_start=ctx.extra_key_token_start,
+            extra_key_ranges=ctx.extra_key_ranges,
+        )
+    except Exception as exc:
+        logger.debug("MTP prefix sidecar publish failed closed: %s", exc)
+        return
+    if stored:
+        logger.debug(
+            "MTP prompt history cached at %d-token boundary for %s",
+            snapshot.boundary_tokens,
+            ctx.request_id or "anonymous request",
+        )
 
 
 def maybe_capture(
@@ -340,7 +679,7 @@ def maybe_capture(
         # not the absolute prompt offset: on a warm prefix cache only the
         # boundary remainder is ever folded, so a long-context request with a
         # small remainder is exactly the cheap case priming is for (#2909).
-        folded = ctx.folded if ctx is not None else 0
+        folded = ctx.folded_this_request if ctx is not None else 0
         if folded + seq_len > window:
             setattr(
                 host,
@@ -355,7 +694,19 @@ def maybe_capture(
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return
-        ctx = _PrimeCtx(mtp_cache=host.make_mtp_cache())
+        plan = _find_plan(host)
+        ctx = _PrimeCtx(
+            mtp_cache=host.make_mtp_cache(),
+            request_id=plan.request_id if plan is not None else None,
+            prompt_tokens=plan.prompt_tokens if plan is not None else None,
+            block_size=plan.block_size if plan is not None else 0,
+            prefix_cache=plan.prefix_cache if plan is not None else None,
+            extra_keys=plan.extra_keys if plan is not None else None,
+            extra_key_token_start=(
+                plan.extra_key_token_start if plan is not None else None
+            ),
+            extra_key_ranges=(plan.extra_key_ranges if plan is not None else None),
+        )
         if not ctx.mtp_cache:
             return
         setattr(host, _CTX_ATTR, ctx)
@@ -380,8 +731,15 @@ def maybe_capture(
     # on them, so the lm_head tail costs nothing.
     host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
     ctx.folded += int(pairs_tokens.shape[1])
+    ctx.folded_this_request += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
     ctx.expected_offset = offset_after
+    _capture_boundary_candidate(
+        ctx,
+        normed,
+        seq_start=offset_after - seq_len,
+        seq_end=offset_after,
+    )
     # Materialize the head-cache buffers per chunk so the fold graph never
     # accumulates across a long prefill; the (1,1,H) pending row is evaluated
     # alongside so the chunk's full hidden can be freed.
@@ -457,6 +815,7 @@ def take_primed(
     except Exception as exc:
         logger.debug("MTP priming discarded: seam fold failed: %s", exc)
         return None
+    _publish_boundary_candidate(ctx)
     return ctx.mtp_cache, ctx.folded + 1
 
 
@@ -470,6 +829,7 @@ __all__ = [
     "HEAD_HIDDEN_POST_NORM",
     "priming_enabled",
     "prime_window",
+    "prepare_prefix_context",
     "suppress_capture",
     "maybe_capture",
     "take_primed",

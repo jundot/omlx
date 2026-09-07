@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small-L attention route for gemma4 speculative verify forwards.
 
-MLX's fused SDPA only covers head_dim {64, 80, 128} for multi-token
-queries; gemma4 (head_dim 256 sliding / 512 global) therefore drops to the
-unfused path for any L >= 2 forward. For the global layers that cost grows
-with context — the L=1 -> L=2 step measured +88% at 16k ctx on the 26B MoE
-— and is what makes MTP verify cycles lose to plain decoding on
-low-accept content.
+Gemma4 uses head_dim 256 for sliding layers and 512 for global layers. MLX
+0.32.2 now handles small multi-row head-dim-256 calls with its native vector
+kernel, so this patch explicitly leaves those shapes alone. Head-dim 512 still
+has no fused MLX route; for global layers that unfused cost grows with context
+and is what makes MTP verify cycles lose to plain decoding on low-accept
+content.
 
 Two routes, picked per layer:
 
@@ -57,6 +57,18 @@ _MIN_L = 2
 _MAX_L = 3  # per-token route ceiling (sliding layers / kernel fallback)
 _KERNEL_MAX_L = 12  # fused kernel ceiling; stock batched wins past ~12
 
+_MLX0322_FULL_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
+_MLX0322_VECTOR_HEAD_DIMS = frozenset({64, 96, 128, 256})
+
+
+def _mlx0322_default_fused(head_dim: int, query_len: int, gqa_factor: int) -> bool:
+    if query_len <= 8:
+        return (
+            head_dim in _MLX0322_VECTOR_HEAD_DIMS
+            and query_len * gqa_factor <= 32
+        )
+    return head_dim in _MLX0322_FULL_HEAD_DIMS
+
 
 def apply() -> bool:
     """Wrap ``mlx_vlm.models.gemma4.language.Attention.__call__``. Idempotent."""
@@ -101,6 +113,7 @@ def apply() -> bool:
 
     def __call__(self, x, mask=None, cache=None, shared_kv=None, offset=None):
         B, L, _ = x.shape
+        gqa_factor = self.n_heads // self.n_kv_heads
         if (
             shared_kv is not None
             or cache is None
@@ -108,6 +121,14 @@ def apply() -> bool:
             or getattr(self.config, "num_kv_shared_layers", 0)
             or not _zero_left_padding(cache)
         ):
+            return original_call(
+                self, x, mask, cache, shared_kv=shared_kv, offset=offset
+            )
+
+        # Do not replace a shape MLX 0.32.2 already sends to a native fused
+        # kernel. This is the common Gemma4 sliding-layer verify path at
+        # head_dim=256 and L<=4.
+        if _mlx0322_default_fused(self.head_dim, L, gqa_factor):
             return original_call(
                 self, x, mask, cache, shared_kv=shared_kv, offset=offset
             )
@@ -122,7 +143,7 @@ def apply() -> bool:
             # GPUs cap below 32 * gqa threads); infeasible geometry falls
             # back before the batched cache update commits us to the route.
             and gemma4_verify_kernel.kernel_max_rows(
-                self.n_heads // self.n_kv_heads, x.dtype
+                gqa_factor, x.dtype
             )
             > 0
         )

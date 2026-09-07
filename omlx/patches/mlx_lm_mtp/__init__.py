@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import logging
 
+from ...model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+
 logger = logging.getLogger(__name__)
 
 # Process-wide construction flag read by the patched ``Model.__init__``
@@ -70,7 +72,7 @@ _MTP_DEPTH = 1
 
 def set_mtp_depth(depth: int) -> None:
     global _MTP_DEPTH
-    _MTP_DEPTH = max(1, min(8, int(depth)))
+    _MTP_DEPTH = max(1, min(MAX_LIGHTNING_MTP_DRAFT_TOKENS, int(depth)))
 
 
 def get_mtp_depth() -> int:

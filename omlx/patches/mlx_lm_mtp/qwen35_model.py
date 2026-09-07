@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 native MTP.
+"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 Lightning MTP.
 
 Adds an MTP head to ``mlx_lm.models.qwen3_5.TextModel`` (the language-model
 half) and a pass-through on ``mlx_lm.models.qwen3_5.Model`` (the VLM-outer
@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from ..dflash_lifecycle import get_dflash_guard_base, set_dflash_guard_base
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
 
     Used as a self-healing idempotency check: when another patch (e.g.
     dflash's speculative hook) overwrites ``__call__`` between two
-    Native-MTP loads in the same process, the marker disappears and the
+    Lightning MTP loads in the same process, the marker disappears and the
     caller knows to re-apply. Reading from ``cls.__dict__`` instead of
     ``getattr`` avoids resolving inherited attributes — only what is
     actually defined on this class counts.
@@ -238,6 +239,15 @@ def _patch_gated_delta_net(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    # dflash coexistence (issue #2972): if the dflash batch-cache guard owns
+    # ``cls.__call__``, do not clobber it — that silently strips the resident
+    # DFlash engine's speculative hook and its generations degenerate into
+    # repetition loops. Instead install our body as the guard's fallback
+    # base: dflash traffic keeps its hook, MTP/batched traffic gets ours.
+    dflash_base = get_dflash_guard_base(cls)
+    if getattr(dflash_base, "_omlx_mtp_call_marker", False):
+        return  # our body already sits under the dflash guard
+
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
@@ -356,7 +366,12 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
     cls._process_chunk = _process_chunk
     __call__._omlx_mtp_call_marker = True
-    cls.__call__ = __call__
+    if dflash_base is not None:
+        # Compose with the armed dflash guard instead of replacing it
+        # (issue #2972): our body becomes the guard's fallback base.
+        set_dflash_guard_base(cls, __call__)
+    else:
+        cls.__call__ = __call__
 
 
 # ---------------------------------------------------------------------------

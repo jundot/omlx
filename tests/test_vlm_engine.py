@@ -18,8 +18,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omlx.patches.mlx_vlm_glm5_next_compat import (
+    apply_mlx_vlm_glm5_next_compat_patch,
+)
+
 try:
     import mlx.core as mx
+
+    from omlx.engine import vlm as vlm_module
 
     HAS_MLX = True
 except ImportError:
@@ -1636,6 +1642,34 @@ class TestFormatMessagesForVLMTemplate:
         ]
         assert image_ranges == [(0, 1)]
 
+    def test_glm5_next_handles_text_history_before_image(self):
+        """Text turns before an image must stay on GLM's native template path."""
+        apply_mlx_vlm_glm5_next_compat_patch()
+        engine = _make_loaded_engine(model_type="glm5_next")
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted[:3] == messages[:3]
+        assert self._count_image_placeholders(formatted) == 1
+        assert image_ranges == [(3, 1)]
+
     def test_glm5_next_inserts_fallback_image_marker(self):
         """Legacy GLM callers with separate images still receive a marker."""
         engine = _make_loaded_engine(model_type="glm5_next")
@@ -2582,3 +2616,50 @@ class TestVLMEngineFrequencyPenalty:
 
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert call_kwargs["sampling_params"].frequency_penalty == 0.42
+
+
+# ---------------------------------------------------------------------------
+# TestCaptureVLMPositionState
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureVLMPositionState:
+    """_capture_vlm_position_state() must hand the scheduler concrete arrays.
+
+    get_rope_index() leaves the mRoPE state lazy on the executor's default
+    stream; a lazy cross-stream input in the engine-stream prefill graph
+    deadlocks the Qwen ANE prefill primitive on restored prefixes (#3305).
+    """
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_captures_and_materializes_lazy_mrope_state(self):
+        pid = mx.arange(6).reshape(1, 6) + 1
+        rd = mx.zeros((1, 1)) - 3
+        lm = SimpleNamespace(_position_ids=pid, _rope_deltas=rd)
+        extra = {}
+
+        with patch.object(vlm_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["position_ids"] is pid
+        assert extra["_captured_rope_deltas"] is rd
+        eval_mock.assert_called_once()
+        assert [id(a) for a in eval_mock.call_args.args] == [id(pid), id(rd)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_existing_position_ids_are_kept(self):
+        given = mx.zeros((1, 2))
+        lm = SimpleNamespace(_position_ids=mx.ones((1, 2)), _rope_deltas=None)
+        extra = {"position_ids": given}
+
+        vlm_module._capture_vlm_position_state(lm, extra)
+
+        assert extra["position_ids"] is given
+        assert "_captured_rope_deltas" not in extra
+
+    def test_missing_language_model_is_noop(self):
+        extra = {}
+
+        vlm_module._capture_vlm_position_state(None, extra)
+
+        assert extra == {}

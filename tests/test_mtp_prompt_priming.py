@@ -8,6 +8,8 @@ in the patched ``TextModel.__call__`` and the activation handoff in
 wiring is exercised by the real-model smoke test.
 """
 
+import threading
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -110,6 +112,108 @@ def _reference_head_cache(model, tokens, extra_tok=None):
     return ref_cache
 
 
+class _MemoryMtpPrefixCache:
+    """Minimal scheduler/cache contract for prompt-history integration tests."""
+
+    def __init__(self, block_size=8):
+        self.block_size = block_size
+        self.snapshots = {}
+
+    def _key(self, tokens, boundary):
+        return tuple(tokens[:boundary]), int(boundary)
+
+    def store_mtp_prefix_snapshot(self, tokens, boundary, snapshot, **kwargs):
+        self.snapshots[self._key(tokens, boundary)] = snapshot
+        return True
+
+    def restore_mtp_prefix_snapshot(self, tokens, boundary, **kwargs):
+        return self.snapshots.get(self._key(tokens, boundary))
+
+
+def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
+    """The production sidecar is only visible while its backbone tip lives."""
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    class _HashMap:
+        def __init__(self):
+            self.blocks = {}
+
+        def get_block(self, key):
+            return self.blocks.get(key)
+
+    hash_map = _HashMap()
+    cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+    cache.block_size = 4
+    cache.paged_cache = SimpleNamespace(
+        model_name="tiny-mtp-test",
+        cached_block_hash_to_block=hash_map,
+    )
+    cache._prefix_index = {}
+    cache._mtp_prefix_snapshots = OrderedDict()
+    cache._mtp_prefix_snapshot_lock = threading.RLock()
+
+    tokens = list(range(8))
+    snapshot = object()
+    assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
+    tip = cache._mtp_prefix_chain_tip(tokens, 8)
+    assert tip is not None
+    # Publishing precedes the async backbone store, so the snapshot must not
+    # become restorable until the matching ordinary block is live.
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    hash_map.blocks[tip] = object()
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is snapshot
+
+    cache._on_block_hash_dropped(tip)
+    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+
+
+def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
+    """MTP sidecars remain bounded and follow wholesale cache clears."""
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    class _HashMap:
+        def __init__(self):
+            self.blocks = {}
+
+        def get_block(self, key):
+            return self.blocks.get(key)
+
+    hash_map = _HashMap()
+    cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
+    cache.block_size = 4
+    cache.paged_cache = SimpleNamespace(
+        model_name="tiny-mtp-lru-test",
+        cached_block_hash_to_block=hash_map,
+    )
+    cache._prefix_index = {}
+    cache._mtp_prefix_snapshots = OrderedDict()
+    cache._mtp_prefix_snapshot_lock = threading.RLock()
+
+    entries = []
+    for branch in range(5):
+        tokens = [branch * 100 + i for i in range(8)]
+        snapshot = object()
+        assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
+        tip = cache._mtp_prefix_chain_tip(tokens, 8)
+        assert tip is not None
+        hash_map.blocks[tip] = object()
+        entries.append((tokens, tip, snapshot))
+
+    assert len(cache._mtp_prefix_snapshots) == 4
+    assert cache.restore_mtp_prefix_snapshot(entries[0][0], 8) is None
+    assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is entries[-1][2]
+
+    # Individual backbone eviction removes the matching sidecar even if a
+    # stale test hash-map entry remains, then the wholesale clear drops all
+    # remaining sidecars and the ordinary prefix index together.
+    cache._on_block_hash_dropped(entries[-1][1])
+    assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is None
+    cache._prefix_index[b"ordinary"] = (1, 2, 3)
+    cache._on_hash_map_cleared()
+    assert not cache._mtp_prefix_snapshots
+    assert not cache._prefix_index
+
+
 @pytest.fixture(autouse=True)
 def _apply_patch():
     try:
@@ -174,6 +278,100 @@ class TestCaptureFold:
         ):
             assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
             assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
+
+    def test_warm_prefix_restores_exact_head_history_without_trunk_reforward(
+        self, strict_model
+    ):
+        """A backbone hit at C restores MTP(C-1)+hidden(C-1), then folds
+        only the uncached suffix and activation seam.  The resulting head
+        cache must equal a one-shot cold oracle exactly within model dtype.
+        Repeating scheduler preparation for the same request is idempotent.
+        """
+        model = strict_model
+        tokens = _tokens(13, seed=40)
+        main_tok = _tokens(1, seed=41)
+        sidecar = _MemoryMtpPrefixCache(block_size=8)
+
+        cold_cache = _make_cache(model)
+        assert not prompt_priming.prepare_prefix_context(
+            model,
+            request_id="cold",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=0,
+            prefix_cache=sidecar,
+        )
+        _chunked_prefill(model, cold_cache, tokens, [8, 5])
+        cold_ctx = prompt_priming._find_ctx(model)
+        assert cold_ctx is not None
+        cold_final_pending = cold_ctx.pending_hidden + 0
+        mx.eval(cold_final_pending)
+        model(main_tok[None, :], cache=cold_cache, return_hidden=True)
+        cold_primed = prompt_priming.take_primed(model, cold_cache, main_tok)
+        assert cold_primed is not None
+        snapshot_key = (tuple(tokens[:8].tolist()), 8)
+        assert snapshot_key in sidecar.snapshots
+        boundary_pending = sidecar.snapshots[snapshot_key].pending_hidden
+
+        # Build the already-restored backbone cache outside capture.  Start
+        # tracing only after sidecar restore: a correct warm path invokes the
+        # MTP head for suffix(5)+seam(1), never for the cached trunk(8).
+        warm_cache = _make_cache(model)
+        with prompt_priming.suppress_capture():
+            model(tokens[:8][None, :], cache=warm_cache)
+        assert prompt_priming.prepare_prefix_context(
+            model,
+            request_id="warm",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=8,
+            prefix_cache=sidecar,
+        )
+        warm_ctx = prompt_priming._find_ctx(model)
+        assert warm_ctx is not None
+        assert warm_ctx.folded == 7
+        assert warm_ctx.expected_offset == 8
+        assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
+
+        # The scheduler's prepared-set normally prevents this second call;
+        # the hook itself also guarantees it cannot reset/double-prime a live
+        # request if invoked twice.
+        assert prompt_priming.prepare_prefix_context(
+            model,
+            request_id="warm",
+            prompt_tokens=tokens.tolist(),
+            cached_tokens=8,
+            prefix_cache=sidecar,
+        )
+        assert prompt_priming._find_ctx(model) is warm_ctx
+
+        mtp_rows = []
+        original_mtp_forward = model.mtp_forward
+
+        def traced_mtp_forward(hidden, next_ids, cache, **kwargs):
+            mtp_rows.append(int(next_ids.shape[1]))
+            return original_mtp_forward(hidden, next_ids, cache, **kwargs)
+
+        model.mtp_forward = traced_mtp_forward
+        _chunked_prefill(model, warm_cache, tokens[8:], [5])
+        warm_final_ctx = prompt_priming._find_ctx(model)
+        assert warm_final_ctx is not None
+        assert mx.array_equal(
+            warm_final_ctx.pending_hidden, cold_final_pending
+        ).item()
+        model(main_tok[None, :], cache=warm_cache, return_hidden=True)
+        warm_primed = prompt_priming.take_primed(model, warm_cache, main_tok)
+        assert warm_primed is not None
+        assert warm_primed[1] == len(tokens)
+        assert mtp_rows == [5, 1]
+
+        mx.eval(
+            [c.state for c in cold_primed[0]],
+            [c.state for c in warm_primed[0]],
+        )
+        for (k, v), (rk, rv) in zip(
+            _kv_entries(warm_primed[0]), _kv_entries(cold_primed[0])
+        ):
+            assert mx.array_equal(k, rk).item()
+            assert mx.array_equal(v, rv).item()
 
     def test_chunk_size_one_seam_is_dense(self, model):
         """A trailing S==1 forward (the __init__ _step seam) still folds."""

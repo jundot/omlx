@@ -18,6 +18,17 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_mtp_rounds_share_the_wrapper_generation_stream():
+    """The wrapper must drain the same stream used inside both round loops."""
+    from mlx_vlm.speculative import common, mtp
+
+    stream = vlm_mtp._vlm_generation_stream
+    assert stream is common.generation_stream
+    assert stream is mtp.generation_stream
+    assert stream is vlm_mtp._mtp_rounds.__globals__["generation_stream"]
+    assert stream is vlm_mtp._mtp_rounds_batch.__globals__["generation_stream"]
+
+
 def test_qwen38_block_fp8_dequantization():
     from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
 
@@ -601,6 +612,60 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert out.gdn_states is gdn_states
     assert out.shared_kv_states == {}
     assert model.forward_kwargs["capture_layer_ids"] == [1]
+
+
+def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():
+    """The dense Qwen3.5 runtime patch must not wire foreign subclasses."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+
+    class FakeLanguageModel:
+        def __init__(self, args, config=None):
+            self.args = args
+            self.config = config
+            self.forward_kwargs = None
+
+        def __call__(
+            self,
+            inputs,
+            inputs_embeds=None,
+            mask=None,
+            cache=None,
+            **kwargs,
+        ):
+            self.forward_kwargs = kwargs
+            return "stock-subclass-output"
+
+    q35_lang = SimpleNamespace(
+        LanguageModel=FakeLanguageModel,
+        MTPModule=lambda args: SimpleNamespace(args=args),
+    )
+    qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
+
+    class ForeignLanguageModel(FakeLanguageModel):
+        pass
+
+    model = ForeignLanguageModel(
+        SimpleNamespace(mtp_num_hidden_layers=1, tie_word_embeddings=True),
+        config=SimpleNamespace(model_type="foreign"),
+    )
+    result = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        return_shared_kv=True,
+        n_confirmed=2,
+        capture_layer_ids=[],
+    )
+
+    assert result == "stock-subclass-output"
+    assert not hasattr(model, "mtp")
+    assert not hasattr(model, "_omlx_mtp_decode_enabled")
+    assert model.forward_kwargs == {
+        "return_hidden": True,
+        "return_shared_kv": True,
+        "n_confirmed": 2,
+        "capture_layer_ids": [],
+    }
 
 
 def test_moe_vlm_sanitize_unfuses_gate_up_by_midpoint(monkeypatch):

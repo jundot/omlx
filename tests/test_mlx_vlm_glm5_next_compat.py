@@ -650,3 +650,66 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
 
     assert calls == 1
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+@pytest.mark.parametrize(("bits", "tokens"), [(5, 128), (8, 1024)])
+def test_glm5_next_prefill_qmm_handles_strided_input(bits, tokens):
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.linear import linear_forward
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    name = f"qwen35_q{bits}_affine_qmm_t"
+    if not fast.has_symbol(name):
+        pytest.skip(f"{name} native kernel is not built")
+
+    mx.random.seed(11)
+    dims = 128
+    base = nn.Linear(dims, dims, bias=False)
+    base.set_dtype(mx.float16)
+    linear = base.to_quantized(group_size=64, bits=bits, mode="affine")
+
+    wide = mx.random.normal((1, tokens, 2 * dims), dtype=mx.float16)
+    mx.eval(wide)
+    strided = mx.split(wide, [dims], axis=-1)[1]
+
+    reference = linear(strided)
+    actual = linear_forward(linear, strided)
+    mx.eval(actual, reference)
+
+    assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+@pytest.mark.parametrize(("bits", "tokens"), [(5, 128), (8, 1024)])
+def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.linear import fused_quantized_matmul
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    name = f"qwen35_q{bits}_affine_qmm_t"
+    if not fast.has_symbol(name):
+        pytest.skip(f"{name} native kernel is not built")
+
+    mx.random.seed(11)
+    dims = 128
+    base = nn.Linear(dims, dims, bias=False)
+    base.set_dtype(mx.float16)
+    linear = base.to_quantized(group_size=64, bits=bits, mode="affine")
+
+    wide = mx.random.normal((1, tokens, 2 * dims), dtype=mx.float16)
+    mx.eval(wide)
+    strided = mx.split(wide, [dims], axis=-1)[1]
+
+    reference = linear(strided)
+    actual = fused_quantized_matmul(
+        strided,
+        linear.weight,
+        linear.scales,
+        linear.biases,
+        bits=bits,
+        group_size=64,
+    )
+    mx.eval(actual, reference)
+
+    assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()

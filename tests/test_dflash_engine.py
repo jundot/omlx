@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DFlash engine integration."""
 
+import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1530,6 +1534,35 @@ class TestDFlashActivityTracking:
         assert engine.get_activity_snapshot()["active_requests"] == 0
         assert engine.has_active_requests() is False
 
+    @pytest.mark.asyncio
+    async def test_memory_pressure_abort_signals_active_generations(self):
+        engine = self._engine()
+        first = threading.Event()
+        second = threading.Event()
+        engine._register_stop_event(first)
+        engine._register_stop_event(second)
+
+        assert engine.has_active_requests() is True
+        assert await engine.abort_all_requests() == 2
+        assert first.is_set()
+        assert second.is_set()
+
+        # Repeated pressure polls must not count the same request twice.
+        assert await engine.abort_all_requests() == 0
+
+        engine._unregister_stop_event(first)
+        engine._unregister_stop_event(second)
+        assert engine.has_active_requests() is False
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_abort_delegates_to_fallback(self):
+        engine = self._engine()
+        engine._fallback_engine = MagicMock()
+        engine._fallback_engine.abort_all_requests = AsyncMock(return_value=3)
+
+        assert await engine.abort_all_requests() == 3
+        engine._fallback_engine.abort_all_requests.assert_awaited_once()
+
 
 class TestDFlashRuntimeCacheStats:
     """DFlash adapts its dflash-mlx runtime cache to the scheduler stats
@@ -1970,3 +2003,99 @@ class TestSpeculationStats:
             )
         )
         assert engine.get_speculation_stats() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "scenario", ["complete", "abort", "cancel_queued", "cancel_running"]
+)
+async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
+    from dflash_mlx.engine.events import TokenEvent
+
+    from omlx.engine.dflash import DFlashEngine
+    from omlx.exceptions import PrefillMemoryAbortedError
+    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "hello")
+    engine._executor_tokenizer = engine._tokenizer_obj
+
+    def events(**kwargs):
+        def iterate():
+            try:
+                started.set()
+                assert release.wait(30)
+                yield TokenEvent(42, 1, 1.0, 1)
+            finally:
+                closed.set()
+
+        return iterate(), None, set()
+
+    engine._stream_dflash_events = events
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    async def generate():
+        if streaming:
+            return [output async for output in engine.stream_generate([1])][-1]
+        return await engine.generate([1])
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        blocker = None
+        if scenario == "cancel_queued":
+            blocker = executor.submit(release.wait, 30)
+        task = asyncio.create_task(generate())
+        try:
+            async with asyncio.timeout(5):
+                while not engine._active_stop_events:
+                    await asyncio.sleep(0.01)
+                if blocker is None:
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+            if scenario.startswith("cancel"):
+                task.cancel()
+                # Exercise the real 10-second drain timeout, including its
+                # cancellation of the asyncio wrapper around executor work.
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert engine.has_active_requests() is (blocker is None)
+            else:
+                if scenario == "abort":
+                    enforcer = object.__new__(ProcessMemoryEnforcer)
+                    enforcer._engine_pool = SimpleNamespace(
+                        _entries={"test": SimpleNamespace(engine=engine)}
+                    )
+                    assert (
+                        await enforcer._abort_loaded_requests_for_memory_emergency()
+                        == 1
+                    )
+                    assert (
+                        await enforcer._abort_loaded_requests_for_memory_emergency()
+                        == 0
+                    )
+                    assert engine.has_active_requests()
+                release.set()
+                if scenario == "abort":
+                    with pytest.raises(PrefillMemoryAbortedError):
+                        await task
+                else:
+                    assert (await task).finish_reason == "stop"
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            # A barrier proves that cancelled running work has actually exited.
+            await asyncio.wrap_future(executor.submit(lambda: None))
+        assert not engine.has_active_requests()
+        assert not engine._active_stop_events
+        assert closed.is_set() is (blocker is None)
+        assert engine.get_activity_snapshot()["active_requests"] == 0

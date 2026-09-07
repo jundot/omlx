@@ -3025,6 +3025,68 @@ class TestModelExceedsRamGuard:
         assert index.nbytes() == weight.nbytes
         assert _checkpoint_storage_bytes([path]) >= weight.nbytes + scales.nbytes
 
+    def test_qwen4_calibration_charges_only_touched_resident_storage(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        from omlx.oq import _calibration_resident_checkpoint_bytes
+
+        resident = np.zeros((32, 64), dtype=np.float16)
+        ple_weight = np.zeros((256, 20), dtype=np.uint32)
+        ple_scales = np.zeros((256, 5), dtype=np.float16)
+        ple_biases = np.zeros((256, 5), dtype=np.float16)
+        vision = np.zeros((16, 64), dtype=np.float16)
+        lm_head = np.zeros((32, 64), dtype=np.float16)
+        ple = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        tensors = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": resident,
+            f"{ple}.weight": ple_weight,
+            f"{ple}.scales": ple_scales,
+            f"{ple}.biases": ple_biases,
+            "vision_tower.blocks.0.attn.q_proj.weight": vision,
+            "language_model.lm_head.weight": lm_head,
+        }
+        path = tmp_path / "model.safetensors"
+        np_save(tensors, str(path))
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+        }
+
+        deferred = sum(
+            tensor.nbytes
+            for name, tensor in tensors.items()
+            if name.startswith(ple)
+            or name.startswith("vision_tower.")
+            or name.endswith("lm_head.weight")
+        )
+        assert _calibration_resident_checkpoint_bytes(tmp_path, config) == (
+            path.stat().st_size - deferred
+        )
+
+    def test_non_qwen4_resident_accounting_remains_complete_storage(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        from omlx.oq import _calibration_resident_checkpoint_bytes
+
+        path = tmp_path / "model.safetensors"
+        np_save(
+            {
+                "model.layers.0.weight": np.zeros((32, 64), dtype=np.float16),
+                # A similarly named tensor has no mmap contract on other models.
+                "model.ngram_embedding.shards.0.weight": np.zeros(
+                    (128, 64), dtype=np.float16
+                ),
+            },
+            str(path),
+        )
+
+        assert _calibration_resident_checkpoint_bytes(
+            tmp_path, {"model_type": "llama"}
+        ) == path.stat().st_size
+
     @pytest.mark.parametrize("capacity_gib", [16, 32, 64])
     def test_budget_reserves_25_percent_on_smaller_systems(
         self, monkeypatch, capacity_gib
@@ -3078,8 +3140,50 @@ class TestModelExceedsRamGuard:
         assert _calibration_memory_budget(at_limit)["requires_proxy"] is False
         assert _calibration_memory_budget(at_limit + 1)["requires_proxy"] is True
 
+    def test_budget_uses_live_memory_pressure(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: int(72.9 * gib)
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: int(107.5 * gib)
+        )
+
+        budget = _calibration_memory_budget(int(67.0 * gib))
+
+        capacity = int(72.9 * gib)
+        assert budget["capacity_bytes"] == capacity
+        assert budget["model_limit_bytes"] == int(capacity * 0.75)
+        assert budget["requires_proxy"] is True
+
 
 class TestOqeCalibrationBatchPlan:
+    def test_qwen4_calibration_forces_ssd_ple_and_keeps_mtp(self):
+        from omlx.oq import _calibration_model_settings
+
+        settings = _calibration_model_settings(
+            {"model_type": "qwen4_exp"},
+            has_mtp_heads=True,
+            has_mtp_weights=True,
+        )
+
+        assert settings.qwen4_ple_ssd_offload is True
+        assert settings.mtp_enabled is True
+
+    def test_ordinary_non_mtp_calibration_has_no_serving_override(self):
+        from omlx.oq import _calibration_model_settings
+
+        assert (
+            _calibration_model_settings(
+                {"model_type": "llama"},
+                has_mtp_heads=False,
+                has_mtp_weights=False,
+            )
+            is None
+        )
+
     def test_subtracts_lazy_model_footprint(self, monkeypatch):
         from omlx import oq as oq_module
 
@@ -3418,6 +3522,80 @@ class TestBuildProxyForSensitivity:
         assert f"{prefix}.key_proj" not in quantization
         assert f"{prefix}.value_proj" not in quantization
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_qwen4_proxy_quantizes_packed_experts_and_preserves_mtp_vision(
+        self, tmp_path, monkeypatch
+    ):
+        """Exercise the source layout that produced the 263.1 GiB proxy."""
+        from safetensors import safe_open
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        out = tmp_path / "proxy"
+        src.mkdir()
+        config = {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "vision_config": {"hidden_size": 16},
+        }
+        (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        raw = "model.language_model.layers.0.mlp.experts"
+        ngram = (
+            "model.language_model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shard_0"
+        )
+        vision = "model.visual.blocks.0.attn.q_proj.weight"
+        np_save(
+            {
+                f"{raw}.gate_up_proj": np.ones((2, 128, 64), dtype=np.float16),
+                f"{raw}.down_proj": np.ones((2, 64, 64), dtype=np.float16),
+                f"{ngram}.weight": np.ones((4, 160), dtype=np.float16),
+                "mtp.fc_hidden.weight": np.ones((64, 64), dtype=np.float16),
+                vision: np.ones((16, 64), dtype=np.float16),
+            },
+            str(src / "model.safetensors"),
+        )
+
+        def qwen4_sanitize(weights):
+            gate_up = weights.pop(f"{raw}.gate_up_proj")
+            gate, up = mx.split(gate_up, 2, axis=-2)
+            prefix = "language_model.model.layers.0.mlp.switch_mlp"
+            weights[f"{prefix}.gate_proj.weight"] = gate
+            weights[f"{prefix}.up_proj.weight"] = up
+            weights[f"{prefix}.down_proj.weight"] = weights.pop(
+                f"{raw}.down_proj"
+            )
+            return weights
+
+        monkeypatch.setattr(
+            "omlx.oq._build_model_sanitizer",
+            lambda *_args, **_kwargs: qwen4_sanitize,
+        )
+        monkeypatch.setattr("omlx.oq._build_non_quantizable_set", lambda _c: set())
+        _build_streaming_proxy_for_sensitivity(
+            str(src),
+            out,
+            dtype="bfloat16",
+            preserve_mtp=True,
+        )
+
+        keys = set()
+        for path in out.glob("*.safetensors"):
+            with safe_open(str(path), framework="numpy") as file:
+                keys.update(file.keys())
+        prefix = "language_model.model.layers.0.mlp.switch_mlp"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            assert f"{prefix}.{projection}.scales" in keys
+        assert not any("mlp.experts.gate_up_proj" in key for key in keys)
+        assert f"{ngram}.scales" in keys
+        assert "mtp.fc_hidden.scales" in keys
+        assert vision in keys
+        assert vision.removesuffix(".weight") + ".scales" not in keys
+
+        quantization = json.loads((out / "config.json").read_text())["quantization"]
+        assert quantization[ngram]["group_size"] == 32
+
 
 class TestSensitivityRequiredEnforcement:
     """Regression tests: quantize_oq_streaming must abort when sensitivity
@@ -3585,7 +3763,9 @@ class TestSensitivityRequiredEnforcement:
 
         assert not proxy.exists()
 
-    def test_oqe_uses_proxy_when_source_exceeds_live_limit(self, tmp_path, monkeypatch):
+    def test_proxy_reuses_prebuild_live_budget(
+        self, tmp_path, monkeypatch
+    ):
         if not HAS_MLX:
             pytest.skip("mlx not available")
         from safetensors.numpy import save_file as np_save
@@ -3600,7 +3780,10 @@ class TestSensitivityRequiredEnforcement:
 
         from omlx import oq as oq_module
 
-        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        system_available = MagicMock(side_effect=[1000, 1])
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", system_available
+        )
         monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
         proxy = tmp_path / "proxy"
         build_proxy = MagicMock()
@@ -3628,6 +3811,7 @@ class TestSensitivityRequiredEnforcement:
             )
 
         build_proxy.assert_called_once()
+        system_available.assert_called_once()
         assert not proxy.exists()
 
 
@@ -4974,6 +5158,110 @@ class TestBuildModelSanitizerMiniMaxCompat:
         assert sanitize({"weight": 1}) == {"weight": 1}
 
 
+class TestBuildModelSanitizerQwen4Compat:
+    def test_qwen4_applies_compat_before_model_lookup(self, monkeypatch):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.oq import _build_model_sanitizer
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _FakeModel:
+            @staticmethod
+            def sanitize(_proxy, weights):
+                return weights
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+            VisionModel=object,
+            LanguageModel=object,
+        )
+        applied = []
+
+        def unsupported_get_model_and_args(_config):
+            raise ValueError("Model type qwen4_exp not supported")
+
+        def apply_compat_patch():
+            applied.append(True)
+            vlm_utils.get_model_and_args = lambda _config: (fake_module, "qwen4_exp")
+            return True
+
+        monkeypatch.setattr(
+            vlm_utils,
+            "get_model_and_args",
+            unsupported_get_model_and_args,
+        )
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat."
+            "apply_mlx_vlm_qwen4_exp_compat_patch",
+            apply_compat_patch,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.sanitize_weights",
+            lambda _model, weights, _config: weights,
+        )
+        config = {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "num_hidden_layers": 1,
+                "hidden_size": 16,
+            },
+            "vision_config": {"hidden_size": 8},
+        }
+
+        sanitize = _build_model_sanitizer(config, text_only=False)
+
+        assert applied == [True]
+        assert sanitize is not None
+
+    def test_qwen4_model_path_binds_mmap_and_preserve_mtp(
+        self, tmp_path, monkeypatch
+    ):
+        from omlx import oq
+
+        configured = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            oq,
+            "_configure_qwen4_exp_quantization_runtime",
+            configured,
+        )
+        # The registration behavior itself is covered above; this assertion
+        # isolates the path/MTP state passed by quantization call sites.
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat."
+            "apply_mlx_vlm_qwen4_exp_compat_patch",
+            lambda: True,
+        )
+        oq._build_model_sanitizer(
+            {
+                "model_type": "qwen4_exp",
+                "architectures": [],
+                "text_config": {"model_type": "qwen4_exp_text"},
+            },
+            model_path=tmp_path,
+            preserve_mtp=True,
+        )
+
+        configured.assert_called_once()
+        assert configured.call_args.args[0] == tmp_path
+        assert configured.call_args.args[1]["model_type"] == "qwen4_exp"
+        assert configured.call_args.kwargs == {"preserve_mtp": True}
+
+
 # =============================================================================
 # Test _vlm_sanitize proxy exposes the gemma-4 audio-guard attributes
 # =============================================================================
@@ -5321,6 +5609,78 @@ class TestCollectImatrixTextLoad:
 
         assert "trust_remote_code" not in mock_load.call_args.kwargs
 
+    def test_vlm_proxy_passes_lenient_load_directly(self, monkeypatch):
+        """SSD-mapped proxy tensors are not normal model parameters.
+
+        The supported mlx-vlm ``strict`` option must reach load_model itself;
+        patching Module.load_weights globally did not reliably affect the real
+        Qwen4 proxy load and rejected every retained PLE shard.
+        """
+        import omlx.utils.model_loading as model_loading
+
+        from omlx import oq as oq_mod
+
+        vlm_load = MagicMock(return_value=MagicMock())
+        tokenizer_load = MagicMock(return_value=MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_vlm.utils", MagicMock(load_model=vlm_load)
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_lm.tokenizer_utils",
+            MagicMock(load=tokenizer_load),
+        )
+        monkeypatch.setattr(
+            model_loading, "_checkpoint_has_mtp_weights", lambda _path: False
+        )
+        monkeypatch.setattr(model_loading, "_has_mtp_heads", lambda _config: False)
+        monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", MagicMock())
+        monkeypatch.setattr(
+            oq_mod, "_collect_imatrix_from_model", MagicMock(return_value=({}, {}))
+        )
+
+        oq_mod._collect_imatrix(
+            "/fake/qwen4-proxy",
+            {
+                "model_type": "qwen4_exp",
+                "vision_config": {"hidden_size": 8},
+                "text_config": {"model_type": "qwen4_exp_text"},
+            },
+            trust_remote_code=True,
+        )
+
+        assert vlm_load.call_args.kwargs["strict"] is False
+        assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+
+    def test_empty_collection_reports_the_failed_stage(self, monkeypatch, tmp_path):
+        from omlx import oq as oq_mod
+
+        monkeypatch.setattr(
+            oq_mod,
+            "_collect_imatrix",
+            MagicMock(
+                return_value=(
+                    {},
+                    {
+                        "failure_stage": "collector_install",
+                        "failure_reason": "no supported capture modules found",
+                    },
+                )
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="stage=collector_install"):
+            oq_mod._load_or_collect_imatrix(
+                str(tmp_path),
+                {},
+                cache_path=str(tmp_path / "imatrix.npz"),
+                reuse_cache=False,
+                num_samples=1,
+                seq_length=8,
+                strict=False,
+                trust_remote_code=False,
+            )
+
 
 class TestMeasureSensitivityQuantizedVlm:
     def test_quantized_vlm_proxy_uses_vlm_loader(self, monkeypatch):
@@ -5375,6 +5735,7 @@ class TestMeasureSensitivityQuantizedVlm:
         assert vlm_load.call_args.args[0] == Path("/fake/minimax-proxy")
         assert vlm_load.call_args.kwargs["lazy"] is True
         assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+        assert vlm_load.call_args.kwargs["strict"] is False
         tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
         lm_load.assert_not_called()
 

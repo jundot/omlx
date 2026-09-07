@@ -83,6 +83,13 @@ def _has_quantized_cache(cache) -> bool:
     return cache is not None and hasattr(cache, "bits")
 
 
+def _bounded_sdpa_fallback(queries, keys, values, scale, mask, sinks):
+    """Keep the registered O(L) contract if the steel kernel itself fails."""
+    from .sdpa256_attention import _flash_sdpa256
+
+    return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
+
+
 def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
     """Size the dispatch budget from the kernel's measured throughput.
 
@@ -190,14 +197,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     if steel_env == "0":
         return False
     if steel_env != "1" and is_nax_available():
-        # Auto: on NAX GPUs (M5 family) stock SDPA's head_dim-256 fallback
-        # runs its matmuls on the tensor units and beats this pre-NAX steel
-        # kernel, so routing it would regress prefill (M5 Max report:
-        # 4k pp 828 -> 400 tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the
-        # kernel on for benchmarking; a NAX port of this kernel is the
-        # tracked follow-up.
+        # Auto: MLX 0.32.2 selects its native split-D fused kernel for NAX
+        # head-dim-256 causal prefills with at least 1024 queries. It beats
+        # this pre-NAX steel kernel, so intercepting it would regress prefill.
+        # OMLX_FA256_STEEL=1 still forces the kernel for benchmarking.
         logger.info(
-            "Qwen FA-256 steel patch skipped: NAX GPU, stock SDPA is faster"
+            "Qwen FA-256 steel patch skipped: NAX GPU, MLX native fused SDPA "
+            "is faster"
         )
         return False
 
@@ -263,7 +269,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                         dispatch_budget=dispatch_budget,
                     )
                 except Exception:
-                    logger.warning("fa256 steel lm kernel failed", exc_info=True)
+                    logger.warning(
+                        "fa256 steel lm kernel failed; using bounded MLX SDPA",
+                        exc_info=True,
+                    )
+                    return _bounded_sdpa_fallback(
+                        queries, keys, values, scale, mask, sinks
+                    )
             return original_lm_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
         mlx_base.scaled_dot_product_attention = patched_lm_sdpa
@@ -313,7 +325,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                             dispatch_budget=dispatch_budget,
                         )
                     except Exception:
-                        logger.warning("fa256 steel vlm kernel failed", exc_info=True)
+                        logger.warning(
+                            "fa256 steel vlm kernel failed; using bounded MLX SDPA",
+                            exc_info=True,
+                        )
+                        return _bounded_sdpa_fallback(
+                            queries, keys, values, scale, mask, sinks
+                        )
                 return original_vlm_sdpa(
                     queries, keys, values, cache, scale, mask, sinks
                 )
@@ -332,6 +350,20 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         pass
 
     if patched_any:
+        try:
+            from .. import memory_monitor
+
+            memory_monitor.register_tiled_prefill_head_dim(
+                256,
+                min_query_len=_MIN_ROUTE_Q_LEN,
+                min_kv_len=min_kv_len,
+                kv_tile=1024,
+            )
+        except Exception:
+            logger.debug(
+                "could not register Qwen FA-256 with memory_monitor",
+                exc_info=True,
+            )
         _PATCHED = True
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "

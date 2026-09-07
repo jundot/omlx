@@ -831,7 +831,7 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
 } // namespace
 
 bool is_nax_available() {
-  // Mirror of mlx::core::metal::is_nax_available() (mlx v0.32.0 device.cpp),
+  // Mirror of mlx::core::metal::is_nax_available() (mlx v0.32.2 device.cpp),
   // which libmlx does not export: macOS >= 26.2 and applegpu gen >= 17
   // ('p'-suffix parts need gen >= 18).
   static bool available = []() {

@@ -162,7 +162,12 @@ class _FakeScheduler:
         self._prefill_transient_tracker = MagicMock()
 
     def preflight_or_raise(
-        self, *, num_prompt_tokens, cached_tokens=0, request_id=None
+        self,
+        *,
+        num_prompt_tokens,
+        cached_tokens=0,
+        request_id=None,
+        text_only=False,
     ):
         if num_prompt_tokens > self.boundary:
             raise PrefillMemoryExceededError(

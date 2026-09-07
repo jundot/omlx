@@ -951,7 +951,6 @@ class TestStaticCeiling:
             result = enforcer._get_static_ceiling()
         assert result == 10 * 1024**3
 
-
 class TestDynamicCeilingActiveRatio:
     """Dynamic ceiling sums free + inactive + active * tier ratio
     (host_statistics64 path) for safe / balanced / aggressive."""

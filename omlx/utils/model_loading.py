@@ -400,7 +400,7 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
-    - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
+    - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
     - mlx-vlm side MTP runtime + nested-visual patches when ``for_vlm`` is
@@ -416,8 +416,14 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    Both patches inject modules into ``sys.modules`` and replace mlx-lm
-    internals; gating keeps non-affected models at zero cost.
+    - mlx-vlm MLX 0.32.2 compatibility backport when ``for_vlm`` is True.
+      This installs before model-module imports and carries only upstream PRs
+      #1949, #1982, and #2006, without moving the deliberately stable mlx-vlm
+      pin.
+    Some model patches inject modules into ``sys.modules`` or replace mlx-lm
+    internals; the mlx-vlm compatibility hook instead transforms only the
+    affected pinned sources as they load. Gating keeps non-affected models at
+    zero cost.
 
     Safe to call repeatedly; the patches are idempotent.
     """
@@ -429,6 +435,13 @@ def maybe_apply_pre_load_patches(
     set_mtp_active(False)
 
     _patch_mlx_lm_load_config()
+
+    if for_vlm:
+        from ..patches.mlx_vlm_mlx0322_compat import (
+            apply_mlx_vlm_mlx0322_compat_patch,
+        )
+
+        apply_mlx_vlm_mlx0322_compat_patch()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm
     # around the defective M5 NAX kernels (issue #2267). Install is cheap

@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import shutil
+import struct as _struct
 import tempfile
 import time as _time
 from dataclasses import dataclass
@@ -54,6 +55,37 @@ _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\."
     r"(?:shard_\d+|shards\.\d+)$"
 )
+
+
+def _is_qwen4_exp_config(config: dict) -> bool:
+    """Return whether *config* selects the Qwen4-Exp/Flash-Next family."""
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        text_config = {}
+    return any(
+        str(model_type or "").lower().startswith("qwen4_exp")
+        for model_type in (config.get("model_type"), text_config.get("model_type"))
+    )
+
+
+def _configure_qwen4_exp_quantization_runtime(
+    model_path: str | Path,
+    config: dict,
+    *,
+    preserve_mtp: bool,
+) -> bool:
+    """Register Qwen4 and bind its mmap PLE/MTP state for quantization."""
+    if not _is_qwen4_exp_config(config):
+        return False
+    from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+
+    configure_qwen4_exp_runtime(
+        model_path,
+        mode="mmap",
+        mtp_enabled=bool(preserve_mtp),
+    )
+    return True
+
 
 _MAX_MODEL_RAM_FRACTION = 0.75
 
@@ -150,6 +182,28 @@ def _is_vlm_load(config: dict) -> bool:
     return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
         _has_vision_subconfig(config)
         and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    )
+
+
+def _calibration_model_settings(
+    config: dict,
+    *,
+    has_mtp_heads: bool,
+    has_mtp_weights: bool,
+):
+    """Build the temporary serving settings used by calibration loads."""
+    mtp_enabled = bool(has_mtp_heads and has_mtp_weights)
+    if not mtp_enabled and not _is_qwen4_exp_config(config):
+        return None
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mtp_enabled=mtp_enabled,
+        mtp_num_draft_tokens=1,
+        # Calibration executes Qwen4 PLE, but only as sparse row gathers.
+        # Force the existing SSD mmap path even when a compact proxy falls
+        # below serving's automatic offload threshold.
+        qwen4_ple_ssd_offload=_is_qwen4_exp_config(config),
     )
 
 
@@ -340,14 +394,7 @@ def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
     forms so proxy construction and final streaming quantization use the same
     policy.
     """
-    text_config = config.get("text_config")
-    if not isinstance(text_config, dict):
-        text_config = {}
-    model_types = (
-        str(config.get("model_type") or "").lower(),
-        str(text_config.get("model_type") or "").lower(),
-    )
-    if not any(model_type.startswith("qwen4_exp") for model_type in model_types):
+    if not _is_qwen4_exp_config(config):
         return False
     return _QWEN4_EXP_NGRAM_SHARD_RE.search(_normalize_quant_path(path)) is not None
 
@@ -3226,7 +3273,11 @@ def estimate_bpw_and_size(
     # the raw header names when discovery is unavailable.
     plan_view = None
     try:
-        _sanitize_fn = _build_model_sanitizer(config)
+        _sanitize_fn = _build_model_sanitizer(
+            config,
+            model_path=source,
+            preserve_mtp=preserve_mtp,
+        )
         if _sanitize_fn is not None:
             _plan = _discover_sanitize_plan(_sanitize_fn, idx)
             if _plan:
@@ -3484,6 +3535,51 @@ def _checkpoint_storage_bytes(weight_files) -> int:
     return total
 
 
+def _calibration_resident_checkpoint_bytes(
+    model_path: str | Path,
+    config: dict,
+) -> int:
+    """Estimate checkpoint bytes touched by calibration model forwards.
+
+    Ordinary architectures retain the historical complete-file accounting.
+    Qwen4-Exp calibration reads PLE rows through SSD mmap and its manual text
+    layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
+    Safetensors headers and every other tensor remain charged to the model.
+    """
+    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
+    if not _is_qwen4_exp_config(config):
+        return checkpoint_bytes
+
+    deferred_bytes = 0
+    for path in weight_files:
+        try:
+            with path.open("rb") as file:
+                raw_size = file.read(8)
+                if len(raw_size) != 8:
+                    continue
+                header_size = _struct.unpack("<Q", raw_size)[0]
+                header = json.loads(file.read(header_size))
+        except (OSError, ValueError, _struct.error):
+            # Failure to classify a file stays conservative: charge it all.
+            continue
+        for tensor_name, metadata in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            if not (
+                _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+                or _is_vision_tensor(tensor_name)
+                or tensor_name.endswith("lm_head.weight")
+            ):
+                continue
+            try:
+                start, end = metadata["data_offsets"]
+                deferred_bytes += max(0, int(end) - int(start))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return max(0, checkpoint_bytes - deferred_bytes)
+
+
 def _calibration_memory_budget(
     checkpoint_bytes: int = 0,
     *,
@@ -3492,9 +3588,9 @@ def _calibration_memory_budget(
     """Return the live memory budget for full-model calibration forwards.
 
     Apple Silicon uses unified memory, but Metal exposes a recommended working
-    set that can be smaller than physical RAM.  The safe capacity is therefore
+    set that can be smaller than physical RAM. The safe capacity is therefore
     the smaller positive value of live system memory and remaining Metal
-    working-set memory.  A proportional 25% reserve scales down to 16/32 GiB
+    working-set memory. A proportional 25% reserve scales down to 16/32 GiB
     machines without imposing a fixed reserve that would reject every model.
     """
     system_available = _system_available_memory_bytes()
@@ -3791,7 +3887,13 @@ def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     return w_mx
 
 
-def _build_model_sanitizer(config: dict, text_only: bool = False):
+def _build_model_sanitizer(
+    config: dict,
+    text_only: bool = False,
+    *,
+    model_path: str | Path | None = None,
+    preserve_mtp: bool = False,
+):
     """Build a sanitize function from the model class.
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
@@ -3819,6 +3921,27 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
     ) and not (text_only or mlx_lm_text_only)
+
+    # Serving normally registers oMLX's vendored Qwen4 implementation before
+    # mlx-vlm class lookup. Quantization does not pass through that loader.
+    # Without this setup the lookup fails, sanitize is skipped, and the raw
+    # packed MoE tensors (which lack a ``.weight`` suffix) remain BF16.
+    if _is_qwen4_exp_config(config):
+        try:
+            if model_path is not None:
+                _configure_qwen4_exp_quantization_runtime(
+                    model_path,
+                    config,
+                    preserve_mtp=preserve_mtp,
+                )
+            else:
+                from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+                    apply_mlx_vlm_qwen4_exp_compat_patch,
+                )
+
+                apply_mlx_vlm_qwen4_exp_compat_patch()
+        except Exception as patch_err:
+            logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
         try:
@@ -4349,8 +4472,6 @@ def _gs_for_mode(bits: int, default_gs: int) -> int:
 
 
 # --- chunked-quantize helpers (added for Qwen3.5-397B) ---------------------
-import struct as _struct
-
 import numpy as _np
 
 
@@ -5737,7 +5858,8 @@ def quantize_oq_streaming(
         logger.info(
             f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
             f"exceeds {int(_MAX_MODEL_RAM_FRACTION * 100)}% of calibration "
-            f"capacity ({_format_size(int(_calibration_budget['capacity_bytes']))}; "
+            "capacity "
+            f"({_format_size(int(_calibration_budget['capacity_bytes']))}; "
             f"limit={_format_size(int(_calibration_budget['model_limit_bytes']))}, "
             "system available="
             f"{_format_size(int(_calibration_budget['system_available_bytes']))}, "
@@ -5778,25 +5900,27 @@ def quantize_oq_streaming(
                 preserve_mtp=preserve_mtp,
             )
             proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
-            proxy_budget = _calibration_memory_budget(
-                proxy_bytes,
-                fallback_system_bytes=_system_ram,
+            proxy_resident_bytes = _calibration_resident_checkpoint_bytes(
+                candidate,
+                config,
             )
-            if int(proxy_budget["capacity_bytes"]) > 0 and bool(
-                proxy_budget["requires_proxy"]
-            ):
+            prebuild_capacity = int(_calibration_budget["capacity_bytes"])
+            prebuild_limit = int(_calibration_budget["model_limit_bytes"])
+            if prebuild_capacity > 0 and proxy_resident_bytes > prebuild_limit:
                 shutil.rmtree(candidate, ignore_errors=True)
                 raise RuntimeError(
-                    "calibration proxy is still too large for the live memory "
-                    f"budget (proxy={_format_size(proxy_bytes)}, "
-                    f"limit={_format_size(int(proxy_budget['model_limit_bytes']))}, "
-                    f"capacity={_format_size(int(proxy_budget['capacity_bytes']))})"
+                    "calibration proxy is still too large for the pre-build live "
+                    f"memory budget (proxy={_format_size(proxy_bytes)}, "
+                    f"resident={_format_size(proxy_resident_bytes)}, "
+                    f"limit={_format_size(prebuild_limit)}, "
+                    f"capacity={_format_size(prebuild_capacity)})"
                 )
             _ram_safe_proxy_dir = candidate
             logger.info(
                 f"oQ{oq_level:g}: calibration proxy size "
-                f"{_format_size(proxy_bytes)} within "
-                f"{_format_size(int(proxy_budget['model_limit_bytes']))} limit"
+                f"{_format_size(proxy_bytes)} on disk, resident calibration "
+                f"footprint {_format_size(proxy_resident_bytes)} within "
+                f"{_format_size(prebuild_limit)} pre-build live memory limit"
             )
         return _ram_safe_proxy_dir
 
@@ -5996,7 +6120,12 @@ def quantize_oq_streaming(
     )
 
     # --- Sanitize-plan discovery ------------------------------------------
-    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
+    sanitize_fn = _build_model_sanitizer(
+        config,
+        text_only=text_only,
+        model_path=source,
+        preserve_mtp=preserve_mtp,
+    )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     # When preserve_mtp is True, the patched sanitize functions
     # (mlx_lm_mtp/qwen35_model.py and mlx_vlm_mtp/qwen35_vlm_model.py)
@@ -7638,11 +7767,33 @@ def _collect_imatrix_from_model(
         seq_length=seq_length,
     )
     if calib_data is None:
-        return {}, {"dataset": calib_dataset, "processed_samples": 0}
+        return {}, {
+            "dataset": calib_dataset,
+            "processed_samples": 0,
+            "failure_stage": "dataset",
+            "failure_reason": "calibration dataset produced no usable samples",
+        }
 
     embed_fn, layers = _find_model_layers(model)
     if embed_fn is None or layers is None:
-        return {}, {"dataset": calib_dataset, "processed_samples": 0}
+        return {}, {
+            "dataset": calib_dataset,
+            "processed_samples": 0,
+            "model_class": f"{type(model).__module__}.{type(model).__name__}",
+            "failure_stage": "layer_discovery",
+            "failure_reason": "no embedding function or decoder layers found",
+        }
+
+    layer_model = _find_layer_model(model, layers)
+    layer_args = getattr(layer_model, "args", None)
+    layer_config = getattr(layer_model, "config", None)
+    layer_model_type = str(
+        getattr(layer_args, "model_type", "")
+        or getattr(layer_config, "model_type", "")
+        or getattr(model, "model_type", "")
+        or ""
+    )
+    layer_count = len(layers)
 
     collector = OQImatrixCollector()
     installed = collector.install(model)
@@ -7651,6 +7802,16 @@ def _collect_imatrix_from_model(
             "dataset": calib_dataset,
             "installed_modules": 0,
             "processed_samples": 0,
+            "model_class": f"{type(model).__module__}.{type(model).__name__}",
+            "layer_model_class": (
+                f"{type(layer_model).__module__}.{type(layer_model).__name__}"
+                if layer_model is not None
+                else None
+            ),
+            "layer_model_type": layer_model_type,
+            "layer_count": layer_count,
+            "failure_stage": "collector_install",
+            "failure_reason": "no supported capture modules found",
         }
 
     available_samples = int(calib_data.shape[0])
@@ -7673,6 +7834,10 @@ def _collect_imatrix_from_model(
     micro_batch_size = int(batch_plan["micro_batch_size"])
     processed_samples = 0
     micro_batches = 0
+    layer_state_kind = None
+    successful_layer_forwards = 0
+    skipped_layer_forwards = 0
+    mtp_head_forwards = 0
     rounds: list[dict[str, Any]] = []
     require_expert_counts = _imatrix_requires_expert_counts(
         config, collector.switch_capture_modules
@@ -7702,6 +7867,10 @@ def _collect_imatrix_from_model(
                 inputs, layer_masks, position_ids = _prepare_layer_inputs(
                     model, layers, batch, inputs
                 )
+                if isinstance(position_ids, dict):
+                    layer_state_kind = position_ids.get("kind")
+                elif layer_state_kind is None:
+                    layer_state_kind = "generic"
 
                 inner = getattr(model, "language_model", None) or model
                 args = getattr(inner, "args", None)
@@ -7728,7 +7897,9 @@ def _collect_imatrix_from_model(
                         layer_idx=layer_idx,
                     )
                     if out is None:
+                        skipped_layer_forwards += 1
                         continue
+                    successful_layer_forwards += 1
                     mx.eval(out)
                     inputs = out
                     # DSpark config uses one-based completed layer depths,
@@ -7754,6 +7925,7 @@ def _collect_imatrix_from_model(
                     inputs,
                     dspark_hiddens=dspark_hiddens,
                 ):
+                    mtp_head_forwards += 1
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -7853,6 +8025,18 @@ def _collect_imatrix_from_model(
         "micro_batches": micro_batches,
         "batch_plan": batch_plan,
         "processed_samples": processed_samples,
+        "model_class": f"{type(model).__module__}.{type(model).__name__}",
+        "layer_model_class": (
+            f"{type(layer_model).__module__}.{type(layer_model).__name__}"
+            if layer_model is not None
+            else None
+        ),
+        "layer_model_type": layer_model_type,
+        "layer_count": layer_count,
+        "layer_state_kind": layer_state_kind,
+        "successful_layer_forwards": successful_layer_forwards,
+        "skipped_layer_forwards": skipped_layer_forwards,
+        "mtp_head_forwards": mtp_head_forwards,
         "installed_modules": installed,
         "capture_module_classes": dict(
             sorted(collector.capture_module_classes.items())
@@ -7864,6 +8048,19 @@ def _collect_imatrix_from_model(
         "coverage": coverage,
         "rounds": rounds,
     }
+    if not collector.entries:
+        metadata["failure_stage"] = "layer_forward"
+        if successful_layer_forwards == 0:
+            metadata["failure_reason"] = (
+                "no decoder layer forward completed successfully"
+            )
+        else:
+            metadata["failure_stage"] = "capture"
+            metadata["failure_reason"] = (
+                f"{installed} hooks were installed and "
+                f"{successful_layer_forwards} layer forwards completed, "
+                "but no hook captured a compatible activation"
+            )
     return collector.entries, metadata
 
 
@@ -7888,14 +8085,11 @@ def _collect_imatrix(
     is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
-    calibration_settings = None
-    if has_mtp_heads and has_mtp_weights:
-        from types import SimpleNamespace
-
-        calibration_settings = SimpleNamespace(
-            mtp_enabled=True,
-            mtp_num_draft_tokens=1,
-        )
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
     patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
     if calibration_settings is not None:
         patch_kwargs["model_settings"] = calibration_settings
@@ -7929,24 +8123,19 @@ def _collect_imatrix(
 
     try:
         if is_vlm:
-            import mlx.nn as _nn
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            _orig_lw = _nn.Module.load_weights
-
-            def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
-                kwargs.pop("strict", None)
-                return _orig_lw(self, file_or_weights, *args, strict=False, **kwargs)
-
-            _nn.Module.load_weights = _lenient_load_weights
-            try:
-                model = vlm_load_model(
-                    Path(model_path),
-                    lazy=True,
-                    trust_remote_code=trust_remote_code,
-                )
-            finally:
-                _nn.Module.load_weights = _orig_lw
+            # Calibration proxies deliberately retain SSD-mapped tensors that
+            # are consumed by model-specific mmap modules rather than owned as
+            # normal MLX parameters (Qwen4 PLE shards are the primary case).
+            # mlx-vlm exposes ``strict`` specifically for this final weight
+            # load; pass it directly instead of monkeypatching Module globally.
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+                strict=False,
+            )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
@@ -7961,13 +8150,13 @@ def _collect_imatrix(
             )
     except Exception as e:
         logger.error("oQe imatrix: model load failed (%s)", e)
-        return {}, {"dataset": calib_dataset, "processed_samples": 0}
+        raise RuntimeError(f"oQe imatrix model load failed: {e}") from e
     finally:
         if restore_mtp_active is not None:
             restore_mtp_active()
 
     try:
-        model_bytes = _checkpoint_storage_bytes(Path(model_path).glob("*.safetensors"))
+        model_bytes = _calibration_resident_checkpoint_bytes(model_path, config)
         return _collect_imatrix_from_model(
             model,
             tokenizer,
@@ -8086,7 +8275,16 @@ def _load_or_collect_imatrix(
         progress_end=progress_end,
     )
     if not entries:
-        raise RuntimeError("oQe imatrix collection produced no entries")
+        stage = str(collection_metadata.get("failure_stage", "unknown"))
+        reason = str(
+            collection_metadata.get(
+                "failure_reason", "collector returned no captured activations"
+            )
+        )
+        raise RuntimeError(
+            "oQe imatrix collection produced no entries "
+            f"(stage={stage}: {reason})"
+        )
     metadata = {
         **expected,
         "entry_count": len(entries),
@@ -8228,14 +8426,11 @@ def _measure_sensitivity(
     # Reuse the centralised pre-load dispatch so every current and future
     # patch (MTP sanitize, DeepSeek V4, nested-visual, load_config, …) is
     # applied exactly as in the production load path.
-    calibration_settings = None
-    if has_mtp_heads and has_mtp_weights:
-        from types import SimpleNamespace
-
-        calibration_settings = SimpleNamespace(
-            mtp_enabled=True,
-            mtp_num_draft_tokens=1,
-        )
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
     patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
     if calibration_settings is not None:
         patch_kwargs["model_settings"] = calibration_settings
@@ -8265,31 +8460,17 @@ def _measure_sensitivity(
 
     try:
         if is_vlm:
-            import mlx.nn as _nn
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            # mlx_vlm.load_model calls model.load_weights(weights) without strict=False.
-            # Shared-KV models (e.g. Gemma 4 2B/4B) omit k/v weights for shared layers,
-            # so strict=True raises ValueError. Relax temporarily — sensitivity only needs
-            # approximate weights; shared layers receive pre-computed KV at inference time.
-            _orig_lw = _nn.Module.load_weights
-
-            def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
-                kwargs.pop("strict", None)
-                return _orig_lw(self, file_or_weights, *args, strict=False, **kwargs)
-
-            _nn.Module.load_weights = _lenient_load_weights
-            try:
-                # No QAT config override needed here: mlx_vlm.utils.load_model
-                # uses quantization_config.get("quant_method") rather than direct
-                # key access, so a missing quant_method falls through silently.
-                model = vlm_load_model(
-                    Path(model_path),
-                    lazy=True,
-                    trust_remote_code=trust_remote_code,
-                )
-            finally:
-                _nn.Module.load_weights = _orig_lw
+            # Sensitivity uses the same proxy representation as imatrix
+            # calibration. Allow intentionally unowned mmap/shared-KV tensors
+            # through mlx-vlm's supported load option.
+            model = vlm_load_model(
+                Path(model_path),
+                lazy=True,
+                trust_remote_code=trust_remote_code,
+                strict=False,
+            )
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
@@ -8430,7 +8611,12 @@ def _build_streaming_proxy_for_sensitivity(
         raise ValueError(f"No .safetensors files found in {model_path}")
 
     all_weights = _LazyTensorIndex(weight_files, config=config)
-    sanitize_fn = _build_model_sanitizer(config, text_only=False)
+    sanitize_fn = _build_model_sanitizer(
+        config,
+        text_only=False,
+        model_path=source,
+        preserve_mtp=preserve_mtp,
+    )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     if sanitize_fn is not None:
         try:
@@ -8649,14 +8835,11 @@ def _measure_sensitivity_from_quantized_model(
     is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
-    calibration_settings = None
-    if has_mtp_heads and has_mtp_weights:
-        from types import SimpleNamespace
-
-        calibration_settings = SimpleNamespace(
-            mtp_enabled=True,
-            mtp_num_draft_tokens=1,
-        )
+    calibration_settings = _calibration_model_settings(
+        config,
+        has_mtp_heads=has_mtp_heads,
+        has_mtp_weights=has_mtp_weights,
+    )
     patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
     if calibration_settings is not None:
         patch_kwargs["model_settings"] = calibration_settings
@@ -8693,6 +8876,11 @@ def _measure_sensitivity_from_quantized_model(
                 Path(model_path),
                 lazy=True,
                 trust_remote_code=trust_remote_code,
+                # Quantized calibration proxies may retain model-specific
+                # tensors consumed directly by mmap modules rather than
+                # represented as ordinary MLX parameters (Qwen4 PLE shards).
+                # Match the imatrix and non-proxy sensitivity load paths.
+                strict=False,
             )
             tokenizer = load_tokenizer(Path(model_path))
         else:

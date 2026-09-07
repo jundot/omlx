@@ -38,6 +38,7 @@ target_sources(
   ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_sparse_gqa.cpp
   ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
 target_include_directories(
   omlx_glm_kernel_ops
@@ -57,6 +58,7 @@ if(MLX_BUILD_METAL)
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
+      ${CMAKE_CURRENT_LIST_DIR}/qwen4_qsa_sparse_gqa.metal
       ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal)
   file(GLOB_RECURSE OMLX_GLM_METAL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/*.h

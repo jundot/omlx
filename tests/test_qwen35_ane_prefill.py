@@ -3217,6 +3217,7 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
@@ -3246,6 +3247,55 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
     assert status["configured"] is False
     assert status["shed"] is True
     assert status["resident_programs"] == 0
+
+
+def test_release_clears_the_state_cache_that_pins_the_same_states():
+    import gc
+
+    model = _ReleasableModel()
+    mlp_handle = _NativeHandle()
+    gdn_handle = _NativeHandle()
+    mlp_ref = weakref.ref(mlp_handle)
+    gdn_ref = weakref.ref(gdn_handle)
+    mlp_state = SimpleNamespace(model=mlp_handle)
+    gdn_state = SimpleNamespace(model=gdn_handle)
+    model.mlp._omlx_ane_prefill_state = mlp_state
+    # _compile_pair and _compile_gdn cache the state per module, so this is a
+    # second reference to everything the release drops.
+    model.mlp._omlx_ane_prefill_cache = {("mlp-key",): mlp_state}
+    model.gdn._omlx_ane_gdn_state = gdn_state
+    model.gdn._omlx_ane_gdn_cache = {("gdn-key",): gdn_state}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del mlp_state, gdn_state, mlp_handle, gdn_handle
+    gc.collect()
+
+    assert released == 2
+    assert mlp_ref() is None
+    assert gdn_ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
+    assert model.gdn._omlx_ane_gdn_cache == {}
+
+
+def test_release_clears_a_stale_state_cache_entry():
+    import gc
+
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    # An entry can outlive its state attribute -- an earlier release, or a
+    # slice replaced at a different chunk width.
+    model.mlp._omlx_ane_prefill_cache = {("stale",): SimpleNamespace(model=handle)}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    # Nothing to latch, so nothing counts as released -- but the bank the entry
+    # pinned still has to be handed back.
+    assert released == 0
+    assert ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
 
 
 def test_release_is_idempotent_and_noop_without_slices():

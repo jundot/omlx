@@ -334,3 +334,110 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_tokens_is_persisted_not_dropped():
+    """#2823: mtp_num_draft_tokens used to be silently discarded by PUT."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(mtp_num_draft_tokens=None)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+    )
+
+    assert settings.mtp_num_draft_tokens == 8
+    assert result["settings"]["mtp_num_draft_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
+    """Same silent-drop class as #2823 for the other two engine settings."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings(
+        preserve_thinking=False,
+        turboquant_skip_last=True,
+    )
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            preserve_thinking=True,
+            turboquant_skip_last=False,
+        ),
+    )
+
+    assert settings.preserve_thinking is True
+    assert settings.turboquant_skip_last is False
+    assert result["settings"]["preserve_thinking"] is True
+    assert result["settings"]["turboquant_skip_last"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, 9])
+async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
+    pool, _ = _failed_pool()
+
+    with pytest.raises(admin_routes.HTTPException, match="must be between 1 and 8"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=value),
+        )
+
+
+def test_unknown_settings_fields_are_rejected_loudly():
+    """Unknown keys must 422 instead of silently returning success:true."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="bogus_field"):
+        # Simulate a client sending a field that has no admin-PUT support.
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8, bogus_field=1)
+
+
+@pytest.mark.asyncio
+async def test_turboquant_skip_last_null_preserves_default_true():
+    """null = clear to the model default; it must not flip the default to
+    False via bool(None) (review feedback on the silent-drop fix)."""
+    pool, _ = _failed_pool()
+    settings = ModelSettings()  # default turboquant_skip_last=True
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(turboquant_skip_last=None),
+    )
+
+    assert settings.turboquant_skip_last is True
+    assert result["settings"]["turboquant_skip_last"] is True
+
+
+def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
+    """mtp_num_draft_tokens must be part of the engine runtime signature only
+    while Lightning MTP (mtp_enabled) is active (review feedback), so a depth
+    change reloads a loaded engine, but a stale value never forces one."""
+    from omlx.engine_pool import EnginePool
+
+    pool = EnginePool()
+
+    depth_3_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+    depth_8_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=8)
+    depth_3_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=3)
+    depth_8_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=8)
+
+    on_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_on)}
+    assert "mtp_num_draft_tokens" in on_keys
+    off_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_off)}
+    assert "mtp_num_draft_tokens" not in off_keys
+
+    # Active MTP: different depths produce different signatures (reload).
+    assert pool._engine_runtime_signature("m", depth_3_on) != pool._engine_runtime_signature(
+        "m", depth_8_on
+    )
+    # Inactive MTP: the value is invisible to the signature (no reload).
+    assert pool._engine_runtime_signature("m", depth_3_off) == pool._engine_runtime_signature(
+        "m", depth_8_off
+    )

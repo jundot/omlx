@@ -41,6 +41,18 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
         importlib.import_module("mlx_vlm.models.glm5_next")
+
+        # mlx-vlm has no glm5_next entry in MODEL_CONFIG, so get_message_json()
+        # raises "Unsupported model: glm5_next" on every turn that carries no
+        # image.  That aborts _format_messages_for_vlm_template() as a whole,
+        # so the engine falls back to mlx-vlm's generic formatter, which emits
+        # no image placeholders -- while oMLX still extracts the images.  Any
+        # conversation mixing an image with a plain turn then fails with
+        # "More images were provided than image tokens."  GLM-5.3 takes the
+        # same list-with-image-first shape as glm4v.
+        from mlx_vlm.prompt_utils import MODEL_CONFIG, MessageFormat
+
+        MODEL_CONFIG.setdefault("glm5_next", MessageFormat.LIST_WITH_IMAGE_FIRST)
     except Exception as exc:  # noqa: BLE001
         logger.debug("GLM-5.3 mlx-vlm registration failed: %s", exc)
         return False

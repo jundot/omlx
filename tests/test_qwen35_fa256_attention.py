@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import sys
 import types
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
@@ -48,8 +49,10 @@ def _install_fake_vlm_base(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fresh_fa256_patch(monkeypatch):
     import omlx.patches.qwen35_fa256_attention as patch
+    from omlx import memory_monitor
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
+    memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
     # Pin the NAX auto-gate off so apply/route behavior stays identical on
     # M5-family test machines; the NAX gating tests override this locally.
     monkeypatch.setattr(patch, "is_nax_available", lambda: False)
@@ -68,6 +71,7 @@ def _fresh_fa256_patch(monkeypatch):
     monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
+    memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
 def test_route_gate_is_qwen_fa256_only():
@@ -138,11 +142,39 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
         )
     ]
 
+    from omlx import memory_monitor
+
+    routes = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS[256]
+    assert any(route.min_query_len == 16 and route.min_kv_len == 16 for route in routes)
+
     q_decode, _, _ = _qkv(1, 32)
     assert (
         base.scaled_dot_product_attention(q_decode, k, v, None, scale, "causal")
         == "original"
     )
+
+
+def test_kernel_failure_keeps_registered_bounded_route(monkeypatch):
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    base, _ = _install_fake_vlm_base(monkeypatch)
+    monkeypatch.setattr(
+        patch, "_native_kernel", lambda: MagicMock(side_effect=RuntimeError("boom"))
+    )
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+    )
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+    bounded = MagicMock(return_value="bounded")
+    monkeypatch.setattr(patch, "_bounded_sdpa_fallback", bounded)
+
+    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
+    q, k, v = _qkv(32, 32)
+    scale = 1.0 / math.sqrt(256)
+    assert (
+        base.scaled_dot_product_attention(q, k, v, None, scale, "causal") == "bounded"
+    )
+    bounded.assert_called_once_with(q, k, v, scale, "causal", None)
 
 
 def test_dispatch_budget_env_and_capability_gate(monkeypatch):
@@ -223,9 +255,8 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
 
 def test_apply_skips_on_nax_gpu(monkeypatch):
-    # On NAX GPUs stock SDPA's unfused head_dim-256 prefill runs its matmuls
-    # on the tensor units and beats the pre-NAX steel kernel (M5 Max report:
-    # 4k pp 828 -> 400 tok/s), so the auto mode must not install the patch.
+    # MLX 0.32.2 has a native NAX split-D fused path for head-dim-256 causal
+    # prefill, so the auto mode must not replace it with the pre-NAX kernel.
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "is_nax_available", lambda: True)

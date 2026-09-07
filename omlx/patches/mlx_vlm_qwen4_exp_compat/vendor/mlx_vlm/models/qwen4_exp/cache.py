@@ -232,6 +232,7 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 class QuantizedKVCache(_BaseCache):
     step = 256
+    geometric_growth = False
 
     def __init__(self, group_size: int = 64, bits: int = 8):
         self.keys = None
@@ -239,6 +240,7 @@ class QuantizedKVCache(_BaseCache):
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
+        self._geometric_capacity_managed = True
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -247,8 +249,16 @@ class QuantizedKVCache(_BaseCache):
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
             el_per_int = 8 * mx.uint32.size // self.bits
-            new_steps = (self.step + num_steps - 1) // self.step * self.step
-            shape = (B, n_kv_heads, new_steps)
+            if self.geometric_growth:
+                old_capacity = 0 if self.keys is None else self.keys[0].shape[-2]
+                needed = prev + num_steps
+                capacity = ((needed + self.step - 1) // self.step) * self.step
+                if old_capacity and self._geometric_capacity_managed:
+                    capacity = max(capacity, 2 * old_capacity)
+                shape = (B, n_kv_heads, capacity)
+            else:
+                new_steps = (self.step + num_steps - 1) // self.step * self.step
+                shape = (B, n_kv_heads, new_steps)
 
             def init_quant(dim):
                 return (
@@ -258,6 +268,10 @@ class QuantizedKVCache(_BaseCache):
                 )
 
             def expand_quant(x):
+                if self.geometric_growth:
+                    new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                    new_x[..., :prev, :] = x[..., :prev, :]
+                    return new_x
                 new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
                 return mx.concatenate([x, new_x], axis=-2)
 
@@ -272,6 +286,8 @@ class QuantizedKVCache(_BaseCache):
                 )
             else:
                 self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+            if self.geometric_growth:
+                self._geometric_capacity_managed = True
 
         self.offset += num_steps
 
@@ -295,6 +311,7 @@ class QuantizedKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
+        self._geometric_capacity_managed = False
 
     @property
     def meta_state(self):
@@ -336,30 +353,47 @@ class QuantizedKVCache(_BaseCache):
 
 class KVCache(_BaseCache):
     step = 256
+    geometric_growth = False
 
     def __init__(self):
         self.keys = None
         self.values = None
         self.offset = 0
+        self._geometric_capacity_managed = True
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            if self.geometric_growth:
+                old_capacity = 0 if self.keys is None else self.keys.shape[2]
+                needed = prev + keys.shape[2]
+                capacity = ((needed + self.step - 1) // self.step) * self.step
+                if old_capacity and self._geometric_capacity_managed:
+                    capacity = max(capacity, 2 * old_capacity)
+            else:
+                n_steps = (self.step + keys.shape[2] - 1) // self.step
+                capacity = n_steps * self.step
+            k_shape = (B, n_kv_heads, capacity, k_head_dim)
+            v_shape = (B, n_kv_heads, capacity, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
             if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
+                if self.geometric_growth:
+                    new_k[..., :prev, :] = self.keys[..., :prev, :]
+                    new_v[..., :prev, :] = self.values[..., :prev, :]
+                    self.keys, self.values = new_k, new_v
+                else:
+                    if prev % self.step != 0:
+                        self.keys = self.keys[..., :prev, :]
+                        self.values = self.values[..., :prev, :]
+                    self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                    self.values = mx.concatenate([self.values, new_v], axis=2)
             else:
                 self.keys, self.values = new_k, new_v
+            if self.geometric_growth:
+                self._geometric_capacity_managed = True
 
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
@@ -383,6 +417,7 @@ class KVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
+        self._geometric_capacity_managed = False
 
     def is_trimmable(self):
         return True

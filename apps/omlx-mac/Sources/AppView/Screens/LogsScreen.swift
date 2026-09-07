@@ -32,7 +32,7 @@ struct LogsScreen: View {
                         isLast: true) {
                         Popup(
                             selection: $vm.selectedFile,
-                            width: 220,
+                            width: .controlMedium,
                             options: vm.fileOptions
                         )
                     }
@@ -45,13 +45,7 @@ struct LogsScreen: View {
                 .padding(.bottom, 8)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 4)
-            }
+            FooterBar(error: vm.lastError)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .toolbar {
@@ -95,7 +89,7 @@ struct LogsScreen: View {
 
         Popup(
             selection: $vm.lines,
-            width: 110,
+            width: .controlCompact,
             options: lineOptions
         )
     }
