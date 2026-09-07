@@ -177,6 +177,10 @@ struct ServerScreen: View {
                     .disabled(!vm.hasPendingServerChanges(services: services)
                               || vm.isMovingBasePath)
             }
+            .padding(.horizontal, 18)
+            .padding(.top, 6)
+
+            HintFooter(error: vm.lastError, notice: vm.offlineApplyNotice)
         }
         .task {
             // services.config is already populated by AppDelegate before this
@@ -188,9 +192,13 @@ struct ServerScreen: View {
         .onChange(of: services.config) { _, _ in
             vm.applyConfig(services.config)
         }
-        .onChange(of: services.serverState) { _, _ in
+        .onChange(of: services.serverState) { _, newState in
             // After a restart triggered by saving host/port, reload to pick
-            // up the new effective values.
+            // up the new effective values. Skip .stopping/.stopped (and any
+            // other non-running-like state) — reloading there just hits a
+            // connection-refused getGlobalSettings() and paints a spurious
+            // error every time the user stops their own server (§G3).
+            guard newState.isRunningLike else { return }
             Task { await vm.load(client: services.client) }
         }
     }
@@ -742,3 +750,30 @@ private struct ServerAdvancedSection: View {
 }
 
 
+private struct HintFooter: View {
+    let error: String?
+    var notice: String? = nil
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HintLine(text: String(localized: "server.footer.hint",
+                                  defaultValue: "Listen Address, Log Level, and SSE Keep-Alive Mode apply the moment you change them. The rest (port, default profile, storage, aliases) commits when you click Apply. Port and storage changes take effect after a server restart.",
+                                  comment: "Hint footer text under the Server screen explaining which controls apply immediately vs. via the Apply button"))
+            if let error {
+                Text(error)
+                    .font(.omlxText(11))
+                    .foregroundStyle(theme.redDot)
+            }
+            // Informational, not an error — the offline Apply path did save
+            // successfully, just locally instead of live (§G4).
+            if let notice {
+                Text(notice)
+                    .font(.omlxText(11))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+    }
+}

@@ -161,7 +161,7 @@
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
                                                         <svg class="w-3 h-3 shrink-0 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                                        <span class="min-w-0" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                        <span class="min-w-0" x-text="window.t('status.model.loading_label') + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + window.t('status.model.left_suffix') : '')"></span>
                                                     </div>
                                                 </template>
                                                 <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
@@ -180,11 +180,11 @@
                                                     <div class="flex items-center gap-1.5 text-xs text-neutral-400 min-w-0">
                                                         <span class="w-2 h-2 rounded-full bg-neutral-300 shrink-0"></span>
                                                         <span class="min-w-0"
-                                                              x-text="'idle' + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + ' left' : '')"></span>
+                                                              x-text="window.t('status.model.idle_label') + (m.idle_seconds != null ? ' · ' + formatDurationShort(m.idle_seconds) : '') + (m.ttl_remaining_seconds != null ? ' · ~' + formatDurationShort(m.ttl_remaining_seconds) + window.t('status.model.left_suffix') : '')"></span>
                                                     </div>
                                                 </template>
                                                 <div class="text-xs text-neutral-400 font-mono min-w-0 break-all"
-                                                     x-text="(m.is_loading ? 'est. ' : '') + modelSizeLabel(m)"></div>
+                                                     x-text="(m.is_loading ? window.t('status.model.estimate_prefix') : '') + modelSizeLabel(m)"></div>
                                             </div>
                                         </div>
                                         <div x-show="!m.is_loading" class="relative shrink-0 self-center">
@@ -211,7 +211,7 @@
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5">
                                                         <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                                        <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                                        <span class="text-xs text-blue-500 font-medium" x-text="window.t('status.model.loading_label') + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + window.t('status.model.left_suffix') : '')"></span>
                                                     </div>
                                                 </template>
                                                 <!-- Prefilling -->
@@ -237,7 +237,7 @@
                                                             <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(m.idle_seconds)"></span>
                                                         </template>
                                                         <template x-if="m.ttl_remaining_seconds != null">
-                                                            <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + ' left'"></span>
+                                                            <span class="text-[10px] text-neutral-400" x-text="'~' + formatDurationShort(m.ttl_remaining_seconds) + window.t('status.model.left_suffix')"></span>
                                                         </template>
                                                     </div>
                                                 </template>
@@ -271,10 +271,10 @@
                                                     <span class="text-[10px] text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
                                                     <span class="text-[10px] text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
-                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
+                                                    <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-[10px] text-neutral-400" x-text="'(' + (pp.scored_tokens ? window.t('status.model.draft_scored_prefix') + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? window.t('status.model.selected_prefix') + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
                                                     <span x-show="pp.elapsed != null" class="text-[10px] text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
                                                     <span x-show="pp.speed > 0" class="text-[10px] text-neutral-400"
-                                                          x-text="'(' + pp.speed.toFixed(0) + ' tok/s' + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + ' left' : '') + ')'"></span>
+                                                          x-text="'(' + pp.speed.toFixed(0) + window.t('status.model.toks_per_sec_suffix') + (pp.eta != null ? ', ' + (pp.eta >= 60 ? Math.floor(pp.eta / 60) + 'm ' + Math.round(pp.eta % 60) + 's' : Math.round(pp.eta) + 's') + window.t('status.model.left_suffix') : '') + ')'"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -352,7 +352,7 @@
                                                     <span class="w-2 h-2 rounded-full bg-amber-300"></span>
                                                     <span class="text-[10px] text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                                     <span class="text-[10px] text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
-                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="'prompt: ' + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
+                                                    <span x-show="wait.prompt_tokens > 0" class="text-[10px] text-neutral-400" x-text="window.t('status.model.prompt_prefix') + formatTokenCount(wait.prompt_tokens) + ' tok'"></span>
                                                 </div>
                                             </template>
                                         </div>
@@ -614,7 +614,7 @@
                                 <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
                             </div>
                             <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">Host</label>
+                                <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.node.host_label') }}</label>
                                 <select id="server-alias-select"
                                         x-model="selectedAlias"
                                         class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">

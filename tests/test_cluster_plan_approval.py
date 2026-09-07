@@ -37,6 +37,11 @@ GiB = 1024**3
 _REPO = Path(__file__).resolve().parents[1]
 _DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
 _CLUSTER_HTML = _REPO / "omlx" / "admin" / "templates" / "dashboard" / "_cluster.html"
+_EN_LOCALE_JSON = (_REPO / "omlx/admin/i18n/en.json").read_text(encoding="utf-8")
+_WINDOW_T_STUB = (
+    f"global.window = {{ _t: {_EN_LOCALE_JSON}, "
+    "t: function(key) { return this._t[key] !== undefined ? this._t[key] : key; } };"
+)
 
 # The two Macs from the incident. Rank 0 is the local coordinator, which on the
 # dashboard is always the Mac the browser is on — the laptop.
@@ -926,12 +931,14 @@ def test_the_new_plan_expressions_survive_a_page_with_no_plan_yet():
 
     script = (
         "const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n"
+        + _WINDOW_T_STUB + "\n"
         "const component = Object.assign({ " + methods + " }, input.state);\n"
         "const scope = new Proxy(component, {\n"
         "  has: () => true,\n"
         "  get: (target, key) => {\n"
         "    if (key === Symbol.unscopables) return undefined;\n"
         "    if (key === 'node') return target.clusterPlanNodes[0];\n"
+        "    if (key === 'window') return global.window;\n"
         "    const value = target[key];\n"
         "    return typeof value === 'function' ? value.bind(target) : value;\n"
         "  },\n"

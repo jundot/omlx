@@ -1,7 +1,8 @@
 """Regression tests for admin model-settings UI gates."""
 
-import json
 from pathlib import Path
+
+from omlx.admin.routes import _load_locale
 
 
 def _model_settings_template() -> str:
@@ -62,7 +63,7 @@ def test_apply_profile_surfaces_server_validation_error():
 
     assert "this.profileError = '';" in method
     assert "const data = await r.json().catch(() => ({}));" in method
-    assert "this.profileError = data.detail || 'Failed to apply profile';" in method
+    assert "this.profileError = data.detail || window.t('js.error.apply_profile_failed');" in method
     assert "this.profileError = String(e);" in method
 
 
@@ -170,7 +171,7 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing_keys = keys - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
 

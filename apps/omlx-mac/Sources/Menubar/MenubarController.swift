@@ -35,7 +35,11 @@ final class MenubarController: NSObject {
     // MARK: - Inputs / state
 
     private let server: ServerProcess?
-    private let config: AppConfig
+    // Was `let`: a snapshot from init that never updated when AppServices.config
+    // changed (§F1) — the stats poller's apiKey (below) and "Open Web Dashboard"'s
+    // auto-login URL both read this and kept using a stale key after a change.
+    // configDidChange(_:) below keeps it current.
+    private var config: AppConfig
     private let updates: UpdateController?
     private let bootstrapError: Error?
     private let client: OMLXClient?
@@ -77,6 +81,7 @@ final class MenubarController: NSObject {
     /// so the empty submenu can say "Loading…" instead of "No models available"
     /// while the initial fetch is still in flight.
     private var modelsFetched = false
+    private var modelsFetchFailed = false
     private var modelsFetchTask: Task<Void, Never>?
     private var statsParentItem: NSMenuItem!
     private var statsSubmenu: NSMenu!
@@ -192,6 +197,17 @@ final class MenubarController: NSObject {
             self,
             selector: #selector(restoreIconRequested(_:)),
             name: MenubarController.restoreIconRequestNotification,
+            object: nil
+        )
+
+        // object: nil — there is exactly one AppServices instance app-wide,
+        // and MenubarController doesn't otherwise hold a reference to it
+        // (only the looser `client`/`config` snapshot), so this stays a
+        // self-contained notification response like defaultsDidChange above.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(configDidChange(_:)),
+            name: AppServices.configDidChangeNotification,
             object: nil
         )
 
@@ -622,23 +638,23 @@ final class MenubarController: NSObject {
     private func rebuildStatsSubmenu() {
         statsSubmenu.removeAllItems()
 
-        let isRunning: Bool
-        if case .running = server?.state { isRunning = true } else { isRunning = false }
-
-        if !isRunning {
+        if !serverIsRunning {
             statsSubmenu.addItem(disabled(String(localized: "menubar.stats.server_off",
                                                  defaultValue: "Server is off",
                                                  comment: "Disabled placeholder in the Serving Stats submenu when the server isn't running")))
             return
         }
+        let hasAPIKey = !(config.apiKey ?? "").isEmpty
+        let noAPIKeyMessage = String(localized: "menubar.stats.no_api_key",
+                                     defaultValue: "Set an API key in the Security screen to enable stats",
+                                     comment: "Disabled placeholder shown wherever stats are unavailable because no API key is configured")
+
         let session = statsPoller?.sessionStats
         let liveActivity = statsPoller?.liveStats?.liveActivity
         let alltime = statsPoller?.alltimeStats
         if session == nil && alltime == nil {
-            statsSubmenu.addItem(disabled(statsPoller == nil
-                                          ? String(localized: "menubar.stats.no_api_key",
-                                                   defaultValue: "Set OMLX_API_KEY to enable stats",
-                                                   comment: "Disabled placeholder in the Serving Stats submenu when no API key is configured")
+            statsSubmenu.addItem(disabled(!hasAPIKey
+                                          ? noAPIKeyMessage
                                           : String(localized: "menubar.stats.loading",
                                                    defaultValue: "Loading stats…",
                                                    comment: "Disabled placeholder shown while stats are loading")))
@@ -685,22 +701,29 @@ final class MenubarController: NSObject {
         statsSubmenu.addItem(disabled(String(localized: "menubar.stats.alltime_section",
                                              defaultValue: "All-Time",
                                              comment: "Section header inside the Serving Stats submenu for all-time metrics")))
-        appendStat(String(localized: "menubar.stats.total_tokens",
-                          defaultValue: "Total Tokens Processed",
-                          comment: "Stats row label for total tokens processed"),
-                   compact(alltime?.totalPromptTokens))
-        appendStat(String(localized: "menubar.stats.cached_tokens",
-                          defaultValue: "Cached Tokens",
-                          comment: "Stats row label for cached tokens count"),
-                   compact(alltime?.totalCachedTokens))
-        appendStat(String(localized: "menubar.stats.cache_efficiency",
-                          defaultValue: "Cache Efficiency",
-                          comment: "Stats row label for the cache efficiency percentage"),
-                   percent(alltime?.cacheEfficiency))
-        appendStat(String(localized: "menubar.stats.total_requests",
-                          defaultValue: "Total Requests",
-                          comment: "Stats row label for total request count"),
-                   compact(alltime?.totalRequests))
+        if !hasAPIKey {
+            // All-time stats need an authenticated admin endpoint; the public
+            // status endpoint that feeds Session above has no such gate. Say
+            // why these rows are empty instead of showing "—" forever.
+            statsSubmenu.addItem(disabled(noAPIKeyMessage))
+        } else {
+            appendStat(String(localized: "menubar.stats.total_tokens",
+                              defaultValue: "Total Tokens Processed",
+                              comment: "Stats row label for total tokens processed"),
+                       compact(alltime?.totalPromptTokens))
+            appendStat(String(localized: "menubar.stats.cached_tokens",
+                              defaultValue: "Cached Tokens",
+                              comment: "Stats row label for cached tokens count"),
+                       compact(alltime?.totalCachedTokens))
+            appendStat(String(localized: "menubar.stats.cache_efficiency",
+                              defaultValue: "Cache Efficiency",
+                              comment: "Stats row label for the cache efficiency percentage"),
+                       percent(alltime?.cacheEfficiency))
+            appendStat(String(localized: "menubar.stats.total_requests",
+                              defaultValue: "Total Requests",
+                              comment: "Stats row label for total request count"),
+                       compact(alltime?.totalRequests))
+        }
     }
 
     // MARK: - Pollers
@@ -794,6 +817,7 @@ final class MenubarController: NSObject {
             unloadingIDs.removeAll()
             loadingIDs.removeAll()
             modelsFetched = false
+            modelsFetchFailed = false
             metricsStore.markServerStopped()
         default:
             break
@@ -860,6 +884,18 @@ final class MenubarController: NSObject {
         }
     }
 
+    /// AppServices.config changed (an API key edit, most commonly — §F1).
+    /// refreshStatsPollerEndpoint() (used on server-state changes) only
+    /// re-points the poller when the base URL diverges, so a same-host
+    /// key-only change wouldn't trigger it; rebuild unconditionally instead
+    /// — startStatsPoller() already tears down the old poller first and is
+    /// cheap enough to call on every config change.
+    @objc private func configDidChange(_ note: Notification) {
+        guard let next = note.userInfo?["config"] as? AppConfig else { return }
+        self.config = next
+        startStatsPoller()
+    }
+
     /// UserDefaults writes can come from any thread; hop to the main actor
     /// before touching the poller or the status items.
     @objc nonisolated private func defaultsDidChange(_ note: Notification) {
@@ -885,6 +921,14 @@ final class MenubarController: NSObject {
 
     @objc private func startServer() {
         guard let server else { return }
+        // A user-initiated Start is a deliberate retry — if the same
+        // port-conflict/failure recurs, it must alert again instead of
+        // silently no-oping behind a stale dedup key (§F3). Each start()
+        // call passes through .starting first, so ServerProcess.update's own
+        // state-equality guard doesn't suppress the follow-up notification;
+        // only these two alert-presentation guards were swallowing it.
+        lastPresentedPortConflictKey = nil
+        lastPresentedFailureMessage = nil
         do {
             switch try server.start() {
             case .started, .alreadyRunning:
@@ -1044,13 +1088,20 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
 
         if models.isEmpty {
-            let placeholder = modelsFetched
-                ? String(localized: "menubar.models.empty",
-                         defaultValue: "No models available",
-                         comment: "Disabled placeholder in the Models submenu when no models are discovered")
-                : String(localized: "menubar.models.fetching",
-                         defaultValue: "Loading…",
-                         comment: "Disabled placeholder in the Models submenu while the model list is being fetched")
+            let placeholder: String
+            if modelsFetchFailed {
+                placeholder = String(localized: "menubar.models.fetch_failed",
+                                      defaultValue: "Failed to load models",
+                                      comment: "Disabled placeholder in the Models submenu when the model list fetch failed")
+            } else if modelsFetched {
+                placeholder = String(localized: "menubar.models.empty",
+                                      defaultValue: "No models available",
+                                      comment: "Disabled placeholder in the Models submenu when no models are discovered")
+            } else {
+                placeholder = String(localized: "menubar.models.fetching",
+                                      defaultValue: "Loading…",
+                                      comment: "Disabled placeholder in the Models submenu while the model list is being fetched")
+            }
             modelsSubmenu.addItem(disabled(placeholder))
             return
         }
@@ -1200,13 +1251,24 @@ final class MenubarController: NSObject {
 
     private func refreshModels() async {
         guard serverIsRunning, let client else { return }
-        guard let resp = try? await client.listModels() else { return }
-        guard !Task.isCancelled else { return }
-        models = MenubarController.visibleMenuModels(resp.models)
-        modelsFetched = true
-        unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
-        loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
-        rebuildModelsSubmenu()
+        do {
+            let resp = try await client.listModels()
+            guard !Task.isCancelled else { return }
+            models = MenubarController.visibleMenuModels(resp.models)
+            modelsFetched = true
+            modelsFetchFailed = false
+            unloadingIDs = MenubarController.reconcileUnloading(unloadingIDs, against: models)
+            loadingIDs = MenubarController.reconcileLoading(loadingIDs, against: models)
+            rebuildModelsSubmenu()
+        } catch {
+            // scheduleModelsRefresh() cancels the previous fetch on every call
+            // (menu re-open, load/unload actions), so a superseded fetch's own
+            // cancellation must not paint "Failed to load models" — only a
+            // fetch that actually ran to completion and failed should.
+            guard !Task.isCancelled, (error as? URLError)?.code != .cancelled else { return }
+            modelsFetchFailed = true
+            rebuildModelsSubmenu()
+        }
     }
 
     // MARK: - Per-model actions
@@ -1323,9 +1385,13 @@ final class MenubarController: NSObject {
         return it
     }
 
+    // .unresponsive (a missed health check, process still alive and was just
+    // serving) counts as "on" here — this gates model/stats submenus and the
+    // web-dashboard/chat click handlers, all of which want "is the server
+    // process still up" rather than "did the last health check land" (§F4).
+    // menuAvailability(for:), below, intentionally stays stricter.
     private var serverIsRunning: Bool {
-        if case .running = server?.state { return true }
-        return false
+        server?.state.isRunningLike ?? false
     }
 
     private func appendStat(_ label: String, _ value: String) {
