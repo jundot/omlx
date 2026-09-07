@@ -44,11 +44,11 @@ def vlm_mtp_processor_conflicts(data: dict) -> list:
     Neutral values (repetition 1.0, presence 0.0) build no processor and do
     not conflict.
 
-    ``thinking_budget_enabled`` is intentionally absent: the vlm_mtp path
-    applies ``ThinkingBudgetProcessor`` at verify time via
+    ``thinking_budget_enabled`` and ``guided_grammar_enabled`` are
+    intentionally absent: the vlm_mtp path applies ``ThinkingBudgetProcessor``
+    and ``GrammarConstraintProcessor`` at verify time via
     ``MTPProcessingSampler`` (see omlx/speculative/processing_sampler.py),
-    so a thinking-budget default no longer forces the BatchGenerator
-    fallback.
+    so neither default forces the BatchGenerator fallback any more.
     """
     conflicts = []
     rep = data.get("repetition_penalty")
@@ -57,8 +57,6 @@ def vlm_mtp_processor_conflicts(data: dict) -> list:
     pres = data.get("presence_penalty")
     if pres is not None and pres != 0.0:
         conflicts.append("presence_penalty")
-    if data.get("guided_grammar_enabled"):
-        conflicts.append("guided_grammar_enabled")
     return conflicts
 
 

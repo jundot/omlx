@@ -421,8 +421,6 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) == 0:
         return False
-    if _has_grammar_processors(gen_batch):
-        return False
     return True
 
 
@@ -592,6 +590,11 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) <= 1:
         return False
+    if _has_grammar_processors(gen_batch):
+        # Row-wise MTP extracts and re-merges per-row caches around each
+        # cycle; the grammar processor's speculative mode is wired for the
+        # singleton cycle only (see _grammar_enter_speculative).
+        return False
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
         return False
     if getattr(
@@ -631,6 +634,8 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     if uids is None:
         return "GenerationBatch has no uids"
     if len(uids) != 1:
+        if _has_grammar_processors(gen_batch):
+            return "row-wise batch MTP keeps grammar-constrained rows on the standard step"
         if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_batch_state"):
             return "pending prompt work may still merge into this batch"
         if getattr(
@@ -643,8 +648,6 @@ def _ineligibility_reason(gen_batch: Any) -> str:
         return ""
     if not _allows_new_mtp_activation(gen_batch, "_omlx_mtp_state"):
         return "pending prompt work may still merge into this singleton batch"
-    if _has_grammar_processors(gen_batch):
-        return "grammar-constrained decoding uses GenerationBatch._step hooks"
     return ""
 
 
@@ -880,7 +883,7 @@ def _proc_list(gen_batch: Any) -> Optional[List[Any]]:
 
 
 def _has_grammar_processors(gen_batch: Any) -> bool:
-    """True when MTP would bypass grammar state advanced by scheduler._step."""
+    """True when any row of the batch carries a grammar constraint."""
     processors_by_seq = getattr(gen_batch, "logits_processors", None)
     if not processors_by_seq:
         return False
@@ -893,6 +896,57 @@ def _has_grammar_processors(gen_batch: Any) -> bool:
         for processors in processors_by_seq
         for proc in (processors or [])
     )
+
+
+def _grammar_enter_speculative(gen_batch: Any) -> None:
+    """Switch the singleton row's grammar processors to self-advancing mode.
+
+    Called at MTP activation, before the first speculative processor call.
+    The scheduler's deferred accept has by then advanced the matcher through
+    every token in ``_token_context[0]`` and left the sampled ``_next_tokens``
+    in flight; the buffer length is therefore the history the matcher
+    reflects, and the in-flight token is accepted by the first speculative
+    ``__call__`` when ``_post_init_mtp`` pushes it into the buffer.
+    """
+    procs = _proc_list(gen_batch)
+    if procs is None:
+        return
+    try:
+        from omlx.api.grammar import grammar_processors
+    except Exception:
+        return
+    grammar = grammar_processors(procs)
+    if not grammar:
+        return
+    buf = gen_batch._token_context[0]
+    history_len = int(getattr(buf, "_size", None) or len(buf.tokens))
+    for proc in grammar:
+        proc.begin_speculative(history_len)
+
+
+def _grammar_leave_speculative(gen_batch: Any) -> None:
+    """Hand grammar processors back to the scheduler's deferred accept.
+
+    Runs on every MTP exit (reconcile, park, late-join handoff, plain drop).
+    ``gen_batch.tokens[row]`` is the streamed history; the matcher is moved
+    to it, and the row is marked pending exactly when a sampled
+    ``_next_tokens`` is waiting for the standard step to feed it.
+    """
+    processors_by_seq = getattr(gen_batch, "logits_processors", None)
+    if not processors_by_seq:
+        return
+    try:
+        from omlx.api.grammar import grammar_processors
+    except Exception:
+        return
+    tokens_rows = getattr(gen_batch, "tokens", None) or []
+    pending = getattr(gen_batch, "_next_tokens", None) is not None
+    for row, procs in enumerate(processors_by_seq):
+        for proc in grammar_processors(procs):
+            if not proc.speculative:
+                continue
+            history = tokens_rows[row] if row < len(tokens_rows) else None
+            proc.end_speculative(history, pending=pending)
 
 
 def _mtp_state_valid_for_batch(gen_batch: Any, state: Optional[_MtpState]) -> bool:
@@ -918,6 +972,7 @@ def _drop_mtp_state(
     released at activation (``take_primed``), on real multi-row merges
     (``patched_extend``), or with the cache itself at request end.
     """
+    _grammar_leave_speculative(gen_batch)
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if state is None:
         return None
@@ -2467,6 +2522,10 @@ def _post_init_mtp(gen_batch: Any) -> None:
     main_lp = gen_batch._next_logprobs[0]  # (vocab,)
 
     if procs is not None:
+        # Grammar rows advance their matcher from the prefixes this path
+        # hands them from here on; main_tok is the in-flight token the
+        # buffer push below makes them accept.
+        _grammar_enter_speculative(gen_batch)
         prev_buf = gen_batch._token_context[0].update_and_fetch(main_tok)
     else:
         prev_buf = None

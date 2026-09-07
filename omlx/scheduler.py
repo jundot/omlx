@@ -704,6 +704,10 @@ def _omlx_advance_grammar_rows(self) -> None:
     """
     from .api.grammar import GrammarConstraintProcessor
 
+    # Rows the MTP verify walk drives are never pending: in speculative mode
+    # the processor advances its own matcher from the prefixes the walk
+    # hands it, and it re-enters this protocol (pending set) when the walk
+    # hands the row back (see GrammarConstraintProcessor.end_speculative).
     rows = [
         (e, proc)
         for e, procs in enumerate(self.logits_processors)
@@ -8886,16 +8890,16 @@ class Scheduler:
             return None
 
         # Per-request logits processors that implement the snapshot/restore
-        # protocol (today: ThinkingBudgetProcessor) ARE applied on this
-        # path: MTPProcessingSampler threads them into mlx-vlm's verify
-        # walk through the positioned ``sample_target`` hook, with
-        # position-keyed state checkpoints so draft rejections rewind them
-        # correctly (see omlx/speculative/processing_sampler.py). Model
-        # level suppress tokens are reproduced via _make_suppressing_sampler.
-        # Everything else (grammar constraints, repetition/presence/
-        # frequency penalties) still has no application point here — same
-        # convention as Lightning MTP: fall back to BatchGenerator so every
-        # processor stays enforced (#2399).
+        # protocol (today: ThinkingBudgetProcessor and
+        # GrammarConstraintProcessor) ARE applied on this path:
+        # MTPProcessingSampler threads them into mlx-vlm's verify walk
+        # through the positioned ``sample_target`` hook, with position-keyed
+        # state checkpoints so draft rejections rewind them correctly (see
+        # omlx/speculative/processing_sampler.py). Model level suppress
+        # tokens are reproduced via _make_suppressing_sampler. Everything
+        # else (repetition/presence/frequency penalties) still has no
+        # application point here — same convention as Lightning MTP: fall
+        # back to BatchGenerator so every processor stays enforced (#2399).
         mtp_processors: list[Any] = []
         unsupported_processors: list[Any] = []
         for proc in logits_processors or []:

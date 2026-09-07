@@ -722,8 +722,13 @@ class TestBatchGeneratorDispatch:
         assert GenerationBatch.next(batch) == []
         assert calls[:3] == ["realign", "batch_eligible", "single_eligible"]
 
-    def test_realign_can_make_grammar_rows_disable_mtp(self, monkeypatch):
-        """If realignment reveals processors, MTP must not activate first."""
+    def test_realign_runs_before_mtp_activation_sees_grammar_rows(self, monkeypatch):
+        """Realignment runs first, and the grammar row it reveals activates MTP.
+
+        Grammar-constrained singletons ride the MTP path (the processor is
+        switched to its speculative mode at activation), so the row state the
+        activation reads must be the realigned one.
+        """
         from mlx_lm.generate import GenerationBatch
 
         from omlx.patches.mlx_lm_mtp import batch_generator
@@ -740,6 +745,7 @@ class TestBatchGeneratorDispatch:
             logits_processors=[],
             _omlx_mtp_activation_safe=True,
         )
+        seen_at_activation = []
 
         def realign_rows():
             batch.logits_processors = [[processor]]
@@ -751,11 +757,12 @@ class TestBatchGeneratorDispatch:
             "_has_grammar_processors",
             lambda b: bool(b.logits_processors and b.logits_processors[0]),
         )
-        monkeypatch.setattr(
-            batch_generator,
-            "_prepare_mtp_state_for_next",
-            lambda _: pytest.fail("MTP activated before row realignment"),
-        )
+
+        def prepare(b):
+            seen_at_activation.append(list(b.logits_processors))
+            return None
+
+        monkeypatch.setattr(batch_generator, "_prepare_mtp_state_for_next", prepare)
         monkeypatch.setattr(batch_generator, "_drop_mtp_state", lambda *_, **__: None)
         monkeypatch.setattr(
             batch_generator,
@@ -764,7 +771,7 @@ class TestBatchGeneratorDispatch:
         )
 
         assert GenerationBatch.next(batch) == []
-        assert batch.logits_processors == [[processor]]
+        assert seen_at_activation == [[[processor]]]
 
     def test_decode_eligibility_reads_model_instance_flag_not_global(self):
         from omlx.patches.mlx_lm_mtp import (
@@ -881,11 +888,11 @@ class TestBatchGeneratorDispatch:
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
             # Empty batch never triggers.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[])) is False
-            # Grammar-constrained decoding relies on GenerationBatch._step hooks,
-            # so MTP must stay off until it mirrors accept_token explicitly.
+            # Grammar-constrained singletons ride the MTP path: the processor
+            # advances its own matcher from the verify walk's prefixes.
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(batch_generator, "_has_grammar_processors", lambda _: True)
-                assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is False
+                assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
         finally:
             set_mtp_active(prior_active)
 
