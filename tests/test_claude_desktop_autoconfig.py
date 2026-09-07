@@ -235,9 +235,9 @@ class TestGatewayModelFormat:
     Anthropic family fields ModelMap.swift::catalog() requires."""
 
     def test_model_info_exposes_anthropic_fields(self):
-        from omlx.api.openai_models import ModelInfo
+        from omlx.api.openai_models import ClaudeTierModelInfo
 
-        entry = ModelInfo(
+        entry = ClaudeTierModelInfo(
             id="claude-sonnet-5",
             owned_by="omlx",
             max_model_len=8192,

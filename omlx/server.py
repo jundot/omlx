@@ -125,6 +125,7 @@ from .api.openai_models import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ClaudeTierModelInfo,
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
@@ -3599,8 +3600,8 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models", response_model_exclude_none=True)
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3710,7 +3711,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
                 if tier_ms is not None and tier_ms.max_tokens is not None:
                     max_tokens = tier_ms.max_tokens
                 models.append(
-                    ModelInfo(
+                    ClaudeTierModelInfo(
                         id=slot_id,
                         owned_by="omlx",
                         max_model_len=get_max_context_window(tier_model),
@@ -3732,7 +3733,18 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
 
-    return ModelsResponse(data=models)
+    # Serialize explicitly: FastAPI's jsonable_encoder and the
+    # ``ModelsResponse`` container both serialize items as the base
+    # ``ModelInfo`` (dropping the tier metadata), while a route-level
+    # exclude would drop upstream fields like ``max_model_len: null``.
+    # Per-item ``model_dump()`` honors each instance's own field config:
+    # standard entries stay byte-identical, tier aliases carry metadata.
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [m.model_dump() for m in models],
+        }
+    )
 
 
 @app.get("/v1/models/status")
