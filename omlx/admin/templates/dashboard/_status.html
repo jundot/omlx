@@ -777,8 +777,21 @@
                                                   class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
                                         </button>
                                         <span class="text-sm font-medium text-neutral-700">{{ t('status.claude_code.desktop') }}</span>
+                                        <span class="text-xs px-2 py-0.5 rounded-full"
+                                              :class="claudeDesktop.configured ? 'bg-green-100 text-green-700' : 'bg-neutral-100 text-neutral-500'"
+                                              x-text="claudeDesktop.configured ? window.t('status.claude_code.desktop_configured') : window.t('status.claude_code.desktop_not_configured')"></span>
                                     </div>
                                     <p class="mt-1.5 text-xs text-neutral-400">{{ t('status.claude_code.desktop_hint') }}</p>
+                                    <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.desktop_side_effect') }}</p>
+                                    <div class="mt-2 flex items-center gap-2">
+                                        <button type="button"
+                                                @click="reapplyClaudeDesktopConfig()"
+                                                :disabled="claudeDesktop.working"
+                                                class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white hover:bg-neutral-50 disabled:opacity-50 transition-all">
+                                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_working') : window.t('status.claude_code.desktop_reapply')"></span>
+                                        </button>
+                                        <span x-show="claudeDesktop.message" x-cloak class="text-xs text-neutral-500" x-text="claudeDesktop.message"></span>
+                                    </div>
                                 </div>
                             </div>
                         </div>
