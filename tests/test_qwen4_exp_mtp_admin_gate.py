@@ -56,13 +56,13 @@ def _make_checkpoint(
 class TestMtpCompatForModelQwen4Exp:
     def test_qwen4_exp_with_embedded_mtp_weights_is_compatible(self, tmp_path):
         model_dir = _make_checkpoint(tmp_path, QWEN4_EXP_CONFIG, mtp_weights=True)
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert ok, f"qwen4_exp with mtp.* weights must pass: {reason}"
         assert reason == ""
 
     def test_qwen4_exp_without_mtp_weights_is_blocked_on_weights(self, tmp_path):
         model_dir = _make_checkpoint(tmp_path, QWEN4_EXP_CONFIG, mtp_weights=False)
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert not ok
         # The rejection must come from the missing-weight check, not the
         # whitelist: the weights check is what the runtime path enforces.
@@ -78,21 +78,21 @@ class TestMtpCompatForModelQwen4Exp:
             mtp_weights=False,
             nextn_weights=True,
         )
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert not ok
         assert "native nextn layers are not supported" in reason
 
     def test_qwen4_exp_without_mtp_heads_is_blocked(self, tmp_path):
         config = {"model_type": "qwen4_exp", "text_config": {}}
         model_dir = _make_checkpoint(tmp_path, config, mtp_weights=True)
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert not ok
         assert "no MTP heads" in reason
 
     def test_unsupported_model_type_still_hits_the_whitelist(self, tmp_path):
         config = {"model_type": "llama", "mtp_num_hidden_layers": 1}
         model_dir = _make_checkpoint(tmp_path, config, mtp_weights=True)
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert not ok
         assert "not on the MTP whitelist" in reason
 
@@ -100,5 +100,5 @@ class TestMtpCompatForModelQwen4Exp:
     def test_generic_whitelisted_types_still_pass(self, tmp_path, model_type):
         config = {"model_type": model_type, "mtp_num_hidden_layers": 1}
         model_dir = _make_checkpoint(tmp_path, config, mtp_weights=True, name="m")
-        ok, reason = _mtp_compat_for_model({"model_path": str(model_dir)})
+        ok, reason, _sidecar = _mtp_compat_for_model({"model_path": str(model_dir)})
         assert ok, f"{model_type} must remain compatible: {reason}"
