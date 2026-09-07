@@ -4,6 +4,7 @@
 import copy
 import json
 import logging
+import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -611,8 +612,37 @@ class ResponseStore:
             response_id, _record = self._store.popitem(last=False)
             self._remove_persisted_record(response_id)
 
+    _TMP_RECORD_MIN_AGE_SECONDS = 3600
+
+    def _reap_stale_tmp_records(self) -> None:
+        """Delete `.tmp` staging leftovers from a crash between write and
+        replace (`_persist_record`). Age-gated so an in-flight write on
+        another thread/process is never touched."""
+        assert self._state_dir is not None
+        now = time.time()
+        for tmp_path in self._state_dir.glob("*.tmp"):
+            if tmp_path.is_symlink():
+                continue
+            try:
+                st = tmp_path.stat()
+            except OSError:
+                continue
+            if now - st.st_mtime < self._TMP_RECORD_MIN_AGE_SECONDS:
+                continue
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "Failed to reap stale response-state tmp file %s: %s",
+                    tmp_path,
+                    exc,
+                )
+
     def _load_persisted_records(self) -> None:
         assert self._state_dir is not None
+        self._reap_stale_tmp_records()
         loaded: List[Dict[str, Any]] = []
         for path in sorted(self._state_dir.glob("*.json")):
             try:

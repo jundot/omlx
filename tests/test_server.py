@@ -19,8 +19,10 @@ from omlx.server import (
     SamplingDefaults,
     ServerState,
     _format_generation_speed_for_log,
+    _reap_dead_cluster_prompt_cache_ssd_dirs_for_server,
     _reject_diffusion_structured_outputs,
     _reset_boundary_snapshots_for_server,
+    _run_log_artifact_reaper_for_server,
     _resolve_metric_durations,
     app,
     get_engine,
@@ -65,6 +67,141 @@ class TestBoundarySnapshotLifecycle:
             _reset_boundary_snapshots_for_server()
 
         assert stale_dir.exists()
+
+
+class TestClusterPromptCacheSsdReapAtStartup:
+    """design doc §D1/R3: the worker-side reap only fires on the *next*
+    cluster activation, which never happens for an abandoned cluster —
+    exactly the doc's measured 30 GiB. This coordinator-side call at
+    server startup is what actually reaches that case."""
+
+    def test_reaps_dead_deployment_dir_at_startup(self, tmp_path):
+        from types import SimpleNamespace
+
+        state_dir = tmp_path / "cluster" / "runtime"
+        dead_dir = state_dir / "prompt-cache-ssd" / "dead-deploy-rank-0"
+        dead_dir.mkdir(parents=True)
+        (dead_dir / "boundary.safetensors").write_bytes(b"snapshot")
+        import os
+        import time
+
+        old = time.time() - 7200
+        os.utime(dead_dir, (old, old))
+
+        state = ServerState()
+        state.global_settings = SimpleNamespace(base_path=tmp_path)
+
+        with patch("omlx.server._server_state", state):
+            _reap_dead_cluster_prompt_cache_ssd_dirs_for_server()
+
+        assert not dead_dir.exists()
+
+    def test_skips_when_no_global_settings(self):
+        state = ServerState()
+        state.global_settings = None
+
+        with patch("omlx.server._server_state", state):
+            _reap_dead_cluster_prompt_cache_ssd_dirs_for_server()  # must not raise
+
+    def test_never_raises_when_the_reap_itself_fails(self, tmp_path):
+        from types import SimpleNamespace
+
+        state = ServerState()
+        state.global_settings = SimpleNamespace(base_path=tmp_path)
+
+        with patch("omlx.server._server_state", state), patch(
+            "omlx.cluster.inference_worker._reap_dead_prompt_cache_ssd_dirs",
+            side_effect=RuntimeError("boom"),
+        ):
+            _reap_dead_cluster_prompt_cache_ssd_dirs_for_server()  # must not raise
+
+
+class TestLogArtifactReaperForServer:
+    def test_reaps_real_settings_paths(self, tmp_path):
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        pycache = tmp_path / "__pycache__"
+        pycache.mkdir()
+        (pycache / "x.pyc").write_bytes(b"x")
+
+        settings = GlobalSettings(base_path=tmp_path)
+        state = ServerState()
+        state.global_settings = settings
+
+        with patch("omlx.server._server_state", state):
+            _run_log_artifact_reaper_for_server()
+
+        assert not pycache.exists()
+
+    def test_skips_when_no_global_settings(self):
+        state = ServerState()
+        state.global_settings = None
+
+        with patch("omlx.server._server_state", state):
+            _run_log_artifact_reaper_for_server()  # must not raise
+
+    def test_never_raises_when_the_reaper_itself_fails(self, tmp_path):
+        from types import SimpleNamespace
+
+        state = ServerState()
+        state.global_settings = SimpleNamespace(
+            base_path=tmp_path,
+            logging=SimpleNamespace(get_log_dir=lambda base: base / "logs"),
+        )
+
+        with patch("omlx.server._server_state", state), patch(
+            "omlx.log_artifact_reaper.run_log_artifact_reaper",
+            side_effect=RuntimeError("boom"),
+        ):
+            _run_log_artifact_reaper_for_server()  # must not raise
+
+
+class TestDiskPressureGuardTaskLifecycle:
+    """The disk-pressure guard task (design doc §R2) is created in
+    `lifespan()` from a bare asyncio task, not a route handler — it must
+    never call route-dependency helpers like `get_engine_pool()`, which
+    raise HTTPException by design (correct for FastAPI to turn into a 503,
+    wrong from a background task where nothing catches it as an HTTP
+    response). Regression coverage for exactly that mistake: the guard
+    previously crashed on every server start before any model loaded."""
+
+    def test_lifespan_starts_and_stops_the_guard_with_no_engine_pool(
+        self, tmp_path, caplog
+    ):
+        import logging
+        import time
+
+        (tmp_path / "cache").mkdir(parents=True, exist_ok=True)
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.disk.guard_tick_interval_seconds = 0.02
+        state = ServerState()
+        state.global_settings = settings
+        assert state.engine_pool is None
+
+        with caplog.at_level(logging.WARNING, logger="omlx.disk_pressure_guard"):
+            with patch("omlx.server._server_state", state):
+                with TestClient(app) as client:
+                    resp = client.get("/api/status")
+                    assert resp.status_code == 200
+                    # Let at least one real tick run before shutdown.
+                    time.sleep(0.1)
+
+        # The tick swallows exceptions itself (by design), so a crash
+        # doesn't fail this test via an assertion — it shows up here as a
+        # logged warning instead. This is what actually would have caught
+        # the get_engine_pool()-outside-a-route-handler regression.
+        assert not [
+            r for r in caplog.records if "Disk pressure guard tick raised" in r.message
+        ]
+
+    def test_lifespan_skips_the_guard_with_no_global_settings(self, tmp_path):
+        state = ServerState()
+        state.global_settings = None
+
+        with patch("omlx.server._server_state", state):
+            with TestClient(app) as client:
+                resp = client.get("/api/status")
+                assert resp.status_code == 200
 
 
 class TestDiffusionStructuredOutputGuard:

@@ -5658,7 +5658,12 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                     exc,
                 )
 
-    # Phase 2: remove any remaining files on disk (covers unloaded models)
+    # Phase 2: remove any remaining files on disk (covers unloaded models).
+    # Sweeps main-KV blocks, GDN sidecars, and the vision-feature cache —
+    # all three share this directory tree and none has a loaded manager to
+    # route through when no model is loaded. Without the sidecar sweep,
+    # "Clear SSD cache" silently left the majority of the cache's bytes
+    # behind (design doc §A4).
     global_settings = _get_global_settings()
     if global_settings is not None:
         cache_dir = global_settings.cache.get_ssd_cache_dir(
@@ -5666,18 +5671,65 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
+                resolved_cache_dir = cache_dir.resolve(strict=True)
+            except OSError:
+                resolved_cache_dir = None
+
+            def _safe_unlink(f: Path) -> bool:
+                # Never unlink through a symlinked component, and never
+                # unlink a path that resolves outside the cache root —
+                # mirrors the manager's own symlink-refusal discipline.
+                if resolved_cache_dir is None:
+                    return False
+                if f.is_symlink() or f.parent.is_symlink():
+                    return False
+                try:
+                    f.resolve(strict=True).relative_to(resolved_cache_dir)
+                except (OSError, ValueError):
+                    return False
+                try:
+                    f.unlink()
+                    return True
+                except OSError:
+                    return False
+
+            try:
                 for subdir in "0123456789abcdef":
                     subdir_path = cache_dir / subdir
-                    if not subdir_path.exists():
+                    if not subdir_path.exists() or subdir_path.is_symlink():
                         continue
                     for f in subdir_path.glob("*.safetensors"):
-                        try:
-                            f.unlink()
+                        if _safe_unlink(f):
                             total_deleted += 1
-                        except OSError:
-                            pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
+
+            try:
+                sidecar_root = cache_dir / "_gdn_sidecars"
+                if sidecar_root.exists() and not sidecar_root.is_symlink():
+                    for signature_dir in sidecar_root.iterdir():
+                        if signature_dir.is_symlink() or not signature_dir.is_dir():
+                            continue
+                        for f in signature_dir.glob("*.safetensors"):
+                            if _safe_unlink(f):
+                                total_deleted += 1
+            except Exception as exc:
+                logger.warning("Failed to clean GDN sidecar directory: %s", exc)
+
+            try:
+                vision_root = cache_dir / "vision_features"
+                if vision_root.exists() and not vision_root.is_symlink():
+                    for subdir in "0123456789abcdef":
+                        subdir_path = vision_root / subdir
+                        if not subdir_path.exists() or subdir_path.is_symlink():
+                            continue
+                        for f in subdir_path.glob("*.safetensors"):
+                            if _safe_unlink(f):
+                                total_deleted += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean vision feature cache directory: %s", exc
+                )
 
     return {"status": "ok", "total_deleted": total_deleted}
 

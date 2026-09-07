@@ -386,6 +386,56 @@ def _reset_boundary_snapshots_for_server() -> None:
         logger.warning("Failed to reset boundary snapshot directory: %s", exc)
 
 
+def _reap_dead_cluster_prompt_cache_ssd_dirs_for_server() -> None:
+    """Coordinator-side sweep for abandoned cluster prompt-cache-ssd dirs.
+
+    `inference_worker.py`'s own reap only runs on the *next* activation of
+    a deployment — which never happens for a cluster that was torn down
+    and never relaunched (design doc §D1: this machine's actual measured
+    state was registry-empty with 30 GiB of dead rank-local snapshot dirs
+    that nothing would ever revisit). Running the identical reap here, at
+    every server start, is what actually reaches that case.
+    """
+    global_settings = _server_state.global_settings
+    if global_settings is None:
+        return
+    try:
+        from .cluster.inference_worker import (
+            _prune_runtime_markers,
+            _reap_dead_prompt_cache_ssd_dirs,
+        )
+
+        state_dir = global_settings.base_path / "cluster" / "runtime"
+        _reap_dead_prompt_cache_ssd_dirs(state_dir / "prompt-cache-ssd", state_dir)
+        _prune_runtime_markers(state_dir)
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning(
+            "Failed to reap dead cluster prompt-cache-ssd directories: %s", exc
+        )
+
+
+def _run_log_artifact_reaper_for_server() -> None:
+    """Log rotation backstop + transient-artifact reaper (design doc §R4).
+
+    Trigger is "server startup + the R2 tick" — this covers startup; the
+    disk-pressure guard task (below) re-runs the same pass on its own
+    cadence.
+    """
+    global_settings = _server_state.global_settings
+    if global_settings is None:
+        return
+    try:
+        from .log_artifact_reaper import run_log_artifact_reaper
+
+        run_log_artifact_reaper(
+            base_path=global_settings.base_path,
+            log_dir=global_settings.logging.get_log_dir(global_settings.base_path),
+            models_dir=global_settings.base_path / "models",
+        )
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning("Log/artifact reaper failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
@@ -421,6 +471,8 @@ async def lifespan(app: FastAPI):
             logger.warning("Server alias auto-detection failed: %s", exc)
 
     _reset_boundary_snapshots_for_server()
+    _reap_dead_cluster_prompt_cache_ssd_dirs_for_server()
+    _run_log_artifact_reaper_for_server()
 
     # Publish the interpreter another Mac's coordinator discovers over SSH.
     # Without it a packaged-app peer fails every discovery candidate and gets
@@ -554,6 +606,64 @@ async def lifespan(app: FastAPI):
 
         ttl_task = asyncio.create_task(_ttl_check_loop())
 
+    # Idle-time, cross-consumer disk-pressure guard (design doc R2): the
+    # only prior eviction triggers were a block save, a sidecar commit, and
+    # the startup scan, so a loaded-but-idle server held its full cache
+    # budget while something else filled the disk.
+    disk_guard_task = None
+    if _server_state.global_settings is not None:
+        from .disk_pressure_guard import disk_pressure_guard_loop
+
+        def _iter_live_schedulers():
+            # Deliberately not admin.routes._iter_loaded_schedulers: that
+            # helper goes through get_engine_pool(), a FastAPI dependency
+            # that *raises* HTTPException when no pool exists yet — correct
+            # inside a route handler (FastAPI turns it into a 503), wrong
+            # from a bare background task, where nothing catches it as an
+            # HTTP response and it would just look like a tick crash on
+            # every server start before any model loads.
+            engine_pool = _server_state.engine_pool
+            if engine_pool is None:
+                return
+            for model_info in engine_pool.get_status().get("models", []):
+                model_id = model_info.get("id")
+                if not model_id or not model_info.get("loaded"):
+                    continue
+                entry = engine_pool._entries.get(model_id)
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = getattr(async_core, "engine", None) if async_core else None
+                scheduler = getattr(core, "scheduler", None) if core else None
+                if scheduler is not None:
+                    yield scheduler
+
+        def _get_live_ssd_managers():
+            for scheduler in _iter_live_schedulers():
+                manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+                if manager is not None:
+                    yield manager
+
+        def _get_live_boundary_stores():
+            for scheduler in _iter_live_schedulers():
+                store = getattr(scheduler, "_boundary_snapshot_store", None)
+                if store is not None:
+                    yield store
+
+        _disk_guard_volume = _server_state.global_settings.cache.get_ssd_cache_dir(
+            _server_state.global_settings.base_path
+        )
+        disk_guard_task = asyncio.create_task(
+            disk_pressure_guard_loop(
+                volume_path=_disk_guard_volume,
+                disk_settings=_server_state.global_settings.disk,
+                get_managers=_get_live_ssd_managers,
+                get_boundary_stores=_get_live_boundary_stores,
+                stop_event=asyncio.Event(),
+                run_log_reaper=_run_log_artifact_reaper_for_server,
+            )
+        )
+
     # Initialize MCP if config provided
     # Priority: env var > settings.json
     mcp_config = os.environ.get("OMLX_MCP_CONFIG")
@@ -582,6 +692,12 @@ async def lifespan(app: FastAPI):
         ttl_task.cancel()
         try:
             await ttl_task
+        except asyncio.CancelledError:
+            pass
+    if disk_guard_task is not None:
+        disk_guard_task.cancel()
+        try:
+            await disk_guard_task
         except asyncio.CancelledError:
             pass
     if _server_state.process_memory_enforcer is not None:

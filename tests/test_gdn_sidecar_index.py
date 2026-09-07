@@ -68,6 +68,68 @@ def test_commit_uses_opaque_atomic_sidecar_path_and_api(tmp_path):
         manager.close()
 
 
+def test_sidecar_restore_hit_counted_separately(tmp_path):
+    """design doc §0.4/§A3: sidecar restore hits must be countable apart
+    from the main-block SSD tier to ground the budget-share decision."""
+    cache_dir = tmp_path / "cache"
+    staged = tmp_path / "staged.safetensors"
+    staged.write_bytes(b"opaque-safetensors-bytes")
+    source_hash = b"source-block"
+    signature = "signature-v1"
+
+    manager = _make_manager(cache_dir)
+    try:
+        manager.commit_gdn_checkpoint_file(
+            source_hash,
+            staged,
+            token_count=2048,
+            model_name="model",
+            cache_signature=signature,
+            block_size=2048,
+        )
+        assert manager.get_stats_dict()["gdn_sidecar_restore_hits"] == 0
+
+        lookup = manager.get_gdn_checkpoint_file_with_diagnostic(
+            source_hash, signature
+        )
+
+        assert lookup is not None
+        assert manager.get_stats_dict()["gdn_sidecar_restore_hits"] == 1
+        assert manager.get_stats_dict()["main_block_ssd_hits"] == 0
+    finally:
+        manager.close()
+
+
+def test_commit_refused_under_hard_disk_pressure(tmp_path):
+    """A sidecar commit is an optional cache write (design doc §R2): under
+    the hard floor it no-ops instead of promoting the staged file."""
+    cache_dir = tmp_path / "cache"
+    staged = tmp_path / "staged.safetensors"
+    staged.write_bytes(b"opaque-safetensors-bytes")
+    source_hash = b"source-block"
+    signature = "signature-v1"
+
+    manager = _make_manager(cache_dir)
+    try:
+        manager.set_disk_pressure_hard(True)
+
+        result = manager.commit_gdn_checkpoint_file(
+            source_hash,
+            staged,
+            token_count=2048,
+            model_name="model",
+            cache_signature=signature,
+            block_size=2048,
+        )
+
+        assert result is None
+        assert staged.exists()  # never promoted
+        assert not manager.has_gdn_checkpoint(source_hash, signature)
+        assert manager.get_stats_dict()["saves_refused_disk_pressure"] == 1
+    finally:
+        manager.close()
+
+
 def test_failed_replacement_preserves_existing_sidecar(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     source_hash = b"source-block"

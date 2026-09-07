@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -21,7 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .deployment import decode_worker_contract
-from .liveness import PeerWatchdog
+from .liveness import PeerWatchdog, marker_owner_is_live, read_marker
 from .memory_guard import (
     admission_budget,
     assignment_memory_safety,
@@ -37,6 +38,7 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .registry import ClusterRegistry
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
@@ -467,12 +469,122 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
     )
 
 
+# A relaunch mints a fresh deployment id, so the "next store on the same
+# directory reclaims the leftovers" premise the store's own teardown comment
+# describes never actually holds after a non-clean exit — nothing else ever
+# enumerates sibling directories. Age gate before treating a directory as
+# dead: design doc §7 rule 2.
+_DEAD_DEPLOYMENT_IDLE_SECONDS = 3600
+
+
+def _reap_dead_prompt_cache_ssd_dirs(root: Path, state_dir: Path) -> None:
+    """Delete sibling `prompt-cache-ssd/<deployment_id>-rank-<N>` dirs that
+    no relaunch will ever revisit (design doc §D1/R3).
+
+    A directory is reaped only when its deployment is (a) absent from the
+    approved-deployments registry, (b) has no live runtime-marker owner —
+    the marker shares the exact `<deployment_id>-rank-<N>` stem, one
+    directory up — and (c) has been idle past the age gate. All three must
+    hold; a directory this rank itself is about to write into is excluded
+    by (a)/(b) since it is alive by definition.
+    """
+    if not root.is_dir() or root.is_symlink():
+        return
+
+    try:
+        registry = ClusterRegistry(state_dir.parent.parent)
+    except Exception:
+        return
+    if registry.load_error is not None:
+        # ClusterRegistry itself fails closed to an *empty* dict on a
+        # corrupt file ("activate none"), which reads as "nothing is
+        # active" — exactly backwards for a deletion routine, where an
+        # unreadable registry must mean "don't know," not "safe to
+        # reap everything." Skip this pass entirely.
+        return
+    active_ids = {d.deployment_id for d in registry.list()}
+
+    now = time.time()
+    for entry in list(root.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        name = entry.name
+        deployment_id, sep, rank_part = name.rpartition("-rank-")
+        if not sep or not deployment_id or not rank_part.isdigit():
+            continue
+        if deployment_id in active_ids:
+            continue
+        marker = read_marker(state_dir / f"{name}.json")
+        if marker is not None and marker_owner_is_live(marker):
+            continue
+        try:
+            idle_seconds = now - entry.stat().st_mtime
+        except OSError:
+            continue
+        if idle_seconds < _DEAD_DEPLOYMENT_IDLE_SECONDS:
+            continue
+        with suppress(OSError):
+            shutil.rmtree(entry)
+
+
+# Kept deliberately as crash evidence (only a clean exit removes a marker,
+# `RuntimeMarker.remove`) but nothing ever pruned ancient ones (design doc
+# §D3). Trivial bytes (8 KiB/marker) — the keep-count exists so recent
+# crash evidence always survives, not to bound disk.
+_MARKER_MAX_AGE_DAYS = 30
+_MARKER_KEEP_NEWEST_PER_MODEL = 3
+
+
+def _prune_runtime_markers(state_dir: Path) -> None:
+    """Delete ancient dead-owner runtime marker JSONs (design doc §D3).
+
+    A marker is only ever a deletion candidate once it falls outside the
+    newest ``_MARKER_KEEP_NEWEST_PER_MODEL`` for its model *and* is older
+    than ``_MARKER_MAX_AGE_DAYS`` *and* its owning pid is dead — a live
+    rank's marker (heartbeat-refreshed) is never touched regardless of the
+    other two conditions.
+    """
+    if not state_dir.is_dir() or state_dir.is_symlink():
+        return
+
+    now = time.time()
+    by_model: dict[str, list[tuple[float, Path]]] = {}
+    for path in state_dir.glob("*-rank-*.json"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        marker = read_marker(path)
+        if marker is None or marker_owner_is_live(marker):
+            continue
+        model = marker.get("model")
+        if not isinstance(model, str):
+            model = ""
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        by_model.setdefault(model, []).append((mtime, path))
+
+    for entries in by_model.values():
+        entries.sort(key=lambda e: e[0], reverse=True)
+        for age_rank, (mtime, path) in enumerate(entries):
+            if age_rank < _MARKER_KEEP_NEWEST_PER_MODEL:
+                continue
+            if (now - mtime) / 86400 < _MARKER_MAX_AGE_DAYS:
+                continue
+            with suppress(OSError):
+                path.unlink()
+
+
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     """Per-rank SSD directory for prompt-cache snapshots, or None when off.
 
     Kept beside the runtime markers and scoped by deployment and rank, so two
     deployments never read each other's snapshots and a rank only ever loads its
     own layer slice.
+
+    Pure path computation, no filesystem I/O — the dead-sibling reap (see
+    `_reap_dead_prompt_cache_ssd_dirs`) runs once at its own call site in
+    `main()`, not on every call here.
     """
 
     if not args.prompt_cache_ssd:
@@ -1200,6 +1312,14 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                if args.prompt_cache_ssd:
+                    with suppress(Exception):
+                        _reap_dead_prompt_cache_ssd_dirs(
+                            Path(args.state_dir).expanduser() / "prompt-cache-ssd",
+                            Path(args.state_dir).expanduser(),
+                        )
+                with suppress(Exception):
+                    _prune_runtime_markers(Path(args.state_dir).expanduser())
                 with (
                     install_server_telemetry(
                         marker,

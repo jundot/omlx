@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for VisionFeatureSSDCache (memory LRU + SSD persistence)."""
 
+import os
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -244,6 +245,80 @@ class TestSSDCache:
         # Should return None and remove from index
         result = ssd_cache.get("img_hash", "model_a")
         assert result is None
+
+    def test_stale_tmp_staging_file_reaped_on_scan(self, tmp_cache_dir):
+        """Same A1 orphan class as the main paged SSD cache: a crash
+        remnant `*_tmp.safetensors` older than the age gate is deleted at
+        startup scan (design doc §A1/R1, extended to this cache)."""
+        sub_dir = tmp_cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        tmp_file = sub_dir / "abc_tmp.safetensors"
+        tmp_file.write_bytes(b"partial")
+        old_time = time.time() - 3600
+        os.utime(tmp_file, (old_time, old_time))
+
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
+        cache.close()
+
+        assert not tmp_file.exists()
+
+    def test_fresh_tmp_staging_file_survives_scan(self, tmp_cache_dir):
+        sub_dir = tmp_cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        tmp_file = sub_dir / "abc_tmp.safetensors"
+        tmp_file.write_bytes(b"partial")
+
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
+        cache.close()
+
+        assert tmp_file.exists()
+
+    def test_symlinked_tmp_name_never_unlinked(self, tmp_cache_dir):
+        sub_dir = tmp_cache_dir / "a"
+        sub_dir.mkdir(parents=True)
+        target = tmp_cache_dir.parent / "outside_target.safetensors"
+        target.write_bytes(b"do not delete me")
+        link_path = sub_dir / "abc_tmp.safetensors"
+        link_path.symlink_to(target)
+        old_time = time.time() - 3600
+        os.utime(target, (old_time, old_time), follow_symlinks=False)
+
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
+        cache.close()
+
+        assert target.exists()
+
+    def test_unreadable_final_file_reaped_on_scan(self, tmp_cache_dir):
+        """A final-name file that fails to parse is corrupt, not in-flight
+        (only ever created by a completed atomic rename): the startup scan
+        reaps it outright instead of leaving it forever."""
+        sub_dir = tmp_cache_dir / "b"
+        sub_dir.mkdir(parents=True)
+        bad_file = sub_dir / "deadbeef.safetensors"
+        bad_file.write_bytes(b"not a real safetensors file")
+
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
+        cache.close()
+
+        assert not bad_file.exists()
+
+    def test_missing_required_metadata_reaped_on_scan(self, tmp_cache_dir):
+        """A structurally-valid safetensors file missing image_hash/
+        model_name is the same corrupt-final class — never indexable, so
+        it's dead weight forever unless the scan reaps it."""
+        sub_dir = tmp_cache_dir / "c"
+        sub_dir.mkdir(parents=True)
+        bad_file = sub_dir / "cafebabe.safetensors"
+        mx.save_safetensors(
+            str(bad_file),
+            {"tensor_0": mx.ones((2, 2))},
+            metadata={"num_tensors": "1"},  # image_hash/model_name omitted
+        )
+
+        cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
+        cache.close()
+
+        assert not bad_file.exists()
 
     def test_close_flushes_writes(self, tmp_cache_dir):
         cache = VisionFeatureSSDCache(cache_dir=tmp_cache_dir, max_memory_entries=3)
