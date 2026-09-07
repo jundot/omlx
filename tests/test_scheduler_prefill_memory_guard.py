@@ -1025,25 +1025,29 @@ def _attach_qwen4_profile(scheduler: Scheduler) -> None:
     )
 
 
-def test_qwen4_text_admission_uses_gathered_transient():
+def test_qwen4_admission_prices_the_gathered_route():
+    """Admission prices the floor chunk by the shared execution predicate.
+
+    Execution gathers every text chunk, with or without images elsewhere in
+    the prompt, so the request's media type must not change the admission
+    price. Image-region chunks are re-priced exactly by the per-chunk guard,
+    which sees each real chunk's mRoPE position_ids.
+    """
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     current = 147 * 1024**3
-    dense = scheduler._admission_estimate(
+    est = scheduler._admission_estimate(
         num_prompt_tokens=233_472,
         cached_tokens=0,
         current=current,
-        text_only=False,
     )
-    gathered = scheduler._admission_estimate(
-        num_prompt_tokens=233_472,
-        cached_tokens=0,
-        current=current,
-        text_only=True,
+    assert est is not None
+    assert est.kv_exact > 0
+    assert est.transient == int(
+        scheduler._admission_transient_bound(
+            est.floor_chunk, est.kv_len, gathered_core=True
+        )
     )
-    assert dense is not None and gathered is not None
-    assert gathered.kv_exact == dense.kv_exact
-    assert gathered.transient * 4 < dense.transient
 
 
 def test_qwen4_pricing_tracks_execution_route(monkeypatch):
@@ -1052,76 +1056,66 @@ def test_qwen4_pricing_tracks_execution_route(monkeypatch):
     _attach_qwen4_profile(scheduler)
     route = scheduler._qwen4_text_gathered_pricing
 
-    assert route(True, query_tokens=2048, cache_tokens=0) is False
-    assert route(True, query_tokens=2048, cache_tokens=2048) is True
-    assert route(True, query_tokens=15, cache_tokens=2048) is False
-    assert route(True, query_tokens=16, cache_tokens=2048) is True
-    assert route(False, query_tokens=2048, cache_tokens=2048) is False
+    assert route(query_tokens=2048, cache_tokens=0) is False
+    assert route(query_tokens=2048, cache_tokens=2048) is True
+    assert route(query_tokens=15, cache_tokens=2048) is False
+    assert route(query_tokens=16, cache_tokens=2048) is True
+
+    # Without position info the chunk is assumed text: execution gathers it.
+    assert route(query_tokens=2048, cache_tokens=2048) is True
+
+    # VLM text chunks (broadcast-identical mRoPE planes) gather exactly like
+    # execution; image-region chunks (differing planes) stay dense-priced.
+    n = 32
+    equal = mx.zeros((3, 1, n), dtype=mx.int64)
+    differing = mx.zeros((3, 1, n), dtype=mx.int64)
+    differing[2] = differing[2] + 1
+    assert route(query_tokens=n, cache_tokens=2048, position_ids=equal) is True
+    assert route(query_tokens=n, cache_tokens=2048, position_ids=differing) is False
 
 
-def test_qwen4_preflight_doors_use_gathered_for_text_only():
+def test_qwen4_preflight_doors_admit_at_the_gathered_price():
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     scheduler._prefill_memory_guard = True
     current = 147 * 1024**3
-    dense = scheduler._admission_estimate(
+    est = scheduler._admission_estimate(
         num_prompt_tokens=233_472,
         cached_tokens=0,
         current=current,
-        text_only=False,
     )
-    gathered = scheduler._admission_estimate(
-        num_prompt_tokens=233_472,
-        cached_tokens=0,
-        current=current,
-        text_only=True,
-    )
-    assert dense is not None and gathered is not None
-    cap = (dense.estimated + gathered.estimated) // 2
-    scheduler._memory_hard_limit_bytes = cap
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = current + est.estimated
     scheduler._memory_abort_limit_bytes = 10**18
     with (
         patch("omlx.scheduler.mx.get_active_memory", return_value=current),
         patch("omlx.scheduler.get_phys_footprint", return_value=current),
     ):
-        with pytest.raises(PrefillMemoryExceededError):
-            scheduler.preflight_or_raise(
-                num_prompt_tokens=233_472, text_only=False
-            )
-        scheduler.preflight_or_raise(num_prompt_tokens=233_472, text_only=True)
+        scheduler.preflight_or_raise(num_prompt_tokens=233_472)
         assert (
-            scheduler.preflight_eviction_request(
-                num_prompt_tokens=233_472, text_only=True
-            )
+            scheduler.preflight_eviction_request(num_prompt_tokens=233_472)
             is None
         )
-        assert (
-            scheduler.preflight_eviction_request(
-                num_prompt_tokens=233_472, text_only=False
-            )
-            is not None
-        )
 
 
-def test_qwen4_image_request_preflight_stays_dense():
+def test_qwen4_image_request_preflight_admits_at_gathered_price():
+    """Image-bearing requests admit at the gathered price.
+
+    Their text chunks execute gathered; the mid-prefill guard prices the
+    actual image-region chunks dense via their mRoPE position_ids (covered
+    by test_qwen4_pricing_tracks_execution_route).
+    """
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     scheduler._prefill_memory_guard = True
     current = 147 * 1024**3
-    dense = scheduler._admission_estimate(
+    est = scheduler._admission_estimate(
         num_prompt_tokens=233_472,
         cached_tokens=0,
         current=current,
-        text_only=False,
     )
-    gathered = scheduler._admission_estimate(
-        num_prompt_tokens=233_472,
-        cached_tokens=0,
-        current=current,
-        text_only=True,
-    )
-    assert dense is not None and gathered is not None
-    scheduler._memory_hard_limit_bytes = (dense.estimated + gathered.estimated) // 2
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = current + est.estimated
     scheduler._memory_abort_limit_bytes = 10**18
     request = _make_request(233_472)
     request.vlm_inputs_embeds = object()
@@ -1130,4 +1124,4 @@ def test_qwen4_image_request_preflight_stays_dense():
         patch("omlx.scheduler.get_phys_footprint", return_value=current),
     ):
         rejection = scheduler._preflight_memory_check(request)
-    assert rejection is not None
+    assert rejection is None

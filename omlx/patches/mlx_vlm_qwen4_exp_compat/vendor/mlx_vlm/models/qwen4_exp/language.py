@@ -23,6 +23,9 @@ from omlx.memory_monitor import (
     qwen4_gathered_min_query_tokens as _gathered_min_query_tokens,
 )
 from omlx.memory_monitor import qwen4_gathered_prefill_route
+from omlx.memory_monitor import (
+    qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
+)
 
 from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
@@ -48,39 +51,6 @@ logger = logging.getLogger(__name__)
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
-# Identity cache: keep the array alive so CPython cannot recycle id().
-_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
-
-
-def _broadcast_text_mrope_position_ids(
-    position_ids: Optional[mx.array],
-    length: int,
-) -> bool:
-    """True for missing/2-D text ids, or 3-D MRoPE that is a text broadcast.
-
-    Parent LanguageModel tiles identical ``(1, L)`` positions to ``(3, 1, L)``
-    for text-only mRoPE. Real image grids differ across the three planes and
-    must stay on the official mask+SDPA path.
-    """
-    if position_ids is None:
-        return True
-    if not isinstance(position_ids, mx.array):
-        return False
-    if position_ids.ndim == 2:
-        return tuple(position_ids.shape) == (1, length)
-    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
-        return False
-    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
-        if cached_ids is position_ids and cached_len == length:
-            return cached_same
-    same = bool(
-        mx.array_equal(position_ids[0], position_ids[1]).item()
-        and mx.array_equal(position_ids[1], position_ids[2]).item()
-    )
-    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
-    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
-        del _TEXT_MROPE_EQUAL_PLANES[:-8]
-    return same
 
 
 def _rank_two_text_position_ids(

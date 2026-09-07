@@ -365,6 +365,7 @@ try:
         estimate_mla_kv_bytes_per_token,
         estimate_qwen4_exp_kv_bytes_per_token,
         make_prefill_memory_profile,
+        qwen4_text_mrope_broadcast,
     )
 
     HAS_TIERED_CACHE = True
@@ -376,6 +377,7 @@ except ImportError:
     estimate_mla_kv_bytes_per_token = None
     estimate_qwen4_exp_kv_bytes_per_token = None
     make_prefill_memory_profile = None
+    qwen4_text_mrope_broadcast = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -3482,14 +3484,30 @@ class Scheduler:
         return callable(checker) and checker() is True
 
     def _qwen4_text_gathered_pricing(
-        self, text_only: bool, *, query_tokens: int, cache_tokens: int
+        self,
+        *,
+        query_tokens: int,
+        cache_tokens: int,
+        position_ids: Any = None,
     ) -> bool:
-        """Predict the Qwen4 text-prefill route for one concrete chunk."""
-        if text_only is not True:
-            return False
+        """Predict the Qwen4 prefill route for one concrete chunk.
+
+        Mirrors the runtime gate ``_gathered_text_prefill_eligible``: the
+        shared query/cache budget predicate plus the mRoPE plane test.
+        Callers that know the chunk's position_ids (the external VLM prefill
+        loop slices them from ``vlm_extra_kwargs``) pass them so image-region
+        chunks stay dense-priced; callers without them (admission) assume a
+        text chunk. The mid-prefill guard re-prices every real chunk with
+        its actual position_ids, so an image-bearing tail is still caught
+        before Metal sees it.
+        """
         monitor = getattr(self, "memory_monitor", None)
         checker = getattr(monitor, "qwen4_gathered_prefill_route", None)
-        return callable(checker) and checker(query_tokens, cache_tokens) is True
+        if not (callable(checker) and checker(query_tokens, cache_tokens) is True):
+            return False
+        if position_ids is None or qwen4_text_mrope_broadcast is None:
+            return True
+        return qwen4_text_mrope_broadcast(position_ids, query_tokens) is True
 
     @staticmethod
     def _qwen4_actual_gathered_pricing(
@@ -3658,6 +3676,20 @@ class Scheduler:
         )
 
         Scheduler._announce_first_prefill_chunk(self, input_arr, base_size, boundary_enabled, block_size, embeds_array)
+
+        def _chunk_route(n_tokens: int, cache_tokens: int) -> bool:
+            # Price the exact chunk execution will run: the shared
+            # query/cache predicate plus the chunk's mRoPE plane test when
+            # the VLM pipeline supplies position_ids. Image-region chunks
+            # have differing planes and stay dense-priced; text chunks
+            # gather, with or without images elsewhere in the prompt.
+            sliced = _slice_vlm_extra(extra_kwargs, n_tokens) if extra_kwargs else {}
+            return self._qwen4_text_gathered_pricing(
+                query_tokens=n_tokens,
+                cache_tokens=cache_tokens,
+                position_ids=sliced.get("position_ids"),
+            )
+
         while input_arr.shape[1] > 0:
             _trace_chunk_start = time.perf_counter()
             _trace_processed_before = processed_tokens
@@ -3679,11 +3711,7 @@ class Scheduler:
                 )
 
             cache_tokens = base_size + processed_tokens
-            gathered_core = self._qwen4_text_gathered_pricing(
-                vlm_embeds is None,
-                query_tokens=n_to_process,
-                cache_tokens=cache_tokens,
-            )
+            gathered_core = _chunk_route(n_to_process, cache_tokens)
             try:
                 n_to_process = self._adaptive_chunk_size(
                     n_to_process,
@@ -3692,11 +3720,7 @@ class Scheduler:
                     kv_len=cache_tokens,
                     gathered_core=gathered_core,
                 )
-                gathered_core = self._qwen4_text_gathered_pricing(
-                    vlm_embeds is None,
-                    query_tokens=n_to_process,
-                    cache_tokens=cache_tokens,
-                )
+                gathered_core = _chunk_route(n_to_process, cache_tokens)
                 # Check the predicted peak before submitting work to Metal.
                 n_to_process = self._guard_prefill_chunk(
                     n_to_process,
@@ -3706,11 +3730,7 @@ class Scheduler:
                     request_id=request.request_id,
                     gathered_core=gathered_core,
                 )
-                final_route = self._qwen4_text_gathered_pricing(
-                    vlm_embeds is None,
-                    query_tokens=n_to_process,
-                    cache_tokens=cache_tokens,
-                )
+                final_route = _chunk_route(n_to_process, cache_tokens)
                 if final_route != gathered_core:
                     gathered_core = final_route
                     n_to_process = self._guard_prefill_chunk(
@@ -5528,7 +5548,7 @@ class Scheduler:
 
         def qwen4_route(query_tokens: int) -> bool:
             return qwen4_accounting and self._qwen4_text_gathered_pricing(
-                True, query_tokens=query_tokens, cache_tokens=cache_tokens
+                query_tokens=query_tokens, cache_tokens=cache_tokens
             )
 
         gathered_core = qwen4_route(n)
@@ -8931,7 +8951,6 @@ class Scheduler:
                     num_prompt_tokens=request.num_prompt_tokens,
                     cached_tokens=request.cached_tokens or 0,
                     request_id=request.request_id,
-                    text_only=getattr(request, "vlm_inputs_embeds", None) is None,
                 )
             except Exception:
                 self._release_paged_cache_for_request(request.request_id)
@@ -10192,7 +10211,6 @@ class Scheduler:
             num_prompt_tokens=prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
-            text_only=getattr(request, "vlm_inputs_embeds", None) is None,
         )
         if est is None:
             return None  # can't estimate, skip
@@ -10251,7 +10269,6 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int,
         current: int,
-        text_only: bool = False,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
@@ -10305,7 +10322,7 @@ class Scheduler:
             monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
         )
         gathered_core = self._qwen4_text_gathered_pricing(
-            text_only, query_tokens=floor_chunk, cache_tokens=kv_len
+            query_tokens=floor_chunk, cache_tokens=kv_len
         )
         transient = int(
             self._admission_transient_bound(
@@ -10370,7 +10387,6 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
-        text_only: bool = False,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
 
@@ -10396,7 +10412,6 @@ class Scheduler:
             num_prompt_tokens=num_prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
-            text_only=text_only,
         )
         if est is None:
             return
@@ -10457,7 +10472,6 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
-        text_only: bool = False,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
 
@@ -10481,7 +10495,6 @@ class Scheduler:
             num_prompt_tokens=num_prompt_tokens,
             cached_tokens=cached_tokens,
             current=current,
-            text_only=text_only,
         )
         if est is None:
             return None
