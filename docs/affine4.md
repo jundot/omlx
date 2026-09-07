@@ -38,8 +38,11 @@ head dimensions divisible by 32 through 512, and up to 32 grouped query rows per
 KV head. Other dimensions, longer queries, and attention sinks use the portable
 path. Boolean and additive attention masks retain their meaning.
 
-Portable attention unpacks directly into rotated float32 keys and values.
-Long queries run in bounded blocks, retiring each block before the next one to
+Eligible BF16 prefill uses fused MLX attention with BF16 unpacking in rotated
+coordinates. It evaluates each layer's attention before releasing its unpacked
+KV workspace. Explicit array masks, sinks and unsupported shapes retain the
+portable float32 path. Long portable queries run in bounded blocks, retiring
+each block before the next one to
 avoid allocating a full query-by-context score matrix. The score budget is
 64 MiB per block, or at least one query row; total temporary memory also includes
 the unpacked keys, values, and attention intermediates.
@@ -65,6 +68,11 @@ compare this path with the FP32 baseline and both earlier implementations.
 At 200K tokens, dense single-row attention fell from 2.90 to 1.78 ms and
 MoE single-row attention from 1.61 to 1.06 ms. The earlier VLM kernels measured
 1.58 and 0.99 ms respectively in the same run.
+The [paired fused-prefill measurements](../benchmarks/results/affine4_prefill_optimized.json)
+at 32K context and 2,048 query rows measured 85.75 ms for dense geometry and
+55.94 ms for MoE geometry, versus 486.05/211.40 ms for the FP32 baseline and
+95.39/60.18 ms for the VLM port. Output cosine against the FP32 path was
+approximately 0.99999; this is an attention-level numerical check.
 For a head dimension of 256, a compressed K or V vector occupies 132 bytes,
 compared with 512 bytes in float16; the retained full-precision layers reduce
 the whole-model compression ratio.

@@ -65,7 +65,7 @@ def _dequantize_rotated_kernel():
             }
             uint nibble = (packed[packed_offset] >> (4 * (dimension % 8))) & 15u;
             int code = int(nibble ^ 8u) - 8;
-            output[index] = float(code) * float(scales[scale_offset]);
+            output[index] = static_cast<Output>(float(code) * float(scales[scale_offset]));
         """,
     )
 
@@ -133,11 +133,13 @@ class Affine4Codec:
             nibbles = _unpack_lowbit(state.indices, _BITS, self.dim).astype(mx.int16)
         return ((nibbles ^ 8) - 8).astype(mx.float32)
 
-    def dequantize_rotated(self, state: TurboQuantMSEState) -> mx.array:
+    def dequantize_rotated(
+        self, state: TurboQuantMSEState, dtype=mx.float32
+    ) -> mx.array:
         if state.norms.ndim == 0:
             expanded = TurboQuantMSEState(state.norms[None], state.indices[None])
-            return self.dequantize_rotated(expanded)[0]
-        signature = (self.dim, state.norms.ndim, state.norms.dtype)
+            return self.dequantize_rotated(expanded, dtype)[0]
+        signature = (self.dim, state.norms.ndim, state.norms.dtype, dtype)
         if (
             mx.default_device() == mx.gpu
             and _DEQUANTIZE_LAUNCHABLE.get(signature) is not False
@@ -148,9 +150,13 @@ class Affine4Codec:
                 if kernel is not None:
                     output = kernel(
                         inputs=[state.indices, state.norms],
-                        template=[("Dim", self.dim), ("Rank", state.norms.ndim)],
+                        template=[
+                            ("Dim", self.dim),
+                            ("Rank", state.norms.ndim),
+                            ("Output", dtype),
+                        ],
                         output_shapes=[(*state.norms.shape, self.dim)],
-                        output_dtypes=[mx.float32],
+                        output_dtypes=[dtype],
                         grid=(state.norms.size * self.dim, 1, 1),
                         threadgroup=(256, 1, 1),
                     )[0]
@@ -160,7 +166,9 @@ class Affine4Codec:
                     return output
             except (RuntimeError, ValueError):
                 _DEQUANTIZE_LAUNCHABLE[signature] = False
-        return self._codes(state) * state.norms.astype(mx.float32)[..., None]
+        return (self._codes(state) * state.norms.astype(mx.float32)[..., None]).astype(
+            dtype
+        )
 
     def dequantize(self, state: TurboQuantMSEState) -> mx.array:
         return self._rotate_inverse(self.dequantize_rotated(state))
@@ -1120,6 +1128,33 @@ class Affine4KVCache(TurboQuantKVCache):
             )
             if output is not None:
                 return output
+        effective_mask = self._attention_mask(
+            mask, queries.shape[-2], _state_length(keys_state)
+        )
+        if (
+            mx.default_device() == mx.gpu
+            and queries.dtype == mx.bfloat16
+            and queries.shape[-2] > 4
+            and _state_length(keys_state) >= _MIN_NATIVE_TOKENS
+            and queries.shape[-2] <= _state_length(keys_state)
+            and self.key_codec.dim == self.value_codec.dim
+            and self.key_codec.dim in (64, 72, 80, 96, 128, 256)
+            and sinks is None
+            and (effective_mask is None or isinstance(effective_mask, str))
+        ):
+            rotated_output = mx.fast.scaled_dot_product_attention(
+                self.key_codec.prepare_queries(queries).astype(mx.bfloat16),
+                self.key_codec.dequantize_rotated(keys_state, mx.bfloat16),
+                self.value_codec.dequantize_rotated(values_state, mx.bfloat16),
+                scale=scale,
+                mask=effective_mask,
+                force_fused=True,
+            )
+            # Retire unpacked KV before the next layer allocates its workspace.
+            mx.eval(rotated_output)
+            return self.value_codec._rotate_inverse(
+                rotated_output.astype(mx.float32)
+            ).astype(queries.dtype)
         rotated_keys = self.key_codec.dequantize_rotated(keys_state)
         rotated_values = self.value_codec.dequantize_rotated(values_state)
         rotated_output = self._portable_attention(

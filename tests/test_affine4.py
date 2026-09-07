@@ -205,6 +205,30 @@ def test_native_long_uniform_attention_stays_finite(tokens):
     close(output, expected.astype(queries.dtype), atol=0.02)
 
 
+@pytest.mark.parametrize("dim", [64, 72, 80, 96, 128, 256])
+@pytest.mark.parametrize("mask", [None, "causal"])
+def test_bf16_fused_prefill_matches_reference(monkeypatch, dim, mask):
+    if not mx.metal.is_available():
+        pytest.skip("Fused prefill requires Metal")
+    cache = Affine4KVCache()
+    cache.update_and_fetch(
+        random((1, 2, 513, dim), mx.bfloat16),
+        random((1, 2, 513, dim), mx.bfloat16, 1),
+    )
+    queries = random((1, 8, 33, dim), mx.bfloat16, 2)
+    original = mx.fast.scaled_dot_product_attention
+    calls = []
+
+    def capture(q, k, v, **kwargs):
+        calls.append((q.dtype, k.dtype, v.dtype, kwargs.get("force_fused")))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
+    output = cache.attention(queries, scale=dim**-0.5, mask=mask)
+    assert calls == [(mx.bfloat16, mx.bfloat16, mx.bfloat16, True)]
+    close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
+
+
 def test_native_large_values():
     if not affine4._m5_mpp_available():
         pytest.skip("Signed-int4 attention requires M5")
@@ -495,14 +519,16 @@ def test_warm_execution_errors_propagate_at_evaluation(monkeypatch):
 
 @pytest.mark.parametrize("dim", [1, 7, 63, 80, 128, 257])
 @pytest.mark.parametrize("shape", [(), (3,), (2, 3, 9)])
-def test_fused_rotated_dequantize_arbitrary_dimensions(dim, shape):
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_fused_rotated_dequantize_arbitrary_dimensions(dim, shape, dtype):
     if not mx.metal.is_available():
         pytest.skip("Fused unpack requires Metal")
     codec = Affine4Codec(dim)
     state = codec.quantize(random((*shape, dim), mx.float32))
     reference = codec._codes(state) * state.norms[..., None]
-    close(codec.dequantize_rotated(state), reference, 0, 0)
-    assert affine4._DEQUANTIZE_LAUNCHABLE[(dim, max(1, len(shape)), mx.float32)] is True
+    close(codec.dequantize_rotated(state, dtype), reference.astype(dtype), 0, 0)
+    signature = (dim, max(1, len(shape)), mx.float32, dtype)
+    assert affine4._DEQUANTIZE_LAUNCHABLE[signature] is True
 
 
 def test_fused_rotated_dequantize_strides():
@@ -547,7 +573,7 @@ def test_dequantize_first_deferred_failure_recovers(monkeypatch):
         0,
         0,
     )
-    assert affine4._DEQUANTIZE_LAUNCHABLE[(63, 3, mx.float32)] is False
+    assert affine4._DEQUANTIZE_LAUNCHABLE[(63, 3, mx.float32, mx.float32)] is False
 
 
 @pytest.mark.parametrize("device_context", ["default", "stream"])
