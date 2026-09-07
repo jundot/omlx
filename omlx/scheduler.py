@@ -3465,13 +3465,11 @@ class Scheduler:
             )
 
     def _apply_turboquant_kv_convert(self, prompt_cache: list[Any]) -> None:
-        """Convert populated KVCache data to TurboQuantKVCache via from_cache().
+        """Convert native full-attention caches to the selected packed format.
 
-        Called AFTER fp16 prefill completes (or on an SSD-restored fp16
-        cache): the completed full-precision KV is quantized once, so prefill
-        hidden states stay exact and quantization error only enters at
-        decode-time reads. This is the key difference from #717/#771, which
-        quantized on the fly during prefill and corrupted hidden states.
+        TurboQuant converts after cold prefill to preserve its hidden states.
+        Affine4 also converts at prefill entry so subsequent updates retain
+        compressed history throughout the request.
         """
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -3523,6 +3521,16 @@ class Scheduler:
         mutable flag on the shared monitor.
         """
         return text_only is True and Scheduler._qwen4_prefill_accounting_enabled(self)
+
+    def _prepare_affine4_prefill_cache(self, prompt_cache: list[Any]) -> None:
+        """Keep full-attention history packed throughout Affine4 prefill."""
+        if (
+            self._turboquant_kv_bits is not None
+            and getattr(self, "_turboquant_kv_scheme", "turboquant") == "affine4"
+            and self._turboquant_eligible(prompt_cache)
+        ):
+            with mx.stream(self._stream):
+                self._apply_turboquant_kv_convert(prompt_cache)
 
     @staticmethod
     def _qwen4_actual_gathered_pricing(
@@ -3590,7 +3598,10 @@ class Scheduler:
         else:
             prompt_cache = make_prompt_cache(self.model)
 
-        # Fresh TurboQuant requests run fp16 during the cold prefill loop and
+        self._prepare_affine4_prefill_cache(prompt_cache)
+
+        # Affine4 packs each layer's new KV during prefill. TurboQuant requests
+        # run in full precision during the cold prefill loop and
         # are quantized once at the end. Restored TurboQuant prefix caches stay
         # quantized while pre-filling the uncached suffix, then keep using TQ for
         # decode. Rotating/sliding-window layers remain native pass-through
@@ -5411,6 +5422,7 @@ class Scheduler:
             if existing_cache is not None
             else make_prompt_cache(self.model)
         )
+        self._prepare_affine4_prefill_cache(prompt_cache)
 
         block_size = self.config.paged_cache_block_size
         boundary_enabled = (

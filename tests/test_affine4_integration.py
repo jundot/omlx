@@ -11,6 +11,7 @@ from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
 from omlx.affine4 import Affine4KVCache, BatchAffine4KVCache
 from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
+from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, _is_turboquant_kv_family_cache
 from omlx.turboquant_kv import BatchTurboQuantKVCache, TurboQuantKVCache
 
@@ -171,3 +172,75 @@ def test_real_model_prefill_convert_and_batched_decode(architecture, scheduler):
     mx.eval(logits)
     assert bool(mx.all(mx.isfinite(logits)))
     assert batch[0].extract(0).offset == 260
+
+
+@pytest.mark.parametrize("architecture", ["llama", "qwen2", "qwen3_5"])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_incremental_prefill_matches_explicit_cache_updates(
+    architecture, chunked, scheduler, monkeypatch
+):
+    from mlx_lm.models.cache import make_prompt_cache
+
+    module = importlib.import_module(f"mlx_lm.models.{architecture}")
+    args = dict(
+        model_type=architecture,
+        hidden_size=256,
+        num_hidden_layers=4,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+    )
+    if architecture == "qwen3_5":
+        args.update(
+            full_attention_interval=2,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+        )
+        model = module.TextModel(module.TextModelArgs(**args))
+    else:
+        model = module.Model(module.ModelArgs(**args))
+    model.set_dtype(mx.bfloat16)
+    scheduler.model = model
+    scheduler.config.prefill_step_size = 128
+    scheduler.config.paged_cache_block_size = 0
+    apply_turboquant_attention_patch()
+    prompt = [i % 64 for i in range(513)]
+    request = Request("incremental", prompt=prompt, sampling_params=SamplingParams())
+    reference = make_prompt_cache(model)
+    scheduler._prepare_affine4_prefill_cache(reference)
+    for start in range(0, 512, 128):
+        mx.eval(model(mx.array([prompt[start:start + 128]]), cache=reference))
+    expected = model(mx.array([prompt[-1:]]), cache=reference)
+    mx.eval(expected)
+    updates = []
+    original = Affine4KVCache.update_and_fetch
+
+    def record(self, keys, values):
+        updates.append((self.offset, keys.shape[-2]))
+        return original(self, keys, values)
+
+    monkeypatch.setattr(Affine4KVCache, "update_and_fetch", record)
+    if chunked:
+        state = scheduler._begin_prefill(request, prompt, None)
+        while not scheduler._step_prefill_chunk(state):
+            pass
+        caches, last = state.cache, state.last_token
+    else:
+        caches, last = scheduler._do_external_prefill(request, prompt, None)
+    packed = [cache for cache in caches if isinstance(cache, Affine4KVCache)]
+    assert packed
+    assert all(cache.offset == 512 for cache in packed)
+    assert {offset for offset, _ in updates} == {0, 128, 256, 384}
+    assert all(count == 128 for _, count in updates)
+    if architecture == "qwen3_5":
+        assert [type(cache) for cache in caches] == [
+            ArraysCache, Affine4KVCache, ArraysCache, KVCache
+        ]
+    actual = model(mx.array([last]), cache=caches)
+    mx.eval(actual)
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.array_equal(actual, expected).item()

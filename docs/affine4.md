@@ -47,10 +47,13 @@ avoid allocating a full query-by-context score matrix. The score budget is
 64 MiB per block, or at least one query row; total temporary memory also includes
 the unpacked keys, values, and attention intermediates.
 
-Cold prefill runs in full precision and converts the cache once before decode.
-This reduces decode residency and SSD storage; it does not remove the memory
-peak during cold prefill. The final full-attention layer remains
+Affine4 compresses new full-attention KV during each layer's prefill update,
+so the complete uncompressed history never has to be resident. Attention
+unpacks one layer at a time as needed. The final full-attention layer remains
 uncompressed by default under the existing `turboquant_skip_last` quality guard.
+Recurrent and sliding-window state retains its native representation. Unlike
+TurboQuant's cold-prefill policy, Affine4 quantization also affects prefill
+hidden states, so cache format and prefill chunk size can change generated text.
 
 ## Storage and correctness
 
