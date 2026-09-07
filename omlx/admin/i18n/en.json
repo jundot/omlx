@@ -677,7 +677,7 @@
   "modal.model_settings.kv_compression_format": "Format",
   "modal.model_settings.kv_compression_turboquant": "TurboQuant",
   "modal.model_settings.kv_compression_affine4": "Affine4 (4-bit)",
-  "modal.model_settings.kv_compression_affine4_hint": "4-bit affine KV cache format. M5 acceleration is selected automatically when supported, with a portable fallback on other hardware or unsupported shapes.",
+  "modal.model_settings.kv_compression_affine4_hint": "Compresses KV to 4-bit Affine4 as the prompt is processed. M5 acceleration is selected automatically when supported, with a portable fallback on other hardware or unsupported shapes.",
   "modal.model_settings.vlm_mtp_compression_conflict": "Disable DFlash / SpecPrefill / MTP / KV cache compression first — VLM MTP owns the speculative decode path.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",

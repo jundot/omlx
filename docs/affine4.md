@@ -42,8 +42,8 @@ Eligible BF16 prefill uses fused MLX attention with BF16 unpacking in rotated
 coordinates. It evaluates each layer's attention before releasing its unpacked
 KV workspace. Explicit array masks, sinks and unsupported shapes retain the
 portable float32 path. Long portable queries run in bounded blocks, retiring
-each block before the next one to
-avoid allocating a full query-by-context score matrix. The score budget is
+each block before the next one to avoid allocating a full query-by-context
+score matrix. The score budget is
 64 MiB per block, or at least one query row; total temporary memory also includes
 the unpacked keys, values, and attention intermediates.
 
@@ -79,17 +79,10 @@ preserves small and large finite values across portable and native execution.
 Native attention uses float16 value accumulation for bounded partitions and
 float32 for larger partitions. Value-scale normalization keeps the bound
 independent of input magnitude; softmax statistics and partition reduction
-remain float32.
-The [paired accumulator measurements](../benchmarks/results/affine4_decode_optimized.json)
-compare this path with the FP32 baseline and both earlier implementations.
-At 200K tokens, dense single-row attention fell from 2.90 to 1.78 ms and
-MoE single-row attention from 1.61 to 1.06 ms. The earlier VLM kernels measured
-1.58 and 0.99 ms respectively in the same run.
-The [paired fused-prefill measurements](../benchmarks/results/affine4_prefill_optimized.json)
-at 32K context and 2,048 query rows measured 85.75 ms for dense geometry and
-55.94 ms for MoE geometry, versus 486.05/211.40 ms for the FP32 baseline and
-95.39/60.18 ms for the VLM port. Output cosine against the FP32 path was
-approximately 0.99999; this is an attention-level numerical check.
+remain float32. Unmasked and causal decode specialize away array-mask reads;
+explicit Boolean masks retain their own kernel specialization. Long-context
+partition tuning depends on tensor geometry, not model names.
+
 For a head dimension of 256, a compressed K or V vector occupies 132 bytes,
 compared with 512 bytes in float16; the retained full-precision layers reduce
 the whole-model compression ratio.
@@ -110,20 +103,21 @@ full-precision KV or TurboQuant.
 python -m pytest tests/test_affine4.py tests/test_affine4_integration.py tests/test_affine4_prefix_cache.py
 ```
 
-These cover native/reference attention, unsupported shapes and masks, snapshot
-metadata, SSD round trips, continuous batching, scheduler signatures, and real
-Llama/Qwen2 model forward passes.
+These cover native/reference attention, overflow bounds, unsupported shapes and
+masks, snapshot metadata, SSD round trips, continuous batching, scheduler
+signatures, and incremental real Llama/Qwen2/Qwen3.5 hybrid forward passes.
 
-The [real-server smoke results](../benchmarks/results/affine4_server_smoke.json)
-record Qwen3.8 generation, warm-prefix reuse, reuse after restart, and Lightning
-MTP verification on an M5 Pro. These validate the execution path and cache
-lifecycle; they are not a model-quality benchmark.
+The [incremental-cache validation](../benchmarks/results/affine4_incremental_validation.md)
+records paired comparisons with the earlier implementations, full-model server
+throughput, prefix persistence, and memory traces. Qwen3.8 completed both 150K
+and 200K cold prompts on a 48 GiB M5 Pro with the existing memory guard.
+These checks validate execution and cache lifecycle, not general model quality.
 
-The [Qwen server comparison](../benchmarks/results/affine4_qwen_server_comparison.md)
-covers Qwen3.6-35B-A3B and Qwen3.8-27B at 4K through 64K context, 4,096-token
-endurance runs, and prefill after restoring a 32K prefix. Affine4 improved
-long-context decode in these measurements, while restored-prefix prefill
-remained slower than uncompressed KV and was slower than TurboQuant on Qwen3.8.
+The earlier [server matrix](../benchmarks/results/affine4_qwen_server_comparison.md)
+and [regression investigation](../benchmarks/results/affine4_regression_comparison.md)
+describe the FP32-accumulator implementation before incremental prefill and the
+current kernel optimizations. Their throughput and memory failures are
+historical baselines.
 
 For attention-only comparisons with TurboQuant and float16 KV:
 
@@ -134,19 +128,8 @@ python benchmarks/bench_affine4.py --fallbacks > attention.json
 Stop other GPU workloads before measuring. Cache construction is excluded from
 timings, and attention speedups do not directly predict whole-model throughput.
 
-The [M5 Pro measurements](../benchmarks/results/affine4_m5_pro.json) include
-forward and reverse benchmark ordering, 20 warmups and 50 samples per case, and
-source hashes. At 32,768 cached tokens, head dimension 256, 24 query heads and
-four KV heads, the median attention times across the two orders were:
-
-| Query rows | Float16 KV | TurboQuant 4-bit | Affine4 |
-| --- | ---: | ---: | ---: |
-| 1 | 0.79–0.80 ms | 0.88–0.90 ms | 0.72–0.75 ms |
-| 4 | 1.71–1.72 ms | 4.19–4.20 ms | 1.32–1.35 ms |
-
-With the native path disabled, fused unpacking reduced one-row portable
-attention from 9.97–10.10 ms to 3.46 ms at that geometry. For a 256-row warm
-prefill, query blocking reduced measured temporary memory from 1,047 MiB to
-332 MiB; a 2,048-row query used 417 MiB. Blocking introduces synchronization to
-bound memory. These measurements do not establish model quality or a speedup
-for every architecture and context length.
+The result files retain source hashes and measurement protocols. Microbenchmarks
+and fixed-length server trials do not establish a speedup for every architecture
+or context length. Incremental lossy prefill also changes hidden states, so
+teacher-forced decode agreement from a shared native cache does not establish
+the quality of an incrementally compressed prompt.

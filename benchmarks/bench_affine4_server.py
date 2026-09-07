@@ -100,7 +100,7 @@ def main():
                 "quantized_skip_last": True,
                 "cold_cache": True,
                 "public_upload": False,
-                "peak_memory": "Whole-process MLX peak, including resident model",
+                "peak_memory": "Peak active MLX allocations, including resident model; physical footprint is sampled separately",
                 "repeat": "8K and 32K repeated in reversed format order",
             },
             "source_sha256": {

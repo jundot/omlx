@@ -1,0 +1,116 @@
+{
+  "units": "bytes unless explicitly suffixed _gib",
+  "log": "incremental-server.log",
+  "implementation_commit": "2f487029",
+  "interpretation": "Cache nbytes includes recurrent state and allocated capacity. MLX peak is an allocator high-water mark. Physical footprint and pool peaks are sampled, not simultaneous or additive. Chunk traces supplement the 250 ms sampler.",
+  "runs": [
+    {
+      "model": "Qwen3.8-27B",
+      "context": 200000,
+      "request_id": "e95b7e1a-2490-4b0f-afca-8530ffdc9e2d",
+      "trace_samples": 196,
+      "cache_bytes_per_token": 19936,
+      "native_kv_bytes_per_token": 65536,
+      "logical_attention_cache_bytes": 3987200000,
+      "native_attention_cache_bytes": 13107200000,
+      "last_prefill_trace": {
+        "rid": "e95b7e1a-2490-4b0f-afca-8530ffdc9e2d",
+        "phase": "after_reclaim",
+        "context": 200000,
+        "cache_bytes": 4141930496,
+        "mlx_active_bytes": 20084639766,
+        "mlx_pool_bytes": 0,
+        "phys_footprint_bytes": 27766159280,
+        "hot_cache_cpu_bytes": 0
+      },
+      "trace_maxima": {
+        "cache_bytes": 4141930496,
+        "mlx_active_bytes": 20084639766,
+        "mlx_pool_bytes": 7046791232,
+        "phys_footprint_bytes": 28262102960,
+        "hot_cache_cpu_bytes": 0
+      },
+      "mlx_active_high_water_bytes": 23414786090,
+      "periodic_sampler_peaks_gib": {
+        "phys_footprint_peak": 26.13,
+        "mlx_active_peak": 21.62,
+        "mlx_cache_peak": 4.24,
+        "system_used_peak": 39.49,
+        "system_wired_peak": 28.95,
+        "total_ram": 48
+      }
+    },
+    {
+      "model": "Qwen3.8-27B",
+      "context": 150000,
+      "request_id": "59e5e270-3280-4a0d-98a8-31fe080889a4",
+      "trace_samples": 148,
+      "cache_bytes_per_token": 19936,
+      "native_kv_bytes_per_token": 65536,
+      "logical_attention_cache_bytes": 2990400000,
+      "native_attention_cache_bytes": 9830400000,
+      "last_prefill_trace": {
+        "rid": "59e5e270-3280-4a0d-98a8-31fe080889a4",
+        "phase": "after_reclaim",
+        "context": 150000,
+        "cache_bytes": 3144409600,
+        "mlx_active_bytes": 19084118038,
+        "mlx_pool_bytes": 0,
+        "phys_footprint_bytes": 24253101880,
+        "hot_cache_cpu_bytes": 0
+      },
+      "trace_maxima": {
+        "cache_bytes": 3144409600,
+        "mlx_active_bytes": 19084118038,
+        "mlx_pool_bytes": 5977604160,
+        "phys_footprint_bytes": 26154121040,
+        "hot_cache_cpu_bytes": 0
+      },
+      "mlx_active_high_water_bytes": 22233319466,
+      "periodic_sampler_peaks_gib": {
+        "phys_footprint_peak": 24.31,
+        "mlx_active_peak": 20.5,
+        "mlx_cache_peak": 5.53,
+        "system_used_peak": 38.6,
+        "system_wired_peak": 27.03,
+        "total_ram": 48
+      }
+    },
+    {
+      "model": "Qwen3.6-35B-A3B",
+      "context": 200000,
+      "request_id": "f5b85acc-9ec4-4764-9602-270ce7280850",
+      "trace_samples": 196,
+      "cache_bytes_per_token": 6800,
+      "native_kv_bytes_per_token": 20480,
+      "logical_attention_cache_bytes": 1360000000,
+      "native_attention_cache_bytes": 4096000000,
+      "last_prefill_trace": {
+        "rid": "f5b85acc-9ec4-4764-9602-270ce7280850",
+        "phase": "after_reclaim",
+        "context": 200000,
+        "cache_bytes": 1424782336,
+        "mlx_active_bytes": 21722117398,
+        "mlx_pool_bytes": 0,
+        "phys_footprint_bytes": 26162144256,
+        "hot_cache_cpu_bytes": 0
+      },
+      "trace_maxima": {
+        "cache_bytes": 1424782336,
+        "mlx_active_bytes": 21722117398,
+        "mlx_pool_bytes": 3346568184,
+        "phys_footprint_bytes": 26349544448,
+        "hot_cache_cpu_bytes": 0
+      },
+      "mlx_active_high_water_bytes": 23798347162,
+      "periodic_sampler_peaks_gib": {
+        "phys_footprint_peak": 24.4,
+        "mlx_active_peak": 21.9,
+        "mlx_cache_peak": 2.48,
+        "system_used_peak": 38.42,
+        "system_wired_peak": 26.69,
+        "total_ram": 48
+      }
+    }
+  ]
+}

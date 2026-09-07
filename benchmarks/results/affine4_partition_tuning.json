@@ -1,0 +1,294 @@
+{
+  "protocol": "Identical BF16 tensors, 10 warmups, 41 interleaved rounds. Target group count is an isolated dispatch override. Native range guard remains enabled.",
+  "source_sha256": "797fd2371536e07445144d5ab8a233bd508cf4f17bf4bcd0cb477bd1f37a01de",
+  "rows": [
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 1,
+      "milliseconds": {
+        "168": 0.509041,
+        "224": 0.608584,
+        "256": 0.567792,
+        "336": 0.572167,
+        "448": 0.586,
+        "vlm_pr": 0.479125
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 0.000244140625
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 0.000244140625
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 0.000244140625
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 0.000244140625
+        }
+      }
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 32768,
+      "query_length": 4,
+      "milliseconds": {
+        "168": 1.142083,
+        "224": 1.298709,
+        "256": 1.1925,
+        "336": 1.101667,
+        "448": 1.213833,
+        "vlm_pr": 1.076458
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        }
+      }
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 200000,
+      "query_length": 1,
+      "milliseconds": {
+        "168": 1.727583,
+        "224": 2.219833,
+        "256": 2.028834,
+        "336": 1.988292,
+        "448": 1.900959,
+        "vlm_pr": 1.570667
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    },
+    {
+      "query_heads": 24,
+      "kv_heads": 4,
+      "tokens": 200000,
+      "query_length": 4,
+      "milliseconds": {
+        "168": 5.24,
+        "224": 5.939375,
+        "256": 5.323458,
+        "336": 5.530375,
+        "448": 5.170625,
+        "vlm_pr": 4.854333
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 1,
+      "milliseconds": {
+        "168": 0.376708,
+        "224": 0.425542,
+        "256": 0.419375,
+        "336": 0.431792,
+        "448": 0.4495,
+        "vlm_pr": 0.383375
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        }
+      }
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 32768,
+      "query_length": 4,
+      "milliseconds": {
+        "168": 0.98975,
+        "224": 0.991625,
+        "256": 1.021375,
+        "336": 1.030541,
+        "448": 1.1085,
+        "vlm_pr": 0.932375
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 0.0001220703125
+        }
+      }
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 200000,
+      "query_length": 1,
+      "milliseconds": {
+        "168": 1.042875,
+        "224": 1.27075,
+        "256": 1.22325,
+        "336": 1.207583,
+        "448": 1.181833,
+        "vlm_pr": 0.98925
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    },
+    {
+      "query_heads": 16,
+      "kv_heads": 2,
+      "tokens": 200000,
+      "query_length": 4,
+      "milliseconds": {
+        "168": 5.132917,
+        "224": 4.15025,
+        "256": 4.352584,
+        "336": 4.058166,
+        "448": 4.063125,
+        "vlm_pr": 4.712875
+      },
+      "numerics": {
+        "168": {
+          "finite": true,
+          "max_abs_vs_168": 0.0
+        },
+        "224": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "256": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "336": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        },
+        "448": {
+          "finite": true,
+          "max_abs_vs_168": 6.103515625e-05
+        }
+      }
+    }
+  ]
+}
