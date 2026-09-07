@@ -117,7 +117,7 @@ class TestListModelsSettings:
             patch.object(admin_routes, "_get_server_state", return_value=state),
             patch.object(admin_routes, "_get_global_settings", return_value=None),
             patch.object(admin_routes, "_dflash_compat_for_model", return_value=(False, "")),
-            patch.object(admin_routes, "_mtp_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_mtp_compat_for_model", return_value=(False, "", False)),
             patch.object(admin_routes, "_paroquant_compat_for_model", return_value=(False, "")),
             patch(
                 "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
