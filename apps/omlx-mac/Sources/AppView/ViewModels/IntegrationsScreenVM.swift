@@ -42,7 +42,7 @@ final class IntegrationsScreenVM {
     // which can drift after a hot-reload).
     private(set) var serverHost: String = "127.0.0.1"
     private(set) var serverPort: Int = 8000
-    private(set) var serverApiKey: String = ""
+    private(set) var serverApiKey: *** = ""
     private(set) var cliPrefix: String = "omlx"
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
