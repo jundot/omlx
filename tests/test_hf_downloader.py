@@ -2436,6 +2436,44 @@ class TestGetModelInfo:
         assert result["params"] == 25_805_936_206
 
     @pytest.mark.asyncio
+    async def test_uses_actual_safetensors_size_for_packed_mxfp4_weights(self):
+        """MXFP4 sidecars use blob bytes, never their logical U32 count."""
+        mock_info = MagicMock()
+        mock_info.id = "deresolution/Qwen3.8-27B-DFlash2-mxfp4"
+        mock_info.downloads = 1046
+        mock_info.likes = 1
+        mock_info.tags = ["mlx", "mxfp4", "dflash2"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = {
+            "parameters": {"U32": 1_924_136_960, "BF16": 267_520},
+            "total": 1_924_404_480,
+        }
+        mock_info.card_data = None
+
+        weight = MagicMock()
+        weight.rfilename = "model.safetensors"
+        weight.size = 1_022_746_831
+        readme = MagicMock()
+        readme.rfilename = "README.md"
+        readme.size = 3_531
+        mock_info.siblings = [weight, readme]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info(mock_info.id)
+
+        assert result["params"] == 1_924_404_480
+        assert result["params_formatted"] == "1.9B"
+        assert result["size"] == 1_022_746_831
+        assert result["size_formatted"] == "975.4 MB"
+
+    @pytest.mark.asyncio
     async def test_detects_lora_adapter(self):
         """Verify is_adapter=True when adapter_config.json is in file list."""
         mock_info = MagicMock()
