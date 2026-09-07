@@ -304,8 +304,14 @@ final class ThroughputBenchScreenVM {
                             self.uploadState = upload
                         }
                         let status = resp.status.lowercased()
+                        // The backend reports failures as "error" (never
+                        // "failed") — without it here a server-side error
+                        // leaves `running` stuck true and the poll spinning
+                        // forever, the same pathology as an unhandled 404
+                        // below (§G8).
                         let terminal = (status == "completed"
                                         || status == "failed"
+                                        || status == "error"
                                         || status == "cancelled")
                         if terminal {
                             self.running = false
@@ -331,8 +337,23 @@ final class ThroughputBenchScreenVM {
                         return
                     }
                 } catch {
-                    // Transient failures (server restart, dropped socket)
-                    // shouldn't kill the poll — log and try again.
+                    if Task.isCancelled { return }
+                    if case OMLXClientError.http(let status, _) = error, status == 404 {
+                        // The run no longer exists server-side (restart, or
+                        // the in-memory run store was cleared) — terminal,
+                        // not transient. Retrying forever would just spin at
+                        // 1 Hz against a resource that will never come back,
+                        // with `running` stuck true (§G8).
+                        await MainActor.run {
+                            self.running = false
+                            self.lastError = String(localized: "bench.error.run_not_found",
+                                                     defaultValue: "Benchmark run no longer exists — the server may have restarted.",
+                                                     comment: "Throughput bench: poll got a 404 for the current run")
+                        }
+                        return
+                    }
+                    // Other failures (server restart mid-request, dropped
+                    // socket) are more likely transient — log and try again.
                     await MainActor.run {
                         self.lastError = error.omlxDescription
                     }
