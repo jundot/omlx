@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Claude Desktop tier aliases (T-001).
+"""Tests for Claude Desktop tier aliases.
 
 When ``ClaudeCodeSettings.desktop_enabled`` is set, oMLX exposes three
 derived (non-persisted) slot IDs that resolve at runtime to the models

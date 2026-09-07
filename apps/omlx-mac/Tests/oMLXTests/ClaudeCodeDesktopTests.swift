@@ -1,6 +1,6 @@
-// T-003 — Claude Desktop tier-alias toggle (server field from T-001).
+// Claude Desktop tier-alias toggle tests.
 // These tests pin the read shape (`claude_code.desktop_enabled`, optional
-// so pre-T-001 servers that omit the key still decode) and the flat patch
+// so older servers that omit the key still decode) and the flat patch
 // shape (`claude_code_desktop_enabled`) so a future rename on either edge
 // breaks the build instead of silently dropping the toggle state.
 
@@ -55,7 +55,7 @@ final class ClaudeCodeDesktopTests: XCTestCase {
     }
 
     func testDesktopEnabledIsNilWhenAbsent() throws {
-        // Pre-T-001 servers omit the key entirely. Decode must succeed with
+        // Older servers omit the key entirely. Decode must succeed with
         // nil so the VM can fall back to `false`.
         let json = """
         {

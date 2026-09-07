@@ -15,7 +15,7 @@ final class IntegrationsScreenVM {
     var opusModel: String = ""
     var sonnetModel: String = ""
     var haikuModel: String = ""
-    /// T-001: Claude Desktop tier aliases (claude-opus-5 /
+    /// Claude Desktop tier aliases (claude-opus-5 /
     /// claude-sonnet-5 / claude-haiku-4-5-20251001) mapped onto the tier
     /// models above.
     var desktopEnabled: Bool = false

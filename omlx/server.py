@@ -3019,7 +3019,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> JSONResponse:
                 )
                 existing_ids.add(profile_model_id)
 
-        # Claude Desktop tier aliases (T-001): derived, non-persisted slot IDs
+        # Claude Desktop tier aliases: derived, non-persisted slot IDs
         # that resolve at runtime to the configured Claude Code tier models.
         # Skipped (with a warning, never a crash) when the slot collides with
         # an existing model ID or an exposed custom alias.

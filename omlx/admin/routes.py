@@ -331,7 +331,7 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_desktop_enabled: bool | None = None
     # Side-effect flag for the Claude Desktop toggle: writing the user's
     # Claude Desktop JSON configs is a visible side effect, so the restart
-    # of the Claude app is opt-in and never automatic (T-002).
+    # of the Claude app is opt-in and never automatic.
     restart_desktop: bool = False
 
     # Other integrations settings
@@ -4643,7 +4643,7 @@ async def update_global_settings(
         runtime_applied.append("embedding_batch_size")
         logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
 
-    # Claude Desktop auto-config side effect (T-002): enabling the toggle
+    # Claude Desktop auto-config side effect: enabling the toggle
     # writes the user's Claude Desktop JSON configs to point at oMLX;
     # disabling restores them. Best-effort — never fails the settings save.
     # The route can also be invoked when only a restore is needed (toggle
