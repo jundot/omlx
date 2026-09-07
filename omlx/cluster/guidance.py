@@ -19,9 +19,11 @@ from dataclasses import dataclass, field
 class Guidance:
     """A readable failure with steps that resolve it.
 
-    ``code`` is the stable machine key structured diagnostics (the incident
-    feed) record next to the redacted message, so different failure funnels
-    that map to the same guidance stay groupable.
+    ``code`` is the stable machine key: readiness-ladder states and structured
+    diagnostics look guidance up by code (``explain_code``) so message-regex
+    and state-code paths converge on the same copy objects, and structured
+    diagnostics (the incident feed) record it next to the redacted message so
+    different failure funnels that map to the same guidance stay groupable.
     """
 
     title: str
@@ -238,6 +240,26 @@ _RULES: tuple[tuple[re.Pattern[str], Guidance], ...] = (
         ),
     ),
     (
+        # Before the generic connection rules: a message naming a 169.254
+        # address is the stale self-assigned link, not a network outage. The
+        # code is also the readiness ladder's stale-address key, so the
+        # regex and structured lookups land on the same copy (#B3).
+        re.compile(r"self-assigned|\b169\.254\.\d{1,3}\.\d{1,3}\b", re.I),
+        Guidance(
+            "The Thunderbolt link has a stale self-assigned address",
+            "A 169.254 address means macOS never finished configuring the "
+            "link — it looks addressed, but the peers agree on the subnet and "
+            "on nothing else, so nothing can connect across it.",
+            (
+                "Run Fabric Doctor → Re-address link to give both ends a "
+                "routable address.",
+                "If it repeats after a reboot, reseat the cable and detect "
+                "the link again before starting the cluster.",
+            ),
+            code="stale_link_address",
+        ),
+    ),
+    (
         re.compile(r"could not resolve|name or service not known|nodename nor servname", re.I),
         Guidance(
             "That address doesn't resolve",
@@ -395,6 +417,14 @@ _FALLBACK = Guidance(
 )
 
 
+# Structured lookup by code. The first-seen-host guidance is deliberately
+# absent: its command embeds the peer target, so it only exists per-message.
+_BY_CODE: dict[str, Guidance] = {
+    guidance.code: guidance for _pattern, guidance in _RULES if guidance.code
+}
+_BY_CODE[_FALLBACK.code or "unknown_failure"] = _FALLBACK
+
+
 def explain(message: str | None) -> Guidance:
     """Map an error message to guidance, falling back to a generic-but-useful one.
 
@@ -411,3 +441,17 @@ def explain(message: str | None) -> Guidance:
         if pattern.search(message):
             return guidance
     return _FALLBACK
+
+
+def explain_code(code: str | None, message: str | None = None) -> Guidance:
+    """Guidance by machine code, falling back through the message-regex path.
+
+    Same contract as ``explain``: never raises and never returns None, so an
+    unknown or absent code degrades to the message lookup rather than a hole.
+    """
+
+    if code:
+        guidance = _BY_CODE.get(code)
+        if guidance is not None:
+            return guidance
+    return explain(message)

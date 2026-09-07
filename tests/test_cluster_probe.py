@@ -212,6 +212,33 @@ def test_collect_status_does_not_advertise_an_ssh_user():
     assert "ssh_user" not in status.to_dict()["node"]
 
 
+def test_collect_status_advertises_the_admin_port(monkeypatch):
+    """C5: the coordinator aims its fast ceiling probe at this port."""
+
+    class _Settings:
+        class server:
+            port = 8123
+
+    monkeypatch.setattr("omlx.settings.get_settings", lambda: _Settings)
+    status = probe.collect_cluster_status()
+    assert status.admin_port == 8123
+    assert status.to_dict()["node"]["admin_port"] == 8123
+
+
+def test_collect_status_admin_port_is_zero_when_settings_are_unavailable(
+    monkeypatch,
+):
+    """A worker-only install has no server settings; 0 keeps legacy guesses."""
+
+    def _unavailable():
+        raise RuntimeError("settings are not configured")
+
+    monkeypatch.setattr("omlx.settings.get_settings", _unavailable)
+    status = probe.collect_cluster_status()
+    assert status.admin_port == 0
+    assert status.to_dict()["node"]["admin_port"] == 0
+
+
 def test_mlx_version_uses_core_module_version(monkeypatch):
     monkeypatch.setattr(probe.hardware, "HAS_MLX", True)
     monkeypatch.setattr(
@@ -414,3 +441,96 @@ def test_linux_probe_accepts_dgx_spark_roce_device_names():
         "rocep1s0f1": "enp1s0f1np1",
         "roceP2p1s0f1": "enP2p1s0f1np1",
     }
+
+
+# ---------------------------------------------------------------------------
+# Readiness ladder (B3): node-local evidence climbs to ROUTED and no further.
+# ---------------------------------------------------------------------------
+
+
+def _linked_runner(ip: str, route_interface: str) -> FakeRunner:
+    return FakeRunner(
+        {
+            "rdma_ctl": (0, "enabled\n", ""),
+            "ibv_devices": (0, IBV_OUTPUT, ""),
+            "ipconfig": (0, f"{ip}\n", ""),
+            "system_profiler": (0, CONNECTED_THUNDERBOLT, ""),
+            "route": (
+                0,
+                f"destination: 172.16.99.2\n  interface: {route_interface}\n",
+                "",
+            ),
+        }
+    )
+
+
+def test_stale_self_assigned_address_stays_config_pending(monkeypatch):
+    """169.254 on the RDMA interface earns no rung, and the reason says why."""
+
+    _patch_hardware(monkeypatch)
+    status = probe.collect_cluster_status(
+        route_to="169.254.42.2",
+        runner=_linked_runner("169.254.42.1", "en1"),
+    )
+
+    assert status.transport_state is TransportState.PEER_LINKED_CONFIG_PENDING
+    readiness = status.to_dict()["transport"]["readiness"]
+    assert readiness["state"] == "peer_linked_config_pending"
+    assert "self-assigned" in readiness["reason"]
+    assert "169.254.42.1" in readiness["reason"]
+    assert readiness["remedy"]
+
+
+def test_routable_address_without_rdma_route_is_addressed(monkeypatch):
+    _patch_hardware(monkeypatch)
+    status = probe.collect_cluster_status(
+        route_to="172.16.99.2",
+        runner=_linked_runner("172.16.99.1", "en7"),
+    )
+
+    assert status.transport_state is TransportState.ADDRESSED
+    readiness = status.to_dict()["transport"]["readiness"]
+    assert readiness["state"] == "addressed"
+    assert readiness["reason"] and readiness["remedy"]
+
+
+def test_rdma_route_over_routable_address_is_routed(monkeypatch):
+    _patch_hardware(monkeypatch)
+    status = probe.collect_cluster_status(
+        route_to="172.16.99.2",
+        runner=_linked_runner("172.16.99.1", "en1"),
+    )
+
+    assert status.transport_state is TransportState.ROUTED
+    assert status.route is not None and status.route.uses_rdma_interface
+
+
+def test_node_local_ladder_never_reports_reachable(monkeypatch):
+    """Single-host evidence cannot prove bidirectionality (failure #5)."""
+
+    from omlx.cluster.readiness import ladder_rank
+
+    _patch_hardware(monkeypatch)
+    status = probe.collect_cluster_status(
+        route_to="172.16.99.2",
+        runner=_linked_runner("172.16.99.1", "en1"),
+    )
+
+    assert ladder_rank(status.transport_state) < ladder_rank(
+        TransportState.REACHABLE
+    )
+
+
+def test_format_cluster_status_prints_reason_and_remedy(monkeypatch):
+    _patch_hardware(monkeypatch)
+    status = probe.collect_cluster_status(
+        route_to="169.254.42.2",
+        runner=_linked_runner("169.254.42.1", "en1"),
+    )
+
+    rendered = probe.format_cluster_status(status)
+
+    assert "Transport:   peer_linked_config_pending" in rendered
+    assert "  reason: " in rendered
+    assert "  remedy: " in rendered
+    assert "self-assigned" in rendered
