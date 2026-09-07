@@ -810,11 +810,13 @@ def _qmm_group_size_kwargs(group_size: int) -> dict:
 def qmm_supports_group_size(group_size: int) -> bool:
     """True if the compiled extension can run qmm at this group size.
 
-    gs=64 always works (the pre-group_size builds are gs=64-only).  Other
-    group sizes require the rebuilt binding; routing a gs=128 layer through
+    gs=32 is provided by the current q4/variant-8 build, while gs=64 works in
+    every build. Group 128 requires the rebuilt binding; routing it through
     an old build would silently run the gs=64 kernel on gs=128 data.
     """
-    return group_size == 64 or _EXT_HAS_QMM_GROUP_SIZE
+    return group_size in (32, 64) or (
+        group_size == 128 and _EXT_HAS_QMM_GROUP_SIZE
+    )
 
 
 _NAX_ARCH_RE = re.compile(r"applegpu_g(\d+)([a-z])")

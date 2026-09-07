@@ -93,8 +93,12 @@ def _is_supported_affine_linear_shape(
         return False
     if ndim < 2 or seq_len <= 1:
         return False
+    bits = getattr(linear, "bits", None)
     group_size = getattr(linear, "group_size", None)
-    if group_size not in (64, 128):
+    if group_size == 32:
+        if dtype != mx.bfloat16 or bits != 4:
+            return False
+    elif group_size not in (64, 128):
         return False
     if not _qmm_supports_group_size(int(group_size)):
         return False
@@ -105,7 +109,6 @@ def _is_supported_affine_linear_shape(
     ):
         # The custom gs128 tile cannot use NAX; stock MLX can on M5 hardware.
         return False
-    bits = getattr(linear, "bits", None)
     if bits not in _SUPPORTED_QMM_BITS or getattr(linear, "mode", None) != "affine":
         return False
     if _native_qmm_for_bits(int(bits)) is None:
@@ -197,6 +200,8 @@ def _linear_qmm(linear: nn.QuantizedLinear, x: mx.array, variant: int) -> mx.arr
     if not _is_supported_affine_linear(linear, x):
         return linear(x)
     gs = int(getattr(linear, "group_size", 64))
+    if gs == 32 and (variant != 8 or is_nax_available()):
+        return linear(x)
     return qmm(x, linear.weight, linear.scales, linear.biases, variant, gs)
 
 
@@ -235,6 +240,11 @@ def _make_patched_mlp(
         gate_proj = getattr(self, "gate_proj", None)
         up_proj = getattr(self, "up_proj", None)
         down_proj = getattr(self, "down_proj", None)
+        projections = (gate_proj, up_proj, down_proj)
+        if any(getattr(proj, "group_size", None) == 32 for proj in projections) and (
+            variant != 8 or is_nax_available()
+        ):
+            return orig_call(self, x, *args, **kwargs)
         gate_dim = _quantized_linear_output_dim(gate_proj)
         if not (
             _can_route_affine_linear(gate_proj, x, min_tokens, q8_min_tokens)
