@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "Saved model no longer available",
   "status.claude_code.command": "Command",
   "status.claude_code.copy_command_tooltip": "Copy command",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "Expose claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 as aliases of the tier models above",
   "status.integrations.section_label": "Applications",
   "status.integrations.copy_command_tooltip": "Copy command",
   "status.engines.section_label": "Engine Versions",

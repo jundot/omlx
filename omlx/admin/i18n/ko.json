@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "저장된 모델을 더 이상 사용할 수 없습니다",
   "status.claude_code.command": "명령어",
   "status.claude_code.copy_command_tooltip": "명령어 복사",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001을 위 티어 모델의 별칭으로 노출합니다",
   "status.integrations.section_label": "애플리케이션",
   "status.integrations.copy_command_tooltip": "명령어 복사",
   "status.engines.section_label": "엔진 버전",

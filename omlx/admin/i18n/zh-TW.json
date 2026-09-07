@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "先前儲存的模型已無法使用",
   "status.claude_code.command": "命令",
   "status.claude_code.copy_command_tooltip": "複製命令",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "將 claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 公開為上述層級模型的別名",
   "status.integrations.section_label": "應用程式",
   "status.integrations.copy_command_tooltip": "複製命令",
   "status.engines.section_label": "引擎版本",

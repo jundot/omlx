@@ -766,6 +766,20 @@
                                         <p class="mt-1 text-xs text-neutral-400">{{ t('status.claude_code.haiku_hint') }}</p>
                                     </div>
                                 </div>
+                                <!-- Claude Desktop tier aliases -->
+                                <div class="mt-4 pt-4 border-t border-neutral-100">
+                                    <div class="flex items-center gap-3">
+                                        <button type="button"
+                                                @click="globalSettings.claude_code.desktop_enabled = !globalSettings.claude_code.desktop_enabled; saveClaudeCodeSettings()"
+                                                :class="globalSettings.claude_code.desktop_enabled ? 'bg-neutral-900' : 'bg-neutral-200'"
+                                                class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
+                                            <span :class="globalSettings.claude_code.desktop_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                                  class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                                        </button>
+                                        <span class="text-sm font-medium text-neutral-700">{{ t('status.claude_code.desktop') }}</span>
+                                    </div>
+                                    <p class="mt-1.5 text-xs text-neutral-400">{{ t('status.claude_code.desktop_hint') }}</p>
+                                </div>
                             </div>
                         </div>
                     </div>

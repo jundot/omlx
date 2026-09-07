@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "Le modèle enregistré n'est plus disponible",
   "status.claude_code.command": "Commande",
   "status.claude_code.copy_command_tooltip": "Copier la commande",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "Expose claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 comme alias des modèles de niveau ci-dessus",
   "status.integrations.section_label": "Autres intégrations",
   "status.integrations.copy_command_tooltip": "Copier la commande",
   "status.engines.section_label": "Versions du moteur",

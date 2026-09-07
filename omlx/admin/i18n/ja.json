@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "保存されたモデルは利用できなくなりました",
   "status.claude_code.command": "コマンド",
   "status.claude_code.copy_command_tooltip": "コマンドをコピー",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 を上記ティアモデルのエイリアスとして公開する",
   "status.integrations.section_label": "アプリケーション",
   "status.integrations.copy_command_tooltip": "コマンドをコピー",
   "status.engines.section_label": "エンジンバージョン",

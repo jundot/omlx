@@ -328,6 +328,7 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
+    claude_code_desktop_enabled: bool | None = None
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -4372,6 +4373,11 @@ async def update_global_settings(
     if "claude_code_haiku_model" in request.model_fields_set:
         global_settings.claude_code.haiku_model = request.claude_code_haiku_model
         claude_code_changed = True
+    if "claude_code_desktop_enabled" in request.model_fields_set:
+        global_settings.claude_code.desktop_enabled = bool(
+            request.claude_code_desktop_enabled
+        )
+        claude_code_changed = True
 
     if claude_code_changed:
         runtime_applied.append("claude_code")
@@ -4380,7 +4386,8 @@ async def update_global_settings(
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
-            f"haiku={global_settings.claude_code.haiku_model}"
+            f"haiku={global_settings.claude_code.haiku_model}, "
+            f"desktop_enabled={global_settings.claude_code.desktop_enabled}"
         )
 
     # Apply integrations settings (Live - immediately applied)

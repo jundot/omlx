@@ -56,6 +56,46 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+# Claude Desktop tier alias slots. When ``ClaudeCodeSettings.desktop_enabled``
+# is set, oMLX exposes these slot IDs as derived (non-persisted) model IDs
+# that resolve at runtime to the models configured in the Claude Code tiers.
+# Each entry maps the public slot ID to the tier attribute name on the
+# Claude Code settings object (``opus_model`` / ``sonnet_model`` /
+# ``haiku_model``).
+CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
+    ("claude-opus-5", "opus"),
+    ("claude-sonnet-5", "sonnet"),
+    ("claude-haiku-4-5-20251001", "haiku"),
+)
+
+# Anthropic family tier label exposed per slot in /v1/models metadata.
+CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
+    "claude-opus-5": "opus",
+    "claude-sonnet-5": "sonnet",
+    "claude-haiku-4-5-20251001": "haiku",
+}
+
+
+def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
+    """Build slot-ID -> tier-model map from Claude Code settings.
+
+    Returns an empty dict when ``desktop_enabled`` is falsy. Tiers with no
+    configured model (None/empty) are omitted, so their slot is neither
+    exposed nor resolved. Duck-typed on purpose: anything exposing
+    ``desktop_enabled`` / ``<tier>_model`` attributes works.
+    """
+    if claude_code_settings is None or not getattr(
+        claude_code_settings, "desktop_enabled", False
+    ):
+        return {}
+    aliases: dict[str, str] = {}
+    for slot_id, tier in CLAUDE_DESKTOP_TIER_SLOTS:
+        target = getattr(claude_code_settings, f"{tier}_model", None)
+        if target:
+            aliases[slot_id] = target
+    return aliases
+
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
@@ -1151,14 +1191,23 @@ class EnginePool:
                 return mid
         return None
 
-    def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
+    def resolve_model_id(
+        self,
+        model_id_or_alias: str,
+        settings_manager,
+        claude_tier_aliases: dict[str, str] | None = None,
+    ) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
         then active cluster deployment IDs, exposed profile model IDs, and
-        model settings aliases. If those fail and input contains a provider
-        prefix (e.g. "omlx/my-model"), strips the prefix and retries. Returns
-        the original string if no match is found.
+        model settings aliases. Claude Desktop tier aliases (derived at
+        runtime from the Claude Code tier models, passed via
+        ``claude_tier_aliases``) resolve AFTER exact directory matches and
+        custom ``model_alias`` entries, so a real model or user alias with
+        the same name always wins. If those fail and input contains a
+        provider prefix (e.g. "omlx/my-model"), strips the prefix and
+        retries. Returns the original string if no match is found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -1199,6 +1248,13 @@ class EnginePool:
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
 
+        # Claude Desktop tier aliases are derived at runtime and resolve only
+        # after exact directory matches and custom aliases.
+        if claude_tier_aliases:
+            tier_target = claude_tier_aliases.get(model_id_or_alias)
+            if tier_target is not None:
+                return tier_target
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -1211,6 +1267,10 @@ class EnginePool:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
                         return mid
+            if claude_tier_aliases:
+                tier_target = claude_tier_aliases.get(stripped)
+                if tier_target is not None:
+                    return tier_target
 
         return model_id_or_alias
 

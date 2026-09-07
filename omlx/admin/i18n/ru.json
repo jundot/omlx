@@ -125,6 +125,8 @@
   "status.claude_code.model_unavailable": "Сохраненная модель больше не доступна.",
   "status.claude_code.command": "Команда",
   "status.claude_code.copy_command_tooltip": "Копировать команду",
+  "status.claude_code.desktop": "Claude Desktop",
+  "status.claude_code.desktop_hint": "Предоставляет claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 как псевдонимы моделей уровней выше",
   "status.integrations.section_label": "Приложения",
   "status.integrations.copy_command_tooltip": "Копировать команду",
   "status.engines.section_label": "Версии движков",

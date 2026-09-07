@@ -8803,6 +8803,7 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_desktop_enabled: this.globalSettings.claude_code.desktop_enabled,
                         }),
                     });
                     if (!response.ok) {
