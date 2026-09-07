@@ -19,6 +19,7 @@ from omlx.cluster.inference_worker import (
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
     _watch_launcher_parent,
+    _worker_mtp_settings,
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
@@ -102,8 +103,9 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
 
     import mlx.core as mx
 
-    previous = mx.default_stream(mx.default_device())
-    stream = _cross_thread_generation_stream(mx)
+    previous_gpu = mx.default_stream(mx.default_device())
+    previous_cpu = mx.default_stream(mx.cpu)
+    streams = _cross_thread_generation_stream(mx)
     lazy_value = mx.arange(4) + 1
     observed: list[list[int]] = []
 
@@ -117,16 +119,64 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
         with _bind_generation_thread_stream(
             FakeResponseGenerator,
             mx,
-            stream,
+            streams,
         ):
             worker = threading.Thread(target=FakeResponseGenerator()._generate)
             worker.start()
             worker.join()
     finally:
-        mx.set_default_stream(previous)
+        mx.set_default_stream(previous_gpu)
+        mx.set_default_stream(previous_cpu)
 
     assert observed == [[1, 2, 3, 4]]
     assert FakeResponseGenerator._generate is original
+
+
+def test_generation_thread_has_a_registered_cpu_stream():
+    """Regression for ``no Stream(cpu, N) in current thread`` under native MTP.
+
+    Native MTP's distributed depth/park coordination (batch_generator.py's
+    ``_sync_distributed_mtp_cycle``) and tensor-parallel collectives inside a
+    forward pass need a CPU default stream on the generation thread, not just
+    a GPU one. Plain single-node decode never exercised that path, so the
+    original ``_cross_thread_generation_stream`` (GPU-only) worked until MTP
+    was enabled on a pure tensor-parallel cluster deployment. This asserts
+    both devices resolve to the *same* stream objects created up front,
+    observed from the generation thread, the way
+    ``test_eager_load_graph_is_visible_to_mlx_lm_generation_thread`` already
+    does for the GPU stream alone.
+    """
+
+    import mlx.core as mx
+
+    previous_gpu = mx.default_stream(mx.default_device())
+    previous_cpu = mx.default_stream(mx.cpu)
+    gpu_stream, cpu_stream = _cross_thread_generation_stream(mx)
+    observed: dict[str, Any] = {}
+
+    class FakeResponseGenerator:
+        def _generate(self):
+            observed["gpu"] = mx.default_stream(mx.default_device())
+            observed["cpu"] = mx.default_stream(mx.cpu)
+            # The actual failure mode: any op requiring the CPU stream must
+            # not raise "no Stream(cpu, N) in current thread" on this thread.
+            mx.eval(mx.add(mx.array(1), mx.array(1), stream=mx.cpu))
+
+    try:
+        with _bind_generation_thread_stream(
+            FakeResponseGenerator,
+            mx,
+            (gpu_stream, cpu_stream),
+        ):
+            worker = threading.Thread(target=FakeResponseGenerator()._generate)
+            worker.start()
+            worker.join()
+    finally:
+        mx.set_default_stream(previous_gpu)
+        mx.set_default_stream(previous_cpu)
+
+    assert observed["gpu"] == gpu_stream
+    assert observed["cpu"] == cpu_stream
 
 
 def _assignment() -> PipelineAssignment:
@@ -541,6 +591,7 @@ def _run_rank(
     ceiling: int = 107 * GiB,
     wired_result=(0, None),
     assignment_honored: bool = False,
+    tensor_parallel_size: int = 1,
 ):
     """Drive ``run_worker`` through its real argv, recording what it did.
 
@@ -585,8 +636,21 @@ def _run_rank(
     monkeypatch.setattr(
         pipeline_index, "apply_mlx_lm_pipeline_index_patch", lambda: None
     )
+    def fake_pre_load_patches(_model, model_settings=None):
+        record["order"].append("mtp-patch")
+        record["pre_load_model_settings"] = model_settings
+
     monkeypatch.setattr(
-        model_loading, "maybe_apply_pre_load_patches", lambda _model: None
+        model_loading, "maybe_apply_pre_load_patches", fake_pre_load_patches
+    )
+
+    def fake_configure_distributed_mtp(**kwargs):
+        record["order"].append("configure-distributed-mtp")
+        record["configure_distributed_mtp_kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "omlx.patches.mlx_lm_mtp.batch_generator.configure_distributed_mtp",
+        fake_configure_distributed_mtp,
     )
     monkeypatch.setattr(
         inference_worker,
@@ -635,7 +699,7 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_contract",
-        lambda _plan: ("a" * 64, assignments, (), 1),
+        lambda _plan: ("a" * 64, assignments, (), tensor_parallel_size),
     )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
@@ -1309,3 +1373,127 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+# --- MTP + pure tensor parallelism (test/cluster-run-from-source) ----------
+
+
+def test_worker_mtp_settings_reads_the_two_cli_flags_only(tmp_path):
+    """maybe_apply_pre_load_patches only reads mtp_enabled/mtp_num_draft_tokens.
+
+    The rank process never sees the full ModelSettings -- only what
+    --mtp-enabled / --mtp-num-draft-tokens threaded onto its launch argv
+    carries. _worker_mtp_settings must expose exactly those two attributes.
+    """
+
+    args = build_parser().parse_args(
+        _worker_argv(
+            tmp_path,
+            extra=["--mtp-enabled", "--mtp-num-draft-tokens", "5"],
+        )
+    )
+    settings = _worker_mtp_settings(args)
+    assert settings.mtp_enabled is True
+    assert settings.mtp_num_draft_tokens == 5
+
+    args_off = build_parser().parse_args(_worker_argv(tmp_path))
+    settings_off = _worker_mtp_settings(args_off)
+    assert settings_off.mtp_enabled is False
+    assert settings_off.mtp_num_draft_tokens is None
+
+
+def test_mtp_patch_applies_before_the_model_loads(monkeypatch, tmp_path):
+    """apply_mlx_lm_mtp_patch (inside maybe_apply_pre_load_patches) must run
+    before provider.load_default() -- its own docstring says the patched
+    __init__/sanitize/from_dict paths must be live before mlx_lm.load() sees
+    the checkpoint, or a loaded MTP model would come up without its head.
+    """
+
+    record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        argv_extra=["--mtp-enabled"],
+        tensor_parallel_size=2,
+    )
+
+    order = record["order"]
+    assert order.index("mtp-patch") < order.index("load"), order
+    assert record["pre_load_model_settings"].mtp_enabled is True
+
+
+def test_mtp_patch_receives_disabled_settings_when_mtp_is_off(monkeypatch, tmp_path):
+    """Without --mtp-enabled, the worker still calls maybe_apply_pre_load_patches
+    (sanitize correctness for a checkpoint carrying unused mtp.* weights) but
+    with mtp_enabled=False, matching the single-node default.
+    """
+
+    record = _run_rank(monkeypatch, tmp_path)
+
+    assert "mtp-patch" in record["order"]
+    assert record["pre_load_model_settings"].mtp_enabled is False
+
+
+def test_distributed_mtp_coordination_is_configured_for_pure_tp(monkeypatch, tmp_path):
+    """Rank 0 is the coordinator; every other rank is not.
+
+    Only rank 0 may ever construct a live _DepthController (see
+    omlx.patches.mlx_lm_mtp.batch_generator) -- an independent controller per
+    rank on differently-loaded Macs would pick different depths on the same
+    cycle, and that manifests as a silent hang in the next TP collective, not
+    a crash. configure_distributed_mtp's coordinator kwarg is what prevents
+    that, so this must be wired correctly for both rank 0 and a worker rank.
+    """
+
+    coordinator_record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        rank=0,
+        argv_extra=["--mtp-enabled"],
+        tensor_parallel_size=2,
+    )
+    assert "configure-distributed-mtp" in coordinator_record["order"]
+    coordinator_kwargs = coordinator_record["configure_distributed_mtp_kwargs"]
+    assert coordinator_kwargs["coordinator"] is True
+
+    worker_record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        rank=1,
+        argv_extra=["--mtp-enabled"],
+        tensor_parallel_size=2,
+    )
+    worker_kwargs = worker_record["configure_distributed_mtp_kwargs"]
+    assert worker_kwargs["coordinator"] is False
+    # Must land before this rank ever runs a decode step.
+    assert (
+        worker_record["order"].index("configure-distributed-mtp")
+        < worker_record["order"].index("serve")
+    )
+
+
+def test_distributed_mtp_coordination_is_skipped_when_mtp_is_off(monkeypatch, tmp_path):
+    record = _run_rank(monkeypatch, tmp_path, tensor_parallel_size=2)
+    assert "configure-distributed-mtp" not in record["order"]
+
+
+def test_distributed_mtp_coordination_is_skipped_for_pipeline_parallel(
+    monkeypatch, tmp_path
+):
+    """Defense in depth: even if --mtp-enabled reaches a pipeline-parallel
+    rank somehow (DistributedBatchedEngine._validate_model_settings and
+    ClusterDeployment.__post_init__ should both already refuse that plan
+    before any rank launches), the worker itself must not enable per-rank
+    MTP coordination for anything but pure TP (tensor_parallel_size ==
+    world_size).
+    """
+
+    record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        argv_extra=["--mtp-enabled"],
+        tensor_parallel_size=1,  # world_size is 2 (default _uneven_plan)
+    )
+    assert "configure-distributed-mtp" not in record["order"]
+    # The patch itself still applies (sanitize correctness) even though
+    # coordination does not activate.
+    assert record["pre_load_model_settings"].mtp_enabled is True

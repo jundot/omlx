@@ -256,25 +256,64 @@ class DistributedBatchedEngine(BatchedEngine):
         )
 
     def _validate_model_settings(self) -> None:
+        """Reject single-node-only feature patches this deployment cannot run.
+
+        These settings gate monkey-patches that ``omlx.patches`` applies
+        in-process to the local engine stack (``omlx/utils/model_loading.py``
+        et al.). A distributed deployment never runs that process: each rank
+        is a private, pinned ``mlx_lm.server`` subprocess
+        (``omlx/cluster/inference_worker.py``) that does not import
+        ``omlx.patches`` at all, so any of these flags would silently have no
+        effect on the ranks actually doing the work.
+
+        ``mtp_enabled`` is the one exception, and only for a pure
+        tensor-parallel deployment (``tensor_parallel_size == world_size``,
+        i.e. no pipeline stages): the worker process opts into the same MTP
+        patch stack before loading its shard (see
+        ``inference_worker.run_worker``), and pure TP already runs mlx-lm's
+        stock synchronized sampler with identical logits on every rank, which
+        is the invariant MTP's replicated draft/verify cycle rides. A
+        pipeline-parallel deployment keeps the rejection: worker ranks there
+        do not compute full logits and cannot independently verify a draft
+        the way this pass assumes.
+        """
         settings = self._model_settings
         if settings is None:
             return
+        pure_tensor_parallel = (
+            self.deployment.tensor_parallel_size == self.deployment.world_size
+        )
         incompatible = [
             name
             for name in (
                 "dflash_enabled",
                 "specprefill_enabled",
-                "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
+        mtp_requested = bool(getattr(settings, "mtp_enabled", False))
+        if mtp_requested and not pure_tensor_parallel:
+            incompatible.append("mtp_enabled")
         if incompatible:
-            raise ValueError(
+            detail = (
                 "distributed inference cannot be combined with "
                 + ", ".join(incompatible)
+                + ": these gate patches to the local single-node engine "
+                "stack (omlx.patches), applied in-process before mlx_lm.load; "
+                "each distributed rank runs a private stock mlx_lm.server "
+                "subprocess that never imports that stack, so the setting "
+                "would have no effect there."
             )
+            if "mtp_enabled" in incompatible:
+                detail += (
+                    " mtp_enabled is supported for pure tensor-parallel "
+                    "deployments (tensor_parallel_size == world_size); this "
+                    "deployment is pipeline-parallel, where worker ranks lack "
+                    "the full logits MTP's draft verification needs."
+                )
+            raise ValueError(detail)
 
     async def stop(self) -> None:
         client, self._client = self._client, None
@@ -383,6 +422,34 @@ class DistributedBatchedEngine(BatchedEngine):
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
 
+    def _reject_images_if_text_only(
+        self, messages: list[dict[str, Any]]
+    ) -> None:
+        """Refuse image content on a VLM deployed text-only.
+
+        A text-only cluster deployment loaded the language model and dropped the
+        vision tower, so an image part cannot be served. Fail with a clear error
+        naming the text-only mode instead of silently ignoring the image.
+        """
+
+        if not getattr(self.deployment, "text_only", False):
+            return
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"image_url", "image", "input_image"} or (
+                    "image_url" in part
+                ):
+                    raise ValueError(
+                        "This cluster deployment was activated text-only "
+                        "(vision disabled); image content is not supported. "
+                        "Serve the model on a single node to use vision."
+                    )
+
     def _completion_payload(
         self,
         *,
@@ -472,6 +539,7 @@ class DistributedBatchedEngine(BatchedEngine):
         """
 
         self._validate_request_features(kwargs)
+        self._reject_images_if_text_only(messages)
         if (
             kwargs.get("seed") is not None
             and self.deployment.execution.sampling_rank_only

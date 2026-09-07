@@ -25,6 +25,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..exceptions import ModelBusyError, ModelNotFoundError
+from ..model_discovery import estimate_text_only_model_size
 from .autoconfigure import (
     STRATEGIES,
     build_rdma_matrix,
@@ -241,7 +242,7 @@ def _validated_ssh_targets(hosts: str) -> list[str]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def inspect_safetensors_layout(model_path: str | Path):
+def inspect_safetensors_layout(model_path: str | Path, *, text_only: bool = False):
     """Compatibility seam for route tests, backed by the complete-model check.
 
     Older callers patched this route-local name.  Keeping the seam avoids
@@ -249,7 +250,7 @@ def inspect_safetensors_layout(model_path: str | Path):
     refuses a directory containing only one rank's previous stage.
     """
 
-    return complete_model_layout(model_path)
+    return complete_model_layout(model_path, text_only=text_only)
 
 
 def set_cluster_getters(engine_pool_getter: Any) -> None:
@@ -424,6 +425,13 @@ class ClusterPlanRequest(BaseModel):
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # Threads a concrete text-only deployment's intent into the layout
+    # measurement itself (inspect_safetensors_layout's ``text_only``): a
+    # VLM sizes full unless the caller is specifically planning a text-only
+    # deployment of it. Defaults False so every other caller of this
+    # request (autoconfigure, plain plan preview) keeps the catalogue-safe
+    # full-size measurement it already had.
+    text_only: bool = False
 
 
 class ClusterHostRequest(BaseModel):
@@ -472,6 +480,11 @@ class ClusterDeploymentRequest(BaseModel):
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # Explicit opt-in to deploy a VLM-shaped checkpoint text-only: only its
+    # language model runs across ranks and vision stays disabled. Without the
+    # flag such checkpoints keep failing closed — silently dropping vision is
+    # treated as a bug (#1261/#1426), so the choice must be the user's.
+    text_only: bool = False
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -654,7 +667,9 @@ def _model_and_nodes(request: ClusterPlanRequest):
             # A coordinator may retain only its previous pipeline stage.  Such
             # a directory is not a smaller complete model and must never be
             # used to build the next plan.
-            model = inspect_safetensors_layout(model_path)
+            model = inspect_safetensors_layout(
+                model_path, text_only=request.text_only
+            )
     else:
         model = synthetic_model_layout(
             total_weight_bytes=request.model_size_bytes,
@@ -2630,8 +2645,22 @@ def _create_deployment(
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        text_only=request.text_only,
     )
     plan = _create_cluster_plan(plan_request)
+    if request.text_only and not (
+        plan.model.supports_tensor_parallel or plan.model.supports_pipeline
+    ):
+        # Fail closed before any peer stages weights: the hybrid planner only
+        # validates divisor arithmetic, so a text-only VLM whose architecture
+        # has no mlx-lm shard()/pipeline() would otherwise plan cleanly and
+        # then fail on every rank at load time.
+        raise ValueError(
+            "text-only deployment is not available for this model: the "
+            "pinned MLX-LM runtime reports neither tensor-parallel nor "
+            "pipeline support for its language model architecture, so there "
+            "is no distributed strategy to run it."
+        )
     execution = _execution_for_request(
         request,
         plan.assignments,
@@ -2673,6 +2702,7 @@ def _create_deployment(
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        text_only=request.text_only,
     )
     return deployment, plan.to_dict()
 
@@ -2719,6 +2749,10 @@ def _performance_optimized_deployment(
         raise ValueError("performance probe did not return every cluster rank")
     source = (request.model_source or "").strip()
     model = (
+        # TODO: remote_model_layout doesn't yet accept text_only, so a
+        # remote model_source always sizes full (safe direction -- an
+        # over-, not under-, estimate for a text_only deployment; see
+        # inspect_safetensors_layout's text_only docstring).
         remote_model_layout(
             validate_ssh_target(source),
             deployment.model,
@@ -2728,7 +2762,9 @@ def _performance_optimized_deployment(
         )
         if source
         and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
-        else inspect_safetensors_layout(deployment.model)
+        else inspect_safetensors_layout(
+            deployment.model, text_only=deployment.text_only
+        )
     )
     # Same budgets the approved plan was built from — reserve, split cap and
     # role included. Re-deriving them here without the cap and the role is how
@@ -3226,7 +3262,13 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     }
         pool = _engine_pool()
         try:
-            model_id = pool.resolve_cluster_model_id(deployment.model)
+            # ``_create_deployment`` already refused a text-only request whose
+            # layout reports no shard strategy, so a text_only deployment that
+            # reaches this join is one the pinned mlx-lm can run.
+            model_id = pool.resolve_cluster_model_id(
+                deployment.model,
+                text_only=deployment.text_only,
+            )
         except ModelNotFoundError:
             register = getattr(pool, "register_cluster_model", None)
             if not callable(register):
@@ -3238,9 +3280,20 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
                     for assignment in deployment.assignments
                 )
             )
+            if deployment.text_only:
+                # The plan's byte total still counts the vision tower the
+                # text loaders drop; register the language-only estimate so
+                # cluster admission is not charged for weights that never
+                # load (#2385).
+                text_only_bytes = estimate_text_only_model_size(
+                    Path(deployment.model).expanduser()
+                )
+                if 0 < text_only_bytes < estimated_size:
+                    estimated_size = text_only_bytes
             model_id, _ = register(
                 deployment.model,
                 estimated_size=estimated_size,
+                text_only=deployment.text_only,
             )
         registry = get_cluster_registry()
         previous = await asyncio.to_thread(
@@ -3396,7 +3449,10 @@ async def deactivate_cluster_deployment(deployment_id: str):
     try:
         pool = _engine_pool()
         try:
-            model_id = pool.resolve_cluster_model_id(deployment.model)
+            model_id = pool.resolve_cluster_model_id(
+                deployment.model,
+                text_only=deployment.text_only,
+            )
         except ModelNotFoundError:
             model_id = None
         if model_id is not None:
