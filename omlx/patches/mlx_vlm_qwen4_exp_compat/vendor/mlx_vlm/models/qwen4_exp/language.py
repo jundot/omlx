@@ -1581,6 +1581,12 @@ class Qwen4ExpGatedResidual(nn.Module):
             and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
+        if not target_verify:
+            from .hc_prefill import prefill_read
+
+            prefilled = prefill_read(self, hyper_input)
+            if prefilled is not None:
+                return prefilled
         return self._forward(hyper_input, target_verify=target_verify)
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):

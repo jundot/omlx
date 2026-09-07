@@ -1532,3 +1532,114 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def _real_size_hc_config():
+    return SimpleNamespace(
+        hc_count=4,
+        hidden_size=2560,
+        hc_lowrank=320,
+        rms_norm_eps=1e-6,
+    )
+
+
+def _quantize_hc_module(module, bits):
+    # Cast to bf16 before quantizing so scales/biases come out bf16, matching
+    # real checkpoints (a float32 Linear -- MLX's default init dtype --
+    # quantizes to float32 scales, which the prefill kernel's compatibility
+    # check correctly rejects; this is a test-fixture detail, not something
+    # production checkpoints hit).
+    module.input_mix_weight_down.weight = module.input_mix_weight_down.weight.astype(
+        mx.bfloat16
+    )
+    module.input_mix_weight_down = module.input_mix_weight_down.to_quantized(64, bits)
+    module.input_mix_weight_up.weight = module.input_mix_weight_up.weight.astype(
+        mx.bfloat16
+    )
+    module.input_mix_weight_up = module.input_mix_weight_up.to_quantized(64, bits)
+    if "block_inject_weight" in module:
+        module.block_inject_weight.weight = module.block_inject_weight.weight.astype(
+            mx.bfloat16
+        )
+        module.block_inject_weight = module.block_inject_weight.to_quantized(64, bits)
+    return module
+
+
+@pytest.mark.parametrize("use_combine", [True, False])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("tokens", [1, 7, 37, 128])
+def test_qwen4_hc_prefill_matches_canonical_forward(
+    monkeypatch, use_combine, bits, tokens
+):
+    """The fused-norm path must agree with the canonical path at the real
+    production shape (hc_count=4, hidden_size=2560), across quantization
+    bit widths (the projections underneath are untouched, so this is really
+    testing that the norm swap alone is transparent to them) and with/
+    without the top-level combine-less mixer. Only bf16-level agreement is
+    expected -- the fused norm reduces with a simdgroup sum, a different
+    summation order than MLX's own reduction -- so this uses a loose
+    tolerance; the tighter float64-referenced cross-check lives in the
+    originating PR's benchmark harness, not this fast unit test.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    monkeypatch.setenv("OMLX_QWEN4_HC_PREFILL", "1")
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
+
+    mx.random.seed(1234 + tokens * 7 + bits)
+    config = _real_size_hc_config()
+    module = Qwen4ExpGatedResidual(config, use_combine=use_combine)
+    _quantize_hc_module(module, bits)
+
+    inputs = mx.random.normal((1, tokens, 4 * 2560)).astype(mx.bfloat16)
+    canonical = module._forward(inputs)
+    fused = module(inputs)
+    mx.eval(canonical, fused) if not isinstance(canonical, tuple) else mx.eval(
+        *canonical, *fused
+    )
+
+    assert getattr(module, "_omlx_hc_prefill", None) is not None
+
+    if not use_combine:
+        assert mx.allclose(canonical, fused, rtol=3e-2, atol=3e-2).item()
+        return
+    for expected, actual in zip(canonical, fused):
+        assert mx.allclose(expected, actual, rtol=3e-2, atol=3e-2).item()
+
+
+def test_qwen4_hc_prefill_disabled_by_default(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    monkeypatch.delenv("OMLX_QWEN4_HC_PREFILL", raising=False)
+    from mlx_vlm.models.qwen4_exp.hc_prefill import prefill_read
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
+
+    mx.random.seed(99)
+    module = Qwen4ExpGatedResidual(_real_size_hc_config())
+    _quantize_hc_module(module, 4)
+    inputs = mx.random.normal((1, 5, 4 * 2560)).astype(mx.bfloat16)
+
+    assert prefill_read(module, inputs) is None
+    assert getattr(module, "_omlx_hc_prefill", False) is False
+
+
+def test_qwen4_hc_prefill_fails_closed_on_shape_mismatch(monkeypatch):
+    """A module whose shape this kernel was not tuned for (here, the tiny
+    test config used elsewhere in this file) must fall back cleanly even
+    with the kernel enabled, never raise."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    monkeypatch.setenv("OMLX_QWEN4_HC_PREFILL", "1")
+    from mlx_vlm.models.qwen4_exp.hc_prefill import prefill_read
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
+
+    config = SimpleNamespace(
+        hc_count=2, hidden_size=32, hc_lowrank=32, rms_norm_eps=1e-6
+    )
+    module = Qwen4ExpGatedResidual(config)
+    inputs = mx.random.normal((1, 5, 64)).astype(mx.bfloat16)
+
+    assert prefill_read(module, inputs) is None
+    assert getattr(module, "_omlx_hc_prefill", False) is None
+
+    canonical = module._forward(inputs)
+    routed = module(inputs)
+    mx.eval(canonical, routed)
+    assert mx.array_equal(canonical, routed).item()
