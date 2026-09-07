@@ -1263,6 +1263,208 @@ def probe_remote_admission_ceiling(
     return ceiling
 
 
+# Runs on the peer under its own interpreter, like the probes above. It never
+# imports omlx (a cold import loads MLX and can blow the SSH timeout); the
+# peer's live server is reached over loopback instead, exactly the way the
+# ceiling probe reads /health. The unload endpoint requires the admin session
+# that server verifies, and its signing secret is persisted in the same
+# settings.json this login account owns — SSH access to the Mac is already
+# admin access, so minting the cookie here grants nothing new. The script
+# always exits 0 with a one-line JSON report; per-model problems are carried
+# inside it so one refusal cannot hide what else was freed.
+_REMOTE_LOCAL_EVICTION = r"""
+import json, os, urllib.error, urllib.parse, urllib.request
+
+result = {
+    "server_reachable": False,
+    "evicted": [],
+    "draining": [],
+    "skipped_pinned": [],
+    "errors": [],
+}
+
+def emit():
+    print(json.dumps(result))
+    raise SystemExit(0)
+
+def base_path():
+    env_value = os.environ.get("OMLX_BASE_PATH")
+    if env_value:
+        return os.path.expanduser(env_value)
+    bootstrap = os.path.expanduser("~/Library/Application Support/oMLX/base-path")
+    try:
+        with open(bootstrap, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        raw = ""
+    return os.path.expanduser(raw) if raw else os.path.expanduser("~/.omlx")
+
+settings = {}
+try:
+    with open(
+        os.path.join(base_path(), "settings.json"), encoding="utf-8"
+    ) as handle:
+        settings = json.load(handle)
+except Exception as exc:
+    result["errors"].append("settings.json unreadable: %s" % exc)
+
+ports = []
+try:
+    configured = int((settings.get("server") or {}).get("port") or 0)
+    if configured > 0:
+        ports.append(configured)
+except (TypeError, ValueError):
+    pass
+for fallback in (8000, 9000):
+    if fallback not in ports:
+        ports.append(fallback)
+
+cookie = ""
+secret = os.environ.get("OMLX_SECRET_KEY") or (settings.get("auth") or {}).get(
+    "secret_key"
+)
+if secret:
+    try:
+        from itsdangerous import URLSafeTimedSerializer
+
+        token = URLSafeTimedSerializer(secret).dumps(
+            {"admin": True, "remember": False}
+        )
+        cookie = "omlx_admin_session=" + token
+    except Exception as exc:
+        result["errors"].append("session token failed: %s" % exc)
+
+def call(port, path, method, timeout):
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (port, path), method=method
+    )
+    if cookie:
+        request.add_header("Cookie", cookie)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+models = None
+port = None
+for candidate in ports:
+    try:
+        models = call(candidate, "/admin/api/models", "GET", 5).get("models") or []
+        port = candidate
+        break
+    except urllib.error.HTTPError as exc:
+        # The server answered but refused the request; 401 means the persisted
+        # secret is not the one the live server signs with.
+        result["errors"].append(
+            "port %d GET /admin/api/models: HTTP %d" % (candidate, exc.code)
+        )
+        result["server_reachable"] = True
+        break
+    except Exception:
+        continue
+if models is None:
+    # No server means no standalone model can be resident either.
+    emit()
+result["server_reachable"] = True
+
+for model in models:
+    if not isinstance(model, dict) or not model.get("loaded"):
+        continue
+    if model.get("virtual") or model.get("is_loading"):
+        continue
+    if model.get("source_type") == "cluster":
+        continue
+    model_id = str(model.get("id") or "")
+    if not model_id:
+        continue
+    if model.get("pinned"):
+        result["skipped_pinned"].append(model_id)
+        continue
+    path = "/admin/api/models/%s/unload" % urllib.parse.quote(model_id, safe="")
+    try:
+        payload = call(port, path, "POST", 30)
+    except urllib.error.HTTPError as exc:
+        result["errors"].append("%s: HTTP %d" % (model_id, exc.code))
+        continue
+    except Exception as exc:
+        result["errors"].append("%s: %s" % (model_id, exc))
+        continue
+    if isinstance(payload, dict) and payload.get("status") == "unloading":
+        result["draining"].append(model_id)
+    else:
+        result["evicted"].append(model_id)
+
+emit()
+"""
+
+
+def evict_remote_local_models(
+    ssh_target: str,
+    *,
+    python_executable: str | None = None,
+    timeout: float = 60.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Unload every unpinned standalone model the peer's own server has loaded.
+
+    A cluster rank that dies of ``InsufficientMemoryError`` may have been
+    competing for unified memory with a model the peer's independent oMLX
+    server loaded through its normal path; retrying without freeing that model
+    only fails again at a higher ceiling. The coordinator has no HTTP route to
+    a peer, but it has the same host-key-verified SSH every probe uses, and
+    the peer's admin API is one loopback call away from there. Pinned models
+    are reported, never evicted. Cluster shard ranks are separate worker
+    processes, not engine-pool entries, so they cannot be touched here.
+    """
+
+    def _evict(executable: str) -> subprocess.CompletedProcess[str]:
+        return _run_cluster_ssh(
+            ssh_target,
+            shlex.join([executable, "-c", _REMOTE_LOCAL_EVICTION]),
+            timeout=timeout,
+            runner=runner,
+        )
+
+    attempted: str | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
+    if python_executable is not None:
+        attempted = _validate_python_executable(python_executable)
+        completed = _evict(attempted)
+    if completed is None or completed.returncode != 0:
+        # Same fallback discipline as the ceiling probe: a stale interpreter
+        # must trigger a search, not a silent give-up (#2680).
+        discovered = discover_remote_python_executable(
+            ssh_target,
+            preferred=attempted or sys.executable,
+            timeout=min(timeout, 8.0),
+            runner=runner,
+        )
+        if discovered != attempted:
+            completed = _evict(discovered)
+    if completed is None or completed.returncode != 0:
+        detail = (
+            (completed.stderr.strip() or completed.stdout.strip())
+            if completed is not None
+            else ""
+        )
+        raise DistributedLaunchError(
+            f"local-model eviction failed for {ssh_target}"
+            + (f": {detail[:500]}" if detail else "")
+        )
+    try:
+        lines = [
+            line for line in completed.stdout.strip().splitlines() if line.strip()
+        ]
+        payload = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise DistributedLaunchError(
+            f"{ssh_target} did not return an eviction report"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("evicted"), list):
+        raise DistributedLaunchError(
+            f"{ssh_target} returned an invalid eviction report"
+        )
+    return payload
+
+
 def probe_remote_host(
     ssh_target: str,
     *,

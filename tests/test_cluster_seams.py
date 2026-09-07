@@ -230,6 +230,15 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Readiness-ladder primitives (transport readiness ladder, #B3),
+        # exposed ahead of the Fabric Doctor UI panels (fabric-doctor
+        # C2-C5) that read the ladder state and gate on fabric verification.
+        ("readiness.py", "is_fabric_verified"),
+        ("readiness.py", "link_ladder_state"),
+        # VPN full-tunnel remedy copy (VPN detection, C4), exposed ahead of
+        # the Fabric Doctor UI panel that will surface it alongside the
+        # pre-warning banner already wired into _note_full_tunnel_vpns.
+        ("vpn.py", "exclusion_instruction"),
     }
 
     sources = {
