@@ -1939,7 +1939,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
             getattr(configured_scheduler, "paged_cache_block_size", None),
             getattr(effective_scheduler, "paged_cache_block_size", None),
-            bool(getattr(runtime_scheduler, "block_aware_cache", None)),
+            getattr(runtime_scheduler, "block_aware_cache", None) is not None,
             getattr(configured_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "prefill_speed_priority", None),
