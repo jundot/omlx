@@ -206,6 +206,18 @@ class BaseEngine(ABC):
     """
 
     @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Whether Chat may parse raw tool envelopes before engine finish.
+
+        Default-false by design. An engine may opt in only when its underlying
+        producer cannot also return authoritative structured ``tool_calls`` for
+        the same stream; otherwise the API layer cannot safely emit before the
+        terminal output arrives.
+        """
+
+        return False
+
+    @property
     @abstractmethod
     def model_name(self) -> str:
         """Get the model name."""

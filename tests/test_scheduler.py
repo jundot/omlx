@@ -807,10 +807,10 @@ class TestSchedulerAddRequest:
         )
         scheduler._current_usage_bytes.assert_called_once_with()
 
-    def test_add_request_below_pressure_keeps_hot_cache_preload_and_promotion(
+    def test_add_request_below_pressure_promotes_during_single_reconstruction(
         self, mock_model, mock_tokenizer
     ):
-        """Normal memory state should preserve existing hot-cache acceleration."""
+        """Normal state promotes while reconstructing, without a duplicate preload."""
         from omlx.cache.paged_cache import BlockTable
 
         scheduler = self._scheduler_with_mock_block_cache(
@@ -839,7 +839,7 @@ class TestSchedulerAddRequest:
         scheduler.add_request(request)
         scheduler._prepare_prefix_cache_for_request(request)
 
-        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
             block_table
         )
@@ -877,7 +877,7 @@ class TestSchedulerAddRequest:
         scheduler.add_request(request)
         scheduler._prepare_prefix_cache_for_request(request)
 
-        scheduler.block_aware_cache.preload_blocks.assert_called_once_with(block_table)
+        scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
             block_table
         )

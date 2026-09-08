@@ -29,6 +29,8 @@ class MockGenerationOutput:
     finished: bool = False
     tool_calls: Optional[List[Dict[str, Any]]] = None
     cached_tokens: int = 0
+    generated_at: Optional[float] = None
+    first_token_at: Optional[float] = None
 
 
 class MockTokenizer:
@@ -61,6 +63,8 @@ class MockBaseEngine(BaseEngine):
         self._model_name = model_name
         self._tokenizer = MockTokenizer()
         self._model_type = "llama"
+        self._supports_early_tool_call_streaming = False
+        self.last_stream_output_finished = False
         # Configurable streaming responses
         self._stream_outputs: List[MockGenerationOutput] = []
 
@@ -71,6 +75,10 @@ class MockBaseEngine(BaseEngine):
     @property
     def tokenizer(self):
         return self._tokenizer
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        return self._supports_early_tool_call_streaming
 
     @property
     def model_type(self) -> Optional[str]:
@@ -101,6 +109,7 @@ class MockBaseEngine(BaseEngine):
     async def stream_generate(self, prompt: str, **kwargs) -> AsyncIterator[MockGenerationOutput]:
         if self._stream_outputs:
             for output in self._stream_outputs:
+                self.last_stream_output_finished = output.finished
                 yield output
         else:
             yield MockGenerationOutput(
@@ -134,6 +143,7 @@ class MockBaseEngine(BaseEngine):
     async def stream_chat(self, messages: List[Dict], **kwargs) -> AsyncIterator[MockGenerationOutput]:
         if self._stream_outputs:
             for output in self._stream_outputs:
+                self.last_stream_output_finished = output.finished
                 yield output
         else:
             yield MockGenerationOutput(
@@ -1708,6 +1718,708 @@ class TestStreamingHelperFunctions:
         assert tool_call_event_indexes
         assert max(content_event_indexes) < min(tool_call_event_indexes)
         assert "tool_calls" in finish_reasons
+
+    @pytest.mark.asyncio
+    async def test_complete_qwen_tool_envelope_streams_once_before_engine_finish(self):
+        """A validated XML call need not wait for a later terminal output."""
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text="<tool_",
+                    new_text="<tool_",
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=(
+                        "<tool_call><function=get_weather>"
+                        "<parameter=city>Sea"
+                    ),
+                    new_text=(
+                        "call><function=get_weather><parameter=city>Sea"
+                    ),
+                    completion_tokens=2,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=(
+                        "<tool_call><function=get_weather>"
+                        "<parameter=city>Seattle</parameter>"
+                        "</function></tool_call>"
+                    ),
+                    new_text="ttle</parameter></function></tool_call>",
+                    completion_tokens=3,
+                    finished=False,
+                ),
+                # A later empty engine output proves the structured call was
+                # emitted at envelope close rather than terminal finalization.
+                MockGenerationOutput(
+                    text=(
+                        "<tool_call><function=get_weather>"
+                        "<parameter=city>Seattle</parameter>"
+                        "</function></tool_call>"
+                    ),
+                    new_text="",
+                    completion_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="weather")],
+            stream=True,
+            stream_options={"include_usage": True},
+            tools=tools,
+        )
+
+        events = []
+        call_seen_before_engine_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "weather"}],
+            request,
+            max_tokens=256,
+            temperature=0,
+            top_p=1,
+            top_k=0,
+            tools=tools,
+        ):
+            events.append(event)
+            if '"tool_calls"' in event and not engine.last_stream_output_finished:
+                call_seen_before_engine_finish = True
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+        calls = []
+        call_event_indexes = []
+        finish_index = None
+        usage = None
+        for event_index, payload in enumerate(payloads):
+            if payload.get("usage"):
+                usage = payload["usage"]
+            choices = payload.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            chunk_calls = choice.get("delta", {}).get("tool_calls") or []
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                call_event_indexes.append(event_index)
+            if choice.get("finish_reason"):
+                finish_index = event_index
+
+        assert len(calls) == 1
+        assert call_seen_before_engine_finish
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "city": "Seattle"
+        }
+        assert call_event_indexes[0] < finish_index
+        assert usage is not None
+        assert "time_to_first_token" in usage
+        assert "time_to_first_visible_token" in usage
+        streamed_content = "".join(
+            choice.get("delta", {}).get("content") or ""
+            for payload in payloads
+            for choice in payload.get("choices") or []
+        )
+        assert "<tool" not in streamed_content
+        assert "<function" not in streamed_content
+
+    @pytest.mark.asyncio
+    async def test_coalesced_content_tool_content_preserves_raw_fifo(self):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        envelope = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Oslo</parameter></function></tool_call>"
+        )
+        full = "before " + envelope + " after"
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=full,
+                    new_text=full,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=full,
+                    new_text="",
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="weather")],
+            stream=True,
+            tools=tools,
+        )
+
+        ordered = []
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "weather"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            if delta.get("content"):
+                ordered.append(("content", delta["content"]))
+            if delta.get("tool_calls"):
+                ordered.append(
+                    ("tool", delta["tool_calls"][0]["function"]["name"])
+                )
+
+        assert ordered == [
+            ("content", "before "),
+            ("tool", "get_weather"),
+            ("content", " after"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_seventeen_call_overflow_keeps_eighteenth_terminal_ordered(self):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+
+        def envelope(index):
+            return (
+                "<tool_call><function=record>"
+                f"<parameter=i>{index}</parameter></function></tool_call>"
+            )
+
+        first = "".join(envelope(index) for index in range(17))
+        eighteenth = envelope(17)
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=first,
+                    new_text=first,
+                    completion_tokens=17,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=first + eighteenth,
+                    new_text=eighteenth,
+                    completion_tokens=18,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=first + eighteenth,
+                    new_text="",
+                    completion_tokens=18,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "record"}}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="record")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        seen_before_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "record"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            chunk_calls = (
+                choices[0].get("delta", {}).get("tool_calls") if choices else None
+            )
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                seen_before_finish |= not engine.last_stream_output_finished
+
+        assert not seen_before_finish
+        assert len(calls) == 18
+        assert [
+            int(json.loads(call["function"]["arguments"])["i"])
+            for call in calls
+        ] == list(range(18))
+
+    @pytest.mark.asyncio
+    async def test_same_output_structured_call_beats_enabled_raw_candidate(self):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        raw = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Raw</parameter></function></tool_call>"
+        )
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        {
+                            "id": "call_authoritative",
+                            "name": "lookup_weather",
+                            "arguments": '{"city":"Paris"}',
+                        }
+                    ],
+                )
+            ]
+        )
+        tools = [
+            {"type": "function", "function": {"name": "get_weather"}},
+            {"type": "function", "function": {"name": "lookup_weather"}},
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="weather")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "weather"}],
+            request,
+            tools=tools,
+        ):
+            if event.startswith("data: {"):
+                payload = json.loads(event[6:-2])
+                choices = payload.get("choices") or []
+                if choices:
+                    calls.extend(
+                        choices[0].get("delta", {}).get("tool_calls") or []
+                    )
+
+        assert [call["function"]["name"] for call in calls] == [
+            "lookup_weather"
+        ]
+        assert calls[0]["id"] == "call_authoritative"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_structured_tool_call_disables_raw_early_candidate(self):
+        """Default-false capability keeps scheduler structure authoritative."""
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()  # explicit capability remains false
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        raw = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Raw</parameter></function></tool_call>"
+        )
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=raw,
+                    new_text="",
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        {
+                            "id": "call_scheduler",
+                            "name": "lookup_weather",
+                            "arguments": '{"city":"Paris"}',
+                        }
+                    ],
+                ),
+            ]
+        )
+        tools = [
+            {"type": "function", "function": {"name": "get_weather"}},
+            {"type": "function", "function": {"name": "lookup_weather"}},
+        ]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="weather")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        seen_before_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "weather"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            chunk_calls = (
+                choices[0].get("delta", {}).get("tool_calls") if choices else None
+            )
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                seen_before_finish |= not engine.last_stream_output_finished
+
+        assert not seen_before_finish
+        assert [call["function"]["name"] for call in calls] == [
+            "lookup_weather"
+        ]
+        assert calls[0]["id"] == "call_scheduler"
+
+    @pytest.mark.asyncio
+    async def test_disabled_early_capability_preserves_terminal_parser_semantics(self):
+        """The Qwen early gate must not tighten unrelated terminal parsing."""
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()  # explicit early-stream capability is false
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        raw = (
+            "<tool_call><function=legacy_terminal_name>"
+            "<parameter=value>1</parameter></function></tool_call>"
+        )
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw,
+                    new_text=raw,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=raw,
+                    new_text="",
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "registered_name"}}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="run")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        seen_before_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "run"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            chunk_calls = (
+                choices[0].get("delta", {}).get("tool_calls") if choices else None
+            )
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                seen_before_finish |= not engine.last_stream_output_finished
+
+        assert not seen_before_finish
+        assert [call["function"]["name"] for call in calls] == [
+            "legacy_terminal_name"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unknown_envelope_makes_later_early_sequence_terminal_only(self):
+        """Unknown/malformed siblings cannot create a partial early sequence."""
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+        from omlx.server import stream_chat_completion
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<tool_call>"
+        engine.tokenizer.tool_call_end = "</tool_call>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        unknown = (
+            "<tool_call><function=hallucinated>"
+            "<parameter=x>1</parameter></function></tool_call>"
+        )
+        valid = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Oslo</parameter></function></tool_call>"
+        )
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=unknown,
+                    new_text=unknown,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=unknown + valid,
+                    new_text=valid,
+                    completion_tokens=2,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text=unknown + valid,
+                    new_text="",
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="weather")],
+            stream=True,
+            tools=tools,
+        )
+
+        calls = []
+        seen_before_finish = False
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "weather"}],
+            request,
+            tools=tools,
+        ):
+            if not event.startswith("data: {"):
+                continue
+            payload = json.loads(event[6:-2])
+            choices = payload.get("choices") or []
+            chunk_calls = (
+                choices[0].get("delta", {}).get("tool_calls") if choices else None
+            )
+            if chunk_calls:
+                calls.extend(chunk_calls)
+                seen_before_finish |= not engine.last_stream_output_finished
+
+        assert not seen_before_finish
+        assert [call["function"]["name"] for call in calls] == ["get_weather"]
+
+    def test_semantic_tool_dedupe_preserves_duplicate_occurrences(self):
+        from omlx.api.openai_models import FunctionCall, ToolCall
+        from omlx.server import _merge_streamed_tool_call_prefix
+
+        early = ToolCall(
+            id="call_early",
+            function=FunctionCall(name="f", arguments='{"b":2,"a":1}'),
+        )
+        same_semantics = ToolCall(
+            id="call_terminal_1",
+            function=FunctionCall(name="f", arguments='{ "a": 1, "b": 2 }'),
+        )
+        repeated = ToolCall(
+            id="call_terminal_2",
+            function=FunctionCall(name="f", arguments='{"a":1,"b":2}'),
+        )
+
+        merged = _merge_streamed_tool_call_prefix(
+            [early],
+            [same_semantics, repeated],
+        )
+        assert [call.id for call in merged] == ["call_early", "call_terminal_2"]
+
+    @pytest.mark.asyncio
+    async def test_chat_usage_separates_model_and_visible_ttft_exactly(
+        self,
+        monkeypatch,
+    ):
+        from omlx.api.openai_models import (
+            ChatCompletionChunk,
+            ChatCompletionRequest,
+            Message,
+        )
+        from omlx.server import stream_chat_completion
+
+        visible_serialized = False
+        original_dump = ChatCompletionChunk.model_dump_json
+
+        def tracked_dump(chunk, *args, **kwargs):
+            nonlocal visible_serialized
+            result = original_dump(chunk, *args, **kwargs)
+            if any(
+                getattr(choice.delta, "content", None)
+                for choice in chunk.choices
+            ):
+                visible_serialized = True
+            return result
+
+        monkeypatch.setattr(ChatCompletionChunk, "model_dump_json", tracked_dump)
+        ticks = iter([100.0, 102.5, 110.0])
+
+        def perf_counter():
+            value = next(ticks)
+            if value == 102.5:
+                assert visible_serialized
+            return value
+
+        monkeypatch.setattr("omlx.server.time.perf_counter", perf_counter)
+        engine = MockBaseEngine()
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text="hello",
+                    new_text="hello",
+                    completion_tokens=1,
+                    first_token_at=101.25,
+                    generated_at=101.75,
+                    finished=True,
+                    finish_reason="stop",
+                )
+            ]
+        )
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="hello")],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        usage = None
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "hello"}],
+            request,
+        ):
+            if event.startswith("data: {"):
+                payload = json.loads(event[6:-2])
+                usage = payload.get("usage") or usage
+
+        assert usage["time_to_first_token"] == 1.25
+        assert usage["time_to_first_visible_token"] == 2.5
+        assert "tool_envelope_buffer_duration" not in usage
+
+    def test_local_engine_capability_requires_explicit_parser_absence(self):
+        from types import SimpleNamespace
+
+        from omlx.engine.batched import BatchedEngine
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        for engine_type in (BatchedEngine, VLMBatchedEngine):
+            engine = engine_type.__new__(engine_type)
+            engine._engine = None
+            assert not engine.supports_early_tool_call_streaming
+            scheduler = SimpleNamespace(_output_parser_factory=object())
+            engine._engine = SimpleNamespace(
+                engine=SimpleNamespace(scheduler=scheduler)
+            )
+            assert not engine.supports_early_tool_call_streaming
+            scheduler._output_parser_factory = None
+            assert engine.supports_early_tool_call_streaming
+
+    def test_early_tool_gate_requires_exact_qwen3_coder_parser(self):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.server import _chat_can_stream_qwen_tool_envelopes
+
+        engine = MockBaseEngine()
+        engine._supports_early_tool_call_streaming = True
+        engine.tokenizer.tool_parser = parse_tool_call
+        assert _chat_can_stream_qwen_tool_envelopes(engine)
+
+        def lookalike(*_args, **_kwargs):
+            return None
+
+        lookalike.__module__ = "third_party.qwen3_coder"
+        engine.tokenizer.tool_parser = lookalike
+        assert not _chat_can_stream_qwen_tool_envelopes(engine)
+
+        lookalike.__module__ = "mlx_lm.tool_parsers.qwen3_coder"
+        lookalike.__name__ = "parse_tool_call"
+        assert not _chat_can_stream_qwen_tool_envelopes(engine)
 
     @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_parsed_from_namespaced_text_does_not_leak_markup(self):

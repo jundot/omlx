@@ -52,14 +52,20 @@ class TestExtractThinking:
         assert "Step 1" in thinking
         assert content == "Final answer"
 
-    def test_open_tag_no_close_recovers_as_content(self):
-        """Model opened ``<think>`` but never closed it — non-streaming
-        path treats the body as content (matching the streaming
-        recovery in ThinkingParser.finish())."""
+    def test_open_tag_no_close_remains_private_reasoning(self):
+        """Unclosed reasoning is never promoted into answer content."""
         from omlx.api.thinking import extract_thinking
         thinking, content = extract_thinking("<think>\nthe whole answer body")
-        assert thinking == ""
-        assert content == "the whole answer body"
+        assert thinking == "the whole answer body"
+        assert content == ""
+
+    def test_complete_then_unclosed_thinking_keeps_late_suffix_private(self):
+        """A malformed later block cannot leak after one valid block."""
+        thinking, content = extract_thinking(
+            "<think>first</think>public<think>private suffix"
+        )
+        assert thinking == "first\nprivate suffix"
+        assert content == "public"
 
     def test_partial_no_open_tag(self):
         """Content before </think> without <think> tag (scheduler prefix case)."""
@@ -98,7 +104,8 @@ class TestExtractThinking:
         issue #1348: in 0.3.9 the Responses API passed
         ``start_in_thinking=True`` here, which misclassified short tool-turn
         answers (no ``</think>``) as thinking and left ``output_text`` empty.
-        Mirrors ``ThinkingParser.finish()`` recovery semantics."""
+        Prompt-open state belongs to ``ThinkingParser``; this standalone helper
+        cannot infer it from tag-free text."""
         thinking, content = extract_thinking("just the reasoning")
         assert thinking == ""
         assert content == "just the reasoning"
@@ -237,17 +244,8 @@ class TestThinkingParser:
         # The > and < characters should pass through since they don't form valid tags
         assert "x > 0" in t1 or "x > 0" in (t1 + parser._buffer)
 
-    def test_recovery_when_no_close_tag_streams_as_content(self):
-        """Model opened ``<think>`` but never emitted ``</think>``.
-
-        For V4-Flash and similar models, the thinking close tag is
-        sometimes skipped — the entire response streams as thinking
-        and the visible answer body ends up empty. ``finish()`` recovers
-        by re-emitting the accumulated thinking text as content so the
-        client can render the body. The thinking deltas already streamed
-        cannot be retracted, so the same text shows in both panels —
-        documented UX trade-off.
-        """
+    def test_unclosed_thinking_stays_private(self):
+        """Model-opened unfinished reasoning never becomes answer content."""
         parser = ThinkingParser()
 
         # Streamed chunks: open tag + free-form text, no close tag.
@@ -273,9 +271,10 @@ class TestThinkingParser:
         # Live thinking deltas streamed normally during the response.
         assert "Hello world" in thinking
         assert "body of the response" in thinking
-        # Recovery: same text re-emitted as content at finish().
-        assert "Hello world" in content
-        assert "body of the response" in content
+        # Fail closed: unfinished private reasoning is not promoted into the
+        # visible answer body. The transport reports this response incomplete.
+        assert content == ""
+        assert parser.unfinished_thinking is True
         # No tag literals leaked into either panel.
         assert "<think>" not in thinking and "<think>" not in content
         assert "</think>" not in thinking and "</think>" not in content
@@ -360,28 +359,26 @@ class TestThinkingParser:
         assert t1 == "body"
         assert c1 == "answer"
 
-    def test_start_in_thinking_recovery_emits_thinking_as_content(self):
-        """Recovery is intentional UX fallback: if start_in_thinking=True
-        and no </think> ever arrives, finish() re-emits the accumulated
-        thinking as content so the message body is not empty. The client
-        ends up showing the same text in both panels — documented
-        trade-off, not a bug. Guard against accidental regression."""
+    def test_start_in_thinking_unfinished_reasoning_stays_private(self):
+        """Prompt-opened reasoning never leaks into visible content."""
         parser = ThinkingParser(start_in_thinking=True)
         parser.feed("the whole answer ")
         parser.feed("never closed")
         t, c = parser.finish()
         assert t == ""
-        assert c == "the whole answer never closed"
+        assert c == ""
+        assert parser.unfinished_thinking is True
 
-    def test_default_recovery_still_works(self):
-        """Regression guard for the legacy recovery branch — default
-        ThinkingParser (no start_in_thinking) with `<think>...` body and
-        no closing tag still re-emits thinking as content."""
+    def test_default_unfinished_reasoning_stays_private(self):
+        """An explicitly opened but unfinished block remains reasoning."""
         parser = ThinkingParser()
-        parser.feed("<think>open but never closed")
+        t1, c1 = parser.feed("<think>open but never closed")
         t, c = parser.finish()
+        assert t1 == "open but never closed"
+        assert c1 == ""
         assert t == ""
-        assert c == "open but never closed"
+        assert c == ""
+        assert parser.unfinished_thinking is True
 
 
 class TestCleanSpecialTokens:
