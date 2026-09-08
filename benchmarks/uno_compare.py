@@ -140,10 +140,10 @@ async def run(args):
     async with httpx.AsyncClient(
         base_url=args.url, headers=headers, timeout=600
     ) as client:
-        response = await client.get("/api/models")
+        response = await client.get("/v1/models")
         response.raise_for_status()
         report["model"] = next(
-            m for m in response.json()["models"] if m["id"] == args.model
+            m for m in response.json()["data"] if m["id"] == args.model
         )
         for trial in range(args.trials + 1):
             for name, prompts in workloads.items():
