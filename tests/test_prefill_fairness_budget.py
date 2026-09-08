@@ -37,6 +37,7 @@ def clock(monkeypatch):
 
 def make_scheduler(**settings) -> Scheduler:
     model = MagicMock()
+    del model._omlx_prefill
     model.layers = []
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
@@ -264,7 +265,8 @@ def test_inflight_chunk_debt_defers_new_admission_until_decode_runs():
     external.assert_not_called()
 
 
-def test_short_external_prefills_share_admission_debt(clock):
+@pytest.mark.parametrize("ane_prefill", [False, True])
+def test_short_external_prefills_share_admission_debt(clock, ane_prefill):
     scheduler = make_scheduler()
     scheduler.running["decoder"] = make_request("decoder")
     requests = [make_request(request_id, 3) for request_id in ("short-a", "short-b")]
@@ -277,6 +279,8 @@ def test_short_external_prefills_share_admission_debt(clock):
         clock.now += 0.5
 
     scheduler.model.side_effect = forward
+    if ane_prefill:
+        scheduler.model._omlx_prefill = forward
     with patch("omlx.scheduler.make_prompt_cache", return_value=[]):
         scheduled, rejected = scheduler._schedule_waiting()
         assert scheduled == [requests[0]]
