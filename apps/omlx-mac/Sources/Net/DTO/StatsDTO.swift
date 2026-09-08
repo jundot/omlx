@@ -81,3 +81,29 @@ struct ClearHotCacheResponse: Codable, Sendable {
     let status: String?
     let totalCleared: Int?
 }
+
+/// Hourly operational aggregates; contains no conversation or client data.
+struct UsageHistoryDTO: Decodable {
+    let available: Bool
+    let droppedRequests: Int
+    let totals: UsageTotalsDTO
+    let models: [UsageTotalsDTO]
+    let heatmap: [UsageDayDTO]
+
+    struct UsageTotalsDTO: Decodable {
+        let modelId: String?
+        let requests: Int
+        let totalTokens: Int
+        let promptTokens: Int
+        let completionTokens: Int
+        let cachedTokens: Int
+        let generationTps: Double?
+        let cacheEfficiency: Double
+    }
+
+    struct UsageDayDTO: Decodable, Identifiable {
+        let date: String
+        let tokens: [Int]
+        var id: String { date }
+    }
+}

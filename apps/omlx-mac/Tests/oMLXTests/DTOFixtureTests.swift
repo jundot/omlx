@@ -39,6 +39,25 @@ final class DTOFixtureTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    func testUsageHistoryDecodesCanonicalModelAndUnknownSpeed() throws {
+        let json = """
+        {"available": true, "dropped_requests": 0,
+         "totals": {"requests": 2, "total_tokens": 120, "prompt_tokens": 100,
+                    "completion_tokens": 20, "cached_tokens": 60,
+                    "generation_tps": 10.0, "cache_efficiency": 0.6},
+         "models": [{"model_id": "canonical-model", "requests": 2,
+                     "total_tokens": 120, "prompt_tokens": 100,
+                     "completion_tokens": 20, "cached_tokens": 60,
+                     "generation_tps": null, "cache_efficiency": 0.6}],
+         "heatmap": [{"date": "2026-09-08", "tokens": [0, 120]}]}
+        """
+        let usage = try Self.makeDecoder().decode(UsageHistoryDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(usage.totals.totalTokens, 120)
+        XCTAssertEqual(usage.models.first?.modelId, "canonical-model")
+        XCTAssertNil(usage.models.first?.generationTps)
+        XCTAssertEqual(usage.heatmap.first?.tokens.reduce(0, +), 120)
+    }
+
     // MARK: - oQ quantization
 
     func testOQStartRequestEncodesEnhancedOptions() throws {
