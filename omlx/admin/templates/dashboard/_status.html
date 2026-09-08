@@ -157,6 +157,13 @@
                                         <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
                                         <div class="min-w-0 flex-1">
                                             <div class="text-sm font-medium text-neutral-800 min-w-0 break-words leading-snug" x-text="m.id"></div>
+                                            <div class="mt-1 flex flex-wrap items-center gap-1" x-show="m.cluster" x-cloak>
+                                                <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
+                                                      x-text="clusterBadgeLabel(m.cluster)"></span>
+                                                <span x-show="m.cluster.live && m.cluster.live.stale"
+                                                      class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                      x-text="window.t('cluster.badge.stale')"></span>
+                                            </div>
                                             <div class="mt-1.5 space-y-1 min-w-0">
                                                 <template x-if="m.is_loading">
                                                     <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
@@ -203,6 +210,16 @@
                                             <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
                                             <!-- Model name -->
                                             <span class="text-sm font-medium text-neutral-800" x-text="m.id"></span>
+                                            <!-- Cluster badge -->
+                                            <template x-if="m.cluster">
+                                                <span class="flex items-center gap-1">
+                                                    <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200 whitespace-nowrap"
+                                                          x-text="clusterBadgeLabel(m.cluster)"></span>
+                                                    <span x-show="m.cluster.live && m.cluster.live.stale" x-cloak
+                                                          class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200 whitespace-nowrap"
+                                                          x-text="window.t('cluster.badge.stale')"></span>
+                                                </span>
+                                            </template>
                                         </div>
                                         <div class="flex items-center gap-3">
                                             <!-- Status indicator -->
@@ -577,23 +594,47 @@
                                     <tbody class="divide-y divide-neutral-100 text-neutral-700">
                                         <template x-for="m in stats.runtime_cache.models" :key="m.id">
                                             <tr>
-                                                <td class="px-3 py-2 font-medium" x-text="m.id"></td>
-                                                <td class="px-3 py-2 text-right" x-text="m.block_size ? (m.block_size + ' tks') : '-' "></td>
-                                                <td class="px-3 py-2 text-right">
-                                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
-                                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                                <td class="px-3 py-2 font-medium">
+                                                    <span x-text="m.id"></span>
+                                                    <span x-show="m.cache_tier === 'rank-prompt-snapshot'" x-cloak
+                                                          class="ml-1.5 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
+                                                          x-text="window.t('cluster.badge.label')"></span>
                                                 </td>
-                                                <td class="px-3 py-2 text-right">
-                                                    <span x-show="m.has_sub_block_cache"
-                                                          class="text-amber-600"
-                                                          x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
-                                                    </span>
-                                                    <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
-                                                </td>
-                                                <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
-                                                <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
-                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
-                                                <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
+                                                <template x-if="m.cache_tier === 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right text-neutral-500"
+                                                        :colspan="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 7 : 5"
+                                                        x-text="window.t('cluster.badge.rank_cache') + ': ' + (((m.rank_prompt_cache?.hit_rate || 0) * 100).toFixed(1) + '%') + ' · ' + formatNumber(m.rank_prompt_cache?.entries || 0) + ' ' + window.t('cluster.badge.rank_cache_entries') + ' · ' + formatSizeBytes(m.rank_prompt_cache?.bytes || 0)"></td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right" x-text="m.block_size ? (m.block_size + ' tks') : '-' "></td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right">
+                                                        <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
+                                                        <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                                    </td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right">
+                                                        <span x-show="m.has_sub_block_cache"
+                                                              class="text-amber-600"
+                                                              x-text="'cached (' + (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))) + ' tokens)'">
+                                                        </span>
+                                                        <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>
+                                                    </td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>
+                                                </template>
+                                                <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
+                                                    <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="formatSizeBytes(m.hot_cache_size_bytes || 0)"></td>
+                                                </template>
                                             </tr>
                                         </template>
                                     </tbody>

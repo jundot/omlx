@@ -9250,6 +9250,19 @@
                 return `~${actual} obs / ${estimated} est`;
             },
 
+            clusterBadgeLabel(cluster) {
+                if (!cluster) return '';
+                const tensor = window.t('cluster.badge.tensor') + '×' + (cluster.tensor_parallel_size || 1);
+                const pipeline = window.t('cluster.badge.pipeline') + '×' + (cluster.pipeline_stages || 1);
+                let strategy = tensor;
+                if (cluster.strategy === 'pipeline') {
+                    strategy = pipeline;
+                } else if (cluster.strategy === 'hybrid') {
+                    strategy = tensor + '+' + pipeline;
+                }
+                return window.t('cluster.badge.label') + ' · ' + strategy;
+            },
+
             copyToClipboard(text) {
                 if (navigator.clipboard && window.isSecureContext) {
                     navigator.clipboard.writeText(text).catch(() => {

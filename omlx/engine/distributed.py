@@ -24,7 +24,13 @@ from ..cluster.launch import (
     DistributedLaunchError,
     _run_cluster_ssh,
 )
-from ..cluster.liveness import check_peers, describe_failure, read_marker
+from ..cluster.liveness import (
+    _DEFAULT_STALE_AFTER,
+    check_peers,
+    describe_failure,
+    marker_age_seconds,
+    read_marker,
+)
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -917,6 +923,36 @@ raise SystemExit(2)
         if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
             return active
         return None
+
+    def get_live_metrics(self) -> dict[str, Any] | None:
+        """Rank zero's latest telemetry snapshot for the admin dashboard.
+
+        The coordinator owns no scheduler, so the only truthful live rates
+        (decode/prefill tok/s, prefill progress, prompt-cache stats) are the
+        ones rank 0 publishes into its runtime marker roughly once a second.
+        Returns None when the marker or its metrics are absent, otherwise
+        ``{"metrics", "updated_at", "age_seconds", "stale"}``; ``stale`` marks
+        a heartbeat older than the liveness staleness bound, in which case
+        consumers must present the model as idle rather than trusting the
+        rates.
+        """
+
+        marker = read_marker(
+            Path(self._supervisor.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-rank-0.json"
+        )
+        if not isinstance(marker, dict):
+            return None
+        metrics = marker.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        age = marker_age_seconds(marker)
+        return {
+            "metrics": metrics,
+            "updated_at": marker.get("updated_at"),
+            "age_seconds": age,
+            "stale": age is not None and age > _DEFAULT_STALE_AFTER,
+        }
 
     async def abort_request(
         self,

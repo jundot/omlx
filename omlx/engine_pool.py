@@ -3173,16 +3173,10 @@ class EnginePool:
         Returns:
             Dictionary with pool status information
         """
-        return {
-            "final_ceiling": self._current_ceiling(),
-            "current_model_memory": self._current_model_memory,
-            "model_count": len(self._entries),
-            "loaded_count": sum(
-                1 for e in self._entries.values() if e.engine is not None
-            ),
-            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
-            "load_time_observations": self._load_time_observations,
-            "models": [
+        models = []
+        for mid, e in sorted(self._entries.items()):
+            deployment = self._distributed_deployment_for_entry(e)
+            models.append(
                 {
                     "id": mid,
                     "model_path": e.model_path,
@@ -3191,8 +3185,11 @@ class EnginePool:
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "resident_estimated_size": self._entry_resident_size(e),
-                    "distributed": (
-                        self._distributed_deployment_for_entry(e) is not None
+                    "distributed": deployment is not None,
+                    "cluster": (
+                        self._cluster_status_payload(deployment)
+                        if deployment is not None
+                        else None
                     ),
                     "actual_size": e.actual_size,
                     "pinned": e.is_pinned,
@@ -3210,8 +3207,40 @@ class EnginePool:
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
-                for mid, e in sorted(self._entries.items())
-            ],
+            )
+        return {
+            "final_ceiling": self._current_ceiling(),
+            "current_model_memory": self._current_model_memory,
+            "model_count": len(self._entries),
+            "loaded_count": sum(
+                1 for e in self._entries.values() if e.engine is not None
+            ),
+            "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
+            "load_time_observations": self._load_time_observations,
+            "models": models,
+        }
+
+    @staticmethod
+    def _cluster_status_payload(deployment: ClusterDeployment) -> dict:
+        """Badge/cluster topology summary for dashboard model rows."""
+
+        world_size = deployment.world_size
+        tensor_parallel_size = deployment.tensor_parallel_size
+        return {
+            "deployment_id": deployment.deployment_id,
+            "world_size": world_size,
+            "tensor_parallel_size": tensor_parallel_size,
+            "pipeline_stages": world_size // tensor_parallel_size,
+            "strategy": (
+                "tensor"
+                if tensor_parallel_size == world_size
+                else "pipeline"
+                if tensor_parallel_size == 1
+                else "hybrid"
+            ),
+            "backend": str(deployment.backend),
+            "target_context_tokens": deployment.target_context_tokens,
+            "profile": deployment.execution.profile,
         }
 
     async def check_ttl_expirations(
