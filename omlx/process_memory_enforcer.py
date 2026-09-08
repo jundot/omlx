@@ -41,7 +41,11 @@ import mlx.core as mx
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
-from .utils.proc_memory import get_phys_footprint
+from .utils.proc_memory import (
+    discount_external_wired,
+    external_wired_bytes,
+    get_phys_footprint,
+)
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -382,6 +386,12 @@ class ProcessMemoryEnforcer:
         self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        # Gate 2 (docs/qwen4exp-streaming-alternatives-investigation.md):
+        # Externally-wired byte accounting (e.g. mmap'd MoE expert
+        # weights that Metal/phys_footprint cannot see) lives in the
+        # process-global, name-keyed registry in omlx.utils.proc_memory;
+        # the enforcer reads it via external_wired_bytes(). No
+        # per-instance provider registry.
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
@@ -597,6 +607,28 @@ class ProcessMemoryEnforcer:
         vm_stat fallback only if the fast host_statistics64 path is unavailable.
         If all telemetry is unavailable, fall back to the static ceiling so
         server health endpoints and the enforcer keep running.
+
+        Gate 2 (revised, LIVE TEST 2 2026-08-31, Fable-reviewed GO): this used
+        to subtract external-wired bytes from the reclaimable estimate
+        whenever idle, on the theory that idle artifact pages sit in
+        free/inactive/active and would otherwise be double-counted as
+        reclaimable headroom. Live measurement falsified that: the registered
+        qwen4_moe_stream provider (fast.mapped_bytes) reports the mmap'd
+        artifact's LOAD-TIME-CONSTANT total size (~43.7 GiB), not how much of
+        it is actually resident right now, and _has_active_requests() is False
+        the instant a load completes -- before the model ever serves a
+        request. Subtracting that constant collapsed the dynamic ceiling to
+        <1 GB against ~34 GB of real usage and force-evicted a model that fit
+        fine, the exact self-defeating pattern already fixed for metal_cap
+        (LIVE TEST 1, Fix A): reserving/subtracting the full artifact size
+        treats streaming as if the experts were fully resident. Nothing real
+        is lost: genuine wired pressure already shows up live via free-bucket
+        depletion (wired pages are disjoint from free/inactive/active in
+        vm_stat), with zero provider involvement -- so external_wired is now
+        off-budget on the dynamic-ceiling side too; it stays in the breakdown
+        dict for observability only. If the ladder later shows real wired
+        contention the lever is mx.set_wired_limit, not this admission
+        ceiling.
         """
         if self._memory_guard_tier == "custom":
             return max(0, self._memory_guard_custom_ceiling_bytes)
@@ -661,6 +693,26 @@ class ProcessMemoryEnforcer:
         else:
             dynamic_ceiling = self._get_dynamic_ceiling()
         metal_cap = self._get_effective_metal_cap_bytes()
+        # Gate 2 (revised, LIVE TEST 1 2026-08-31): external-wired bytes (the
+        # mmap'd MoE expert-streaming artifact) are RECLAIMABLE file-backed
+        # page cache, NOT a hard wired reservation. Subtracting them from
+        # metal_cap collapsed the hard ceiling below the model's real
+        # resident footprint and force-evicted a model that fit fine -- and
+        # reserving the full payload defeats streaming's whole benefit (the
+        # driver wires only bounded per-command expert subsets, never the
+        # full payload at once; on a 64GB box full simultaneous wiring is
+        # physically impossible anyway: backbone ~25.6GB + experts ~46.9GB >
+        # RAM). So external is OFF-BUDGET on the ceiling side; it is retained
+        # in the breakdown below for observability only. It is no longer
+        # subtracted from ANY ceiling: not from metal_cap here (Fix A) and
+        # not from the dynamic ceiling (Fix D removed that idle-only
+        # subtraction). It is observability-only in /health now; real wired
+        # pressure is caught live via vm_stat free-bucket depletion instead
+        # (wired pages are disjoint from free/inactive/active), so nothing
+        # here credits or charges it. If the ladder later shows real wired
+        # contention the lever is mx.set_wired_limit (shrinking MLX's own
+        # share), not this admission ceiling.
+        external_wired = self._get_external_wired_bytes()
         candidates = [static_ceiling, dynamic_ceiling]
         if metal_cap > 0:
             candidates.append(metal_cap)
@@ -668,6 +720,7 @@ class ProcessMemoryEnforcer:
             "static": static_ceiling,
             "dynamic": dynamic_ceiling,
             "metal_cap": metal_cap,
+            "external_wired": external_wired,
             "hard_limit": min(candidates),
         }
 
@@ -804,9 +857,25 @@ class ProcessMemoryEnforcer:
         so idle/status accounting remains as precise as before.
         """
         phys = get_phys_footprint()
+        # external_wired is NOT charged against any ceiling as of Fix D
+        # (LIVE TEST 2, 2026-08-31, Fable-reviewed) -- it is purely
+        # observational in the /health breakdown now (both metal_cap, Fix A,
+        # and the dynamic ceiling, Fix D, stopped subtracting it; real wired
+        # pressure shows up live via vm_stat free-bucket depletion instead).
+        # This discount below is separate and still correct: it is
+        # measurement hygiene, removing MLX's phantom accounting of mmap'd
+        # bytes from mx.get_active_memory() (which counts them; phys_footprint
+        # does not), not budget charging. Discount ONCE, at the sample site,
+        # split by path to avoid double-discount:
         if self._has_active_requests():
-            return max(self._cached_executor_active_memory_bytes(), phys)
-        return max(mx.get_active_memory(), phys)
+            # cached scheduler sample is ALREADY external-discounted
+            # upstream (Scheduler._current_usage_bytes) -- do NOT discount
+            # again here.
+            active = self._cached_executor_active_memory_bytes()
+            return max(active, phys)
+        # idle path: discount the direct sample here.
+        active = discount_external_wired(mx.get_active_memory())
+        return max(active, phys)
 
     def _is_emergency_pressure(self, current: int, ceiling: int) -> bool:
         """Return True only for pressure beyond the configured ceiling.
@@ -837,6 +906,8 @@ class ProcessMemoryEnforcer:
 
     def _has_active_requests(self) -> bool:
         """Best-effort active-request detection without touching MLX."""
+        if self._engine_pool is None:
+            return False
         for entry in self._engine_pool._entries.values():
             engine = getattr(entry, "engine", None)
             if engine is None:
@@ -850,6 +921,16 @@ class ProcessMemoryEnforcer:
             except Exception:
                 return True
         return False
+
+    def _get_external_wired_bytes(self) -> int:
+        """Worst-case externally-wired bytes from the process-global
+        registry in omlx.utils.proc_memory (mmap'd MoE expert weights,
+        etc.). NOT charged against any ceiling as of Fix D -- metal_cap
+        (Fix A) and the dynamic ceiling (Fix D) both stopped subtracting
+        it; it is purely observational, surfaced in the /health breakdown
+        only. Real wired pressure is caught live via vm_stat free-bucket
+        depletion instead."""
+        return external_wired_bytes()
 
     def _cached_executor_active_memory_bytes(self) -> int:
         """Max MLX active-memory sample recorded by scheduler executor threads."""
