@@ -17,23 +17,37 @@ def is_paroquant_config(config: dict) -> bool:
 
 
 def paroquant_dflash_compatibility(config: dict) -> tuple[bool, str]:
-    """Keep initial support restricted to the dense Qwen3.8-27B layout."""
+    """Accept Qwen layouts covered by the ParoQuant loader and DFlash adapter."""
     text = config.get("text_config") or config
     quant = config.get("quantization_config") or {}
+    # Use actual mlx-lm module names, not a substring match: text-only aliases
+    # and unrelated Qwen architectures need their own loader/adapter coverage.
+    if config.get("model_type") not in {
+        "qwen2",
+        "qwen3",
+        "qwen3_moe",
+        "qwen3_5",
+        "qwen3_5_moe",
+    }:
+        return (
+            False,
+            "ParoQuant DFlash supports Qwen2, Qwen3 and Qwen3.5-family dense/MoE text targets",
+        )
     if (
-        config.get("model_type") != "qwen3_5"
-        or not isinstance(text, dict)
-        or text.get("num_hidden_layers") != 64
-        or text.get("hidden_size") != 5120
-        or text.get("vocab_size") != 248320
-        or text.get("num_experts", 0) not in (0, None)
+        not isinstance(text, dict)
+        or not isinstance(quant, dict)
+        or any(
+            type(text.get(key)) is not int or text[key] <= 0
+            for key in ("num_hidden_layers", "hidden_size", "vocab_size")
+        )
+        # AutoAWQ conversion in ParoQuant currently unpacks four-bit nibbles.
         or quant.get("bits") != 4
-        or quant.get("group_size") != 128
-        or quant.get("krot") != 8
+        or quant.get("group_size") not in (32, 64, 128)
+        or ("krot" in quant and (type(quant["krot"]) is not int or quant["krot"] <= 0))
     ):
         return (
             False,
-            "ParoQuant DFlash currently supports only the dense Qwen3.8-27B 4-bit, group-128, krot-8 layout",
+            "ParoQuant DFlash requires positive text dimensions, 4-bit weights, group size 32/64/128, and positive rotation count when specified",
         )
     return True, ""
 

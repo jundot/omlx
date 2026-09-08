@@ -1,13 +1,21 @@
 # ParoQuant with DFlash
 
-DFlash text generation supports the dense Qwen3.8-27B ParoQuant layout
-(4-bit weights, group size 128, eight rotation stages). A matching draft is
-`z-lab/Qwen3.8-27B-DFlash2`.
+DFlash text generation accepts ParoQuant Qwen2, Qwen3, Qwen3-MoE, and
+Qwen3.5-family dense/MoE targets (including Qwen3.6/Qwen3.8 checkpoints using
+those model types). Model size is read from configuration rather than fixed
+to the 27B layout. Supported quantization is 4-bit with group size 32, 64, or
+128; rotation count is taken from checkpoint tensors.
 
-Install oMLX with the `paroquant` extra, register the target and draft, then
-select the draft under the target's DFlash settings. Start with block size 5;
-block sizes 3 and 8 are also covered by the correctness checks. A Hugging Face
-cache reference must resolve to the snapshot containing the checkpoint files,
+This is not universal ParoQuant support: other architectures need their own
+loader/adapter validation, and every target needs a DFlash draft trained for
+the same base model. The supplied `z-lab/Qwen3.8-27B-DFlash2` draft must not be
+reused with differently sized targets.
+
+Install oMLX with the `paroquant` extra, register the target and its matching
+draft, then select the draft under the target's DFlash settings. For the
+fully validated Qwen3.8-27B pair, start with block size 5; block sizes 3 and 8
+also passed correctness checks. For other pairs, follow the draft's limits.
+A Hugging Face cache reference must resolve to the snapshot containing the checkpoint files,
 not the cache's `models--...` container directory.
 
 ParoQuant targets load through ParoQuant's text loader. Its rotation-aware
@@ -17,7 +25,7 @@ verification, and recurrent/attention cache rollback. Ordinary MLX targets retai
 their original loading and verification paths.
 
 Eligibility is checked consistently by the dashboard, settings API, and target
-loader. Other ParoQuant architectures and quantization layouts remain unsupported.
+loader. Uncovered ParoQuant architectures and quantization layouts remain unsupported.
 Draft hidden size, vocabulary size, target-layer count, and capture-layer indices
 must match the target. Matching dimensions do not establish semantic compatibility:
 choose a draft trained for the same base model.
@@ -95,3 +103,20 @@ Machine-readable evidence is in
 [`validation_summary.json`](../../benchmarks/paroquant_dflash/validation_summary.json).
 Live image generation and a controlled comparison against the batched engine
 were not part of this validation.
+
+## Family-level validation
+
+The extension covers the actual mlx-lm types `qwen2`, `qwen3`, `qwen3_moe`,
+`qwen3_5`, and `qwen3_5_moe`. Small numerical fixtures cover all five types,
+including quantized MoE experts with shared ParoQuant rotations. They verify
+hidden capture and every rejection position in a five-token block. Additional
+fixtures exercise group sizes 32/64 and rotation counts 2/4, alongside 128/8.
+Real ParoQuant loader round-trips verify rotation preservation and forward
+parity for these small MLX-format checkpoints; only tokenizer construction is
+stubbed. This is structural/numerical coverage, not full-checkpoint validation
+of every published model or its draft.
+
+The full-model results above remain specific to Qwen3.8-27B. Native/AutoAWQ
+conversion for other published checkpoints and their draft acceptance quality
+have not been newly measured. Non-four-bit formats remain rejected because
+the installed ParoQuant AutoAWQ converter unpacks four-bit nibbles.
