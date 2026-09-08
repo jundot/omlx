@@ -487,6 +487,8 @@
   "cluster.pairing.shared_secret_placeholder": "16자 이상",
   "cluster.pairing.generate": "생성",
   "cluster.pairing.copy": "복사",
+  "settings.advanced.gpu_keepwarm": "유휴 상태에서 GPU를 따뜻하게 유지",
+  "settings.advanced.gpu_keepwarm_hint": "GPU는 유휴 상태에서 클럭을 낮추므로 다음 요청이 상승 비용을 치릅니다. M1 Ultra에서 GLM-5.3-Flash로 측정(04/09): 요청 간격 8초에서 끄면 17.5-18.5 tok/s, 켜면 23.8-24.5 tok/s. 연속 요청은 변화 없음. 품질이 아니라 유휴 전력을 소비합니다. 다음 서버 시작부터 적용.",
   "settings.advanced.burst_decode": "Burst Decode",
   "settings.advanced.burst_decode_hint": "Process tokens in batches internally for faster generation. Higher levels run faster but stream in larger chunks; lower levels stream more smoothly. Applies instantly, no restart.",
   "settings.advanced.burst_decode_off": "Off (smoothest streaming)",

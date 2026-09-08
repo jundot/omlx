@@ -117,6 +117,12 @@ def serve_command(args):
     if settings.cache.ane_compile_cache:
         os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
+    # The engine loop reads the keepwarm flag once, when it starts. Export the
+    # global setting so it reaches every engine the pool creates; setdefault
+    # keeps an explicit env override authoritative.
+    if not bool(getattr(settings.server, "gpu_keepwarm", True)):
+        os.environ.setdefault("OMLX_GPU_KEEPWARM", "0")
+
     # Register TRACE level (5) — includes full message content
     TRACE = 5
     logging.addLevelName(TRACE, "TRACE")

@@ -1130,5 +1130,7 @@
   "js.success.download_started": "Download iniciado: {repo_id}",
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
-  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP."
+  "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP.",
+  "settings.advanced.gpu_keepwarm": "Manter a GPU aquecida enquanto ociosa",
+  "settings.advanced.gpu_keepwarm_hint": "A GPU baixa o clock quando fica parada, e o pedido seguinte paga a subida. Medido no M1 Ultra com o GLM-5.3-Flash (04/09): com 8 s entre pedidos, 17,5-18,5 tok/s sem isto e 23,8-24,5 com isto; pedidos colados não mudam. Custa energia ociosa, não qualidade — o tique é uma multiplicação minúscula, só quando não há pedido em andamento. Vale na próxima subida do servidor."
 }

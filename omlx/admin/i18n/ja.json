@@ -1130,5 +1130,7 @@
   "js.success.download_started": "ダウンロード開始: {repo_id}",
   "js.success.settings_saved": "設定が保存されました",
   "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
-  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。"
+  "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。",
+  "settings.advanced.gpu_keepwarm": "アイドル時に GPU を温めておく",
+  "settings.advanced.gpu_keepwarm_hint": "GPU はアイドル状態でクロックを下げるため、次のリクエストが立ち上がりを負担します。M1 Ultra・GLM-5.3-Flash で実測（04/09）：リクエスト間隔 8 秒で、無効時 17.5-18.5 tok/s、有効時 23.8-24.5 tok/s。連続リクエストは変わりません。品質ではなくアイドル時の電力を消費します。次回のサーバー起動から有効。"
 }

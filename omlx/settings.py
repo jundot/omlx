@@ -178,6 +178,15 @@ class ServerSettings:
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
+    # Keep the GPU clock up while the engine loop has nothing to do. Measured
+    # on M1 Ultra with GLM-5.3-Flash oQ2e (04/09, two rounds per arm, 5x300
+    # tokens): with 8 s between requests the server does 17,5-18,5 tok/s
+    # without it and 23,8-24,5 with it (+29% to +40%), and back-to-back
+    # requests are unchanged. An agent pauses between turns, so it is the
+    # agent's own pattern that pays the clock ramp. Costs idle power, not
+    # quality: the tick is one 256x256 fp16 matmul, only when no request is
+    # in flight. Applies on the next server start.
+    gpu_keepwarm: bool = True
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -209,6 +218,7 @@ class ServerSettings:
                 False,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
+            gpu_keepwarm=bool(data.get("gpu_keepwarm", True)),
         )
 
 

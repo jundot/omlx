@@ -1130,5 +1130,7 @@
   "js.success.download_started": "已開始下載：{repo_id}",
   "js.success.settings_saved": "設定儲存成功",
   "settings.mcp.expose_tools": "向客戶端公開後端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。"
+  "settings.mcp.expose_tools_hint": "將後端 MCP 工具合併到聊天回應中。如果您的用戶端有自己的 MCP 伺服器，請停用此選項。",
+  "settings.advanced.gpu_keepwarm": "閒置時保持 GPU 溫熱",
+  "settings.advanced.gpu_keepwarm_hint": "GPU 閒置時會降頻，下一個請求要承擔升頻的代價。M1 Ultra 上用 GLM-5.3-Flash 實測（04/09）：請求間隔 8 秒時，關閉為 17.5-18.5 tok/s，開啟為 23.8-24.5。連續請求不變。消耗的是閒置功耗，不是品質。下次啟動伺服器時生效。"
 }

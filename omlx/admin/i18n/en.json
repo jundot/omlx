@@ -487,6 +487,8 @@
   "cluster.pairing.shared_secret_placeholder": "At least 16 characters",
   "cluster.pairing.generate": "Generate",
   "cluster.pairing.copy": "Copy",
+  "settings.advanced.gpu_keepwarm": "Keep the GPU warm while idle",
+  "settings.advanced.gpu_keepwarm_hint": "The GPU lowers its clock when it sits idle, and the next request pays the ramp. Measured on M1 Ultra with GLM-5.3-Flash (04/09): with 8 s between requests, 17.5-18.5 tok/s without this and 23.8-24.5 with it; back-to-back requests are unchanged. Costs idle power, not quality — the tick is one tiny matmul, only when no request is in flight. Applies on the next server start.",
   "settings.advanced.burst_decode": "Burst Decode",
   "settings.advanced.burst_decode_hint": "Process tokens in batches internally for faster generation. Higher levels run faster but stream in larger chunks; lower levels stream more smoothly. Applies instantly, no restart.",
   "settings.advanced.burst_decode_off": "Off (smoothest streaming)",
