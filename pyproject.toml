@@ -259,6 +259,7 @@ include = ["omlx*"]
     "static/**/*",
     "i18n/*.json",
     "bench_corpora/*",
+    "data/*.json",
 ]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]

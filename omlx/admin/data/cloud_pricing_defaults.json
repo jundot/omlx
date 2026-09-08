@@ -1,0 +1,17 @@
+[
+  {"match": "gpt-4o-mini", "display_name": "GPT-4o mini", "input": 0.15, "output": 0.60},
+  {"match": "gpt-4o", "display_name": "GPT-4o", "input": 2.50, "output": 10.00},
+  {"match": "gpt-4.1-nano", "display_name": "GPT-4.1 nano", "input": 0.10, "output": 0.40},
+  {"match": "gpt-4.1-mini", "display_name": "GPT-4.1 mini", "input": 0.40, "output": 1.60},
+  {"match": "gpt-4.1", "display_name": "GPT-4.1", "input": 2.00, "output": 8.00},
+  {"match": "claude-opus-4", "display_name": "Claude Opus 4", "input": 15.00, "output": 75.00},
+  {"match": "claude-3-opus", "display_name": "Claude 3 Opus", "input": 15.00, "output": 75.00},
+  {"match": "claude-sonnet-4", "display_name": "Claude Sonnet 4", "input": 3.00, "output": 15.00},
+  {"match": "claude-3-7-sonnet", "display_name": "Claude 3.7 Sonnet", "input": 3.00, "output": 15.00},
+  {"match": "claude-3-5-sonnet", "display_name": "Claude 3.5 Sonnet", "input": 3.00, "output": 15.00},
+  {"match": "claude-3-5-haiku", "display_name": "Claude 3.5 Haiku", "input": 0.80, "output": 4.00},
+  {"match": "claude-3-haiku", "display_name": "Claude 3 Haiku", "input": 0.25, "output": 1.25},
+  {"match": "gemini-2.0-flash", "display_name": "Gemini 2.0 Flash", "input": 0.10, "output": 0.40},
+  {"match": "gemini-1.5-flash", "display_name": "Gemini 1.5 Flash", "input": 0.075, "output": 0.30},
+  {"match": "gemini-1.5-pro", "display_name": "Gemini 1.5 Pro", "input": 1.25, "output": 5.00}
+]

@@ -11,8 +11,11 @@ import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from .usage_ledger import close_current_session, reset_usage_ledger
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,7 @@ class ServerMetrics:
     def __init__(self, stats_path: Optional[Path] = None):
         self._lock = threading.Lock()
         self._stats_path = stats_path
+        self.session_id: str = uuid.uuid4().hex
 
         # Session totals (reset on server restart or clear)
         self.total_prompt_tokens: int = 0
@@ -315,6 +319,42 @@ class ServerMetrics:
                 uptime,
             )
 
+    def get_per_model_breakdown(self, scope: str = "session") -> Dict[str, Dict[str, Any]]:
+        """Return a copy of the per-model counters for ``scope``. Thread-safe.
+
+        Args:
+            scope: "session" for current session, "alltime" for persisted totals.
+        """
+        with self._lock:
+            source = self._alltime_per_model if scope == "alltime" else self._per_model
+            return {
+                model_id: dict(counters) for model_id, counters in source.items()
+            }
+
+    def to_session_record(self, is_open: bool = False) -> Dict[str, Any]:
+        """Build a usage-ledger record snapshotting the current session.
+
+        Args:
+            is_open: True for a live, not-yet-closed session — ``ended_at``
+                is left ``None``. False (default) stamps ``ended_at`` with
+                the current time, for closing the session at restart/shutdown.
+        """
+        with self._lock:
+            per_model = {
+                model_id: dict(counters)
+                for model_id, counters in self._per_model.items()
+            }
+            return {
+                "session_id": self.session_id,
+                "started_at": self._start_time,
+                "ended_at": None if is_open else time.time(),
+                "requests": self.total_requests,
+                "prompt_tokens": self.total_prompt_tokens,
+                "completion_tokens": self.total_completion_tokens,
+                "cached_tokens": self.total_cached_tokens,
+                "per_model": per_model,
+            }
+
     def clear_metrics(self) -> None:
         """Clear session metrics. Thread-safe."""
         with self._lock:
@@ -357,12 +397,18 @@ def get_server_metrics() -> ServerMetrics:
     return _server_metrics
 
 
-def reset_server_metrics(stats_path: Optional[Path] = None) -> None:
+def reset_server_metrics(
+    stats_path: Optional[Path] = None, ledger_path: Optional[Path] = None
+) -> None:
     """Reset metrics (called on server start).
 
-    If a previous instance exists and has a stats_path, save before resetting.
+    If a previous instance exists, save its all-time stats and close its
+    session into the usage ledger before resetting. The new usage ledger
+    singleton is (re)pointed at ``ledger_path``.
     """
     global _server_metrics
     if _server_metrics is not None:
         _server_metrics.save_alltime()
+        close_current_session(_server_metrics)
     _server_metrics = ServerMetrics(stats_path=stats_path)
+    reset_usage_ledger(ledger_path)
