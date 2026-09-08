@@ -91,12 +91,14 @@ def compile_tool_grammar(compiler, tools, existing=None):
 class UnoToolConstraint:
     """Advance speculative matchers independently and commit only accepted tokens."""
 
-    def __init__(self, compiled_grammar, vocab_size):
+    def __init__(self, compiled_grammar, vocab_size, *, matcher=None):
         import numpy as np
         import xgrammar as xgr
         from xgrammar.kernels.apply_token_bitmask_mlx import apply_token_bitmask_mlx
 
-        self.matcher = xgr.GrammarMatcher(compiled_grammar)
+        self.matcher = (
+            matcher if matcher is not None else xgr.GrammarMatcher(compiled_grammar)
+        )
         self.bitmask = np.full((1, (vocab_size + 31) // 32), -1, dtype=np.int32)
         self.apply_mask = apply_token_bitmask_mlx
         self.vocab_size = vocab_size
