@@ -23,7 +23,10 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _CLUSTER = _REPO / "omlx" / "cluster"
-_DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+_DASHBOARD_SCRIPTS = (
+    _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js",
+    _REPO / "omlx" / "admin" / "static" / "js" / "cluster_v2.js",
+)
 
 _PREFIX = "/admin/api/cluster"
 # Template literals interpolate with ${...}, which may contain calls and nested
@@ -48,12 +51,15 @@ def _js_called_paths() -> set[str]:
     """Cluster URLs the dashboard builds, normalised to their route shape."""
 
     called = set()
-    for match in _CLUSTER_URL.finditer(_DASHBOARD_JS.read_text()):
-        path = match.group("path").split("?")[0]
-        # Any interpolated segment stands for a path parameter.
-        path = re.sub(r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path)
-        path = path.rstrip("/") if path not in ("", "/") else path
-        called.add(_PREFIX + path)
+    for script in _DASHBOARD_SCRIPTS:
+        for match in _CLUSTER_URL.finditer(script.read_text()):
+            path = match.group("path").split("?")[0]
+            # Any interpolated segment stands for a path parameter.
+            path = re.sub(
+                r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path
+            )
+            path = path.rstrip("/") if path not in ("", "/") else path
+            called.add(_PREFIX + path)
     return called
 
 
@@ -74,17 +80,34 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    # The backend PR intentionally lands before the Cluster v2 dashboard. The
-    # UI follow-up will call replan after the deployment contract settles.
-    allowed_without_caller: set[str] = {"/admin/api/cluster/replan"}
-    # Runtime lifecycle APIs land before the Cluster v2 dashboard follow-up.
-    allowed_without_caller.update(
-        {
-            "/admin/api/cluster/backend-selection",
-            "/admin/api/cluster/deployments/{parameter}/load",
-            "/admin/api/cluster/deployments/{parameter}/unload",
-        }
-    )
+    # These are compatibility/manual operator APIs retained after the v1
+    # dashboard console was removed. Cluster v2 uses discovery/pairing,
+    # autoconfigure, deployment lifecycle, CUDA enrollment, and diagnostics;
+    # scripts and older clients may still use these explicit low-level probes.
+    allowed_without_caller: set[str] = {
+        "/admin/api/cluster/backend-selection",
+        "/admin/api/cluster/collective-smoke",
+        "/admin/api/cluster/discover",
+        "/admin/api/cluster/fabric",
+        "/admin/api/cluster/guidance",
+        "/admin/api/cluster/incidents",
+        "/admin/api/cluster/incidents/{parameter}/dismiss",
+        "/admin/api/cluster/link-setup",
+        "/admin/api/cluster/link-status",
+        "/admin/api/cluster/pairing-token",
+        "/admin/api/cluster/peer-health",
+        "/admin/api/cluster/pipeline-smoke",
+        "/admin/api/cluster/plan",
+        "/admin/api/cluster/ssh-key",
+        "/admin/api/cluster/ssh-key/exchange",
+        "/admin/api/cluster/ssh-key/exchange-token",
+        "/admin/api/cluster/ssh-key/generate",
+        "/admin/api/cluster/ssh-key/store-keychain",
+        "/admin/api/cluster/status",
+        "/admin/api/cluster/transports",
+        "/admin/api/cluster/verify-pairing-token",
+        "/admin/api/cluster/worker-smoke",
+    }
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
@@ -99,7 +122,7 @@ def test_fetch_calls_never_use_a_params_option():
     the suite stayed green.
     """
 
-    source = _DASHBOARD_JS.read_text()
+    source = "\n".join(script.read_text() for script in _DASHBOARD_SCRIPTS)
     offenders = []
     for index, line in enumerate(source.splitlines(), start=1):
         if re.search(r"^\s*params:\s*\{", line):

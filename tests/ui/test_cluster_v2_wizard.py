@@ -77,6 +77,10 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
+    "/admin/api/cluster/diagnostics",
+    "/admin/api/cluster/join-keys",
+    "/admin/api/cluster/join-status",
+    "/admin/api/cluster/cuda-fabric/verify",
 }
 
 
@@ -160,7 +164,7 @@ def test_discovered_fixture_proves_the_two_mac_cap_is_gone():
     javascript = _read(JAVASCRIPT)
     template = _read(TEMPLATE)
     assert "length === 2" not in javascript
-    assert "slice(0, 2" not in javascript
+    assert "planNodes().slice(0, 2" not in javascript
     assert "max 2" not in javascript.lower()
     assert 'x-for="device in allDevices()"' in template
 
@@ -196,7 +200,7 @@ def test_polling_is_one_hertz_and_visibility_gated():
     assert "CLUSTER_V2_POLL_MS = 1000" in javascript
     assert "document.hidden" in javascript
     assert "this.mainTab === 'cluster'" in javascript
-    assert "this.clusterLegacyView" in javascript
+    assert "clusterLegacyView" not in javascript
     assert "setInterval(() => this.tick(), CLUSTER_V2_POLL_MS)" in javascript
 
 
@@ -1217,17 +1221,15 @@ def test_one_hertz_tick_polls_runtime_ownership_and_not_just_deployments():
     assert "=== 'ready'" in active
 
 
-def test_legacy_view_toggle_keeps_v1_reachable_exactly_once():
+def test_cluster_v2_is_the_sole_dashboard_flow():
     dashboard = _read(DASHBOARD)
     template = _read(TEMPLATE)
 
-    assert dashboard.count('{% include "dashboard/_cluster.html" %}') == 1
+    assert '{% include "dashboard/_cluster.html" %}' not in dashboard
     assert dashboard.count('{% include "dashboard/_cluster_v2.html" %}') == 1
-    assert 'x-data="{ clusterLegacyView: false }"' in dashboard
-    assert "clusterLegacyView = true" in template
-    assert "clusterLegacyView = false" in dashboard
-    assert "Advanced (legacy)" in template
-    assert "data-cluster-legacy-view" in dashboard
+    assert "clusterLegacyView" not in dashboard + template
+    assert "Advanced (legacy)" not in dashboard + template
+    assert "data-cluster-v2-advanced-tools" in template
     # cluster_v2.js loads before dashboard.js so the factory exists when
     # Alpine initializes x-data="clusterV2Wizard()".
     scripts = dashboard.index("js/cluster_v2.js"), dashboard.index("js/dashboard.js")
@@ -1370,6 +1372,58 @@ component.devicesPayload = {
 };
 component.roleOptions = roles;
 """ % json.dumps(str(FIXTURES / "node_roles.json"))
+
+
+def test_advanced_cuda_tools_use_selected_pair_and_one_time_join_contract():
+    result = _run_wizard(
+        """
+global.window = {
+  location: { hostname: '192.168.1.20', protocol: 'http:', port: '8000' },
+};
+global.setTimeout = () => 0;
+const calls = [];
+const nodes = [
+  { node_id: 'cuda-a', hostname: 'CUDA A', ssh: 'cuda-a.local' },
+  { node_id: 'cuda-b', hostname: 'CUDA B', ssh: 'cuda-b.local' },
+  { node_id: 'cuda-c', hostname: 'CUDA C', ssh: 'cuda-c.local' },
+];
+component.apiFetch = async (url, options = {}) => {
+  calls.push({ url, method: options.method || 'GET', body: options.body || null });
+  if (url.endsWith('/join-status')) return { join_keys: [], nodes };
+  if (url.endsWith('/join-keys')) return {
+    command: 'curl secure | sh', join_id: 'a'.repeat(16),
+    expires_at: Date.now() / 1000 + 1800,
+  };
+  if (url.endsWith('/cuda-fabric/verify')) return { verified: true };
+  throw new Error('unexpected URL ' + url);
+};
+(async () => {
+  await component.toggleAdvancedTools();
+  component.cudaJoin.controllerIp = '192.168.1.20';
+  await component.generateCudaJoinCommand();
+  component.cudaFabricMemberA = 'cuda-a';
+  component.cudaFabricMemberB = 'cuda-c';
+  await component.verifyCudaFabric();
+  const verify = calls.find((call) => call.url.endsWith('/cuda-fabric/verify'));
+  process.stdout.write(JSON.stringify({
+    command: component.cudaJoin.command,
+    joined: component.cudaNodes().length,
+    verify: JSON.parse(verify.body),
+    methods: calls.map((call) => call.method),
+  }));
+})().catch((error) => { console.error(error); process.exit(1); });
+""",
+    )
+
+    assert result["command"] == "curl secure | sh"
+    assert result["joined"] == 3
+    assert result["verify"] == {
+        "hosts": [
+            {"node_id": "cuda-a", "ssh": "cuda-a.local"},
+            {"node_id": "cuda-c", "ssh": "cuda-c.local"},
+        ]
+    }
+    assert "POST" in result["methods"]
 
 
 def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():
@@ -1974,6 +2028,33 @@ process.stdout.write(JSON.stringify({
     assert "row.status === 'warn'" in template
     assert "triangle-alert" in template
     assert "text-amber-800 bg-amber-50 border border-amber-200" in template
+
+
+def test_peer_runtime_warning_is_amber_and_does_not_block_planning():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.checks.started = true;
+component.checks.probes = {
+  'node-b': {
+    ok: true,
+    result: { runtime_warnings: ['Remote runtime uses a fallback interpreter.'] },
+  },
+};
+const row = component.checkRows().find((item) => item.key === 'ssh');
+process.stdout.write(JSON.stringify({
+  status: row.status,
+  detail: row.detail,
+  blockingPass: component.checksBlockingPass(),
+}));
+""",
+    )
+
+    assert result == {
+        "status": "warn",
+        "detail": "Remote runtime uses a fallback interpreter.",
+        "blockingPass": True,
+    }
 
 
 def test_split_bar_has_a_tensor_variant_and_width_transitions():
