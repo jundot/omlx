@@ -57,6 +57,42 @@ def test_plain_answer_has_no_tool_error():
     assert result.error is None
 
 
+@pytest.mark.parametrize(
+    "value", ["  indented\n", "\tline\r\n", "", " \t\n", " 42 ", " true ", ' {"a": 1} ']
+)
+@pytest.mark.parametrize("typed", [False, True])
+def test_xml_string_arguments_preserve_exact_text(value, typed):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {} if typed else {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        }
+    ]
+    type_tag = "<ifm|arg_type>string</ifm|arg_type>" if typed else ""
+    text = (
+        "<ifm|tool_calls><ifm|tool_call>edit"
+        f"<ifm|arg_key>text</ifm|arg_key>{type_tag}"
+        f"<ifm|arg_value>{value}</ifm|arg_value>"
+        "<ifm|arg_key>count</ifm|arg_key><ifm|arg_value> 42 </ifm|arg_value>"
+        "</ifm|tool_call></ifm|tool_calls>"
+    )
+    session = session_for("", tools)
+    for character in text:
+        session._emit(character)
+    result = session.finalize()
+    assert result.error is None
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"text": value, "count": 42}
+
+
 def test_one_malformed_group_does_not_disappear_beside_a_valid_call():
     good = '<ifm|tool_calls><ifm|tool_call>{"name":"read","arguments":{}}</ifm|tool_call></ifm|tool_calls>'
     bad = '<ifm|tool_calls><ifm|tool_call>{"name":"read"}</ifm|tool_call></ifm|tool_calls>'
