@@ -647,7 +647,7 @@ async def lifespan(app: FastAPI):
         preload_task.cancel()
         with suppress(asyncio.CancelledError):
             await preload_task
-    get_server_metrics().save_alltime()
+    get_server_metrics().close()
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -3454,6 +3454,7 @@ async def create_embeddings(
             cached_tokens=0,
             prefill_duration=elapsed,
             model_id=resolved_model,
+            request_duration=elapsed,
         )
 
         data = []
@@ -3576,6 +3577,7 @@ async def create_rerank(
         cached_tokens=0,
         prefill_duration=elapsed,
         model_id=resolved_model,
+        request_duration=elapsed,
     )
 
     # Format response - results sorted by score (descending). Strings wrap
@@ -3786,6 +3788,7 @@ async def create_completion(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             return CompletionResponse(
@@ -4275,6 +4278,7 @@ async def create_chat_completion(
                 prefill_duration=metric_prefill_duration,
                 generation_duration=metric_gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Separate thinking from content
@@ -4904,6 +4908,7 @@ async def stream_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -5705,6 +5710,7 @@ async def stream_chat_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
+            request_duration=total_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -6182,6 +6188,7 @@ async def stream_anthropic_messages(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
@@ -6535,6 +6542,7 @@ async def create_anthropic_message(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Separate thinking from content
@@ -7062,6 +7070,7 @@ async def create_response(
                 prefill_duration=prefill_duration,
                 generation_duration=gen_duration,
                 model_id=resolved_model,
+                request_duration=elapsed,
             )
 
             # Process output text
@@ -7857,6 +7866,7 @@ async def stream_responses_api(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=serving_model,
+            request_duration=total_duration,
         )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0

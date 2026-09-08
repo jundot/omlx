@@ -12,7 +12,10 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from .usage_history import UsageHistory
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,8 @@ class ServerMetrics:
     def __init__(self, stats_path: Optional[Path] = None):
         self._lock = threading.Lock()
         self._stats_path = stats_path
+        self.usage_history: UsageHistory | None = None
+        self._history_record_failed = False
 
         # Session totals (reset on server restart or clear)
         self.total_prompt_tokens: int = 0
@@ -164,6 +169,7 @@ class ServerMetrics:
         prefill_duration: float = 0.0,
         generation_duration: float = 0.0,
         model_id: str = "",
+        request_duration: float | None = None,
     ) -> None:
         """Record a completed request. Thread-safe."""
         with self._lock:
@@ -208,6 +214,28 @@ class ServerMetrics:
 
             # Periodic save
             self._maybe_save_alltime()
+
+        if self.usage_history is not None:
+            try:
+                self.usage_history.record(
+                    model_id=model_id,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    prefill_duration=prefill_duration,
+                    generation_duration=generation_duration,
+                    request_duration=request_duration,
+                )
+            except Exception:
+                if not self._history_record_failed:
+                    logger.warning("Usage history recording failed; serving continues")
+                    self._history_record_failed = True
+
+    def close(self) -> None:
+        """Flush cumulative stats and historical aggregates at shutdown."""
+        self.save_alltime()
+        if self.usage_history is not None:
+            self.usage_history.close()
 
     def record_preflight_rejection(self, reason: str) -> None:
         """Increment the preflight-rejection counter for ``reason``.
@@ -364,5 +392,12 @@ def reset_server_metrics(stats_path: Optional[Path] = None) -> None:
     """
     global _server_metrics
     if _server_metrics is not None:
-        _server_metrics.save_alltime()
+        _server_metrics.close()
     _server_metrics = ServerMetrics(stats_path=stats_path)
+    if stats_path is not None:
+        from .usage_history import UsageHistory
+
+        try:
+            _server_metrics.usage_history = UsageHistory(stats_path.parent / "usage.sqlite3")
+        except Exception:
+            logger.warning("Usage history initialization failed; serving continues")
