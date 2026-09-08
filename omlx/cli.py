@@ -42,6 +42,20 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    """Parse a cache block override, accepting 0 as the automatic sentinel."""
+
+    if isinstance(value, bool):
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
 
@@ -64,6 +78,7 @@ def _has_cli_overrides(args) -> bool:
         "hot_cache_max_size",
         "hot_cache_write_through",
         "initial_cache_blocks",
+        "arrays_cache_block_size",
         "mcp_config",
         "hf_endpoint",
         "hf_cache_enabled",
@@ -319,6 +334,9 @@ def serve_command(args):
             scheduler_config.hot_cache_write_through = bool(
                 args.hot_cache_write_through
             )
+
+        if getattr(args, "arrays_cache_block_size", None) is not None:
+            scheduler_config.arrays_cache_block_size = args.arrays_cache_block_size
 
         if args.no_cache:
             print(
@@ -1147,6 +1165,12 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+    serve_parser.add_argument(
+        "--arrays-cache-block-size",
+        type=_nonnegative_int,
+        default=None,
+        help="ArraysCache hybrid block size in tokens; 0 selects automatic sizing.",
     )
 
     # MCP options

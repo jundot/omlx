@@ -33,6 +33,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         model=object(),
         config=SimpleNamespace(paged_cache_block_size=64),
         block_aware_cache=object() if snapshots_enabled else None,
+        _qwen35_sparse_boundaries=False,
         _stream=mx.default_stream(mx.gpu),
     )
     state = Scheduler._begin_prefill(
@@ -42,6 +43,12 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         [cache, SimpleNamespace(offset=128)],
     )
     ns._prefill_step_size_for_progress = lambda *a: 64
+    ns._next_prefill_snapshot_boundary = (
+        lambda *args: Scheduler._next_prefill_snapshot_boundary(ns, *args)
+    )
+    ns._should_capture_prefill_boundary = (
+        lambda *args: Scheduler._should_capture_prefill_boundary(ns, *args)
+    )
     ns._reserve_qsa_index_capacity = (
         lambda caches, tokens: Scheduler._reserve_qsa_index_capacity(ns, caches, tokens)
     )

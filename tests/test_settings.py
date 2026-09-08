@@ -421,6 +421,7 @@ class TestCacheSettings:
         assert settings.gdn_sidecar_state_dtype == "fp32"
         assert settings.ane_compile_cache is False
         assert settings.initial_cache_blocks == 256
+        assert settings.arrays_cache_block_size is None
 
     def test_get_ssd_cache_dir_default(self):
         """Test default SSD cache directory."""
@@ -467,6 +468,7 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "arrays_cache_block_size": None,
         }
 
     def test_from_dict(self):
@@ -614,6 +616,21 @@ class TestCacheSettings:
         }
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
+
+    def test_arrays_cache_block_size_roundtrip_and_scheduler_config(self):
+        settings = CacheSettings.from_dict({"arrays_cache_block_size": 512})
+        assert settings.arrays_cache_block_size == 512
+        restored = CacheSettings.from_dict(settings.to_dict())
+        assert restored.arrays_cache_block_size == 512
+        global_settings = GlobalSettings(cache=restored)
+        assert global_settings.to_scheduler_config().arrays_cache_block_size == 512
+
+    @pytest.mark.parametrize("value", [-1, 1.5, True, "512"])
+    def test_arrays_cache_block_size_rejects_invalid_values(self, value):
+        settings = GlobalSettings(cache=CacheSettings(arrays_cache_block_size=value))
+        assert any(
+            "arrays_cache_block_size" in error for error in settings.validate()
+        )
 
     def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
         """Legacy hot_cache_max_size=auto should load as disabled."""

@@ -275,6 +275,7 @@ class TestServeCommandOptions:
         assert "--paged-ssd-cache-dir" in result.stdout
         assert "--paged-ssd-cache-max-size" in result.stdout
         assert "--no-cache" in result.stdout
+        assert "--arrays-cache-block-size" in result.stdout
 
     def test_serve_has_mcp_option(self):
         """Test that serve command has --mcp-config option."""

@@ -342,6 +342,8 @@ class CacheSettings:
     # once, at the first ANE compile, so a change applies on restart.
     ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # None/0 selects the scheduler's automatic ArraysCache block target.
+    arrays_cache_block_size: int | None = None
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
     # True/False preserve the legacy explicit split/embedded choices.
@@ -439,6 +441,7 @@ class CacheSettings:
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "arrays_cache_block_size": self.arrays_cache_block_size,
         }
 
     @classmethod
@@ -489,6 +492,7 @@ class CacheSettings:
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            arrays_cache_block_size=data.get("arrays_cache_block_size"),
         )
 
 
@@ -1304,6 +1308,11 @@ class GlobalSettings:
             and args.initial_cache_blocks is not None
         ):
             self.cache.initial_cache_blocks = args.initial_cache_blocks
+        if (
+            hasattr(args, "arrays_cache_block_size")
+            and args.arrays_cache_block_size is not None
+        ):
+            self.cache.arrays_cache_block_size = args.arrays_cache_block_size
         if getattr(args, "no_cache", False):
             self.cache.enabled = False
 
@@ -1612,6 +1621,16 @@ class GlobalSettings:
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
             )
 
+        block_size = self.cache.arrays_cache_block_size
+        if block_size is not None and (
+            isinstance(block_size, bool)
+            or not isinstance(block_size, int)
+            or block_size < 0
+        ):
+            errors.append(
+                "Invalid arrays_cache_block_size: must be a non-negative integer"
+            )
+
         # Sampling validation
         if (
             self.sampling.max_context_window_policy is not None
@@ -1727,6 +1746,7 @@ class GlobalSettings:
                 self.cache.gdn_ssd_pending_max_size
             ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            arrays_cache_block_size=self.cache.arrays_cache_block_size,
         )
 
     def to_dict(self) -> dict[str, Any]:

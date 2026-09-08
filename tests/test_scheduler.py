@@ -110,6 +110,7 @@ class TestSchedulerConfig:
         assert config.embedding_batch_size == 32
         assert config.prefill_step_size == 2048
         assert config.paged_cache_block_size == 256
+        assert config.arrays_cache_block_size is None
         assert config.max_cache_blocks is None
         assert config.initial_cache_blocks == 256
         assert config.paged_ssd_cache_dir is None
@@ -3338,6 +3339,105 @@ class TestSchedulerBoundarySnapshots:
         assert scheduler._boundary_snapshot_required is True
         assert mock_model._omlx_mtp_commit_align == 4
 
+    def _prefill_boundary_scheduler(self, mock_model, mock_tokenizer, store=None):
+        """Scheduler, request, and stateful stub cache for timer tests."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_store = store
+        request = Request(
+            request_id="req-prefill-timer",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        snapshot_cache = [type("RotatingKVCache", (), {})()]
+        return scheduler, request, snapshot_cache
+
+    def test_prefill_boundary_snapshot_times_memory_capture(
+        self, mock_model, mock_tokenizer
+    ):
+        """The in-memory persist path must land in phase timers (#3070)."""
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer
+        )
+
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert (
+            scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
+        )
+        assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
+
+    def test_terminal_boundary_snapshot_uses_terminal_phase(
+        self, mock_model, mock_tokenizer
+    ):
+        """Verified terminal captures do not inflate prefill timing."""
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer
+        )
+
+        scheduler._on_prefill_boundary_snapshot(
+            request.request_id,
+            snapshot_cache,
+            4,
+            source="terminal",
+        )
+
+        stats = scheduler.get_phase_stats()
+        assert stats["terminal_boundary_capture"]["count"] == 1
+        assert "prefill_boundary_capture" not in stats
+
+    def test_prefill_boundary_snapshot_times_ssd_capture(
+        self, mock_model, mock_tokenizer
+    ):
+        """The SSD persist path is timed; the snapshot remains a marker."""
+        store = MagicMock()
+        store.save.return_value = True
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer, store=store
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert scheduler._boundary_cache_snapshots[request.request_id][4] is None
+
+    def test_prefill_boundary_snapshot_times_ssd_fallback(
+        self, mock_model, mock_tokenizer
+    ):
+        """A failed SSD save falls back to memory inside the timed phase."""
+        store = MagicMock()
+        store.save.return_value = False
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer, store=store
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 4)
+
+        assert scheduler.get_phase_stats()["prefill_boundary_capture"]["count"] == 1
+        assert scheduler._boundary_cache_snapshots[request.request_id][4] is not None
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["ssd_fallbacks"] == 1
+        assert diagnostics["captures_memory"] == 1
+
+    def test_prefill_boundary_snapshot_unaligned_is_not_timed(
+        self, mock_model, mock_tokenizer
+    ):
+        """Early returns happen before the persist branch and record no phase."""
+        scheduler, request, snapshot_cache = self._prefill_boundary_scheduler(
+            mock_model, mock_tokenizer
+        )
+        scheduler._on_prefill_boundary_snapshot(request.request_id, snapshot_cache, 3)
+
+        assert "prefill_boundary_capture" not in scheduler.get_phase_stats()
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["reasons"]["unaligned_token_count"] == 1
+
     def test_prefill_boundary_snapshot_ignores_non_boundary_token_count(
         self, mock_model, mock_tokenizer
     ):
@@ -3673,6 +3773,26 @@ class TestSchedulerArraysCacheBlockAlignment:
                 return mx.zeros((1, tokens.shape[1], 1))
 
         return HybridModel()
+
+    def test_explicit_arrays_block_override_does_not_change_prefill_step(
+        self, mock_tokenizer, tmp_path
+    ):
+        scheduler = Scheduler(
+            model=self._hybrid_model(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=2048,
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=256,
+                arrays_cache_block_size=512,
+            ),
+        )
+        try:
+            assert scheduler.config.paged_cache_block_size == 512
+            assert scheduler.config.prefill_step_size == 2048
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 2048
+        finally:
+            scheduler.shutdown()
 
     def test_qwen35_wide_prefill_aligns_block_size_to_4096(
         self, mock_tokenizer, tmp_path
