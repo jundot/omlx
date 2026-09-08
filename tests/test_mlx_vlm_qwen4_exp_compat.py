@@ -1622,24 +1622,53 @@ def test_qwen4_hc_prefill_disabled_by_default(monkeypatch):
 
 
 def test_qwen4_hc_prefill_fails_closed_on_shape_mismatch(monkeypatch):
-    """A module whose shape this kernel was not tuned for (here, the tiny
-    test config used elsewhere in this file) must fall back cleanly even
-    with the kernel enabled, never raise."""
+    """A module whose ``hidden_size`` is not a multiple of 32 -- the one
+    real constraint this kernel has (see ``hc_prefill.py``'s module
+    docstring) -- must fall back cleanly even with the kernel enabled,
+    never raise. 100 is deliberately not a multiple of 32."""
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     monkeypatch.setenv("OMLX_QWEN4_HC_PREFILL", "1")
     from mlx_vlm.models.qwen4_exp.hc_prefill import prefill_read
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
 
     config = SimpleNamespace(
-        hc_count=2, hidden_size=32, hc_lowrank=32, rms_norm_eps=1e-6
+        hc_count=4, hidden_size=100, hc_lowrank=32, rms_norm_eps=1e-6
     )
     module = Qwen4ExpGatedResidual(config)
-    inputs = mx.random.normal((1, 5, 64)).astype(mx.bfloat16)
+    inputs = mx.random.normal((1, 5, 400)).astype(mx.bfloat16)
 
     assert prefill_read(module, inputs) is None
     assert getattr(module, "_omlx_hc_prefill", False) is None
 
     canonical = module._forward(inputs)
     routed = module(inputs)
-    mx.eval(canonical, routed)
-    assert mx.array_equal(canonical, routed).item()
+    mx.eval(*canonical, *routed)
+    assert all(mx.array_equal(e, a).item() for e, a in zip(canonical, routed))
+
+
+@pytest.mark.parametrize("hc_count,hidden_size", [(4, 2560), (8, 2560), (4, 1536), (6, 3200), (2, 32)])
+def test_qwen4_hc_prefill_generalizes_beyond_production_shape(monkeypatch, hc_count, hidden_size):
+    """The kernel is not hardcoded to Qwen4-Exp's specific (hc_count=4,
+    hidden_size=2560) -- both are compile-time template parameters, and
+    the only real requirement is ``hidden_size % 32 == 0``. This checks a
+    handful of other shapes, including a tiny one (2, 32), all engage and
+    agree with canonical.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    monkeypatch.setenv("OMLX_QWEN4_HC_PREFILL", "1")
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual
+
+    mx.random.seed(hc_count * 1000 + hidden_size)
+    config = SimpleNamespace(
+        hc_count=hc_count, hidden_size=hidden_size, hc_lowrank=32, rms_norm_eps=1e-6
+    )
+    module = Qwen4ExpGatedResidual(config)
+    inputs = mx.random.normal((1, 37, hc_count * hidden_size)).astype(mx.bfloat16)
+
+    canonical = module._forward(inputs)
+    fused = module(inputs)
+    mx.eval(*canonical, *fused)
+
+    assert getattr(module, "_omlx_hc_prefill", None) is not None
+    for expected, actual in zip(canonical, fused):
+        assert mx.allclose(expected, actual, rtol=3e-2, atol=3e-2).item()

@@ -41,6 +41,15 @@ generation (M4 Max). Fails closed to the canonical path on any shape/dtype
 mismatch, or any runtime exception the first time the kernel actually runs
 -- turning it on cannot make a checkpoint this was not tuned against
 produce wrong output, only leave it on the unmodified path.
+
+The kernel itself is not tied to Qwen4-Exp's specific ``hc_count=4,
+hidden_size=2560`` -- the Metal source takes both as compile-time template
+parameters, and the only real constraint is ``hidden_size % 32 == 0`` (each
+of the 32 lanes in a simdgroup owns ``hidden_size/32`` elements; a
+non-multiple would need boundary handling this kernel doesn't have). Each
+distinct ``(hidden_size, hc_count)`` pair gets its own compiled kernel,
+cached after first use, so this costs nothing at the validated shape --
+confirmed by benchmark, see the PR description.
 """
 
 from __future__ import annotations
@@ -54,10 +63,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
-
-_HC_COUNT = 4
-_HIDDEN_SIZE = 2560
-_STREAM_WIDTH = _HC_COUNT * _HIDDEN_SIZE  # 10240
 
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -80,28 +85,37 @@ class _Prepared:
     gain: mx.array
     eps: float
     has_inject: bool
+    hidden: int
+    lanes: int
+    stream: int
 
 
 def _prepare(module) -> "_Prepared | None":
     """Validate one hyper-connection module. Fails closed: anything that
-    does not match the exact shape this kernel was tuned for returns
-    ``None`` and the caller falls back to ``module._forward``.
+    does not match a shape this kernel can run returns ``None`` and the
+    caller falls back to ``module._forward``.
 
     Unlike a projection-shaped kernel, this only constrains the norm's own
     shape -- the projections underneath (``input_mix_weight_down``,
     ``input_mix_weight_up``, ``block_inject_weight``) are used exactly as
     the module already has them, quantized or not, at whatever bit width.
+    ``hidden_size`` and ``hc_count`` are read from the module, not fixed to
+    Qwen4-Exp's specific values (see the module docstring) -- the only
+    hard requirement is ``hidden_size`` being a multiple of 32.
     """
-    if getattr(module, "hidden_size", None) != _HIDDEN_SIZE:
+    hidden = getattr(module, "hidden_size", None)
+    if not isinstance(hidden, int) or hidden <= 0 or hidden % 32 != 0:
         return None
-    if getattr(module, "hc_count", None) != _HC_COUNT:
+    lanes = getattr(module, "hc_count", None)
+    if not isinstance(lanes, int) or lanes <= 0:
         return None
+    stream = lanes * hidden
 
     norm = getattr(module, "hc_norm", None)
     gain = getattr(norm, "weight", None)
-    if not isinstance(gain, mx.array) or gain.shape != (_STREAM_WIDTH,):
+    if not isinstance(gain, mx.array) or gain.shape != (stream,):
         return None
-    if getattr(norm, "group_size", None) != _HIDDEN_SIZE:
+    if getattr(norm, "group_size", None) != hidden:
         return None
     eps = getattr(norm, "eps", None)
     if not isinstance(eps, float):
@@ -111,7 +125,10 @@ def _prepare(module) -> "_Prepared | None":
         if not callable(getattr(module, name, None)):
             return None
 
-    return _Prepared(gain=gain, eps=float(eps), has_inject="block_inject_weight" in module)
+    return _Prepared(
+        gain=gain, eps=float(eps), has_inject="block_inject_weight" in module,
+        hidden=hidden, lanes=lanes, stream=stream,
+    )
 
 
 _R1_HEADER = "#include <metal_stdlib>\nusing namespace metal;\n"
@@ -144,38 +161,44 @@ _R1_SOURCE = """
 
 
 @lru_cache(maxsize=None)
-def _r1_kernel():
+def _r1_kernel(hidden: int, lanes: int):
     return mx.fast.metal_kernel(
-        name="omlx_qwen4_hc_prefill_r1_rmsnorm",
+        name=f"omlx_qwen4_hc_prefill_r1_rmsnorm_h{hidden}_l{lanes}",
         input_names=["x", "gain", "eps"],
         output_names=["n"],
-        source=_R1_SOURCE.format(hidden=_HIDDEN_SIZE, lanes=_HC_COUNT),
+        source=_R1_SOURCE.format(hidden=hidden, lanes=lanes),
         header=_R1_HEADER,
     )
 
 
-def _r1_rmsnorm(x: mx.array, gain: mx.array, eps: float) -> mx.array:
+def _r1_rmsnorm(x: mx.array, gain: mx.array, eps: float, hidden: int, lanes: int, stream: int) -> mx.array:
     """Grouped RMSNorm, one dispatch, ``x`` never leaves registers.
 
-    ``x``    [S, 10240] bf16
-    ``gain`` [10240] bf16 (zero-centered; applied as ``1 + gain``)
-    returns  [S, 10240] bf16
+    ``x``    [S, stream] bf16, ``stream == lanes * hidden``
+    ``gain`` [stream] bf16 (zero-centered; applied as ``1 + gain``)
+    returns  [S, stream] bf16
+
+    ``(hidden, lanes)`` select (and, on first use, compile) the kernel
+    variant for that shape -- see ``_r1_kernel``'s cache. The validated
+    Qwen4-Exp shape (2560, 4) pays the same cost as before generalization:
+    one dict lookup keyed by a pair of ints, not a runtime branch inside
+    the kernel itself.
     """
     lead = x.shape[:-1]
     s = 1
     for d in lead:
         s *= d
-    x2 = x.reshape(s, _STREAM_WIDTH)
+    x2 = x.reshape(s, stream)
     eps_arr = mx.array([eps], dtype=mx.float32)
 
-    (n,) = _r1_kernel()(
+    (n,) = _r1_kernel(hidden, lanes)(
         inputs=[x2, gain, eps_arr],
-        grid=(32 * s * _HC_COUNT, 1, 1),
+        grid=(32 * s * lanes, 1, 1),
         threadgroup=(32, 1, 1),
-        output_shapes=[(s, _STREAM_WIDTH)],
+        output_shapes=[(s, stream)],
         output_dtypes=[mx.bfloat16],
     )
-    return n.reshape(*lead, _STREAM_WIDTH)
+    return n.reshape(*lead, stream)
 
 
 def prefill_read(module, hyper_input: mx.array):
@@ -187,10 +210,10 @@ def prefill_read(module, hyper_input: mx.array):
     norm dispatch is replaced.
 
     Returns ``None`` (canonical path) whenever ``OMLX_QWEN4_HC_PREFILL`` is
-    not set, the module's shape does not match what this kernel was tuned
-    for, or the kernel raises the first time it actually runs -- in the
-    last case it disables itself for the rest of the process rather than
-    retrying every call.
+    not set, the module's shape does not match what this kernel can run
+    (see ``_prepare``), or the kernel raises the first time it actually
+    runs -- in the last case it disables itself for the rest of the
+    process rather than retrying every call.
     """
     global _RUNTIME_FAILED, _FAILURE_LOGGED
     if _RUNTIME_FAILED or not _enabled():
@@ -199,7 +222,6 @@ def prefill_read(module, hyper_input: mx.array):
         isinstance(hyper_input, mx.array)
         and hyper_input.dtype == mx.bfloat16
         and hyper_input.ndim >= 2
-        and hyper_input.shape[-1] == _STREAM_WIDTH
         and mx.default_device() == mx.gpu
     ):
         return None
@@ -210,9 +232,14 @@ def prefill_read(module, hyper_input: mx.array):
         module._omlx_hc_prefill = prepared
     if prepared is None:
         return None
+    if hyper_input.shape[-1] != prepared.stream:
+        return None
 
     try:
-        normed = _r1_rmsnorm(hyper_input, prepared.gain, prepared.eps)
+        normed = _r1_rmsnorm(
+            hyper_input, prepared.gain, prepared.eps,
+            prepared.hidden, prepared.lanes, prepared.stream,
+        )
         mix = module.input_mix_weight_down(normed)
         block_injection = (
             module.block_inject_weight(normed) if prepared.has_inject else None
