@@ -1035,11 +1035,19 @@
                                             <label class="text-xs text-neutral-600">{{ t('modal.model_settings.qwen_ane_prompt_block') }}
                                                 <input type="number" x-model.number="modelSettings.k2_ane_prefill_sequence_length" min="1024" step="64" class="w-full p-2 border rounded-lg">
                                             </label>
-                                            <label class="text-xs text-neutral-600">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}
-                                                <input type="number" x-model.number="modelSettings.k2_ane_prefill_fraction" min="0.05" max="1" step="any" class="w-full p-2 border rounded-lg">
+                                            <label class="flex items-center justify-between gap-3 text-xs text-neutral-600">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}
+                                                <select x-model.number="modelSettings.k2_ane_prefill_fraction" class="w-32 p-2 border rounded-lg">
+                                                    <template x-for="option in k2AneFractionOptions(modelSettings.k2_ane_prefill_fraction)" :key="option.value">
+                                                        <option :value="option.value" x-text="option.label" :selected="option.value === modelSettings.k2_ane_prefill_fraction"></option>
+                                                    </template>
+                                                </select>
                                             </label>
-                                            <label class="text-xs text-neutral-600">{{ t('modal.model_settings.k2_ane_shared') }}
-                                                <input type="number" x-model.number="modelSettings.k2_ane_prefill_shared_fraction" min="0" max="1" step="any" class="w-full p-2 border rounded-lg">
+                                            <label class="flex items-center justify-between gap-3 text-xs text-neutral-600">{{ t('modal.model_settings.k2_ane_shared') }}
+                                                <select x-model.number="modelSettings.k2_ane_prefill_shared_fraction" class="w-32 p-2 border rounded-lg">
+                                                    <template x-for="option in k2AneFractionOptions(modelSettings.k2_ane_prefill_shared_fraction, true)" :key="option.value">
+                                                        <option :value="option.value" x-text="option.label" :selected="option.value === modelSettings.k2_ane_prefill_shared_fraction"></option>
+                                                    </template>
+                                                </select>
                                             </label>
                                         </div>
                                         {{ ane_tuning_controls() }}

@@ -7288,6 +7288,17 @@
                 return this.selectedModel?.config_model_type === 'k2_horizon';
             },
 
+            k2AneFractionOptions(current, shared = false) {
+                const options = (shared ? [[0, '0%'], [1 / 3, '33%'], [1, '100%']]
+                    : [[1 / 3, '33%'], [0.5, '50%']])
+                    .map(([value, label]) => ({value, label}));
+                if (!options.some(option => option.value === current)) {
+                    options.unshift({value: current, label: current.toLocaleString(undefined,
+                        {style: 'percent', maximumFractionDigits: 2})});
+                }
+                return options;
+            },
+
             unoAdapterCandidates() {
                 const base = this.selectedModel?.uno_base_model_id;
                 return (this.models || []).filter(m => base

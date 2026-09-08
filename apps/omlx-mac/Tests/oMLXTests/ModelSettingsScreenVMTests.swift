@@ -222,6 +222,28 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(vm.qwen35AnePrefillGdnFraction, "0.527")
     }
 
+    func testK2AnePresetsKeepOneThirdAndExistingValues() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
+        vm.k2AnePrefillEnabled = true
+        let presets = ModelSettingsScreenVM.k2AneFractionOptions(current: "0.42")
+        XCTAssertEqual(presets.map(\.0), ["0.42", String(1.0 / 3.0), "0.5"])
+        XCTAssertEqual(presets.map(\.1), ["42%", "33%", "50%"])
+        vm.k2AnePrefillFraction = presets[0].0
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.k2AnePrefillFraction]?.value as? Double, 0.42)
+        vm.k2AnePrefillFraction = presets[1].0
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.k2AnePrefillFraction]?.value as? Double, 1.0 / 3.0)
+        XCTAssertEqual(ModelSettingsScreenVM.k2AneFractionOptions(current: vm.k2AnePrefillFraction).count, 2)
+    }
+
+    func testK2SharedPresetsKeepLoadedStringSelection() {
+        for current in ["0", "0.0", "1", "1.0", String(1.0 / 3.0)] {
+            let options = ModelSettingsScreenVM.k2AneFractionOptions(current: current, shared: true)
+            XCTAssertEqual(options.map(\.1), ["0%", "33%", "100%"])
+            XCTAssertEqual(options.filter { $0.0 == current }.count, 1)
+        }
+    }
+
     func testMovaAneRecommendationUsesK2ProfileFields() throws {
         let vm = ModelSettingsScreenVM()
         vm.model = makeModel(id: "mova", configModelType: "k2_horizon")

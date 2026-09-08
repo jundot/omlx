@@ -381,6 +381,18 @@ final class ModelSettingsScreenVM {
 
     var isK2Base: Bool { model?.configModelType == "k2_horizon" }
 
+    static func k2AneFractionOptions(current: String, shared: Bool = false) -> [(String, String)] {
+        let presets: [(Double, String)] = shared
+            ? [(0, "0%"), (1.0 / 3.0, "33%"), (1, "100%")]
+            : [(1.0 / 3.0, "33%"), (0.5, "50%")]
+        let value = Double(current)
+        var options = presets.map { ($0.0 == value ? current : String($0.0), $0.1) }
+        if let value, !presets.contains(where: { $0.0 == value }) {
+            options.insert((current, value.formatted(.percent.precision(.fractionLength(0...2)))), at: 0)
+        }
+        return options
+    }
+
     var reasoningEffortPresets: [String] {
         isK2Base ? ["low", "medium", "high"] : ChatTemplateKwargsCodec.reasoningEffortPresets
     }

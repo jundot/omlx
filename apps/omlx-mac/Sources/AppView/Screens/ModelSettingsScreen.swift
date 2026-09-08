@@ -1160,12 +1160,12 @@ private struct ExperimentalSection: View {
                                       isNumeric: true, range: 1024...262_144, step: 64, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.k2_ane.dense", defaultValue: "Dense MLP on ANE")) {
-                            TextInput(text: vm.bindProfile($vm.k2AnePrefillFraction), placeholder: "0.3333333333333333", mono: true,
-                                      isNumeric: true, range: 0.05...1, step: 0.01, width: .controlMedium)
+                            Popup(selection: vm.bindProfile($vm.k2AnePrefillFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.k2AneFractionOptions(current: vm.k2AnePrefillFraction))
                         }
                         Row(label: String(localized: "settings.experimental.k2_ane.shared", defaultValue: "Shared MLP on ANE")) {
-                            TextInput(text: vm.bindProfile($vm.k2AnePrefillSharedFraction), placeholder: "1", mono: true,
-                                      isNumeric: true, range: 0...1, step: 0.01, width: .controlMedium)
+                            Popup(selection: vm.bindProfile($vm.k2AnePrefillSharedFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.k2AneFractionOptions(current: vm.k2AnePrefillSharedFraction, shared: true))
                         }
                     }
                 }
