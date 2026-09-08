@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -498,11 +499,6 @@ async def lifespan(app: FastAPI):
         # unloaded before the new weights allocate (#2319).
         _server_state.engine_pool._get_admission_soft_target = (
             enforcer.get_admission_soft_target
-        )
-        # Resident-vs-mmap is a throughput call and must not read the
-        # instantaneous ceiling, which dips right after a model swap.
-        _server_state.engine_pool._get_residency_ceiling = (
-            enforcer.get_residency_ceiling
         )
         enforcer.start()
 
@@ -4002,6 +3998,13 @@ async def create_chat_completion(
                 tool_calls = extraction.tool_calls
                 cleaned_thinking = extraction.cleaned_thinking
 
+            # Always strip any remaining IFM/K2-Horizon tags from content
+            from .api.utils import _IFM_TAGS_TO_STRIP
+            for tag in _IFM_TAGS_TO_STRIP:
+                cleaned_text = cleaned_text.replace(tag, "")
+            # Also catch any orphaned IFM tags
+            cleaned_text = re.sub(r"\s*</?ifm\|[^>]+>\s*", " ", cleaned_text).strip()
+
             # Process response_format if specified
             if response_format and not tool_calls:
                 cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -4831,9 +4834,17 @@ async def stream_chat_completion(
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
+                # Also always strip IFM/K2-Horizon tool call tags which
+                # may appear even when no tools are provided.
                 if content_delta:
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
+                    # Always strip IFM/K2-Horizon tags — ToolCallStreamFilter
+                    # doesn't recognize them since the tokenizer lacks
+                    # has_tool_calling=True.
+                    from .api.utils import _IFM_TAGS_TO_STRIP_THINK
+                    for tag in _IFM_TAGS_TO_STRIP_THINK:
+                        content_delta = content_delta.replace(tag, "")
                     if content_delta:
                         chunk = ChatCompletionChunk(
                             id=response_id,
@@ -4893,6 +4904,10 @@ async def stream_chat_completion(
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
+            else:
+                from .api.utils import _IFM_TAGS_TO_STRIP_THINK
+                for tag in _IFM_TAGS_TO_STRIP_THINK:
+                    content_delta = content_delta.replace(tag, "")
             if content_delta:
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -5301,6 +5316,10 @@ async def stream_anthropic_messages(
                 if content_delta:
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
+                    # Always strip IFM/K2-Horizon tags
+                    from .api.utils import _IFM_TAGS_TO_STRIP_THINK
+                    for tag in _IFM_TAGS_TO_STRIP_THINK:
+                        content_delta = content_delta.replace(tag, "")
                     if content_delta:
                         # When tools are requested AND we haven't yet opened
                         # a text block, drop pure-whitespace deltas. Most
@@ -5387,6 +5406,10 @@ async def stream_anthropic_messages(
     if content_delta:
         if tool_filter:
             content_delta = tool_filter.feed(content_delta)
+        # Always strip IFM/K2-Horizon tags
+        from .api.utils import _IFM_TAGS_TO_STRIP_THINK
+        for tag in _IFM_TAGS_TO_STRIP_THINK:
+            content_delta = content_delta.replace(tag, "")
         if content_delta:
             if thinking_block_started and not text_block_started:
                 yield create_content_block_stop_event(index=block_index)
