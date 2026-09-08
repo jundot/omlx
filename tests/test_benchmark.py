@@ -1153,6 +1153,7 @@ class TestFilterUploadedSettings:
             "specprefill_enabled": False,
             "turboquant_kv_enabled": True,
             "mtp_enabled": True,
+            "ngram_spec_enabled": False,
             "vlm_mtp_enabled": False,
             "qwen35_ane_prefill_enabled": False,
         }

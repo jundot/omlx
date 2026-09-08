@@ -1434,6 +1434,26 @@ class VLMBatchedEngine(BaseEngine):
     during prefill while maintaining full BatchGenerator compatibility.
     """
 
+    def get_speculation_stats(self):
+        """Session MTP/n-gram speculation counters for the admin dashboard.
+
+        Same shape as DFlash's (issue #2398); the routes bridge duck-types
+        this method, so the Active Models sub-row lights up with no route
+        changes. Backed by the process-global accumulator in
+        omlx.patches.mlx_lm_mtp.spec_stats (aggregates across MTP-active
+        models when several are loaded at once).
+        """
+        try:
+            from ..patches.mlx_lm_mtp.spec_stats import (
+                get_speculation_stats,
+                model_identity_keys,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        core_model = getattr(getattr(self, "_engine", None), "model", None)
+        candidates = model_identity_keys(core_model) if core_model is not None else None
+        return get_speculation_stats(candidates)
+
     def __init__(
         self,
         model_name: str,

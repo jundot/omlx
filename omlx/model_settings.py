@@ -307,6 +307,19 @@ class ModelSettings:
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
 
+    # n-gram history-lookup drafting on the MTP verify path (llama.cpp
+    # ngram-simple family). Copies draft tokens from the request's own
+    # prompt+generation when the last match_len tokens repeat; verified
+    # losslessly, falls back to the Lightning MTP chain on miss. Requires
+    # mtp_enabled (it rides the same draft+verify cycle). draft_max is
+    # memory-bound: verify width k=16 sustains on a 128GB M1 Ultra with
+    # the resident-PLE Qwen4 checkpoint, k=32 OOMs on long generations.
+    ngram_spec_enabled: bool = False
+    ngram_spec_match_len: Optional[int] = None  # None = default 16
+    ngram_spec_draft_max: Optional[int] = None  # None = default 16
+    ngram_spec_draft_min: Optional[int] = None  # None = default 4
+    ngram_spec_freq_rule: bool = False  # copy length follows occurrence count
+
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -344,6 +357,11 @@ class ModelSettings:
         # the admin UI / API rather than at model load. TurboQuant KV is
         # compatible: its attention patch routes MTP's decode-shaped
         # multi-row verify through the quantized decode kernels.
+        if self.ngram_spec_enabled and not self.mtp_enabled:
+            raise ValueError(
+                "ngram_spec_enabled requires mtp_enabled; the n-gram drafter "
+                "rides the Lightning MTP verify cycle"
+            )
         if self.mtp_enabled and self.dflash_enabled:
             raise ValueError(
                 "mtp_enabled and dflash_enabled cannot both be True; choose one "

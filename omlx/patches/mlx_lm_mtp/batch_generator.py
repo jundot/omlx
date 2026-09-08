@@ -680,6 +680,10 @@ class _MtpStats:
     depth_accepted: List[int] = field(default_factory=list)
     # Cycles the depth controller parked at 0 (plain steps, no speculation).
     zero_cycles: int = 0
+    # n-gram lookup drafting: cycles whose draft came from history copy,
+    # and lookups that found nothing (cycle then fell back to the MTP chain).
+    ngram_cycles: int = 0
+    ngram_misses: int = 0
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -2294,6 +2298,88 @@ def _dspark_next_drafts(
     mx.async_eval(state.drafts)
 
 
+# ---------------------------------------------------------------------------
+# n-gram lab harness (temporary, env-gated).
+#
+# OMLX_NGRAM_LAB=cost forces a synthetic draft of OMLX_NGRAM_LAB_K tokens that
+# is guaranteed to mismatch at position 0. Every cycle therefore pays the full
+# cost of a (k+1)-position verify forward plus a k-token rollback, and emits
+# exactly one token. That isolates cycle(k) on the decode path -- the single
+# unknown deciding whether long n-gram drafts pay off on this stack -- and
+# doubles as a stress test of the GDN recurrent rollback at large k.
+#
+# Because a mismatch at position 0 is the worst case for rollback, the derived
+# ceiling (k+1)/cycle(k) is a LOWER bound on what a real drafter could reach.
+# ---------------------------------------------------------------------------
+_NGRAM_LAB = os.environ.get("OMLX_NGRAM_LAB", "").strip().lower()
+
+
+def _ngram_lab_k() -> int:
+    try:
+        return max(1, int(os.environ.get("OMLX_NGRAM_LAB_K", "48")))
+    except ValueError:
+        return 48
+
+
+def _lab_synthetic_drafts(state: "_MtpState", k: int):
+    """Deterministic never-matching drafts, varied per cycle."""
+    import mlx.core as mx
+
+    seed = int(getattr(state.stats, "cycles", 0))
+    toks = [((seed * 7919 + i * 104729 + 13) % 90000) + 1000 for i in range(k)]
+    return mx.array(toks, dtype=mx.uint32)
+
+
+_NGRAM_POOL = None
+
+
+def _ngram_shared_pool():
+    """Process-wide cross-request pool (plan v3, F4), created on first use
+    with the same knobs as the per-request source."""
+    global _NGRAM_POOL
+    if _NGRAM_POOL is None:
+        from omlx.speculative.ngram import SharedNGramPool
+
+        from . import get_ngram_spec_params as _ng_p
+
+        _NGRAM_POOL = SharedNGramPool(*_ng_p())
+    return _NGRAM_POOL
+
+
+def _ngram_source_for_cycle(gen_batch, state, committed, procs):
+    """Create-or-fetch the request's n-gram source and feed it this cycle.
+
+    Seeded from the token buffer (full prompt at insert). With logits
+    processors active the buffer also holds every generated token —
+    including this cycle's committed ones — so the seeding call skips the
+    committed extend to keep the splice free of duplicates (plan v3, F3.3).
+    """
+    from omlx.speculative.ngram import NGramDraftSource
+
+    from . import get_ngram_spec_params as _ng_p
+
+    src = getattr(state, "_ngram_src", None)
+    skip_extend = False
+    if src is None:
+        src = NGramDraftSource(*_ng_p())
+        try:
+            seed = gen_batch._token_context[0].tokens.tolist()
+            src.extend(seed)
+            _ngram_shared_pool().feed(seed, new_segment=True)
+            skip_extend = procs is not None
+        except Exception:
+            pass
+        state._ngram_src = src
+    if not skip_extend:
+        toks = committed.tolist()
+        src.extend(toks)
+        try:
+            _ngram_shared_pool().feed(toks, new_segment=False)
+        except Exception:
+            pass
+    return src
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -2321,6 +2407,18 @@ def _chain_next_drafts(
     single sync resolves them.
     """
     import mlx.core as mx
+
+    if _NGRAM_LAB == "cost":
+        k = _ngram_lab_k()
+        # stats/emit index by state.depth; the controller would fight the
+        # fixed k, so pin both for the duration of the lab run.
+        state.depth = max(state.depth, k)
+        state.controller = None
+        state.drafts = _lab_synthetic_drafts(state, k)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        mx.async_eval(state.drafts)
+        return
 
     model = gen_batch.model
     if _dspark_host(model) is not None:
@@ -2374,6 +2472,48 @@ def _chain_next_drafts(
         logits_keep=1,
     )
     state.hist_offset += int(n)
+
+    # --- n-gram lookup drafting (self-speculative, lossless via verify) ---
+    # The head fold above already ran, so the MTP cache stays warm and the
+    # fallback chain below remains correct on miss cycles. On a hit the
+    # draft is copied from the request's own token history instead of the
+    # MTP chain; draft_lps stays empty, which the verify cycle reads as a
+    # point-mass proposal (the emit path then uses the target's own row).
+    from . import is_ngram_spec_enabled as _ng_on, get_ngram_spec_params as _ng_p
+
+    if _ng_on():
+        src = _ngram_source_for_cycle(gen_batch, state, committed, procs)
+        cont = src.lookup()
+        if cont is None and len(src) >= 8:
+            # Cross-request fallback (plan v3, F4): another request may have
+            # seen this suffix — an agent loop re-sending the same file.
+            try:
+                cont = _ngram_shared_pool().lookup_suffix(src._tokens[-24:])
+            except Exception:
+                cont = None
+        if cont is not None:
+            # Memory pressure gate (plan v3, F2.1): "soft" halves the copy,
+            # "hard" stands the drafter down for this cycle — the k=32 OOM
+            # from the gate run happened exactly under this kind of squeeze.
+            from . import get_ngram_pressure_level
+
+            level = get_ngram_pressure_level()
+            if level == "hard":
+                cont = None
+            elif level == "soft" and len(cont) > 8:
+                cont = cont[:8]
+        if cont is not None:
+            state._ngram_cycle = True
+            state.stats.ngram_cycles += 1
+            if state.depth < len(cont):
+                state.depth = len(cont)
+            state.drafts = mx.array(cont, dtype=mx.uint32)
+            state.draft_lps = []
+            state.draft_accept_lps = []
+            mx.async_eval(state.drafts)
+            return
+        state.stats.ngram_misses += 1
+        state._ngram_cycle = False
 
     draft_toks: List[Any] = []
     draft_lps: List[Any] = []
@@ -2492,6 +2632,9 @@ def _post_init_mtp(gen_batch: Any) -> None:
         # are the first draft's distribution; the rest of the chain follows.
         mx.eval(main_tok, next_main_tok)
         state = _MtpState(uid=gen_batch.uids[0])
+        from .spec_stats import model_identity_keys
+
+        state.stats.model_keys = model_identity_keys(gen_batch.model)
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
@@ -2826,6 +2969,14 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         emits[init=<i>,draft=<d>,bonus=<b>,verify=<v>]
         timing[backbone=<X>ms mtp=<Y>ms sample=<S>ms cache=<C>ms]
     """
+    from . import spec_stats as _spec_stats
+
+    try:
+        _spec_stats.record(
+            stats, finish_reason, keys=getattr(stats, "model_keys", None)
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break emit paths
+        pass
     total_emits = (
         stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
     )
@@ -2845,6 +2996,10 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         depth_str = ""
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
+    if stats.ngram_cycles or stats.ngram_misses:
+        depth_str += (
+            f" ngram[served={stats.ngram_cycles} miss={stats.ngram_misses}]"
+        )
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
@@ -2909,6 +3064,12 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
 
     if state.next_main is None or state.drafts is None:
         raise _MtpStepFallback("chain cycle entered without next_main / drafts")
+
+    # Captured before _chain_next_drafts below overwrites it: the flag
+    # describes the drafts being VERIFIED in this cycle, and the depth
+    # controller must not learn its MTP timing model from n-gram cycles
+    # (copy drafts do not decay with depth the way chained head drafts do).
+    cycle_was_ngram = bool(getattr(state, "_ngram_cycle", False))
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -2987,11 +3148,18 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         # samples for every position, and the bonus draw, all resolved in
         # ONE host sync (mirrors the greedy path's sync structure).
         accept_rows = _accept_lp_for(sampler, combined_lp)  # (k+1, V)
-        q_rows = mx.stack(state.draft_accept_lps)  # (k, V)
         idx = state.drafts.astype(mx.int32)[:, None]
         p_at = mx.take_along_axis(accept_rows[:k], idx, axis=-1).squeeze(-1)
-        q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
-        ratio = p_at - q_at  # (k,) log acceptance ratios
+        if state.draft_accept_lps:
+            q_rows = mx.stack(state.draft_accept_lps)  # (k, V)
+            q_at = mx.take_along_axis(q_rows, idx, axis=-1).squeeze(-1)
+            ratio = p_at - q_at  # (k,) log acceptance ratios
+        else:
+            # Point-mass proposal (n-gram copy): q(token) = 1, log q = 0,
+            # so the Leviathan/Chen ratio reduces to log p at the drafted
+            # token — accept with the target's own probability.
+            q_rows = None
+            ratio = p_at
         u = mx.random.uniform(shape=(k,))
         acc = mx.logical_or(ratio >= 0, mx.log(u) < ratio)
         m_arr = mx.cumprod(acc.astype(mx.int32)).sum().reshape(1)
@@ -2999,7 +3167,13 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         # reject position's sample is used; computing all k keeps the cycle
         # single-sync and costs a few elementwise vocab ops on GPU.
         p_all = mx.exp(accept_rows[:k])
-        res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
+        if q_rows is not None:
+            res = mx.maximum(p_all - mx.exp(q_rows), 0.0)
+        else:
+            # Residual of a point-mass q: p with the drafted column removed.
+            res = mx.put_along_axis(
+                p_all, idx, mx.zeros((k, 1), dtype=p_all.dtype), axis=-1
+            )
         z = res.sum(axis=-1, keepdims=True)
         res_dist = mx.where(z > 0, res, p_all)
         res_samples = mx.random.categorical(mx.log(res_dist))  # (k,)
@@ -3089,7 +3263,11 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     # --- commit: queue emits + cache rollback ---
     t0 = time.perf_counter()
     for j in range(m):
-        state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+        # A drafter without its own per-position distribution (n-gram,
+        # lab harness) leaves draft_lps empty; the target's row j is the
+        # distribution that predicted draft_ids[j], so use it directly.
+        _lp = state.draft_lps[j] if state.draft_lps else combined_lp[j]
+        state.queue.append((int(draft_ids[j]), _lp, "draft"))
     if m == k:
         state.queue.append((int(emit_last_id), emit_last_lp, "bonus"))
         _clear_rollback(gen_batch.prompt_cache)
@@ -3122,17 +3300,22 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
     if materialize_boundary_emit:
         _materialize_mtp_boundary_emit(gen_batch, state)
+    if cycle_was_ngram:
+        src = getattr(state, "_ngram_src", None)
+        if src is not None:
+            src.feedback(m)
     if state.controller is not None:
         was_warmup = bool(state.controller._warmup)
         keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
         if keepalive:
             state.mtp_cache.fold_keepalive = False
-        state.controller.observe(
-            k,
-            m,
-            (time.perf_counter() - cycle_t0) * 1000,
-            time_sample=not keepalive,
-        )
+        if not cycle_was_ngram:
+            state.controller.observe(
+                k,
+                m,
+                (time.perf_counter() - cycle_t0) * 1000,
+                time_sample=not keepalive,
+            )
         _maybe_finish_mtp_reentry_probe(
             gen_batch,
             state,

@@ -473,6 +473,7 @@ raise SystemExit(2)
                 "dflash_enabled",
                 "specprefill_enabled",
                 "mtp_enabled",
+                "ngram_spec_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
             )

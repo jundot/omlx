@@ -65,6 +65,11 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'ngram_spec_enabled',
+        'ngram_spec_match_len',
+        'ngram_spec_draft_max',
+        'ngram_spec_draft_min',
+        'ngram_spec_freq_rule',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -7434,6 +7439,11 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    ngram_spec_enabled: s.ngram_spec_enabled || false,
+                    ngram_spec_match_len: s.ngram_spec_match_len ?? null,
+                    ngram_spec_draft_max: s.ngram_spec_draft_max ?? null,
+                    ngram_spec_draft_min: s.ngram_spec_draft_min ?? null,
+                    ngram_spec_freq_rule: s.ngram_spec_freq_rule || false,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -8405,6 +8415,22 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                ngram_spec_enabled: !!this.modelSettings.mtp_enabled
+                                    && !!this.modelSettings.ngram_spec_enabled,
+                                ngram_spec_match_len: this.modelSettings.ngram_spec_enabled
+                                    && this.modelSettings.ngram_spec_match_len
+                                    ? parseInt(this.modelSettings.ngram_spec_match_len)
+                                    : null,
+                                ngram_spec_draft_max: this.modelSettings.ngram_spec_enabled
+                                    && this.modelSettings.ngram_spec_draft_max
+                                    ? parseInt(this.modelSettings.ngram_spec_draft_max)
+                                    : null,
+                                ngram_spec_draft_min: this.modelSettings.ngram_spec_enabled
+                                    && this.modelSettings.ngram_spec_draft_min
+                                    ? parseInt(this.modelSettings.ngram_spec_draft_min)
+                                    : null,
+                                ngram_spec_freq_rule: !!this.modelSettings.ngram_spec_enabled
+                                    && !!this.modelSettings.ngram_spec_freq_rule,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -8469,6 +8495,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    ngram_spec_enabled: false,
+                                    ngram_spec_freq_rule: false,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
