@@ -46,6 +46,7 @@ async def test_k2_recommendation_keeps_settings_unchanged(
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
+        assert not transient.uno_enabled
         assert transient.qwen35_ane_prefill_enabled == candidate.enabled
         return {**ane_tuning._empty_result(candidate), "processing_tps": next(speeds)}
 

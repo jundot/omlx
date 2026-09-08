@@ -436,6 +436,7 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
         settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
         settings.qwen35_ane_prefill_shared_fraction = candidate.shared_fraction
         for field in (
+            "uno_enabled",
             "dflash_enabled",
             "specprefill_enabled",
             "mtp_enabled",

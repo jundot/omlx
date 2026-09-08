@@ -225,6 +225,11 @@ def softplus_beta_ln2(x: mx.array) -> mx.array:
     return (mx.logaddexp(x32 * _LN2, 0.0) / _LN2).astype(x.dtype)
 
 
+def _project(layer, x, lora_mask):
+    conditional = getattr(layer, "conditional_forward", None)
+    return conditional(x, lora_mask) if conditional is not None else layer(x)
+
+
 class PartialRoPE(nn.Module):
     """Rotate leading pairs in the checkpoint's split-half head layout."""
 
@@ -289,9 +294,9 @@ class Attention(nn.Module):
             )
         )
 
-    def _values(self, x: mx.array) -> mx.array:
+    def _values(self, x: mx.array, lora_mask=None) -> mx.array:
         if not self.mova:
-            return self.v_proj(x)
+            return _project(self.v_proj, x, lora_mask)
         inds, weights = route(
             x, self.v_router.weight, self.v_expert_bias, self.top_k, self.scaling_factor
         )
@@ -304,20 +309,21 @@ class Attention(nn.Module):
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any = None,
+        lora_mask=None,
     ) -> mx.array:
         batch, length, _ = x.shape
         queries = (
-            self.q_proj(x)
+            _project(self.q_proj, x, lora_mask)
             .reshape(batch, length, self.n_heads, -1)
             .transpose(0, 2, 1, 3)
         )
         keys = (
-            self.k_proj(x)
+            _project(self.k_proj, x, lora_mask)
             .reshape(batch, length, self.n_kv_heads, -1)
             .transpose(0, 2, 1, 3)
         )
         values = (
-            self._values(x)
+            self._values(x, lora_mask)
             .reshape(batch, length, self.n_kv_heads, -1)
             .transpose(0, 2, 1, 3)
         )
@@ -339,7 +345,7 @@ class Attention(nn.Module):
                 batch, length, self.n_heads, -1
             )
             output = output * gate
-        return self.o_proj(output.reshape(batch, length, -1))
+        return _project(self.o_proj, output.reshape(batch, length, -1), lora_mask)
 
 
 class MLP(nn.Module):
@@ -349,12 +355,14 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dims, hidden_dims, bias=False)
         self.down_proj = nn.Linear(hidden_dims, dims, bias=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, lora_mask=None) -> mx.array:
         ane = getattr(self, "_omlx_ane_prefill", None)
-        if ane is not None and ane.active:
+        if ane is not None and ane.active and lora_mask is None:
             return ane(x)
-        h = swiglu(self.gate_proj(x), self.up_proj(x))
-        return self.down_proj(h)
+        h = swiglu(
+            _project(self.gate_proj, x, lora_mask), _project(self.up_proj, x, lora_mask)
+        )
+        return _project(self.down_proj, h, lora_mask)
 
 
 class SparseMoeBlock(nn.Module):
@@ -374,7 +382,9 @@ class SparseMoeBlock(nn.Module):
             args.hidden_size, args.moe_intermediate_size * args.num_shared_experts
         )
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, lora_mask=None) -> mx.array:
+        if lora_mask is not None:
+            raise ValueError("Uno adapters require a dense K2 base")
         inds, weights = route(
             x,
             self.gate.weight,
@@ -417,9 +427,10 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any = None,
+        lora_mask=None,
     ) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        return h + self.mlp(self.post_attention_layernorm(h))
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache, lora_mask)
+        return h + self.mlp(self.post_attention_layernorm(h), lora_mask=lora_mask)
 
 
 class K2HorizonModel(nn.Module):
@@ -431,13 +442,13 @@ class K2HorizonModel(nn.Module):
             args.hidden_size, args.layernorm_num_groups, args.rms_norm_eps
         )
 
-    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
+    def __call__(self, inputs: mx.array, cache: Any = None, lora_mask=None) -> mx.array:
         h = self.embed_tokens(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
         mask = create_attention_mask(h, cache[0])
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+            h = layer(h, mask, c, lora_mask)
         return self.norm(h)
 
 
@@ -450,8 +461,8 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
-        out = self.model(inputs, cache)
+    def __call__(self, inputs: mx.array, cache: Any = None, lora_mask=None) -> mx.array:
+        out = self.model(inputs, cache, lora_mask)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)

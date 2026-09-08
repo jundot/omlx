@@ -2198,6 +2198,7 @@
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
+                        :disabled="usesUno()"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
                         <option value="auto" :disabled="!thinkingModes().includes('auto')">{{ t('chat.thinking_mode.auto') }}</option>
@@ -2206,6 +2207,7 @@
                         <option value="off" :disabled="!thinkingModes().includes('off')">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
                     <p x-show="currentModelInfo()?.thinking_forced" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
+                    <p x-show="usesUno()" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.uno_budget_hint') }}</p>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
@@ -2737,6 +2739,10 @@
 
             thinkingModes() {
                 return this.currentModelInfo()?.thinking_modes || [];
+            },
+
+            usesUno() {
+                return !!this.currentModelInfo()?.settings?.uno_enabled;
             },
 
             thinkingModeValue() {

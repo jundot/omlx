@@ -733,15 +733,20 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
-                    sublabel: String(localized: "settings.advanced.thinking_budget.sub",
+                    sublabel: vm.unoEnabled ? String(
+                        localized: "settings.uno.budget_hint",
+                        defaultValue: "Uno does not support thinking budgets.")
+                        : String(localized: "settings.advanced.thinking_budget.sub",
                                      defaultValue: "Limit thinking tokens for reasoning models. Forces end of thinking when exceeded.",
                                      comment: "Sublabel for the thinking budget field")) {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
                                       mono: true, suffix: "tk", width: .controlCompact)
+                                .disabled(vm.unoEnabled)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
+                            .disabled(vm.unoEnabled && !vm.thinkingBudgetEnabled)
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -1654,6 +1659,27 @@ private struct ExperimentalSection: View {
                                          comment: "Sublabel for the DFlash SSD cache size field")) {
                         TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
                                   placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
+                    }
+                }
+            }
+
+            if vm.isK2Base {
+                Row(label: String(localized: "settings.uno.enable", defaultValue: "Enable Uno"),
+                    sublabel: vm.unoUnavailableReason ?? String(
+                        localized: "settings.uno.hint",
+                        defaultValue: "Use a conditional diffusion adapter with this base model.")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.unoEnabled))
+                        .disabled(!vm.unoEnabled && vm.unoUnavailableReason != nil)
+                        .accessibilityLabel(String(localized: "settings.uno.enable", defaultValue: "Enable Uno"))
+                        .accessibilityHint(vm.unoUnavailableReason ?? "")
+                        .accessibilityIdentifier("uno.enabled")
+                }
+                .help(vm.unoUnavailableReason ?? "")
+                if vm.unoEnabled {
+                    Row(label: String(localized: "settings.uno.adapter", defaultValue: "Uno adapter")) {
+                        Popup("settings.uno.adapter", selection: vm.bindProfile($vm.unoAdapterModel),
+                              width: .controlWide, options: vm.unoAdapterModelOptions())
+                            .accessibilityIdentifier("uno.adapter")
                     }
                 }
             }

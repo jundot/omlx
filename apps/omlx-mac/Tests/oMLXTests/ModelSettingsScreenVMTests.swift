@@ -406,8 +406,86 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNotNil(vm.currentSettingsDict()["enable_thinking"])
     }
 
+    func testUnoDefaultsAndCompatibleVariants() {
+        let vm = ModelSettingsScreenVM()
+        let base = "IFM/K2-Horizon-0.9B"
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoBaseModelId: base)
+        vm.allModels = [
+            vm.model!,
+            makeModel(id: "Uno", configModelType: "k2_horizon_uno", unoBaseModelId: base),
+            makeModel(id: "Uno-Q4", configModelType: "k2_horizon_uno", unoBaseModelId: base),
+            makeModel(id: "7B-Uno", configModelType: "k2_horizon_uno", unoBaseModelId: "IFM/K2-Horizon-7B"),
+        ]
+        XCTAssertTrue(vm.isK2Base)
+        XCTAssertFalse(vm.unoEnabled)
+        XCTAssertNil(vm.unoUnavailableReason)
+        XCTAssertEqual(vm.unoAdapterModelOptions().map(\.0), ["", "Uno", "Uno-Q4"])
+        XCTAssertEqual(vm.currentSettingsDict()["uno_enabled"]?.value as? Bool, false)
+        vm.unoEnabled = true
+        vm.unoAdapterModel = "Uno-Q4"
+        XCTAssertTrue(vm.validateUnoWorkingSettings())
+        XCTAssertEqual(vm.currentSettingsDict()["uno_adapter_model"]?.value as? String, "Uno-Q4")
+        vm.unoAdapterModel = "7B-Uno"
+        XCTAssertFalse(vm.validateUnoWorkingSettings())
+        vm.unoEnabled = false
+        XCTAssertTrue(vm.validateUnoWorkingSettings())
+        vm.model = makeModel(id: "MoVA", configModelType: "k2_horizon")
+        XCTAssertTrue(vm.isK2Base)
+        XCTAssertNotNil(vm.unoUnavailableReason)
+        vm.model = makeModel(id: "Qwen", configModelType: "qwen3_5")
+        XCTAssertFalse(vm.isK2Base)
+        XCTAssertTrue(vm.unoAdapterCandidates.isEmpty)
+        XCTAssertNil(vm.currentSettingsDict()["uno_enabled"])
+    }
 
+    func testUnoRejectsConflictingWorkingSettings() {
+        let vm = ModelSettingsScreenVM()
+        for key in [\ModelSettingsScreenVM.mtpEnabled, \.vlmMtpEnabled, \.dflashEnabled,
+                    \.specprefillEnabled, \.turboquantKvEnabled, \.qwen35AnePrefillEnabled,
+                    \.thinkingBudgetEnabled] {
+            vm[keyPath: key] = true
+            XCTAssertNotNil(vm.unoConflictReason)
+            vm[keyPath: key] = false
+        }
+        for key in [\ModelSettingsScreenVM.minP, \.repetitionPenalty, \.presencePenalty] {
+            vm[keyPath: key] = "0.2"
+            XCTAssertNotNil(vm.unoConflictReason)
+            vm[keyPath: key] = ""
+        }
+        vm.minP = "0"
+        vm.repetitionPenalty = "1"
+        vm.presencePenalty = "0"
+        XCTAssertNil(vm.unoConflictReason)
+    }
 
+    func testUnoWireFieldsAndModelProfileRoundtrip() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let data = Data(#"{"id":"base","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"k2_horizon","uno_base_model_id":"IFM/K2-Horizon-0.9B","settings":{"uno_enabled":true,"uno_adapter_model":"Uno-Q4","guided_grammar_enabled":true}}"#.utf8)
+        let model = try decoder.decode(ModelDTO.self, from: data)
+        XCTAssertEqual(model.unoBaseModelId, "IFM/K2-Horizon-0.9B")
+        XCTAssertEqual(model.settings?.unoEnabled, true)
+        XCTAssertEqual(model.settings?.unoAdapterModel, "Uno-Q4")
+        let vm = ModelSettingsScreenVM()
+        vm.model = model
+        XCTAssertNotNil(vm.unoConflictReason)
+        var patch = ModelSettingsPatch()
+        patch.unoEnabled = true
+        patch.unoAdapterModel = "Uno-Q4"
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let encoded = try encoder.encode(patch)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["uno_enabled", "uno_adapter_model"])
+        XCTAssertEqual(object["uno_enabled"] as? Bool, true)
+        XCTAssertEqual(object["uno_adapter_model"] as? String, "Uno-Q4")
+        vm.unoEnabled = true
+        vm.unoAdapterModel = "Uno-Q4"
+        let snapshot = try encoder.encode(vm.currentSettingsDict())
+        let settings = try decoder.decode(ModelSettingsDTO.self, from: snapshot)
+        XCTAssertEqual(settings.unoEnabled, true)
+        XCTAssertEqual(settings.unoAdapterModel, "Uno-Q4")
+    }
 
     func testThinkingPatchCanClearK2SettingWithoutChangingOtherWireValues() throws {
         let encoder = JSONEncoder()
@@ -445,7 +523,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
-    private func makeModel(id: String, configModelType: String?) -> ModelDTO {
+    private func makeModel(id: String, configModelType: String?, unoBaseModelId: String? = nil) -> ModelDTO {
         var model = ModelDTO(
             id: id,
             displayName: nil,
@@ -462,6 +540,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             engineType: nil,
             modelType: nil,
             configModelType: configModelType,
+            unoBaseModelId: unoBaseModelId,
             modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
