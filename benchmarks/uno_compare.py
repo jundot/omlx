@@ -75,7 +75,10 @@ async def measure(client, args, prompts):
         from omlx.utils.proc_memory import get_phys_footprint
 
         while not done.is_set():
-            samples.append(get_phys_footprint(args.server_pid))
+            footprint = get_phys_footprint(args.server_pid)
+            if footprint <= 0:
+                raise RuntimeError("Cannot read the server process footprint")
+            samples.append(footprint)
             await asyncio.sleep(0.05)
 
     monitor = asyncio.create_task(memory()) if args.server_pid else None
@@ -84,11 +87,11 @@ async def measure(client, args, prompts):
         responses = await asyncio.gather(
             *(request(client, args, prompt, delay) for prompt, delay in prompts)
         )
+        elapsed = time.perf_counter() - started
     finally:
         done.set()
         if monitor:
             await monitor
-    elapsed = time.perf_counter() - started
     return {
         "seconds": elapsed,
         "requests": responses,
@@ -113,12 +116,15 @@ async def run(args):
         f"Record {i}: the reference value is {i % 17}." for i in range(300)
     )
     workloads = {
-        "short": [("List the first twenty prime numbers.", 0)],
+        "short": [("What is 17 times 19? Reply with just the number.", 0)],
         "coding": [(prompt, 0)],
         "long_context": [
             (long_prompt + "\nSummarize the pattern in these records.", 0)
         ],
-        "overlap": [(prompt, 0), ("List the first twenty prime numbers.", 0)],
+        "overlap": [
+            (prompt, 0),
+            ("What is 17 times 19? Reply with just the number.", 0),
+        ],
         "staggered": [(prompt, 0), ("What is 17 times 19?", 0.25)],
     }
     report = {
