@@ -11393,6 +11393,7 @@ class Scheduler:
 
                 if parser_session is not None:
                     final_result = parser_session.finalize()
+                    output.error = getattr(final_result, "error", None)
                     if final_result.stream_text:
                         output.new_text += final_result.stream_text
                     if final_result.visible_text:

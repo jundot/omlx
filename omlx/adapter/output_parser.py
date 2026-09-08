@@ -45,6 +45,7 @@ class OutputParserFinalizeResult:
     output_text_prefix: str = ""
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     finish_reason: str | None = None
+    error: str | None = None
 
 
 class OutputParserSession(Protocol):
@@ -1319,28 +1320,26 @@ class K2HorizonOutputParserSession:
         text += self._tool_filter.finish()
 
         tool_calls: list[dict[str, str]] = []
+        error = None
         if self._tools:
             try:
-                from ..api.tool_calling import parse_tool_calls
+                from ..api.tool_calling import _marker_payloads, parse_tool_calls
+                from ..patches.k2_horizon.tool_parser import parse_tool_call
 
+                for payload in _marker_payloads(
+                    self._raw_text, _K2_TOOL_CALLS_START, _K2_TOOL_CALLS_END
+                ):
+                    parse_tool_call(payload, self._tools)
                 _, parsed_calls = parse_tool_calls(
                     self._raw_text, self._tokenizer, self._tools
                 )
-                valid_names = {
-                    function["name"]
-                    for tool in self._tools
-                    if isinstance(tool, dict)
-                    and isinstance((function := tool.get("function")), dict)
-                    and isinstance(function.get("name"), str)
-                    and function["name"]
-                }
+                if _K2_TOOL_CALLS_START in self._raw_text and (
+                    not parsed_calls
+                    or self._raw_text.rfind(_K2_TOOL_CALLS_START)
+                    > self._raw_text.rfind(_K2_TOOL_CALLS_END)
+                ):
+                    raise ValueError("Incomplete or malformed K2 tool-call envelope")
                 for call in parsed_calls or []:
-                    if call.function.name not in valid_names:
-                        logger.warning(
-                            "Dropping unregistered K2 Horizon tool call %r",
-                            call.function.name,
-                        )
-                        continue
                     tool_calls.append(
                         {
                             "id": getattr(call, "id", ""),
@@ -1349,13 +1348,15 @@ class K2HorizonOutputParserSession:
                         }
                     )
             except Exception as e:  # noqa: BLE001
-                logger.debug("K2 Horizon tool-call parse failed: %s", e)
+                logger.warning("K2 Horizon tool-call parse failed: %s", e)
+                error = "K2 Horizon generated an incomplete or malformed tool call."
 
         return OutputParserFinalizeResult(
             stream_text=text,
             visible_text=text,
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else None,
+            error=error,
         )
 
 

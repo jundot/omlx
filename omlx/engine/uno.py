@@ -579,6 +579,8 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         if cancelled.is_set():
             return
         final = parser.finalize()
+        if getattr(final, "error", None):
+            raise RuntimeError(final.error)
         delta = buffer.feed(final.stream_text, final=True)
         if buffer.stopped:
             finish = "stop"

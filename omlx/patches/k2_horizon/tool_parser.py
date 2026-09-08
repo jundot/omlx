@@ -39,6 +39,8 @@ def _parse_xml_call(body: str, tools: list[Any] | None) -> dict[str, Any]:
     name = (body[: matches[0].start()] if matches else body).strip()
     if not name or "<ifm|" in name:
         raise ValueError("K2 Horizon XML tool call is missing a function name")
+    if matches and _ARGUMENT_PATTERN.sub("", body[matches[0].start() :]).strip():
+        raise ValueError("K2 Horizon XML tool call contains an incomplete argument")
 
     string_args = _get_string_arg_names(name, tools)
     arguments: dict[str, Any] = {}
@@ -62,6 +64,8 @@ def parse_tool_call(text: str, tools: list[Any] | None = None) -> list[dict[str,
     bodies = [body.strip() for body in _CALL_PATTERN.findall(text)]
     if not bodies:
         raise ValueError("K2 Horizon tool group contains no complete <ifm|tool_call>")
+    if _CALL_PATTERN.sub("", text).strip():
+        raise ValueError("K2 Horizon tool group contains an incomplete call")
     return [
         (
             _parse_json_call(body, tools)
