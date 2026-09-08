@@ -79,6 +79,10 @@ def load_target_bundle(model_ref: str | Path, **kwargs: Any) -> Any:
     from dflash_mlx.engine.target_ops import resolve_target_ops
     from dflash_mlx.runtime.loading import LoadedTargetBundle
 
+    # This is specific to the current Qwen TargetOps implementation: its
+    # recurrent hooks accept mlx-lm calls, not mlx-vlm's gdn_sink/position
+    # interface. Image requests reload the full model via the VLM fallback.
+    # It is not a general requirement for every DFlash architecture.
     model, tokenizer, is_vlm = load(
         str(model_ref), lazy=kwargs.get("lazy", True), force_text=True
     )

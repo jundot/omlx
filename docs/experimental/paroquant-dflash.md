@@ -31,7 +31,20 @@ must match the target. Matching dimensions do not establish semantic compatibili
 choose a draft trained for the same base model.
 
 This enables text speculation. Image requests continue through oMLX's existing
-VLM fallback. It does not enable ParoQuant's separately gated MTP, SpecPrefill,
+VLM fallback, which loads the original checkpoint including its vision tower.
+The text-only target is an architecture-specific adapter choice, not a generic
+DFlash rule for VLMs. With the currently pinned Qwen backend, loading the
+mlx-vlm model directly resolves an adapter but fails on its first captured
+forward: the recurrent hook does not accept mlx-vlm's `gdn_sink` argument.
+
+Image requests therefore retain visual input, but do not use DFlash acceleration.
+The first image request evicts the text target/draft and loads the full VLM;
+the engine stays in fallback mode until it is stopped/reloaded. Native
+image-conditioned DFlash would require a VLM-aware Qwen adapter that preserves
+processor/vision embeddings, multimodal positions, and recurrent rollback.
+Simply removing `force_text=True` does not implement that support.
+
+It does not enable ParoQuant's separately gated MTP, SpecPrefill,
 IndexCache, or TurboQuant settings.
 
 ## Validation
@@ -82,6 +95,10 @@ claims require matched cache state, runtime/memory policy, repeated alternating
 runs, and equal correct output. DFlash phase timers can include asynchronous work;
 they are not exclusive GPU kernel timings.
 
+To check a text request followed by a real image request through VLM fallback,
+use `engine_smoke` with `--vision-smoke-only`. It constructs a red image,
+requires a red-color answer, and checks that the fallback loaded a vision tower.
+
 ## Recorded validation (2026-09-08)
 
 On an M3 Max with 64 GiB unified memory, MLX 0.32.2, the pinned mlx-lm
@@ -101,8 +118,10 @@ On an M3 Max with 64 GiB unified memory, MLX 0.32.2, the pinned mlx-lm
 
 Machine-readable evidence is in
 [`validation_summary.json`](../../benchmarks/paroquant_dflash/validation_summary.json).
-Live image generation and a controlled comparison against the batched engine
-were not part of this validation.
+A follow-up real-checkpoint image-input test returned "Red" for a generated
+red image after text generation, with VLM fallback active and a vision tower
+present. This is a bounded image-input smoke check, not broad vision-quality
+validation. A controlled comparison against the batched engine was not run.
 
 ## Family-level validation
 

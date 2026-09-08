@@ -257,5 +257,23 @@
   "seeded_sampling_reproducible": true,
   "regression_tests_passed": 309,
   "final_focused_tests_passed": 24,
-  "scope": "Correctness and integration validation; not a controlled speed comparison. Image routing covered by existing unit tests, not a live image run."
+  "scope": "Correctness and integration validation; not a controlled speed comparison. Image routing covered by existing unit tests, not a live image run.",
+  "vision_followup": {
+    "implementation_commit": "10c0f050",
+    "image_fallback": {
+      "text_before_image": "five, six, seven, eight, nine, ten, eleven, twelve,",
+      "image_response": "Red",
+      "in_vlm_fallback": true,
+      "vision_tower_present": true
+    },
+    "direct_vlm_adapter_probe": {
+      "model_class": "mlx_vlm.models.qwen3_5.qwen3_5",
+      "language_model_class": "mlx_vlm.models.qwen3_5.language",
+      "adapter_resolves": true,
+      "ordinary_forward_finite": true,
+      "exception_type": "TypeError",
+      "error": "_install_speculative_linear_cache_hook.<locals>.speculative_call() got an unexpected keyword argument 'gdn_sink'"
+    },
+    "scope": "Real full-checkpoint text-to-image fallback; direct adapter interface tested on a small mlx-vlm model."
+  }
 }

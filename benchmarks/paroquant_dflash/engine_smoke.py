@@ -49,6 +49,50 @@ async def main(args):
         start = time.perf_counter()
         await engine.start()
         print("ENGINE_LOADED", time.perf_counter() - start, flush=True)
+        if args.vision_smoke_only:
+            import base64
+            import io
+
+            from PIL import Image
+
+            await generate("before_image", "Continue the count: one, two, three, four,")
+            image = io.BytesIO()
+            Image.new("RGB", (224, 224), (255, 0, 0)).save(image, format="PNG")
+            image_url = (
+                "data:image/png;base64," + base64.b64encode(image.getvalue()).decode()
+            )
+            output = await engine.chat(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {
+                                "type": "text",
+                                "text": "What color fills this image? Answer with only the color name.",
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=64,
+                temperature=0.0,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+            row = {
+                "label": "image_fallback",
+                "text": output.text,
+                "in_vlm_fallback": engine._in_fallback_mode,
+                "vision_tower_present": hasattr(
+                    engine._fallback_engine._vlm_model, "vision_tower"
+                ),
+            }
+            records.append(row)
+            Path(args.output).write_text(
+                json.dumps(records, indent=2, default=str) + "\n"
+            )
+            assert "red" in output.text.lower(), output.text
+            assert row["in_vlm_fallback"] and row["vision_tower_present"]
+            return
         tok = engine.tokenizer
         for length in args.contexts:
             filler = tok.encode(
@@ -104,4 +148,5 @@ if __name__ == "__main__":
     parser.add_argument("--draft", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--contexts", type=int, nargs="+", default=[4096, 16384, 32768])
+    parser.add_argument("--vision-smoke-only", action="store_true")
     asyncio.run(main(parser.parse_args()))
