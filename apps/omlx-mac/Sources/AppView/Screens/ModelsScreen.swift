@@ -38,6 +38,9 @@ struct ModelsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+        .onChange(of: services.serverState) { _, newState in
+            if !newState.isRunningLike { vm.clearOnServerStopped() }
+        }
         .confirmationDialog(
             String(localized: "models.delete.confirm_title",
                    defaultValue: "Delete this model from disk?",

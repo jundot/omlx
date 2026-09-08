@@ -307,7 +307,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var ssdCacheDir: String? = nil
     var ssdCacheMaxSize: String? = nil
     /// Starting cache block count. Requires server restart to take effect.
-    var initialCacheBlocks: Int? = nil
+    /// `nil` leaves it unchanged, `.null` clears it back to server-default,
+    /// `.value(n)` sets it — same 3-state shape as `idleTimeoutSeconds`.
+    var initialCacheBlocks: PatchOptionalInt? = nil
 
     /// Server-wide model auto-unload after N seconds idle. Server enforces
     /// `>= 60`. `nil` (default) leaves it unchanged, `.null` disables

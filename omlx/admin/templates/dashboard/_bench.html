@@ -461,8 +461,10 @@
                                     </div>
                                 </div>
                             </template>
-                            <!-- Upload complete summary -->
-                            <div x-show="benchUploadDone" x-cloak class="pt-3 flex items-center justify-between">
+                            <!-- Upload complete summary: total=0 means nothing was
+                                 ever attempted (e.g. a cancelled run), not a
+                                 completed-with-zero-items upload — omit the row. -->
+                            <div x-show="benchUploadDone?.total > 0" x-cloak class="pt-3 flex items-center justify-between">
                                 <span class="text-xs text-neutral-500"
                                       x-text="(benchUploadDone?.success || 0) + '/' + (benchUploadDone?.total || 0) + ' uploaded'"></span>
                                 <a x-show="benchUploadDone?.owner_hash"
