@@ -65,6 +65,7 @@ class UnoDecoder:
         seed=0,
         prefill_step_size=512,
         prefill=None,
+        constraint=None,
     ):
         if not getattr(model, "_uno_adapter_loaded", False):
             raise ValueError("Uno decoding requires a validated conditional adapter")
@@ -88,6 +89,7 @@ class UnoDecoder:
             raise ValueError("Uno prefill_step_size must be a positive integer")
         self.prefill_step_size = prefill_step_size
         self.prefill = model if prefill is None else prefill
+        self.constraint = constraint
 
     def _key(self):
         self.key, key = mx.random.split(self.key)
@@ -147,10 +149,14 @@ class UnoDecoder:
             draft = mx.concatenate([mx.array([committed[-1]]), noise])[None]
             row_mask = mx.concatenate([mx.zeros((1,)), mx.ones((length - 1,))])[None]
             draft_logits = self.model(draft, cache=cache, lora_mask=row_mask)[0]
+            if self.constraint is not None:
+                draft_logits = self.constraint.seed(draft_logits)
             proposals, q = self._sample(draft_logits)
             mx.eval(proposals, q)
             self._trim(cache, frontier)
             verify_logits = self.model(proposals[None], cache=cache)[0]
+            if self.constraint is not None:
+                verify_logits = self.constraint.verify(verify_logits, proposals.tolist())
             targets, p = self._sample(verify_logits)
             uniforms = residual = None
             if self.temperature == 0:
@@ -186,6 +192,8 @@ class UnoDecoder:
                     break
             if cancelled is not None and cancelled():
                 return
+            if self.constraint is not None:
+                self.constraint.commit(output)
             committed.extend(output)
             emitted += len(output)
             self._trim(cache, len(committed) - 1)

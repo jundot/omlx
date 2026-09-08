@@ -133,6 +133,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_step = 512
         self._prefill = None
         self._last_speculation = {}
+        self._grammar_compiler = None
 
     @property
     def model_name(self):
@@ -268,6 +269,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
                     self._prefix_cache = None
                 self._prefill = None
                 self._model = self._executor_tokenizer = self._tokenizer = None
+                self._grammar_compiler = None
                 self._output_parser_factory = self._prefill_guard = None
                 gc.collect()
                 mx.clear_cache()
@@ -344,6 +346,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
             "xtc_probability",
             "xtc_threshold",
             "repetition_context_size",
+            "compiled_grammar",
         }
         for name, value in kwargs.items():
             if name not in accepted and value is not None:
@@ -394,9 +397,11 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
             for message in messages:
                 message.pop("partial", None)
         from ..patches.k2_horizon import validate_chat_template_kwargs
+        from ..patches.k2_horizon.tool_grammar import validate_tool_prefix
 
         options = dict(chat_template_kwargs or {})
         validate_chat_template_kwargs(options)
+        validate_tool_prefix(messages, tools, is_partial)
         options.update(tokenize=False, add_generation_prompt=not is_partial)
         if is_partial:
             options["continue_final_message"] = True
@@ -417,6 +422,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         self._preflight(self._prompt_ids(prompt), request_id=request_id, **kwargs)
 
     async def preflight_chat(self, messages, tools=None, request_id=None, **kwargs):
+        self._prepare_tool_grammar(tools, kwargs)
         prompt = self._chat_prompt(
             messages,
             tools,
@@ -439,6 +445,13 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
         )
         if opened:
             parser.notify_prefilled_thought()
+        constraint = None
+        if options.get("compiled_grammar") is not None:
+            from ..patches.k2_horizon.tool_grammar import UnoToolConstraint
+
+            constraint = UnoToolConstraint(
+                options["compiled_grammar"], self._model.args.vocab_size
+            )
         decoder = UnoDecoder(
             self._model,
             eos_token_ids=tokenizer.eos_token_ids,
@@ -453,6 +466,7 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
             ),
             prefill_step_size=self._prefill_step,
             prefill=self._prefill,
+            constraint=constraint,
         )
         buffer = _StopBuffer(stops)
         text = ""
@@ -702,7 +716,29 @@ class UnoEngine(ActivityTrackingMixin, BaseEngine):
             raise RuntimeError("Uno request ended without a completion")
         return result
 
+    def _prepare_tool_grammar(self, tools, kwargs):
+        if not tools:
+            return
+        from ..api.grammar import create_grammar_compiler
+        from ..patches.k2_horizon.tool_grammar import compile_tool_grammar
+
+        if self._grammar_compiler is None:
+            try:
+                self._grammar_compiler = create_grammar_compiler(
+                    self._tokenizer, self._model, cache_limit_bytes=64 * 1024**2
+                )
+            except ImportError as error:
+                raise InvalidRequestError(
+                    "K2 tool-name constraints require xgrammar. Install omlx[grammar]."
+                ) from error
+        kwargs["compiled_grammar"] = compile_tool_grammar(
+            self._grammar_compiler,
+            convert_tools_for_template(tools),
+            kwargs.get("compiled_grammar"),
+        )
+
     async def stream_chat(self, messages, tools=None, **kwargs):
+        self._prepare_tool_grammar(tools, kwargs)
         prompt = self._chat_prompt(
             messages,
             tools,

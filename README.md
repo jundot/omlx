@@ -230,6 +230,13 @@ Compatible dense Uno adapters are validated by base identity and tensor layout,
 without a model-size whitelist.
 Uno implements the linear Psi-Spec sampler from the [paper](https://arxiv.org/abs/2609.04010) and [reference code](https://github.com/ifm-ai/uno).
 
+K2 tool requests require `omlx[grammar]`. Names are constrained to the request's
+tools in XML, typed XML, and JSON calls, including with Uno; tool argument schemas
+remain the client's responsibility. This also works with client-owned tools when
+backend MCP exposure is disabled. Malformed calls return an error instead of
+disappearing. Combining tool constraints with structured output, or continuing
+an unfinished assistant tool-call prefix, is currently unsupported.
+
 ### Per-Model Settings
 
 Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.

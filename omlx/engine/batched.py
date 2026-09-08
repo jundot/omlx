@@ -188,7 +188,11 @@ class BatchedEngine(BaseEngine):
             from ..api.grammar import create_grammar_compiler
 
             self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer, self._model
+                self._tokenizer,
+                self._model,
+                cache_limit_bytes=(
+                    64 * 1024**2 if self.model_type == "k2_horizon" else -1
+                ),
             )
             logger.info("GrammarCompiler initialized for %s", self._model_name)
         except Exception:
@@ -762,8 +766,10 @@ class BatchedEngine(BaseEngine):
 
             if self.model_type == "k2_horizon":
                 from ..patches.k2_horizon import validate_chat_template_kwargs
+                from ..patches.k2_horizon.tool_grammar import validate_tool_prefix
 
                 validate_chat_template_kwargs(template_kwargs)
+                validate_tool_prefix(messages, tools, is_partial)
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
                     self._tokenizer,
@@ -877,6 +883,16 @@ class BatchedEngine(BaseEngine):
             except Exception as e:
                 logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+    def _prepare_k2_tool_grammar(self, tools, kwargs):
+        if self.model_type == "k2_horizon" and tools:
+            from ..patches.k2_horizon.tool_grammar import compile_tool_grammar
+
+            kwargs["compiled_grammar"] = compile_tool_grammar(
+                self.grammar_compiler,
+                convert_tools_for_template(tools),
+                kwargs.get("compiled_grammar"),
+            )
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -913,6 +929,7 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -991,6 +1008,7 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1179,6 +1197,7 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
+        self._prepare_k2_tool_grammar(tools, kwargs)
         prompt = self._apply_chat_template(
             messages,
             template_tools,
