@@ -1064,6 +1064,13 @@
                 return messages.filter(Boolean).join(', ') || fallback;
             },
 
+            // Generic FastAPI error renderer for non-cluster endpoints:
+            // 422 validation failures return detail as an ARRAY of objects,
+            // which otherwise surfaces to the user as "[object Object]".
+            apiErrorMessage(detail, fallback = 'Something went wrong') {
+                return this.clusterErrorMessage(detail, fallback);
+            },
+
             clusterDisplayedError() {
                 return this.clusterConnectionError || this.clusterError;
             },
@@ -6814,7 +6821,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.apiErrorMessage(data.detail, window.t('js.error.save_settings_failed'));
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -6867,7 +6874,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.reload_failed'));
+                        alert(this.apiErrorMessage(data.detail, window.t('js.error.reload_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to reload models:', err);
@@ -6909,7 +6916,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.apiErrorMessage(data.detail, window.t('js.error.update_model_setting_failed')));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -6932,7 +6939,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.load_model_failed'));
+                        alert(this.apiErrorMessage(data.detail, window.t('js.error.load_model_failed')));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -6955,7 +6962,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.unload_model_failed'));
+                        alert(this.apiErrorMessage(data.detail, window.t('js.error.unload_model_failed')));
                     }
                     await this.loadModels();
                 } catch (err) {
@@ -7570,7 +7577,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = this.apiErrorMessage(data.detail, 'Failed to save profile');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7608,7 +7615,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to apply profile';
+                        this.profileError = this.apiErrorMessage(data.detail, 'Failed to apply profile');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7730,7 +7737,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = this.apiErrorMessage(data.detail, 'Failed to update profile');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7766,7 +7773,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = this.apiErrorMessage(data.detail, 'Failed to save template');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7787,7 +7794,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = this.apiErrorMessage(data.detail, 'Failed to update template');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -7942,7 +7949,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                        throw new Error(this.apiErrorMessage(data.detail, 'Failed to start ANE tuning.'));
                     }
                     this.aneTuning.tuningId = data.tuning_id;
                     this.aneTuning.total = Number(data.total || 0);
@@ -8073,7 +8080,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                        throw new Error(this.apiErrorMessage(data.detail, 'Failed to apply ANE tuning result.'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -8496,7 +8503,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        alert(this.apiErrorMessage(data.detail, window.t('js.error.save_model_settings_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
