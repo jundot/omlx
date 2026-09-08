@@ -117,6 +117,9 @@ def serve_command(args):
     if settings.cache.ane_compile_cache:
         os.environ.setdefault("OMLX_QWEN35_ANE_COMPILE_CACHE", "1")
 
+    # Same for the post-load prefill warmup: the pool reads it at every load.
+    if not bool(getattr(settings.server, "prefill_warmup", True)):
+        os.environ.setdefault("OMLX_PREFILL_WARMUP", "0")
     # Register TRACE level (5) — includes full message content
     TRACE = 5
     logging.addLevelName(TRACE, "TRACE")

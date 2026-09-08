@@ -178,6 +178,11 @@ class ServerSettings:
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
+    # Pay the cold first prefill chunk (~14,5 GB of footprint against ~2 GB
+    # warm, measured 04/09 on GLM-5.3-Flash) at load time, not on the user's
+    # first prompt — it aborted the 103 GB model in 2 of 4 loads and refused
+    # a 1024-token step. One throwaway 512-token forward after each load.
+    prefill_warmup: bool = True
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -209,6 +214,7 @@ class ServerSettings:
                 False,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
+            prefill_warmup=bool(data.get("prefill_warmup", True)),
         )
 
 

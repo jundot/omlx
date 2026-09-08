@@ -487,6 +487,8 @@
   "cluster.pairing.shared_secret_placeholder": "At least 16 characters",
   "cluster.pairing.generate": "Generate",
   "cluster.pairing.copy": "Copy",
+  "settings.advanced.prefill_warmup": "Warm up the prefill after loading a model",
+  "settings.advanced.prefill_warmup_hint": "The first prompt after a load pays a cold cost: the first 512-token chunk grows the process footprint by ~14.5 GB, every later one by ~2 GB (MLX's Metal buffer pool filling once). Measured on M1 Ultra with GLM-5.3-Flash (04/09): that cold chunk pushed a 103 GB model over the 115.5 GB hard watermark and aborted the user's first prompt in 2 of 4 loads. With this on, one throwaway 512-token forward runs right after each load (~3-4 s) so the first real prompt finds a warm pool. Applies on the next server start.",
   "settings.advanced.burst_decode": "Burst Decode",
   "settings.advanced.burst_decode_hint": "Process tokens in batches internally for faster generation. Higher levels run faster but stream in larger chunks; lower levels stream more smoothly. Applies instantly, no restart.",
   "settings.advanced.burst_decode_off": "Off (smoothest streaming)",
