@@ -6091,15 +6091,24 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
-        if (
+        # Suppressing target-selected EOS changes sampling behavior, so it is
+        # deliberately operator-controlled and off by default.  The guard
+        # masks model terminal IDs only while a prompt-opened thinking region
+        # remains active; request-specific stop IDs stay authoritative.
+        thinking_eos_guard = os.environ.get(
+            "OMLX_THINKING_EOS_GUARD", "0"
+        ).strip().lower() in {"1", "true", "on", "yes"}
+        needs_think_protocol = bool(
+            thinking_eos_guard
+            and request is not None
+            and getattr(request, "needs_think_prefix", False)
+        )
+        parser_budget_protocol = bool(
             sampling_params.thinking_budget is not None
             and request is not None
-            and (
-                getattr(request, "needs_think_prefix", False)
-                or self._get_output_parser_thinking_end_text() is not None
-            )
-        ):
+            and self._get_output_parser_thinking_end_text() is not None
+        )
+        if needs_think_protocol or parser_budget_protocol:
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
@@ -6120,6 +6129,11 @@ class Scheduler:
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
                     token_to_piece=self._thinking_budget_token_to_piece,
+                    stop_token_ids=(
+                        sorted(self._get_stop_tokens() - set(think_end_ids))
+                        if needs_think_protocol
+                        else None
+                    ),
                 )
                 logits_processors.append(processor)
 

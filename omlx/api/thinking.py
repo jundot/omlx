@@ -389,29 +389,31 @@ class ThinkingParser:
 
 
 class ThinkingBudgetProcessor:
-    """Logits processor that enforces a thinking token budget.
+    """Logits processor for an optional budget and opt-in EOS guard.
 
-    Counts tokens generated while in thinking mode.  When the budget is
-    exceeded, forces the close-think token(s) one at a time, then becomes
-    a no-op for the rest of generation.
+    When a budget is configured, counts tokens generated while in thinking
+    mode and forces the close-think sequence at the limit.  An explicitly
+    configured stop-token set is masked only while thinking remains open.
 
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
     Args:
         think_end_token_ids: Token ID(s) for the close-think tag.
-        budget: Maximum number of thinking tokens before forcing close.
+        budget: Optional maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        stop_token_ids: Explicitly enabled terminal IDs to mask until close.
     """
 
     def __init__(
         self,
         think_end_token_ids: List[int],
-        budget: int,
+        budget: Optional[int],
         think_start_token_id: Optional[int] = None,
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        stop_token_ids: Optional[Sequence[int]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -420,9 +422,12 @@ class ThinkingBudgetProcessor:
             + list(think_end_token_ids)
             + (trailing_token_ids or [])
         )
-        self._budget = budget
+        self._budget = None if budget is None else max(1, int(budget))
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._stop_token_ids = tuple(
+            sorted({int(token_id) for token_id in (stop_token_ids or ())})
+        )
 
         # State
         self._thinking_tokens: int = 0
@@ -458,10 +463,15 @@ class ThinkingBudgetProcessor:
         if self._forcing:
             return self._force_next_token(logits, mx)
 
+        if self._in_thinking and self._stop_token_ids:
+            logits[..., list(self._stop_token_ids)] = mx.array(float("-inf"))
+
         if self._waiting_utf8:
             return logits
 
         if self._in_thinking:
+            if self._budget is None:
+                return logits
             self._thinking_tokens += 1
             if self._thinking_tokens >= self._budget:
                 if self._last_token_utf8_complete:
