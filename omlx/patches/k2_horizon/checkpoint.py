@@ -8,6 +8,7 @@ import inspect
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import MethodType
 
 
 def checkpoint_files(path: Path) -> list[Path]:
@@ -98,6 +99,20 @@ def _patch_tokenizer(utils) -> None:
             config_path.is_file()
             and json.loads(config_path.read_text()).get("model_type") == "k2_horizon"
         ):
+            encode_method = tokenizer.encode
+            encode = encode_method.__func__
+
+            @functools.wraps(encode)
+            def encode_prompt(self, text, *args, **kwargs):
+                if (
+                    not args
+                    and isinstance(text, str)
+                    and text.startswith("<|ifm|begin_of_text|>")
+                ):
+                    kwargs.setdefault("add_special_tokens", False)
+                return encode(self, text, *args, **kwargs)
+
+            tokenizer.encode = MethodType(encode_prompt, encode_method.__self__)
             tokenizer.add_eos_token("<|ifm|im_end|>")
             generation_path = Path(model_path) / "generation_config.json"
             if generation_path.is_file():
