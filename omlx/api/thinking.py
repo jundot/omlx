@@ -212,6 +212,44 @@ def extract_thinking(text: str) -> Tuple[str, str]:
     return ("", text)
 
 
+def reclassify_truncated_thinking(
+    raw_text: str,
+    finish_reason: str | None,
+    start_in_thinking: bool,
+) -> Tuple[str, str]:
+    """Return (thinking_content, regular_content) for a non-streaming result.
+
+    When the generation was cut off by ``max_tokens`` (``finish_reason ==
+    "length"``) while the prompt had opened a thinking block and the model
+    never emitted a close tag before the cut, ``extract_thinking`` classifies
+    the tag-free body as content. That body is an unfinished chain of thought,
+    and surfacing it as the visible answer leaks the reasoning (issue #2457).
+
+    Reclassify the whole body as thinking so the answer stays empty instead
+    of leaked. The close tag string is the module-level ``_CLOSE_TAG``; we
+    check the raw text for it rather than relying on ``extract_thinking``'s
+    output, because both its tag-free and malformed branches collapse to
+    ``("", text)``.
+
+    Args:
+        raw_text: Complete (cleaned) model output text.
+        finish_reason: The generation's finish reason ("stop", "length", ...).
+        start_in_thinking: Whether the prompt opened a thinking block
+            (computed by the caller via ``prompt_opens_thinking``).
+
+    Returns:
+        Tuple of (thinking_content, regular_content).
+    """
+    thinking_content, regular_content = extract_thinking(raw_text)
+    if (
+        finish_reason == "length"
+        and _CLOSE_TAG not in raw_text
+        and start_in_thinking
+    ):
+        return raw_text, ""
+    return thinking_content, regular_content
+
+
 class ThinkingParser:
     """Stateful streaming parser for separating <think>...</think> from content.
 
@@ -323,15 +361,24 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(self, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
         Also recovers from malformed thinking — when the model never
-        emitted ``</think>`` and no content was ever produced, returns
+        emitted `` response`` and no content was ever produced, returns
         the accumulated thinking text as content so the client surfaces
         a non-empty answer body.
+
+        Args:
+            truncated: True when the stream was cut off by ``max_tokens``
+                (``finish_reason == "length"``). In that case a missing
+                `` response`` close tag means the model was interrupted
+                mid-thought, not that it chose to answer without closing.
+                The accumulated text is reasoning, not an answer, so the
+                recovery branch is skipped to avoid leaking the chain of
+                thought into the visible reply (issue #2457).
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -340,8 +387,25 @@ class ThinkingParser:
         partial = self._buffer
         self._buffer = ""
 
+        # Truncated stream: never re-emit accumulated thinking as content.
+        # The reasoning deltas already streamed live cannot be retracted,
+        # but surfacing the same text as an answer would make the client
+        # present a chain of thought as if it were the real reply. An
+        # empty content field is strictly better than a leaked one.
+        if truncated:
+            if not partial:
+                return ("", "")
+            # Partial tag never completed — emit it as-is in the current
+            # mode, mirroring the non-truncated flush below.
+            if self._in_thinking:
+                self._thinking_accumulated.append(partial)
+                return (partial, "")
+            else:
+                self._content_emitted = True
+                return ("", partial)
+
         # Recovery: prompt opened a thinking block (or model echoed
-        # ``<think>`` itself), the close tag never arrived, and nothing
+        # `` thinking`` itself), the close tag never arrived, and nothing
         # ever streamed as content. Re-emit the accumulated thinking text
         # as content so the answer body is not empty. The thinking events
         # already streamed live cannot be retracted, so the client sees
