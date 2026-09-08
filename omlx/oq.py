@@ -166,6 +166,36 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
+def _canonical_output_dtype(dtype: str) -> str:
+    """Name the dtype oQ will actually store, mirroring ``target_dtype``.
+
+    Both write paths store fp16 for anything not exactly ``"bfloat16"``, so
+    deriving the label from the same test keeps the config from disagreeing
+    with the tensors. Assumes ``dtype`` already passed the ``OQ_DTYPES``
+    check, which is what keeps the fallback from mislabelling a third value.
+    """
+    return "bfloat16" if dtype == "bfloat16" else "float16"
+
+
+def _apply_output_dtype(config: dict, dtype: str) -> None:
+    """Record the dtype oQ wrote, replacing the source's inherited claim.
+
+    A source config describes the checkpoint oQ read, not the one it writes,
+    and nothing in the load path corrects it, so a float16 build of a bfloat16
+    source reads back as bfloat16. Follows ``_clone_config`` in
+    ``tools/clone_mlx_model_fp16.py``, but only rewrites keys the source
+    declared rather than adding any. ``vision_config`` is left alone: under a
+    float16 target, vision and audio weights are stored as float32.
+    """
+    resolved = _canonical_output_dtype(dtype)
+    for section in (config, config.get("text_config")):
+        if not isinstance(section, dict):
+            continue
+        for key in ("dtype", "torch_dtype"):
+            if key in section:
+                section[key] = resolved
+
+
 def _is_vlm_load(config: dict) -> bool:
     """VLM routing predicate for oQ's model-load helpers.
 
@@ -6507,6 +6537,7 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
     if imatrix_report is not None:
@@ -8799,6 +8830,7 @@ def _build_streaming_proxy_for_sensitivity(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
