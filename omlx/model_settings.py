@@ -307,12 +307,10 @@ class ModelSettings:
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
 
-    uno_enabled: bool = False
     k2_ane_prefill_enabled: bool = False
     k2_ane_prefill_fraction: float = 1 / 3
     k2_ane_prefill_shared_fraction: float = 1.0
     k2_ane_prefill_sequence_length: int = 2048
-    uno_adapter_model: str | None = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -366,28 +364,6 @@ class ModelSettings:
             or self.k2_ane_prefill_sequence_length % 32
         ):
             raise ValueError("K2 ANE prefill tile must be a positive multiple of 32.")
-        if self.uno_enabled:
-            if not self.uno_adapter_model:
-                raise ValueError("Enable Uno requires an adapter selection.")
-            for name in (
-                "mtp_enabled",
-                "vlm_mtp_enabled",
-                "dflash_enabled",
-                "specprefill_enabled",
-                "turboquant_kv_enabled",
-                "qwen35_ane_prefill_enabled",
-                "guided_grammar_enabled",
-                "thinking_budget_enabled",
-            ):
-                if getattr(self, name, False):
-                    raise ValueError(f"Uno cannot be combined with {name}.")
-            for name, neutral in (
-                ("min_p", 0),
-                ("repetition_penalty", 1),
-                ("presence_penalty", 0),
-            ):
-                if getattr(self, name) not in (None, neutral):
-                    raise ValueError(f"Uno requires {name}={neutral}.")
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is

@@ -65,12 +65,10 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
-        'uno_enabled',
         'k2_ane_prefill_enabled',
         'k2_ane_prefill_fraction',
         'k2_ane_prefill_shared_fraction',
         'k2_ane_prefill_sequence_length',
-        'uno_adapter_model',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -7299,23 +7297,7 @@
                 return options;
             },
 
-            unoAdapterCandidates() {
-                const base = this.selectedModel?.uno_base_model_id;
-                return (this.models || []).filter(m => base
-                    && m.config_model_type === 'k2_horizon_uno'
-                    && m.uno_base_model_id === base);
-            },
 
-            unoConflict() {
-                const s = this.modelSettings || {};
-                return ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled',
-                    'specprefill_enabled', 'turboquant_kv_enabled',
-                    'qwen35_ane_prefill_enabled', 'guided_grammar_enabled',
-                    'enableThinkingBudget'].some(key => s[key])
-                    || [['min_p', 0], ['repetition_penalty', 1], ['presence_penalty', 0]]
-                        .some(([key, neutral]) => s[key] !== '' && s[key] != null
-                            && Number(s[key]) !== neutral);
-            },
 
             vlmMtpDraftModelCandidates() {
                 return this.draftModelCandidates(
@@ -7482,8 +7464,6 @@
                     k2_ane_prefill_fraction: s.k2_ane_prefill_fraction ?? 1 / 3,
                     k2_ane_prefill_shared_fraction: s.k2_ane_prefill_shared_fraction ?? 1,
                     k2_ane_prefill_sequence_length: s.k2_ane_prefill_sequence_length ?? 2048,
-                    uno_enabled: s.uno_enabled || false,
-                    uno_adapter_model: s.uno_adapter_model || '',
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -8467,8 +8447,6 @@
                                 k2_ane_prefill_fraction: Number(this.modelSettings.k2_ane_prefill_fraction),
                                 k2_ane_prefill_shared_fraction: Number(this.modelSettings.k2_ane_prefill_shared_fraction),
                                 k2_ane_prefill_sequence_length: Number(this.modelSettings.k2_ane_prefill_sequence_length),
-                                uno_enabled: !!this.modelSettings.uno_enabled,
-                                uno_adapter_model: this.modelSettings.uno_adapter_model || null,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -8533,8 +8511,6 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
-                                    uno_enabled: false,
-                                    uno_adapter_model: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,

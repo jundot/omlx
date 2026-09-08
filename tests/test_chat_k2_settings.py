@@ -1,22 +1,20 @@
-"""Exercise Chat request settings for K2, Uno, and other model families."""
+"""Exercise Chat request settings for K2 and other model families."""
 
 import json
-from pathlib import Path
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 
 @pytest.mark.parametrize(
-    "model_type,uno,expected_mode,expected_generation",
+    "model_type,expected_mode,expected_generation",
     [
-        ("k2_horizon", True, "auto", {"max_tokens": 128}),
-        ("k2_horizon", False, "on_limit", {"max_tokens": 128, "thinking_budget": 4096}),
+        ("k2_horizon", "on_limit", {"max_tokens": 128, "thinking_budget": 4096}),
         (
             "qwen3",
-            False,
             "on_limit",
             {
                 "max_tokens": 128,
@@ -27,7 +25,7 @@ import pytest
     ],
 )
 def test_saved_thinking_settings_respect_model_capabilities(
-    model_type, uno, expected_mode, expected_generation
+    model_type, expected_mode, expected_generation
 ):
     node = shutil.which("node")
     if not node:
@@ -36,7 +34,6 @@ def test_saved_thinking_settings_respect_model_capabilities(
     names = [
         "currentModelInfo",
         "isK2Model",
-        "usesUno",
         "thinkingModeValue",
         "normalizeThinkingBudgetTokens",
         "setThinkingMode",
@@ -53,7 +50,7 @@ def test_saved_thinking_settings_respect_model_capabilities(
     model = {
         "id": "base",
         "config_model_type": model_type,
-        "settings": {"uno_enabled": uno},
+        "settings": {},
     }
     script = (
         "const app = {"

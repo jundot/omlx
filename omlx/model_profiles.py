@@ -84,8 +84,6 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "k2_ane_prefill_fraction",
     "k2_ane_prefill_shared_fraction",
     "k2_ane_prefill_sequence_length",
-    "uno_enabled",
-    "uno_adapter_model",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
     "specprefill_enabled",

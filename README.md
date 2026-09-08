@@ -218,20 +218,15 @@ Load LLMs, VLMs, embedding models, and rerankers within the same server. Models 
 K2 Horizon supports serving and oQ quantization. Use **Chat Template Kwargs**
 to set `reasoning_effort` to `low`, `medium`, or `high` (default).
 **Thinking Budget** limits reasoning. A budget of 1 forces immediate closure and can reduce answer quality.
-For a compatible K2 base, enable **Uno** and select its local adapter.
-Uno is off by default, supports SSD prefix reuse, and does not support thinking budgets.
 **K2 ANE Prompt Processing** is opt-in for dense K2 and MoVA. The tuner compares
 GPU and ANE MLP splits in the web and macOS settings. Apply its result to opt in.
 Attention, routed experts,
 KV, and decode stay on GPU. Existing affine quantization is retained on GPU;
 ANE uses FP16 and can change outputs. Split configurations use separate SSD
 prefix namespaces. This requires the native ANE extension.
-Compatible dense Uno adapters are validated by base identity and tensor layout,
-without a model-size whitelist.
-Uno implements the linear Psi-Spec sampler from the [paper](https://arxiv.org/abs/2609.04010) and [reference code](https://github.com/ifm-ai/uno).
 
 K2 tool requests require `omlx[grammar]`. Names are constrained to the request's
-tools in XML, typed XML, and JSON calls, including with Uno; tool argument schemas
+tools in XML, typed XML, and JSON calls; tool argument schemas
 remain the client's responsibility. This also works with client-owned tools when
 backend MCP exposure is disabled. Malformed calls return an error instead of
 disappearing. Combining tool constraints with structured output, or continuing

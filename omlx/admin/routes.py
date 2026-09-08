@@ -271,12 +271,10 @@ class ModelSettingsRequest(BaseModel):
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
-    uno_enabled: bool | None = None
     k2_ane_prefill_enabled: bool | None = None
     k2_ane_prefill_fraction: float | None = None
     k2_ane_prefill_shared_fraction: float | None = None
     k2_ane_prefill_sequence_length: int | None = None
-    uno_adapter_model: str | None = None
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
@@ -2014,7 +2012,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             _ms.specprefill_draft_model,
             _ms.dflash_draft_model,
             _ms.vlm_mtp_draft_model,
-            _ms.uno_adapter_model,
         ):
             if ref:
                 referenced_drafts.add(ref)
@@ -2122,10 +2119,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "paroquant_reason": paroquant_reason,
         }
 
-        if model_info.get("config_model_type") in ("k2_horizon", "k2_horizon_uno"):
-            from ..uno_bundle import uno_base_id
-
-            model_data["uno_base_model_id"] = uno_base_id(model_info["model_path"])
 
         # Add settings if available
         if settings:
@@ -2917,12 +2910,8 @@ async def update_model_settings(
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
-    if "uno_enabled" in sent:
-        current_settings.uno_enabled = bool(request.uno_enabled)
     if "k2_ane_prefill_enabled" in sent:
         current_settings.k2_ane_prefill_enabled = bool(request.k2_ane_prefill_enabled)
-    if "uno_adapter_model" in sent:
-        current_settings.uno_adapter_model = request.uno_adapter_model or None
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -2953,17 +2942,6 @@ async def update_model_settings(
             ):
                 raise ValueError("ANE prefill requires a K2 model.")
         except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-    if current_settings.uno_enabled:
-        from ..uno_bundle import resolve_uno_bundle
-
-        try:
-            current_settings.__post_init__()
-            adapter = engine_pool.get_entry(current_settings.uno_adapter_model)
-            if adapter is None or adapter.config_model_type != "k2_horizon_uno":
-                raise ValueError("Select an available Uno adapter.")
-            resolve_uno_bundle(entry.model_path, adapter.model_path)
-        except (ValueError, OSError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     if request.is_pinned is not None:

@@ -17,7 +17,7 @@ from omlx.model_settings import ModelSettings
 async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_path):
     from omlx.custom_kernels.qwen35_prefill import fast
 
-    base = ModelSettings(uno_enabled=True, uno_adapter_model="adapter")
+    base = ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=128)
     loaded = {"model"}
 
     async def unload(name):
@@ -45,9 +45,8 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
-        assert not transient.uno_enabled
         assert transient.k2_ane_prefill_enabled == candidate.enabled
-        assert base.uno_enabled and not base.k2_ane_prefill_enabled
+        assert base.thinking_budget_enabled and not base.k2_ane_prefill_enabled
         loaded.add("model")
         row = ane_tuning._empty_result(candidate)
         row["processing_tps"] = next(samples)
@@ -62,7 +61,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
     assert run.recommendation["backend"] == "k2"
     assert run.recommendation["enabled"] == (peak > 103)
     assert not loaded and restored == ["old"]
-    assert base.uno_enabled and not base.k2_ane_prefill_enabled
+    assert base.thinking_budget_enabled and not base.k2_ane_prefill_enabled
 
 
 @pytest.mark.asyncio

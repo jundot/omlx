@@ -2198,16 +2198,14 @@
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
-                        :disabled="isK2Model() && usesUno()"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                         style="color: var(--text-primary);">
                         <option value="auto">{{ t('chat.thinking_mode.auto') }}</option>
                         <option value="on_unlimit" :disabled="isK2Model()">{{ t('chat.thinking_mode.on_unlimited') }}</option>
-                        <option value="on_limit" :disabled="usesUno()">{{ t('chat.thinking_mode.on_limited') }}</option>
+                        <option value="on_limit">{{ t('chat.thinking_mode.on_limited') }}</option>
                         <option value="off" :disabled="isK2Model()">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
-                    <p x-show="isK2Model() && !usesUno()" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
-                    <p x-show="usesUno()" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.uno_budget_hint') }}</p>
+                    <p x-show="isK2Model()" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
@@ -2741,13 +2739,10 @@
                 return this.currentModelInfo()?.config_model_type === 'k2_horizon';
             },
 
-            usesUno() {
-                return !!this.currentModelInfo()?.settings?.uno_enabled;
-            },
 
             thinkingModeValue() {
                 if (this.isK2Model()) {
-                    return this.modelSettings.thinking_budget_enabled && !this.usesUno()
+                    return this.modelSettings.thinking_budget_enabled
                         ? 'on_limit' : 'auto';
                 }
                 if (this.modelSettings.enable_thinking === false) return 'off';
@@ -2816,7 +2811,6 @@
             },
 
             setThinkingMode(mode) {
-                if (mode === 'on_limit' && this.usesUno()) return;
                 if (this.isK2Model() && ['off', 'on_unlimit'].includes(mode)) return;
                 if (mode === 'on_unlimit') {
                     this.modelSettings.enable_thinking = true;
@@ -3432,7 +3426,7 @@
                     if (s[key] != null) gen[key] = s[key];
                 }
                 if (this.isK2Model()) {
-                    if (s.thinking_budget_enabled && !this.usesUno()) {
+                    if (s.thinking_budget_enabled) {
                         gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
                     }
                 } else if (s.enable_thinking === true) {
