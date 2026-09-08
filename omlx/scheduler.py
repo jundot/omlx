@@ -3522,17 +3522,13 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
         # in a restored RotatingKVCache (e.g. shared layer_meta_states from
         # an earlier store_cache bug). Use cached_tokens which is always
         # derived from block_table.num_tokens and therefore trustworthy.
-        if (
-            boundary_enabled
-            and hasattr(request, "cached_tokens")
-            and request.cached_tokens > 0
-        ):
+        if hasattr(request, "cached_tokens") and request.cached_tokens > 0:
             if base_size != request.cached_tokens:
                 logger.debug(
                     "Cache base_size mismatch: computed %d, expected %d "
@@ -3967,6 +3963,7 @@ class Scheduler:
         per_token = 0.0
         static_per_token = 0.0
         recent_reclaim = 0
+        partial_bytes = 0
         tracker = self._prefill_transient_tracker
         if self.memory_monitor is not None:
             static = self.memory_monitor.estimate_chunk_transient_bytes(
@@ -3990,8 +3987,10 @@ class Scheduler:
             # tracker keeps their measured histories separate, so switching
             # paths cannot reintroduce a stale dense charge after the first
             # gathered sample.
+            partial_bytes = tracker.partial_bound(n_tokens, gathered_core)
             ewma = tracker.bytes_per_token_for(gathered_core)
-            recent_reclaim = tracker.recent_reclaim_bytes
+            if tracker.recent_reclaim_bytes:
+                recent_reclaim = tracker.reclaim_bytes_at(get_phys_footprint())
             if ewma > 0:
                 per_token = max(per_token, ewma)
             last_n_tokens = tracker.last_n_tokens_for(gathered_core)
@@ -4005,7 +4004,10 @@ class Scheduler:
             static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
             + recent_reclaim
         )
-        return max(base_prediction, reallocation_prediction)
+        return max(
+            base_prediction, reallocation_prediction,
+            partial_bytes * self._PREFILL_TRANSIENT_SAFETY,
+        )
 
     def _admission_transient_bound(
         self, n_tokens: int, kv_len: int, *, gathered_core: bool = False
@@ -4921,15 +4923,9 @@ class Scheduler:
                 / 1024**2,
             )
             return
-        # The reclaim ledger sees every measurement, including samples the
-        # EWMA gates below skip: a release on a sub-floor tail must still be
-        # priced, and any positive growth confirms the pool reallocation and
-        # drops the one-shot charge — leaving it armed after the footprint
-        # recovered would double count against the guard's gates.
-        if delta <= 0:
-            self._prefill_transient_tracker.record_reclaim(-delta)
-        else:
-            self._prefill_transient_tracker.clear_reclaim()
+        # Include samples skipped by the EWMA gates. A positive delta repays
+        # only the footprint actually recovered, not the entire prior release.
+        self._prefill_transient_tracker.observe_footprint(pre_bytes, post_bytes)
         min_chunk = max(1, self._prefill_min_chunk_tokens)
         if n_tokens < min_chunk:
             logger.debug(
@@ -4967,11 +4963,30 @@ class Scheduler:
                 requested_step,
             )
             return
+        partial = requested_step is not None and n_tokens < requested_step
+        if partial:
+            self._prefill_transient_tracker.observe_partial(
+                n_tokens, delta, gathered_core=gathered_core
+            )
+        if partial and self._prefill_transient_tracker.has_representative_sample_for(
+            gathered_core
+        ):
+            self._prefill_transient_tracker.observe_floor(
+                delta, floor_sample=n_tokens <= min_chunk,
+                gathered_core=gathered_core,
+            )
+            logger.debug(
+                "[throttle:%s] partial rid=%s n=%d delta=%.2fMB "
+                "(retained as bytes; representative rate unchanged)",
+                loop_label, request_id, n_tokens, delta / 1024**2,
+            )
+            return
         self._prefill_transient_tracker.update(
             n_tokens,
             delta,
             floor_sample=n_tokens <= min_chunk,
             gathered_core=gathered_core,
+            representative=not partial,
         )
         logger.debug(
             "[throttle:%s] measure rid=%s n=%d kv_len=%d transient=%.2fMB per_token=%.1fKB ewma=%.1fKB observed_max=%.1fMB samples=%d",
@@ -5321,10 +5336,9 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = _cache_base_sizes(prompt_cache)
         if (
-            boundary_enabled
-            and hasattr(request, "cached_tokens")
+            hasattr(request, "cached_tokens")
             and request.cached_tokens > 0
             and base_size != request.cached_tokens
         ):

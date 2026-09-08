@@ -871,8 +871,8 @@ def test_sub_floor_tail_release_is_charged():
     assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
 
 
-def test_skipped_positive_sample_clears_reclaim_charge():
-    """Any positive delta drops the charge, even on EWMA-skipped samples."""
+def test_skipped_positive_sample_repays_only_recovered_footprint():
+    """A skipped positive sample must preserve the unrecovered release."""
     released = 6 * _GB
     ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
     ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
@@ -889,7 +889,7 @@ def test_skipped_positive_sample_clears_reclaim_charge():
     assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
 
     # Positive growth on a sub-floor tail is excluded from the EWMA but the
-    # footprint recovered, so the one-shot charge must not stay armed.
+    # footprint recovered only five of the six released GiB.
     ns._record_chunk_transient(
         17,
         94 * _GB,
@@ -898,10 +898,10 @@ def test_skipped_positive_sample_clears_reclaim_charge():
         loop_label="test",
         requested_step=2048,
     )
-    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == _GB
 
 
-def test_speed_partial_positive_clears_reclaim_charge():
+def test_speed_partial_positive_preserves_remaining_reclaim():
     """Speed-priority partial chunks also confirm reallocation."""
     released = 6 * _GB
     ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
@@ -927,7 +927,7 @@ def test_speed_partial_positive_clears_reclaim_charge():
         loop_label="test",
         requested_step=512,
     )
-    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == _GB
 
 
 def test_record_chunk_transient_skips_tail_samples():
@@ -1620,3 +1620,126 @@ def test_adaptive_throttle_tail_below_floor_never_grows_chunk():
     # above the tail (152).
     n = _call(ns, 152, kv_len=122_000)
     assert n <= 152
+
+
+@pytest.mark.parametrize("current, remaining", [(97, 3), (99, 1), (100, 0)])
+def test_reclaim_prediction_uses_live_unrecovered_gap(current, remaining):
+    ns = _throttle_ctx(current=current * _GB, hard=119 * _GB)
+    ns.memory_monitor = None
+    ns._prefill_transient_tracker.observe_footprint(100 * _GB, 94 * _GB)
+    with patch.object(sched_mod, "get_phys_footprint", return_value=current * _GB):
+        assert ns._predicted_chunk_transient(512, 0) == remaining * _GB
+
+
+def test_repeated_large_sample_still_bounds_scheduler_prediction():
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns.memory_monitor = None
+    for mib in (100, 2048, 2048):
+        ns._prefill_transient_tracker.update(512, mib * 1024**2)
+    assert ns._predicted_chunk_transient(512, 0) >= 2 * _GB * 1.3
+
+
+class TestPartialCostIsolation:
+    @staticmethod
+    def context():
+        ns = _throttle_ctx(current=10 * _GB, hard=16 * _GB)
+        ns._fake_current = 10 * _GB
+        ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+            ns, Scheduler
+        )
+        return ns
+
+    @staticmethod
+    def record(ns, width, mib, step=512):
+        ns._record_chunk_transient(
+            width, 10 * _GB, 10 * _GB + mib * 1024**2,
+            request_id="partial", loop_label="test", requested_step=step,
+        )
+
+    def test_partial_spike_does_not_stop_next_full_chunk(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        rate = ns._prefill_transient_tracker.bytes_per_token
+        for _ in range(4):
+            self.record(ns, 128, 1319)
+        tracker = ns._prefill_transient_tracker
+        assert tracker.bytes_per_token == rate
+        assert tracker.last_n_tokens == 512
+        assert tracker.last_delta_bytes == 333 * 1024**2
+        assert ns._predicted_chunk_transient(512, 90000) == pytest.approx(
+            1319 * 1024**2 * 1.3
+        )
+        assert _call(ns, 512, kv_len=90000) == 512
+        assert _guard_call(ns, 512, kv_len=90000) == 512
+
+    def test_cheap_partial_cannot_lower_representative_cost(self):
+        ns = self.context()
+        self.record(ns, 512, 2048)
+        before = ns._predicted_chunk_transient(512, 0)
+        for _ in range(5):
+            self.record(ns, 128, 10)
+        assert ns._predicted_chunk_transient(512, 0) == before
+
+    def test_cheap_full_chunk_cannot_erase_partial_allocation(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        self.record(ns, 128, 1319)
+        self.record(ns, 512, 333)
+        assert ns._prefill_transient_tracker.partial_bytes_for(False) == 1319 * 1024**2
+        ns._fake_current = 13.5 * _GB
+        assert _guard_call(ns, 128, kv_len=90000) < 128
+        ns._prefill_speed_priority = True
+        with pytest.raises(PrefillMemoryExceededError):
+            _guard_call(ns, 128, kv_len=90000)
+
+    def test_covering_full_sample_replaces_partial_evidence(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        self.record(ns, 128, 200)
+        before = [ns._predicted_chunk_transient(n, 0) for n in (32, 128, 512)]
+        self.record(ns, 512, 800)
+        assert ns._prefill_transient_tracker.partial_bytes_for(False) == 0
+        assert all(
+            ns._predicted_chunk_transient(n, 0) >= cost
+            for n, cost in zip((32, 128, 512), before)
+        )
+
+    def test_unseeded_partial_keeps_existing_calibration(self):
+        ns = self.context()
+        self.record(ns, 128, 1319)
+        tracker = ns._prefill_transient_tracker
+        assert not tracker.has_representative_sample_for(False)
+        assert tracker.bytes_per_token == 1319 * 1024**2 / 128
+        self.record(ns, 128, 333)
+        assert not tracker.has_representative_sample_for(False)
+
+    def test_partial_floor_keeps_existing_admission_protection(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        self.record(ns, 32, 1000)
+        assert ns._prefill_transient_tracker.observed_max_bytes == 1000 * 1024**2
+
+
+    def test_large_partial_does_not_become_a_new_global_floor(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        self.record(ns, 128, 1319)
+        assert ns._predicted_chunk_transient(32, 0) == pytest.approx(
+            1319 * 1024**2 * 32 / 128 * 1.3
+        )
+        ns._fake_current = 13.5 * _GB
+        assert _guard_call(ns, 32, kv_len=90000) == 32
+
+
+    def test_gradual_partial_growth_below_outlier_gate_does_not_raise_ewma(self):
+        ns = self.context()
+        self.record(ns, 512, 333)
+        tracker = ns._prefill_transient_tracker
+        rate = tracker.bytes_per_token
+        for _ in range(6):
+            cost_mib = tracker.bytes_per_token * 3 * 128 / 1024**2
+            self.record(ns, 128, cost_mib)
+        assert tracker.bytes_per_token == rate
+        assert ns._predicted_chunk_transient(512, 0) == pytest.approx(
+            333 * 1024**2 * 1.3
+        )

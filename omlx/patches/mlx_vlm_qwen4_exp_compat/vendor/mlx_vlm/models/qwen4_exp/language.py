@@ -18,6 +18,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.memory_monitor import (
+    qwen4_gathered_min_query_tokens as _gathered_min_query_tokens,
+)
+
 from .cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
@@ -75,17 +79,6 @@ def _broadcast_text_mrope_position_ids(
     if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
         del _TEXT_MROPE_EQUAL_PLANES[:-8]
     return same
-
-
-def _gathered_min_query_tokens() -> int:
-    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
-    raw = os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "").strip()
-    if raw:
-        try:
-            return max(2, int(raw))
-        except ValueError:
-            pass
-    return 16
 
 
 def _split_text_mrope_positions(

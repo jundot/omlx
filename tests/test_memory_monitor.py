@@ -1367,3 +1367,24 @@ class TestAnePrefillTransientReserve:
         # Negative input clamps to zero instead of widening headroom.
         monitor.set_ane_prefill_transient_bytes(-5)
         assert monitor._ane_prefill_transient_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "override, minimum", [("", 16), ("32", 32), ("1", 2), ("invalid", 16)]
+)
+def test_qwen4_short_prefill_prices_runtime_dense_route(
+    monkeypatch, override, minimum
+):
+    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", override)
+    profile = TestQwen4ExpPrefillMemoryProfile._profile()
+    for width in range(2, minimum):
+        assert profile.estimate_prefill_transient_bytes(
+            width, 160_000, gathered_core=True
+        ) == profile.estimate_prefill_transient_bytes(
+            width, 160_000, gathered_core=False
+        )
+    assert profile.estimate_prefill_transient_bytes(
+        minimum, 160_000, gathered_core=True
+    ) < profile.estimate_prefill_transient_bytes(
+        minimum, 160_000, gathered_core=False
+    )
