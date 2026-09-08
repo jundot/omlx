@@ -1,0 +1,59 @@
+{
+  "_state": "device_card",
+  "_comment": "Three unpaired peers stream in — proves the v1 two-Mac cap is gone.",
+  "paired": [],
+  "discovered": [
+    {
+      "node_id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "friendly_name": "studio-2",
+      "version": "0.6.1",
+      "cluster_name": "omlx",
+      "caps": {"chip": "M3 Ultra", "ram_gb": 512, "backends": ["metal"], "thunderbolt": true, "jaccl": true},
+      "addrs": [{"ip": "192.168.1.11", "if_type": "thunderbolt"}],
+      "http_port": 8000,
+      "paired": false,
+      "last_seen": 1782000001.0,
+      "link": "tb",
+      "state": "discovered"
+    },
+    {
+      "node_id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "friendly_name": "macbook-air",
+      "version": "0.6.1",
+      "cluster_name": "omlx",
+      "caps": {"chip": "M4", "ram_gb": 32, "backends": ["metal"], "thunderbolt": false, "jaccl": false},
+      "addrs": [{"ip": "192.168.1.12", "if_type": "wifi"}],
+      "http_port": 8000,
+      "paired": false,
+      "last_seen": 1782000002.0,
+      "link": "wifi",
+      "state": "discovered"
+    },
+    {
+      "node_id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "friendly_name": "mini-office",
+      "version": "0.6.1",
+      "cluster_name": "omlx",
+      "caps": {"chip": "M4 Pro", "ram_gb": 64, "backends": ["metal"], "thunderbolt": true, "jaccl": false},
+      "addrs": [{"ip": "192.168.1.13", "if_type": "ethernet"}],
+      "http_port": 8000,
+      "paired": false,
+      "last_seen": 1782000003.0,
+      "link": "ethernet",
+      "state": "suspect"
+    }
+  ],
+  "self": {
+    "node_id": "3f6f2a90-7d1c-4b55-9c2a-1f0e9a8b7c6d",
+    "friendly_name": "studio-1",
+    "version": "0.6.1",
+    "cluster_name": "omlx",
+    "caps": {"chip": "M3 Ultra", "ram_gb": 512, "backends": ["metal"], "thunderbolt": true, "jaccl": true},
+    "addrs": [{"ip": "192.168.1.10", "if_type": "ethernet"}],
+    "http_port": 8000,
+    "paired": true,
+    "last_seen": 1782000000.0,
+    "link": "ethernet",
+    "state": "discovered"
+  }
+}

@@ -1,0 +1,616 @@
+<!-- Cluster tab v2 — exo-style wizard. Self-contained Alpine component
+     (cluster_v2.js) nested inside the dashboard() scope; reads mainTab and
+     clusterLegacyView from ancestors. The v1 tab survives unchanged behind
+     the "Advanced (legacy)" toggle wired in dashboard.html.
+     States: empty / discovering / device_card / pairing / checks / plan /
+     active / error. Feedback is toasts and banners, never modals. -->
+<div x-data="clusterV2Wizard()" x-init="init()"
+     x-show="mainTab === 'cluster' && !clusterLegacyView" x-cloak
+     data-cluster-v2-wizard>
+    <div class="animate-fade-in-up">
+
+        <!-- Header: outcome-first title, step pills, legacy escape hatch. -->
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+            <div>
+                <h2 class="text-2xl font-bold tracking-tight text-neutral-900">Your Macs, one computer</h2>
+                <p class="text-sm text-neutral-500 mt-2 max-w-2xl">
+                    oMLX finds other Macs on your network by itself. Pair them with one
+                    code and models split across the whole pool automatically.
+                </p>
+            </div>
+            <button type="button" @click="clusterLegacyView = true"
+                    class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-500 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 hover:text-neutral-700 self-start"
+                    data-cluster-v2-legacy-toggle>
+                <i data-lucide="wrench" class="w-3.5 h-3.5"></i>
+                Advanced (legacy)
+            </button>
+        </div>
+
+        <!-- Where you are. Five steps, derived from the live snapshot. -->
+        <div class="mb-6" data-cluster-v2-steps x-show="wizardState() !== 'error'">
+            <ol class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                <template x-for="(step, index) in wizardSteps()" :key="step.key">
+                    <li class="relative rounded-xl border p-3 transition-colors"
+                        :class="{
+                            'border-green-200 bg-green-50': step.state === 'done',
+                            'border-neutral-900 bg-white ring-1 ring-neutral-900': step.state === 'active',
+                            'border-neutral-200 bg-neutral-50': step.state === 'todo'
+                        }">
+                        <div class="flex items-center gap-2">
+                            <span class="w-5 h-5 rounded-full text-[10px] font-bold flex items-center justify-center flex-shrink-0"
+                                  :class="{
+                                      'bg-green-500 text-white': step.state === 'done',
+                                      'bg-neutral-900 text-white': step.state === 'active',
+                                      'bg-neutral-200 text-neutral-500': step.state === 'todo'
+                                  }">
+                                <template x-if="step.state === 'done'">
+                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                </template>
+                                <template x-if="step.state !== 'done'">
+                                    <span x-text="index + 1"></span>
+                                </template>
+                            </span>
+                            <span class="text-xs font-semibold"
+                                  :class="step.state === 'todo' ? 'text-neutral-500' : 'text-neutral-900'"
+                                  x-text="step.title"></span>
+                        </div>
+                        <div class="text-[10px] mt-1.5 pl-7 truncate"
+                             :class="step.state === 'todo' ? 'text-neutral-400' : 'text-neutral-600'"
+                             x-text="step.hint"></div>
+                    </li>
+                </template>
+            </ol>
+        </div>
+
+        <!-- Error state: banner with recovery, never a modal. -->
+        <div x-show="wizardState() === 'error'" x-cloak
+             class="mb-6 rounded-xl border border-red-200 bg-red-50 overflow-hidden"
+             data-cluster-v2-state="error" data-cluster-v2-error>
+            <div class="flex items-start gap-3 px-4 py-3 text-sm text-red-800">
+                <i data-lucide="circle-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                <div class="min-w-0 flex-1">
+                    <div class="font-semibold">Can't reach the cluster service on this Mac</div>
+                    <div class="text-xs text-red-700 mt-1">
+                        The discovery backend did not answer. If this build predates cluster v2,
+                        the legacy view still works.
+                    </div>
+                    <div class="text-[11px] font-mono text-red-700 mt-2 break-all" x-text="devicesError"></div>
+                    <div class="flex flex-wrap gap-2 mt-3">
+                        <button type="button" @click="retryConnection()"
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-800 bg-white border border-red-300 rounded-lg hover:bg-red-100">
+                            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                            Try again
+                        </button>
+                        <button type="button" @click="clusterLegacyView = true"
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-800 bg-white border border-red-200 rounded-lg hover:bg-red-100">
+                            <i data-lucide="wrench" class="w-3.5 h-3.5"></i>
+                            Open Advanced (legacy)
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Version mismatch: actionable amber banner; the device is NOT hidden. -->
+        <template x-if="versionMismatches().length && wizardState() !== 'error'">
+            <div class="mb-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
+                 data-cluster-v2-version-mismatch>
+                <div class="flex items-start gap-3 text-sm text-amber-800">
+                    <i data-lucide="triangle-alert" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                    <div class="min-w-0 flex-1">
+                        <div class="font-semibold">Version mismatch across your Macs</div>
+                        <template x-for="mismatch in versionMismatches()" :key="mismatch.name">
+                            <div class="text-xs text-amber-700 mt-1"
+                                 x-text="`${mismatch.name} runs v${mismatch.peerVersion}, this Mac runs v${mismatch.selfVersion}.`"></div>
+                        </template>
+                        <div class="text-xs text-amber-700 mt-1">
+                            Update the older Mac to the same build before activating — the app
+                            auto-updates; with Homebrew run <code class="font-mono">brew upgrade omlx</code>.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </template>
+
+        <!-- ============================ empty ============================ -->
+        <section x-show="wizardState() === 'empty'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="empty">
+            <div class="p-5 sm:p-8 text-center max-w-xl mx-auto">
+                <div class="w-12 h-12 rounded-2xl bg-neutral-100 flex items-center justify-center mx-auto">
+                    <i data-lucide="laptop" class="w-6 h-6 text-neutral-500"></i>
+                </div>
+                <h3 class="text-lg font-semibold text-neutral-900 mt-4">Set up this Mac first</h3>
+                <p class="text-sm text-neutral-500 mt-2">
+                    This Mac hasn't introduced itself to the network yet. oMLX does that by itself
+                    once distributed inference is on — then a second Mac is all you add.
+                </p>
+                <ol class="text-left text-sm text-neutral-700 space-y-3 mt-6">
+                    <li class="flex items-start gap-3">
+                        <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">1</span>
+                        <span>Open <span class="font-semibold">Settings → Advanced</span> and enable <span class="font-semibold">Distributed Inference</span>, then restart oMLX.</span>
+                    </li>
+                    <li class="flex items-start gap-3">
+                        <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">2</span>
+                        <span>On your other Mac, install oMLX with one line:</span>
+                    </li>
+                </ol>
+                <div class="mt-3 flex items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
+                    <code class="flex-1 text-left text-xs font-mono text-neutral-800 select-all">brew install jundot/omlx/omlx</code>
+                    <button type="button" @click="copyInstallCommand()"
+                            class="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium text-neutral-600 border border-neutral-200 rounded-md hover:bg-neutral-100">
+                        <i data-lucide="copy" class="w-3 h-3"></i>
+                        <span x-text="installCommandCopied ? 'Copied!' : 'Copy'"></span>
+                    </button>
+                </div>
+                <p class="text-xs text-neutral-400 mt-3">
+                    Or download the app from Releases and drag it to Applications — same result.
+                    Once both Macs run oMLX, they find each other here automatically.
+                </p>
+            </div>
+        </section>
+
+        <!-- ========================= discovering ========================= -->
+        <section x-show="wizardState() === 'discovering'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="discovering">
+            <div class="p-5 sm:p-8 text-center max-w-xl mx-auto">
+                <div class="relative w-16 h-16 mx-auto">
+                    <span class="absolute inset-0 rounded-full bg-neutral-200 animate-ping opacity-40"></span>
+                    <div class="relative w-16 h-16 rounded-full bg-neutral-100 border border-neutral-200 flex items-center justify-center">
+                        <i data-lucide="radar" class="w-7 h-7 text-neutral-500"></i>
+                    </div>
+                </div>
+                <h3 class="text-lg font-semibold text-neutral-900 mt-4"
+                    x-text="selfDevice() ? 'Looking for other Macs…' : 'Waking up discovery…'"></h3>
+                <p class="text-sm text-neutral-500 mt-2">
+                    <span x-show="selfDevice()">This Mac is on the network as
+                        <span class="font-semibold text-neutral-700" x-text="deviceName(selfDevice())"></span>.
+                        New devices appear here by themselves — nothing to type.</span>
+                    <span x-show="!selfDevice()">Still introducing this Mac to the network.</span>
+                </p>
+                <p class="text-xs text-neutral-400 mt-4">
+                    Nothing showing up? Make sure the other Mac runs oMLX with Distributed
+                    Inference enabled, and that macOS allowed oMLX under
+                    <span class="font-medium">System Settings → Privacy &amp; Security → Local Network</span>.
+                </p>
+            </div>
+        </section>
+
+        <!-- ============ device cards (N devices — no 2-Mac cap) ============ -->
+        <section x-show="['device_card', 'pairing', 'checks', 'plan'].includes(wizardState())"
+                 x-cloak class="mb-6" data-cluster-v2-state="device_card">
+            <div class="flex items-center justify-between gap-3 mb-3">
+                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">
+                    Your devices
+                    <span class="text-neutral-300 normal-case font-medium"
+                          x-text="combinedMemoryLabel()"></span>
+                </div>
+                <span class="inline-flex items-center gap-1.5 text-[10px] text-neutral-400">
+                    <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                    Listening for new devices
+                </span>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                <template x-for="device in allDevices()" :key="device.node_id">
+                    <div class="rounded-2xl border bg-white p-4 transition-colors"
+                         :class="device.paired || device.is_self ? 'border-neutral-200' : 'border-neutral-900 ring-1 ring-neutral-900'"
+                         data-cluster-v2-device-card>
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <div class="flex items-center gap-2">
+                                    <i data-lucide="laptop" class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
+                                    <span class="text-sm font-semibold text-neutral-900 truncate"
+                                          x-text="deviceName(device)"></span>
+                                </div>
+                                <div class="text-xs text-neutral-500 mt-1"
+                                     x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
+                            </div>
+                            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold whitespace-nowrap"
+                                  :class="deviceStateTone(device)"
+                                  x-text="deviceStateLabel(device)"></span>
+                        </div>
+                        <div class="flex items-center gap-3 mt-3 text-[11px] text-neutral-500">
+                            <span class="inline-flex items-center gap-1">
+                                <i :data-lucide="deviceLinkMeta(device).icon" class="w-3.5 h-3.5"></i>
+                                <span x-text="deviceLinkMeta(device).label"></span>
+                            </span>
+                            <span class="inline-flex items-center gap-1" x-show="device.version">
+                                <i data-lucide="tag" class="w-3.5 h-3.5"></i>
+                                <span x-text="'v' + device.version"></span>
+                            </span>
+                        </div>
+                        <div class="mt-4 flex items-center gap-2"
+                             x-show="!device.is_self && !device.paired && device.state !== 'awaiting_approval'">
+                            <button type="button" @click="beginPairing(device)"
+                                    class="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800"
+                                    data-cluster-v2-pair-button>
+                                <i data-lucide="link-2" class="w-3.5 h-3.5"></i>
+                                Pair
+                            </button>
+                        </div>
+                        <div class="mt-4" x-show="!device.is_self && device.paired">
+                            <button type="button" @click="unpairDevice(device)"
+                                    class="inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-medium rounded-lg border"
+                                    :class="confirmUnpairFor === device.node_id
+                                        ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
+                                        : 'text-neutral-500 border-neutral-200 hover:bg-neutral-50'"
+                                    data-cluster-v2-unpair>
+                                <i data-lucide="unlink" class="w-3 h-3"></i>
+                                <span x-text="confirmUnpairFor === device.node_id ? 'Click again to unpair' : 'Unpair'"></span>
+                            </button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Paired and ready, but checks haven't run this session. -->
+            <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3"
+                 x-show="wizardState() === 'device_card' && pairedDevices().length && !checks.started">
+                <div class="min-w-0">
+                    <div class="text-xs font-semibold text-neutral-900">Ready when you are</div>
+                    <div class="text-[10px] text-neutral-500 mt-0.5">
+                        oMLX will verify the connection, versions and RDMA before splitting anything.
+                    </div>
+                </div>
+                <button type="button" @click="startChecks()"
+                        class="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 whitespace-nowrap">
+                    <i data-lucide="shield-check" class="w-3.5 h-3.5"></i>
+                    Run automatic checks
+                </button>
+            </div>
+        </section>
+
+        <!-- =========================== pairing =========================== -->
+        <section x-show="wizardState() === 'pairing'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="pairing" data-cluster-v2-pairing>
+            <div class="p-5 sm:p-6 max-w-xl">
+                <!-- Pending approval arriving from another Mac. -->
+                <template x-if="pendingApprovals().length && !pairing.target">
+                    <div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">A Mac wants to join</div>
+                        <template x-for="device in pendingApprovals()" :key="device.node_id">
+                            <div class="mt-3 rounded-xl border border-neutral-900 ring-1 ring-neutral-900 p-4">
+                                <div class="flex items-center justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <div class="text-sm font-semibold text-neutral-900 truncate"
+                                             x-text="deviceName(device)"></div>
+                                        <div class="text-xs text-neutral-500 mt-0.5"
+                                             x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device)"></div>
+                                    </div>
+                                    <button type="button" @click="submitPairDenial(device)"
+                                            class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral-500 border border-neutral-200 rounded-lg hover:bg-neutral-50"
+                                            data-cluster-v2-deny>
+                                        <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                                        Deny
+                                    </button>
+                                </div>
+                                <p class="text-xs text-neutral-600 mt-3">
+                                    Its screen shows a 6-digit code. Type it here to approve — a wrong
+                                    code three times locks pairing for 10 minutes.
+                                </p>
+                                <div class="flex items-center gap-2 mt-2">
+                                    <input type="text" inputmode="numeric" maxlength="6"
+                                           x-model="pairing.code"
+                                           @keydown.enter="submitPairApproval(device)"
+                                           placeholder="6-digit code"
+                                           class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
+                                           data-cluster-v2-pair-code>
+                                    <button type="button" @click="submitPairApproval(device)"
+                                            :disabled="pairing.busy"
+                                            class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
+                                            data-cluster-v2-approve>
+                                        <i data-lucide="check" class="w-3.5 h-3.5"></i>
+                                        Approve
+                                    </button>
+                                </div>
+                                <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+
+                <!-- User pressed Pair on a discovered card. -->
+                <template x-if="pairing.target">
+                    <div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Pair a new Mac</div>
+                        <h4 class="text-base font-semibold text-neutral-900 mt-2"
+                            x-text="'Pair with ' + deviceName(pairing.target)"></h4>
+                        <ol class="text-sm text-neutral-600 space-y-2 mt-3">
+                            <li class="flex items-start gap-2.5">
+                                <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">1</span>
+                                <span>On <span class="font-semibold" x-text="deviceName(pairing.target)"></span>,
+                                    open its oMLX dashboard — it shows a 6-digit code.</span>
+                            </li>
+                            <li class="flex items-start gap-2.5">
+                                <span class="w-5 h-5 rounded-full bg-neutral-900 text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">2</span>
+                                <span>Type that code here. The code expires after 10 minutes.</span>
+                            </li>
+                        </ol>
+                        <div class="flex items-center gap-2 mt-4">
+                            <input type="text" inputmode="numeric" maxlength="6"
+                                   x-model="pairing.code"
+                                   @keydown.enter="submitPairApproval(pairing.target)"
+                                   placeholder="6-digit code"
+                                   class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
+                                   data-cluster-v2-pair-code>
+                            <button type="button" @click="submitPairApproval(pairing.target)"
+                                    :disabled="pairing.busy"
+                                    class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
+                                    data-cluster-v2-approve>
+                                <svg x-show="pairing.busy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span x-text="pairing.busy ? 'Approving…' : 'Approve & pair'"></span>
+                            </button>
+                            <button type="button" @click="cancelPairing()"
+                                    class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700">
+                                Cancel
+                            </button>
+                        </div>
+                        <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
+                        <div class="mt-3">
+                            <button type="button" @click="submitPairDenial(pairing.target)"
+                                    class="text-[10px] text-neutral-400 hover:text-neutral-600 underline underline-offset-2"
+                                    data-cluster-v2-deny>
+                                Not your device? Deny the request instead
+                            </button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </section>
+
+        <!-- =========================== checks ============================ -->
+        <section x-show="wizardState() === 'checks'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="checks" data-cluster-v2-checks>
+            <div class="p-5 sm:p-6">
+                <div class="flex items-start justify-between gap-3">
+                    <div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Automatic checks</div>
+                        <p class="text-xs text-neutral-500 mt-1">
+                            Everything oMLX needs before it splits a model. Rows fix themselves
+                            when the underlying condition does.
+                        </p>
+                    </div>
+                    <button type="button" @click="runChecks()"
+                            :disabled="checks.running"
+                            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-100 disabled:opacity-50 whitespace-nowrap">
+                        <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                        Re-run checks
+                    </button>
+                </div>
+
+                <ul class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
+                    <template x-for="row in checkRows()" :key="row.key">
+                        <li class="px-4 py-3 bg-white" data-cluster-v2-check-row :data-check="row.key">
+                            <div class="flex items-start gap-3">
+                                <span class="w-5 h-5 mt-0.5 flex items-center justify-center flex-shrink-0">
+                                    <svg x-show="row.status === 'running' || row.status === 'pending'"
+                                         class="animate-spin h-4 w-4 text-neutral-400" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                    <i x-show="row.status === 'pass'" data-lucide="check-circle-2" class="w-4 h-4 text-green-500"></i>
+                                    <i x-show="row.status === 'fail'" data-lucide="x-circle" class="w-4 h-4 text-red-500"></i>
+                                    <i x-show="row.status === 'skipped' || row.status === 'unknown'" data-lucide="minus-circle" class="w-4 h-4 text-neutral-300"></i>
+                                </span>
+                                <div class="min-w-0 flex-1">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-xs font-semibold text-neutral-900" x-text="row.label"></span>
+                                        <button x-show="row.key === 'benchmark' && !checks.benchmarkRunning"
+                                                type="button" @click="runBenchmark()"
+                                                class="text-[10px] font-medium text-neutral-500 border border-neutral-200 rounded-md px-2 py-1 hover:bg-neutral-50"
+                                                x-text="checks.benchmark ? 'Run again' : 'Run benchmark'"></button>
+                                    </div>
+                                    <div class="text-xs mt-0.5"
+                                         :class="{
+                                             'text-green-700': row.status === 'pass',
+                                             'text-red-700': row.status === 'fail',
+                                             'text-neutral-500': !['pass', 'fail'].includes(row.status)
+                                         }"
+                                         x-text="row.detail"></div>
+                                    <div class="text-[11px] text-red-700 bg-red-50 border border-red-100 rounded-lg px-2.5 py-1.5 mt-2"
+                                         x-show="row.status === 'fail' && row.fix"
+                                         x-text="row.fix"></div>
+                                </div>
+                            </div>
+                        </li>
+                    </template>
+                </ul>
+
+                <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <p class="text-[11px] text-neutral-400"
+                       x-show="!checksBlockingPass()">
+                        The split unlocks once SSH and matching versions pass. RDMA and the
+                        benchmark only change how fast the result is.
+                    </p>
+                    <p class="text-[11px] text-green-600" x-show="checksBlockingPass()">
+                        All clear — your Macs are ready to share a model.
+                    </p>
+                    <button type="button" @click="enterPlan()"
+                            :disabled="!checksBlockingPass()"
+                            class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
+                            data-cluster-v2-continue-plan>
+                        Continue to the model split
+                        <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============================ plan ============================= -->
+        <section x-show="wizardState() === 'plan'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="plan" data-cluster-v2-plan>
+            <div class="p-5 sm:p-6">
+                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Split a model across the pool</div>
+                <p class="text-xs text-neutral-500 mt-1">
+                    Pick a downloaded model. oMLX measures it and gives each Mac a contiguous
+                    slice of its layers — heavier slices go to bigger Macs.
+                </p>
+
+                <!-- Model picker -->
+                <div class="mt-4" data-cluster-v2-model-picker>
+                    <div class="relative">
+                        <i data-lucide="search" class="w-3.5 h-3.5 text-neutral-400 pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"></i>
+                        <input type="text" x-model="modelSearch"
+                               placeholder="Search downloaded models"
+                               class="w-full pl-9 pr-3 py-2 text-xs border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                    </div>
+                    <div class="mt-2 max-h-56 overflow-y-auto divide-y divide-neutral-100 border border-neutral-200 rounded-xl">
+                        <div x-show="modelsLoading" class="px-4 py-3 text-xs text-neutral-400">Reading models from every Mac…</div>
+                        <div x-show="!modelsLoading && !filteredModels().length" class="px-4 py-3 text-xs text-neutral-400"
+                             x-text="modelsError || 'No downloaded models found. Download one in the Models tab first.'"></div>
+                        <template x-for="model in filteredModels()" :key="model.model_path">
+                            <button type="button" @click="selectModel(model)"
+                                    class="w-full text-left px-4 py-2.5 hover:bg-neutral-50 flex items-center justify-between gap-3"
+                                    :class="selectedModelPath === model.model_path ? 'bg-neutral-50' : ''">
+                                <span class="min-w-0">
+                                    <span class="block text-xs font-semibold text-neutral-900 truncate"
+                                          x-text="shortModelName(model)"></span>
+                                    <span class="block text-[10px] text-neutral-400 truncate"
+                                          x-text="modelPresenceLabel(model)"></span>
+                                </span>
+                                <i x-show="selectedModelPath === model.model_path"
+                                   data-lucide="check-circle-2" class="w-4 h-4 text-green-500 flex-shrink-0"></i>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+
+                <!-- Planning progress / error -->
+                <div class="mt-4 flex items-center gap-2 text-xs text-neutral-500" x-show="planLoading">
+                    <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                    Measuring the model and balancing layers…
+                </div>
+                <div class="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
+                     x-show="planError" x-text="planError"></div>
+
+                <!-- Visual layer split bar -->
+                <template x-if="plan">
+                    <div class="mt-5" data-cluster-v2-split-bar>
+                        <div class="flex items-center justify-between gap-3 mb-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Model order · early to late layers</span>
+                            <span class="text-[10px] text-neutral-500"
+                                  x-text="planTotalLayers() + ' layers total · ' + backendLabel()"></span>
+                        </div>
+                        <div class="h-12 flex overflow-hidden rounded-xl border border-neutral-200 bg-neutral-100">
+                            <template x-for="(assignment, index) in planAssignments()" :key="assignment.rank">
+                                <div class="h-full flex items-center justify-center px-2 border-r border-white last:border-r-0"
+                                     :class="[
+                                         'bg-neutral-900 text-white',
+                                         'bg-neutral-600 text-white',
+                                         'bg-neutral-400 text-white',
+                                         'bg-neutral-300 text-neutral-700',
+                                         'bg-neutral-200 text-neutral-700',
+                                     ][index % 5]"
+                                     :style="'width: ' + ((assignment.layer_count / Math.max(planTotalLayers(), 1)) * 100) + '%'"
+                                     :title="planNodeName(assignment) + ' · layers [' + assignment.start_layer + ', ' + assignment.end_layer + ')'">
+                                    <span class="text-[10px] sm:text-xs font-semibold truncate"
+                                          x-text="planNodeName(assignment) + ' · ' + assignment.layer_count + 'L'"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-3">
+                            <template x-for="assignment in planAssignments()" :key="assignment.rank">
+                                <div class="rounded-xl border border-neutral-200 px-3 py-2.5">
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         x-text="planNodeName(assignment)"></div>
+                                    <div class="text-[10px] text-neutral-500 mt-0.5 font-mono"
+                                         x-text="'layers [' + assignment.start_layer + ', ' + assignment.end_layer + ')'"></div>
+                                </div>
+                            </template>
+                        </div>
+                        <div class="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3">
+                            <div class="min-w-0">
+                                <div class="text-xs font-semibold text-neutral-900">Exactly this split will launch</div>
+                                <div class="text-[10px] text-neutral-500 mt-0.5">
+                                    Activation is signed against what you see — if anything changes,
+                                    oMLX rebuilds the plan instead of launching the wrong one.
+                                </div>
+                            </div>
+                            <button type="button" @click="activatePlan()"
+                                    :disabled="activateBusy"
+                                    class="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40 whitespace-nowrap"
+                                    data-cluster-v2-activate>
+                                <svg x-show="activateBusy" class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                                <span x-text="activateBusy ? 'Activating…' : 'Activate cluster'"></span>
+                            </button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </section>
+
+        <!-- =========================== active ============================ -->
+        <section x-show="wizardState() === 'active'" x-cloak
+                 class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
+                 data-cluster-v2-state="active" data-cluster-v2-active>
+            <div class="p-5 sm:p-6">
+                <div class="flex items-start justify-between gap-3">
+                    <div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Cluster running</div>
+                        <h4 class="text-lg font-semibold text-neutral-900 mt-1"
+                            x-text="activeDeployment() ? activeDeployment().model_path.split('/').filter(Boolean).pop() : ''"></h4>
+                        <p class="text-xs text-neutral-500 mt-1">
+                            The model starts across your Macs the next time it loads. If it is already
+                            loaded locally, unload it first so the new split applies.
+                        </p>
+                    </div>
+                    <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-green-50 border border-green-200 text-green-700 self-start">
+                        <span class="w-2 h-2 rounded-full bg-current animate-pulse"></span>
+                        Active
+                    </span>
+                </div>
+
+                <!-- Device list + health -->
+                <div class="mt-4 divide-y divide-neutral-100 border border-neutral-200 rounded-xl overflow-hidden">
+                    <template x-for="device in allDevices()" :key="device.node_id">
+                        <div class="px-4 py-3 bg-white flex items-center gap-3" data-cluster-v2-active-device>
+                            <i data-lucide="laptop" class="w-4 h-4 text-neutral-400 flex-shrink-0"></i>
+                            <div class="min-w-0 flex-1">
+                                <div class="text-xs font-semibold text-neutral-900 truncate"
+                                     x-text="deviceName(device)"></div>
+                                <div class="text-[10px] text-neutral-500"
+                                     x-text="deviceChipLabel(device) + ' · ' + deviceRamLabel(device) + ' · ' + deviceLinkMeta(device).label"></div>
+                            </div>
+                            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold"
+                                  :class="deviceStateTone(device)"
+                                  x-text="deviceStateLabel(device)"></span>
+                        </div>
+                    </template>
+                </div>
+
+                <div class="mt-4 flex flex-wrap items-center gap-2">
+                    <template x-for="deployment in deploymentsPayload" :key="deployment.deployment_id">
+                        <button type="button" @click="deactivateDeployment(deployment)"
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border"
+                                :class="confirmDeactivateFor === deployment.deployment_id
+                                    ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
+                                    : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
+                                data-cluster-v2-deactivate>
+                            <i data-lucide="octagon-x" class="w-3.5 h-3.5"></i>
+                            <span x-text="confirmDeactivateFor === deployment.deployment_id ? 'Click again to deactivate' : 'Deactivate'"></span>
+                        </button>
+                    </template>
+                </div>
+            </div>
+        </section>
+
+        <!-- Toasts — small, transient, type-colored; never modals. -->
+        <div class="fixed bottom-4 right-4 z-50 space-y-2 w-80 max-w-[calc(100vw-2rem)]"
+             data-cluster-v2-toasts>
+            <template x-for="toast in toasts" :key="toast.id">
+                <div class="flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 shadow-lg text-xs"
+                     :class="toastTone(toast.type)">
+                    <i :data-lucide="toastIcon(toast.type)" class="w-4 h-4 mt-0.5 flex-shrink-0"></i>
+                    <span class="flex-1 min-w-0" x-text="toast.message"></span>
+                    <button type="button" @click="dismissToast(toast.id)"
+                            class="p-0.5 opacity-50 hover:opacity-100 flex-shrink-0"
+                            aria-label="Dismiss">
+                        <i data-lucide="x" class="w-3 h-3"></i>
+                    </button>
+                </div>
+            </template>
+        </div>
+
+    </div>
+</div>

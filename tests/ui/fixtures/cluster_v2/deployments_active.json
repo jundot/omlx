@@ -1,0 +1,17 @@
+{
+  "_state": "active",
+  "_comment": "GET /admin/api/cluster/deployments — one approved deployment: wizard renders the active state with health + Deactivate.",
+  "deployments": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "model_path": "/Users/dev/models/minimax-m3",
+      "backend": "jaccl",
+      "plan_hash": "9f2ab41cd0e1f7a3b5c6d8e9f0a1b2c3",
+      "created_at": 1781999900.0,
+      "hosts": [
+        {"node_id": "3f6f2a90-7d1c-4b55-9c2a-1f0e9a8b7c6d", "ssh": "127.0.0.1", "ips": ["192.168.1.10"]},
+        {"node_id": "a1b2c3d4-0001-4000-8000-000000000001", "ssh": "192.168.1.11", "ips": ["192.168.1.11"]}
+      ]
+    }
+  ]
+}
