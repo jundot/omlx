@@ -73,6 +73,36 @@ def _mock_extract_cache_states(snapshot_cache):
 
 
 class TestBoundarySnapshotSSDStore:
+    @pytest.mark.parametrize("with_metadata", [False, True])
+    def test_arrays_cache_scheduler_snapshot_roundtrip(self, with_metadata):
+        from mlx_lm.models.cache import ArraysCache
+        from omlx.cache.type_handlers import ArraysCacheHandler
+        from omlx.scheduler import Scheduler
+
+        original = ArraysCache(2)
+        original[0] = mx.arange(24).reshape(3, 2, 4)
+        original[1] = mx.arange(18).reshape(3, 2, 3)
+        if with_metadata:
+            original.left_padding = mx.array([0, 2, 5])
+            original.lengths = mx.array([13, 9, 4])
+        extracted, _ = Scheduler._extract_cache_states(MagicMock(), [original])
+        raw, metadata = self.store._serialize_extracted(extracted, "arrays", 4096)
+        decoded = self.store._deserialize(raw, metadata)
+        assert decoded is not None
+        restored = ArraysCacheHandler().deserialize_state(
+            decoded[0]["state"], decoded[0]["meta_state"]
+        )
+        restored.filter([2, 0])
+        for actual, expected in zip(restored.cache, original.cache):
+            assert mx.array_equal(actual, expected[[2, 0]]).item()
+        assert len(restored.cache) == 2
+        for name in ("left_padding", "lengths"):
+            actual, expected = getattr(restored, name), getattr(original, name)
+            if expected is None:
+                assert actual is None
+            else:
+                assert mx.array_equal(actual, expected[[2, 0]]).item()
+
     @pytest.fixture(autouse=True)
     def setup(self, tmp_path):
         self.base_dir = tmp_path / "ssd_cache"

@@ -57,6 +57,10 @@ def _has_cli_overrides(args) -> bool:
         "max_audio_upload_size",
         "max_concurrent_requests",
         "embedding_batch_size",
+        "native_paged_kv_pages",
+        "native_paged_kv_page_size",
+        "native_paged_attention_mode",
+        "native_paged_prefix_cache_pages",
         "memory_guard",
         "memory_guard_gb",
         "paged_ssd_cache_dir",
@@ -1093,6 +1097,32 @@ Example directory structure:
         type=int,
         default=None,
         help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
+    )
+    serve_parser.add_argument(
+        "--native-paged-kv-pages",
+        type=_positive_int,
+        default=None,
+        help="GPU KV pages per full-attention layer. Enables the ECO native "
+        "Paged KV path with existing prefix/SSD cache reuse.",
+    )
+    serve_parser.add_argument(
+        "--native-paged-kv-page-size",
+        type=_positive_int,
+        default=None,
+        help="Tokens per native GPU KV page (default: 64).",
+    )
+    serve_parser.add_argument(
+        "--native-paged-attention-mode",
+        choices=["auto", "mlx", "gather", "direct"],
+        default=None,
+        help="Attention backend for native GPU pages (default: auto).",
+    )
+    serve_parser.add_argument(
+        "--native-paged-prefix-cache-pages",
+        type=_positive_int,
+        default=None,
+        help="Total page-reference budget for in-memory hybrid prefix sharing. "
+        "Used with native Paged KV when the tiered cache is disabled; disabled by default.",
     )
 
     # Memory guard options

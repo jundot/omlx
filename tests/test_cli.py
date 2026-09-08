@@ -222,6 +222,17 @@ class TestServeCommandOptions:
         assert "balanced" in result.stdout
         assert "aggressive" in result.stdout
 
+    def test_serve_has_native_paged_kv_options(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "serve", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "--native-paged-kv-pages" in result.stdout
+        assert "--native-paged-kv-page-size" in result.stdout
+        assert "--native-paged-attention-mode" in result.stdout
+
     def test_serve_no_model_specific_options(self):
         """Test that serve command does not have model-specific options (managed via admin page)."""
         result = subprocess.run(

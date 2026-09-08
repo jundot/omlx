@@ -1,0 +1,3 @@
+include CMakeLists.txt
+include *.cpp *.h *.metal
+include LICENSE

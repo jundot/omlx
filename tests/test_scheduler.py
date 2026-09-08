@@ -6550,6 +6550,19 @@ class TestBuildStateMachineStopStrings:
     def _make_scheduler(self, mock_model, mock_tokenizer):
         return Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
+    def _assert_matches(self, matcher, tokens):
+        if not hasattr(matcher, "_states"):
+            root = matcher.make_state()
+            state = root
+            for token in tokens:
+                state, matched = matcher.match(state, root, token)
+            assert matched
+        else:
+            node = matcher._states["normal"][0]
+            for token in tokens:
+                node = node[token]
+            assert "__match__" in node
+
     def _request_with_stop(self, stop):
         return Request(
             request_id="stop-001",
@@ -6560,9 +6573,7 @@ class TestBuildStateMachineStopStrings:
     def test_no_stop_string_only_eos_transitions(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         sm = scheduler._build_state_machine(self._request_with_stop([]))
-        # SequenceStateMachine has internal _states dict; non-empty implies
-        # at least the EOS transitions are present.
-        assert sm._states
+        self._assert_matches(sm, [mock_tokenizer.eos_token_id])
 
     def test_stop_string_added_as_token_sequence(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -6571,13 +6582,7 @@ class TestBuildStateMachineStopStrings:
         assert expected_seq, "MockTokenizer must produce a token for 'delta'"
 
         sm = scheduler._build_state_machine(self._request_with_stop(["delta"]))
-        # Walk the trie following expected_seq; the terminal node must
-        # have a __match__ entry, meaning the sequence is registered.
-        node = sm._states["normal"][0]
-        for tok in expected_seq:
-            assert tok in node, f"token {tok} missing from trie"
-            node = node[tok]
-        assert "__match__" in node, "stop sequence not terminated in trie"
+        self._assert_matches(sm, expected_seq)
 
     def test_empty_or_non_string_entries_skipped(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
@@ -6585,22 +6590,14 @@ class TestBuildStateMachineStopStrings:
         # should be tokenized.
         sm = scheduler._build_state_machine(self._request_with_stop(["", "real", 123]))
         real_seq = mock_tokenizer.encode("real", add_special_tokens=False)
-        node = sm._states["normal"][0]
-        for tok in real_seq:
-            assert tok in node
-            node = node[tok]
-        assert "__match__" in node
+        self._assert_matches(sm, real_seq)
 
     def test_multiple_stop_strings_all_registered(self, mock_model, mock_tokenizer):
         scheduler = self._make_scheduler(mock_model, mock_tokenizer)
         sm = scheduler._build_state_machine(self._request_with_stop(["foo", "bar"]))
         for stop_str in ("foo", "bar"):
             seq = mock_tokenizer.encode(stop_str, add_special_tokens=False)
-            node = sm._states["normal"][0]
-            for tok in seq:
-                assert tok in node
-                node = node[tok]
-            assert "__match__" in node
+            self._assert_matches(sm, seq)
 
 
 class _StopSequenceDetokenizer:

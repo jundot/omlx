@@ -1,0 +1,2 @@
+# Optional native paging runtime; stock installs retain the upstream dependency pin.
+mlx-lm @ git+https://github.com/IndenScale/mlx-lm@34c4b9fa6437093329e73a64a24d95dc1837331a

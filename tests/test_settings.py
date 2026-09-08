@@ -358,6 +358,10 @@ class TestSchedulerSettings:
             "chunked_prefill": False,
             "prefill_priority": "context",
             "decode_fairness": True,
+            "native_paged_kv_cache_pages": None,
+            "native_paged_kv_page_size": 64,
+            "native_paged_attention_mode": "auto",
+            "native_paged_prefix_cache_pages": 0,
         }
 
     def test_decode_fairness_from_dict(self):

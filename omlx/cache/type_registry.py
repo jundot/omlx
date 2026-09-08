@@ -47,6 +47,7 @@ class CacheTypeRegistry:
     # Mapping from mlx-lm class names to cache types
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
+        "PagedKVCache": CacheType.KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
         # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
         # during speculative decode. The live tensor/state representation is

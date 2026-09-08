@@ -295,6 +295,11 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Physical GPU pages per full-attention layer. None disables ECO Paged KV.
+    native_paged_kv_cache_pages: int | None = None
+    native_paged_kv_page_size: int = 64
+    native_paged_attention_mode: str = "auto"
+    native_paged_prefix_cache_pages: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -321,6 +326,14 @@ class SchedulerSettings:
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            native_paged_kv_cache_pages=data.get("native_paged_kv_cache_pages"),
+            native_paged_kv_page_size=int(
+                data.get("native_paged_kv_page_size", 64)
+            ),
+            native_paged_attention_mode=str(
+                data.get("native_paged_attention_mode", "auto")
+            ),
+            native_paged_prefix_cache_pages=int(data.get("native_paged_prefix_cache_pages", 0)),
         )
 
 
@@ -1123,6 +1136,26 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
+        if native_pages := os.getenv("OMLX_NATIVE_PAGED_KV_PAGES"):
+            try:
+                self.scheduler.native_paged_kv_cache_pages = int(native_pages)
+            except ValueError:
+                logger.warning(f"Invalid OMLX_NATIVE_PAGED_KV_PAGES value: {native_pages}")
+        if native_page_size := os.getenv("OMLX_NATIVE_PAGED_KV_PAGE_SIZE"):
+            try:
+                self.scheduler.native_paged_kv_page_size = int(native_page_size)
+            except ValueError:
+                logger.warning(
+                    "Invalid OMLX_NATIVE_PAGED_KV_PAGE_SIZE value: "
+                    f"{native_page_size}"
+                )
+        if native_attention := os.getenv("OMLX_NATIVE_PAGED_ATTENTION_MODE"):
+            self.scheduler.native_paged_attention_mode = native_attention
+        if native_prefix := os.getenv("OMLX_NATIVE_PAGED_PREFIX_CACHE_PAGES"):
+            try:
+                self.scheduler.native_paged_prefix_cache_pages = int(native_prefix)
+            except ValueError:
+                logger.warning("Invalid OMLX_NATIVE_PAGED_PREFIX_CACHE_PAGES value")
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1258,6 +1291,16 @@ class GlobalSettings:
             and args.embedding_batch_size is not None
         ):
             self.scheduler.embedding_batch_size = args.embedding_batch_size
+        if getattr(args, "native_paged_kv_pages", None) is not None:
+            self.scheduler.native_paged_kv_cache_pages = args.native_paged_kv_pages
+        if getattr(args, "native_paged_prefix_cache_pages", None) is not None:
+            self.scheduler.native_paged_prefix_cache_pages = args.native_paged_prefix_cache_pages
+        if getattr(args, "native_paged_kv_page_size", None) is not None:
+            self.scheduler.native_paged_kv_page_size = args.native_paged_kv_page_size
+        if getattr(args, "native_paged_attention_mode", None) is not None:
+            self.scheduler.native_paged_attention_mode = (
+                args.native_paged_attention_mode
+            )
 
         # Memory guard settings. Naming a tier or a ceiling on the command
         # line also turns the guard on. With a saved
@@ -1550,7 +1593,26 @@ class GlobalSettings:
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
             )
-
+        if (
+            self.scheduler.native_paged_kv_cache_pages is not None
+            and self.scheduler.native_paged_kv_cache_pages <= 0
+        ):
+            errors.append("native_paged_kv_cache_pages must be > 0")
+        if self.scheduler.native_paged_kv_page_size <= 0:
+            errors.append("native_paged_kv_page_size must be > 0")
+        if self.scheduler.native_paged_prefix_cache_pages < 0:
+            errors.append("native_paged_prefix_cache_pages must be >= 0")
+        if self.scheduler.native_paged_prefix_cache_pages and self.scheduler.native_paged_kv_cache_pages is None:
+            errors.append("native prefix sharing requires native Paged KV")
+        if self.scheduler.native_paged_attention_mode not in {
+            "auto",
+            "mlx",
+            "gather",
+            "direct",
+        }:
+            errors.append(
+                "native_paged_attention_mode must be auto, mlx, gather, or direct"
+            )
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
             errors.append(
@@ -1714,6 +1776,14 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            native_paged_kv_cache_pages=(
+                self.scheduler.native_paged_kv_cache_pages
+            ),
+            native_paged_kv_page_size=self.scheduler.native_paged_kv_page_size,
+            native_paged_attention_mode=(
+                self.scheduler.native_paged_attention_mode
+            ),
+            native_paged_prefix_cache_pages=self.scheduler.native_paged_prefix_cache_pages,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
