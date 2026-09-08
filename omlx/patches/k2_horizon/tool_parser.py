@@ -52,8 +52,7 @@ def _parse_xml_call(body: str, tools: list[Any] | None) -> dict[str, Any]:
                 string_args.add(key)
             else:
                 string_args.discard(key)
-        value = match.group(3)
-        arguments[key] = value if key in string_args else value.strip()
+        arguments[key] = match.group(3)
     return {
         "name": name,
         "arguments": _normalize_arguments(name, arguments, tools, string_args),

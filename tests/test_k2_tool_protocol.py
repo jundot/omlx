@@ -93,6 +93,14 @@ def test_xml_string_arguments_preserve_exact_text(value, typed):
     assert json.loads(result.tool_calls[0]["arguments"]) == {"text": value, "count": 42}
 
 
+def test_xml_untyped_text_preserves_whitespace_without_schema():
+    text = (
+        "<ifm|tool_call>edit<ifm|arg_key>text</ifm|arg_key>"
+        "<ifm|arg_value>  indented\n</ifm|arg_value></ifm|tool_call>"
+    )
+    assert parse_tool_call(text)[0]["arguments"] == {"text": "  indented\n"}
+
+
 def test_one_malformed_group_does_not_disappear_beside_a_valid_call():
     good = '<ifm|tool_calls><ifm|tool_call>{"name":"read","arguments":{}}</ifm|tool_call></ifm|tool_calls>'
     bad = '<ifm|tool_calls><ifm|tool_call>{"name":"read"}</ifm|tool_call></ifm|tool_calls>'
