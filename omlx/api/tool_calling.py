@@ -494,6 +494,29 @@ def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
         pos = value_end + len(_XML_PARAMETER_CLOSE)
 
 
+_ATTR_FUNCTION_OPEN_RE = re.compile(r'<function\s+name="([^"]+)"\s*>')
+# Both <param> (MiniCPM5's chat template) and <parameter> spellings occur in
+# the wild; the backreference pairs open/close spellings so a literal
+# "</param>" cannot close a <parameter> element. The non-greedy CDATA
+# alternative ensures nested literal tags inside CDATA do not end elements early.
+_ATTR_PARAM_RE = re.compile(
+    r'<(param|parameter)\s+name="([^"]+)"\s*>(?:\s*<!\[CDATA\[(.*?)\]\]>\s*|(.*?))</\1>',
+    re.DOTALL,
+)
+
+
+def _iter_attr_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(key, value)`` for each ``<param name="k">v</param>`` element.
+
+    MiniCPM5's chat template tells the model to wrap values containing
+    ``<``, ``&`` or newlines in a CDATA block; the wrapper is removed here so
+    the argument carries the literal value, verbatim.
+    """
+    for match in _ATTR_PARAM_RE.finditer(params_text):
+        value = match.group(3) if match.group(3) is not None else match.group(4).strip()
+        yield match.group(2), value
+
+
 def _find_marker_span_end(
     text: str, payload_start: int, end_marker: str
 ) -> Optional[Tuple[int, int]]:
@@ -586,6 +609,7 @@ def _parse_xml_tool_calls(
     Handles models that use <tool_call>...</tool_call> XML format, including:
     - GLM format: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
     - Qwen/Llama format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+    - Attribute style: <tool_call><function name="name"><param name="key">value</param></function></tool_call>
     - Generic JSON: <tool_call>{"name": ..., "arguments": ...}</tool_call>
 
     When ``tools`` is provided, parameter values are coerced to their
@@ -623,6 +647,24 @@ def _parse_xml_tool_calls(
             props = _tool_param_properties(func_name, tools)
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
+                arguments[key] = _coerce_param_value(val, key, props, func_name)
+            _built = _build_tool_call(func_name, arguments)
+            if _built is not None:
+                tool_calls.append(_built)
+            continue
+
+        # Attribute style: <function name="name"><param name="key">value</param></function>
+        # (MiniCPM5 family, #3429). Bounded by rfind like the keyword-style
+        # branch above so a literal close tag inside a value cannot end the
+        # element early.
+        attr_open = _ATTR_FUNCTION_OPEN_RE.match(content)
+        attr_close = content.rfind(_XML_FUNCTION_CLOSE)
+        if attr_open and attr_close >= attr_open.end():
+            func_name = attr_open.group(1)
+            params_text = content[attr_open.end() : attr_close]
+            props = _tool_param_properties(func_name, tools)
+            arguments = {}
+            for key, val in _iter_attr_xml_parameters(params_text):
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
             _built = _build_tool_call(func_name, arguments)
             if _built is not None:
@@ -702,6 +744,71 @@ def _parse_namespaced_tool_calls(
 
     cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
     return cleaned, tool_calls
+
+
+_ATTR_FUNCTION_ELEMENT_RE = re.compile(
+    r'<function\s+name="([^"]+)"\s*>((?:(?!<function[\s>]).)*?)</function>',
+    re.DOTALL,
+)
+
+
+def _parse_attribute_function_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """
+    Fallback parser for bare attribute-style tool calls (#3429).
+
+    MiniCPM5-family chat templates emit
+    ``<function name="name"><param name="key">value</param></function>``
+    with no wrapper marker at all, so none of the envelope-anchored parsers
+    ever see it.
+
+    Without an envelope the only safe anchor is the request's own tool
+    declarations: an element is parsed only when its name exactly matches a
+    declared tool, so prose that merely mentions ``<function name="...">``
+    markup for an unknown function passes through untouched, and the parser
+    is inert when the request declares no tools.
+
+    Elements are bounded at the first ``</function>`` (there is no outer
+    envelope to bound by, and rfind would merge sibling calls), accepting
+    that a literal close tag inside a value ends the element early.
+    An element also cannot span a later ``<function`` open tag, so an
+    unclosed tag in prose cannot swallow a following real call.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    if not tools:
+        return text, None
+    registered = _extract_tool_names(tools)
+    if not registered:
+        return text, None
+
+    tool_calls = []
+    spans: List[Tuple[int, int]] = []
+    for match in _ATTR_FUNCTION_ELEMENT_RE.finditer(text):
+        func_name = match.group(1)
+        if func_name not in registered:
+            continue
+        props = _tool_param_properties(func_name, tools)
+        arguments = {}
+        for key, val in _iter_attr_xml_parameters(match.group(2)):
+            arguments[key] = _coerce_param_value(val, key, props, func_name)
+        _built = _build_tool_call(func_name, arguments)
+        if _built is not None:
+            tool_calls.append(_built)
+            spans.append(match.span())
+
+    if not tool_calls:
+        return text, None
+
+    out: List[str] = []
+    last = 0
+    for span_start, span_end in spans:
+        out.append(text[last:span_start])
+        last = span_end
+    out.append(text[last:])
+    return "".join(out).strip(), tool_calls
 
 
 def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -1690,6 +1797,14 @@ def _parse_tool_calls_impl(
         ns = ns_match.group(1)
         return _parse_namespaced_tool_calls(cleaned_text, ns, tools)
 
+    # Fallback: bare attribute-style <function name="..."> elements with no
+    # wrapper marker (MiniCPM5 family, #3429). Anchored on declared tool
+    # names; see the parser's docstring.
+    if _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
+        attr_result = _parse_attribute_function_tool_calls(cleaned_text, tools)
+        if attr_result[1] is not None:
+            return attr_result
+
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
         hermes_result = _parse_hermes_tool_calls(cleaned_text)
@@ -1912,6 +2027,11 @@ class ToolCallStreamFilter:
             ("]<]minimax[>[<tool_call>", "]<]minimax[>[</tool_call>"),
             ("<|tool_call_start|>", "<|tool_call_end|>"),
             ("<tool_call>", "</tool_call>"),
+            # Bare attribute-style dialect (MiniCPM5 family, #3429). The open
+            # marker is a tag prefix rather than a complete tag; like the
+            # unconditional <tool_call> pair above, it only ever runs on
+            # tool-enabled streams.
+            ('<function name="', "</function>"),
         ]
         self._suppress_after_markers: List[str] = []
         if marker:
