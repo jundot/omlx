@@ -89,6 +89,14 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 
     model_type = str(cfg.get("model_type") or "").lower()
 
+    from ..patches.dflash_paroquant import (
+        is_paroquant_config,
+        paroquant_dflash_compatibility,
+    )
+
+    if is_paroquant_config(cfg):
+        return paroquant_dflash_compatibility(cfg)
+
     is_qwen = "qwen" in model_type
     is_gemma4 = model_type in ("gemma4", "gemma4_text", "gemma4_unified")
     is_laguna = model_type == "laguna"
@@ -537,9 +545,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         def _load_models():
             from dflash_mlx.draft_backend import EagerDraftBackend
             from dflash_mlx.engine.target_ops import bind_draft_to_target
-            from dflash_mlx.runtime.loading import (
-                load_draft_bundle,
+            from dflash_mlx.runtime.loading import load_draft_bundle
+
+            from ..patches.dflash_paroquant import (
                 load_target_bundle,
+                validate_paroquant_draft,
             )
 
             # Apply the same pre-load patches BatchedEngine uses before
@@ -611,6 +621,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     else None
                 ),
             )
+            validate_paroquant_draft(target_bundle.meta, draft_meta)
             bind_draft_to_target(
                 draft,
                 target_bundle.model,

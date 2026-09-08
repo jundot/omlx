@@ -595,9 +595,6 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
     the compat hint instead of pointing the user at an unrelated reason.
     """
-    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
-    if is_paro:
-        return False, paro_reason
     try:
         from ..engine.dflash import is_dflash_compatible
     except ImportError:
