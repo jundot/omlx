@@ -617,8 +617,10 @@ class TestSchedulerAddRequest:
         """Reject unknown cache classes before a partial hit loses their state."""
         from omlx.cache.paged_cache import BlockTable
 
-        RingSlidingKVCache = type("RingSlidingKVCache", (), {})
-        mock_model.make_cache = lambda: [RingSlidingKVCache()]
+        # The real ring class is now registered; keep this a genuinely
+        # unsupported layout so capability additions cannot weaken the test.
+        UnregisteredRingCache = type("UnregisteredRingCache", (), {})
+        mock_model.make_cache = lambda: [UnregisteredRingCache()]
 
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
@@ -723,7 +725,7 @@ class TestSchedulerAddRequest:
         cache_list = type(
             "CacheList",
             (),
-            {"caches": (type("KVCache", (), {})(), type("RingSlidingKVCache", (), {})())},
+            {"caches": (type("KVCache", (), {})(), type("UnregisteredRingCache", (), {})())},
         )
         mock_model.make_cache = lambda: [cache_list()]
 

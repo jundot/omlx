@@ -24,6 +24,7 @@ from .type_handlers import (
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
+from .unlimited_ocr_handler import RingSlidingKVCacheHandler
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class CacheTypeRegistry:
         "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
         "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
         "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
+        "RingSlidingKVCache": CacheType.RING_SLIDING_KVCACHE,
+        "OMLXRingSlidingKVCache": CacheType.RING_SLIDING_KVCACHE,
     }
 
     # Default handler instance
@@ -157,6 +160,15 @@ class CacheTypeRegistry:
         if class_name == "SizedArraysCache":
             return True
         return cls._class_name_map.get(class_name) == CacheType.ARRAYS_CACHE
+
+    @classmethod
+    def is_ring_family(cls, class_name: str) -> bool:
+        """Match registered ring layouts, not arbitrary KVCache subclasses.
+
+        Family membership permits ring-handler dispatch; it does not imply
+        oMLX's adapted-only set_prefill_end or singleton interfaces.
+        """
+        return cls._class_name_map.get(class_name) == CacheType.RING_SLIDING_KVCACHE
 
     @classmethod
     def detect_cache_type(cls, cache_obj: Any) -> CacheType:
@@ -272,6 +284,7 @@ def _initialize_default_handlers() -> None:
     CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
     CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
     CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
+    CacheTypeRegistry.register(RingSlidingKVCacheHandler())
 
 
 # Initialize handlers when module is imported
