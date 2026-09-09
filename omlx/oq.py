@@ -529,9 +529,6 @@ def universal_quant_predicate(
     if path_l.endswith("sconv.conv"):
         return False
 
-    if config.get("model_type") == "k2_horizon" and _is_k2_horizon_protected(path):
-        return bits(8)
-
     boost_map = config.get("_oq_boost_map") or {}
     if path in boost_map:
         return dict(boost_map[path])
@@ -831,15 +828,6 @@ def _collect_named_weight_shapes_from_weights(
             continue
         named_shapes[norm_name] = tuple(tensor.shape)
     return named_shapes
-
-
-def _is_k2_horizon_protected(path: str) -> bool:
-    """K2 Horizon keeps attention, dense MLPs, routed down_proj, and the head at Q8."""
-    if _is_routed_expert(path):
-        return "down_proj" in path
-    if any(p in path for p in ("self_attn.", "lm_head", "embed_tokens")):
-        return True
-    return ".mlp." in path and "experts" not in path
 
 
 def _is_routed_expert(path: str) -> bool:

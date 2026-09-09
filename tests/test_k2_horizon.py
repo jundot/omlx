@@ -87,9 +87,7 @@ def test_model_cache_and_quantization(kind):
 
 @pytest.mark.parametrize("groups", [1, 2, 4])
 @pytest.mark.parametrize("length", [1, 8, 512])
-def test_grouped_norm_and_oq_protection(groups, length):
-    from omlx.oq import universal_quant_predicate
-
+def test_grouped_norm(groups, length):
     x = mx.arange(length * 64).reshape(1, length, 64).astype(mx.bfloat16)
     actual = GroupedRMSNorm(64, groups, 1e-5)(x)
     grouped = x.astype(mx.float32).reshape(1, length, groups, 64 // groups)
@@ -97,18 +95,6 @@ def test_grouped_norm_and_oq_protection(groups, length):
         grouped * mx.rsqrt(mx.mean(grouped**2, -1, keepdims=True) + 1e-5)
     ).reshape(x.shape)
     assert mx.allclose(actual.astype(mx.float32), expected, atol=0.01).item()
-    config = {"model_type": "k2_horizon"}
-    layer = nn.Linear(64, 64)
-    assert (
-        universal_quant_predicate("model.layers.0.self_attn.v_router", layer, config)
-        is False
-    )
-    assert (
-        universal_quant_predicate("model.layers.0.self_attn.q_proj", layer, config)[
-            "bits"
-        ]
-        == 8
-    )
 
 
 @pytest.mark.parametrize("quantized", [False, True])
