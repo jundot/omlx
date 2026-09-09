@@ -209,11 +209,26 @@ def test_kv_sink_is_cleared_between_forwards():
     assert getattr(_active, "sink", None) is None
 
 
-def test_trunk_norm_is_restored_when_the_forward_raises():
+class _LayerError(RuntimeError):
+    """A deliberate mid-forward failure, so the test owns the exception."""
+
+
+def test_trunk_norm_is_restored_when_the_forward_raises(monkeypatch):
+    # The recorder stands in for self.norm for the duration of one forward.
+    # If an exception could leave it installed, every later forward would
+    # return the recorder's output and leak the previous request's hidden.
+    from mlx_lm.models.gemma4_text import DecoderLayer
+
+    def explode(self, *args, **kwargs):
+        raise _LayerError("layer failed mid-forward")
+
     model = _inner()
     norm = model.model.norm
-    with pytest.raises(Exception):
-        model(mx.array([[1, 2, 3]]), cache="not-a-cache", return_hidden=True)
+    monkeypatch.setattr(DecoderLayer, "__call__", explode)
+
+    with pytest.raises(_LayerError):
+        model(mx.array([[1, 2, 3]]), cache=model.make_cache(), return_hidden=True)
+
     assert model.model.norm is norm
     from omlx.patches.mlx_lm_mtp.gemma4_text_model import _active
 

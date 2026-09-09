@@ -152,12 +152,9 @@ def _patch_inner_model(mod: Any) -> None:
         self._omlx_mtp_decode_enabled = enabled
         if not enabled:
             return
-        from mlx_vlm.speculative.drafters.gemma4_assistant import (
-            Gemma4AssistantDraftModel,
-            ModelConfig as Gemma4AssistantConfig,
-        )
+        from ..mlx_lm_gemma4_assistant import build_draft_model
 
-        self.mtp = Gemma4AssistantDraftModel(Gemma4AssistantConfig.from_dict(assistant))
+        self.mtp = build_draft_model(assistant)
         # Function refs read weights at call time, so binding pre-load is safe.
         self.mtp.bind(self)
         self._omlx_mtp_chain = True
@@ -239,11 +236,9 @@ def _patch_inner_model(mod: Any) -> None:
         valid_len = _query_position(self)
         rejected = getattr(self, "_omlx_mtp_kv_offset", valid_len) - valid_len
         if rejected > 0:
-            from mlx_vlm.speculative.mtp import (  # noqa: SLF001
-                _slice_shared_kv_after_reject,
-            )
+            from ..mlx_lm_gemma4_assistant import slice_shared_kv_after_reject
 
-            shared_kv = _slice_shared_kv_after_reject(shared_kv, rejected)
+            shared_kv = slice_shared_kv_after_reject(shared_kv, rejected)
 
         drafter._kv_valid_len = valid_len
         position_ids = mx.array([[max(valid_len - 1, 0)]])
