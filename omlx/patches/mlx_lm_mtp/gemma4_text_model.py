@@ -261,9 +261,9 @@ def _patch_inner_model(mod: Any) -> None:
 
         Gemma 4 is attention-only, so unlike qwen35 there is no recurrent
         state to restore and replay: every layer drops
-        ``num_drafts - accepted`` positions. Trimmability is checked across
-        all layers before any are trimmed, because a half-rolled-back cache
-        is unrecoverable.
+        ``num_drafts - accepted`` positions. Every layer is asked whether it
+        can trim before any of them is trimmed, because a half-rolled-back
+        cache is unrecoverable.
 
         A sliding layer whose ring has wrapped still trims: ``cache_rollback``
         arms an undo log around the verify forward, so ``is_trimmable()``
