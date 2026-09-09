@@ -129,3 +129,6 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+
+# Deploy-time source-ref stamp, written outside git (see omlx/build_ref.py)
+omlx/_build_ref.txt

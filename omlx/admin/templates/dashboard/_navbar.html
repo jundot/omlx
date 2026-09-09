@@ -8,6 +8,7 @@
                 </a>
                 <div class="flex flex-col gap-0">
                     <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
+                    <div class="flex items-center gap-1.5">
                     <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
                        class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
                        @mouseenter="versionHover = true" @mouseleave="versionHover = false">
@@ -20,6 +21,13 @@
                                   ? window.t('navbar.update_available').replace('{version}', latestVersion)
                                   : window.t('navbar.go_to_github')"></span>
                     </a>
+                    {% if build_ref %}
+                    <span title="Deployed source ref"
+                          class="px-1.5 py-0.5 rounded text-[10px] font-medium leading-none max-w-[14rem] truncate
+                                 bg-neutral-100 text-neutral-700 border border-neutral-200
+                                 dark:bg-neutral-800 dark:text-neutral-200 dark:border-neutral-700">{{ build_ref }}</span>
+                    {% endif %}
+                    </div>
                 </div>
             </div>
 
