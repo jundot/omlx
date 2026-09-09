@@ -145,17 +145,25 @@ console.log(JSON.stringify({neutral, changed, budget: app.unoConflict(), unavail
 
 
 @pytest.mark.asyncio
-async def test_pool_selects_uno_and_charges_adapter(models, tmp_path):
+@pytest.mark.parametrize("ane_enabled", [False, True])
+async def test_pool_selects_uno_and_charges_adapter(models, tmp_path, ane_enabled):
     base, adapter = models
     pool = EnginePool()
     pool.discover_models(str(tmp_path))
-    settings = ModelSettings(uno_enabled=True, uno_adapter_model=adapter.name)
+    settings = ModelSettings(
+        uno_enabled=True,
+        uno_adapter_model=adapter.name,
+        qwen35_ane_prefill_enabled=ane_enabled,
+    )
     entry = pool.get_entry(base.name)
     before = pool._engine_runtime_signature(base.name, ModelSettings())
     assert before != pool._engine_runtime_signature(base.name, settings)
-    assert pool._entry_runtime_resident_size(entry, settings) == (
+    weight_size = (
         entry.estimated_size + pool.get_entry(adapter.name).estimated_size
     )
+    assert pool._entry_runtime_resident_size(
+        entry, settings, include_ane_reservation=False
+    ) == weight_size
     with patch("omlx.engine.uno.UnoEngine") as constructor:
         constructor.return_value.start = AsyncMock()
         with patch.object(pool, "_validate_llm_engine_ready"):
@@ -165,6 +173,8 @@ async def test_pool_selects_uno_and_charges_adapter(models, tmp_path):
         pool._entry_runtime_resident_size(entry, settings)
         == entry.runtime_estimated_size
     )
+    assert entry.runtime_settle_size == weight_size
+    assert (entry.runtime_estimated_size > weight_size) == ane_enabled
 
 
 @pytest.mark.asyncio
