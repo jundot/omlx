@@ -2414,6 +2414,7 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         entry = engine_pool.get_entry(run.request.model_id)
         config = json.loads((Path(entry.model_path) / "config.json").read_text())
         candidates = _k2_candidates(config)
+        candidates.append(replace(candidates[0], label="GPU only (recheck)"))
         run.results = [_empty_result(candidate) for candidate in candidates]
         run.total = len(candidates)
         for model_id in list(engine_pool.get_loaded_model_ids()):
@@ -2441,7 +2442,11 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
 
 async def _measure_k2_workloads(run, engine, candidate, long_ttft):
     """Verify each split with short prompts, arrivals during decode, and KV reuse."""
-    for name, length, count in (("short", 256, 1), ("batch", 1024, 8)):
+    for name, length, count in (
+        ("short", 256, 1),
+        ("batch", 1024, 8),
+        ("cached", 1024, 8),
+    ):
         if name not in run.evaluation_prompts:
             run.evaluation_prompts[name] = [
                 _generate_prompt(
@@ -2455,7 +2460,7 @@ async def _measure_k2_workloads(run, engine, candidate, long_ttft):
         ("short_prompt", "short", False, False),
         ("concurrent", "batch", False, False),
         ("staggered", "batch", True, False),
-        ("cached", "batch", False, True),
+        ("cached", "cached", False, True),
     ):
         unit = "ms" if name == "short_prompt" else "tok/s"
         if cached and not engine.prefix_cache_enabled:
@@ -2485,6 +2490,8 @@ async def _measure_k2_workloads(run, engine, candidate, long_ttft):
                 raise RuntimeError(
                     "The cached-prompt test did not reuse every request's KV prefix"
                 )
+            if not cached and any(metrics["cached_tokens"]):
+                raise RuntimeError("An uncached-prompt test reused KV")
             if sample:
                 samples.append(
                     metrics["avg_ttft_ms"] if unit == "ms" else metrics["aggregate_tps"]
@@ -2573,9 +2580,27 @@ def _k2_comparison(baseline, candidate):
 
 
 def _select_k2_recommendation(run):
-    baseline = run.results[0]
+    baselines = [result for result in run.results if not result["enabled"]]
+    baseline = dict(baselines[0])
+    baseline["workloads"] = {
+        name: {
+            **measurement,
+            **{
+                key: [
+                    value
+                    for result in baselines
+                    for value in result["workloads"][name].get(key, [])
+                ]
+                for key in ("samples", "max_ttft_ms")
+            },
+        }
+        for name, measurement in baseline["workloads"].items()
+    }
+    baseline["processing_tps"] = statistics.median(
+        result["processing_tps"] for result in baselines
+    )
     candidates = []
-    for candidate in run.results[1:]:
+    for candidate in (result for result in run.results if result["enabled"]):
         rows = _k2_comparison(baseline, candidate)
         measured = [row for row in rows if row["improvement_percent"] is not None]
         safe = all(row["stable"] for row in measured)

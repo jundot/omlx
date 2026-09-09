@@ -218,8 +218,10 @@ Load LLMs, VLMs, embedding models, and rerankers within the same server. Models 
 K2 Horizon supports serving and oQ quantization. Use **Chat Template Kwargs**
 to set `reasoning_effort` to `low`, `medium`, or `high` (default).
 **Thinking Budget** limits reasoning. A budget of 1 forces immediate closure and can reduce answer quality.
-**K2 ANE Prompt Processing** is opt-in for dense K2 and MoVA. The tuner compares
-GPU and ANE MLP splits in the web and macOS settings. Apply its result to opt in.
+**K2 ANE Prompt Processing** is opt-in for dense K2 and MoVA. Use **Test ANE**
+in the existing model-settings panel. It compares short and long prompts,
+eight concurrent requests, arrivals during decode, and cached prompts.
+It rechecks the GPU baseline before recommending a split. Apply the result to opt in.
 Attention, routed experts,
 KV, and decode stay on GPU. Existing affine quantization is retained on GPU;
 ANE uses FP16 and can change outputs. Split configurations use separate SSD

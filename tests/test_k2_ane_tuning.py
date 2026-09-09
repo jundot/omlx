@@ -41,7 +41,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
     monkeypatch.setattr(
         fast, "_ext", SimpleNamespace(ane_compile_program_bank=object())
     )
-    samples = iter([100, 101, peak, 101, 100])
+    samples = iter([100, 101, peak, 101, 100, 100])
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
@@ -166,6 +166,26 @@ def test_k2_verdict_rejects_missing_concurrency_measurement():
         ane_tuning._k2_comparison({"workloads": workloads()}, candidate)
 
 
+def test_gpu_recheck_can_reject_an_apparent_ane_gain():
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="model", backend="k2")
+    )
+    run.results = [
+        dict(label="GPU", enabled=False, processing_tps=100, workloads=workloads()),
+        dict(label="ANE", enabled=True, processing_tps=120, workloads=workloads(120)),
+    ]
+    assert ane_tuning._select_k2_recommendation(run)["enabled"]
+    run.results.append(
+        dict(
+            label="GPU recheck",
+            enabled=False,
+            processing_tps=140,
+            workloads=workloads(140),
+        )
+    )
+    assert not ane_tuning._select_k2_recommendation(run)["enabled"]
+
+
 @pytest.mark.parametrize("samples", [[], [1], [float("nan")] * 3, [0] * 3])
 def test_k2_verdict_requires_valid_first_token_samples(samples):
     candidate = {"workloads": workloads(120)}
@@ -189,7 +209,10 @@ async def test_k2_evaluation_covers_arrivals_and_proves_cache_reuse(
             "avg_ttft_ms": 10,
             "aggregate_tps": 100,
             "max_ttft_ms": 15,
-            "cached_tokens": [256 if cache_hits else 0] * options["batch_size"],
+            "cached_tokens": [
+                256 if cache_hits and not options["skip_cache_store"] else 0
+            ]
+            * options["batch_size"],
         }
 
     monkeypatch.setattr(ane_tuning, "_run_batch_test", measure)
