@@ -19,6 +19,24 @@ def test_cluster_help_is_exposed():
     assert "collective-smoke" in result.stdout
     assert "pipeline-smoke" in result.stdout
     assert "plan" in result.stdout
+    assert "discover" in result.stdout
+    assert "inventory" in result.stdout
+    assert "provision" in result.stdout
+
+
+def test_cluster_discover_ports_must_be_integers():
+    """--ports is typed, so a non-numeric value is an argparse error, not a
+    ValueError traceback out of the socket layer."""
+
+    result = subprocess.run(
+        [sys.executable, "-m", "omlx.cli", "cluster", "discover", "--ports", "ssh"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert "--ports" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_cluster_status_json_is_runnable():
