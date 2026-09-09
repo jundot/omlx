@@ -823,6 +823,12 @@ class ClaudeCodeSettings:
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
+    # Serve Claude Code's auto-mode Bash safety-classifier requests (#1's
+    # predicate) with a configured tier's model instead of whatever the
+    # active session requested. Off by default, matching model_fallback's
+    # own opt-in default (#2).
+    steer_classifier_requests: bool = False
+    classifier_model_tier: str = "haiku"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -831,6 +837,8 @@ class ClaudeCodeSettings:
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
             "haiku_model": self.haiku_model,
+            "steer_classifier_requests": self.steer_classifier_requests,
+            "classifier_model_tier": self.classifier_model_tier,
         }
 
     @classmethod
@@ -841,6 +849,8 @@ class ClaudeCodeSettings:
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
             haiku_model=data.get("haiku_model"),
+            steer_classifier_requests=data.get("steer_classifier_requests", False),
+            classifier_model_tier=data.get("classifier_model_tier", "haiku"),
         )
 
 
@@ -1645,6 +1655,13 @@ class GlobalSettings:
             errors.append(
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
+            )
+        valid_classifier_tiers = {"opus", "sonnet", "haiku"}
+        if self.claude_code.classifier_model_tier not in valid_classifier_tiers:
+            errors.append(
+                f"Invalid claude_code classifier_model_tier: "
+                f"'{self.claude_code.classifier_model_tier}' "
+                f"(must be one of {sorted(valid_classifier_tiers)})"
             )
 
         # Integration validation
