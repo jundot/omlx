@@ -51,11 +51,11 @@ class IntegrationContext:
 class Integration:
     """Base integration definition."""
 
-    name: str  # "codex", "opencode", "openclaw", "hermes", "pi"
-    display_name: str  # "Codex", "OpenCode", "OpenClaw", "Hermes Agent", "Pi"
-    type: str  # "env_var" or "config_file"
-    install_check: str  # binary name to check with `which`
-    install_hint: str  # installation instructions
+    name: str # "codex", "opencode", "openclaw", "hermes", "pi"
+    display_name: str # "Codex", "OpenCode", "OpenClaw", "Hermes Agent", "Pi"
+    type: str # "env_var" or "config_file"
+    install_check: str # binary name to check with `which`
+    install_hint: str # installation instructions
 
     def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
@@ -158,12 +158,15 @@ class Integration:
         self,
         config_path: Path,
         updater: callable,
+        *,
+        backup: bool = True,
     ) -> None:
-        """Read, update, and write a JSON config file with backup.
+        """Read, update, and write a JSON config file with optional backup.
 
         Args:
             config_path: Path to the config file.
             updater: Function that takes existing config dict and modifies it in-place.
+            backup: Whether to create a timestamped backup of an existing file.
         """
         existing: dict = {}
         if config_path.exists():
@@ -175,13 +178,14 @@ class Integration:
                 existing = {}
 
             # Create timestamped backup
-            timestamp = int(time.time())
-            backup = config_path.with_suffix(f".{timestamp}.bak")
-            try:
-                shutil.copy2(config_path, backup)
-                print(f"Backup: {backup}")
-            except OSError as e:
-                print(f"Warning: could not create backup: {e}")
+            if backup:
+                timestamp = int(time.time())
+                backup_path = config_path.with_suffix(f".{timestamp}.bak")
+                try:
+                    shutil.copy2(config_path, backup_path)
+                    print(f"Backup: {backup_path}")
+                except OSError as e:
+                    print(f"Warning: could not create backup: {e}")
 
         updater(existing)
 
@@ -196,9 +200,8 @@ class Integration:
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
     """Show a fullscreen curses arrow-key picker for model selection.
 
-    Loaded models appear first with a filled bullet; unloaded (available on
-    disk) appear after with an empty bullet. Curses uses terminfo so this
-    works reliably across SSH/PuTTY/tmux/screen, unlike inline ANSI TUIs.
+    Loaded models appear first, then unloaded models. Curses uses terminfo so
+    this works reliably across SSH/PuTTY/tmux/screen.
 
     Raises ImportError if stdlib curses is not available.
     Returns the selected model id, or exits with 130 on cancel.
