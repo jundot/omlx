@@ -1,0 +1,4303 @@
+{
+  "hardware": "Apple M4 Max, 128 GiB unified memory",
+  "limitations": [
+    "The 7B cases have no complete thermal history.",
+    "MoVA telemetry covers each whole case and records Heavy thermal pressure. It does not establish comparable thermal conditions for each candidate.",
+    "These measurements do not establish performance under matched thermal conditions."
+  ],
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "software": {
+    "python": "3.13.5",
+    "mlx": "0.32.2",
+    "mlx-lm": "0.31.3",
+    "xgrammar": "0.2.3"
+  },
+  "controls": {
+    "ane_tile_tokens": 2048,
+    "measured_repeats": 3,
+    "temperature": 0,
+    "top_p": 1,
+    "long_prompt_tokens": 8193,
+    "long_prompt_max_output_tokens": 2,
+    "short_prompt_tokens": 256,
+    "batch_prompt_tokens": 1024,
+    "batch_size": 8,
+    "other_workload_max_output_tokens": 128,
+    "gpu_controls": "Before and after the ANE candidates.",
+    "cache": "Separate cached corpus; all eight requests reuse 1023 tokens. Uncached workloads have zero hits.",
+    "batch_rate": "Generated tokens divided by total workload time, including prefill and waiting.",
+    "ane_arithmetic": "FP16; attention, routed experts, KV, and decode remain on GPU."
+  },
+  "runs": [
+    {
+      "case": "7b-oq8e",
+      "source_commit": "13ff217f58fabe6625f880b59bd641be5d633bcb",
+      "config_sha256": "9d1d33dd131d931557d5d0f60f6f2e948bc215b1bb6c38ee2257393a89a4fbb1",
+      "quantization": {
+        "default_bits": 8,
+        "group_size": 64,
+        "module_override_counts_by_bits": {},
+        "note": null
+      },
+      "system_metrics": null,
+      "telemetry_scope": "No complete thermal history was recorded.",
+      "saved_settings_unchanged": true,
+      "results": [
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 651.1,
+          "samples": [
+            707.0,
+            651.1,
+            580.2
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                11588.5,
+                12584.2,
+                14120.0
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                644.5,
+                683.2,
+                676.1
+              ],
+              "max_ttft_ms": [
+                644.5225419593044,
+                683.1525419838727,
+                676.1206669616513
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                47.313144000238786,
+                49.166942719736994,
+                48.50844745172138
+              ],
+              "max_ttft_ms": [
+                18323.545790975913,
+                17410.437582992017,
+                17749.870583007578
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                43.96697798069958,
+                43.074406002020396,
+                42.7114537778847
+              ],
+              "max_ttft_ms": [
+                17017.499915964436,
+                17350.31283396529,
+                17382.07016600063
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                124.67789578264899,
+                126.80922700973983,
+                126.66047967838344
+              ],
+              "max_ttft_ms": [
+                1587.8706660005264,
+                1596.7989999917336,
+                1619.2784579470754
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.0,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 33%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 738.1,
+          "samples": [
+            731.9,
+            738.1,
+            773.4
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                11193.7,
+                11100.8,
+                10593.0
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                2122.8,
+                2128.8,
+                2093.1
+              ],
+              "max_ttft_ms": [
+                2122.836000053212,
+                2128.7662090035155,
+                2093.057874997612
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                15.003253949673224,
+                14.985028416467129,
+                14.772073585626295
+              ],
+              "max_ttft_ms": [
+                65424.26008399343,
+                65495.30029197922,
+                66442.37720797537
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                17.446034218516097,
+                17.016395107074814,
+                17.380019769311588
+              ],
+              "max_ttft_ms": [
+                53282.43941598339,
+                54934.95579098817,
+                53486.767082998995
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                160.1706714352937,
+                161.21937899431526,
+                163.2012867490228
+              ],
+              "max_ttft_ms": [
+                1530.5309999966994,
+                1506.1497919959947,
+                1421.8253339640796
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 13.36,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 50%",
+          "enabled": true,
+          "mlp_fraction": 0.5,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 668.8,
+          "samples": [
+            669.3,
+            668.8,
+            667.4
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                12241.7,
+                12249.4,
+                12276.5
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                2452.8,
+                2450.6,
+                2458.7
+              ],
+              "max_ttft_ms": [
+                2452.821207989473,
+                2450.6098330020905,
+                2458.7163340183906
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                12.028001946202497,
+                12.155563879553203,
+                12.169081701282236
+              ],
+              "max_ttft_ms": [
+                82673.04029100342,
+                81733.09837502893,
+                81779.1317080264
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                12.146863557681922,
+                12.091371786709026,
+                12.174518319862827
+              ],
+              "max_ttft_ms": [
+                78231.91512504127,
+                78649.10670899553,
+                78232.52929101
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                164.9359222252616,
+                165.66102663514977,
+                167.50857970113134
+              ],
+              "max_ttft_ms": [
+                1470.9543749922886,
+                1480.188250017818,
+                1416.795541997999
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 2.72,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only (recheck)",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 762.3,
+          "samples": [
+            783.6,
+            762.3,
+            752.0
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                10455.5,
+                10747.5,
+                10895.6
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                560.4,
+                557.5,
+                563.3
+              ],
+              "max_ttft_ms": [
+                560.3535000118427,
+                557.4661249993369,
+                563.3211249951273
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                51.42944260158712,
+                52.604297135701536,
+                55.6815567769859
+              ],
+              "max_ttft_ms": [
+                16704.007416963577,
+                16370.854582986794,
+                15521.764083998278
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                53.46459657566527,
+                53.10231578805025,
+                52.69971103028465
+              ],
+              "max_ttft_ms": [
+                13665.94974999316,
+                13681.01887498051,
+                13867.220291984268
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                151.94294536690438,
+                151.07568951602525,
+                149.21457343504932
+              ],
+              "max_ttft_ms": [
+                1412.1088330284692,
+                1456.8089580279775,
+                1428.1409159884788
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 17.08,
+          "error": null
+        }
+      ],
+      "recommendation": {
+        "backend": "k2",
+        "enabled": false,
+        "mlp_fraction": null,
+        "shared_fraction": 1.0,
+        "processing_tps": 706.7,
+        "speedup_percent": 0.0,
+        "sequence_length": 2048,
+        "gdn_enabled": false,
+        "reason": "slower",
+        "comparison_label": "Dense 33%"
+      },
+      "comparison": [
+        {
+          "id": "long_prompt",
+          "unit": "ms",
+          "gpu": 11242.05,
+          "ane": 11100.8,
+          "improvement_percent": 1.2724308157970654,
+          "stable": false
+        },
+        {
+          "id": "short_prompt",
+          "unit": "ms",
+          "gpu": 603.9,
+          "ane": 2122.8,
+          "improvement_percent": -71.55172413793103,
+          "stable": false,
+          "gpu_ttft_ms": 603.9218334772158,
+          "ane_ttft_ms": 2122.836000053212
+        },
+        {
+          "id": "concurrent",
+          "unit": "tok/s",
+          "gpu": 50.29819266066205,
+          "ane": 14.985028416467129,
+          "improvement_percent": -70.20762054500848,
+          "stable": false,
+          "gpu_ttft_ms": 17057.222499977797,
+          "ane_ttft_ms": 65495.30029197922
+        },
+        {
+          "id": "staggered",
+          "unit": "tok/s",
+          "gpu": 48.333344505492114,
+          "ane": 17.380019769311588,
+          "improvement_percent": -64.04134672009569,
+          "stable": false,
+          "gpu_ttft_ms": 15442.360103974352,
+          "ane_ttft_ms": 53486.767082998995
+        },
+        {
+          "id": "cached",
+          "unit": "tok/s",
+          "gpu": 138.01190022239456,
+          "ane": 161.21937899431526,
+          "improvement_percent": 16.81556353801652,
+          "stable": false,
+          "gpu_ttft_ms": 1522.339812014252,
+          "ane_ttft_ms": 1506.1497919959947
+        }
+      ]
+    },
+    {
+      "case": "7b-oq4e",
+      "source_commit": "310cc85d07bad530e1e6edb79233e372f9715969",
+      "config_sha256": "249207d5cd9df5daec822460c73455080a8c385fb2e32700403d2e4f3ef5f283",
+      "quantization": {
+        "default_bits": 4,
+        "group_size": 64,
+        "module_override_counts_by_bits": {
+          "8": 254
+        },
+        "note": "All quantized projections retain Q8 under the dense-model safeguards."
+      },
+      "system_metrics": null,
+      "telemetry_scope": "No complete thermal history was recorded.",
+      "saved_settings_unchanged": true,
+      "results": [
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 700.2,
+          "samples": [
+            694.3,
+            700.2,
+            706.9
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                11800.0,
+                11701.0,
+                11590.1
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                577.2,
+                652.6,
+                665.6
+              ],
+              "max_ttft_ms": [
+                577.2016659611836,
+                652.5913330260664,
+                665.5784580507316
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                52.12654255922113,
+                53.43168740871744,
+                52.798492284181926
+              ],
+              "max_ttft_ms": [
+                16798.289374972228,
+                16293.798834027257,
+                16590.353916981257
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                49.889788451335775,
+                49.03565682382915,
+                51.45124317329111
+              ],
+              "max_ttft_ms": [
+                14603.749375033658,
+                15036.022499960382,
+                14311.185667000245
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                127.70412948608376,
+                128.06364963546042,
+                132.25985290164502
+              ],
+              "max_ttft_ms": [
+                1650.5990829900838,
+                1596.8159170006402,
+                1695.9472080343403
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.0,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 33%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 877.8,
+          "samples": [
+            874.4,
+            877.8,
+            884.8
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                9369.7,
+                9333.7,
+                9260.0
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                1852.8,
+                1879.2,
+                1832.9
+              ],
+              "max_ttft_ms": [
+                1852.7633339981548,
+                1879.1667079785839,
+                1832.94933300931
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                17.11464439890872,
+                17.1306623959683,
+                16.732537279065266
+              ],
+              "max_ttft_ms": [
+                57323.43554199906,
+                57173.40658302419,
+                58631.53050001711
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                17.436704226215905,
+                17.385144808448782,
+                17.43491850356259
+              ],
+              "max_ttft_ms": [
+                53261.048583022784,
+                53566.10462500248,
+                53413.82349998457
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                162.65234616527547,
+                160.8763045424716,
+                160.8293012149315
+              ],
+              "max_ttft_ms": [
+                1428.390208981,
+                1512.1157499961555,
+                1460.191541002132
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 25.36,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 50%",
+          "enabled": true,
+          "mlp_fraction": 0.5,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 685.6,
+          "samples": [
+            684.4,
+            685.6,
+            685.7
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                11970.7,
+                11949.3,
+                11949.1
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                2448.0,
+                2450.1,
+                2436.7
+              ],
+              "max_ttft_ms": [
+                2448.0029580299743,
+                2450.0941669684835,
+                2436.669291986618
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                12.163979001573294,
+                12.123018083256959,
+                12.157560012851672
+              ],
+              "max_ttft_ms": [
+                81830.58062498458,
+                81999.2009170237,
+                81877.95662501594
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                12.185302085063213,
+                12.32046875358754,
+                11.810706343543231
+              ],
+              "max_ttft_ms": [
+                78164.13695801748,
+                76800.9957500035,
+                80352.38658398157
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                147.664462647226,
+                147.46694645679574,
+                145.5685965889004
+              ],
+              "max_ttft_ms": [
+                1643.6382500105537,
+                1632.5552909984253,
+                1630.771083990112
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -2.09,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only (recheck)",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 690.9,
+          "samples": [
+            709.1,
+            690.9,
+            671.2
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                11554.2,
+                11858.9,
+                12206.1
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                615.1,
+                611.8,
+                611.5
+              ],
+              "max_ttft_ms": [
+                615.1326670078561,
+                611.8497080169618,
+                611.4561249851249
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                56.15106737305714,
+                55.71980041409705,
+                55.58848494121617
+              ],
+              "max_ttft_ms": [
+                15351.310542027932,
+                15480.007249978371,
+                15533.658375032246
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                54.7505708719384,
+                54.61869822356428,
+                54.68500106616848
+              ],
+              "max_ttft_ms": [
+                13460.931750014424,
+                13443.39641701663,
+                13440.1015000185
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                158.96650865198413,
+                155.34531530514553,
+                157.94454303362346
+              ],
+              "max_ttft_ms": [
+                1468.173166969791,
+                1571.2836250313558,
+                1519.0240829833783
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -1.33,
+          "error": null
+        }
+      ],
+      "recommendation": {
+        "backend": "k2",
+        "enabled": false,
+        "mlp_fraction": null,
+        "shared_fraction": 1.0,
+        "processing_tps": 695.55,
+        "speedup_percent": 0.0,
+        "sequence_length": 2048,
+        "gdn_enabled": false,
+        "reason": "slower",
+        "comparison_label": "Dense 33%"
+      },
+      "comparison": [
+        {
+          "id": "long_prompt",
+          "unit": "ms",
+          "gpu": 11750.5,
+          "ane": 9333.7,
+          "improvement_percent": 25.893268478738317,
+          "stable": true
+        },
+        {
+          "id": "short_prompt",
+          "unit": "ms",
+          "gpu": 613.45,
+          "ane": 1852.8,
+          "improvement_percent": -66.89065198618307,
+          "stable": false,
+          "gpu_ttft_ms": 613.4911875124089,
+          "ane_ttft_ms": 1852.7633339981548
+        },
+        {
+          "id": "concurrent",
+          "unit": "tok/s",
+          "gpu": 54.5100861749668,
+          "ane": 17.11464439890872,
+          "improvement_percent": -68.6027933546573,
+          "stable": false,
+          "gpu_ttft_ms": 15913.728604529751,
+          "ane_ttft_ms": 57323.43554199906
+        },
+        {
+          "id": "staggered",
+          "unit": "tok/s",
+          "gpu": 53.0349706984277,
+          "ane": 17.43491850356259,
+          "improvement_percent": -67.12561867394513,
+          "stable": false,
+          "gpu_ttft_ms": 13886.058708507335,
+          "ane_ttft_ms": 53413.82349998457
+        },
+        {
+          "id": "cached",
+          "unit": "tok/s",
+          "gpu": 143.80258410339528,
+          "ane": 160.8763045424716,
+          "improvement_percent": 11.87302755755777,
+          "stable": true,
+          "gpu_ttft_ms": 1584.049771015998,
+          "ane_ttft_ms": 1460.191541002132
+        }
+      ]
+    },
+    {
+      "case": "mova-oq8e",
+      "source_commit": "310cc85d07bad530e1e6edb79233e372f9715969",
+      "config_sha256": "7c81f90ec421f21d0763955fbd4babba452b687117450b5ea072341b979c89da",
+      "quantization": {
+        "default_bits": 8,
+        "group_size": 64,
+        "module_override_counts_by_bits": {},
+        "note": null
+      },
+      "system_metrics": {
+        "sample_count": 9777,
+        "interval_s": 0.25,
+        "cpu": {
+          "total_avg": 17.8,
+          "total_max": 79.4,
+          "p_avg": 8.1,
+          "e_avg": 46.8
+        },
+        "gpu": {
+          "util_avg": 94.6,
+          "util_max": 100.0
+        },
+        "thermal": {
+          "start": 2,
+          "max": 2
+        }
+      },
+      "telemetry_scope": "Entire case, including loading and compilation.",
+      "saved_settings_unchanged": true,
+      "results": [
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 527.9,
+          "samples": [
+            514.5,
+            527.9,
+            532.0
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                15924.4,
+                15520.4,
+                15401.1
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                788.7,
+                772.4,
+                787.3
+              ],
+              "max_ttft_ms": [
+                788.6676659691148,
+                772.3616249859333,
+                787.3050830094144
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                35.0231080901964,
+                34.917151662508594,
+                34.96007068726769
+              ],
+              "max_ttft_ms": [
+                24681.49187497329,
+                24811.948582995683,
+                24770.140458014794
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                34.38768413157,
+                34.51940962941404,
+                31.81248285184507
+              ],
+              "max_ttft_ms": [
+                22456.59733301727,
+                22414.697624975815,
+                24329.288250009995
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                103.088010246656,
+                102.98214562918469,
+                103.19343627277817
+              ],
+              "max_ttft_ms": [
+                1797.159207984805,
+                1824.058290978428,
+                1794.2709170165472
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.0,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 0,
+          "label": "Dense 33%, shared 0%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 459.9,
+          "samples": [
+            454.0,
+            460.8,
+            459.9
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                18044.7,
+                17780.1,
+                17813.1
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                872.0,
+                881.8,
+                880.7
+              ],
+              "max_ttft_ms": [
+                871.9670829595998,
+                881.8324999883771,
+                880.6742909946479
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                30.385228654300374,
+                30.303781463204313,
+                30.295097585735313
+              ],
+              "max_ttft_ms": [
+                28809.22920902958,
+                28861.03774997173,
+                28894.627708010375
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                30.27334465114984,
+                30.39278948056157,
+                30.087179696616385
+              ],
+              "max_ttft_ms": [
+                26059.60233299993,
+                25897.919874987565,
+                26096.698458015453
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                103.1258478455987,
+                102.81956078008452,
+                102.68739721559332
+              ],
+              "max_ttft_ms": [
+                1824.3105830042623,
+                1813.920957967639,
+                1854.1364999837242
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -12.88,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 0.3333333333333333,
+          "label": "Dense 33%, shared 33%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 485.5,
+          "samples": [
+            485.5,
+            487.2,
+            484.6
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                16873.9,
+                16818.2,
+                16907.4
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                976.8,
+                976.1,
+                948.2
+              ],
+              "max_ttft_ms": [
+                976.7760830000043,
+                976.1160840280354,
+                948.162249987945
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                28.368423242648266,
+                28.366674285133502,
+                28.353340567171152
+              ],
+              "max_ttft_ms": [
+                31679.443958040792,
+                31684.1773330234,
+                31746.676166018005
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                27.867667933528367,
+                27.59576818270398,
+                27.257186937261917
+              ],
+              "max_ttft_ms": [
+                29245.5382499611,
+                29564.48520795675,
+                30041.931083018426
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                103.40430265648085,
+                103.58881545259983,
+                104.25087170636249
+              ],
+              "max_ttft_ms": [
+                1826.862332993187,
+                1833.281208993867,
+                1786.4856660016812
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -8.03,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 33%, shared 100%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 476.2,
+          "samples": [
+            471.2,
+            476.2,
+            477.5
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                17388.6,
+                17204.7,
+                17159.5
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                910.2,
+                902.2,
+                898.0
+              ],
+              "max_ttft_ms": [
+                910.2114170091227,
+                902.1607500035316,
+                897.9540829895996
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                29.08572588894757,
+                28.891860621545025,
+                27.819822992245644
+              ],
+              "max_ttft_ms": [
+                30603.51795796305,
+                30721.859958022833,
+                32326.03462500265
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                27.51881255582232,
+                27.411614897559584,
+                27.397047669766263
+              ],
+              "max_ttft_ms": [
+                29272.793791955337,
+                29329.081167001277,
+                29319.18708299054
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                99.64002486777525,
+                98.25886380487013,
+                99.51092582965026
+              ],
+              "max_ttft_ms": [
+                1840.6406249850988,
+                1954.4319169945084,
+                1930.4990420350805
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -9.79,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 50%, shared 100%",
+          "enabled": true,
+          "mlp_fraction": 0.5,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 483.7,
+          "samples": [
+            474.6,
+            483.7,
+            492.6
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                17262.5,
+                16939.2,
+                16631.5
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                894.3,
+                904.0,
+                901.0
+              ],
+              "max_ttft_ms": [
+                894.3394999951124,
+                903.9529589936137,
+                901.0493750101887
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                29.965350003233706,
+                30.115263081448713,
+                30.031986705645537
+              ],
+              "max_ttft_ms": [
+                29580.246625002474,
+                29252.484207972884,
+                29505.87016699137
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                28.470698778397363,
+                29.567351506535232,
+                29.552688281305294
+              ],
+              "max_ttft_ms": [
+                28493.255249981303,
+                26971.170041011646,
+                26990.746208000928
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                105.22410042423343,
+                105.22850855281534,
+                104.84971530105439
+              ],
+              "max_ttft_ms": [
+                1852.4984589894302,
+                1855.6584999896586,
+                1865.3043329832144
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -8.37,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only (recheck)",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 484.9,
+          "samples": [
+            483.4,
+            484.9,
+            486.5
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                16947.9,
+                16896.6,
+                16839.0
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                850.0,
+                841.8,
+                836.5
+              ],
+              "max_ttft_ms": [
+                849.9835000257008,
+                841.8271660339087,
+                836.516749986913
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                31.967161192239246,
+                31.785261094373066,
+                31.17955752471131
+              ],
+              "max_ttft_ms": [
+                26984.543874976225,
+                27196.086125040893,
+                27921.125249995384
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                30.160413379793226,
+                30.16060078141263,
+                30.0238951282681
+              ],
+              "max_ttft_ms": [
+                25746.286874986254,
+                25769.501624978147,
+                25994.078917021398
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                101.90583017731905,
+                101.52019385869835,
+                101.71666069884334
+              ],
+              "max_ttft_ms": [
+                1834.292915998958,
+                1898.4929579892196,
+                1856.23716696864
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -8.15,
+          "error": null
+        }
+      ],
+      "recommendation": {
+        "backend": "k2",
+        "enabled": false,
+        "mlp_fraction": null,
+        "shared_fraction": 1.0,
+        "processing_tps": 506.4,
+        "speedup_percent": 0.0,
+        "sequence_length": 2048,
+        "gdn_enabled": false,
+        "reason": "slower",
+        "comparison_label": "Dense 50%, shared 100%"
+      },
+      "comparison": [
+        {
+          "id": "long_prompt",
+          "unit": "ms",
+          "gpu": 16381.7,
+          "ane": 16939.2,
+          "improvement_percent": -3.2911825824123886,
+          "stable": false
+        },
+        {
+          "id": "short_prompt",
+          "unit": "ms",
+          "gpu": 812.6,
+          "ane": 901.0,
+          "improvement_percent": -9.811320754716979,
+          "stable": false,
+          "gpu_ttft_ms": 812.5922079780139,
+          "ane_ttft_ms": 901.0493750101887
+        },
+        {
+          "id": "concurrent",
+          "unit": "tok/s",
+          "gpu": 33.44215642737392,
+          "ane": 30.031986705645537,
+          "improvement_percent": -10.197218379545047,
+          "stable": false,
+          "gpu_ttft_ms": 25898.246228985954,
+          "ane_ttft_ms": 29505.87016699137
+        },
+        {
+          "id": "staggered",
+          "unit": "tok/s",
+          "gpu": 30.98654181662885,
+          "ane": 29.552688281305294,
+          "improvement_percent": -4.627342876171115,
+          "stable": false,
+          "gpu_ttft_ms": 25037.787562498124,
+          "ane_ttft_ms": 26990.746208000928
+        },
+        {
+          "id": "cached",
+          "unit": "tok/s",
+          "gpu": 102.44398790325187,
+          "ane": 105.22410042423343,
+          "improvement_percent": 2.7137878736301246,
+          "stable": false,
+          "gpu_ttft_ms": 1829.175603488693,
+          "ane_ttft_ms": 1855.6584999896586
+        }
+      ]
+    },
+    {
+      "case": "mova-oq4e",
+      "source_commit": "310cc85d07bad530e1e6edb79233e372f9715969",
+      "config_sha256": "f58a9c94245c34946842ff01fb6432771b25d50556158f69fce4e50e461daf78",
+      "quantization": {
+        "default_bits": 4,
+        "group_size": 64,
+        "module_override_counts_by_bits": {
+          "8": 386
+        },
+        "note": null
+      },
+      "system_metrics": {
+        "sample_count": 8063,
+        "interval_s": 0.25,
+        "cpu": {
+          "total_avg": 16.6,
+          "total_max": 65.5,
+          "p_avg": 8.6,
+          "e_avg": 40.6
+        },
+        "gpu": {
+          "util_avg": 94.5,
+          "util_max": 100.0
+        },
+        "thermal": {
+          "start": 2,
+          "max": 2
+        }
+      },
+      "telemetry_scope": "Entire case, including loading and compilation.",
+      "saved_settings_unchanged": true,
+      "results": [
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 587.8,
+          "samples": [
+            582.4,
+            587.8,
+            596.8
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                14067.5,
+                13939.0,
+                13728.5
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                707.4,
+                686.1,
+                696.0
+              ],
+              "max_ttft_ms": [
+                707.4147080420516,
+                686.0809170175344,
+                696.0402919794433
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                40.08373122237796,
+                39.51098493756995,
+                39.34744888157326
+              ],
+              "max_ttft_ms": [
+                21152.807665988803,
+                21620.186665968504,
+                21681.064457981847
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                38.718934456927336,
+                38.79520021805646,
+                38.72392087872314
+              ],
+              "max_ttft_ms": [
+                19508.615874976385,
+                19494.028291956056,
+                19459.55479197437
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                120.26936580037518,
+                120.56897014559367,
+                121.6127934754051
+              ],
+              "max_ttft_ms": [
+                1728.2380830147304,
+                1716.9489999650978,
+                1737.104709027335
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.0,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 0,
+          "label": "Dense 33%, shared 0%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 588.1,
+          "samples": [
+            621.1,
+            586.0,
+            588.1
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                13190.4,
+                13981.7,
+                13930.3
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                714.1,
+                718.4,
+                710.8
+              ],
+              "max_ttft_ms": [
+                714.1278330236673,
+                718.3885420090519,
+                710.8435000409372
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                38.03022458026776,
+                38.085211090871994,
+                38.050121933949335
+              ],
+              "max_ttft_ms": [
+                22712.838541949168,
+                22722.7655830211,
+                22718.992916983552
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                37.598347308756594,
+                37.555574180762,
+                37.51994684125421
+              ],
+              "max_ttft_ms": [
+                20429.705458052922,
+                20405.247875023633,
+                20509.3264169991
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                121.43263711730329,
+                120.53417769990438,
+                122.93369067010366
+              ],
+              "max_ttft_ms": [
+                1728.537040995434,
+                1784.7473750007339,
+                1692.7724159904756
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.05,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 0.3333333333333333,
+          "label": "Dense 33%, shared 33%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 596.3,
+          "samples": [
+            578.2,
+            596.4,
+            596.3
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                14170.3,
+                13736.6,
+                13738.8
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                815.2,
+                804.4,
+                810.1
+              ],
+              "max_ttft_ms": [
+                815.2487920015119,
+                804.4265420176089,
+                810.0972080137581
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                34.08365394572139,
+                33.507299243274296,
+                33.19096826282738
+              ],
+              "max_ttft_ms": [
+                26073.600167001132,
+                26616.713542025536,
+                26962.014958960935
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                32.15560469819711,
+                32.12155776163774,
+                31.957967740376485
+              ],
+              "max_ttft_ms": [
+                25145.86229098495,
+                25197.48929195339,
+                25337.64008403523
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                117.9022489901083,
+                117.99474385174639,
+                118.13870622879155
+              ],
+              "max_ttft_ms": [
+                1806.1692499904893,
+                1766.2513329996727,
+                1738.1736250245012
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 1.45,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 33%, shared 100%",
+          "enabled": true,
+          "mlp_fraction": 0.3333333333333333,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 599.5,
+          "samples": [
+            587.4,
+            599.5,
+            603.1
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                13948.4,
+                13666.6,
+                13585.6
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                759.2,
+                749.3,
+                752.1
+              ],
+              "max_ttft_ms": [
+                759.159124980215,
+                749.256041017361,
+                752.1109170047566
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                36.17320608869806,
+                35.67915170995522,
+                35.092634459131695
+              ],
+              "max_ttft_ms": [
+                24268.163417000324,
+                24664.537750009913,
+                25179.190750001
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                34.23072902822171,
+                33.86751809585683,
+                33.400443271830085
+              ],
+              "max_ttft_ms": [
+                23107.59520897409,
+                23236.851916997693,
+                23503.923083015252
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                114.526377856133,
+                114.9355227749165,
+                115.52434488308685
+              ],
+              "max_ttft_ms": [
+                1841.7827910161577,
+                1812.9058330086991,
+                1801.7989579821005
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 1.99,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1,
+          "label": "Dense 50%, shared 100%",
+          "enabled": true,
+          "mlp_fraction": 0.5,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 591.8,
+          "samples": [
+            578.3,
+            591.8,
+            603.3
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                14167.7,
+                13843.9,
+                13580.9
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                752.7,
+                770.2,
+                755.1
+              ],
+              "max_ttft_ms": [
+                752.7095830300823,
+                770.1936669764109,
+                755.096291017253
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                36.5081086795313,
+                36.14457666573941,
+                35.961975302908556
+              ],
+              "max_ttft_ms": [
+                23987.59766598232,
+                24240.08854100248,
+                24343.69670902379
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                35.10725184651639,
+                34.92465599443495,
+                34.91193464487426
+              ],
+              "max_ttft_ms": [
+                22432.080290978774,
+                22582.34891598113,
+                22610.760750016198
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                118.96690027727534,
+                117.85125795412989,
+                119.623101359049
+              ],
+              "max_ttft_ms": [
+                1759.051208035089,
+                1799.8774170409888,
+                1725.1309999846853
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": 0.68,
+          "error": null
+        },
+        {
+          "backend": "k2",
+          "shared_fraction": 1.0,
+          "label": "GPU only (recheck)",
+          "enabled": false,
+          "mlp_fraction": null,
+          "gdn_enabled": false,
+          "gdn_fraction": null,
+          "cpu_enabled": false,
+          "cpu_fraction": null,
+          "cpu_down_fraction": null,
+          "cpu_gdn_fraction": null,
+          "fused_down": false,
+          "cpu_threads": null,
+          "processing_tps": 587.7,
+          "samples": [
+            577.6,
+            587.7,
+            589.7
+          ],
+          "workloads": {
+            "long_prompt": {
+              "unit": "ms",
+              "samples": [
+                14183.8,
+                13940.2,
+                13893.7
+              ]
+            },
+            "short_prompt": {
+              "unit": "ms",
+              "samples": [
+                700.6,
+                695.8,
+                693.6
+              ],
+              "max_ttft_ms": [
+                700.6448329775594,
+                695.7639169995673,
+                693.5780000058003
+              ],
+              "cached_tokens": [
+                [
+                  0
+                ],
+                [
+                  0
+                ],
+                [
+                  0
+                ]
+              ]
+            },
+            "concurrent": {
+              "unit": "tok/s",
+              "samples": [
+                39.56653291809949,
+                39.37672571542751,
+                38.896767514149126
+              ],
+              "max_ttft_ms": [
+                21525.312584009953,
+                21653.061332996003,
+                21914.888916013297
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "staggered": {
+              "unit": "tok/s",
+              "samples": [
+                37.666655870612,
+                37.36290966066008,
+                36.85934309805497
+              ],
+              "max_ttft_ms": [
+                20120.293084008154,
+                20269.644332991447,
+                20583.438833011314
+              ],
+              "cached_tokens": [
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              ]
+            },
+            "cached": {
+              "unit": "tok/s",
+              "samples": [
+                117.63249328861646,
+                117.81943042302699,
+                117.81231617868289
+              ],
+              "max_ttft_ms": [
+                1765.8215829869732,
+                1752.5060419575311,
+                1764.2042920342647
+              ],
+              "cached_tokens": [
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ],
+                [
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023,
+                  1023
+                ]
+              ]
+            }
+          },
+          "state": "completed",
+          "stage": "verification",
+          "detail": null,
+          "latency_ms": null,
+          "speedup_percent": -0.02,
+          "error": null
+        }
+      ],
+      "recommendation": {
+        "backend": "k2",
+        "enabled": false,
+        "mlp_fraction": null,
+        "shared_fraction": 1.0,
+        "processing_tps": 587.75,
+        "speedup_percent": 0.0,
+        "sequence_length": 2048,
+        "gdn_enabled": false,
+        "reason": "slower",
+        "comparison_label": "Dense 33%, shared 0%"
+      },
+      "comparison": [
+        {
+          "id": "long_prompt",
+          "unit": "ms",
+          "gpu": 13939.6,
+          "ane": 13930.3,
+          "improvement_percent": 0.06676094556470336,
+          "stable": true
+        },
+        {
+          "id": "short_prompt",
+          "unit": "ms",
+          "gpu": 695.9,
+          "ane": 714.1,
+          "improvement_percent": -2.5486626522896016,
+          "stable": false,
+          "gpu_ttft_ms": 695.9021044895053,
+          "ane_ttft_ms": 714.1278330236673
+        },
+        {
+          "id": "concurrent",
+          "unit": "tok/s",
+          "gpu": 39.443855326498735,
+          "ane": 38.050121933949335,
+          "improvement_percent": -3.533461374433844,
+          "stable": false,
+          "gpu_ttft_ms": 21636.623999482254,
+          "ane_ttft_ms": 22718.992916983552
+        },
+        {
+          "id": "staggered",
+          "unit": "tok/s",
+          "gpu": 38.19279516376967,
+          "ane": 37.555574180762,
+          "improvement_percent": -1.668432436733891,
+          "stable": false,
+          "gpu_ttft_ms": 19814.45447949227,
+          "ane_ttft_ms": 20429.705458052922
+        },
+        {
+          "id": "cached",
+          "unit": "tok/s",
+          "gpu": 119.04439811170108,
+          "ane": 121.43263711730329,
+          "improvement_percent": 2.006175043500402,
+          "stable": false,
+          "gpu_ttft_ms": 1744.805375492433,
+          "ane_ttft_ms": 1728.537040995434
+        }
+      ]
+    }
+  ]
+}
