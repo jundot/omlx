@@ -222,11 +222,20 @@ class _ScriptedModel:
 
 
 @pytest.mark.parametrize("reject_at", list(range(7)) + [None])
-def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(reject_at):
+@pytest.mark.parametrize("direct_cycle", [False, True])
+def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(
+    reject_at, direct_cycle
+):
     model = _ScriptedModel(reject_at)
     decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
-    iterator = decoder.generate([2, 3, 4], max_tokens=16)
-    cycle = next(iterator)
+    if direct_cycle:
+        cache = model.make_cache()
+        model(mx.array([[2, 3]]), cache=cache)
+        cycle = decoder.cycle(4, cache=cache, frontier=3, max_tokens=16)
+    else:
+        iterator = decoder.generate([2, 3, 4], max_tokens=16)
+        cycle = next(iterator)
+        iterator.close()
     expected = (
         list(range(10, 19))
         if reject_at is None
@@ -237,7 +246,6 @@ def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(reject_at):
     assert cycle.cache_length == 3 + len(expected) - 1
     keys = model.cache[0].state[0]
     assert keys[0, 0, :, 0].tolist() == [2, 3, 4] + expected[:-1]
-    iterator.close()
 
 
 @pytest.mark.parametrize("eos_slot", range(9))
@@ -396,13 +404,13 @@ def test_uno_reuses_ssd_prefix_after_reload(
     )
     prompt = list(range(2, 19))
     calls = []
-    original = UnoDecoder.generate
+    original = UnoDecoder.cycle
 
     def record(self, *args, **kwargs):
         calls.append(True)
-        yield from original(self, *args, **kwargs)
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(UnoDecoder, "generate", record)
+    monkeypatch.setattr(UnoDecoder, "cycle", record)
     results = []
     for attempt in range(3 if cancel_warm else 2):
         scheduler = Scheduler(model, mock_tokenizer, config)

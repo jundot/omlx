@@ -132,82 +132,99 @@ class UnoDecoder:
                 mx.clear_cache()
         emitted = 0
         while emitted < max_tokens:
-            if cancelled is not None and cancelled():
-                return
-            length = min(self.block_size, max_tokens - emitted)
-            frontier = len(committed)
-            if any(layer.offset != frontier - 1 for layer in cache):
-                raise RuntimeError("Uno draft must start with one uncached seed")
-            # Upstream noise.py uses [1, mask_token_id). Released K2 masks equal vocab_size.
-            noise = mx.random.randint(
-                1, self.model.args.vocab_size, shape=(length - 1,), key=self._key()
+            cycle = self.cycle(
+                committed[-1],
+                cache=cache,
+                frontier=len(committed),
+                max_tokens=max_tokens - emitted,
+                cancelled=cancelled,
             )
-            draft = mx.concatenate([mx.array([committed[-1]]), noise])[None]
-            row_mask = mx.concatenate([mx.zeros((1,)), mx.ones((length - 1,))])[None]
-            draft_logits = self.model(draft, cache=cache, lora_mask=row_mask)[0]
-            if self.constraint is not None:
-                draft_logits = self.constraint.seed(draft_logits)
-            proposals, q = self._sample(draft_logits)
-            mx.eval(proposals, q)
-            self._trim(cache, frontier)
-            verify_logits = self.model(proposals[None], cache=cache)[0]
-            if self.constraint is not None:
-                verify_logits = self.constraint.verify(
-                    verify_logits, proposals.tolist()
-                )
-            targets, p = self._sample(verify_logits)
-            uniforms = residual = None
-            if self.temperature == 0:
-                flags = proposals[1:] == targets[:-1]
-                corrections = targets[:-1]
-            elif length > 1:
-                uniforms = mx.random.uniform(shape=(length - 1,), key=self._key())
-                flags, residual = acceptance_and_residual(
-                    p[:-1], q[1:], proposals[1:], uniforms
-                )
-                corrections = mx.random.categorical(mx.log(residual), key=self._key())
-            else:
-                flags = mx.array([], dtype=mx.bool_)
-                corrections = mx.array([], dtype=mx.int32)
-            mx.eval(flags, corrections, targets)
-            accepted = 0
-            for flag in flags.tolist():
-                if not flag:
-                    break
-                accepted += 1
-            proposed = proposals.tolist()
-            output = proposed[: accepted + 1]
-            if accepted < length - 1:
-                output.append(int(corrections[accepted].item()))
-            else:
-                output.append(int(targets[-1].item()))
-            output = output[: max_tokens - emitted]
-            finish = None
-            for i, token in enumerate(output):
-                if token in self.eos:
-                    output = output[: i + 1]
-                    finish = "stop"
-                    break
-            if cancelled is not None and cancelled():
+            if cycle is None:
                 return
-            if self.constraint is not None:
-                self.constraint.commit(output)
-            committed.extend(output)
-            emitted += len(output)
-            self._trim(cache, len(committed) - 1)
-            if finish is None and emitted == max_tokens:
-                finish = "length"
-            # Reuse small allocations and reclaim retired KV buffers.
-            if mx.get_cache_memory() > 64 * 1024**2:
-                mx.synchronize()
-                mx.clear_cache()
-            yield UnoCycle(
-                tuple(output),
-                min(accepted, len(output) - 1),
-                length - 1,
-                2,
-                len(committed) - 1,
-                finish,
+            committed.extend(cycle.tokens)
+            emitted += len(cycle.tokens)
+            yield cycle
+            if cycle.finish_reason:
+                return
+
+    def cycle(self, seed_token, *, cache, frontier, max_tokens, cancelled=None):
+        """Verify one block from an existing KV frontier."""
+        if type(max_tokens) is not int or max_tokens <= 0:
+            raise ValueError("Uno cycle requires positive max_tokens")
+        if (
+            type(seed_token) is not int
+            or not 0 <= seed_token < self.model.args.vocab_size
+        ):
+            raise ValueError("Uno seed token outside vocabulary")
+        if cancelled is not None and cancelled():
+            return
+        length = min(self.block_size, max_tokens)
+        if any(layer.offset != frontier - 1 for layer in cache):
+            raise RuntimeError("Uno draft must start with one uncached seed")
+        # Upstream noise.py uses [1, mask_token_id). Released K2 masks equal vocab_size.
+        noise = mx.random.randint(
+            1, self.model.args.vocab_size, shape=(length - 1,), key=self._key()
+        )
+        draft = mx.concatenate([mx.array([seed_token]), noise])[None]
+        row_mask = mx.concatenate([mx.zeros((1,)), mx.ones((length - 1,))])[None]
+        draft_logits = self.model(draft, cache=cache, lora_mask=row_mask)[0]
+        if self.constraint is not None:
+            draft_logits = self.constraint.seed(draft_logits)
+        proposals, q = self._sample(draft_logits)
+        mx.eval(proposals, q)
+        self._trim(cache, frontier)
+        verify_logits = self.model(proposals[None], cache=cache)[0]
+        if self.constraint is not None:
+            verify_logits = self.constraint.verify(verify_logits, proposals.tolist())
+        targets, p = self._sample(verify_logits)
+        uniforms = residual = None
+        if self.temperature == 0:
+            flags = proposals[1:] == targets[:-1]
+            corrections = targets[:-1]
+        elif length > 1:
+            uniforms = mx.random.uniform(shape=(length - 1,), key=self._key())
+            flags, residual = acceptance_and_residual(
+                p[:-1], q[1:], proposals[1:], uniforms
             )
-            if finish:
-                return
+            corrections = mx.random.categorical(mx.log(residual), key=self._key())
+        else:
+            flags = mx.array([], dtype=mx.bool_)
+            corrections = mx.array([], dtype=mx.int32)
+        mx.eval(flags, corrections, targets)
+        accepted = 0
+        for flag in flags.tolist():
+            if not flag:
+                break
+            accepted += 1
+        proposed = proposals.tolist()
+        output = proposed[: accepted + 1]
+        if accepted < length - 1:
+            output.append(int(corrections[accepted].item()))
+        else:
+            output.append(int(targets[-1].item()))
+        output = output[:max_tokens]
+        finish = None
+        for i, token in enumerate(output):
+            if token in self.eos:
+                output = output[: i + 1]
+                finish = "stop"
+                break
+        if cancelled is not None and cancelled():
+            return
+        if self.constraint is not None:
+            self.constraint.commit(output)
+        self._trim(cache, frontier + len(output) - 1)
+        if finish is None and len(output) == max_tokens:
+            finish = "length"
+        # Reuse small allocations and reclaim retired KV buffers.
+        if mx.get_cache_memory() > 64 * 1024**2:
+            mx.synchronize()
+            mx.clear_cache()
+        return UnoCycle(
+            tuple(output),
+            min(accepted, len(output) - 1),
+            length - 1,
+            2,
+            frontier + len(output) - 1,
+            finish,
+        )

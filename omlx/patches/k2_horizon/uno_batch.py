@@ -92,15 +92,12 @@ def step(batch, ordinary_step):
             constraint=_constraint(batch),
         )
         remaining = batch.max_tokens[0] - batch._num_tokens[0]
-        iterator = decoder.generate(
-            batch.tokens[0] + [token],
+        cycle = decoder.cycle(
+            token,
+            cache=caches,
+            frontier=len(batch.tokens[0]) + 1,
             max_tokens=max(1, remaining),
-            prompt_cache=caches,
         )
-        try:
-            cycle = next(iterator)
-        finally:
-            iterator.close()
         state.queued.extend(cycle.tokens)
         batch.prompt_cache = [
             BatchKVCache.merge([cache]) if isinstance(original, BatchKVCache) else cache
