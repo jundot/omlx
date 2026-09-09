@@ -699,14 +699,14 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
                                   comment: "Row label for the enable-thinking toggle"),
-                    sublabel: vm.isK2Base ? String(
+                    sublabel: vm.thinkingForced ? String(
                         localized: "settings.k2.thinking_hint",
                         defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
                         : String(localized: "settings.advanced.enable_thinking.sub",
                                      defaultValue: "Enable reasoning/thinking mode for this model",
                                      comment: "Sublabel for the enable-thinking toggle")) {
-                    RowSwitch(isOn: vm.isK2Base ? .constant(true) : vm.bindProfile($vm.enableThinking))
-                        .disabled(vm.isK2Base)
+                    RowSwitch(isOn: vm.thinkingForced ? .constant(true) : vm.bindProfile($vm.enableThinking))
+                        .disabled(vm.thinkingForced)
                 }
                 if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
                     Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
@@ -893,7 +893,7 @@ private struct ChatTemplateKwargsEditor: View {
             // `enable_thinking` and `reasoning_effort` are server-side
             // singletons — once added, the menu hides them so the user
             // can't push duplicate keys into `chat_template_kwargs`.
-            if !vm.isDiffusionModel, !vm.isK2Base,
+            if !vm.isDiffusionModel, !vm.thinkingForced,
                !vm.chatTemplateEntries.contains(where: { $0.kind == .enableThinking }) {
                 Button("enable_thinking") {
                     vm.addKwarg(.enableThinking)
@@ -1050,7 +1050,7 @@ private struct EntryEditor: View {
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
-        .disabled(vm.isK2Base && !entry.usesCustomReasoningEffort)
+        .disabled(vm.model?.reasoningEffortCustom != true && !entry.usesCustomReasoningEffort)
     }
 
     @ViewBuilder
@@ -1143,24 +1143,24 @@ private struct ExperimentalSection: View {
         // edits. Applying a profile persists the load-time settings and the
         // engine picks them up when it reloads.
         ListGroup {
-            if vm.isQwen35AnePrefillModel || vm.isK2Base {
-                if vm.isK2Base {
+            if vm.model?.anePrefillBackend != nil {
+                if (vm.model?.anePrefillBackend == "k2") {
                     Row(label: String(localized: "settings.experimental.k2_ane.label", defaultValue: "K2 ANE Prompt Processing"),
                         sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload.")) {
-                        RowSwitch(isOn: vm.bindProfile($vm.k2AnePrefillEnabled))
+                        RowSwitch(isOn: vm.bindProfile($vm.qwen35AnePrefillEnabled))
                     }
-                    if vm.k2AnePrefillEnabled {
+                    if vm.qwen35AnePrefillEnabled {
                         Row(label: String(localized: "settings.experimental.qwen_ane.sequence.label", defaultValue: "ANE Prompt Block")) {
-                            TextInput(text: vm.bindProfile($vm.k2AnePrefillSequenceLength), placeholder: "2048", mono: true,
+                            TextInput(text: vm.bindProfile($vm.qwen35AnePrefillSequenceLength), placeholder: "2048", mono: true,
                                       isNumeric: true, range: 1024...262_144, step: 64, width: .controlCompact)
                         }
                         Row(label: String(localized: "settings.experimental.k2_ane.dense", defaultValue: "Dense MLP on ANE")) {
-                            Popup(selection: vm.bindProfile($vm.k2AnePrefillFraction), width: .controlCompact,
-                                  options: ModelSettingsScreenVM.k2AneFractionOptions(current: vm.k2AnePrefillFraction))
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillFraction, presets: vm.model?.anePrefillMlpFractions ?? []))
                         }
                         Row(label: String(localized: "settings.experimental.k2_ane.shared", defaultValue: "Shared MLP on ANE")) {
-                            Popup(selection: vm.bindProfile($vm.k2AnePrefillSharedFraction), width: .controlCompact,
-                                  options: ModelSettingsScreenVM.k2AneFractionOptions(current: vm.k2AnePrefillSharedFraction, shared: true))
+                            Popup(selection: vm.bindProfile($vm.qwen35AnePrefillSharedFraction), width: .controlCompact,
+                                  options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillSharedFraction, presets: vm.model?.anePrefillSharedFractions ?? []))
                         }
                     }
                 }
@@ -1177,11 +1177,11 @@ private struct ExperimentalSection: View {
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                    sublabel: (vm.model?.anePrefillBackend == "k2") ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
-                        if !vm.aneTuningIsRunning && !vm.isK2Base {
+                        if !vm.aneTuningIsRunning && vm.model?.anePrefillBackend != "k2" {
                             Menu("Tuner overrides") {
                                 Toggle("Allow CPU offload", isOn: $vm.aneTuningAllowCPU)
                                 Toggle("Allow CPU gate/up", isOn: $vm.aneTuningAllowCPUGate)
@@ -1234,7 +1234,7 @@ private struct ExperimentalSection: View {
                             }
                             .buttonStyle(.omlx(.normal, size: .small))
                         } else {
-                            Button(String(localized: "settings.experimental.ane_eval.start", defaultValue: "Test ANE")) {
+                            Button("Tune for this Mac") {
                                 Task { await vm.startANETuning(client: client) }
                             }
                             .buttonStyle(.omlx(.normal, size: .small))

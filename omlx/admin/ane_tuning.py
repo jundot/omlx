@@ -446,13 +446,12 @@ async def _measure_result_slot(
 
 def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Candidate):
     settings = replace(base)
+    settings.qwen35_ane_prefill_enabled = candidate.enabled
+    settings.qwen35_ane_prefill_sequence_length = request.sequence_length
     if candidate.backend == "k2":
-        settings.k2_ane_prefill_enabled = candidate.enabled
-        settings.k2_ane_prefill_sequence_length = request.sequence_length
-        settings.k2_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
-        settings.k2_ane_prefill_shared_fraction = candidate.shared_fraction
+        settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
+        settings.qwen35_ane_prefill_shared_fraction = candidate.shared_fraction
         for field in (
-            "qwen35_ane_prefill_enabled",
             "dflash_enabled",
             "specprefill_enabled",
             "mtp_enabled",
@@ -461,11 +460,9 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
             setattr(settings, field, False)
         settings.__post_init__()
         return settings
-    settings.qwen35_ane_prefill_enabled = candidate.enabled
     settings.qwen35_ane_prefill_fused_down = bool(
         candidate.enabled and candidate.fused_down
     )
-    settings.qwen35_ane_prefill_sequence_length = request.sequence_length
     # Saved calibration must not alter the search. The winning run computes a
     # fresh crossover from this run's GPU and hybrid throughput measurements.
     settings.qwen35_ane_prefill_tail_padding_min_tokens = 0

@@ -1,47 +1,6 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "settings.experimental.ane_eval.start": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Test ANE"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ANEをテスト"
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ANE 테스트"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Проверить ANE"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "测试 ANE"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "測試 ANE"
-          }
-        }
-      }
-    },
     "settings.experimental.ane_eval.recommended": {
       "extractionState": "manual",
       "localizations": {

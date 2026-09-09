@@ -51,6 +51,11 @@ from .exceptions import (
     describe_ceiling_binding,
 )
 from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -375,15 +380,21 @@ class EnginePool:
                 format_size(extra),
                 entry.model_id,
             )
-        if getattr(runtime_settings, "k2_ane_prefill_enabled", False):
+        if (
+            getattr(runtime_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(entry.config_model_type) == "k2"
+        ):
             from .patches.k2_horizon.ane_prefill import prefill_memory_reservation
 
             config = json.loads((Path(entry.model_path) / "config.json").read_text())
             extra += prefill_memory_reservation(
                 config,
-                fraction=runtime_settings.k2_ane_prefill_fraction,
-                shared_fraction=runtime_settings.k2_ane_prefill_shared_fraction,
-                width=runtime_settings.k2_ane_prefill_sequence_length,
+                fraction=ane_prefill_fraction(
+                    runtime_settings.qwen35_ane_prefill_fraction,
+                    entry.config_model_type,
+                ),
+                shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
+                width=runtime_settings.qwen35_ane_prefill_sequence_length,
             )
         return base + extra
 
@@ -655,18 +666,33 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
-        qwen_ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
-        add("qwen35_ane_prefill_enabled", qwen_ane_active)
-        if qwen_ane_active:
+        ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
+        model_type = entry.config_model_type if entry else None
+        backend = ane_prefill_backend(model_type)
+        add("qwen35_ane_prefill_enabled", ane_active)
+        if ane_active:
+            add("ane_prefill_backend", backend)
             add(
                 "qwen35_ane_prefill_sequence_length",
                 data.get("qwen35_ane_prefill_sequence_length", 2048),
             )
             add(
+                "qwen35_ane_prefill_fraction",
+                ane_prefill_fraction(
+                    data.get("qwen35_ane_prefill_fraction"),
+                    model_type,
+                ),
+            )
+            if backend == "k2":
+                add(
+                    "qwen35_ane_prefill_shared_fraction",
+                    data.get("qwen35_ane_prefill_shared_fraction", 1.0),
+                )
+        if ane_active and backend != "k2":
+            add(
                 "qwen35_ane_prefill_tail_padding_min_tokens",
                 data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
             )
-            add("qwen35_ane_prefill_fraction", data.get("qwen35_ane_prefill_fraction", 0.53))
             add(
                 "qwen35_ane_prefill_fused_down",
                 data.get("qwen35_ane_prefill_fused_down", False),
@@ -769,14 +795,6 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
-        add("k2_ane_prefill_enabled", bool(data.get("k2_ane_prefill_enabled", False)))
-        if data.get("k2_ane_prefill_enabled"):
-            for key, default in (
-                ("k2_ane_prefill_fraction", 1 / 3),
-                ("k2_ane_prefill_shared_fraction", 1.0),
-                ("k2_ane_prefill_sequence_length", 2048),
-            ):
-                add(key, data.get(key, default))
         return tuple(signature)
 
     @property
@@ -2655,6 +2673,8 @@ class EnginePool:
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
+            if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
+                validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
             base_resident_size = self._entry_resident_size(entry)

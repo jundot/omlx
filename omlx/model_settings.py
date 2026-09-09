@@ -34,6 +34,55 @@ SETTINGS_VERSION = 1
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
 
+def ane_prefill_backend(model_type: str | None) -> str | None:
+    """Select the ANE implementation from model metadata."""
+    model_type = (model_type or "").lower().replace("-", "_")
+    if model_type == "k2_horizon":
+        return "k2"
+    if model_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+        return "qwen"
+    return None
+
+
+def ane_prefill_fraction(value: float | None, model_type: str | None) -> float:
+    """Resolve an unset split without changing an explicitly saved fraction."""
+    if value is not None:
+        return value
+    return 1 / 3 if ane_prefill_backend(model_type) == "k2" else 0.53
+
+
+def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
+    """Validate common controls against the selected backend's limits."""
+    backend = ane_prefill_backend(model_type)
+    if settings.get("qwen35_ane_prefill_enabled") and backend is None:
+        raise ValueError("ANE prefill is unavailable for this model.")
+    width = settings.get("qwen35_ane_prefill_sequence_length", 2048)
+    minimum, alignment = (32, 32) if backend == "k2" else (1024, 64)
+    if type(width) is not int or width < minimum or width % alignment:
+        raise ValueError(
+            f"ANE prompt block must be a multiple of {alignment} and at least {minimum}."
+        )
+    fraction = ane_prefill_fraction(
+        settings.get("qwen35_ane_prefill_fraction"), model_type
+    )
+    valid_fraction = 0 < fraction <= 1 if backend == "k2" else 0.05 <= fraction <= 0.90
+    if not valid_fraction:
+        bounds = "in (0, 1]" if backend == "k2" else "between 0.05 and 0.90"
+        raise ValueError(f"MLP ANE fraction must be {bounds}.")
+    shared = settings.get("qwen35_ane_prefill_shared_fraction", 1.0)
+    if shared is None or not 0 <= shared <= 1:
+        raise ValueError("ANE shared fraction must be in [0, 1].")
+    if backend == "k2" and settings.get("qwen35_ane_prefill_enabled"):
+        for name in (
+            "dflash_enabled",
+            "specprefill_enabled",
+            "mtp_enabled",
+            "vlm_mtp_enabled",
+        ):
+            if settings.get(name, False):
+                raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
+
+
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
     therefore cannot combine with ``vlm_mtp_enabled``.
@@ -114,14 +163,14 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        qwen35_ane_prefill_enabled: Enable private fixed-shape Qwen3.5/3.6/3.8
-            ANE/GPU prompt processing.
-        qwen35_ane_prefill_sequence_length: Exact flattened token count routed
-            through the eagerly compiled ANE programs.
+        qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
+            supported model. Model metadata selects the implementation.
+        qwen35_ane_prefill_sequence_length: Compiled ANE prompt block size.
         qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
             projection block padded to the compiled ANE shape (zero disables).
         qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
-            across the ANE instances.
+            across the ANE instances (None = backend default).
+        qwen35_ane_prefill_shared_fraction: Shared-expert MLP share where supported.
         qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
             into each dual-ANE/CPU hidden-channel branch.
         qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
@@ -238,13 +287,15 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
-    # Experimental private-API ANE/GPU prefill for dense Qwen3.5/3.6/3.8 MLPs.
+    # Shared ANE/GPU prefill controls retain the original Qwen setting names.
+    # Backend-specific controls apply only to models that support them.
     # Off by default because the fixed-shape ANE models add load-time/runtime
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
     qwen35_ane_prefill_enabled: bool = False
     qwen35_ane_prefill_sequence_length: int = 2048
     qwen35_ane_prefill_tail_padding_min_tokens: int = 0
-    qwen35_ane_prefill_fraction: float = 0.53
+    qwen35_ane_prefill_fraction: Optional[float] = None  # Backend default
+    qwen35_ane_prefill_shared_fraction: float = 1.0
     qwen35_ane_prefill_fused_down: bool = False
     qwen35_ane_prefill_max_layers: int = 64
     qwen35_ane_prefill_dual_ane: bool = True
@@ -307,11 +358,6 @@ class ModelSettings:
     # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
     mtp_num_draft_tokens: Optional[int] = None
 
-    k2_ane_prefill_enabled: bool = False
-    k2_ane_prefill_fraction: float = 1 / 3
-    k2_ane_prefill_shared_fraction: float = 1.0
-    k2_ane_prefill_sequence_length: int = 2048
-
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
     # (for Qwen 3.5/3.6). Both resolve to draft_kind="mtp" in mlx-vlm.
@@ -344,26 +390,6 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
-        if self.k2_ane_prefill_enabled:
-            for name in (
-                "qwen35_ane_prefill_enabled",
-                "dflash_enabled",
-                "specprefill_enabled",
-                "mtp_enabled",
-                "vlm_mtp_enabled",
-            ):
-                if getattr(self, name, False):
-                    raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
-        if not 0 <= self.k2_ane_prefill_shared_fraction <= 1:
-            raise ValueError("K2 ANE shared fraction must be in [0, 1].")
-        if not 0 < self.k2_ane_prefill_fraction <= 1:
-            raise ValueError("K2 ANE prefill fraction must be in (0, 1].")
-        if (
-            type(self.k2_ane_prefill_sequence_length) is not int
-            or self.k2_ane_prefill_sequence_length < 32
-            or self.k2_ane_prefill_sequence_length % 32
-        ):
-            raise ValueError("K2 ANE prefill tile must be a positive multiple of 32.")
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is

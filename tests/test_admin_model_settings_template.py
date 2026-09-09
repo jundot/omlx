@@ -84,9 +84,9 @@ def test_reasoning_effort_has_presets_and_custom_input():
     assert 'placeholder="0.9"' in section
     assert "<datalist" not in section
 
-    order = ["low", "medium", "high", "xhigh", "max"]
-    positions = [section.index(f'value="{value}"') for value in order]
-    assert positions == sorted(positions)
+    assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
+    assert ':value="value" x-text="value"' in section
+    assert '!selectedModel?.reasoning_effort_custom && !entry.custom' in section
 
 
 def test_reasoning_effort_add_guard_covers_custom_entries():
@@ -190,8 +190,7 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
         "qwen35_ane_prefill_gdn_max_layers",
     }
 
-    assert 'x-if="isQwen35AnePrefillModel(selectedModel)"' in html
-    assert "'qwen3_5', 'qwen3_6', 'qwen3_8'" in script
+    assert "x-if=\"selectedModel?.ane_prefill_backend === 'qwen'\"" in html
     for field in fields:
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
@@ -281,7 +280,10 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     )[0]
 
     assert "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048" in state
-    assert "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53" in state
+    assert (
+        "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
+        in state
+    )
     assert "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
     assert "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
     assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state

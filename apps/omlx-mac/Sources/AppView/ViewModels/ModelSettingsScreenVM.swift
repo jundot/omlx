@@ -36,7 +36,7 @@ final class ModelSettingsScreenVM {
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
-        case k2AnePrefillEnabled, k2AnePrefillSequenceLength, k2AnePrefillFraction, k2AnePrefillSharedFraction
+        case qwen35AnePrefillSharedFraction
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -271,10 +271,7 @@ final class ModelSettingsScreenVM {
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
     // benchmark path. The feature itself remains opt-in.
-    var k2AnePrefillEnabled = false
-    var k2AnePrefillSequenceLength = "2048"
-    var k2AnePrefillFraction = String(1.0 / 3.0)
-    var k2AnePrefillSharedFraction = "1"
+    var qwen35AnePrefillSharedFraction = "1"
     var qwen35AnePrefillEnabled: Bool = false
     var qwen35AnePrefillSequenceLength: String = "2048"
     var qwen35AnePrefillTailPaddingMinTokens: String = "0"
@@ -377,22 +374,19 @@ final class ModelSettingsScreenVM {
         return Self.diffusionConfigModelTypes.contains(type)
     }
 
-    var isK2Base: Bool { model?.configModelType == "k2_horizon" }
+    var thinkingForced: Bool { model?.thinkingForced == true }
 
-    static func k2AneFractionOptions(current: String, shared: Bool = false) -> [(String, String)] {
-        let presets: [(Double, String)] = shared
-            ? [(0, "0%"), (1.0 / 3.0, "33%"), (1, "100%")]
-            : [(1.0 / 3.0, "33%"), (0.5, "50%")]
+    static func aneFractionOptions(current: String, presets: [Double]) -> [(String, String)] {
         let value = Double(current)
-        var options = presets.map { ($0.0 == value ? current : String($0.0), $0.1) }
-        if let value, !presets.contains(where: { $0.0 == value }) {
+        var options = presets.map { ($0 == value ? current : String($0), $0.formatted(.percent.precision(.fractionLength(0)))) }
+        if let value, !presets.contains(value) {
             options.insert((current, value.formatted(.percent.precision(.fractionLength(0...2)))), at: 0)
         }
         return options
     }
 
     var reasoningEffortPresets: [String] {
-        isK2Base ? ["low", "medium", "high"] : ChatTemplateKwargsCodec.reasoningEffortPresets
+        model?.reasoningEffortOptions ?? []
     }
 
     var isQwen4Exp: Bool {
@@ -414,7 +408,7 @@ final class ModelSettingsScreenVM {
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
             return true
-        case .k2AnePrefillEnabled, .k2AnePrefillSequenceLength, .k2AnePrefillFraction, .k2AnePrefillSharedFraction:
+        case .qwen35AnePrefillSharedFraction:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -562,14 +556,11 @@ final class ModelSettingsScreenVM {
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
-                self.k2AnePrefillEnabled = s?.k2AnePrefillEnabled ?? false
-                self.k2AnePrefillSequenceLength = s?.k2AnePrefillSequenceLength.map(String.init) ?? "2048"
-                self.k2AnePrefillFraction = s?.k2AnePrefillFraction.map { String($0) } ?? String(1.0 / 3.0)
-                self.k2AnePrefillSharedFraction = s?.k2AnePrefillSharedFraction.map { String($0) } ?? "1"
+                self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
-                self.qwen35AnePrefillFraction = s?.qwen35AnePrefillFraction.map { Self.formatPct($0) } ?? "0.53"
+                self.qwen35AnePrefillFraction = String(s?.qwen35AnePrefillFraction ?? m.anePrefillDefaultFraction ?? 0.53)
                 self.qwen35AnePrefillMaxLayers = s?.qwen35AnePrefillMaxLayers.map(String.init) ?? "64"
                 self.qwen35AnePrefillDualAne = s?.qwen35AnePrefillDualAne ?? true
                 self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
@@ -719,18 +710,13 @@ final class ModelSettingsScreenVM {
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
-        case .k2AnePrefillEnabled, .k2AnePrefillSequenceLength, .k2AnePrefillFraction, .k2AnePrefillSharedFraction:
-            guard isK2Base, validateK2AneWorkingSettings() else { return }
-            patch.k2AnePrefillEnabled = k2AnePrefillEnabled
-            patch.k2AnePrefillSequenceLength = Int(k2AnePrefillSequenceLength)
-            patch.k2AnePrefillFraction = Double(k2AnePrefillFraction)
-            patch.k2AnePrefillSharedFraction = Double(k2AnePrefillSharedFraction)
+        case .qwen35AnePrefillSharedFraction:
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
-            switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
-            case .success(let value): patch.qwen35AnePrefillSequenceLength = value
-            case .failure(let error): lastError = error.message; return
-            }
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
         case .qwen35AnePrefillTailPaddingMinTokens:
             switch QwenAneSettingsValidator.tailPadding(
                 qwen35AnePrefillTailPaddingMinTokens,
@@ -740,13 +726,8 @@ final class ModelSettingsScreenVM {
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillFraction:
-            switch QwenAneSettingsValidator.mlpFraction(
-                qwen35AnePrefillFraction,
-                cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuFraction : "0"
-            ) {
-            case .success(let value): patch.qwen35AnePrefillFraction = value
-            case .failure(let error): lastError = error.message; return
-            }
+            guard validateAneWorkingSettings() else { return }
+            patch.qwen35AnePrefillFraction = Double(qwen35AnePrefillFraction)
         case .qwen35AnePrefillMaxLayers:
             switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
             case .success(let value): patch.qwen35AnePrefillMaxLayers = value
@@ -846,7 +827,7 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
-        if isK2Base { patch.enableThinking = .some(nil) }
+        if thinkingForced { patch.enableThinking = .some(nil) }
         do {
             _ = try await client.updateModelSettings(id: modelID, patch: patch)
             self.lastError = nil
@@ -857,7 +838,7 @@ final class ModelSettingsScreenVM {
 
     func startANETuning(client: OMLXClient) async {
         guard !aneTuningIsRunning else { return }
-        guard let sequenceLength = Int(isK2Base ? k2AnePrefillSequenceLength : qwen35AnePrefillSequenceLength) else {
+        guard let sequenceLength = Int(qwen35AnePrefillSequenceLength) else {
             lastError = "ANE prompt block must be a number."
             return
         }
@@ -919,17 +900,15 @@ final class ModelSettingsScreenVM {
     /// model from its current profile via a direct settings write.
     func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
+        qwen35AnePrefillEnabled = recommendation.enabled
+        qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+        if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
         if recommendation.backend == "k2" {
-            k2AnePrefillEnabled = recommendation.enabled
-            k2AnePrefillSequenceLength = String(recommendation.sequenceLength)
-            if let fraction = recommendation.mlpFraction { k2AnePrefillFraction = String(fraction) }
-            if let fraction = recommendation.sharedFraction { k2AnePrefillSharedFraction = String(fraction) }
+            if let fraction = recommendation.sharedFraction { qwen35AnePrefillSharedFraction = String(fraction) }
             profileDirty = true
             lastError = nil
             return
         }
-        qwen35AnePrefillEnabled = recommendation.enabled
-        qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
         qwen35AnePrefillTailPaddingMinTokens = String(
             recommendation.tailPaddingMinTokens ?? 0
         )
@@ -964,7 +943,7 @@ final class ModelSettingsScreenVM {
     // MARK: - Chat-template kwarg list mutation
 
     func addKwarg(_ kind: ChatTemplateKwargEntryKind) {
-        if isK2Base && kind == .enableThinking { return }
+        if thinkingForced && kind == .enableThinking { return }
         if isDiffusionModel {
             switch kind {
             case .enableThinking, .reasoningEffort:
@@ -976,7 +955,7 @@ final class ModelSettingsScreenVM {
         let defaultValue: String
         switch kind {
         case .enableThinking:  defaultValue = "true"
-        case .reasoningEffort: defaultValue = isK2Base ? "high" : "low"
+        case .reasoningEffort: defaultValue = model?.reasoningEffortDefault ?? ""
         case .custom:          defaultValue = ""
         }
         chatTemplateEntries.append(
@@ -1051,13 +1030,7 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
-    var isQwen35AnePrefillModel: Bool {
-        guard let rawType = model?.configModelType else { return false }
-        let type = rawType.lowercased().replacingOccurrences(of: "-", with: "_")
-        return type.hasPrefix("qwen3_5")
-            || type.hasPrefix("qwen3_6")
-            || type.hasPrefix("qwen3_8")
-    }
+    var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// Native Lightning MTP can't co-exist with the other speculative
     /// decoders. TurboQuant KV supports its decode-shaped multi-row verify
@@ -1170,7 +1143,7 @@ final class ModelSettingsScreenVM {
 
         // Universal — thinking / tool / reasoning
         if !isDiffusion {
-            if !isK2Base { putBool(ProfileSettingsKey.enableThinking, enableThinking) }
+            if !thinkingForced { putBool(ProfileSettingsKey.enableThinking, enableThinking) }
             putBool(ProfileSettingsKey.thinkingBudgetEnabled, thinkingBudgetEnabled)
             putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
             putBool(ProfileSettingsKey.forceSampling, forceSampling)
@@ -1202,19 +1175,16 @@ final class ModelSettingsScreenVM {
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
             }
-            if isK2Base {
-                putBool(ProfileSettingsKey.k2AnePrefillEnabled, k2AnePrefillEnabled)
-                if k2AnePrefillEnabled {
-                    putInt(ProfileSettingsKey.k2AnePrefillSequenceLength, k2AnePrefillSequenceLength)
-                    putDouble(ProfileSettingsKey.k2AnePrefillFraction, k2AnePrefillFraction)
-                    putDouble(ProfileSettingsKey.k2AnePrefillSharedFraction, k2AnePrefillSharedFraction)
-                }
-            }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
                 putInt(ProfileSettingsKey.qwen35AnePrefillSequenceLength, qwen35AnePrefillSequenceLength)
-                putInt(ProfileSettingsKey.qwen35AnePrefillTailPaddingMinTokens, qwen35AnePrefillTailPaddingMinTokens)
                 putDouble(ProfileSettingsKey.qwen35AnePrefillFraction, qwen35AnePrefillFraction)
+                if model?.anePrefillBackend == "k2" {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillSharedFraction, qwen35AnePrefillSharedFraction)
+                }
+            }
+            if qwen35AnePrefillEnabled && isQwen35AnePrefillModel {
+                putInt(ProfileSettingsKey.qwen35AnePrefillTailPaddingMinTokens, qwen35AnePrefillTailPaddingMinTokens)
                 putInt(ProfileSettingsKey.qwen35AnePrefillMaxLayers, qwen35AnePrefillMaxLayers)
                 putBool(ProfileSettingsKey.qwen35AnePrefillDualAne, qwen35AnePrefillDualAne)
                 putBool(ProfileSettingsKey.qwen35AnePrefillGdn, qwen35AnePrefillGdn)
@@ -1406,7 +1376,7 @@ final class ModelSettingsScreenVM {
     func saveWorkingAs(scope: ProfileScope, name: String, client: OMLXClient) async {
         let cleanName = name.trimmingCharacters(in: .whitespaces)
         guard !cleanName.isEmpty, scope != .preset else { return }
-        guard validateK2AneWorkingSettings(), validateQwenAneWorkingSettings() else { return }
+        guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1453,7 +1423,7 @@ final class ModelSettingsScreenVM {
     /// ProfileDetailCard preview's "Update with working" button.
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         guard scope != .preset else { return }
-        guard validateK2AneWorkingSettings(), validateQwenAneWorkingSettings() else { return }
+        guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1491,19 +1461,17 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    private func validateK2AneWorkingSettings() -> Bool {
-        guard k2AnePrefillEnabled else { return true }
-        guard let width = Int(k2AnePrefillSequenceLength), width >= 32, width % 32 == 0,
-              let dense = Double(k2AnePrefillFraction), dense > 0, dense <= 1,
-              let shared = Double(k2AnePrefillSharedFraction), shared >= 0, shared <= 1 else {
-            lastError = "K2 ANE requires a tile divisible by 32, dense share in (0, 1], and shared share in [0, 1]."
-            return false
-        }
-        return true
-    }
-
-    private func validateQwenAneWorkingSettings() -> Bool {
+    private func validateAneWorkingSettings() -> Bool {
         guard qwen35AnePrefillEnabled else { return true }
+        if model?.anePrefillBackend == "k2" {
+            guard let width = Int(qwen35AnePrefillSequenceLength), width >= 32, width % 32 == 0,
+                  let dense = Double(qwen35AnePrefillFraction), dense > 0, dense <= 1,
+                  let shared = Double(qwen35AnePrefillSharedFraction), shared >= 0, shared <= 1 else {
+                lastError = "ANE requires a tile divisible by 32, dense share in (0, 1], and shared share in [0, 1]."
+                return false
+            }
+            return true
+        }
 
         switch QwenAneSettingsValidator.promptBlock(qwen35AnePrefillSequenceLength) {
         case .success: break

@@ -5,7 +5,6 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
-    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -65,10 +64,7 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
-        'k2_ane_prefill_enabled',
-        'k2_ane_prefill_fraction',
-        'k2_ane_prefill_shared_fraction',
-        'k2_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -6976,7 +6972,7 @@
                 const isDiffusion = !!ms.is_diffusion_model;
 
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
-                    if (k === 'enable_thinking' && this.isK2Model()) continue;
+                    if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
@@ -7212,13 +7208,6 @@
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
             },
 
-            isQwen35AnePrefillModel(model) {
-                const modelType = String(model?.config_model_type || '')
-                    .toLowerCase()
-                    .replace(/-/g, '_');
-                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
-            },
-
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -7282,14 +7271,9 @@
                 return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
             },
 
-            isK2Model() {
-                return this.selectedModel?.config_model_type === 'k2_horizon';
-            },
-
-            k2AneFractionOptions(current, shared = false) {
-                const options = (shared ? [[0, '0%'], [1 / 3, '33%'], [1, '100%']]
-                    : [[1 / 3, '33%'], [0.5, '50%']])
-                    .map(([value, label]) => ({value, label}));
+            aneFractionOptions(current, presets) {
+                const options = (presets || []).map(value => ({value,
+                    label: value.toLocaleString(undefined, {style: 'percent', maximumFractionDigits: 0})}));
                 if (!options.some(option => option.value === current)) {
                     options.unshift({value: current, label: current.toLocaleString(undefined,
                         {style: 'percent', maximumFractionDigits: 2})});
@@ -7415,7 +7399,7 @@
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
-                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53,
                     qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
                     qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
                     qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
@@ -7460,10 +7444,7 @@
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
-                    k2_ane_prefill_enabled: s.k2_ane_prefill_enabled || false,
-                    k2_ane_prefill_fraction: s.k2_ane_prefill_fraction ?? 1 / 3,
-                    k2_ane_prefill_shared_fraction: s.k2_ane_prefill_shared_fraction ?? 1,
-                    k2_ane_prefill_sequence_length: s.k2_ane_prefill_sequence_length ?? 2048,
+                    qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -7972,7 +7953,7 @@
                         body: JSON.stringify({
                             model_id: modelId,
                             sequence_length: parseInt(
-                                this.isK2Model() ? this.modelSettings.k2_ane_prefill_sequence_length : this.modelSettings.qwen35_ane_prefill_sequence_length
+                                this.modelSettings.qwen35_ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
                             allow_cpu: this.aneTuningOverrides.allowCpu,
@@ -8072,49 +8053,45 @@
                 const patch = {
                     qwen35_ane_prefill_enabled: !!recommendation.enabled,
                     qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
-                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
-                        recommendation.tail_padding_min_tokens || 0
-                    ),
                 };
                 if (recommendation.enabled) {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
-                    patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
-                    if (recommendation.gdn_enabled) {
-                        patch.qwen35_ane_prefill_gdn_fraction = Number(
-                            recommendation.gdn_fraction
-                        );
-                    }
-                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
-                    patch.qwen35_ane_prefill_cpu_fraction = Number(
-                        recommendation.cpu_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
-                        recommendation.cpu_down_fraction || 0
-                    );
-                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
-                        recommendation.cpu_gdn_fraction || 0
-                    );
-                    if (recommendation.cpu_threads !== null
-                        && recommendation.cpu_threads !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_threads = Number(
-                            recommendation.cpu_threads
-                        );
-                    }
-                    if (recommendation.cpu_shared_resource !== null
-                        && recommendation.cpu_shared_resource !== undefined) {
-                        patch.qwen35_ane_prefill_cpu_shared_resource =
-                            !!recommendation.cpu_shared_resource;
-                    }
                 }
-
                 if (recommendation.backend === 'k2') {
-                    for (const key of Object.keys(patch)) delete patch[key];
-                    patch.k2_ane_prefill_enabled = !!recommendation.enabled;
-                    patch.k2_ane_prefill_sequence_length = Number(recommendation.sequence_length);
                     if (recommendation.enabled) {
-                        patch.k2_ane_prefill_fraction = Number(recommendation.mlp_fraction);
-                        patch.k2_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
+                        patch.qwen35_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
+                    }
+                } else {
+                    patch.qwen35_ane_prefill_tail_padding_min_tokens = Number(recommendation.tail_padding_min_tokens || 0);
+                    if (recommendation.enabled) {
+                        patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
+                        patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                        if (recommendation.gdn_enabled) {
+                            patch.qwen35_ane_prefill_gdn_fraction = Number(
+                                recommendation.gdn_fraction
+                            );
+                        }
+                        patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                        patch.qwen35_ane_prefill_cpu_fraction = Number(
+                            recommendation.cpu_fraction || 0
+                        );
+                        patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                            recommendation.cpu_down_fraction || 0
+                        );
+                        patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                            recommendation.cpu_gdn_fraction || 0
+                        );
+                        if (recommendation.cpu_threads !== null
+                            && recommendation.cpu_threads !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_threads = Number(
+                                recommendation.cpu_threads
+                            );
+                        }
+                        if (recommendation.cpu_shared_resource !== null
+                            && recommendation.cpu_shared_resource !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_shared_resource =
+                                !!recommendation.cpu_shared_resource;
+                        }
                     }
                 }
                 this.aneTuning.applying = true;
@@ -8222,7 +8199,8 @@
             },
 
             validateQwenAneSettings() {
-                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+                if (!this.modelSettings.qwen35_ane_prefill_enabled
+                    || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
 
                 const integer = (value, label, minimum) => {
                     if (value === '' || value === null || value === undefined) {
@@ -8358,7 +8336,7 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
-                                enable_thinking: this.isK2Model() ? null : this.modelSettings.enable_thinking,
+                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
@@ -8388,7 +8366,7 @@
                                 qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
                                     ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
                                     : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
                                 qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
                                 qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
                                 qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
@@ -8466,10 +8444,7 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                k2_ane_prefill_enabled: this.isK2Model() && !!this.modelSettings.k2_ane_prefill_enabled,
-                                k2_ane_prefill_fraction: Number(this.modelSettings.k2_ane_prefill_fraction),
-                                k2_ane_prefill_shared_fraction: Number(this.modelSettings.k2_ane_prefill_shared_fraction),
-                                k2_ane_prefill_sequence_length: Number(this.modelSettings.k2_ane_prefill_sequence_length),
+                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -8605,7 +8580,7 @@
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
                         this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
-                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
+                        this.modelSettings.qwen35_ane_prefill_fraction = this.selectedModel?.ane_prefill_default_fraction ?? 0.53;
                         this.modelSettings.qwen35_ane_prefill_max_layers = 64;
                         this.modelSettings.qwen35_ane_prefill_dual_ane = true;
                         this.modelSettings.qwen35_ane_prefill_gdn = true;

@@ -4,6 +4,8 @@
 import importlib
 import sys
 
+REASONING_EFFORTS = ("low", "medium", "high")
+
 _APPLIED = False
 
 
@@ -34,7 +36,7 @@ def apply_k2_horizon_patch() -> bool:
 def validate_chat_template_kwargs(kwargs):
     from ...exceptions import InvalidRequestError
 
-    if kwargs.get("reasoning_effort", "high") not in ("low", "medium", "high"):
+    if kwargs.get("reasoning_effort", "high") not in REASONING_EFFORTS:
         raise InvalidRequestError("K2 reasoning_effort must be low, medium or high.")
     if kwargs.get("enable_thinking") is False:
         raise InvalidRequestError(

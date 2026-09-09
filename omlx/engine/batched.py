@@ -13,6 +13,11 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
@@ -416,21 +421,28 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
-        if getattr(self._model_settings, "k2_ane_prefill_enabled", False):
+        ane_backend = ane_prefill_backend(self.model_type)
+        ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled:
+            validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
+        if ane_enabled and ane_backend == "k2":
             from ..patches.k2_horizon.ane_prefill import enable_ane_prefill
 
             await loop.run_in_executor(
                 get_mlx_executor(),
                 lambda: enable_ane_prefill(
                     self._model,
-                    fraction=self._model_settings.k2_ane_prefill_fraction,
-                    shared_fraction=self._model_settings.k2_ane_prefill_shared_fraction,
-                    width=self._model_settings.k2_ane_prefill_sequence_length,
+                    fraction=ane_fraction,
+                    shared_fraction=self._model_settings.qwen35_ane_prefill_shared_fraction,
+                    width=self._model_settings.qwen35_ane_prefill_sequence_length,
                 ),
             )
 
         ane_prefill_sequence_length = 0
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+        if ane_enabled and ane_backend == "qwen":
             try:
                 from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
 
@@ -454,11 +466,7 @@ class BatchedEngine(BaseEngine):
                             )
                             or 0
                         ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
+                        fraction=ane_fraction,
                         max_layers=getattr(
                             self._model_settings,
                             "qwen35_ane_prefill_max_layers",
@@ -485,11 +493,7 @@ class BatchedEngine(BaseEngine):
                             True,
                         ),
                         ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
+                            ane_fraction
                             if getattr(
                                 self._model_settings,
                                 "qwen35_ane_prefill_fused_down",

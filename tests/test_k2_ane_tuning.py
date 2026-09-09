@@ -43,8 +43,8 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
-        assert transient.k2_ane_prefill_enabled == candidate.enabled
-        assert base.thinking_budget_enabled and not base.k2_ane_prefill_enabled
+        assert transient.qwen35_ane_prefill_enabled == candidate.enabled
+        assert base.thinking_budget_enabled and not base.qwen35_ane_prefill_enabled
         loaded.add("model")
         row = ane_tuning._empty_result(candidate)
         row["processing_tps"] = next(samples)
@@ -60,7 +60,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
     assert run.recommendation["backend"] == "k2"
     assert run.recommendation["enabled"] == (peak > 103)
     assert not loaded and restored == ["old"]
-    assert base.thinking_budget_enabled and not base.k2_ane_prefill_enabled
+    assert base.thinking_budget_enabled and not base.qwen35_ane_prefill_enabled
 
 
 @pytest.mark.asyncio
@@ -324,7 +324,7 @@ async def test_quick_evaluation_keeps_cleanup_active_and_preserves_manual_settin
 
     now = [0]
     monkeypatch.setattr(ane_tuning, "time", SimpleNamespace(monotonic=lambda: now[0]))
-    base = ModelSettings(k2_ane_prefill_enabled=True)
+    base = ModelSettings(qwen35_ane_prefill_enabled=True)
     engine = SimpleNamespace(tokenizer=object(), stream_generate=AsyncMock())
 
     async def load(*args, **kwargs):
@@ -397,6 +397,6 @@ async def test_quick_evaluation_keeps_cleanup_active_and_preserves_manual_settin
         assert "cleanup failed" in run.error_message
     elif outcome == "budget":
         assert "Inconclusive" in run.message and "unchanged" in run.termination_reason
-    assert base.k2_ane_prefill_enabled
+    assert base.qwen35_ane_prefill_enabled
     assert pool._unload_engine.await_count == 2 and restored == ["old"]
     engine.stream_generate.assert_not_called()
