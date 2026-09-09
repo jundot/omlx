@@ -31,6 +31,15 @@ class UnoEngine(BatchedEngine):
         self._adapter_path = adapter_path
         self._bundle = None
 
+    async def _prepare_loaded_model(self) -> None:
+        import asyncio
+
+        from ..engine_core import get_mlx_executor
+
+        await asyncio.get_running_loop().run_in_executor(
+            get_mlx_executor(), self._prepare_uno_model
+        )
+
     def _prepare_uno_model(self):
         from ..patches.k2_horizon.compiled import (
             can_compile_blocks,
@@ -53,7 +62,7 @@ class UnoEngine(BatchedEngine):
         install_cache_hooks()
         self._bundle = bundle
 
-    def _validate_uno_request(self, prompt=None, **options):
+    def _validate_request(self, prompt=None, **options) -> None:
         self._validate_options(**options)
         if options.get("compiled_grammar") is not None and not options.get("tools"):
             raise InvalidRequestError("Uno supports K2 tool constraints only")

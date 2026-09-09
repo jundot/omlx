@@ -262,6 +262,12 @@ class BatchedEngine(BaseEngine):
             return extract_k2_horizon_messages(messages)
         return messages
 
+    async def _prepare_loaded_model(self) -> None:
+        """Prepare loaded weights before post-load transforms."""
+
+    def _validate_request(self, prompt=None, **options) -> None:
+        """Validate engine-specific options before request admission."""
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
@@ -322,8 +328,7 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
-        if getattr(self, "is_uno_model", False):
-            await loop.run_in_executor(get_mlx_executor(), self._prepare_uno_model)
+        await self._prepare_loaded_model()
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
@@ -1021,19 +1026,18 @@ class BatchedEngine(BaseEngine):
         from ..request import SamplingParams
 
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
-        if getattr(self, "is_uno_model", False):
-            self._validate_uno_request(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                **kwargs,
-            )
+        self._validate_request(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            stop=stop,
+            **kwargs,
+        )
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1114,19 +1118,18 @@ class BatchedEngine(BaseEngine):
         from ..request import SamplingParams
 
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
-        if getattr(self, "is_uno_model", False):
-            self._validate_uno_request(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop,
-                **kwargs,
-            )
+        self._validate_request(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            stop=stop,
+            **kwargs,
+        )
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1323,8 +1326,7 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
-        if getattr(self, "is_uno_model", False):
-            self._validate_uno_request(prompt, tools=tools, **kwargs)
+        self._validate_request(prompt, tools=tools, **kwargs)
         # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
         # malformed input) are normally surfaced by the real chat path's
         # add_request → tokenize call as a 500 — there's no path-specific
@@ -1363,8 +1365,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        if getattr(self, "is_uno_model", False):
-            self._validate_uno_request(prompt, **kwargs)
+        self._validate_request(prompt, **kwargs)
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:

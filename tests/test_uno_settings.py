@@ -204,6 +204,92 @@ async def test_uno_stream_cleanup_uses_shared_engine(memory_abort):
     assert not engine.has_active_requests()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uno", [False, True])
+@pytest.mark.parametrize(
+    "entry", ["generate", "stream_generate", "preflight_chat", "preflight_completion"]
+)
+async def test_uno_admission_hooks_preserve_ordinary_requests(uno, entry):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.engine.uno import UnoEngine
+    from omlx.exceptions import InvalidRequestError
+
+    class Admitted(Exception):
+        pass
+
+    engine = UnoEngine("base", adapter_path="adapter") if uno else BatchedEngine("base")
+    engine._loaded = True
+    engine._tokenizer = SimpleNamespace(encode=lambda _: [3, 4])
+    engine._bundle = SimpleNamespace(config={"vocab_size": 128}, context_length=1024)
+    engine._apply_chat_template = Mock(return_value="prompt")
+    admitted = AsyncMock(side_effect=Admitted)
+    engine._engine = SimpleNamespace(
+        generate=admitted,
+        add_request=admitted,
+        engine=SimpleNamespace(scheduler=object()),
+    )
+    engine._preflight_or_raise_with_eviction = admitted
+    prompt = (
+        [{"role": "user", "content": "prompt"}]
+        if entry == "preflight_chat"
+        else "prompt"
+    )
+    with pytest.raises(InvalidRequestError if uno else Admitted):
+        result = getattr(engine, entry)(prompt, min_p=0.1)
+        if entry == "stream_generate":
+            await anext(result)
+        else:
+            await result
+    assert admitted.await_count == (0 if uno else 1)
+
+
+@pytest.mark.asyncio
+async def test_uno_preparation_uses_loader_executor_before_transforms(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.engine.uno import UnoEngine
+
+    class SetupChecked(Exception):
+        pass
+
+    order = []
+    model, tokenizer = object(), object()
+
+    def load(*args, **kwargs):
+        order.append(("load", threading.get_ident()))
+        return model, tokenizer
+
+    def prepare():
+        assert engine._model is model and engine._tokenizer is tokenizer
+        order.append(("prepare", threading.get_ident()))
+
+    def transforms(*args):
+        order.append(("transforms", threading.get_ident()))
+        raise SetupChecked
+
+    engine = UnoEngine("base", adapter_path="adapter")
+    monkeypatch.setattr(engine, "_prepare_uno_model", prepare)
+    monkeypatch.setattr("omlx.engine.batched.get_tokenizer_config", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "omlx.utils.model_loading.maybe_apply_pre_load_patches", lambda *a, **k: None
+    )
+    monkeypatch.setattr("omlx.utils.model_loading.maybe_load_custom_quantization", load)
+    monkeypatch.setattr(
+        "omlx.utils.model_loading.apply_post_load_transforms", transforms
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        with pytest.raises(SetupChecked):
+            await engine.start()
+    assert [name for name, _ in order] == ["load", "prepare", "transforms"]
+    assert order[0][1] == order[1][1] != threading.get_ident()
+    assert order[2][1] == threading.get_ident()
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [{"reasoning_effort": value} for value in ("off", "xhigh", "max", 1, None)]
