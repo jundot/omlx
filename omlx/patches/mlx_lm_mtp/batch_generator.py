@@ -37,6 +37,32 @@ Known limitation (compute-bound single-stream Apple Silicon):
   smaller per-step backbone, or under continuous batching where spare
   compute exists. See #1097 / #1311 for measurements.
 
+Fused-batch MTP (``OMLX_MTP_FUSED_BATCH=1``, opt-in, default off):
+  When multiple MTP-capable sequences share a continuous batch, run ONE
+  batched ``(N, k+1)`` verify forward across all rows against the shared
+  cache instead of N per-row backbone forwards (which the row-wise path,
+  ``OMLX_MTP_ROWWISE_BATCH=1``, does and which does not amortize). Each row
+  greedily accepts its own run length ``m_i``, commits its OWN ``m_i+1``
+  tokens in one ``next()`` via multi-token emit (``_emit_ragged_responses``;
+  the scheduler appends responses per-uid, so >1 Response/uid is honoured),
+  the shared cache is rolled back by a per-row accepted vector, and every row
+  re-drafts ``k`` fresh tokens so all rows re-present a rectangular verify
+  next cycle. This is vLLM-style ragged spec-decode: MTP's single-stream
+  latency win AND batched aggregate throughput at the same time.
+    - Scope: greedy only; hybrid GDN + PLE targets (qwen4_exp / qwen3_5,
+      e.g. Qwen3.8-Flash-Next); commit-align is supported. Out-of-scope
+      cases (logits processors, non-greedy, head_clone) decline cleanly via
+      ``_MtpStepFallback`` to the standard batched step — flag OFF is stock.
+    - ``OMLX_MTP_FUSED_K`` caps the per-cycle draft depth. Lower depth wins
+      for AGGREGATE throughput (fewer verify positions per committed token);
+      measured optimum on M5 Max Flash-Next is ``2`` (k=1: 38.6, k=2: 51.6,
+      k=3: 29.7 tok/s aggregate at 8-way). Unset uses the primed depth.
+    - Requires an mlx-vlm whose ``rollback_speculative_cache`` handles a
+      ragged batch on ``BatchQSAKVCache`` (Blaizzy/mlx-vlm#2197); older
+      versions raise and the fused path safely declines to the standard step.
+    - MEASURED (M5 Max, Flash-Next, temp 0, wall-clock aggregate): 8-way 51.6,
+      12-way 53.2, 16-way 53.0 tok/s, coherent, ~6x the row-wise path.
+
 Greedy identity (sampler is None): the patched dispatch produces the same
 tokens as the standard step. PR 990's ``test_mtp_generate_identity``
 encodes this contract; the oMLX-side equivalent lives in
@@ -449,6 +475,38 @@ def _rowwise_batch_mtp_enabled() -> bool:
     )
 
 
+_FUSED_BATCH_MTP_ENV = "OMLX_MTP_FUSED_BATCH"
+
+
+def _fused_batch_mtp_enabled() -> bool:
+    """Opt-in for FUSED-batch MTP on multi-row batches (default off).
+
+    Unlike the row-wise path (one backbone forward per row per cycle), the
+    fused path runs ONE batched ``(N, k+1)`` verify forward across all rows
+    against the shared batched cache, with per-row greedy acceptance and a
+    ragged per-row rollback (``rollback_speculative_cache`` with a per-row
+    accepted vector). This amortizes the single expensive backbone forward
+    over the whole batch, so it stacks the MTP accept-rate speedup on top of
+    batched-decode aggregate throughput -- the Apple-Silicon analogue of
+    vLLM's CUDA fused speculative decode.
+
+    v1 scope (falls back to the standard batched step otherwise): greedy
+    (temp 0), no logits processors / grammar, all rows idle with a common
+    draft depth, and a model without a per-accept clamp or commit-alignment
+    hook (qwen4_exp / Flash-Next qualifies).
+    """
+    return os.environ.get(_FUSED_BATCH_MTP_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _any_batch_mtp_enabled() -> bool:
+    return _rowwise_batch_mtp_enabled() or _fused_batch_mtp_enabled()
+
+
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
     if getattr(gen_batch, state_attr, None) is not None:
         return True
@@ -596,7 +654,7 @@ def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
         return False
     if getattr(
         gen_batch, "_omlx_mtp_batch_state", None
-    ) is None and not _rowwise_batch_mtp_enabled():
+    ) is None and not _any_batch_mtp_enabled():
         return False
     # No cache-position alignment requirement: activation seeds each row from
     # its own extract_cache(idx) view and steady-state row cycles diverge the
@@ -2571,6 +2629,215 @@ def _post_init_mtp(gen_batch: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fused-batch depth-k verify (OMLX_MTP_FUSED_BATCH=1) — one batched backbone
+# forward across all rows + ragged per-row rollback. See _fused_batch_mtp_enabled.
+# ---------------------------------------------------------------------------
+
+
+def _set_batched_mrope_deltas(gen_batch: Any, uids: List[Any]) -> None:
+    """Per-row mRoPE deltas for the batched verify (batched _set_singleton_mrope_delta)."""
+    model = getattr(gen_batch, "model", None)
+    if (
+        model is not None
+        and getattr(model, "_uses_mrope", False)
+        and getattr(model, "_uid_rope_deltas", None)
+        and hasattr(model, "set_batch_rope_deltas")
+    ):
+        import mlx.core as mx
+
+        deltas = [float(model._uid_rope_deltas.get(u, 0.0)) for u in uids]
+        model.set_batch_rope_deltas(mx.array(deltas))
+
+
+def _fused_precheck(gen_batch: Any, states: List[Any]) -> None:
+    """Restrict the fused path to its v1 scope; raise _MtpStepFallback otherwise.
+
+    All raises happen BEFORE any backbone forward / cache mutation, so a decline
+    reconciles cleanly to the standard batched step.
+    """
+    model = gen_batch.model
+    if _proc_list(gen_batch) is not None:
+        raise _MtpStepFallback("fused MTP: logits processors present (v1 greedy/no-proc)")
+    if not _is_greedy(gen_batch):
+        raise _MtpStepFallback("fused MTP: non-greedy sampler (v1 greedy only)")
+    if getattr(model, "mtp_clamp_accept", None) is not None:
+        raise _MtpStepFallback("fused MTP: model uses mtp_clamp_accept (v1 unsupported)")
+    # commit-align is SUPPORTED in the ragged path (per-row boundary cap applied
+    # in _run_verify_cycle_batched_impl) — do NOT bail on it. It only caps a row's
+    # accepted count so its cumulative emit lands on a paged-cache block boundary
+    # (~1 cycle per `align` tokens), enabling clean boundary snapshots for prefix
+    # caching. Bailing here was collapsing Flash-Next to the slow row-wise path.
+    for s in states:
+        if not getattr(s, "chain", False):
+            raise _MtpStepFallback("fused MTP: a row is not on the chain path")
+        if getattr(s, "head_clone", False):
+            raise _MtpStepFallback("fused MTP: head_clone rows unsupported (v1)")
+
+
+def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
+    try:
+        return _run_verify_cycle_batched_impl(gen_batch, batch_state)
+    except _MtpStepFallback as exc:
+        if _MTP_FUSED_LOG:
+            logger.info("MTP fused BAIL: %s", exc)
+        raise
+
+
+def _run_verify_cycle_batched_impl(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
+    """One FUSED depth-k verify across all rows.
+
+    Generalizes _run_verify_cycle_chain's greedy path to N rows: ONE batched
+    ``_call_backbone`` over ``(N, k+1)`` against the shared batched cache; per-row
+    greedy acceptance -> per-row accepted vector ``m``; ONE ragged
+    ``rollback_speculative_cache(cache, gdn, m, k+1)``; then per-row queue emits
+    plus a per-row MTP-head redraft (``_chain_next_drafts`` — a cheap single-layer
+    head). Requires all rows idle sharing a common depth; raises _MtpStepFallback
+    to defer to the standard batched step otherwise.
+    """
+    import mlx.core as mx
+
+    uids = list(getattr(gen_batch, "uids", []) or [])
+    if len(uids) < 2:
+        raise _MtpStepFallback("fused MTP: fewer than 2 rows")
+    states = [batch_state.states.get(u) for u in uids]
+    if any(s is None for s in states):
+        raise _MtpStepFallback("fused MTP: missing row state")
+    _fused_precheck(gen_batch, states)
+
+    # DRAIN PHASE: min-commit gives every row the same queue length (c+1), and
+    # priming seeds every row 2 tokens, so queues fill and empty in lockstep.
+    # While any row still has queued tokens, just emit one token per row (no
+    # backbone forward); the fused verify only runs when ALL queues are empty.
+    if any(s.queue for s in states):
+        if not all(s.queue for s in states):
+            # Ragged queues (a row joined/finished mid-batch): let the standard
+            # reconcile path resync rather than emit a half-empty batch.
+            raise _MtpStepFallback("fused MTP: ragged queue lengths across rows")
+        return _emit_batch_responses(gen_batch, batch_state)
+
+    if any(s.next_main is None or s.drafts is None for s in states):
+        raise _MtpStepFallback("fused MTP: a row is missing next_main/drafts")
+    depths = [int(s.drafts.shape[0]) for s in states]
+    k = min(depths)
+    _kcap = os.environ.get("OMLX_MTP_FUSED_K", "").strip()
+    if _kcap.isdigit() and int(_kcap) >= 1:
+        k = min(k, int(_kcap))          # cap draft depth to study verify-cost scaling
+    if k < 1:
+        raise _MtpStepFallback("fused MTP: a row is at depth 0 (park)")
+
+    # Freeze depth uniform so subsequent cycles stay rectangular (full batch use).
+    for s in states:
+        s.controller = None
+        s.depth = k
+
+    inputs = mx.stack(
+        [mx.concatenate([s.next_main, s.drafts[:k]]) for s in states]
+    )  # (N, k+1)
+    _set_batched_mrope_deltas(gen_batch, uids)
+
+    logits, hidden, gdn = _call_backbone(
+        gen_batch.model, inputs, gen_batch.prompt_cache, n_confirmed=1
+    )  # logits (N, k+1, V), hidden (N, k+1, H)
+
+    # Batched greedy acceptance: per-row accepted run length m_i.
+    targets = mx.argmax(logits, axis=-1).astype(mx.int32)            # (N, k+1)
+    drafts_k = mx.stack([s.drafts[:k].astype(mx.int32) for s in states])  # (N, k)
+    matches = (targets[:, :k] == drafts_k).astype(mx.int32)          # (N, k)
+    m_arr = mx.cumprod(matches, axis=1).sum(axis=1)                  # (N,)
+    combined_lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    mx.eval(targets, m_arr)  # single host sync for the accept decision
+    host_t = targets.tolist()
+    m_list = [int(v) for v in m_arr.tolist()]
+
+    # RAGGED COMMIT (vLLM-style). Every row commits its OWN accepted run m_i+1 in
+    # ONE next() call via multi-token emit (the scheduler appends per-uid, so >1
+    # Response/uid is honoured). No min-commit throwaway. The shared cache rolls
+    # back by a PER-ROW vector (keep m_i+1 of k+1 for row i — proven primitive:
+    # rollback_speculative_cache accepts a ragged accepted vector). Each row then
+    # re-drafts k fresh tokens from its own new frontier, so ALL rows re-present a
+    # rectangular (N, k+1) verify next cycle regardless of how many they committed.
+    per_row: Dict[Any, list] = {}
+    accepted_list = []
+    _align = int(getattr(gen_batch.model, "_omlx_mtp_commit_align", 0) or 0)
+    for i, s in enumerate(states):
+        mi = m_list[i]
+        # commit-align: cap this row's accepted count so its cumulative emit lands
+        # on a paged-cache block boundary (clean boundary snapshot for prefix cache).
+        # host_t[i][mi] at a capped mi == the accepted draft at that position (the
+        # match held through the original m), so it's the row's own greedy token.
+        if _align > 0:
+            _emitted = len(gen_batch.tokens[i])
+            _to_b = ((_emitted // _align) + 1) * _align - _emitted
+            if 0 < _to_b < mi:
+                mi = _to_b
+                m_list[i] = mi   # keep rollback + redraft consistent with the cap
+        draft_ids = [int(x) for x in s.drafts[:k].tolist()]
+        toks = [(draft_ids[j], s.draft_lps[j], "draft") for j in range(mi)]
+        toks.append((host_t[i][mi], combined_lp[i, mi], "bonus" if mi == k else "verify"))
+        per_row[uids[i]] = toks
+        accepted_list.append(mi)
+        st = s.stats
+        st.cycles += 1
+        st.accepts += mi           # tokens COMMITTED this cycle (ragged = all m_i)
+        if mi < k:
+            st.rejects += 1
+        while len(st.depth_drafted) < k:
+            st.depth_drafted.append(0)
+            st.depth_accepted.append(0)
+        for j in range(k):
+            st.depth_drafted[j] += 1
+            if j < mi:
+                st.depth_accepted[j] += 1
+
+    # Ragged per-row rollback: keep m_i+1 of k+1 for each row. The per-row accepted
+    # VECTOR requires an mlx-vlm whose rollback_speculative_cache handles a ragged
+    # batch on the serving cache (BatchQSAKVCache); on an older mlx-vlm it raises
+    # (e.g. AttributeError on the pre-fix ``c.keys`` guard), so convert any failure
+    # to _MtpStepFallback and let the standard batched step reconcile — the fused
+    # path safely declines rather than corrupting the cache. Requires
+    # Blaizzy/mlx-vlm#2197 for the full ragged speedup.
+    if all(mi == k for mi in m_list):
+        _clear_rollback(gen_batch.prompt_cache)
+    else:
+        accepted_vec = mx.array(accepted_list, dtype=mx.int32)
+        try:
+            ok = _rollback_after_reject(
+                gen_batch.model, gen_batch.prompt_cache, gdn,
+                accepted=accepted_vec, block_size=k + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 - decline cleanly on any rollback error
+            raise _MtpStepFallback(f"fused MTP: ragged rollback unsupported ({exc})")
+        if not ok:
+            raise _MtpStepFallback("fused MTP: ragged rollback rejected")
+
+    # Per-row MTP-head redraft from each row's OWN committed prefix (length m_i+1).
+    for i, s in enumerate(states):
+        mi = m_list[i]
+        if not s.head_clone:
+            _mtp_head_trim_to(s.mtp_cache, s.hist_offset)
+        draft_ids = [int(x) for x in s.drafts[:k].tolist()]
+        committed = mx.array(draft_ids[:mi] + [host_t[i][mi]], dtype=mx.uint32)
+        row = _make_row_batch(
+            gen_batch, i, prompt_cache=gen_batch.prompt_cache, state=s
+        )
+        _chain_next_drafts(row, s, hidden[i:i + 1, : mi + 1], committed, None)
+        s.next_main = committed[-1:]
+
+    if _MTP_FUSED_LOG:
+        commit_sum = sum(mi + 1 for mi in m_list)
+        logger.info(
+            "MTP fused RAGGED: N=%d k=%d m=%s commit_sum=%d (%.2f tok/row/cycle)",
+            len(states), k, m_list, commit_sum, commit_sum / len(states),
+        )
+    return _emit_ragged_responses(gen_batch, batch_state, per_row)
+
+
+_MTP_FUSED_LOG = os.environ.get("OMLX_MTP_FUSED_LOG", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+# ---------------------------------------------------------------------------
 # next() dispatch
 # ---------------------------------------------------------------------------
 
@@ -2586,6 +2853,13 @@ def _mtp_batch_next(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
     """
     if not getattr(gen_batch, "uids", None):
         return []
+
+    if _fused_batch_mtp_enabled():
+        # Fused path: ONE batched verify forward + ragged rollback across all
+        # rows. Raises _MtpStepFallback (before any cache mutation) to defer to
+        # the standard batched step for out-of-scope cases (non-greedy, procs,
+        # depth-0, single row).
+        return _run_verify_cycle_batched(gen_batch, batch_state)
 
     replacements: Dict[int, List[Any]] = {}
     token_context_updates: Dict[int, Any] = {}
@@ -2684,6 +2958,75 @@ def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[A
     if len(keep) < len(gen_batch.uids):
         gen_batch.filter(keep)
 
+    return responses
+
+
+def _emit_ragged_responses(
+    gen_batch: Any, batch_state: _MtpBatchState, per_row: Dict[Any, list]
+) -> List[Any]:
+    """Emit each row's FULL ragged accepted run in ONE next() call (vLLM-style).
+
+    ``per_row`` maps uid -> ordered list of (token_id, logprobs_1d, source). Unlike
+    ``_emit_batch_responses`` (one token/row/call), this appends ALL of a row's
+    committed tokens as multiple Response objects — the scheduler's
+    ``_process_batch_responses`` iterates responses and appends per-uid (no dedup),
+    so >1 Response per uid is honoured in order. A row that hits stop/length
+    mid-run stops emitting there and is filtered out of the batch.
+    """
+    Response = type(gen_batch).Response
+    keep: List[int] = []
+    responses: List[Any] = []
+    finished_uids: List[Any] = []
+
+    for idx, uid in enumerate(list(gen_batch.uids)):
+        toks = per_row.get(uid)
+        if not toks:
+            raise _MtpStepFallback(f"ragged emit: row uid={uid} produced no tokens")
+        state = batch_state.states.get(uid)
+        row_finished = False
+        for (token_id, logprobs_1d, source) in toks:
+            if state is not None:
+                _bump_emit_stat(state, source)
+            finish_reason: Optional[str] = None
+            gen_batch.tokens[idx].append(token_id)
+            gen_batch._num_tokens[idx] += 1
+            if gen_batch._num_tokens[idx] >= gen_batch.max_tokens[idx]:
+                finish_reason = "length"
+            new_state, match_sequence, current_state = gen_batch.state_machines[idx].match(
+                gen_batch._matcher_states[idx], token_id,
+            )
+            gen_batch._matcher_states[idx] = new_state
+            if match_sequence is not None and current_state is None:
+                finish_reason = "stop"
+            if finish_reason is not None:
+                responses.append(
+                    Response(
+                        uid=uid, token=token_id, logprobs=logprobs_1d,
+                        finish_reason=finish_reason, current_state=current_state,
+                        match_sequence=match_sequence,
+                        prompt_cache=gen_batch.extract_cache(idx),
+                        all_tokens=gen_batch.tokens[idx],
+                    )
+                )
+                if state is not None:
+                    _log_mtp_stats(uid, state.stats, finish_reason)
+                finished_uids.append(uid)
+                row_finished = True
+                break
+            responses.append(
+                Response(
+                    uid=uid, token=token_id, logprobs=logprobs_1d,
+                    finish_reason=None, current_state=current_state,
+                    match_sequence=match_sequence, prompt_cache=None, all_tokens=None,
+                )
+            )
+        if not row_finished:
+            keep.append(idx)
+
+    for uid in finished_uids:
+        batch_state.states.pop(uid, None)
+    if len(keep) < len(gen_batch.uids):
+        gen_batch.filter(keep)
     return responses
 
 
