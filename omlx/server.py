@@ -94,6 +94,7 @@ from .api.embedding_models import (
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
+    find_non_finite_embeddings,
     normalize_embedding_items,
     normalize_input,
     truncate_embedding,
@@ -3442,6 +3443,26 @@ async def create_embeddings(
 
         elapsed = time.perf_counter() - start_time
         resolved_model = resolve_model_id(request.model) or request.model
+
+        # A NaN/Inf vector has no JSON representation: FastAPI would ship it
+        # as null-filled arrays inside a 200, and a RAG pipeline stores the
+        # corrupt vectors without noticing. Fail the request instead.
+        non_finite = find_non_finite_embeddings(output.embeddings)
+        if non_finite:
+            logger.error(
+                f"Embedding: model={resolved_model} returned non-finite values "
+                f"for input item(s) {non_finite} of {len(embedding_inputs)}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Embedding model returned non-finite (NaN/Inf) values for "
+                    f"input item(s) {non_finite}. The response was rejected "
+                    "instead of returning null vectors; try sending the affected "
+                    "inputs one per request or batching inputs of equal length."
+                ),
+            )
+
         logger.info(
             f"Embedding: model={resolved_model}, "
             f"{len(embedding_inputs)} inputs, {output.dimensions} dims, "
