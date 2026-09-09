@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "K2 ANE 프롬프트 처리",
   "modal.model_settings.k2_ane_hint": "MoVA를 포함한 K2 프롬프트 처리에 ANE를 사용합니다. 디코딩은 GPU에서 실행됩니다. Apple 비공개 인터페이스를 사용하며 출력이 달라질 수 있습니다.",
   "modal.model_settings.k2_ane_shared": "ANE의 공유 MLP 비율",
-  "modal.model_settings.k2_ane_tune_hint": "짧고 긴 프롬프트, 요청 8개, 캐시된 프롬프트를 비교합니다. 테스트 중 모델을 다시 로드합니다. 다른 요청이 없을 때 실행하세요.",
+  "modal.model_settings.k2_ane_tune_hint": "프롬프트, 요청 8개, 캐시 재사용을 선택적으로 테스트합니다. 약 3분이 목표이며 로딩이나 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1147,5 +1147,6 @@
   "modal.model_settings.ane_eval_cached": "캐시된 요청 8개 · 총 처리량",
   "modal.model_settings.ane_eval_first_token": "첫 토큰",
   "modal.model_settings.ane_eval_cache_disabled": "캐시 꺼짐",
+  "modal.model_settings.ane_eval_not_tested": "테스트 안 됨",
   "modal.model_settings.ane_eval_details": "분할 세부 정보"
 }

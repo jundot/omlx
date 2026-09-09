@@ -1177,7 +1177,7 @@ private struct ExperimentalSection: View {
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Compare short and long prompts, eight requests, and cached prompts. Models reload during testing. Run when idle. Use the result, then save the profile.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Optional test of prompts, eight requests, and cache reuse. Targets three minutes; loading or cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
@@ -1840,7 +1840,9 @@ private struct ExperimentalSection: View {
                         .font(.omlxText(9))
                 }
             } else {
-                Text(String(localized: "settings.experimental.ane_eval.cache_disabled", defaultValue: "Cache off"))
+                Text(row.unavailable == "cache_disabled"
+                     ? String(localized: "settings.experimental.ane_eval.cache_disabled", defaultValue: "Cache off")
+                     : String(localized: "settings.experimental.ane_eval.not_tested", defaultValue: "Not tested"))
             }
         }
         .monospacedDigit()

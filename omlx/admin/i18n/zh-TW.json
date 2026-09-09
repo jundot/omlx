@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "K2 ANE 提示處理",
   "modal.model_settings.k2_ane_hint": "使用 ANE 處理 K2 提示，包括 MoVA。解碼仍由 GPU 執行。使用 Apple 私有介面，輸出可能不同。",
   "modal.model_settings.k2_ane_shared": "ANE 上的共用 MLP",
-  "modal.model_settings.k2_ane_tune_hint": "比較短提示詞、長提示詞、八個請求和快取提示詞。測試期間會重新載入模型。請在沒有其他請求時執行。",
+  "modal.model_settings.k2_ane_tune_hint": "選用測試：提示詞、8 個請求和快取重用。目標時間約三分鐘；載入或清理可能需要更久。無需測試即可啟用 ANE。",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1147,5 +1147,6 @@
   "modal.model_settings.ane_eval_cached": "8 個快取請求 · 總吞吐量",
   "modal.model_settings.ane_eval_first_token": "首個 token",
   "modal.model_settings.ane_eval_cache_disabled": "快取已關閉",
+  "modal.model_settings.ane_eval_not_tested": "未測試",
   "modal.model_settings.ane_eval_details": "分配詳情"
 }

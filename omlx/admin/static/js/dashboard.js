@@ -7921,7 +7921,7 @@
             },
 
             aneComparisonValue(result, device) {
-                if (result.unavailable) {
+                if (result.unavailable && result[device] == null) {
                     return window.t(`modal.model_settings.ane_eval_${result.unavailable}`);
                 }
                 const value = result[device];

@@ -38,9 +38,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
         ane_tuning, "_restore_speed_priority", lambda _, value: restored.append(value)
     )
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(
-        fast, "_ext", SimpleNamespace(ane_compile_program=object())
-    )
+    monkeypatch.setattr(fast, "_ext", SimpleNamespace(ane_compile_program=object()))
     samples = iter([100, 101, peak, 101, 100, 100])
 
     async def measure(run, pool, settings, candidate):
@@ -87,9 +85,7 @@ async def test_k2_tuner_failure_does_not_apply_partial_results(
     monkeypatch.setattr(ane_tuning, "_pin_speed_priority", lambda _: None)
     monkeypatch.setattr(ane_tuning, "_restore_speed_priority", lambda *_: None)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(
-        fast, "_ext", SimpleNamespace(ane_compile_program=object())
-    )
+    monkeypatch.setattr(fast, "_ext", SimpleNamespace(ane_compile_program=object()))
     monkeypatch.setattr(ane_tuning, "_measure_candidate", AsyncMock(side_effect=error))
     run = ane_tuning.create_run(
         ane_tuning.ANETuningRequest(model_id="model", backend="k2")
@@ -239,7 +235,7 @@ async def test_k2_evaluation_covers_arrivals_and_proves_cache_reuse(
     assert len(results["concurrent"]["samples"]) == 3
     assert (
         len([call for call in calls if call["staggered"] and call["batch_size"] == 8])
-        == 4
+        == 3
     )
     if cache_enabled:
         assert all(all(row) for row in results["cached"]["cached_tokens"])
@@ -248,3 +244,159 @@ async def test_k2_evaluation_covers_arrivals_and_proves_cache_reuse(
         )
     else:
         assert results["cached"]["unavailable"] == "cache_disabled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_enabled", [False, True])
+async def test_quick_evaluation_skips_batches_after_clear_prompt_regression(
+    monkeypatch, cache_enabled
+):
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="model", backend="k2")
+    )
+    baseline = dict(
+        label="GPU", enabled=False, processing_tps=100, workloads=workloads()
+    )
+    if not cache_enabled:
+        baseline["workloads"]["cached"] = dict(
+            unit="tok/s", samples=[], unavailable="cache_disabled"
+        )
+    run.results = [baseline]
+    engine = SimpleNamespace(tokenizer=object(), prefix_cache_enabled=cache_enabled)
+    calls = []
+
+    async def measure(**options):
+        calls.append(options)
+        return dict(
+            avg_ttft_ms=200, max_ttft_ms=200, aggregate_tps=50, cached_tokens=[0]
+        )
+
+    monkeypatch.setattr(ane_tuning, "_run_batch_test", measure)
+    monkeypatch.setattr(
+        ane_tuning, "_generate_prompt", lambda _, length, profile: [1] * length
+    )
+    candidate = ane_tuning._Candidate("ANE", True, backend="k2")
+    result = await ane_tuning._measure_k2_workloads(run, engine, candidate, [100] * 3)
+    assert len(calls) == 3 and all(
+        c["batch_size"] == 1 and c["max_tokens"] == 2 for c in calls
+    )
+    assert run.current == 13
+    rows = ane_tuning._k2_comparison(baseline, dict(workloads=result))
+    assert not ane_tuning._k2_eligible(rows)
+    assert (
+        next(row for row in rows if row["id"] == "concurrent")["unavailable"]
+        == "not_tested"
+    )
+    assert (
+        next(row for row in rows if row["id"] == "short_prompt")["improvement_percent"]
+        == -50
+    )
+
+
+def test_partial_measurements_cannot_recommend_ane():
+    baseline = dict(workloads=workloads())
+    candidate = dict(workloads=workloads(120))
+    candidate["workloads"]["concurrent"] = dict(
+        unit="tok/s", samples=[], unavailable="not_tested"
+    )
+    rows = ane_tuning._k2_comparison(baseline, candidate)
+    assert not ane_tuning._k2_eligible(rows)
+
+
+def test_skipped_candidate_still_requires_valid_gpu_measurements():
+    baseline = dict(workloads=workloads())
+    candidate = dict(workloads=workloads(120))
+    baseline["workloads"]["concurrent"]["samples"] = [float("nan")] * 3
+    candidate["workloads"]["concurrent"] = dict(
+        unit="tok/s", samples=[], unavailable="not_tested"
+    )
+    with pytest.raises(RuntimeError, match="invalid"):
+        ane_tuning._k2_comparison(baseline, candidate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("outcome", ["budget", "success", "cancelled", "error"])
+async def test_quick_evaluation_keeps_cleanup_active_and_preserves_manual_setting(
+    monkeypatch, tmp_path, cleanup_fails, outcome
+):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    now = [0]
+    monkeypatch.setattr(ane_tuning, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    base = ModelSettings(k2_ane_prefill_enabled=True)
+    engine = SimpleNamespace(tokenizer=object(), stream_generate=AsyncMock())
+
+    async def load(*args, **kwargs):
+        now[0] = 181
+        return engine
+
+    (tmp_path / "config.json").write_text(json.dumps(dict(num_hidden_layers=3)))
+    cleaning, finish_cleanup = asyncio.Event(), asyncio.Event()
+    unload_count = 0
+
+    async def unload(_):
+        nonlocal unload_count
+        unload_count += 1
+        if unload_count == 2:
+            cleaning.set()
+            await finish_cleanup.wait()
+            if cleanup_fails:
+                raise RuntimeError("cleanup failed")
+
+    pool = SimpleNamespace(
+        get_entry=lambda _: SimpleNamespace(model_path=tmp_path),
+        _settings_manager=SimpleNamespace(get_settings=lambda _: base),
+        get_loaded_model_ids=lambda: ["model"],
+        _unload_engine=AsyncMock(side_effect=unload),
+        get_engine=AsyncMock(side_effect=load),
+    )
+    monkeypatch.setattr(ane_tuning, "_pin_speed_priority", lambda _: "old")
+    restored = []
+    monkeypatch.setattr(
+        ane_tuning, "_restore_speed_priority", lambda _, value: restored.append(value)
+    )
+    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "_ext", SimpleNamespace(ane_compile_program=object()))
+    monkeypatch.setattr(
+        ane_tuning, "_generate_prompt", lambda _, length, profile: [1] * length
+    )
+    if outcome != "budget":
+
+        async def measure(run, pool, settings, candidate):
+            if outcome == "cancelled":
+                raise asyncio.CancelledError()
+            if outcome == "error":
+                raise RuntimeError("measurement failed")
+            row = ane_tuning._empty_result(candidate)
+            row.update(processing_tps=100, workloads=workloads())
+            return row
+
+        monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="model", backend="k2")
+    )
+    monkeypatch.setattr(ane_tuning, "_runs", {run.tuning_id: run})
+    run.task = asyncio.create_task(ane_tuning.run_tuning(run, pool))
+    await cleaning.wait()
+    assert run.status == "running" and run.phase == "cleaning_up"
+    assert ane_tuning.get_active_run() is run
+    from omlx.admin.routes import cancel_ane_tuning
+
+    response = await cancel_ane_tuning(run.tuning_id, is_admin=True)
+    assert response["status"] == "cleaning_up" and not run.task.cancelling()
+    finish_cleanup.set()
+    await run.task
+    expected = "completed" if outcome in ("budget", "success") else outcome
+    assert run.status == ("error" if cleanup_fails else expected)
+    assert (run.recommendation is not None) == (
+        outcome == "success" and not cleanup_fails
+    )
+    assert ane_tuning.get_active_run() is None
+    if cleanup_fails:
+        assert "cleanup failed" in run.error_message
+    elif outcome == "budget":
+        assert "Inconclusive" in run.message and "unchanged" in run.termination_reason
+    assert base.k2_ane_prefill_enabled
+    assert pool._unload_engine.await_count == 2 and restored == ["old"]
+    engine.stream_generate.assert_not_called()

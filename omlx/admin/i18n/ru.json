@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "Обработка запросов K2 на ANE",
   "modal.model_settings.k2_ane_hint": "Использует ANE для обработки запросов K2, включая MoVA. Декодирование остаётся на GPU. Используются закрытые интерфейсы Apple; результаты могут отличаться.",
   "modal.model_settings.k2_ane_shared": "Общий MLP на ANE",
-  "modal.model_settings.k2_ane_tune_hint": "Сравнивает короткие и длинные промпты, восемь запросов и промпты из кеша. Во время теста модели перезагружаются. Запускайте без других запросов.",
+  "modal.model_settings.k2_ane_tune_hint": "Необязательный тест промптов, восьми запросов и кеша. Около трёх минут; загрузка или очистка может занять больше времени. ANE можно включить без теста.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1147,5 +1147,6 @@
   "modal.model_settings.ane_eval_cached": "8 запросов из кеша · общая скорость",
   "modal.model_settings.ane_eval_first_token": "Первый токен",
   "modal.model_settings.ane_eval_cache_disabled": "Кеш выключен",
+  "modal.model_settings.ane_eval_not_tested": "Не проверено",
   "modal.model_settings.ane_eval_details": "Параметры распределения"
 }

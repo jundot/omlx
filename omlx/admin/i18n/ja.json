@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "K2 ANE プロンプト処理",
   "modal.model_settings.k2_ane_hint": "MoVAを含むK2のプロンプト処理にANEを使用します。デコードはGPUで行います。Appleの非公開APIを使用するため、出力が変わる場合があります。",
   "modal.model_settings.k2_ane_shared": "共有MLPのANE割合",
-  "modal.model_settings.k2_ane_tune_hint": "短い・長いプロンプト、8リクエスト、キャッシュ済みプロンプトを比較します。テスト中にモデルを再読み込みします。他のリクエストがないときに実行してください。",
+  "modal.model_settings.k2_ane_tune_hint": "プロンプト、8件のリクエスト、キャッシュ再利用の任意テストです。目安は3分ですが、読み込みや終了処理には追加の時間がかかる場合があります。テストせずにANEを有効にできます。",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1147,5 +1147,6 @@
   "modal.model_settings.ane_eval_cached": "キャッシュ済み8リクエスト・合計スループット",
   "modal.model_settings.ane_eval_first_token": "最初のトークン",
   "modal.model_settings.ane_eval_cache_disabled": "キャッシュ無効",
+  "modal.model_settings.ane_eval_not_tested": "未テスト",
   "modal.model_settings.ane_eval_details": "分割の詳細"
 }

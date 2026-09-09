@@ -452,6 +452,47 @@
         }
       }
     },
+    "settings.experimental.ane_eval.not_tested": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not tested"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未テスト"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "테스트 안 됨"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Не проверено"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未测试"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未測試"
+          }
+        }
+      }
+    },
     "settings.experimental.ane_eval.cache_disabled": {
       "extractionState": "manual",
       "localizations": {
@@ -608,13 +649,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Compare short and long prompts, eight requests, and cached prompts. Models reload during testing. Run when idle. Use the result, then save the profile."
+            "value": "Optional test of prompts, eight requests, and cache reuse. Targets three minutes; loading or cleanup can take longer. You can enable ANE without testing."
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Сравнивает короткие и длинные промпты, восемь запросов и промпты из кеша. Во время теста модели перезагружаются. Запускайте без других запросов. Примените результат и сохраните профиль."
+            "value": "Необязательный тест промптов, восьми запросов и кеша. Около трёх минут; загрузка или очистка может занять больше времени. ANE можно включить без теста."
           }
         }
       }
