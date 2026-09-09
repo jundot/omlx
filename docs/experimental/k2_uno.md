@@ -12,7 +12,7 @@ The loader checks the base identity, adapter settings, and tensor layout.
 These are the released dense pairs tested by this implementation.
 The loader accepts compatible layouts without a model-size whitelist.
 The limits include prompt and output tokens. These measurements do not test the full context limits.
-MoVA and gated attention are unsupported.
+Uno does not support MoVA or gated attention.
 
 ## Limits
 
