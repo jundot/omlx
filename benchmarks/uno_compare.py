@@ -67,7 +67,7 @@ async def request(client, args, prompt, delay=0):
     }
 
 
-async def measure(client, args, prompts):
+async def measure(client, args, prompts, sampler=None):
     samples = []
     done = asyncio.Event()
 
@@ -82,16 +82,22 @@ async def measure(client, args, prompts):
             await asyncio.sleep(0.05)
 
     monitor = asyncio.create_task(memory()) if args.server_pid else None
+    window_start = time.monotonic()
     started = time.perf_counter()
     try:
         responses = await asyncio.gather(
             *(request(client, args, prompt, delay) for prompt, delay in prompts)
         )
         elapsed = time.perf_counter() - started
+        window_end = time.monotonic()
     finally:
         done.set()
         if monitor:
             await monitor
+    system_metrics = sampler.window(window_start, window_end) if sampler else None
+    if system_metrics is not None:
+        # The sampler runs in this client. Server memory comes from its PID.
+        system_metrics.pop("memory", None)
     return {
         "seconds": elapsed,
         "requests": responses,
@@ -100,6 +106,7 @@ async def measure(client, args, prompts):
         )
         / elapsed,
         "sampled_peak_phys_footprint_bytes": max(samples) if samples else None,
+        "system_metrics": system_metrics,
     }
 
 
@@ -142,25 +149,35 @@ async def run(args):
         "results": [],
     }
     headers = {"Authorization": "Bearer " + os.environ["OMLX_API_KEY"]}
-    async with httpx.AsyncClient(
-        base_url=args.url, headers=headers, timeout=600
-    ) as client:
-        response = await client.get("/v1/models")
-        response.raise_for_status()
-        report["model"] = next(
-            m for m in response.json()["data"] if m["id"] == args.model
-        )
-        for trial in range(args.trials + 1):
-            for name, prompts in workloads.items():
-                result = await measure(client, args, prompts)
-                report["results"].append(
-                    {"workload": name, "trial": trial, "warmup": trial == 0, **result}
-                )
-                args.output.write_text(json.dumps(report, indent=2) + "\n")
-                print(
-                    f"{args.label} {name} trial={trial}: {result['seconds']:.3f}s",
-                    flush=True,
-                )
+    sampler = None
+    if args.server_pid:
+        from omlx.utils.system_sampler import SystemSampler
+
+        sampler = SystemSampler()
+        sampler.start()
+    try:
+        async with httpx.AsyncClient(
+            base_url=args.url, headers=headers, timeout=600
+        ) as client:
+            response = await client.get("/v1/models")
+            response.raise_for_status()
+            report["model"] = next(
+                m for m in response.json()["data"] if m["id"] == args.model
+            )
+            for trial in range(args.trials + 1):
+                for name, prompts in workloads.items():
+                    result = await measure(client, args, prompts, sampler)
+                    report["results"].append(
+                        {"workload": name, "trial": trial, "warmup": trial == 0, **result}
+                    )
+                    args.output.write_text(json.dumps(report, indent=2) + "\n")
+                    print(
+                        f"{args.label} {name} trial={trial}: {result['seconds']:.3f}s",
+                        flush=True,
+                    )
+    finally:
+        if sampler:
+            sampler.stop()
 
 
 if __name__ == "__main__":

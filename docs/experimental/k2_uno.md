@@ -47,5 +47,6 @@ Trial 0 warms each workload. Use later trials for comparison.
 The script records response duration, first streamed text, server generation rate, and sampled process memory.
 It also sends eight simultaneous requests and eight staggered requests.
 Use `--concurrency` to select 1, 2, 4, or 8 requests. Memory uses macOS physical footprint samples every 50 milliseconds.
+Local runs with `--server-pid` also record host CPU/GPU utilization and thermal pressure for each workload.
 Generation rate comes from API usage. Aggregate rate divides all completion tokens by the request group's duration.
 The output budget applies to reasoning and answer tokens. Inspect finish reasons before treating a response as a completed task.
