@@ -265,6 +265,75 @@ DFlashEngine.start() fails:
 
 DFlash check runs **before** engine type routing in `_load_engine()`. If `dflash_enabled=True` and `dflash_draft_model` is set, DFlashEngine is created regardless of whether the model would normally be VLM or LLM. On failure, falls back to the model's natural engine type.
 
+### Verifying the effective engine
+
+A DFlash load fails soft, and so does a DFlash *request*: a long prompt or an
+image evicts the DFlash runtime after a successful load and the engine stays on
+its fallback engine until the model reloads. Either way the request succeeds
+with `200`, served by the model's natural engine. `GET /v1/models/status`
+reports what actually happened, so a client can assert DFlash is running
+instead of reading the server log.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `engine_type` | str | Configured engine for the model (unchanged) |
+| `effective_engine` | str \| null | Engine serving the model now: `dflash`, `vlm`, `batched`, `distributed`, `embedding`, `reranker`, `audio_stt`, `audio_tts`, `audio_sts`. `null` when not loaded |
+| `dflash_requested` | bool | `dflash_enabled` was set for this load |
+| `dflash_active` | bool | DFlash is the engine serving the model right now |
+| `dflash_fallback_reason` | str \| null | Why a requested DFlash load is not active, at startup or after a runtime fallback. Redacted and truncated to 200 characters |
+
+DFlash running:
+
+```json
+{
+  "id": "Qwen3.8-27B",
+  "loaded": true,
+  "engine_type": "batched",
+  "effective_engine": "dflash",
+  "dflash_requested": true,
+  "dflash_active": true,
+  "dflash_fallback_reason": null
+}
+```
+
+DFlash requested but fell back:
+
+```json
+{
+  "id": "Qwen3.8-27B",
+  "loaded": true,
+  "engine_type": "batched",
+  "effective_engine": "batched",
+  "dflash_requested": true,
+  "dflash_active": false,
+  "dflash_fallback_reason": "DFlash start failed: ValueError: Received parameters not in model: candidate_selector.hidden_projection.weight, ..."
+}
+```
+
+DFlash active at load, then dropped at runtime (`dflash_max_ctx` exceeded):
+
+```json
+{
+  "id": "Qwen3.8-27B",
+  "loaded": true,
+  "engine_type": "batched",
+  "effective_engine": "batched",
+  "dflash_requested": true,
+  "dflash_active": false,
+  "dflash_fallback_reason": "DFlash runtime fallback: prompt of 14000 tokens reached the DFlash context limit of 8192"
+}
+```
+
+A one-line client assertion:
+
+```bash
+curl -s localhost:10240/v1/models/status \
+  | jq -e '.models[] | select(.id=="Qwen3.8-27B") | .dflash_active'
+```
+
+DFlash was never requested when `dflash_requested` is `false`; `dflash_active`
+is then `false` and `dflash_fallback_reason` is `null`.
+
 ---
 
 ## Configuration reference

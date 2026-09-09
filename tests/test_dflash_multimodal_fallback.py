@@ -174,12 +174,18 @@ class TestChatMultimodalFallback:
         mock_fallback = AsyncMock()
         mock_fallback.chat = AsyncMock(return_value=mock_output)
 
-        with patch.object(vlm_dflash_engine, "_evict_dflash_and_start_fallback") as mock_evict:
-            mock_evict.side_effect = lambda: setattr(vlm_dflash_engine, "_fallback_engine", mock_fallback) or setattr(vlm_dflash_engine, "_in_fallback_mode", True)
+        def _fake_evict(_reason):
+            vlm_dflash_engine._fallback_engine = mock_fallback
+            vlm_dflash_engine._in_fallback_mode = True
+
+        with patch.object(
+            vlm_dflash_engine, "_evict_dflash_and_start_fallback"
+        ) as mock_evict:
+            mock_evict.side_effect = _fake_evict
 
             result = await vlm_dflash_engine.chat(_image_url_messages())
 
-        mock_evict.assert_called_once()
+        mock_evict.assert_called_once_with(DFlashEngine._MULTIMODAL_FALLBACK_REASON)
         mock_fallback.chat.assert_called_once()
         call_msgs = mock_fallback.chat.call_args[0][0]
         assert any(
@@ -261,8 +267,14 @@ class TestStreamChatMultimodalFallback:
         mock_fallback = AsyncMock()
         mock_fallback.stream_chat = mock_stream
 
-        with patch.object(vlm_dflash_engine, "_evict_dflash_and_start_fallback") as mock_evict:
-            mock_evict.side_effect = lambda: setattr(vlm_dflash_engine, "_fallback_engine", mock_fallback) or setattr(vlm_dflash_engine, "_in_fallback_mode", True)
+        def _fake_evict(_reason):
+            vlm_dflash_engine._fallback_engine = mock_fallback
+            vlm_dflash_engine._in_fallback_mode = True
+
+        with patch.object(
+            vlm_dflash_engine, "_evict_dflash_and_start_fallback"
+        ) as mock_evict:
+            mock_evict.side_effect = _fake_evict
 
             outputs = []
             async for out in vlm_dflash_engine.stream_chat(_image_url_messages()):
@@ -308,7 +320,7 @@ class TestFallbackLockSafety:
 
         evict_count = 0
 
-        async def mock_evict():
+        async def mock_evict(_reason):
             nonlocal evict_count
             evict_count += 1
             await asyncio.sleep(0.05)
