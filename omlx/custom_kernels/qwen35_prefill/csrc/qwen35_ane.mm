@@ -1658,6 +1658,10 @@ public:
     encoder.set_buffer(model_->output_buffer(), 0);
     encoder.set_output_array(output, 1);
     encoder.dispatch_threads(MTL::Size(output.size(), 1, 1), MTL::Size(256, 1, 1));
+    // MLX detaches the primitive after scheduling; its command buffers do not
+    // retain resources. Keep the ANE IOSurfaces alive through the output copy.
+    encoder.get_command_buffer()->addCompletedHandler(
+        MTL::HandlerFunction([model = model_](MTL::CommandBuffer *) {}));
     // As in Qwen, force MLX onto its post-commit path after the input commit.
     auto commit_guard = device.get_kernel("qwen35_ane_commit_guard", library);
     encoder.set_compute_pipeline_state(commit_guard);

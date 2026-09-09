@@ -316,7 +316,11 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
 
 
 @pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
-def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams():
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams(
+    asynchronous, reverse
+):
     from omlx.custom_kernels.qwen35_prefill import fast
 
     model = make_model()
@@ -335,6 +339,12 @@ def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams(
     # The graph must retain the program and each output across surface reuse.
     del split, ref, model
     gc.collect()
+    if reverse:
+        expected.reverse()
+        actual.reverse()
+    if asynchronous:
+        mx.async_eval(expected, actual)
+        gc.collect()
     mx.eval(expected, actual)
     for reference, result in zip(expected, actual):
         close(reference, result)
