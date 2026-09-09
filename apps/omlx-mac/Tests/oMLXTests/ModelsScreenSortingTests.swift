@@ -57,7 +57,6 @@ final class ModelsScreenSortingTests: XCTestCase {
             engineType: nil,
             modelType: nil,
             configModelType: nil,
-            unoBaseModelId: nil,
             modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,

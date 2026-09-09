@@ -83,6 +83,68 @@ def test_uno_rejects_conflicting_settings(flag):
 
 
 @pytest.mark.asyncio
+async def test_admin_supplies_uno_adapters_constraints_and_thinking_modes(models, tmp_path, monkeypatch):
+    from omlx.admin import routes
+    from omlx.model_settings import UNO_REQUIRED_SETTINGS
+
+    base, adapter = models
+    other = tmp_path / "other-Uno"
+    other.mkdir()
+    (other / "adapter_config.json").write_text(json.dumps(
+        {"peft_type": "LORA", "base_model_name_or_path": "IFM/K2-Horizon-7B"}
+    ))
+    (other / "adapter_model.safetensors").write_bytes(b"fixture")
+    pool = EnginePool()
+    pool.discover_models(str(tmp_path))
+    manager = ModelSettingsManager(tmp_path / "settings")
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(routes, "_get_server_state", lambda: None)
+    monkeypatch.setattr(routes, "_get_global_settings", lambda: None)
+    for enabled in (False, True, False):
+        manager.set_settings(base.name, ModelSettings(uno_enabled=enabled, uno_adapter_model=adapter.name))
+        response = (await routes.list_models(is_admin=True))["models"]
+        model = next(item for item in response if item["id"] == base.name)
+        assert model["uno_compatible"] is True
+        assert model["uno_adapters"] == [adapter.name]
+        assert model["uno_required_settings"] == UNO_REQUIRED_SETTINGS
+        assert model["thinking_modes"] == (["auto"] if enabled else ["auto", "on_limit"])
+        for helper in (item for item in response if item["is_helper"]):
+            assert helper["uno_compatible"] is False
+            assert helper["uno_adapters"] == []
+
+
+def test_dashboard_uses_server_uno_constraints_for_unsaved_settings():
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required to exercise dashboard JavaScript")
+    source = (Path(__file__).parents[1] / "omlx/admin/static/js/dashboard.js").read_text()
+    methods = "\n".join(re.search(
+        r"^            " + name + r"\([^\n]*\) \{.*?^            \},", source, re.M | re.S
+    ).group() for name in ("unoAdapterCandidates", "unoConflict", "thinkingBudgetAvailable"))
+    script = "const app = {" + methods + "};" + """
+app.selectedModel = {uno_adapters: ['variant'], uno_required_settings: {temperature: 0.5, thinking_budget_enabled: 0}};
+app.models = [{id: 'variant', config_model_type: 'future_adapter'}, {id: 'unlisted'}];
+app.modelSettings = {temperature: '0.5', enableThinkingBudget: false, uno_enabled: true};
+const unavailable = !app.thinkingBudgetAvailable();
+const neutral = app.unoConflict();
+app.modelSettings.temperature = '0.7';
+const changed = app.unoConflict();
+app.modelSettings.temperature = '0.5';
+app.modelSettings.enableThinkingBudget = true;
+console.log(JSON.stringify({neutral, changed, budget: app.unoConflict(), unavailable, adapters: app.unoAdapterCandidates()}));
+"""
+    result = json.loads(subprocess.check_output([node, "-e", script], text=True))
+    assert result == {"neutral": False, "changed": True, "budget": True, "unavailable": True,
+                      "adapters": [{"id": "variant", "config_model_type": "future_adapter"}]}
+
+
+@pytest.mark.asyncio
 async def test_pool_selects_uno_and_charges_adapter(models, tmp_path):
     base, adapter = models
     pool = EnginePool()
@@ -315,19 +377,21 @@ def test_uno_ane_setting_roundtrip_and_reservation(models, tmp_path):
     from omlx.patches.k2_horizon.ane_prefill import prefill_memory_reservation
 
     base, adapter = models
-    assert ModelSettings(k2_ane_prefill_enabled=True).k2_ane_prefill_enabled
+    assert ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
     pool = EnginePool()
     pool.discover_models(str(tmp_path))
     ordinary = ModelSettings(uno_enabled=True, uno_adapter_model=adapter.name)
     ane = ModelSettings(
-        uno_enabled=True, uno_adapter_model=adapter.name, k2_ane_prefill_enabled=True
+        uno_enabled=True,
+        uno_adapter_model=adapter.name,
+        qwen35_ane_prefill_enabled=True,
     )
     manager = ModelSettingsManager(tmp_path / "settings")
     manager.set_settings(base.name, ane)
     assert (
         ModelSettingsManager(tmp_path / "settings")
         .get_settings(base.name)
-        .k2_ane_prefill_enabled
+        .qwen35_ane_prefill_enabled
     )
     assert pool._engine_runtime_signature(
         base.name, ordinary

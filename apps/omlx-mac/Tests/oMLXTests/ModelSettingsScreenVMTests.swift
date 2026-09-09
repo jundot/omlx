@@ -408,15 +408,14 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
     func testUnoDefaultsAndCompatibleVariants() {
         let vm = ModelSettingsScreenVM()
-        let base = "IFM/K2-Horizon-0.9B"
-        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoBaseModelId: base)
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["Uno", "Uno-Q4"])
         vm.allModels = [
             vm.model!,
-            makeModel(id: "Uno", configModelType: "k2_horizon_uno", unoBaseModelId: base),
-            makeModel(id: "Uno-Q4", configModelType: "k2_horizon_uno", unoBaseModelId: base),
-            makeModel(id: "7B-Uno", configModelType: "k2_horizon_uno", unoBaseModelId: "IFM/K2-Horizon-7B"),
+            makeModel(id: "Uno", configModelType: "k2_horizon_uno"),
+            makeModel(id: "Uno-Q4", configModelType: "k2_horizon_uno"),
+            makeModel(id: "7B-Uno", configModelType: "k2_horizon_uno"),
         ]
-        XCTAssertTrue(vm.isK2Base)
+        XCTAssertTrue(vm.thinkingForced)
         XCTAssertFalse(vm.unoEnabled)
         XCTAssertNil(vm.unoUnavailableReason)
         XCTAssertEqual(vm.unoAdapterModelOptions().map(\.0), ["", "Uno", "Uno-Q4"])
@@ -430,18 +429,19 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.unoEnabled = false
         XCTAssertTrue(vm.validateUnoWorkingSettings())
         vm.model = makeModel(id: "MoVA", configModelType: "k2_horizon")
-        XCTAssertTrue(vm.isK2Base)
+        XCTAssertTrue(vm.thinkingForced)
         XCTAssertNotNil(vm.unoUnavailableReason)
         vm.model = makeModel(id: "Qwen", configModelType: "qwen3_5")
-        XCTAssertFalse(vm.isK2Base)
+        XCTAssertFalse(vm.thinkingForced)
         XCTAssertTrue(vm.unoAdapterCandidates.isEmpty)
         XCTAssertNil(vm.currentSettingsDict()["uno_enabled"])
     }
 
     func testUnoRejectsConflictingWorkingSettings() {
         let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "base", configModelType: "k2_horizon", unoAdapters: ["Uno"])
         for key in [\ModelSettingsScreenVM.mtpEnabled, \.vlmMtpEnabled, \.dflashEnabled,
-                    \.specprefillEnabled, \.turboquantKvEnabled, \.qwen35AnePrefillEnabled,
+                    \.specprefillEnabled, \.turboquantKvEnabled,
                     \.thinkingBudgetEnabled] {
             vm[keyPath: key] = true
             XCTAssertNotNil(vm.unoConflictReason)
@@ -452,18 +452,33 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             XCTAssertNotNil(vm.unoConflictReason)
             vm[keyPath: key] = ""
         }
+        vm.qwen35AnePrefillEnabled = true
         vm.minP = "0"
         vm.repetitionPenalty = "1"
         vm.presencePenalty = "0"
         XCTAssertNil(vm.unoConflictReason)
     }
 
+    func testUnoConstraintsFollowServerValuesAndWorkingEdits() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "future", configModelType: "future_model", unoAdapters: ["adapter"])
+        vm.model?.unoRequiredSettings = ["temperature": 0.5, "thinking_budget_enabled": 0]
+        vm.unoEnabled = true
+        vm.temperature = "0.7"
+        XCTAssertNotNil(vm.unoConflictReason)
+        XCTAssertFalse(vm.thinkingBudgetAvailable)
+        vm.temperature = "0.5"
+        XCTAssertNil(vm.unoConflictReason)
+        vm.model?.unoRequiredSettings?.removeValue(forKey: "thinking_budget_enabled")
+        XCTAssertTrue(vm.thinkingBudgetAvailable)
+    }
+
     func testUnoWireFieldsAndModelProfileRoundtrip() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let data = Data(#"{"id":"base","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"k2_horizon","uno_base_model_id":"IFM/K2-Horizon-0.9B","settings":{"uno_enabled":true,"uno_adapter_model":"Uno-Q4","guided_grammar_enabled":true}}"#.utf8)
+        let data = Data(#"{"id":"base","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"k2_horizon","uno_compatible":true,"uno_adapters":["Uno-Q4"],"uno_required_settings":{"guided_grammar_enabled":0},"settings":{"uno_enabled":true,"uno_adapter_model":"Uno-Q4","guided_grammar_enabled":true}}"#.utf8)
         let model = try decoder.decode(ModelDTO.self, from: data)
-        XCTAssertEqual(model.unoBaseModelId, "IFM/K2-Horizon-0.9B")
+        XCTAssertEqual(model.unoAdapters, ["Uno-Q4"])
         XCTAssertEqual(model.settings?.unoEnabled, true)
         XCTAssertEqual(model.settings?.unoAdapterModel, "Uno-Q4")
         let vm = ModelSettingsScreenVM()
@@ -523,7 +538,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
-    private func makeModel(id: String, configModelType: String?, unoBaseModelId: String? = nil) -> ModelDTO {
+    private func makeModel(id: String, configModelType: String?, unoAdapters: [String] = []) -> ModelDTO {
         var model = ModelDTO(
             id: id,
             displayName: nil,
@@ -540,7 +555,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             engineType: nil,
             modelType: nil,
             configModelType: configModelType,
-            unoBaseModelId: unoBaseModelId,
             modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
@@ -563,6 +577,15 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         model.anePrefillDefaultFraction = model.anePrefillBackend == "k2" ? 1.0 / 3.0 : 0.53
         model.anePrefillMlpFractions = [1.0 / 3.0, 0.5]
         model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
+        model.unoCompatible = !unoAdapters.isEmpty
+        model.unoAdapters = unoAdapters
+        model.unoRequiredSettings = [
+            "mtp_enabled": 0, "vlm_mtp_enabled": 0, "dflash_enabled": 0,
+            "specprefill_enabled": 0, "turboquant_kv_enabled": 0,
+            "guided_grammar_enabled": 0,
+            "thinking_budget_enabled": 0, "min_p": 0, "repetition_penalty": 1,
+            "presence_penalty": 0,
+        ]
         return model
     }
 }

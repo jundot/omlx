@@ -68,8 +68,8 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
-        'qwen35_ane_prefill_shared_fraction',
         'uno_enabled',
+        'qwen35_ane_prefill_shared_fraction',
         'uno_adapter_model',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -1571,21 +1571,21 @@
             },
 
             unoAdapterCandidates() {
-                const base = this.selectedModel?.uno_base_model_id;
-                return (this.models || []).filter(m => base
-                    && m.config_model_type === 'k2_horizon_uno'
-                    && m.uno_base_model_id === base);
+                const ids = this.selectedModel?.uno_adapters || [];
+                return (this.models || []).filter(model => ids.includes(model.id));
+            },
+
+            thinkingBudgetAvailable() {
+                return !this.modelSettings.uno_enabled
+                    || !('thinking_budget_enabled' in (this.selectedModel?.uno_required_settings || {}));
             },
 
             unoConflict() {
-                const s = this.modelSettings || {};
-                return ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled',
-                    'specprefill_enabled', 'turboquant_kv_enabled',
-                    'qwen35_ane_prefill_enabled', 'guided_grammar_enabled',
-                    'enableThinkingBudget'].some(key => s[key])
-                    || [['min_p', 0], ['repetition_penalty', 1], ['presence_penalty', 0]]
-                        .some(([key, neutral]) => s[key] !== '' && s[key] != null
-                            && Number(s[key]) !== neutral);
+                const settings = {...this.modelSettings,
+                    thinking_budget_enabled: this.modelSettings.enableThinkingBudget};
+                return Object.entries(this.selectedModel?.uno_required_settings || {})
+                    .some(([key, neutral]) => settings[key] !== '' && settings[key] != null
+                        && Number(settings[key]) !== neutral);
             },
 
             vlmMtpDraftModelCandidates() {

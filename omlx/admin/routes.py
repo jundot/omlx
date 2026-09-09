@@ -1995,6 +1995,10 @@ def _model_options(model_info: dict, settings) -> dict:
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
         "auto", "on_unlimit", "on_limit", "off"
     ]
+    from ..model_settings import UNO_REQUIRED_SETTINGS
+
+    if settings and settings.uno_enabled and "thinking_budget_enabled" in UNO_REQUIRED_SETTINGS:
+        thinking_modes.remove("on_limit")
     ane_backend = (
         None if model_info.get("is_helper") else ane_prefill_backend(model_type)
     )
@@ -2083,6 +2087,16 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         None,
     )
     dflash_ssd_cache_available = bool(ssd_cache_dir)
+
+    from ..model_settings import UNO_REQUIRED_SETTINGS
+    from ..uno_bundle import uno_base_id
+
+    uno_adapters = {}
+    for model in models_status:
+        if model.get("config_model_type") == "k2_horizon_uno":
+            base = uno_base_id(model.get("model_path", ""))
+            if base is not None:
+                uno_adapters.setdefault(base, []).append(model["id"])
 
     # Combine model info with settings
     models = []
@@ -2235,10 +2249,16 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         }
 
         model_data.update(_model_options(model_data, settings))
-        if model_info.get("config_model_type") in ("k2_horizon", "k2_horizon_uno"):
-            from ..uno_bundle import uno_base_id
-
-            model_data["uno_base_model_id"] = uno_base_id(model_info["model_path"])
+        uno_base = None
+        if model_data["config_model_type"] == "k2_horizon" and not model_data["is_helper"]:
+            uno_base = uno_base_id(model_data["model_path"])
+        model_data.update(
+            uno_compatible=uno_base is not None,
+            uno_adapters=uno_adapters.get(uno_base, []),
+            uno_required_settings={
+                key: int(value) for key, value in UNO_REQUIRED_SETTINGS.items()
+            } if uno_base is not None else {},
+        )
 
         # Add settings if available
         if settings:

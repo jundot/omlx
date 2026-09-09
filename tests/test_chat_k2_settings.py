@@ -1,32 +1,34 @@
-"""Exercise Chat request settings for K2 and other model families."""
+"""Exercise Chat request settings for K2, Uno, and other model families."""
 
 import json
+from pathlib import Path
 import re
 import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
 
 @pytest.mark.parametrize(
-    "model_type, enabled, budget, expected_mode, expected_generation",
+    "model_type, uno, enabled, budget, expected_mode, expected_generation",
     [
-        ("k2_horizon", None, True, "on_limit", {"thinking_budget": 4096}),
-        ("k2_horizon", False, True, "on_limit", {"thinking_budget": 4096}),
-        ("k2_horizon", True, True, "on_limit", {"thinking_budget": 4096}),
-        ("k2_horizon", False, False, "auto", {}),
-        ("k2_horizon", True, False, "auto", {}),
-        ("qwen3", True, True, "on_limit", {"chat_template_kwargs": {"enable_thinking": True}, "thinking_budget": 4096}),
-        ("qwen3", True, False, "on_unlimit", {"chat_template_kwargs": {"enable_thinking": True}}),
-        ("qwen3", False, True, "off", {"chat_template_kwargs": {"enable_thinking": False}}),
-        ("qwen3", False, False, "off", {"chat_template_kwargs": {"enable_thinking": False}}),
-        ("qwen3", None, True, "auto", {}),
-        ("qwen3", None, False, "auto", {}),
+        ("k2_horizon", False, None, True, "on_limit", {"thinking_budget": 4096}),
+        ("k2_horizon", False, False, True, "on_limit", {"thinking_budget": 4096}),
+        ("k2_horizon", False, True, True, "on_limit", {"thinking_budget": 4096}),
+        ("k2_horizon", False, False, False, "auto", {}),
+        ("k2_horizon", False, True, False, "auto", {}),
+        ("qwen3", False, True, True, "on_limit", {"chat_template_kwargs": {"enable_thinking": True}, "thinking_budget": 4096}),
+        ("qwen3", False, True, False, "on_unlimit", {"chat_template_kwargs": {"enable_thinking": True}}),
+        ("qwen3", False, False, True, "off", {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("qwen3", False, False, False, "off", {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("qwen3", False, None, True, "auto", {}),
+        ("qwen3", False, None, False, "auto", {}),
+        ("k2_horizon", True, True, True, "auto", {}),
+        ("k2_horizon", True, None, False, "auto", {}),
     ],
 )
 def test_saved_thinking_settings_respect_model_capabilities(
-    model_type, enabled, budget, expected_mode, expected_generation
+    model_type, uno, enabled, budget, expected_mode, expected_generation
 ):
     node = shutil.which("node")
     if not node:
@@ -51,12 +53,12 @@ def test_saved_thinking_settings_respect_model_capabilities(
     model = {
         "id": "base",
         "config_model_type": model_type,
-        "settings": {},
+        "settings": {"uno_enabled": uno},
     }
     from omlx.admin.routes import _model_options
     from omlx.model_settings import ModelSettings
 
-    model.update(_model_options(model, ModelSettings()))
+    model.update(_model_options(model, ModelSettings(uno_enabled=uno, uno_adapter_model="adapter" if uno else None)))
     # Presentation must follow the response even if a future model has another name.
     model["config_model_type"] = "future_model"
     script = (

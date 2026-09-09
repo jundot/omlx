@@ -505,9 +505,9 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="modelSettings.uno_enabled ? window.t('modal.model_settings.uno_budget_hint') : window.t('modal.model_settings.thinking_budget_hint')"></p>
+                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="!thinkingBudgetAvailable() ? window.t('modal.model_settings.uno_budget_hint') : window.t('modal.model_settings.thinking_budget_hint')"></p>
                                     </div>
-                                    <button type="button" :disabled="modelSettings.uno_enabled && !modelSettings.enableThinkingBudget" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                    <button type="button" :disabled="!thinkingBudgetAvailable() && !modelSettings.enableThinkingBudget" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
@@ -515,7 +515,7 @@
                                     </button>
                                 </div>
                                 <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
-                                    <input type="number" :disabled="modelSettings.uno_enabled" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
+                                    <input type="number" :disabled="!thinkingBudgetAvailable()" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
@@ -1412,7 +1412,7 @@
                                     </div>
                                 </div>
 
-                                <div x-show="selectedModel?.config_model_type === 'k2_horizon' && !selectedModel?.is_helper"
+                                <div x-show="selectedModel?.uno_compatible"
                                      class="p-4 bg-neutral-50 rounded-xl space-y-3 mt-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div>

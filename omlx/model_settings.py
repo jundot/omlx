@@ -27,6 +27,20 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
+# Neutral values required by Uno. The admin API also exposes these to settings clients.
+UNO_REQUIRED_SETTINGS = {
+    "mtp_enabled": False,
+    "vlm_mtp_enabled": False,
+    "dflash_enabled": False,
+    "specprefill_enabled": False,
+    "turboquant_kv_enabled": False,
+    "guided_grammar_enabled": False,
+    "thinking_budget_enabled": False,
+    "min_p": 0,
+    "repetition_penalty": 1,
+    "presence_penalty": 0,
+}
+
 SETTINGS_VERSION = 1
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
@@ -481,24 +495,10 @@ class ModelSettings:
         if self.uno_enabled:
             if not self.uno_adapter_model:
                 raise ValueError("Select a Uno adapter before enabling Uno.")
-            for name in (
-                "mtp_enabled",
-                "vlm_mtp_enabled",
-                "dflash_enabled",
-                "specprefill_enabled",
-                "turboquant_kv_enabled",
-                "qwen35_ane_prefill_enabled",
-                "guided_grammar_enabled",
-                "thinking_budget_enabled",
-            ):
-                if getattr(self, name, False):
-                    raise ValueError(f"Uno cannot be combined with {name}.")
-            for name, neutral in (
-                ("min_p", 0),
-                ("repetition_penalty", 1),
-                ("presence_penalty", 0),
-            ):
+            for name, neutral in UNO_REQUIRED_SETTINGS.items():
                 if getattr(self, name) not in (None, neutral):
+                    if isinstance(neutral, bool):
+                        raise ValueError(f"Uno cannot be combined with {name}.")
                     raise ValueError(f"Uno requires {name}={neutral}.")
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in

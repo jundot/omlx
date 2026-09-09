@@ -733,7 +733,7 @@ private struct AdvancedTab: View {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
-                    sublabel: vm.unoEnabled ? String(
+                    sublabel: !vm.thinkingBudgetAvailable ? String(
                         localized: "settings.uno.budget_hint",
                         defaultValue: "Uno does not support thinking budgets.")
                         : String(localized: "settings.advanced.thinking_budget.sub",
@@ -743,10 +743,10 @@ private struct AdvancedTab: View {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
                                       mono: true, suffix: "tk", width: .controlCompact)
-                                .disabled(vm.unoEnabled)
+                                .disabled(!vm.thinkingBudgetAvailable)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
-                            .disabled(vm.unoEnabled && !vm.thinkingBudgetEnabled)
+                            .disabled(!vm.thinkingBudgetAvailable && !vm.thinkingBudgetEnabled)
                     }
                 }
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
@@ -1663,7 +1663,7 @@ private struct ExperimentalSection: View {
                 }
             }
 
-            if vm.isK2Base {
+            if vm.model?.unoCompatible == true {
                 Row(label: String(localized: "settings.uno.enable", defaultValue: "Enable Uno"),
                     sublabel: vm.unoUnavailableReason ?? String(
                         localized: "settings.uno.hint",
