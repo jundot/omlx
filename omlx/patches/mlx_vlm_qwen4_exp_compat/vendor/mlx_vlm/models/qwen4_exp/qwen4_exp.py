@@ -142,6 +142,18 @@ class Model(Qwen3_5Model):
             self.language_model.bind_mtp_owner(self)
 
     def sanitize(self, weights):
+        # Normalize legacy/community key layouts to the expected language_model structure
+        normalized_keys = {}
+        for key, value in weights.items():
+            if key.startswith("model.visual."):
+                key = "vision_tower." + key[13:]
+            elif key.startswith("model.") and not key.startswith("model.language_model."):
+                key = "language_model.model." + key[6:]
+            elif key.startswith("lm_head."):
+                key = "language_model.lm_head." + key[8:]
+            normalized_keys[key] = value
+        weights = normalized_keys
+
         if get_ple_runtime_mode() == "mmap" and not getattr(
             self, "_omlx_preserve_qwen4_ple_for_quantization", False
         ):
