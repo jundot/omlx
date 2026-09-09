@@ -350,7 +350,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
                 for program in programs:
                     program.active = chunk.shape[1] == width
                 if isinstance(target.model, CompiledBody):
-                    target.model(chunk, cache=cache, prefill=True)
+                    target.model(chunk, cache=cache, prefill=chunk.shape[1] == width)
                 else:
                     target(chunk, cache=cache)
                 mx.eval([c.state for c in cache])

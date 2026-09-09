@@ -2356,10 +2356,12 @@ def _validate_k2_tuning_model(model: Any) -> None:
     """Check loaded MLP weights, not the checkpoint's activation dtype."""
     import mlx.nn as nn
 
+    from ..patches.k2_horizon.ane_prefill import _linear
+
     for layer in model.layers[:-1]:
         mlp = getattr(layer.mlp, "shared_experts", layer.mlp)
         for name in ("gate_proj", "up_proj", "down_proj"):
-            projection = getattr(mlp, name)
+            projection = _linear(getattr(mlp, name))
             if (
                 not isinstance(projection, nn.QuantizedLinear)
                 or projection.mode != "affine"

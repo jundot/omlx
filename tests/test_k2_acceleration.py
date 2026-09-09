@@ -373,10 +373,23 @@ def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, pref
         fast.qwen35_ane_profile_set_enabled(False)
 
 
+def test_ane_prefix_namespace_separates_compiled_gpu_math(monkeypatch):
+    from omlx.patches.k2_horizon import ane_prefill
+
+    monkeypatch.setattr(ane_prefill, "PrefillMLP", lambda *a, **k: SimpleNamespace())
+    model = make_model()
+    enable_ane_prefill(model, fraction=0.5, width=32)
+    ordinary = model._omlx_k2_ane_signature
+    install_compiled_blocks(model)
+    enable_ane_prefill(model, fraction=0.5, width=32)
+    assert model._omlx_k2_ane_signature != ordinary
+
+
 @pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
 @pytest.mark.parametrize("prefix", [0, 32])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
-    mock_tokenizer, monkeypatch, prefix
+    mock_tokenizer, monkeypatch, prefix, compiled
 ):
     from mlx_lm.generate import BatchGenerator, GenerationBatch
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -384,6 +397,10 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
     from omlx.scheduler import Scheduler, SchedulerConfig
 
     model = make_model()
+    if compiled:
+        from omlx.patches.k2_horizon.compiled import install_compiled_blocks
+
+        install_compiled_blocks(model)
     enable_ane_prefill(model, fraction=0.5, width=32)
     scheduler = Scheduler(
         model=model,
@@ -501,15 +518,3 @@ def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams(
     mx.eval(expected, actual)
     for reference, result in zip(expected, actual):
         close(reference, result)
-
-
-def test_ane_prefix_namespace_separates_compiled_gpu_math(monkeypatch):
-    from omlx.patches.k2_horizon import ane_prefill
-
-    monkeypatch.setattr(ane_prefill, "PrefillMLP", lambda *a, **k: SimpleNamespace())
-    model = make_model()
-    enable_ane_prefill(model, fraction=0.5, width=32)
-    ordinary = model._omlx_k2_ane_signature
-    install_compiled_blocks(model)
-    enable_ane_prefill(model, fraction=0.5, width=32)
-    assert model._omlx_k2_ane_signature != ordinary
