@@ -797,6 +797,52 @@ def test_link_verification_rejects_a_route_on_the_wrong_interface():
     assert "en4" in reason
 
 
+def test_link_verification_accepts_a_correct_route_when_only_icmp_is_filtered():
+    """A single dropped ping is not proof the path is dead — macOS's Firewall
+    "stealth mode" silently drops ICMP echo by default. A real TCP connection
+    to the peer's SSH port on the correctly-routed interface must still pass."""
+
+    link = shared_link_addresses(_laptop(), _studio())
+    calls = []
+
+    def runner(host, command):
+        calls.append((host, tuple(command)))
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        if command[0] == "/sbin/ping":
+            return subprocess.CompletedProcess(command, 1, "", "Request timeout")
+        return subprocess.CompletedProcess(command, 0, "", "")  # the TCP probe
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is True
+    assert reason == link.reason
+    assert [command[0] for _, command in calls] == [
+        "/sbin/route",
+        "/sbin/ping",
+        "python3",
+        "/sbin/route",
+        "/sbin/ping",
+        "python3",
+    ]
+
+
+def test_link_verification_still_rejects_when_icmp_and_tcp_both_fail():
+    link = shared_link_addresses(_laptop(), _studio())
+
+    def runner(host, command):
+        if command[0] == "/sbin/route":
+            interface = "en4" if host == "127.0.0.1" else "en5"
+            return subprocess.CompletedProcess(command, 0, f"interface: {interface}\n", "")
+        return subprocess.CompletedProcess(command, 1, "", "unreachable")
+
+    verified, reason = verify_link_reachability(link, runner=runner)
+
+    assert verified is False
+    assert "did not answer" in reason
+
+
 def test_the_detected_link_speed_is_carried_into_the_explanation():
     hosts = {"127.0.0.1": _laptop(), "Studio.local": _studio()}
     transports = (
