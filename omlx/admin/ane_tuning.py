@@ -2404,7 +2404,7 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         from ..custom_kernels.qwen35_prefill import fast
 
         if not fast.qwen35_ane_available() or not hasattr(
-            fast._ext, "ane_compile_program_bank"
+            fast._ext, "ane_compile_program"
         ):
             raise RuntimeError("K2 tuning requires the native ANE extension")
         manager = getattr(engine_pool, "_settings_manager", None)

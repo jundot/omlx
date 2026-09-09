@@ -60,9 +60,8 @@ private:
   explicit AneLinearModel(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 
-  friend std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
-      const std::string &, const mlx::core::array &, const std::vector<int> &,
-      const std::vector<int> &, int);
+  friend std::shared_ptr<AneLinearModel> ane_compile_program(
+      const std::string &, const mlx::core::array &, int, int, int);
   friend class AneLinearBankBuilder;
   friend class AneFusedBankBuilder;
   friend std::shared_ptr<AneLinearModel>
@@ -170,10 +169,9 @@ std::shared_ptr<AneLinearModel> qwen35_ane_compile_fp16_linear(
 
 mlx::core::array ane_planar(const mlx::core::array &x,
     const std::shared_ptr<AneLinearModel> &model);
-std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
+std::shared_ptr<AneLinearModel> ane_compile_program(
     const std::string &mil, const mlx::core::array &weight_blob,
-    const std::vector<int> &input_dims, const std::vector<int> &output_dims,
-    int sequence_length);
+    int input_dim, int output_dim, int sequence_length);
 
 std::shared_ptr<AneLinearModel> qwen35_ane_compile_swiglu_down(
     const mlx::core::array &gate_weight,

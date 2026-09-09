@@ -1666,19 +1666,15 @@ array ane_planar(const array &x, const std::shared_ptr<AneLinearModel> &model) {
       std::make_shared<K2AnePlanarPrimitive>(to_stream(Device::cpu), model), {x});
 }
 
-std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
+std::shared_ptr<AneLinearModel> ane_compile_program(
     const std::string &mil_source, const array &weight_blob,
-    const std::vector<int> &input_dims, const std::vector<int> &output_dims,
-    int sequence_length) {
+    int input_dim, int output_dim, int sequence_length) {
   if (!qwen35_ane_available()) throw std::runtime_error("Private ANE runtime is unavailable.");
   if (mil_source.empty() || weight_blob.dtype() != mlx::core::uint8 || weight_blob.ndim() != 1 ||
       !row_contiguous(weight_blob) || weight_blob.size() < 128 ||
-      input_dims.empty() || input_dims.size() > 256 ||
-      input_dims.size() != output_dims.size() || sequence_length < 2 ||
-      sequence_length % 32 ||
-      std::any_of(input_dims.begin(), input_dims.end(), [](int n) { return n <= 0; }) ||
-      std::any_of(output_dims.begin(), output_dims.end(), [](int n) { return n <= 0; })) {
-    throw std::invalid_argument("Invalid generated ANE program bank.");
+      input_dim <= 0 || output_dim <= 0 || sequence_length < 2 ||
+      sequence_length % 32) {
+    throw std::invalid_argument("Invalid generated ANE program.");
   }
   @autoreleasepool {
     NSData *mil = [NSData dataWithBytes:mil_source.data() length:mil_source.size()];
@@ -1690,20 +1686,16 @@ std::vector<std::shared_ptr<AneLinearModel>> ane_compile_program_bank(
         descriptors, @selector(modelWithMILText:weights:optionsPlist:), mil, weights, nil);
     id model = ((id (*)(Class, SEL, id))objc_msgSend)(
         models, @selector(inMemoryModelWithDescriptor:), descriptor);
-    if (!model) throw std::runtime_error("Generated ANE bank creation failed.");
+    if (!model) throw std::runtime_error("Generated ANE program creation failed.");
     id identifier = ((id (*)(id, SEL))objc_msgSend)(model, @selector(hexStringIdentifier));
     NSDictionary *options = ane_execution_options(0);
     AneLoadResult loaded = load_or_compile_ane_model(
         model, identifier, 0, options, mil, @{@"weight.bin" : blob},
-        @"K2 ANE bank", @"K2 ANE bank");
+        @"K2 ANE program", @"K2 ANE program");
     auto program = std::make_shared<SharedAneProgram>(model, loaded, options);
-    std::vector<std::shared_ptr<AneLinearModel>> result;
-    for (size_t index = 0; index < input_dims.size(); ++index) {
-      auto impl = std::make_unique<AneLinearModel::Impl>(
-          program, input_dims[index], output_dims[index], sequence_length, index);
-      result.emplace_back(new AneLinearModel(std::move(impl)));
-    }
-    return result;
+    auto impl = std::make_unique<AneLinearModel::Impl>(
+        program, input_dim, output_dim, sequence_length, 0);
+    return std::shared_ptr<AneLinearModel>(new AneLinearModel(std::move(impl)));
   }
 }
 

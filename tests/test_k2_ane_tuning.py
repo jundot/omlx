@@ -39,7 +39,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
     )
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(
-        fast, "_ext", SimpleNamespace(ane_compile_program_bank=object())
+        fast, "_ext", SimpleNamespace(ane_compile_program=object())
     )
     samples = iter([100, 101, peak, 101, 100, 100])
 
@@ -88,7 +88,7 @@ async def test_k2_tuner_failure_does_not_apply_partial_results(
     monkeypatch.setattr(ane_tuning, "_restore_speed_priority", lambda *_: None)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(
-        fast, "_ext", SimpleNamespace(ane_compile_program_bank=object())
+        fast, "_ext", SimpleNamespace(ane_compile_program=object())
     )
     monkeypatch.setattr(ane_tuning, "_measure_candidate", AsyncMock(side_effect=error))
     run = ane_tuning.create_run(

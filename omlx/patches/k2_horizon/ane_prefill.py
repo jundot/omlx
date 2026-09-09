@@ -23,14 +23,12 @@ class _Blob:
         values = np.asarray(tensor.astype(mx.float32))
         if not np.isfinite(values).all() or (np.abs(values) > 65504).any():
             raise ValueError("ANE weights must be finite and representable in FP16")
-        return self.add_raw(values.astype(np.float16).tobytes(), 1)
-
-    def add_raw(self, raw, dtype_code):
+        raw = values.astype(np.float16).tobytes()
         self.data.extend(bytes((-len(self.data)) % 64))
         offset = len(self.data)
         header = bytearray(64)
         struct.pack_into(
-            "<IIQQ", header, 0, 0xDEADBEEF, dtype_code, len(raw), offset + 64
+            "<IIQQ", header, 0, 0xDEADBEEF, 1, len(raw), offset + 64
         )
         self.data.extend(header)
         self.data.extend(raw)
@@ -56,15 +54,14 @@ def _projection_statements(weight, width, blob, prefix, source="x"):
     )
 
 
-def _full_mlp_procedure(index, projections, width, blob):
+def _full_mlp_procedure(projections, width, blob):
     """Undo input scaling before SiLU; use separate down-input scaling."""
     dim = projections[0].shape[1]
     hidden = projections[0].shape[0]
     lines = [
-        f"  func procedure{index:03d}<ios18>(tensor<fp16, [1, {dim + 2}, 1, {width}]> input) {{",
+        f"  func procedure000<ios18>(tensor<fp16, [1, {dim + 1}, 1, {width}]> input) {{",
         f'    tensor<fp16, [1, {dim}, 1, {width}]> x = slice_by_size(x=input, begin=tensor<int32, [4]>([0,0,0,0]), size=tensor<int32, [4]>([1,{dim},1,{width}]))[name=string("slice_x")];',
-        f'    tensor<fp16, [1, 1, 1, {width}]> mask = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("slice_mask")];',
-        f'    tensor<fp16, [1, 1, 1, {width}]> input_scale = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim+1},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("input_scale")];',
+        f'    tensor<fp16, [1, 1, 1, {width}]> input_scale = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("input_scale")];',
     ]
     lines.append(_projection_statements(projections[0], width, blob, "g"))
     lines.append(_projection_statements(projections[1], width, blob, "u"))
@@ -144,7 +141,7 @@ class PrefillMLP:
     def __init__(self, reference, *, cut, width=TILE):
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        if fast._ext is None or not hasattr(fast._ext, "ane_compile_program_bank"):
+        if fast._ext is None or not hasattr(fast._ext, "ane_compile_program"):
             raise RuntimeError("K2 ANE prefill requires the native ANE extension")
         projections = tuple(
             getattr(reference, n) for n in ("gate_proj", "up_proj", "down_proj")
@@ -158,16 +155,16 @@ class PrefillMLP:
             _dense_part(_projection_part(ref, cut, down=i == 2))
             for i, ref in enumerate(projections)
         )
-        proc = _full_mlp_procedure(0, ane_weights, width, blob)
+        proc = _full_mlp_procedure(ane_weights, width, blob)
         del ane_weights
         source = (
             'program(1.3)\n[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3520.4.1"}, {"coremlc-version", "3520.5.1"}})]\n{\n'
             + proc
             + "\n}\n"
         )
-        self.program = fast._ext.ane_compile_program_bank(
-            source, blob.array(), [dim + 2], [dim], width
-        )[0]
+        self.program = fast._ext.ane_compile_program(
+            source, blob.array(), dim + 1, dim, width
+        )
         self.width = width
         base = projections[0]
         self.dtype = (
@@ -209,9 +206,7 @@ class PrefillMLP:
         scales = mx.power(2, mx.minimum(4, mx.floor(mx.log2(1024 / maximum)))).astype(
             x.dtype
         )
-        packed = mx.concatenate(
-            [rows * scales, mx.zeros((self.width, 1), dtype=x.dtype), scales], axis=-1
-        )
+        packed = mx.concatenate([rows * scales, scales], axis=-1)
         planar = mx.contiguous(packed.astype(mx.float16).T)
         # Complete packing before submitting the independent GPU and ANE work.
         mx.eval(planar, scales)
@@ -272,7 +267,7 @@ def prefill_memory_reservation(
                 gpu_copies += rows * math.ceil(cols / quant["group_size"]) * 4
         weights += size
         largest = max(largest, size)
-        surfaces += (2 * dims + 2) * width * 2
+        surfaces += (2 * dims + 1) * width * 2
     # Allow compiled weights, retained blobs, surfaces, and one staging program.
     return 3 * weights + 2 * surfaces + largest + gpu_copies
 

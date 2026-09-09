@@ -34,8 +34,10 @@ def close(a, b):
 @pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
 @pytest.mark.parametrize("rows", [7, 32])
 @pytest.mark.parametrize("bits", [None, 4, 8])
-def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits):
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits, dtype):
     model = make_model()
+    model.set_dtype(dtype)
     ref = model.layers[0].mlp
     if bits is not None:
         for name in ("gate_proj", "up_proj", "down_proj"):
@@ -48,7 +50,7 @@ def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits):
             )
     weights = [getattr(ref, n).weight for n in ("gate_proj", "up_proj", "down_proj")]
     split = PrefillMLP(ref, cut=64, width=32)
-    x = mx.random.normal((1, rows, 64)).astype(mx.bfloat16)
+    x = mx.random.normal((1, rows, 64)).astype(dtype)
     target = ref(x)
     before = split(x)
     mx.eval(target, before)
