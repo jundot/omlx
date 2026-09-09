@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 from .anthropic_models import (
@@ -95,6 +96,24 @@ def _content_block_to_dict(block: Any) -> dict[str, Any] | None:
     if isinstance(block, dict):
         return block
     return None
+
+
+def _text_from_content_blocks(blocks: Iterable[Any]) -> list[str]:
+    """Text of every block whose normalized form is a text block, in order.
+
+    Returns raw, unfiltered text. Callers extracting system-prompt text must
+    still apply the billing-header filter and ``_strip_client_budget_markers``
+    themselves — this helper does not know which call site needs them.
+    """
+    texts: list[str] = []
+    for block in blocks:
+        block_dict = _content_block_to_dict(block)
+        if block_dict is None or block_dict.get("type") != "text":
+            continue
+        text = block_dict.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
 
 
 def _append_anthropic_image_part(
@@ -509,12 +528,8 @@ def convert_anthropic_to_internal_harmony(
             tool_results: list[dict] = []
 
             for block in content:
-                # Handle both Pydantic models and dicts
-                if hasattr(block, "model_dump"):
-                    block_dict = block.model_dump()
-                elif isinstance(block, dict):
-                    block_dict = block
-                else:
+                block_dict = _content_block_to_dict(block)
+                if block_dict is None:
                     continue
 
                 block_type = block_dict.get("type", "")
@@ -711,18 +726,12 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     if isinstance(system, str):
         return _strip_client_budget_markers(system)
     elif isinstance(system, list):
-        text_parts = []
-        for block in system:
-            if hasattr(block, "text"):
-                text = block.text
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-            else:
-                continue
-            # Skip billing header blocks (contain random values that break prefix cache)
-            if text.startswith(_BILLING_HEADER_PREFIX):
-                continue
-            text_parts.append(text)
+        # Skip billing header blocks (contain random values that break prefix cache)
+        text_parts = [
+            text
+            for text in _text_from_content_blocks(system)
+            if not text.startswith(_BILLING_HEADER_PREFIX)
+        ]
         return _strip_client_budget_markers("\n".join(text_parts))
     return ""
 
@@ -754,14 +763,9 @@ def _normalize_in_messages_system(
             if content:
                 extracted_parts.append(content)
         elif isinstance(content, list):
-            for block in content:
-                block_dict = _content_block_to_dict(block)
-                if block_dict is None:
-                    continue
-                if block_dict.get("type") == "text":
-                    text = block_dict.get("text", "")
-                    if text:
-                        extracted_parts.append(text)
+            extracted_parts.extend(
+                text for text in _text_from_content_blocks(content) if text
+            )
 
     base = _extract_system_text(request.system) if request.system else ""
     if extracted_parts:
@@ -846,11 +850,14 @@ def _extract_tool_result_content(
         # List of content blocks
         text_parts = []
         for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 text_parts.append(item)
+                continue
+            item_dict = _content_block_to_dict(item)
+            if item_dict is not None and item_dict.get("type") == "text":
+                text = item_dict.get("text", "")
+                if isinstance(text, str):
+                    text_parts.append(text)
         result_text = "\n".join(text_parts)
     elif isinstance(content, dict):
         if content.get("type") == "text":
@@ -923,12 +930,8 @@ def convert_anthropic_tools_to_internal(
     dropped: list[str] = []
 
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if hasattr(tool, "model_dump"):
-            tool_dict = tool.model_dump()
-        elif isinstance(tool, dict):
-            tool_dict = tool
-        else:
+        tool_dict = _content_block_to_dict(tool)
+        if tool_dict is None:
             continue
 
         if _is_server_side_tool(tool_dict):
