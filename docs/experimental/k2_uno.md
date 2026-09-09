@@ -43,6 +43,7 @@ python benchmarks/uno_compare.py --model K2 --label uno-off \
 Restart the server with Uno enabled. Repeat the command with `--label uno-on` and `--output uno-on.json`.
 Supply the new server PID. Alternate the mode order across repeated runs.
 Trial 0 warms each workload. Use later trials for comparison.
+Trials reuse prompts, so long-context results can include prefix-cache hits. The JSON records those hits.
 
 The script records response duration, first streamed text, server generation rate, and sampled process memory.
 It also sends eight simultaneous requests and eight staggered requests.
