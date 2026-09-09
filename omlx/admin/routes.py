@@ -4797,6 +4797,15 @@ async def claude_desktop_restore(
         raise HTTPException(status_code=500, detail=f"Restore failed: {exc}")
     if applied and request.restart_desktop:
         desktop.restart_claude_desktop()
+    # Keep the persisted flag in sync so the dashboard toggle reflects
+    # reality after a direct restore call (not just via the settings PATCH).
+    global_settings = _get_global_settings()
+    if global_settings is not None and global_settings.claude_code.desktop_enabled:
+        global_settings.claude_code.desktop_enabled = False
+        try:
+            global_settings.save()
+        except Exception as e:
+            logger.warning("Failed to persist desktop_enabled after restore: %s", e)
     return {
         "success": True,
         "configured": bool(desktop.is_configured()),
