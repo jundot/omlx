@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "mlx/allocator.h"
-#include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
@@ -1266,12 +1265,6 @@ MTL::Buffer *AneLinearModel::input_buffer() const {
 MTL::Buffer *AneLinearModel::output_buffer() const {
   return reinterpret_cast<MTL::Buffer *>(impl_->output_buffer_);
 }
-void *AneLinearModel::input_host_data() const {
-  return IOSurfaceGetBaseAddress(impl_->input_surface_);
-}
-void *AneLinearModel::output_host_data() const {
-  return IOSurfaceGetBaseAddress(impl_->output_surface_);
-}
 AneLinearModel::Ticket
 AneLinearModel::begin(MTL::CommandBuffer *command_buffer) {
   return impl_->begin(command_buffer);
@@ -1614,38 +1607,63 @@ public:
   K2AnePlanarPrimitive(Stream stream, std::shared_ptr<AneLinearModel> model)
       : Primitive(stream), model_(std::move(model)) {}
 
-  void eval_cpu(const std::vector<array> &inputs, std::vector<array> &outputs) override {
-    const auto x = inputs[0];
-    auto output = outputs[0];
-    output.set_data(allocator::malloc(output.nbytes()));
-    outputs[0] = output;
-    cpu::get_command_encoder(stream()).dispatch([x, output, model = model_]() mutable {
-      const bool profiling = ane_profile_enabled();
-      const uint64_t start = profiling ? profile_now_ns() : 0;
-      if (profiling) profile_add(0, kOperations, 1);
-      auto *input = model->input_host_data();
-      auto *result = model->output_host_data();
-      if (!input || !result) throw std::runtime_error("ANE surfaces are not host accessible");
-      auto ticket = model->begin(nullptr);
-      std::memcpy(input, x.data<void>(), x.nbytes());
-      const uint64_t ready = profiling ? profile_now_ns() : 0;
-      try {
-        std::thread([model, ticket] { model->execute(ticket); }).detach();
-      } catch (...) {
-        model->cancel_ticket(ticket);
-        throw;
-      }
-      model->wait(ticket);
-      std::memcpy(output.data<void>(), result, output.nbytes());
-      if (profiling) {
-        profile_add(0, kPackNs, ready - start);
-        profile_add(0, kAne0EvalNs, profile_now_ns() - ready);
-      }
-    });
+  void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
+    throw std::runtime_error("K2 ANE planar transfer has no CPU implementation");
   }
 
-  void eval_gpu(const std::vector<array> &, std::vector<array> &) override {
-    throw std::runtime_error("K2 planar transfer requires the CPU stream");
+  void eval_gpu(const std::vector<array> &inputs, std::vector<array> &outputs) override {
+    auto &device = metal::device(stream().device);
+    auto &encoder = metal::get_command_encoder(stream());
+    auto library = device.get_library("omlx_qwen35_prefill_kernels", binary_dir());
+    auto copy = device.get_kernel("k2_ane_copy_planar", library);
+    const auto &x = inputs[0];
+    auto &output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+    const bool profiling = ane_profile_enabled();
+    const uint64_t start = profiling ? profile_now_ns() : 0;
+    if (profiling) profile_add(0, kOperations, 1);
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_input_array(x, 0);
+    encoder.set_buffer(model_->input_buffer(), 1);
+    encoder.dispatch_threads(MTL::Size(x.size(), 1, 1), MTL::Size(256, 1, 1));
+    encoder.end_encoding();
+    auto *producer = encoder.get_command_buffer();
+    producer->retain();
+    AneLinearModel::Ticket ticket{};
+    try {
+      ticket = model_->begin(producer);
+    } catch (...) {
+      producer->release();
+      throw;
+    }
+    AneDispatchGuard guard(producer, model_, ticket);
+    encoder.commit();
+    producer->waitUntilCompleted();
+    if (pack_buffer_failed(producer)) {
+      throw std::runtime_error(pack_buffer_error(producer));
+    }
+    producer->release();
+    guard.producer_released();
+    const uint64_t ready = profiling ? profile_now_ns() : 0;
+    std::thread([model = model_, ticket] { model->execute(ticket); }).detach();
+    guard.disarm();
+    model_->wait(ticket);
+    if (profiling) {
+      profile_add(0, kPackNs, ready - start);
+      profile_add(0, kAne0EvalNs, profile_now_ns() - ready);
+    }
+
+    encoder.set_compute_pipeline_state(copy);
+    encoder.set_buffer(model_->output_buffer(), 0);
+    encoder.set_output_array(output, 1);
+    encoder.dispatch_threads(MTL::Size(output.size(), 1, 1), MTL::Size(256, 1, 1));
+    // As in Qwen, force MLX onto its post-commit path after the input commit.
+    auto commit_guard = device.get_kernel("qwen35_ane_commit_guard", library);
+    encoder.set_compute_pipeline_state(commit_guard);
+    while (!encoder.needs_commit()) {
+      encoder.dispatch_threads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+    }
   }
   DEFINE_NAME(K2AnePlanarPrimitive);
   bool is_equivalent(const Primitive &other) const override {
@@ -1662,8 +1680,14 @@ array ane_planar(const array &x, const std::shared_ptr<AneLinearModel> &model) {
     throw std::invalid_argument("ANE planar I/O requires contiguous FP16 [channels, tile] input");
   }
   if (model->has_error()) throw std::runtime_error("ANE program has a prior execution failure");
+  // A host wait inside eval_gpu cannot advance lazy producers on other streams.
+  // Serving already evaluates packing before submitting the GPU MLP suffix.
+  array input = x;
+  input.eval();
+  // Keep transfers independent of the already-submitted GPU MLP suffix.
+  static const auto transfer_stream = new_thread_unsafe_stream(Device::gpu);
   return array({model->output_dim(), model->sequence_length()}, float16,
-      std::make_shared<K2AnePlanarPrimitive>(to_stream(Device::cpu), model), {x});
+      std::make_shared<K2AnePlanarPrimitive>(transfer_stream, model), {input});
 }
 
 std::shared_ptr<AneLinearModel> ane_compile_program(

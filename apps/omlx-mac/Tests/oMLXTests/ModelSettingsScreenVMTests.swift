@@ -248,14 +248,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testMovaAneRecommendationUsesSharedProfileFields() throws {
         let vm = ModelSettingsScreenVM()
         vm.model = makeModel(id: "mova", configModelType: "k2_horizon")
-        let data = Data(#"{"tuning_id":"k2","model_id":"mova","status":"completed","phase":"completed","message":"Done","current":1,"total":1,"results":[],"comparison":[{"id":"concurrent","unit":"tok/s","gpu":100,"ane":110,"gpu_ttft_ms":1250,"ane_ttft_ms":1000},{"id":"cached","unit":"tok/s","gpu":null,"ane":null,"unavailable":"cache_disabled"}],"recommendation":{"backend":"k2","reason":"recommended","comparison_label":"Dense 33%, shared 100%","enabled":true,"mlp_fraction":0.3333333333333333,"shared_fraction":1,"gdn_enabled":false,"processing_tps":100,"speedup_percent":4,"sequence_length":2048}}"#.utf8)
+        let data = Data(#"{"tuning_id":"k2","model_id":"mova","status":"completed","phase":"completed","message":"Done","current":1,"total":1,"results":[],"recommendation":{"backend":"k2","enabled":true,"mlp_fraction":0.3333333333333333,"shared_fraction":1,"gdn_enabled":false,"processing_tps":100,"speedup_percent":4,"sequence_length":2048}}"#.utf8)
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         vm.aneTuningStatus = try decoder.decode(ANETuningStatusResponse.self, from: data)
-        XCTAssertEqual(vm.aneTuningStatus?.recommendation?.reason, "recommended")
-        XCTAssertEqual(vm.aneTuningStatus?.comparison?.first?.gpuTtftMs, 1250)
-        XCTAssertEqual(vm.aneTuningStatus?.comparison?.last?.unavailable, "cache_disabled")
-        XCTAssertNil(vm.aneTuningStatus?.comparison?.last?.gpu)
+        XCTAssertEqual(vm.aneTuningStatus?.recommendation?.processingTps, 100)
+        XCTAssertEqual(vm.aneTuningStatus?.recommendation?.speedupPercent, 4)
         vm.applyANETuningRecommendation()
         XCTAssertTrue(vm.thinkingForced)
         XCTAssertTrue(vm.qwen35AnePrefillEnabled)

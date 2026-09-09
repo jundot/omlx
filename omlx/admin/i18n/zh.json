@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "K2 ANE 提示处理",
   "modal.model_settings.k2_ane_hint": "使用 ANE 处理 K2 提示，包括 MoVA。解码仍由 GPU 执行。使用 Apple 私有接口，输出可能不同。",
   "modal.model_settings.k2_ane_shared": "ANE 上的共享 MLP",
-  "modal.model_settings.k2_ane_tune_hint": "可选测试：提示词、8 个请求和缓存复用。目标用时约三分钟；加载或清理可能需要更久。无需测试即可启用 ANE。",
+  "modal.model_settings.k2_ane_tune_hint": "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1135,18 +1135,5 @@
   "js.success.download_started": "已开始下载：{repo_id}",
   "js.success.settings_saved": "设置已成功保存",
   "settings.mcp.expose_tools": "向客户端公开后端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。",
-  "modal.model_settings.ane_eval_recommended": "建议使用 ANE。这些测试显示了稳定的提升。",
-  "modal.model_settings.ane_eval_slower": "保持 ANE 关闭。一项或多项工作负载变慢。",
-  "modal.model_settings.ane_eval_latency": "保持 ANE 关闭。部分请求的首个 token 等待时间增加。",
-  "modal.model_settings.ane_eval_no_clear_gain": "保持 ANE 关闭。测试未发现明显且稳定的提升。",
-  "modal.model_settings.ane_eval_long_prompt": "长提示词 · 首个 token",
-  "modal.model_settings.ane_eval_short_prompt": "短提示词 · 首个 token",
-  "modal.model_settings.ane_eval_concurrent": "8 个请求 · 总吞吐量",
-  "modal.model_settings.ane_eval_staggered": "解码期间加入 · 总吞吐量",
-  "modal.model_settings.ane_eval_cached": "8 个缓存请求 · 总吞吐量",
-  "modal.model_settings.ane_eval_first_token": "首个 token",
-  "modal.model_settings.ane_eval_cache_disabled": "缓存已关闭",
-  "modal.model_settings.ane_eval_not_tested": "未测试",
-  "modal.model_settings.ane_eval_details": "分配详情"
+  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。"
 }

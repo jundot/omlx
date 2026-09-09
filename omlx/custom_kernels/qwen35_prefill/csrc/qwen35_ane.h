@@ -29,8 +29,6 @@ public:
   int sequence_length() const;
   MTL::Buffer *input_buffer() const;
   MTL::Buffer *output_buffer() const;
-  void *input_host_data() const;
-  void *output_host_data() const;
 
   struct Ticket {
     uint64_t ready;

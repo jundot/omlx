@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "Обработка запросов K2 на ANE",
   "modal.model_settings.k2_ane_hint": "Использует ANE для обработки запросов K2, включая MoVA. Декодирование остаётся на GPU. Используются закрытые интерфейсы Apple; результаты могут отличаться.",
   "modal.model_settings.k2_ane_shared": "Общий MLP на ANE",
-  "modal.model_settings.k2_ane_tune_hint": "Необязательный тест промптов, восьми запросов и кеша. Около трёх минут; загрузка или очистка может занять больше времени. ANE можно включить без теста.",
+  "modal.model_settings.k2_ane_tune_hint": "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1135,18 +1135,5 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
-  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы.",
-  "modal.model_settings.ane_eval_recommended": "Используйте ANE. Эти тесты показали стабильный выигрыш.",
-  "modal.model_settings.ane_eval_slower": "Оставьте ANE выключенным. Одна или несколько нагрузок замедлились.",
-  "modal.model_settings.ane_eval_latency": "Оставьте ANE выключенным. Некоторые запросы дольше ожидали первый токен.",
-  "modal.model_settings.ane_eval_no_clear_gain": "Оставьте ANE выключенным. Тесты не выявили явного стабильного выигрыша.",
-  "modal.model_settings.ane_eval_long_prompt": "Длинный промпт · первый токен",
-  "modal.model_settings.ane_eval_short_prompt": "Короткий промпт · первый токен",
-  "modal.model_settings.ane_eval_concurrent": "8 запросов · общая скорость",
-  "modal.model_settings.ane_eval_staggered": "Добавление при декодировании · общая скорость",
-  "modal.model_settings.ane_eval_cached": "8 запросов из кеша · общая скорость",
-  "modal.model_settings.ane_eval_first_token": "Первый токен",
-  "modal.model_settings.ane_eval_cache_disabled": "Кеш выключен",
-  "modal.model_settings.ane_eval_not_tested": "Не проверено",
-  "modal.model_settings.ane_eval_details": "Параметры распределения"
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
 }

@@ -1016,31 +1016,7 @@
                                                class="text-xs"
                                                x-text="aneTuning.status?.termination_reason"></p>
 
-                                            <div x-show="aneTuningForSelectedModel() && aneTuning.status?.comparison?.length"
-                                                 x-cloak class="overflow-hidden rounded-lg border border-neutral-200 bg-white">
-                                                <div class="grid grid-cols-[minmax(0,1fr)_7rem_7rem] gap-3 px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-50">
-                                                    <span>{{ t('modal.model_settings.qwen_ane_tune_test') }}</span>
-                                                    <span class="text-right">GPU</span>
-                                                    <span class="text-right">GPU + ANE</span>
-                                                </div>
-                                                <template x-for="result in aneTuning.status?.comparison || []" :key="result.id">
-                                                    <div class="grid grid-cols-[minmax(0,1fr)_7rem_7rem] gap-3 px-3 py-2 text-xs border-t border-neutral-100">
-                                                        <span class="text-neutral-600" x-text="aneComparisonLabel(result)"></span>
-                                                        <template x-for="device in ['gpu', 'ane']" :key="device">
-                                                            <div class="text-right tabular-nums text-neutral-800">
-                                                                <span x-text="aneComparisonValue(result, device)"></span>
-                                                                <span class="block text-[10px] text-neutral-500" x-text="aneComparisonLatency(result, device)"></span>
-                                                            </div>
-                                                        </template>
-                                                    </div>
-                                                </template>
-                                                <details class="border-t border-neutral-200 px-3 py-2">
-                                                    <summary class="cursor-pointer text-xs text-neutral-600">{{ t('modal.model_settings.ane_eval_details') }}</summary>
-                                                    <p class="my-2 text-xs text-neutral-500" x-text="aneTuning.status?.recommendation?.comparison_label"></p>
-                                                    {{ ane_candidate_results() }}
-                                                </details>
-                                            </div>
-                                            <div x-show="aneTuningForSelectedModel() && !aneTuning.status?.comparison?.length && aneTuning.status?.results?.length" x-cloak>
+                                            <div x-show="aneTuningForSelectedModel() && aneTuning.status?.results?.length" x-cloak>
                                                 {{ ane_candidate_results() }}
                                             </div>
                                             <p x-show="aneTuningForSelectedModel() && aneTuning.error"

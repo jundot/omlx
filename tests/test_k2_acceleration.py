@@ -109,7 +109,7 @@ def test_mova_prefill_preserves_routes_and_gpu_decode():
         with mx.stream(mx.new_stream(mx.gpu)):
             prefill(ids, cache=cache)
         ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
-        assert ops == 4
+        assert ops == 2
         assert all(c.offset == 39 for c in cache)
         actual = model(mx.array([[43]]), cache=cache)
         mx.eval(actual)
@@ -150,7 +150,7 @@ def test_family_partitions_use_checkpoint_dimensions():
 
 @pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
 @pytest.mark.parametrize("chunked", [False, True])
-@pytest.mark.parametrize("prefix", [0, 16])
+@pytest.mark.parametrize("prefix", [0, 16, 48])
 def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, prefix):
     from omlx.custom_kernels.qwen35_prefill import fast
     from omlx.request import Request, SamplingParams
@@ -211,10 +211,130 @@ def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, pref
         assert last == prompt[-1:]
         assert all(c.offset == 64 for c in cache)
         ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
-        assert ops == 4
+        assert ops == 2 * ((64 - prefix) // 32)
         logits = model(mx.array([last]), cache=cache)
         assert mx.all(mx.isfinite(logits)).item()
         assert all(c.offset == 65 for c in cache)
         assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == ops
     finally:
         fast.qwen35_ane_profile_set_enabled(False)
+
+
+@pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
+@pytest.mark.parametrize("prefix", [0, 32])
+def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
+    mock_tokenizer, monkeypatch, prefix
+):
+    from mlx_lm.generate import BatchGenerator, GenerationBatch
+    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    model = make_model()
+    enable_ane_prefill(model, fraction=0.5, width=32)
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=32, paged_cache_block_size=0),
+    )
+    prompts = [[(i + j) % 100 for j in range(40)] for i in range(8)]
+    peak = 0
+    step = GenerationBatch._step
+
+    def observe(batch):
+        nonlocal peak
+        peak = max(peak, len(batch))
+        return step(batch)
+
+    monkeypatch.setattr(GenerationBatch, "_step", observe)
+    batch = BatchGenerator(
+        model,
+        max_tokens=16,
+        completion_batch_size=8,
+        prefill_batch_size=1,
+        sampler=lambda x: mx.argmax(x, axis=-1),
+        stream=scheduler._stream,
+    )
+    scheduler.batch_generator = batch
+    received = {i: [] for i in range(8)}
+    completed = set()
+
+    def insert(index):
+        prompt = prompts[index]
+        cache = make_prompt_cache(model)
+        if prefix:
+            model._omlx_prefill(mx.array([prompt[:prefix]]), cache=cache)
+            cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
+        request = Request(
+            request_id=str(index), prompt=prompt, sampling_params=SamplingParams()
+        )
+        request.prompt_token_ids, request.num_prompt_tokens = prompt, len(prompt)
+        request.cached_tokens = prefix
+        before = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        cache, last = scheduler._do_external_prefill(request, prompt[prefix:], cache)
+        after = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        assert after - before == (0 if prefix else model._omlx_k2_ane_prefill_count)
+        return batch.insert([last], caches=[cache], all_tokens=[prompt[:-1]])[0]
+
+    fast.qwen35_ane_profile_set_enabled(True)
+    fast.qwen35_ane_profile_reset()
+    try:
+        with mx.stream(scheduler._stream):
+            assert insert(0) == 0
+            joined = removed = False
+            for _ in range(50):
+                before = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+                responses = batch.next_generated()
+                assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == before
+                for response in responses:
+                    received[response.uid].append(response.token)
+                    if response.prompt_cache is not None:
+                        tokens = prompts[response.uid] + received[response.uid]
+                        assert all(
+                            c.offset == len(tokens) for c in response.prompt_cache
+                        )
+                        actual = model(mx.array([[19]]), cache=response.prompt_cache)[
+                            :, -1
+                        ]
+                        expected = model(mx.array([tokens + [19]]))[:, -1]
+                        close(expected, actual)
+                        completed.add(response.uid)
+                if not joined:
+                    for i in range(1, 8):
+                        assert insert(i) == i
+                    joined = True
+                if peak == 8 and not removed:
+                    # Cancelling one active row must leave the other seven caches usable.
+                    batch.remove([7])
+                    removed = True
+                if len(completed) == 7:
+                    break
+            assert peak == 8 and removed and completed == set(range(7))
+    finally:
+        fast.qwen35_ane_profile_set_enabled(False)
+        scheduler.shutdown()
+
+
+@pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
+def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams():
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    model = make_model()
+    model.set_dtype(mx.float16)
+    ref = model.layers[0].mlp
+    split = PrefillMLP(ref, cut=model.args.intermediate_size, width=32)
+    expected, actual = [], []
+    for i in range(8):
+        with mx.stream(mx.new_stream(mx.gpu)):
+            x = mx.random.normal((32, 64)).astype(mx.float16) + i / 8
+            planar = mx.contiguous(
+                mx.concatenate([x, mx.ones((32, 1), dtype=mx.float16)], axis=-1).T
+            )
+            expected.append(ref(x[None])[0].T)
+            actual.append(fast._ext.ane_planar(planar, split.program))
+    # The graph must retain the program and each output across surface reuse.
+    del split, ref, model
+    gc.collect()
+    mx.eval(expected, actual)
+    for reference, result in zip(expected, actual):
+        close(reference, result)

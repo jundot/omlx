@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "K2 ANE Prompt Processing",
   "modal.model_settings.k2_ane_hint": "Use ANE for K2 prompt processing, including MoVA. Decode stays on GPU. ANE uses private Apple interfaces. Outputs may differ.",
   "modal.model_settings.k2_ane_shared": "Shared MLP on ANE",
-  "modal.model_settings.k2_ane_tune_hint": "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing.",
+  "modal.model_settings.k2_ane_tune_hint": "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1135,18 +1135,5 @@
   "js.success.download_started": "Download started: {repo_id}",
   "js.success.settings_saved": "Settings saved successfully",
   "settings.mcp.expose_tools": "Expose backend MCP tools to clients",
-  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers.",
-  "modal.model_settings.ane_eval_recommended": "Use ANE. These tests found a stable gain.",
-  "modal.model_settings.ane_eval_slower": "Keep ANE off. It slowed one or more workloads.",
-  "modal.model_settings.ane_eval_latency": "Keep ANE off. Some requests waited longer for the first token.",
-  "modal.model_settings.ane_eval_no_clear_gain": "Keep ANE off. These tests found no clear, stable gain.",
-  "modal.model_settings.ane_eval_long_prompt": "Long prompt · first token",
-  "modal.model_settings.ane_eval_short_prompt": "Short prompt · first token",
-  "modal.model_settings.ane_eval_concurrent": "8 requests · total throughput",
-  "modal.model_settings.ane_eval_staggered": "Join during decode · total throughput",
-  "modal.model_settings.ane_eval_cached": "8 cached requests · total throughput",
-  "modal.model_settings.ane_eval_first_token": "First token",
-  "modal.model_settings.ane_eval_cache_disabled": "Cache off",
-  "modal.model_settings.ane_eval_not_tested": "Not tested",
-  "modal.model_settings.ane_eval_details": "Split details"
+  "settings.mcp.expose_tools_hint": "Merge backend MCP tools into chat completions. Disable if your client has its own MCP servers."
 }

@@ -335,10 +335,10 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         if inputs.shape[0] != 1:
             raise ValueError("K2 ANE prefill requires one prompt per forward")
         try:
-            for program in programs:
-                program.active = True
             for start in range(0, inputs.shape[1], width):
                 chunk = inputs[:, start : start + width]
+                for program in programs:
+                    program.active = chunk.shape[1] == width
                 target(chunk, cache=cache)
                 mx.eval([c.state for c in cache])
         finally:
@@ -347,7 +347,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
 
     model._omlx_prefill = prefill
     model._omlx_k2_ane_signature = (
-        f"k2-ane-v1-{fraction:.17g}-{shared_fraction:.17g}-{width}"
+        f"k2-ane-v2-{fraction:.17g}-{shared_fraction:.17g}-{width}"
     )
     model._omlx_k2_ane_prefill_count = len(programs)
     return prefill

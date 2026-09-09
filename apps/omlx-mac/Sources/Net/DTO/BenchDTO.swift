@@ -267,8 +267,6 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
 struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     var backend: String? = nil
     var sharedFraction: Double? = nil
-    var reason: String? = nil
-    var comparisonLabel: String? = nil
     let enabled: Bool
     let mlpFraction: Double?
     let gdnEnabled: Bool
@@ -288,18 +286,7 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let tailPaddingMinTokens: Int?
 }
 
-struct ANETuningComparisonDTO: Codable, Equatable, Identifiable, Sendable {
-    let id: String
-    let unit: String
-    let gpu: Double?
-    let ane: Double?
-    let gpuTtftMs: Double?
-    let aneTtftMs: Double?
-    let unavailable: String?
-}
-
 struct ANETuningStatusResponse: Codable, Sendable {
-    var comparison: [ANETuningComparisonDTO]? = nil
     let tuningId: String
     let modelId: String
     let status: String

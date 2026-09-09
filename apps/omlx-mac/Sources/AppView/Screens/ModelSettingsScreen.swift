@@ -1177,7 +1177,7 @@ private struct ExperimentalSection: View {
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: (vm.model?.anePrefillBackend == "k2") ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                    sublabel: (vm.model?.anePrefillBackend == "k2") ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
@@ -1254,19 +1254,7 @@ private struct ExperimentalSection: View {
                                     .multilineTextAlignment(.trailing)
                             }
 
-                            if let rows = status.comparison, !rows.isEmpty {
-                                aneComparison(rows)
-                                DisclosureGroup(String(localized: "settings.experimental.ane_eval.details", defaultValue: "Split details")) {
-                                    if let label = status.recommendation?.comparisonLabel {
-                                        Text(label)
-                                            .font(.omlxText(10))
-                                            .foregroundStyle(theme.textSecondary)
-                                    }
-                                    aneCandidateResults(status)
-                                }
-                                .font(.omlxText(10))
-                                .frame(width: 320)
-                            } else if !status.results.isEmpty {
+                            if !status.results.isEmpty {
                                 aneCandidateResults(status)
                             }
                         }
@@ -1796,69 +1784,9 @@ private struct ExperimentalSection: View {
         .frame(width: 285)
     }
 
-    private func aneComparison(_ rows: [ANETuningComparisonDTO]) -> some View {
-        Grid(alignment: .trailing, horizontalSpacing: 8, verticalSpacing: 6) {
-            GridRow {
-                Text("Test").gridColumnAlignment(.leading)
-                Text("GPU")
-                Text("GPU + ANE")
-            }
-            .font(.omlxText(9, weight: .semibold))
-            Divider()
-            ForEach(rows) { row in
-                GridRow {
-                    Text(aneComparisonLabel(row.id))
-                        .fixedSize(horizontal: false, vertical: true)
-                    aneComparisonValue(row.gpu, ttft: row.gpuTtftMs, row: row)
-                    aneComparisonValue(row.ane, ttft: row.aneTtftMs, row: row)
-                }
-            }
-        }
-        .font(.omlxText(10))
-        .foregroundStyle(theme.textSecondary)
-        .frame(width: 320)
-    }
-
-    private func aneComparisonLabel(_ id: String) -> String {
-        switch id {
-        case "long_prompt": return String(localized: "settings.experimental.ane_eval.long_prompt", defaultValue: "Long prompt · first token")
-        case "short_prompt": return String(localized: "settings.experimental.ane_eval.short_prompt", defaultValue: "Short prompt · first token")
-        case "concurrent": return String(localized: "settings.experimental.ane_eval.concurrent", defaultValue: "8 requests · total throughput")
-        case "staggered": return String(localized: "settings.experimental.ane_eval.staggered", defaultValue: "Join during decode · total throughput")
-        case "cached": return String(localized: "settings.experimental.ane_eval.cached", defaultValue: "8 cached requests · total throughput")
-        default: return id
-        }
-    }
-
-    private func aneComparisonValue(_ value: Double?, ttft: Double?, row: ANETuningComparisonDTO) -> some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            if let value {
-                Text(row.unit == "ms" ? String(format: "%.2f s", value / 1000) : String(format: "%.1f tok/s", value))
-                    .foregroundStyle(theme.text)
-                if row.unit != "ms", let ttft {
-                    Text(String(localized: "settings.experimental.ane_eval.first_token", defaultValue: "First token") + String(format: ": %.2f s", ttft / 1000))
-                        .font(.omlxText(9))
-                }
-            } else {
-                Text(row.unavailable == "cache_disabled"
-                     ? String(localized: "settings.experimental.ane_eval.cache_disabled", defaultValue: "Cache off")
-                     : String(localized: "settings.experimental.ane_eval.not_tested", defaultValue: "Not tested"))
-            }
-        }
-        .monospacedDigit()
-    }
-
     private func aneRecommendationText(
         _ recommendation: ANETuningRecommendationDTO
     ) -> String {
-        if recommendation.backend == "k2", let reason = recommendation.reason {
-            switch reason {
-            case "recommended": return String(localized: "settings.experimental.ane_eval.recommended", defaultValue: "Use ANE. These tests found a stable gain.")
-            case "slower": return String(localized: "settings.experimental.ane_eval.slower", defaultValue: "Keep ANE off. It slowed one or more workloads.")
-            case "latency": return String(localized: "settings.experimental.ane_eval.latency", defaultValue: "Keep ANE off. Some requests waited longer for the first token.")
-            default: return String(localized: "settings.experimental.ane_eval.no_clear_gain", defaultValue: "Keep ANE off. These tests found no clear, stable gain.")
-            }
-        }
         if !recommendation.enabled {
             guard let tps = recommendation.processingTps else {
                 return "GPU-only recommended"

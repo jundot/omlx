@@ -630,7 +630,7 @@
   "modal.model_settings.k2_ane": "Procesamiento de prompts K2 con ANE",
   "modal.model_settings.k2_ane_hint": "Usa ANE para procesar prompts K2 BF16, incluido MoVA. La decodificación permanece en la GPU. Usa interfaces privadas de Apple; los resultados pueden variar.",
   "modal.model_settings.k2_ane_shared": "MLP compartido en ANE",
-  "modal.model_settings.k2_ane_tune_hint": "Prueba opcional de prompts, ocho solicitudes y reutilización de caché. Dura unos tres minutos; la carga o limpieza puede tardar más. Puede activar ANE sin hacer la prueba.",
+  "modal.model_settings.k2_ane_tune_hint": "Ajuste opcional para prompts largos con pesos MLP de ocho bits o menos. Los resultados no predicen el rendimiento por lotes. Unos tres minutos; la carga y limpieza pueden tardar más. Puede activar ANE sin hacer la prueba.",
   "modal.model_settings.qwen_ane": "Qwen ANE Prompt Processing",
   "modal.model_settings.qwen_ane_hint": "Split eligible Qwen 3.5/3.6/3.8 prompt-processing work across both ANEs and the GPU. This uses private Apple runtime interfaces and applies after the model reloads.",
   "modal.model_settings.qwen_ane_prompt_block": "Prompt block",
@@ -1135,18 +1135,5 @@
   "js.success.download_started": "Descarga iniciada: {repo_id}",
   "js.success.settings_saved": "Configuración guardada correctamente",
   "settings.mcp.expose_tools": "Exponer herramientas MCP del backend a los clientes",
-  "settings.mcp.expose_tools_hint": "Combina las herramientas MCP del backend en las respuestas. Desactívalo si tu cliente tiene sus propios servidores MCP.",
-  "modal.model_settings.ane_eval_recommended": "Use ANE. Estas pruebas mostraron una mejora estable.",
-  "modal.model_settings.ane_eval_slower": "Mantenga ANE desactivado. Ralentizó una o más cargas.",
-  "modal.model_settings.ane_eval_latency": "Mantenga ANE desactivado. Algunas solicitudes esperaron más al primer token.",
-  "modal.model_settings.ane_eval_no_clear_gain": "Mantenga ANE desactivado. No se encontró una mejora clara y estable.",
-  "modal.model_settings.ane_eval_long_prompt": "Prompt largo · primer token",
-  "modal.model_settings.ane_eval_short_prompt": "Prompt corto · primer token",
-  "modal.model_settings.ane_eval_concurrent": "8 solicitudes · rendimiento total",
-  "modal.model_settings.ane_eval_staggered": "Llegadas durante decodificación · rendimiento total",
-  "modal.model_settings.ane_eval_cached": "8 solicitudes en caché · rendimiento total",
-  "modal.model_settings.ane_eval_first_token": "Primer token",
-  "modal.model_settings.ane_eval_cache_disabled": "Caché desactivada",
-  "modal.model_settings.ane_eval_not_tested": "No probado",
-  "modal.model_settings.ane_eval_details": "Detalles del reparto"
+  "settings.mcp.expose_tools_hint": "Combina las herramientas MCP del backend en las respuestas. Desactívalo si tu cliente tiene sus propios servidores MCP."
 }
