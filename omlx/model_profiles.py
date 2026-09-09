@@ -106,6 +106,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "qwen4_ple_ssd_offload",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # LoRA adapter path is a model-specific filesystem path, not a profile tunable.
+        "adapter_path",
     }
 )
 
