@@ -497,15 +497,12 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
-    # If the model was chosen interactively (no --model and no explicit tier flags),
-    # use the picked model for all tiers instead of letting settings-based tier
-    # models override the user's selection.
-    if args.model is None and not (
-        cli_opus_model or cli_sonnet_model or cli_haiku_model
-    ):
-        opus_model = None
-        sonnet_model = None
-        haiku_model = None
+    # Tier precedence: explicit tier flag > saved claude_code tier setting >
+    # the model picked (or auto-selected) above. The picker only chooses the
+    # default model; tiers configured on the Claude Code settings page keep
+    # their role, otherwise the three persisted selections would be silently
+    # replaced by one model on every interactive launch (#3543). Roles without
+    # a saved model fall back to the picked model in the integration.
 
     # Enforce Claude Code's model requirements after all interactive,
     # automatic, and explicit model paths have resolved. The picker also marks
