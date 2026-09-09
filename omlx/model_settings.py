@@ -480,7 +480,7 @@ class ModelSettings:
             )
         if self.uno_enabled:
             if not self.uno_adapter_model:
-                raise ValueError("Enable Uno requires an adapter selection.")
+                raise ValueError("Select a Uno adapter before enabling Uno.")
             for name in (
                 "mtp_enabled",
                 "vlm_mtp_enabled",

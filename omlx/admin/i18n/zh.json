@@ -730,7 +730,7 @@
   "modal.model_settings.uno": "启用 Uno",
   "modal.model_settings.uno_hint": "单个请求使用 Uno。请求重叠时使用常规连续批处理。",
   "modal.model_settings.uno_missing": "没有兼容的本地 Uno 适配器。",
-  "modal.model_settings.uno_conflict": "请禁用其他解码加速功能、语法约束和思考 Token 限制，并清除 Min P 和惩罚设置。",
+  "modal.model_settings.uno_conflict": "请禁用其他解码加速功能、引导语法和思考 Token 限制。将 Min P 和存在惩罚设为 0。将重复惩罚设为 1.0。",
   "modal.model_settings.uno_adapter": "Uno 适配器",
   "modal.model_settings.uno_select": "选择适配器",
   "modal.model_settings.vlm_mtp": "VLM MTP",

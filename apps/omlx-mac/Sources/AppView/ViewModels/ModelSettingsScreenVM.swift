@@ -334,9 +334,10 @@ final class ModelSettingsScreenVM {
     var dflashSsdCache: Bool = false
     var dflashSsdCacheGib: String = "20"
 
-    // Experimental: native MTP
     var unoEnabled: Bool = false
     var unoAdapterModel: String = ""
+
+    // Experimental: native MTP
     var mtpEnabled: Bool = false
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
@@ -418,7 +419,7 @@ final class ModelSettingsScreenVM {
             || model?.settings?.guidedGrammarEnabled == true
             || penalties.contains(where: { !$0.0.isEmpty && Double($0.0) != $0.1 }) {
             return String(localized: "settings.uno.conflict",
-                          defaultValue: "Disable other decode accelerators, grammar constraints and thinking budgets. Clear Min P and penalty settings.")
+                          defaultValue: "Disable other decode accelerators, Guided Grammar, and Thinking Budget. Set Min P and Presence Penalty to 0. Set Repetition Penalty to 1.0.")
         }
         return nil
     }

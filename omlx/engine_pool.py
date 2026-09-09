@@ -2853,7 +2853,7 @@ class EnginePool:
         try:
             effective_type = entry.engine_type
             if entry.config_model_type == "k2_horizon_uno":
-                raise ValueError("Select a compatible K2 base and enable Uno in its settings.")
+                raise ValueError("Select a compatible K2 base. Enable Uno in its settings.")
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")

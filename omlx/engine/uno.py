@@ -116,9 +116,7 @@ class UnoEngine(BatchedEngine):
                         "Uno requires repetition_penalty=1.0. "
                         "Check request, model, and global sampling settings."
                     )
-                raise InvalidRequestError(
-                    f"Uno does not yet support {name}; its p/q sampler must implement the same transform"
-                )
+                raise InvalidRequestError(f"Uno requires {name}={default}.")
         accepted = {
             "seed",
             "tools",

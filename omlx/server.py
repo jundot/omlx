@@ -4519,8 +4519,8 @@ def _reject_diffusion_structured_outputs(
             or format_type not in (None, "text")
         ):
             raise InvalidRequestError(
-                "Uno does not yet support grammar-constrained output; both proposal "
-                "and verification distributions need the same grammar constraints.",
+                "Uno does not support structured output or custom grammars. "
+                "Native K2 tool constraints remain available.",
                 field="response_format",
             )
         return

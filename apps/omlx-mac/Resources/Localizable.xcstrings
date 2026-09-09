@@ -24149,37 +24149,37 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Disable other decode accelerators, grammar constraints and thinking budgets. Clear Min P and penalty settings."
+            "value": "Disable other decode accelerators, Guided Grammar, and Thinking Budget. Set Min P and Presence Penalty to 0. Set Repetition Penalty to 1.0."
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "他のデコード高速化機能、文法制約、Thinking Budgetを無効にしてください。Min P とペナルティの設定をクリアしてください。"
+            "value": "他のデコード高速化機能、ガイド付き文法、思考トークン制限を無効にしてください。Min P と存在ペナルティを 0 に設定してください。繰り返しペナルティを 1.0 に設定してください。"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "다른 디코딩 가속 기능, 문법 제약 및 Thinking Budget을 비활성화하세요. Min P와 페널티 설정을 지우세요."
+            "value": "다른 디코딩 가속 기능, 가이드 문법 및 Thinking 토큰 제한을 비활성화하세요. Min P와 존재 페널티를 0으로 설정하세요. 반복 페널티를 1.0으로 설정하세요."
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Отключите другие ускорители декодирования, грамматические ограничения и бюджет thinking. Очистите настройки Min P и штрафов."
+            "value": "Отключите другие ускорители декодирования, управляемую грамматику и бюджет мышления. Установите Min P и штраф за присутствие в 0. Установите штраф за повторение в 1.0."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "请禁用其他解码加速功能、语法约束和思考预算，并清除 Min P 和惩罚设置。"
+            "value": "请禁用其他解码加速功能、引导语法和思考 Token 限制。将 Min P 和存在惩罚设为 0。将重复惩罚设为 1.0。"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "請停用其他解碼加速功能、文法限制和Thinking Budget，並清除 Min P 和懲罰設定。"
+            "value": "請停用其他解碼加速功能、引導文法和思考 Token 限制。將 Min P 和存在懲罰設為 0。將重複懲罰設為 1.0。"
           }
         }
       }

@@ -730,7 +730,7 @@
   "modal.model_settings.uno": "Включить Uno",
   "modal.model_settings.uno_hint": "Для одного запроса используется Uno. При перекрытии запросов используется обычная непрерывная пакетная обработка.",
   "modal.model_settings.uno_missing": "Нет совместимого локального адаптера Uno.",
-  "modal.model_settings.uno_conflict": "Отключите другие ускорители декодирования, грамматические ограничения и бюджет мышления. Очистите настройки Min P и штрафов.",
+  "modal.model_settings.uno_conflict": "Отключите другие ускорители декодирования, управляемую грамматику и бюджет мышления. Установите Min P и штраф за присутствие в 0. Установите штраф за повторение в 1.0.",
   "modal.model_settings.uno_adapter": "Адаптер Uno",
   "modal.model_settings.uno_select": "Выберите адаптер",
   "modal.model_settings.vlm_mtp": "VLM MTP",

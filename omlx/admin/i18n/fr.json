@@ -730,7 +730,7 @@
   "modal.model_settings.uno": "Activer Uno",
   "modal.model_settings.uno_hint": "Utilise Uno pour une requête. Les requêtes simultanées utilisent le traitement continu par lots habituel.",
   "modal.model_settings.uno_missing": "Aucun adaptateur Uno local compatible n’est disponible.",
-  "modal.model_settings.uno_conflict": "Désactivez les autres accélérateurs de décodage, les contraintes grammaticales et les budgets de réflexion. Effacez les paramètres Min P et les pénalités.",
+  "modal.model_settings.uno_conflict": "Désactivez les autres accélérateurs de décodage, la grammaire guidée et le budget de réflexion. Réglez Min P et la pénalité de présence sur 0. Réglez la pénalité de répétition sur 1.0.",
   "modal.model_settings.uno_adapter": "Adaptateur Uno",
   "modal.model_settings.uno_select": "Sélectionnez un adaptateur",
   "modal.model_settings.vlm_mtp": "VLM MTP",

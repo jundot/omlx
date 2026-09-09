@@ -730,7 +730,7 @@
   "modal.model_settings.uno": "Uno を有効にする",
   "modal.model_settings.uno_hint": "単一のリクエストには Uno を使用します。リクエストが重なると、通常の連続バッチ処理を使用します。",
   "modal.model_settings.uno_missing": "互換性のあるローカルの Uno アダプターがありません。",
-  "modal.model_settings.uno_conflict": "他のデコード高速化機能、文法制約、思考トークン制限を無効にしてください。Min P とペナルティの設定をクリアしてください。",
+  "modal.model_settings.uno_conflict": "他のデコード高速化機能、ガイド付き文法、思考トークン制限を無効にしてください。Min P と存在ペナルティを 0 に設定してください。繰り返しペナルティを 1.0 に設定してください。",
   "modal.model_settings.uno_adapter": "Uno アダプター",
   "modal.model_settings.uno_select": "アダプターを選択",
   "modal.model_settings.vlm_mtp": "VLM MTP",

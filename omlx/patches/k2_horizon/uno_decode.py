@@ -44,7 +44,7 @@ class UnoCycle:
 
 
 class UnoDecoder:
-    """Generate committed blocks; callers never observe rejected draft tokens."""
+    """Generate committed blocks. Callers never observe rejected draft tokens."""
 
     def __init__(
         self,

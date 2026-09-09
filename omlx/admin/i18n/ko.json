@@ -730,7 +730,7 @@
   "modal.model_settings.uno": "Uno 활성화",
   "modal.model_settings.uno_hint": "요청이 하나일 때 Uno를 사용합니다. 요청이 겹치면 일반 연속 배치 처리를 사용합니다.",
   "modal.model_settings.uno_missing": "호환되는 로컬 Uno 어댑터가 없습니다.",
-  "modal.model_settings.uno_conflict": "다른 디코딩 가속 기능, 문법 제약 및 Thinking 토큰 제한을 비활성화하세요. Min P와 페널티 설정을 지우세요.",
+  "modal.model_settings.uno_conflict": "다른 디코딩 가속 기능, 가이드 문법 및 Thinking 토큰 제한을 비활성화하세요. Min P와 존재 페널티를 0으로 설정하세요. 반복 페널티를 1.0으로 설정하세요.",
   "modal.model_settings.uno_adapter": "Uno 어댑터",
   "modal.model_settings.uno_select": "어댑터 선택",
   "modal.model_settings.vlm_mtp": "VLM MTP",
