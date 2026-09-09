@@ -934,6 +934,18 @@ class BlockAwarePrefixCache(CacheManager):
         tip_block_saved = False
 
         for i in range(num_new_blocks):
+            # Scheduler teardown closes SSD write admission before waiting for
+            # this worker. Stop before allocating/slicing another block; the
+            # save_block() guard handles the race after this check.
+            if getattr(self.paged_ssd_cache, "accepting_writes", True) is False:
+                logger.info(
+                    "Stopping prefix-cache persistence for %s at block %d/%d: "
+                    "SSD shutdown has begun",
+                    request_id,
+                    i,
+                    num_new_blocks,
+                )
+                break
             start_idx = i * self.block_size
             end_idx = min(start_idx + self.block_size, len(new_tokens))
             block_tokens = new_tokens[start_idx:end_idx]

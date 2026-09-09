@@ -14,6 +14,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import functools
 import gc
 import logging
 import os
@@ -1149,34 +1150,51 @@ class EngineCore:
             logger.debug(f"Engine {self._engine_id} released model ownership")
 
         self._closed = True
+        scheduler = self.scheduler
+        assert scheduler is not None
 
         # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
         # stream is bound to the engine's executor thread, so dispatch both
-        # through the executor; fall back to a direct call if the executor
-        # is already shut down.
-        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
-            fn_name = getattr(fn, "__name__", repr(fn))
+        # through the executor and never retry them on the close thread.
+        persistence_deadline = time.monotonic() + FATAL_TEARDOWN_TIMEOUT_S
+        shutdown_fn = functools.partial(
+            scheduler.shutdown,
+            persistence_deadline=persistence_deadline,
+        )
+        deep_reset_fn = functools.partial(
+            scheduler.deep_reset,
+            persistence_deadline=persistence_deadline,
+        )
+        mlx_executor = self._mlx_executor
+        assert mlx_executor is not None
+        for fn, fn_name in (
+            (shutdown_fn, "shutdown"),
+            (deep_reset_fn, "deep_reset"),
+        ):
             try:
-                self._mlx_executor.submit(fn).result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+                teardown_future = mlx_executor.submit(fn)
+            except RuntimeError:
+                # Scheduler and MLX teardown cannot safely move to the close
+                # thread merely because the executor rejected submission.
+                # A well-behaved executor only rejects submission once it is
+                # shutting down — exactly the state where teardown must still
+                # run before the engine is reported closed. Terminate so a
+                # supervisor restarts with a clean state instead of reporting a
+                # half-torn-down engine as closed.
+                fatal_exit(
+                    "Engine %s: could not dispatch %s to the MLX executor; "
+                    "teardown cannot proceed safely"
+                    % (self._engine_id, fn_name)
+                )
+            try:
+                teardown_future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
             except concurrent.futures.TimeoutError:
                 fatal_exit(
                     f"Engine teardown timed out after "
                     f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while running "
                     f"{fn_name} for engine {self._engine_id}"
                 )
-            except RuntimeError:
-                try:
-                    fn()
-                except RuntimeError:
-                    pass
-                except Exception:
-                    logger.warning(
-                        "Engine %s: %s raised during close() fallback",
-                        self._engine_id,
-                        getattr(fn, "__name__", fn),
-                        exc_info=True,
-                    )
             except Exception:
                 # A failing shutdown/deep_reset must not abort close(), or the
                 # SSD cache manager below stays open and its writer thread keeps
@@ -1198,12 +1216,24 @@ class EngineCore:
         manager = getattr(self.scheduler, "paged_ssd_cache_manager", None)
         if manager is not None:
             try:
-                manager.close()
+                manager.close(deadline=persistence_deadline)
             except Exception:
                 logger.warning(
                     "Engine %s: SSD cache manager close() failed during teardown",
                     self._engine_id,
                     exc_info=True,
+                )
+            # A surviving writer thread keeps the cache dir owned by the old
+            # manager while it drains. A replacement manager opened for the
+            # same cache dir would then corrupt committed blocks. Report the
+            # engine closed only if the writer is genuinely gone; otherwise
+            # terminate so a supervisor restarts with a clean state.
+            manager_writer = getattr(manager, "_writer_thread", None)
+            if manager_writer is not None and manager_writer.is_alive():
+                fatal_exit(
+                    "Engine %s: SSD cache writer thread survived close(); "
+                    "refusing to report a clean teardown for a restart-safe "
+                    "replacement." % self._engine_id
                 )
             self.scheduler.paged_ssd_cache_manager = None
         manager = None
