@@ -20,12 +20,24 @@ from .mathqa import MathQABenchmark
 from .mbpp import MBPPBenchmark
 from .mmlu import MMLUBenchmark
 from .mmlu_pro import MMLUProBenchmark
+from .hellaswag_uniform import HellaSwagUniformBenchmark
+from .mmlu_uniform import MMLUUniformBenchmark
+from .mmlu_pro_uniform import MMLUProUniformBenchmark
+from .cmmlu_uniform import CMMLUUniformBenchmark
+from .kmmlu_uniform import KMMLUUniformBenchmark
+from .jmmlu_uniform import JMMLUUniformBenchmark
 from .safetybench import SafetyBenchBenchmark
 from .truthfulqa import TruthfulQABenchmark
 from .winogrande import WinograndeBenchmark
 
 BENCHMARKS: dict[str, type[BaseBenchmark]] = {
+    "hellaswag_uniform": HellaSwagUniformBenchmark,
     "mmlu": MMLUBenchmark,
+    "mmlu_uniform": MMLUUniformBenchmark,
+    "mmlu_pro_uniform": MMLUProUniformBenchmark,
+    "cmmlu_uniform": CMMLUUniformBenchmark,
+    "kmmlu_uniform": KMMLUUniformBenchmark,
+    "jmmlu_uniform": JMMLUUniformBenchmark,
     "mmlu_pro": MMLUProBenchmark,
     "kmmlu": KMMLUBenchmark,
     "cmmlu": CMMLUBenchmark,
