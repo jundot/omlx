@@ -2,7 +2,6 @@
 """Opt-in ANE MLP prefill for dense and MoVA K2 models."""
 
 import math
-import re
 import struct
 import weakref
 
@@ -45,18 +44,14 @@ class _Blob:
         return result
 
 
-def _procedure(index, weight, width, blob):
+def _projection_statements(weight, width, blob, prefix, source="x"):
     out_dim, in_dim = weight.shape
     shape = f"[{out_dim}, {in_dim}, 1, 1]"
     offset = blob.add(weight)
     return "\n".join(
         [
-            f"  func procedure{index:03d}<ios18>(tensor<fp16, [1, {in_dim + 1}, 1, {width}]> input) {{",
-            f'    tensor<fp16, [1, {in_dim}, 1, {width}]> x = slice_by_size(x=input, begin=tensor<int32, [4]>([0,0,0,0]), size=tensor<int32, [4]>([1,{in_dim},1,{width}]))[name=string("slice_x")];',
-            f'    tensor<fp16, [1, 1, 1, {width}]> mask = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{in_dim},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("slice_mask")];',
-            f'    tensor<fp16, {shape}> w = const()[name=string("w"), val=tensor<fp16, {shape}>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64({offset})))];',
-            f'    tensor<fp16, [1, {out_dim}, 1, {width}]> y = conv(x=x, weight=w, strides=tensor<int32, [2]>([1,1]), pad_type=string("valid"), pad=tensor<int32, [4]>([0,0,0,0]), dilations=tensor<int32, [2]>([1,1]), groups=int32(1))[name=string("y")];',
-            "  } -> (y);",
+            f'    tensor<fp16, {shape}> {prefix}_w = const()[name=string("{prefix}_w"), val=tensor<fp16, {shape}>(BLOBFILE(path=string("@model_path/weights/weight.bin"), offset=uint64({offset})))];',
+            f'    tensor<fp16, [1, {out_dim}, 1, {width}]> {prefix}_y = conv(x={source}, weight={prefix}_w, strides=tensor<int32, [2]>([1,1]), pad_type=string("valid"), pad=tensor<int32, [4]>([0,0,0,0]), dilations=tensor<int32, [2]>([1,1]), groups=int32(1))[name=string("{prefix}_y")];',
         ]
     )
 
@@ -65,30 +60,14 @@ def _full_mlp_procedure(index, projections, width, blob):
     """Undo input scaling before SiLU; use separate down-input scaling."""
     dim = projections[0].shape[1]
     hidden = projections[0].shape[0]
-    first = _procedure(index, projections[0], width, blob).splitlines()
-    lines = first[:3]
-    lines[0] = lines[0].replace(f"{dim + 1},", f"{dim + 2},")
-    lines.append(
-        f'    tensor<fp16, [1, 1, 1, {width}]> input_scale = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim + 1},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("input_scale")];'
-    )
-
-    def body(projection, prefix, source="x", original=None):
-        raw = (
-            original
-            if original is not None
-            else _procedure(index, projection, width, blob).splitlines()
-        )
-        text = "\n".join(raw[3:-1])
-        text = re.sub(
-            r"\b(w|flat_w|wd|ws|dequant|a|b|base|low|masked|delta|scaled|y)\b",
-            lambda m: prefix + "_" + m[0],
-            text,
-        )
-        text = text.replace(prefix + "_y=", "y=").replace("x=x,", "x=" + source + ",")
-        return text
-
-    lines.append(body(projections[0], "g", original=first))
-    lines.append(body(projections[1], "u"))
+    lines = [
+        f"  func procedure{index:03d}<ios18>(tensor<fp16, [1, {dim + 2}, 1, {width}]> input) {{",
+        f'    tensor<fp16, [1, {dim}, 1, {width}]> x = slice_by_size(x=input, begin=tensor<int32, [4]>([0,0,0,0]), size=tensor<int32, [4]>([1,{dim},1,{width}]))[name=string("slice_x")];',
+        f'    tensor<fp16, [1, 1, 1, {width}]> mask = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("slice_mask")];',
+        f'    tensor<fp16, [1, 1, 1, {width}]> input_scale = slice_by_size(x=input, begin=tensor<int32, [4]>([0,{dim+1},0,0]), size=tensor<int32, [4]>([1,1,1,{width}]))[name=string("input_scale")];',
+    ]
+    lines.append(_projection_statements(projections[0], width, blob, "g"))
+    lines.append(_projection_statements(projections[1], width, blob, "u"))
     shape = f"[1, {hidden}, 1, {width}]"
     lines += [
         f'    tensor<fp16, {shape}> gate = real_div(x=g_y, y=input_scale)[name=string("gate")];',
@@ -108,7 +87,7 @@ def _full_mlp_procedure(index, projections, width, blob):
         f'    tensor<fp16, [1, 1, 1, {width}]> down_scale = real_div(x=fp16(1024.0), y=bounded_max)[name=string("down_scale")];',
         f'    tensor<fp16, {shape}> down_input = mul(x=act, y=down_scale)[name=string("down_input")];',
     ]
-    lines.append(body(projections[2], "d", "down_input"))
+    lines.append(_projection_statements(projections[2], width, blob, "d", "down_input"))
     out = projections[2].shape[0]
     lines += [
         f'    tensor<fp16, [1, {out}, 1, {width}]> unscaled = real_div(x=d_y, y=down_scale)[name=string("unscaled")];',
