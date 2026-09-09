@@ -1119,6 +1119,25 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
+def _is_mtp_settable(config: dict, model_type: str | None) -> bool:
+    """True when the admin UI may offer the native MTP toggle for this model.
+
+    Deliberate superset of :func:`_is_mtp_compatible`. ``qwen4_exp`` activates
+    Lightning MTP through its own loader branch (``configure_qwen4_exp_runtime``,
+    which gates on embedded MTP tensors and drives the Qwen4 head), NOT through
+    the generic patch block — adding it to ``_is_mtp_compatible`` would run
+    that block too, layering the Qwen3.5/3.6 mlx-vlm MTP patches on top of the
+    dedicated Qwen4 runtime. So the dashboard gate and the runtime whitelist
+    are separate questions, and this answers the dashboard one (#3200 shipped
+    the acceptance inline at both admin call sites; this gives it one name).
+    """
+    if not _has_mtp_heads(config):
+        return False
+    if not model_type:
+        return False
+    return _is_mtp_compatible(config, model_type) or model_type == "qwen4_exp"
+
+
 def load_text_model(
     model_name: str,
     tokenizer_config: dict[str, Any] | None = None,
