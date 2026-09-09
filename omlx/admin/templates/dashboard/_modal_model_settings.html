@@ -1273,6 +1273,12 @@
                                             </button>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
+                                            <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max snapshot prompt tokens</label>
+                                            <input type="number" x-model.number="modelSettings.dflash_max_snapshot_tokens" min="0" step="1000" placeholder="32000"
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            <p class="text-xs text-neutral-400 mt-1">Prompts longer than this are never inserted into the prefix cache. Raise it for agent workloads whose fixed prefix already exceeds the default, or every turn re-prefills from scratch. Leave empty for dflash default (32000); 0 removes the cap.</p>
+                                        </div>
+                                        <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">In-memory cache max entries</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">

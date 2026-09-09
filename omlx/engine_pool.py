@@ -746,6 +746,7 @@ class EnginePool:
                 add(
                     "dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes")
                 )
+            add("dflash_max_snapshot_tokens", data.get("dflash_max_snapshot_tokens"))
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_block_size", data.get("dflash_block_size"))
