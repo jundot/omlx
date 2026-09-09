@@ -398,9 +398,9 @@ def test_align_does_not_read_the_head_when_picking_the_target():
 
 
 def _position(entries):
-    return gemma4_text_model._query_position(
-        SimpleNamespace(_omlx_mtp_cache_ref=entries)
-    )
+    from omlx.patches.mlx_lm_gemma4_assistant import query_position
+
+    return query_position(SimpleNamespace(_omlx_mtp_cache_ref=entries))
 
 
 def test_query_position_prefers_the_rotating_absolute_offset():

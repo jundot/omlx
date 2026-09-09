@@ -7,32 +7,28 @@ model, which ``oq.combine_gemma4_assistant_mtp`` merges under
 side (``mlx_vlm_mtp.gemma4_vlm_runtime``), so a checkpoint served through
 mlx-lm — a text-only quant, a DFlash target, the VLM->LLM fallback — had
 no binding site and this module simply discarded the head. It still does
-when MTP is off; when MTP is on it attaches the head instead.
-
-Three things make that cheap. ``Gemma4AssistantDraftModel`` is not
-vision-coupled and its ``bind`` already accepts an mlx-lm host; mlx-lm's
-``gemma4_text`` already implements gemma4's cross-layer K/V sharing; and
-``batch_generator``'s MTP machinery is model-agnostic. What is missing is
-the two outputs the head consumes, so this adds them: the per-layer-type
-K/V banks (``shared_kv_sink``) and the pre-norm hidden.
+when MTP is off; when MTP is on it attaches the head and supplies the two
+things the head reads from a backbone forward — the per-layer-type K/V
+banks (``shared_kv_sink``) and the pre-norm hidden. ``draft_step`` in
+``mlx_lm_gemma4_assistant`` then drives it, shared with the mlx-vlm path.
 
 Hidden is captured BEFORE the trunk RMSNorm. ``_trunk_norm_module``
 re-applies it for any model that does not set
 ``_omlx_mtp_head_hidden_normed``, so capturing post-norm would double-norm
 the head's inputs — silently, as a weak acceptance rate.
 
-The layer loop is not copied. Each ``DecoderLayer`` already returns its
-``kvs``, so wrapping the layer records them and swapping ``norm`` for a
-recorder captures its input, which keeps this independent of the
-per-layer-input plumbing around the loop.
+Both outputs come from wrapping gemma4's layer loop rather than copying
+it: each ``DecoderLayer`` already returns its ``kvs``, and swapping
+``norm`` for a recorder captures its input. Reading the K/V back out of
+the cache instead would be wrong, because ``RotatingKVCache.state``
+returns the raw ring and a wrapped sliding layer would hand the head
+out-of-order banks.
 
-Concurrency. The per-layer sink and the model-level stash both carry state
-out of a forward, and neither can cross requests: every MLX call runs on
-the one-worker executor in ``omlx.engine_core`` (``max_workers=1``, since
-mlx-lm's BatchGenerator uses a module-level Metal stream — issue #85), and
-MTP is admitted only for singleton batches. The sink is a
-``threading.local`` regardless, which costs nothing and bounds a failure
-that would otherwise return confident logits over another request's K/V.
+The sink and the stash both carry state out of a forward, and neither can
+cross requests: MLX runs on the one-worker executor in
+``omlx.engine_core`` (issue #85), and MTP is admitted only for singleton
+batches. The sink is a ``threading.local`` anyway, which costs nothing and
+bounds a failure that would otherwise draft over another request's K/V.
 """
 
 from __future__ import annotations
@@ -138,8 +134,6 @@ def _patch_inner_model(mod: Any) -> None:
     if getattr(cls, "_omlx_mtp_attach_patched", False):
         return
 
-    import mlx.core as mx
-
     original_init = cls.__init__
     original_call = cls.__call__
 
@@ -181,9 +175,11 @@ def _patch_inner_model(mod: Any) -> None:
         if sink is not None and getattr(self, "mtp", None) is not None:
             # mtp_forward is a separate top-level call, so this outlives the
             # forward; see the module docstring for why that is safe.
+            from ..mlx_lm_gemma4_assistant import query_position
+
             self._omlx_mtp_shared_kv = sink
             self._omlx_mtp_cache_ref = cache
-            self._omlx_mtp_kv_offset = _query_position(self)
+            self._omlx_mtp_kv_offset = query_position(self)
 
         if not want_hidden:
             return self._omlx_logits(out)
@@ -208,44 +204,11 @@ def _patch_inner_model(mod: Any) -> None:
         return_hidden: bool = False,
         logits_keep: int = 0,
     ):
-        """Assistant-head forward under the Lightning chain contract.
+        """Drive the assistant head; the mlx-vlm path drives it the same way."""
+        del mtp_cache, logits_keep  # stateless head, one output position
+        from ..mlx_lm_gemma4_assistant import draft_step
 
-        Single-position: only the last (hidden, token) pair matters. The
-        head keeps no state, so ``mtp_cache`` is unused.
-        """
-        del mtp_cache, logits_keep
-        drafter = self.mtp
-        # nn.quantize() swaps embed_tokens after construction; a stale bind
-        # drafts from a random-init embedding and degrades silently.
-        if drafter._input_embed is not self.model.embed_tokens:
-            drafter.bind(self)
-        shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
-        if not shared_kv:
-            raise RuntimeError(
-                "gemma4 mtp_forward called without a prior return_hidden "
-                "backbone forward (no shared K/V stash)"
-            )
-
-        h = hidden_states[:, -1:, :]
-        tok_embed = drafter._input_embed(next_token_ids[:, -1:])
-        tok_embed = tok_embed * drafter._input_embed_scale
-        inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
-
-        # The stash was taken at the verify forward, so after a rejection it
-        # still carries the rejected rows in its tail; drop them.
-        valid_len = _query_position(self)
-        rejected = getattr(self, "_omlx_mtp_kv_offset", valid_len) - valid_len
-        if rejected > 0:
-            from ..mlx_lm_gemma4_assistant import slice_shared_kv_after_reject
-
-            shared_kv = slice_shared_kv_after_reject(shared_kv, rejected)
-
-        drafter._kv_valid_len = valid_len
-        position_ids = mx.array([[max(valid_len - 1, 0)]])
-        head_hidden, logits = drafter(inputs_embeds, shared_kv, position_ids)
-        if return_hidden:
-            return logits, head_hidden
-        return logits
+        return draft_step(self, hidden_states, next_token_ids, return_hidden)
 
     def make_mtp_cache(self):
         """The assistant head is stateless."""
@@ -288,28 +251,6 @@ def _patch_inner_model(mod: Any) -> None:
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls._omlx_mtp_attach_patched = True
-
-
-def _query_position(model: Any) -> int:
-    """Committed length, from the cache stashed at the last verify forward.
-
-    Host-side ints only, never the per-row ``offset`` array, so the chain
-    cycle stays sync-free. Batched rotating caches expose ``_offset``
-    (absolute processed length), batched plain caches ``_idx`` (storage
-    length, equal to committed under the singleton gating MTP requires),
-    and stock caches an int ``offset``.
-    """
-    for c in getattr(model, "_omlx_mtp_cache_ref", None) or []:
-        rotating = getattr(c, "_offset", None)
-        if isinstance(rotating, int):
-            return rotating
-        offset = getattr(c, "offset", None)
-        if isinstance(offset, int):
-            return offset
-        idx = getattr(c, "_idx", None)
-        if isinstance(idx, int):
-            return idx
-    raise RuntimeError("gemma4 mtp_forward: no cache offset available")
 
 
 def _is_head_key(key: str) -> bool:
