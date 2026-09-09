@@ -79,6 +79,63 @@ def test_k2_ane_setting_roundtrip_and_reservation(models, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ane_enabled", [False, True])
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("other_gib", [0, 6])
+async def test_k2_unload_checks_weights_not_ane_admission_reserve(
+    models, tmp_path, ane_enabled, retained, other_gib
+):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    gib = 1024**3
+    pool = EnginePool()
+    pool.discover_models(str(tmp_path))
+    entry = pool.get_entry(models.name)
+    entry.estimated_size = 5 * gib
+    pool._current_model_memory = other_gib * gib
+    active = other_gib * gib
+
+    async def start():
+        nonlocal active
+        active += entry.estimated_size
+
+    async def stop():
+        nonlocal active
+        if not retained:
+            active -= entry.estimated_size
+
+    engine = MagicMock()
+    engine.start = AsyncMock(side_effect=start)
+    engine.stop = AsyncMock(side_effect=stop)
+    engine.has_active_requests.return_value = False
+    settings = ModelSettings(qwen35_ane_prefill_enabled=ane_enabled)
+    reservation = 20 * gib if ane_enabled else 0
+    with (
+        patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+        patch("omlx.engine_pool.mx") as mlx,
+        patch("omlx.engine_pool.get_phys_footprint", side_effect=lambda: active),
+        patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+        patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch(
+            "omlx.patches.k2_horizon.ane_prefill.prefill_memory_reservation",
+            return_value=20 * gib,
+        ),
+    ):
+        mlx.get_active_memory.side_effect = lambda: active
+        await pool._load_engine(models.name, runtime_settings=settings)
+        assert entry.runtime_estimated_size == 5 * gib + reservation
+        assert pool._current_model_memory == (other_gib + 5) * gib + reservation
+        await pool._unload_engine(models.name)
+
+    waits = [call.args[0] for call in sleep.await_args_list if call.args[0] > 0]
+    assert waits == ([0.5] * 10 + [1.0] * 3 if retained else [])
+    assert pool._current_model_memory == other_gib * gib
+    assert entry.engine is None
+    assert entry.runtime_estimated_size is None
+    assert entry.runtime_settle_size is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_admin_rejects_invalid_k2_ane_settings(
     models, tmp_path, monkeypatch, enabled
