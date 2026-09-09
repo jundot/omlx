@@ -63,7 +63,6 @@ class UnoBundle:
     base_model_id: str
     context_length: int
     config: dict
-    block_size: int = 8
 
 
 def resolve_uno_bundle(base_path: str | Path, adapter_path: str | Path) -> UnoBundle:

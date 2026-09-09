@@ -49,6 +49,7 @@ def make_regions(layer):
         )
         for kind, fn in (("pre", pre), ("post", post), ("prefix", prefix))
         for conditional in (False, True)
+        if kind != "prefix" or not conditional
     }
 
 
@@ -92,9 +93,6 @@ class CompiledBody(nn.Module):
             else:
                 h = regions["post", conditional](h, out, *extra)
         return self.norm(h)
-
-    def prefill(self, inputs, *, cache):
-        return self(inputs, cache=cache, prefill=True)
 
 
 def can_compile_blocks(model):

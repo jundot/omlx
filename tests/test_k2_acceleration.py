@@ -112,7 +112,13 @@ def test_compiled_rejects_unsupported_rope_and_cache():
 
 
 @pytest.mark.parametrize("offset", [0, 2])
-def test_prefill_callback_excludes_seed_drafts_and_verification(offset):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_scheduler_prefill_excludes_seed_drafts_and_verification(
+    mock_tokenizer, offset, chunked
+):
+    from omlx.request import Request, SamplingParams
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
     model = make_model()
     cache = make_prompt_cache(model)
     prompt = [2, 3, 5, 7, 11, 13]
@@ -125,17 +131,38 @@ def test_prefill_callback_excludes_seed_drafts_and_verification(offset):
         calls.append(ids.tolist()[0])
         return model(ids, cache=cache)
 
-    decoder = UnoDecoder(
-        model, eos_token_ids=[], temperature=0, prefill_step_size=2, prefill=prefill
+    model._omlx_prefill = prefill
+    scheduler = Scheduler(
+        model,
+        mock_tokenizer,
+        SchedulerConfig(prefill_step_size=2, paged_cache_block_size=0),
     )
-    cycles = list(decoder.generate(prompt, max_tokens=12, prompt_cache=cache))
-    assert sum(calls, []) == prompt[offset:-1]
-    assert sum(len(c.tokens) for c in cycles) == 12
-    assert all(c.offset == len(prompt) + 12 - 1 for c in cache)
-    calls.clear()
-    list(decoder.generate(prompt, max_tokens=0))
-    list(decoder.generate(prompt, max_tokens=2, cancelled=lambda: True))
-    assert calls == []
+    request = Request(
+        request_id="prefill", prompt=prompt, sampling_params=SamplingParams()
+    )
+    request.prompt_token_ids, request.num_prompt_tokens = prompt, len(prompt)
+    request.cached_tokens = offset
+    scheduler.requests[request.request_id] = request
+    try:
+        if chunked:
+            state = scheduler._begin_prefill(request, prompt[offset:], cache)
+            while not scheduler._step_prefill_chunk(state):
+                pass
+            cache, last = state.cache, state.last_token
+        else:
+            cache, last = scheduler._do_external_prefill(
+                request, prompt[offset:], cache
+            )
+        assert sum(calls, []) == prompt[offset:-1]
+        assert last == prompt[-1:]
+        assert all(c.offset == len(prompt) - 1 for c in cache)
+        calls.clear()
+        decoder = UnoDecoder(model, eos_token_ids=[], temperature=0)
+        cycle = decoder.cycle(last[0], cache=cache, frontier=len(prompt), max_tokens=12)
+        assert cycle.tokens and calls == []
+        assert all(c.offset == len(prompt) + len(cycle.tokens) - 1 for c in cache)
+    finally:
+        scheduler.shutdown()
 
 
 def test_compiled_prefill_is_explicit_and_skips_final_mlp():
@@ -146,7 +173,7 @@ def test_compiled_prefill_is_explicit_and_skips_final_mlp():
     model.model._prefill_mlps = (spy,)
     ids = mx.array([[2, 3, 5]])
     cache = make_prompt_cache(model)
-    model.model.prefill(ids, cache=cache)
+    model.model(ids, cache=cache, prefill=True)
     mx.eval([c.state for c in cache])
     assert spy.call_count == 1
     model(ids, cache=cache)

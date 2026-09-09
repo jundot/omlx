@@ -9,7 +9,6 @@ import math
 from dataclasses import dataclass
 
 import mlx.core as mx
-from mlx_lm.models.cache import make_prompt_cache
 
 
 def probabilities(logits, temperature, top_p=1.0, top_k=None):
@@ -40,8 +39,6 @@ def acceptance_and_residual(p, q, proposals, uniforms):
 class UnoCycle:
     tokens: tuple[int, ...]
     accepted_proposals: int
-    proposed_tokens: int
-    forwards: int
     cache_length: int
     finish_reason: str | None
 
@@ -59,8 +56,6 @@ class UnoDecoder:
         top_p=0.95,
         top_k=None,
         seed=0,
-        prefill_step_size=512,
-        prefill=None,
         constraint=None,
     ):
         if not getattr(model, "_uno_adapter_loaded", False):
@@ -81,10 +76,6 @@ class UnoDecoder:
         self.block_size = block_size
         self.temperature, self.top_p, self.top_k = temperature, top_p, top_k
         self.key = mx.random.key(seed)
-        if type(prefill_step_size) is not int or prefill_step_size <= 0:
-            raise ValueError("Uno prefill_step_size must be a positive integer")
-        self.prefill_step_size = prefill_step_size
-        self.prefill = model if prefill is None else prefill
         self.constraint = constraint
 
     def _key(self):
@@ -105,47 +96,6 @@ class UnoDecoder:
             layer.trim(layer.offset - length)
             if layer.offset != length:
                 raise RuntimeError("Uno KV rollback failed")
-
-    def generate(self, prompt, *, max_tokens, cancelled=None, prompt_cache=None):
-        if not prompt or type(max_tokens) is not int or max_tokens < 0:
-            raise ValueError(
-                "Uno requires a nonempty prompt and nonnegative max_tokens"
-            )
-        if any(
-            type(token) is not int or not 0 <= token < self.model.args.vocab_size
-            for token in prompt
-        ):
-            raise ValueError("Uno prompt token outside vocabulary")
-        committed = list(prompt)
-        cache = make_prompt_cache(self.model) if prompt_cache is None else prompt_cache
-        offset = cache[0].offset
-        if not 0 <= offset < len(prompt) or any(c.offset != offset for c in cache):
-            raise ValueError("Uno prefix cache must leave at least one uncached token")
-        if len(prompt) > 1 and max_tokens:
-            for start in range(offset, len(prompt) - 1, self.prefill_step_size):
-                if cancelled is not None and cancelled():
-                    return
-                end = min(len(prompt) - 1, start + self.prefill_step_size)
-                self.prefill(mx.array([prompt[start:end]]), cache=cache)
-                mx.eval([layer.state for layer in cache])
-                mx.synchronize()
-                mx.clear_cache()
-        emitted = 0
-        while emitted < max_tokens:
-            cycle = self.cycle(
-                committed[-1],
-                cache=cache,
-                frontier=len(committed),
-                max_tokens=max_tokens - emitted,
-                cancelled=cancelled,
-            )
-            if cycle is None:
-                return
-            committed.extend(cycle.tokens)
-            emitted += len(cycle.tokens)
-            yield cycle
-            if cycle.finish_reason:
-                return
 
     def cycle(self, seed_token, *, cache, frontier, max_tokens, cancelled=None):
         """Verify one block from an existing KV frontier."""
@@ -223,8 +173,6 @@ class UnoDecoder:
         return UnoCycle(
             tuple(output),
             min(accepted, len(output) - 1),
-            length - 1,
-            2,
             frontier + len(output) - 1,
             finish,
         )

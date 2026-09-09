@@ -222,20 +222,12 @@ class _ScriptedModel:
 
 
 @pytest.mark.parametrize("reject_at", list(range(7)) + [None])
-@pytest.mark.parametrize("direct_cycle", [False, True])
-def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(
-    reject_at, direct_cycle
-):
+def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(reject_at):
     model = _ScriptedModel(reject_at)
     decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
-    if direct_cycle:
-        cache = model.make_cache()
-        model(mx.array([[2, 3]]), cache=cache)
-        cycle = decoder.cycle(4, cache=cache, frontier=3, max_tokens=16)
-    else:
-        iterator = decoder.generate([2, 3, 4], max_tokens=16)
-        cycle = next(iterator)
-        iterator.close()
+    cache = model.make_cache()
+    model(mx.array([[2, 3]]), cache=cache)
+    cycle = decoder.cycle(4, cache=cache, frontier=3, max_tokens=16)
     expected = (
         list(range(10, 19))
         if reject_at is None
@@ -248,13 +240,30 @@ def test_each_rejection_frontier_and_all_accepted_preserve_real_kv(
     assert keys[0, 0, :, 0].tolist() == [2, 3, 4] + expected[:-1]
 
 
+def run_uno_cycles(decoder, prompt, max_tokens, cache=None):
+    cache = make_prompt_cache(decoder.model) if cache is None else cache
+    if cache[0].offset < len(prompt) - 1:
+        decoder.model(mx.array([prompt[cache[0].offset : -1]]), cache=cache)
+    seed, frontier = prompt[-1], len(prompt)
+    while max_tokens:
+        cycle = decoder.cycle(
+            seed, cache=cache, frontier=frontier, max_tokens=max_tokens
+        )
+        yield cycle
+        if cycle.finish_reason:
+            break
+        seed = cycle.tokens[-1]
+        frontier += len(cycle.tokens)
+        max_tokens -= len(cycle.tokens)
+
+
 @pytest.mark.parametrize("eos_slot", range(9))
 def test_eos_at_every_committed_slot_excludes_later_draft_tokens(eos_slot):
     model = _ScriptedModel()
     decoder = UnoDecoder(
         model, eos_token_ids=[10 + eos_slot], block_size=8, temperature=0
     )
-    cycles = list(decoder.generate([2, 3, 4], max_tokens=16))
+    cycles = list(run_uno_cycles(decoder, [2, 3, 4], 16))
     assert len(cycles) == 1
     assert list(cycles[0].tokens) == list(range(10, 11 + eos_slot))
     assert cycles[0].accepted_proposals == min(7, eos_slot)
@@ -264,17 +273,16 @@ def test_eos_at_every_committed_slot_excludes_later_draft_tokens(eos_slot):
     )
 
 
-@pytest.mark.parametrize("budget", range(9))
+@pytest.mark.parametrize("budget", range(1, 9))
 def test_budget_shorter_than_block_is_exact(budget):
     decoder = UnoDecoder(
         _ScriptedModel(), eos_token_ids=[], block_size=8, temperature=0
     )
-    cycles = list(decoder.generate([2, 3], max_tokens=budget))
+    cycles = list(run_uno_cycles(decoder, [2, 3], budget))
     assert [token for cycle in cycles for token in cycle.tokens] == list(
         range(10, 10 + budget)
     )
-    if budget:
-        assert cycles[-1].finish_reason == "length"
+    assert cycles[-1].finish_reason == "length"
 
 
 def test_mova_router_preserves_source_partition_rounding():
@@ -354,30 +362,6 @@ def test_uno_rejects_untrained_block_size():
         )
 
 
-def test_uno_prefill_does_not_accumulate_retired_kv_buffers():
-    class BufferedModel(_ScriptedModel):
-        def __call__(self, inputs, cache=None, lora_mask=None):
-            values = mx.broadcast_to(
-                inputs[:, None, :, None], (1, 8, inputs.shape[1], 64)
-            ).astype(mx.float32)
-            cache[0].update_and_fetch(values, values)
-            return mx.zeros((1, inputs.shape[1], 128))
-
-    model = BufferedModel()
-    decoder = UnoDecoder(model, eos_token_ids=[], prefill_step_size=256)
-    cached_bytes = []
-    mx.clear_cache()
-
-    def cancelled():
-        mx.synchronize()
-        cached_bytes.append(mx.get_cache_memory())
-        return model.cache[0].offset >= 8192
-
-    assert list(decoder.generate([2] * 8194, max_tokens=1, cancelled=cancelled)) == []
-    resident_bytes = sum(value.nbytes for value in model.cache[0].state)
-    assert max(cached_bytes) < 2 * resident_bytes
-
-
 @pytest.mark.parametrize("cancel_warm", [False, True])
 def test_uno_reuses_ssd_prefix_after_reload(
     tmp_path, mock_tokenizer, monkeypatch, cancel_warm
@@ -448,7 +432,7 @@ def test_uno_restored_prefix_preserves_only_verified_kv(reject_at):
     cache = model.make_cache()
     model(mx.array([prompt[:3]]), cache=cache)
     decoder = UnoDecoder(model, eos_token_ids=[], block_size=8, temperature=0)
-    cycles = list(decoder.generate(prompt, max_tokens=9, prompt_cache=cache))
+    cycles = list(run_uno_cycles(decoder, prompt, 9, cache))
     emitted = [token for cycle in cycles for token in cycle.tokens]
     assert cache[0].state[0][0, 0, :, 0].tolist() == prompt + emitted[:-1]
     assert cache[0].offset == len(prompt) + len(emitted) - 1
