@@ -104,6 +104,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
+        # Only meaningful for checkpoints that carry bfloat16 leaves; the
+        # dashboard gates it per model, so a profile must not carry it over.
+        "activation_fp16_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }

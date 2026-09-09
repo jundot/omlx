@@ -133,6 +133,61 @@ class TestListModelsSettings:
         assert model["qwen4_ple_resident_bytes"] == 1000
         assert model["qwen4_ple_mmap_bytes"] == 400
 
+    def test_list_models_reports_activation_fp16_support(self, tmp_path):
+        import json as _json
+        import struct
+
+        def _checkpoint(name, dtype):
+            path = tmp_path / name
+            path.mkdir()
+            header = _json.dumps(
+                {"w": {"dtype": dtype, "shape": [2], "data_offsets": [0, 4]}}
+            ).encode()
+            (path / "model-00001.safetensors").write_bytes(
+                struct.pack("<Q", len(header)) + header + b"\x00" * 4
+            )
+            return path
+
+        def _supported(model_path):
+            pool = MagicMock()
+            pool.get_status.return_value = {
+                "models": [
+                    {
+                        "id": model_path.name,
+                        "model_path": str(model_path),
+                        "estimated_size": 1000,
+                    }
+                ]
+            }
+            manager = MagicMock()
+            manager.get_all_settings.return_value = {}
+            state = MagicMock(default_model=None)
+
+            with (
+                patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+                patch.object(
+                    admin_routes, "_get_settings_manager", return_value=manager
+                ),
+                patch.object(admin_routes, "_get_server_state", return_value=state),
+                patch.object(admin_routes, "_get_global_settings", return_value=None),
+                patch.object(
+                    admin_routes, "_dflash_compat_for_model", return_value=(False, "")
+                ),
+                patch.object(
+                    admin_routes, "_mtp_compat_for_model", return_value=(False, "")
+                ),
+                patch.object(
+                    admin_routes,
+                    "_paroquant_compat_for_model",
+                    return_value=(False, ""),
+                ),
+            ):
+                result = asyncio.run(admin_routes.list_models(is_admin=True))
+            return result["models"][0]["activation_fp16_supported"]
+
+        assert _supported(_checkpoint("bf16", "BF16")) is True
+        assert _supported(_checkpoint("fp16", "F16")) is False
+
     def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
         """Ensure nested model paths only affect UI display names."""
         model_root = tmp_path / "models"
