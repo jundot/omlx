@@ -8858,6 +8858,34 @@
                 }
             },
 
+            async restoreClaudeDesktopConfig() {
+                if (this.claudeDesktop.working) return;
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/restore', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.globalSettings.claude_code.desktop_enabled = false;
+                    await this.saveClaudeCodeSettings();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_success');
+                } catch (err) {
+                    console.error('Failed to restore Claude Desktop configuration:', err);
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);

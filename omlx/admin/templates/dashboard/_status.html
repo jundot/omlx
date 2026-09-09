@@ -790,6 +790,12 @@
                                                 class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white hover:bg-neutral-50 disabled:opacity-50 transition-all">
                                             <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_working') : window.t('status.claude_code.desktop_reapply')"></span>
                                         </button>
+                                        <button type="button"
+                                                @click="restoreClaudeDesktopConfig()"
+                                                :disabled="claudeDesktop.working"
+                                                class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white hover:bg-neutral-50 disabled:opacity-50 transition-all">
+                                            <span x-text="claudeDesktop.working ? window.t('status.claude_code.desktop_restoring') : window.t('status.claude_code.desktop_restore')"></span>
+                                        </button>
                                         <span x-show="claudeDesktop.message" x-cloak class="text-xs text-neutral-500" x-text="claudeDesktop.message"></span>
                                     </div>
                                 </div>

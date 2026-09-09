@@ -369,3 +369,113 @@ class TestAdminRouteAndUI:
             data = json.loads(locale_path.read_text(encoding="utf-8"))
             assert "status.claude_code.desktop" in data, locale_path.name
             assert "status.claude_code.desktop_hint" in data, locale_path.name
+
+
+class TestDesktopEnabledGetRoundTrip:
+    def test_get_includes_desktop_enabled(self, tmp_path, monkeypatch):
+        import asyncio
+
+        import omlx.admin.routes as admin_routes
+
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        assert "desktop_enabled" in result["claude_code"]
+        assert result["claude_code"]["desktop_enabled"] is False
+        gs.claude_code.desktop_enabled = True
+        result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        assert result["claude_code"]["desktop_enabled"] is True
+
+    async def test_patch_true_then_get_true(self, tmp_path, monkeypatch):
+        import omlx.admin.routes as admin_routes
+        import omlx.server  # noqa: F401 — ensure server import first (set_admin_getters)
+        from omlx.admin.routes import GlobalSettingsRequest
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(
+            claude_desktop, "configure_omlx_gateway", lambda *a, **k: True
+        )
+        monkeypatch.setattr(claude_desktop, "restore", lambda *a, **k: True)
+        request = GlobalSettingsRequest.model_validate(
+            {"claude_code_desktop_enabled": True}
+        )
+        await admin_routes.update_global_settings(request, True)
+        assert gs.claude_code.desktop_enabled is True
+        result = await admin_routes.get_global_settings(is_admin=True)
+        assert result["claude_code"]["desktop_enabled"] is True
+
+    async def test_restore_persist_false_triggers_no_configure(self, tmp_path, monkeypatch):
+        import omlx.admin.routes as admin_routes
+        import omlx.server  # noqa: F401 — ensure server import first (set_admin_getters)
+        from omlx.admin.routes import GlobalSettingsRequest
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = True
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        calls = {"configure": [], "restore": []}
+        monkeypatch.setattr(
+            claude_desktop,
+            "configure_omlx_gateway",
+            lambda *a, **k: calls["configure"].append(True) or True,
+        )
+        monkeypatch.setattr(
+            claude_desktop, "restore", lambda *a, **k: calls["restore"].append(True) or True
+        )
+        request = GlobalSettingsRequest.model_validate(
+            {"claude_code_desktop_enabled": False}
+        )
+        response = await admin_routes.update_global_settings(request, True)
+        assert gs.claude_code.desktop_enabled is False
+        assert calls["configure"] == []
+        assert calls["restore"] == [True]
+        assert response["claude_desktop"] == {"applied": True, "action": "restore"}
+        # Second persist while already off must not re-trigger any side effect.
+        calls["restore"].clear()
+        request = GlobalSettingsRequest.model_validate(
+            {"claude_code_desktop_enabled": False}
+        )
+        response = await admin_routes.update_global_settings(request, True)
+        assert calls["configure"] == []
+        assert calls["restore"] == []
+        assert response["claude_desktop"] == {"applied": False}
+
+
+class TestRestoreButton:
+    def test_restore_markup_and_handler(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "omlx/admin/templates/dashboard/_status.html").read_text(
+            encoding="utf-8"
+        )
+        assert "restoreClaudeDesktopConfig()" in html
+        assert "status.claude_code.desktop_restore" in html
+        assert "status.claude_code.desktop_restoring" in html
+        js = (root / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
+        assert "async restoreClaudeDesktopConfig()" in js
+        assert "/admin/api/claude-desktop/restore" in js
+        assert "desktop_enabled = false" in js
+        assert "desktop_restore_success" in js
+        assert "desktop_restore_error" in js
+
+    def test_restore_i18n_keys_present_in_every_locale(self):
+        from pathlib import Path
+
+        i18n_dir = Path(__file__).resolve().parents[1] / "omlx/admin/i18n"
+        locales = sorted(i18n_dir.glob("*.json"))
+        assert len(locales) == 9, f"expected 9 locales, got {len(locales)}"
+        wanted = {
+            "status.claude_code.desktop_restore",
+            "status.claude_code.desktop_restoring",
+            "status.claude_code.desktop_restore_success",
+            "status.claude_code.desktop_restore_error",
+        }
+        for locale_path in locales:
+            data = json.loads(locale_path.read_text(encoding="utf-8"))
+            missing = wanted - set(data)
+            assert not missing, f"{locale_path.name} missing {sorted(missing)}"
+            for key in wanted:
+                assert data[key].strip(), f"{locale_path.name} {key} empty"
