@@ -2453,3 +2453,15 @@ class Model(nn.Module):
             shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
             shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
             shard_inplace(layer.ffn.switch_mlp.up_proj, "all-to-sharded", group=group)
+
+# --- oMLX DSpark speculative decoding hook (env-gated; see dspark_generator.py) ---
+if __import__("os").environ.get("OMLX_DSPARK_SPEC"):
+    try:
+        import importlib.util as _dsu, os as _dso
+        _dsp = _dso.path.join(_dso.path.dirname(_dso.path.abspath(__file__)), "dspark_generator.py")
+        _dss = _dsu.spec_from_file_location("omlx_dspark_generator", _dsp)
+        _dsm = _dsu.module_from_spec(_dss)
+        __import__("sys").modules["omlx_dspark_generator"] = _dsm
+        _dss.loader.exec_module(_dsm); _dsm.enable()
+    except Exception as _dse:
+        __import__("logging").getLogger(__name__).warning("dspark hook failed: %r", _dse, exc_info=True)
