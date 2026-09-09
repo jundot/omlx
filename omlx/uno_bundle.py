@@ -58,7 +58,6 @@ def uno_base_id(path: str | Path) -> str | None:
 
 @dataclass(frozen=True)
 class UnoBundle:
-    base_path: Path
     adapter_path: Path
     base_model_id: str
     context_length: int
@@ -80,10 +79,4 @@ def resolve_uno_bundle(base_path: str | Path, adapter_path: str | Path) -> UnoBu
     for name, released_limit in _BASES.values():
         if name == base_id:
             limit = min(limit, released_limit)
-    return UnoBundle(
-        base_path,
-        adapter_path,
-        base_id,
-        min(config["max_position_embeddings"], limit),
-        config,
-    )
+    return UnoBundle(adapter_path, base_id, limit, config)
