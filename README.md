@@ -213,27 +213,6 @@ Load LLMs, VLMs, embedding models, and rerankers within the same server. Models 
 - **Per-model TTL**: Set an idle timeout per model to auto-unload after a period of inactivity.
 - **Process memory enforcement**: Total memory limit (default: system RAM - 8GB) prevents system-wide OOM.
 
-### IFM K2 Horizon
-
-K2 Horizon supports serving and oQ quantization. Use **Chat Template Kwargs**
-to set `reasoning_effort` to `low`, `medium`, or `high` (default).
-**Thinking Budget** limits reasoning. A budget of 1 forces immediate closure and can reduce answer quality.
-**K2 ANE Prompt Processing** is opt-in for dense K2 and MoVA. Use **Test ANE**
-in the existing model-settings panel. It compares short and long prompts,
-eight concurrent requests, arrivals during decode, and cached prompts.
-It rechecks the GPU baseline before recommending a split. Apply the result to opt in.
-Attention, routed experts,
-KV, and decode stay on GPU. Existing affine quantization is retained on GPU;
-ANE uses FP16 and can change outputs. Split configurations use separate SSD
-prefix namespaces. This requires the native ANE extension.
-
-K2 tool requests require `omlx[grammar]`. Names are constrained to the request's
-tools in XML, typed XML, and JSON calls; tool argument schemas
-remain the client's responsibility. This also works with client-owned tools when
-backend MCP exposure is disabled. Malformed calls return an error instead of
-disappearing. Combining tool constraints with structured output, or continuing
-an unfinished assistant tool-call prefix, is currently unsupported.
-
 ### Per-Model Settings
 
 Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.
@@ -302,7 +281,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 
 ### Tool Calling & Structured Output
 
-Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected via mlx-lm's built-in tool parsers:
+Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
 
 | Model Family | Format |
 |---|---|
@@ -312,6 +291,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
 | Mistral | `[TOOL_CALLS]` |
+| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`; requires `omlx[grammar]` |
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 
