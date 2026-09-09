@@ -307,6 +307,32 @@ def parse_chip_info(chip_string: str) -> tuple[str, str]:
     return (chip_name, chip_variant)
 
 
+def get_chip_generation() -> int | None:
+    """Return Apple Silicon generation number from the brand string (M2 → 2)."""
+    chip_name, _ = parse_chip_info(get_chip_name())
+    match = re.match(r"M(\d+)$", chip_name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def supports_native_bfloat16() -> bool:
+    """True when Metal has native bfloat16 support (Apple M3 and later)."""
+    generation = get_chip_generation()
+    return generation is None or generation >= 3
+
+
+def default_oq_dtype() -> str:
+    """Chip-aware default oQ dtype for non-quantized weight/scales.
+
+    M1/M2 lack native bf16; float16 is faster there. M3+ defaults to bfloat16
+    for numerical stability.
+    """
+    if supports_native_bfloat16():
+        return "bfloat16"
+    return "float16"
+
+
 def compute_owner_hash(
     uuid: str, chip_name: str, gpu_cores: Optional[int], memory_gb: int
 ) -> str:

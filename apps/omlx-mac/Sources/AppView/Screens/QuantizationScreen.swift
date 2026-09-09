@@ -407,8 +407,8 @@ private struct AdvancedSection: View {
                         isLast: true
                     ) {
                         Segmented(selection: $dtype, options: [
-                            ("bfloat16", "bfloat16"),
                             ("float16",  "float16"),
+                            ("bfloat16", "bfloat16"),
                         ])
                     }
                 }

@@ -28,6 +28,12 @@ from ..model_discovery import _decode_hf_cache_model_id, _has_vision_subconfig
 logger = logging.getLogger(__name__)
 
 
+def _default_oq_dtype() -> str:
+    from ..utils.hardware import default_oq_dtype
+
+    return default_oq_dtype()
+
+
 class _QuantCancelled(Exception):
     """Raised by progress callback when task is cancelled."""
 
@@ -78,7 +84,7 @@ class QuantTask:
     group_size: int = 64
     sensitivity_model_path: str = ""
     text_only: bool = False
-    dtype: str = "bfloat16"
+    dtype: str = field(default_factory=_default_oq_dtype)
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
     enhanced: bool = False
@@ -285,7 +291,7 @@ class OQManager:
         group_size: int = 64,
         sensitivity_model_path: str = "",
         text_only: bool = False,
-        dtype: str = "bfloat16",
+        dtype: str | None = None,
         preserve_mtp: bool = False,
         auto_proxy_sensitivity: bool = True,
         enhanced: bool = False,
@@ -324,6 +330,9 @@ class OQManager:
             validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
+
+        if dtype is None:
+            dtype = _default_oq_dtype()
 
         if oq_level not in OQ_LEVELS:
             raise ValueError(

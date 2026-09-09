@@ -94,6 +94,7 @@
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
+    const DEFAULT_OQ_DTYPE = window.OMLX_DEFAULT_OQ_DTYPE || 'float16';
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -155,6 +156,7 @@
                     web_search_content_max_chars: 20000,
                 },
                 ui: { language: 'en' },
+                quantization: { default_oq_dtype: DEFAULT_OQ_DTYPE },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -673,7 +675,7 @@
             // oQ Advanced Settings
             oqAdvancedOpen: false,
             oqTextOnly: false,
-            oqDtype: 'bfloat16',
+            oqDtype: DEFAULT_OQ_DTYPE,
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
             oqMtpAssistantPath: '',
@@ -923,6 +925,7 @@
                         loads.push(this.loadRecommendedModels());
                     }
                     if (this.modelsTab === 'quantizer') {
+                        this.syncOqDtypeDefault();
                         loads.push(this.loadOQModels());
                     }
                     if (this.msInitialized && this.msAvailable) {
@@ -1028,6 +1031,7 @@
                 this.mainTab = 'models';
                 this.syncTabStateToUrl();
                 if (tab === 'quantizer') {
+                    this.syncOqDtypeDefault();
                     this.loadOQModels();
                 }
                 if (tab === 'uploader') {
@@ -6583,6 +6587,14 @@
                 }
             },
 
+            syncOqDtypeDefault() {
+                const dtype = this.globalSettings.quantization?.default_oq_dtype
+                    || window.OMLX_DEFAULT_OQ_DTYPE
+                    || DEFAULT_OQ_DTYPE;
+                this.globalSettings.quantization = { default_oq_dtype: dtype };
+                this.oqDtype = dtype;
+            },
+
             async loadGlobalSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings');
@@ -6612,6 +6624,11 @@
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+                        const dtype = data.quantization?.default_oq_dtype
+                            || window.OMLX_DEFAULT_OQ_DTYPE
+                            || DEFAULT_OQ_DTYPE;
+                        this.globalSettings.quantization = { default_oq_dtype: dtype };
+                        this.oqDtype = dtype;
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
