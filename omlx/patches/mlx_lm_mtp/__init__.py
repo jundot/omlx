@@ -65,8 +65,8 @@ def is_mtp_active() -> bool:
 # next model load. Same construction-time-flag pattern as _MTP_ACTIVE: the
 # patched ``TextModel.__init__`` copies it onto the instance
 # (``_omlx_mtp_depth``) so decode never reads the global. Depth > 1 only
-# engages on models whose patch marks ``_omlx_mtp_chain`` (Qwen3.5/3.6);
-# DeepSeek-V4 stays on the depth-1 legacy cycle.
+# engages on models whose patch marks ``_omlx_mtp_chain``; the rest stay on
+# the depth-1 legacy cycle.
 _MTP_DEPTH = 1
 
 

@@ -1109,9 +1109,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
-    only). The model also has to declare MTP heads in the config; otherwise
-    the patch is a no-op.
+    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, on both
+    the mlx-vlm and mlx-lm paths). The model also has to declare MTP heads in
+    the config; otherwise the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
