@@ -18,7 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -279,21 +279,8 @@ def run_snapshot(run: ANETuningRun) -> dict[str, Any]:
 
 def _empty_result(candidate: _Candidate) -> dict[str, Any]:
     return {
-        "backend": candidate.backend,
-        "shared_fraction": candidate.shared_fraction,
-        "label": candidate.label,
+        **asdict(candidate),
         "detail": None,
-        "stage": candidate.stage,
-        "enabled": candidate.enabled,
-        "mlp_fraction": candidate.mlp_fraction,
-        "gdn_enabled": candidate.gdn_enabled,
-        "gdn_fraction": candidate.gdn_fraction,
-        "cpu_enabled": candidate.cpu_enabled,
-        "cpu_fraction": candidate.cpu_fraction,
-        "cpu_down_fraction": candidate.cpu_down_fraction,
-        "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
-        "fused_down": candidate.fused_down,
-        "cpu_threads": candidate.cpu_threads,
         "state": "pending",
         "processing_tps": None,
         "latency_ms": None,
@@ -730,19 +717,7 @@ async def _measure_candidate(
         )
 
     result = {
-        "backend": candidate.backend,
-        "shared_fraction": candidate.shared_fraction,
-        "label": candidate.label,
-        "enabled": candidate.enabled,
-        "mlp_fraction": candidate.mlp_fraction,
-        "gdn_enabled": candidate.gdn_enabled,
-        "gdn_fraction": candidate.gdn_fraction,
-        "cpu_enabled": candidate.cpu_enabled,
-        "cpu_fraction": candidate.cpu_fraction,
-        "cpu_down_fraction": candidate.cpu_down_fraction,
-        "cpu_gdn_fraction": candidate.cpu_gdn_fraction,
-        "fused_down": candidate.fused_down,
-        "cpu_threads": candidate.cpu_threads,
+        **asdict(candidate),
         "processing_tps": round(statistics.median(samples), 2),
         "samples": [round(value, 2) for value in samples],
         "_profile": profile,
@@ -2600,30 +2575,26 @@ def _k2_comparison(baseline, candidate):
                 if not all(math.isfinite(value) and value > 0 for value in samples):
                     raise RuntimeError("ANE evaluation returned an invalid measurement")
         if not gpu["samples"] or not ane["samples"]:
-            if ane.get("unavailable") == "not_tested" and gpu["samples"]:
-                rows.append(
-                    dict(
-                        id=name, unit=unit, gpu=statistics.median(gpu["samples"]),
-                        ane=None, improvement_percent=None, stable=False,
-                        unavailable="not_tested",
-                    )
-                )
-                continue
-            if (
-                name != "cached"
-                or gpu.get("unavailable") != "cache_disabled"
-                or ane.get("unavailable") != "cache_disabled"
+            unavailable = ane.get("unavailable")
+            if unavailable == "not_tested" and gpu["samples"]:
+                gpu_value = statistics.median(gpu["samples"])
+            elif (
+                name == "cached"
+                and unavailable == "cache_disabled"
+                and gpu.get("unavailable") == "cache_disabled"
             ):
+                gpu_value = None
+            else:
                 raise RuntimeError("ANE evaluation is incomplete")
             rows.append(
                 dict(
                     id=name,
                     unit=gpu["unit"],
-                    gpu=None,
+                    gpu=gpu_value,
                     ane=None,
                     improvement_percent=None,
                     stable=False,
-                    unavailable="cache_disabled",
+                    unavailable=unavailable,
                 )
             )
             continue
