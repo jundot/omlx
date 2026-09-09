@@ -156,7 +156,7 @@ final class SystemStatsTests: XCTestCase {
         XCTAssertEqual(StatsFormat.percent(nil), "–")
         XCTAssertEqual(StatsFormat.percent(0.153), "15%")
         XCTAssertEqual(StatsFormat.percent(1.7), "100%", "fractions clamp to 100%")
-        XCTAssertEqual(StatsFormat.wholeGB(512_000_000_000), "512")
+        XCTAssertEqual(StatsFormat.wholeGiB(51_539_607_552), "48")
         XCTAssertEqual(StatsFormat.window(sampleCount: 60, interval: 1.0), "60s")
         XCTAssertEqual(StatsFormat.window(sampleCount: 60, interval: 0.5), "30s")
         XCTAssertEqual(StatsFormat.window(sampleCount: 0, interval: 1.0), "")

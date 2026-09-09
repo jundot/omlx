@@ -127,4 +127,10 @@ final class SystemMetricsPoller {
         let gb = Double(bytes) / 1_000_000_000.0
         return String(format: "%.1f", gb)
     }
+
+    /// Format binary memory units for the macOS system-memory panel.
+    nonisolated static func formatBytesAsGiB(_ bytes: UInt64) -> String {
+        let gib = Double(bytes) / 1_073_741_824.0
+        return String(format: "%.1f", gib)
+    }
 }

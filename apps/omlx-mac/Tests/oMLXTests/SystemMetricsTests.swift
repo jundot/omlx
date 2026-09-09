@@ -94,6 +94,10 @@ final class SystemMetricsTests: XCTestCase {
         XCTAssertEqual(SystemMetricsPoller.formatBytesAsGB(0), "0.0")
     }
 
+    func testFormatBytesAsGibUsesBinaryUnits() {
+        XCTAssertEqual(SystemMetricsPoller.formatBytesAsGiB(51_539_607_552), "48.0")
+    }
+
     func testFormatBytesAsGbRoundsHalfUp() {
         // 12.55 GB → "12.5" (banker's) or "12.6" (away). printf %.1f on
         // Darwin rounds half to even at the binary level — pin whichever
