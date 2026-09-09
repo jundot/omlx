@@ -299,7 +299,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
         mlp = getattr(layer.mlp, "shared_experts", layer.mlp)
         for name in ("gate_proj", "up_proj", "down_proj"):
             ref = getattr(mlp, name)
-            linear = ref.linear if isinstance(ref, ConditionalLoRALinear) else ref
+            linear = _linear(ref)
             if not isinstance(linear, (nn.Linear, nn.QuantizedLinear)):
                 raise ValueError("ANE prefill requires linear K2 MLP projections")
             dtype = (
@@ -311,7 +311,7 @@ def enable_ane_prefill(model, *, fraction=FRACTION, shared_fraction=1.0, width=T
                 raise ValueError(
                     "ANE prefill requires FP16/BF16 activations and bias-free projections"
                 )
-        gate = getattr(mlp.gate_proj, "linear", mlp.gate_proj).weight
+        gate = _linear(mlp.gate_proj).weight
         alignment = max(
             64,
             *(

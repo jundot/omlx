@@ -5,15 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 
-from .uno_adapter import ConditionalLoRALinear
-
-
-def _project(ref, x, mask):
-    return (
-        ref.conditional_forward(x, mask)
-        if isinstance(ref, ConditionalLoRALinear)
-        else ref(x)
-    )
+from .k2_horizon_model import _project
 
 
 def make_regions(layer):
