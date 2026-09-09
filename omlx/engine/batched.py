@@ -204,7 +204,13 @@ class BatchedEngine(BaseEngine):
             from ..utils.install import get_install_method
 
             method = get_install_method()
-            if method == "dmg":
+            if self.model_type == "k2_horizon":
+                logger.info(
+                    "K2 tool grammar is unavailable; generating unconstrained "
+                    "tool calls with normal API parsing. Install omlx[grammar] "
+                    "to enable tool-name constraints."
+                )
+            elif method == "dmg":
                 logger.warning(
                     "GrammarCompiler initialization failed for %s on the "
                     "DMG build. The bundle ships xgrammar against a torch "
@@ -773,7 +779,8 @@ class BatchedEngine(BaseEngine):
                 from ..patches.k2_horizon.tool_grammar import validate_tool_prefix
 
                 validate_chat_template_kwargs(template_kwargs)
-                validate_tool_prefix(messages, tools, is_partial)
+                if tools and self.grammar_compiler is not None:
+                    validate_tool_prefix(messages, tools, is_partial)
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
                     self._tokenizer,

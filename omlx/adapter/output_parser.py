@@ -1222,14 +1222,13 @@ _K2_MARKERS = tuple(marker for pair in _K2_THINK_MARKERS for marker in pair) + (
 
 
 class K2HorizonOutputParserSession:
-    """Normalize IFM reasoning markers to ``<think>`` and hide tool envelopes."""
+    """Normalize IFM reasoning markers; leave tool parsing to the shared API path."""
 
     def __init__(
         self,
         tokenizer: Any,
         marker_ids: dict[str, int],
         model_path: str | None = None,
-        tools: list[dict] | None = None,
     ):
         self._tokenizer = tokenizer
         self._open_ids = {marker_ids[start] for start, _ in _K2_THINK_MARKERS}
@@ -1238,16 +1237,10 @@ class K2HorizonOutputParserSession:
             marker_ids[_K2_TOOL_CALLS_START]: _K2_TOOL_CALLS_START,
             marker_ids[_K2_TOOL_CALLS_END]: _K2_TOOL_CALLS_END,
         }
-        self._tools = tools
         self._in_reasoning = False
-        self._raw_text = ""
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
             self._detokenizer.reset()
-
-        from ..api.tool_calling import ToolCallStreamFilter
-
-        self._tool_filter = ToolCallStreamFilter(tokenizer)
 
     def notify_prefilled_thought(self) -> None:
         self._in_reasoning = True
@@ -1256,10 +1249,8 @@ class K2HorizonOutputParserSession:
         return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _emit(self, text: str) -> OutputParserTokenResult:
-        self._raw_text += text
-        visible = self._tool_filter.feed(text)
         return OutputParserTokenResult(
-            stream_text=visible, visible_text=visible, record_token=True
+            stream_text=text, visible_text=text, record_token=True
         )
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
@@ -1285,38 +1276,11 @@ class K2HorizonOutputParserSession:
         text = ""
         if self._detokenizer is not None:
             self._detokenizer.finalize()
-            final_text = self._detokenizer.last_segment
-            self._raw_text += final_text
-            text = self._tool_filter.feed(final_text)
-        text += self._tool_filter.finish()
-
-        tool_calls: list[dict[str, str]] = []
-        error = None
-        if self._tools:
-            try:
-                from ..api.tool_calling import parse_tool_calls
-
-                _, parsed_calls = parse_tool_calls(
-                    self._raw_text, self._tokenizer, self._tools
-                )
-                for call in parsed_calls or []:
-                    tool_calls.append(
-                        {
-                            "id": getattr(call, "id", ""),
-                            "name": call.function.name,
-                            "arguments": call.function.arguments,
-                        }
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("K2 Horizon tool-call parse failed: %s", e)
-                error = "K2 Horizon generated an incomplete or malformed tool call."
+            text = self._detokenizer.last_segment
 
         return OutputParserFinalizeResult(
             stream_text=text,
             visible_text=text,
-            tool_calls=tool_calls,
-            finish_reason="tool_calls" if tool_calls else None,
-            error=error,
         )
 
 
@@ -1383,14 +1347,6 @@ def detect_output_parser(
                 session_tokenizer,
                 marker_ids,
                 model_path=session_model_path,
-            ),
-            create_session_with_tools=lambda session_tokenizer, tools: (
-                K2HorizonOutputParserSession(
-                    session_tokenizer,
-                    marker_ids,
-                    model_path=session_model_path,
-                    tools=tools,
-                )
             ),
             thinking_start_text=_K2_THINK_MARKERS[0][0],
             thinking_start_output_text="<think>\n",

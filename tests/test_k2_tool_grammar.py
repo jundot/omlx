@@ -122,11 +122,11 @@ def test_alternate_tokenizations_prefixes_and_request_isolation(compiler):
     assert not accept(other, "<ifm|tool_calls><ifm|tool_call>read</ifm|tool_call>")
 
 
-def test_optional_constraints_fail_explicitly(compiler):
+def test_optional_backend_and_conflicting_constraints(compiler):
     existing = object()
     assert compile_tool_grammar(None, [], existing) is existing
-    with pytest.raises(InvalidRequestError, match="xgrammar"):
-        compile_tool_grammar(None, tools_for("read"))
+    assert compile_tool_grammar(None, tools_for("read")) is None
+    assert compile_tool_grammar(None, tools_for("read"), existing) is existing
     with pytest.raises(InvalidRequestError, match="together"):
         compile_tool_grammar(compiler, tools_for("read"), existing)
 

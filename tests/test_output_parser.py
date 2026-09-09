@@ -69,6 +69,7 @@ class CohereTokenizer:
 
 
 def test_k2_reasoning_modes_and_tool_envelopes():
+    from omlx.api.tool_calling import parse_tool_calls
     from omlx.patches.k2_horizon.tool_parser import parse_tool_call
 
     markers = [
@@ -100,7 +101,7 @@ def test_k2_reasoning_modes_and_tool_envelopes():
     factory = detect_output_parser("k2", tokenizer, {"model_type": "k2_horizon"})
     tools = [{"type": "function", "function": {"name": "weather"}}]
     for mode in ("think", "think_fast", "think_faster"):
-        session = factory.create_session_with_tools(tokenizer, tools)
+        session = factory.create_session(tokenizer)
         tokens = [
             ids[f"<ifm|{mode}>"],
             1,
@@ -112,9 +113,16 @@ def test_k2_reasoning_modes_and_tool_envelopes():
         ]
         text = "".join(session.process_token(token).stream_text for token in tokens)
         final = session.finalize()
-        assert text + final.stream_text == "<think>\nreason</think>answer"
-        assert final.tool_calls[0]["name"] == "weather"
-        assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Paris"}
+        assert text + final.stream_text == (
+            "<think>\nreason</think>answer<ifm|tool_calls>"
+            + tokenizer.decode([3])
+            + "</ifm|tool_calls>"
+        )
+        assert final.tool_calls == []
+        clean, calls = parse_tool_calls(text + final.stream_text, tokenizer, tools)
+        assert clean == "answer"
+        assert calls[0].function.name == "weather"
+        assert json.loads(calls[0].function.arguments) == {"city": "Paris"}
 
 
 class DeepSeekV4Tokenizer(CohereTokenizer):

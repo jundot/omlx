@@ -4289,3 +4289,172 @@ class TestStreamingEdgeCases:
                     finish_reasons.append(fr)
 
         assert "length" in finish_reasons
+
+
+class TestK2OptionalToolGrammar:
+    """Exercise the real HTTP serialization with an unavailable grammar backend."""
+
+    @pytest.fixture
+    def k2_client(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from omlx.api import grammar
+        from omlx.engine.batched import BatchedEngine
+        from omlx.patches.k2_horizon.tool_parser import parse_tool_call
+        from omlx.server import app, _server_state
+
+        class K2Engine(MockBaseEngine):
+            grammar_compiler = BatchedEngine.grammar_compiler
+
+            async def preflight_chat(self, messages, tools=None, **kwargs):
+                BatchedEngine._prepare_k2_tool_grammar(self, tools, kwargs)
+                assert kwargs["compiled_grammar"] is None
+
+            async def chat(self, messages, **kwargs):
+                return self._stream_outputs[-1]
+
+        def unavailable(*args, **kwargs):
+            raise ImportError("No module named 'xgrammar'")
+
+        monkeypatch.setattr(grammar, "create_grammar_compiler", unavailable)
+        engine = K2Engine()
+        engine._model_type = "k2_horizon"
+        engine._model = None
+        engine._grammar_compiler = None
+        engine._grammar_compiler_init_attempted = False
+        engine.tokenizer.has_tool_calling = True
+        engine.tokenizer.tool_call_start = "<ifm|tool_calls>"
+        engine.tokenizer.tool_call_end = "</ifm|tool_calls>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
+        monkeypatch.setattr(_server_state, "default_model", "test-model")
+        yield TestClient(app), engine
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'before<ifm|tool_calls><ifm|tool_call>{"name":"read","arguments":{"path":"test.py"}}</ifm|tool_call></ifm|tool_calls>after',
+            "before<ifm|tool_calls><ifm|tool_call>read<ifm|arg_key>path</ifm|arg_key><ifm|arg_value>test.py</ifm|arg_value></ifm|tool_call></ifm|tool_calls>after",
+            'before<ifm|tool_calls><ifm|tool_call>{"name":"bash","arguments":{"command":"python3 verify.py</ifm|arg_value>\n</ifm|tool_call></ifm|tool_calls>',
+            'before<ifm|tool_calls><ifm|tool_call>{"name":"read"}</ifm|tool_call></ifm|tool_calls>after',
+        ],
+    )
+    def test_valid_calls_and_malformed_text(self, k2_client, stream, api, body):
+        client, engine = k2_client
+        valid = "test.py" in body
+        raw = "<think>Reasoning.</think>" + body
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text=raw[: i + 5],
+                    new_text=raw[i : i + 5],
+                    completion_tokens=i // 5 + 1,
+                    finished=i + 5 >= len(raw),
+                    finish_reason="stop" if i + 5 >= len(raw) else None,
+                )
+                for i in range(0, len(raw), 5)
+            ]
+        )
+        schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+        request = {"model": "test-model", "stream": stream}
+        if api == "responses":
+            request.update(
+                input="Read test.py",
+                store=False,
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "read",
+                        "parameters": schema,
+                    }
+                ],
+            )
+        else:
+            request["messages"] = [{"role": "user", "content": "Read test.py"}]
+            if api == "messages":
+                request.update(
+                    max_tokens=1024,
+                    tools=[
+                        {
+                            "name": "read",
+                            "input_schema": schema,
+                        }
+                    ],
+                )
+            else:
+                request["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "parameters": schema,
+                        },
+                    }
+                ]
+        response = client.post("/v1/" + api, json=request)
+        assert response.status_code == 200, response.text
+        assert engine._grammar_compiler_init_attempted
+        assert engine._grammar_compiler is None
+        text, calls = "", []
+        if stream:
+            events = parse_sse_events(response.text)
+            assert not any("error" in event for event in events), events
+            if api == "chat/completions":
+                deltas = [
+                    c.get("delta", {}) for e in events for c in e.get("choices", [])
+                ]
+                text = "".join(d.get("content", "") for d in deltas)
+                calls = [t for d in deltas for t in d.get("tool_calls", [])]
+                assert (
+                    "".join(d.get("reasoning_content", "") for d in deltas)
+                    == "Reasoning."
+                )
+            elif api == "messages":
+                text = "".join(
+                    e["delta"].get("text", "")
+                    for e in events
+                    if e.get("type") == "content_block_delta"
+                )
+                calls = [
+                    e["content_block"]
+                    for e in events
+                    if e.get("type") == "content_block_start"
+                    and e["content_block"]["type"] == "tool_use"
+                ]
+            else:
+                text = "".join(
+                    e["delta"]
+                    for e in events
+                    if e.get("type") == "response.output_text.delta"
+                )
+                calls = [
+                    e["item"]
+                    for e in events
+                    if e.get("type") == "response.output_item.done"
+                    and e["item"]["type"] == "function_call"
+                ]
+        else:
+            data = response.json()
+            if api == "chat/completions":
+                message = data["choices"][0]["message"]
+                text, calls = message.get("content", ""), message.get("tool_calls", [])
+                assert message["reasoning_content"] == "Reasoning."
+            elif api == "messages":
+                text = "".join(
+                    item["text"] for item in data["content"] if item["type"] == "text"
+                )
+                calls = [item for item in data["content"] if item["type"] == "tool_use"]
+            else:
+                text = "".join(
+                    c["text"]
+                    for item in data["output"]
+                    if item["type"] == "message"
+                    for c in item["content"]
+                    if c["type"] == "output_text"
+                )
+                calls = [
+                    item for item in data["output"] if item["type"] == "function_call"
+                ]
+        assert text == ("beforeafter" if valid else body)
+        assert bool(calls) is valid

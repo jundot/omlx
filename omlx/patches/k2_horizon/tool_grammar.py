@@ -22,16 +22,12 @@ def _sequence(*elements):
 
 
 def compile_tool_grammar(compiler, tools, existing=None):
-    """Constrain names in native XML/JSON envelopes without inspecting descriptions."""
-    if not tools:
+    """Constrain native tool names when the optional grammar backend is available."""
+    if not tools or compiler is None:
         return existing
     if existing is not None:
         raise InvalidRequestError(
             "K2 tool names and structured output cannot be constrained together."
-        )
-    if compiler is None:
-        raise InvalidRequestError(
-            "K2 tool-name constraints require xgrammar. Install omlx[grammar]."
         )
     names = sorted({tool["function"]["name"] for tool in tools})
     whitespace = {"type": "grammar", "grammar": r"root ::= [ \t\r\n]*"}
