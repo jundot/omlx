@@ -1046,6 +1046,7 @@
   "chat.more_actions_tooltip": "More actions",
   "chat.branch_here": "Branch here",
   "chat.delete_message": "Delete",
+  "chat.confirm_delete_message": "Esto eliminará este mensaje y todos los mensajes posteriores en este chat. ¿Continuar?",
   "chat.copy_markdown": "Copy markdown",
   "chat.generating_tooltip": "Generating",
   "chat.delete_response_tooltip": "Delete this response",
