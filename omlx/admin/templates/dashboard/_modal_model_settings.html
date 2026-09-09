@@ -178,14 +178,22 @@
                                                 ? 'bg-emerald-500 text-white border border-emerald-500'
                                                 : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
                                             class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
-                                        <span x-show="p.expose_as_model"
-                                              class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
-                                              :class="p.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
                                         <span x-text="p.display_name || p.name"></span>
                                         <span x-show="activeProfileName === p.name && profilesDrift"
                                               class="w-1.5 h-1.5 rounded-full bg-white"
                                               :title="t('modal.model_settings.profiles.drift_hint')"></span>
                                     </button>
+                                    <!-- Direct expose/unexpose toggle — exposing an existing
+                                         profile no longer requires opening the edit dialog. -->
+                                    <button type="button" @click="toggleProfileExpose(p)"
+                                            @mouseenter="showTip($event.currentTarget, t('modal.model_settings.profiles.expose_hint') + (p.has_engine_fields ? ('\n' + t('modal.model_settings.profiles.expose_engine_fields_hint')) : ''))"
+                                            @mouseleave="hideTip()"
+                                            :aria-pressed="!!p.expose_as_model"
+                                            :aria-label="t('modal.model_settings.profiles.expose_as_model')"
+                                            :class="p.expose_as_model
+                                                ? (p.has_engine_fields ? 'bg-amber-500 text-white border-amber-500' : 'bg-emerald-500 text-white border-emerald-500')
+                                                : 'bg-white text-neutral-400 border-neutral-200 hover:text-neutral-700 hover:border-neutral-400'"
+                                            class="px-1.5 py-1 text-[9px] font-bold rounded-full border transition-colors">API</button>
                                     <button type="button"
                                             @click="editingProfile = p.name; p._editDisplayName = p.display_name || p.name; p._editApiName = p.api_name || p.name; p._editDescription = p.description || ''; p._editExposeAsModel = !!p.expose_as_model; profileError = ''"
                                             class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
@@ -204,7 +212,7 @@
                                 </div>
                             </template>
                             <button type="button"
-                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {display_name:'',api_name:'',api_name_touched:false,description:'',also_as_template:false}"
+                                    @click="showNewProfileForm = true; profileError = ''; newProfile = {display_name:'',api_name:'',api_name_touched:false,description:'',also_as_template:false,expose_as_model:false}"
                                     class="px-2.5 py-1 text-xs rounded-full border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
                                 {{ t('modal.model_settings.profiles.new_profile') }}
                             </button>
@@ -216,8 +224,33 @@
                         <input type="text" x-model="newProfile.display_name" :placeholder="t('modal.model_settings.profiles.display_name_label')"
                                @input="if (!newProfile.api_name_touched) newProfile.api_name = slugifyProfileApiName(newProfile.display_name)"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
-                        <input type="text" x-model="newProfile.api_name" @input="newProfile.api_name_touched = true" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
-                               class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
+                        <div class="flex gap-2">
+                            <input type="text" x-model="newProfile.api_name" @input="newProfile.api_name_touched = true" :placeholder="t('modal.model_settings.profiles.name_placeholder')"
+                                   class="min-w-0 flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs font-mono">
+                            <!-- Same ON/OFF affordance as the edit dialog (§3 Theme A):
+                                 exposing is a one-step choice at create time, not a
+                                 second trip through the edit dialog. -->
+                            <button type="button"
+                                    @click="newProfile.expose_as_model = !newProfile.expose_as_model"
+                                    @mouseenter="showTip($event.currentTarget, t('modal.model_settings.profiles.expose_hint'))"
+                                    @mouseleave="hideTip()"
+                                    :aria-pressed="!!newProfile.expose_as_model"
+                                    :aria-label="t('modal.model_settings.profiles.expose_as_model')"
+                                    :class="newProfile.expose_as_model
+                                        ? 'bg-emerald-600 text-white border-emerald-600'
+                                        : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
+                                    class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
+                                API
+                                <span x-text="newProfile.expose_as_model ? 'ON' : 'OFF'"></span>
+                            </button>
+                        </div>
+                        <!-- Live preview of the exact string that will appear in the
+                             models list — see it before saving, not after. -->
+                        <p x-show="newProfile.expose_as_model" x-cloak class="text-[10px] text-neutral-500">
+                            {{ t('modal.model_settings.profiles.exposed_as') }}:
+                            <span class="font-mono text-neutral-700"
+                                  x-text="(selectedModel?.settings?.model_alias || selectedModel?.id || '') + ':' + (newProfile.api_name || slugifyProfileApiName(newProfile.display_name) || '…')"></span>
+                        </p>
                         <input type="text" x-model="newProfile.description" :placeholder="t('modal.model_settings.profiles.description_label')"
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">

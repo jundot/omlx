@@ -278,7 +278,7 @@
             _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
-            newProfile: { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false },
+            newProfile: { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false, expose_as_model: false },
             showNewTemplateForm: false,
             newTemplate: { name: '', display_name: '', description: '' },
             editingProfile: null,        // profile name being edited inline
@@ -7090,7 +7090,12 @@
                 return null;
             },
             profileTooltip(profile) {
-                const lines = [];
+                // §3 Theme A / 1.4 of docs/named-profile-model-list-feature.md:
+                // clicking this pill applies the profile to the base model's
+                // form — it never publishes anything. The API toggle next to
+                // it is the one that exposes; the two are independent and
+                // the UI doesn't say so anywhere else.
+                const lines = [window.t('modal.model_settings.profiles.apply_hint')];
                 if (profile?.expose_as_model && profile.model_id) {
                     lines.push(profile.model_id);
                 }
@@ -7554,6 +7559,7 @@
                     description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(
@@ -7565,7 +7571,7 @@
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
-                        this.newProfile = { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false };
+                        this.newProfile = { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false, expose_as_model: false };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -7707,6 +7713,14 @@
                     settings: this.formValuesForProfile(),
                 });
             },
+            // Direct expose/unexpose from the pill's API badge — the
+            // second affordance from docs/named-profile-model-list-feature.md
+            // §3 Theme A: exposing an existing profile no longer requires
+            // the edit dialog. Errors surface through the shared
+            // `profileError` slot, same as every other profile action.
+            toggleProfileExpose(p) {
+                return this.updateProfile(p.name, { expose_as_model: !p.expose_as_model });
+            },
             async updateProfile(name, patch) {
                 // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
                 if (!this.selectedModel) return;
@@ -7734,6 +7748,52 @@
                     }
                 } catch (e) {
                     this.profileError = String(e);
+                }
+            },
+            // Settings-tab models table (§3 Theme B / Phase 2.1 of
+            // docs/named-profile-model-list-feature.md): open the base
+            // model's settings modal with this profile's edit dialog
+            // pre-opened, rather than requiring the user to find it in the
+            // pill row themselves. `profile` here is the list's own
+            // exposed_profiles entry (admin/routes.py:2052-2056); the modal
+            // reloads profiles fresh via openModelSettings, so match by name
+            // against that fresh list rather than reusing this object.
+            async editExposedProfileFromList(model, profile) {
+                await this.openModelSettings(model);
+                const target = this.profiles.find(p => p.name === profile.name);
+                if (!target) return;
+                this.profileScope = 'model';
+                this.editingProfile = target.name;
+                target._editDisplayName = target.display_name || target.name;
+                target._editApiName = target.api_name || target.name;
+                target._editDescription = target.description || '';
+                target._editExposeAsModel = !!target.expose_as_model;
+                this.profileError = '';
+            },
+            // Expose-off action for a profile row, without requiring the
+            // settings modal to be open at all (Phase 2.1). Standalone
+            // fetch rather than `updateProfile` — that method requires
+            // `selectedModel` to already be set from an open modal.
+            async unexposeProfileFromList(model, profile) {
+                try {
+                    const r = await fetch(
+                        `/admin/api/models/${encodeURIComponent(model.id)}/profiles/${encodeURIComponent(profile.name)}`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ expose_as_model: false }),
+                        },
+                    );
+                    if (r.ok) {
+                        await this.loadModels();
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        alert(data.detail || window.t('js.error.update_profile_failed'));
+                    }
+                } catch (e) {
+                    alert(String(e));
                 }
             },
             async createTemplate() {

@@ -3932,6 +3932,25 @@
         if (storedKey) {
             this.apiKeySet = true;
             await this.loadModels();
+            // Deep-link from an admin models-list row (§3 Theme B /
+            // docs/named-profile-model-list-feature.md 2.2): `?model=` opens
+            // a fresh chat preselecting that model/exposed-profile ID, then
+            // the param is dropped so a reload doesn't keep forcing a new
+            // chat. Falls through silently if the ID isn't (or is no longer)
+            // available — same as any other stale-model case.
+            const deepLinkParams = new URLSearchParams(window.location.search);
+            const deepLinkModel = deepLinkParams.get('model');
+            if (deepLinkModel && this.isModelAvailableOnServer(deepLinkModel)) {
+                this.currentModel = this.resolveGatewayModelId(deepLinkModel);
+                await this.startNewChat();
+                deepLinkParams.delete('model');
+                const cleanedSearch = deepLinkParams.toString();
+                history.replaceState(
+                    null,
+                    '',
+                    window.location.pathname + (cleanedSearch ? `?${cleanedSearch}` : '') + window.location.hash,
+                );
+            }
             if (this.currentModel) {
                 await this.loadModelCapabilities(this.currentModel);
             }

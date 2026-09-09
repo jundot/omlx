@@ -1615,20 +1615,12 @@
                                         </div>
                                     </div>
 
-                                    <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
+                                    <!-- Preset / per-field chips (exposed profiles now get their
+                                         own rows below, not a chip in this summary — §3 Theme B of
+                                         docs/named-profile-model-list-feature.md) -->
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true))"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
-                                            <!-- 1. API-exposed profile pills -->
-                                            <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
-                                                      @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
-                                                      @mouseleave="hideTip()">
-                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
-                                                          :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
-                                                    <span x-text="profile.api_name || profile.name"></span>
-                                                </span>
-                                            </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->
                                             <template x-if="!model.settings?.active_profile_name && matchedPreset(model.settings)">
                                                 <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-cyan-50 text-cyan-700 border border-cyan-200">
@@ -1706,6 +1698,51 @@
                                             </template>
                                         </div>
                                     </div>
+
+                                    <!-- Exposed-profile child rows (§3 Theme B): always the ↳
+                                         indent + API badge + "via <base>" attribution, so they
+                                         can never be mistaken for a physical model directory.
+                                         Favorite/default/hidden toggles are base-model-only —
+                                         those fields are excluded from profiles by design. -->
+                                    <template x-for="profile in (model.exposed_profiles || [])" :key="'row-' + profile.name">
+                                        <div class="flex items-center gap-3 pl-14 pr-6 py-2 border-t border-neutral-100">
+                                            <span class="text-neutral-300 flex-shrink-0" aria-hidden="true">↳</span>
+                                            <span class="px-1 py-0.5 text-[9px] font-bold rounded flex-shrink-0"
+                                                  :class="profile.has_engine_fields ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'">API</span>
+                                            <div class="flex-1 min-w-0 flex items-center gap-2">
+                                                <p class="text-sm font-medium text-neutral-800 truncate"
+                                                   x-text="profile.display_name || profile.name"></p>
+                                                <span class="font-mono text-[10px] text-neutral-400 truncate" x-text="profile.model_id"></span>
+                                                <span class="text-[10px] text-neutral-400 flex-shrink-0"
+                                                      x-text="window.t('settings.models.table.profile_via') + ' ' + (model.display_name || model.id)"></span>
+                                                <!-- §3 Theme B / OQ4 fidelity: the resident engine may be a
+                                                     different engine-construction variant than this profile
+                                                     would produce -- memory is occupied either way, but
+                                                     selecting this profile is not a free no-op. -->
+                                                <span x-show="model.loaded && profile.variant_active === false" x-cloak
+                                                      class="text-[10px] font-medium text-amber-600 flex-shrink-0"
+                                                      x-text="window.t('settings.models.table.profile_loaded_base_variant')"></span>
+                                                <span x-show="model.loaded && profile.variant_active !== false" x-cloak
+                                                      class="text-[10px] font-medium text-neutral-400 flex-shrink-0"
+                                                      x-text="window.t('settings.models.table.status_loaded').toLowerCase()"></span>
+                                            </div>
+                                            <button @click="window.location.href = '/admin/chat?model=' + encodeURIComponent(profile.model_id)"
+                                                    :title="window.t('settings.models.table.profile_chat_tooltip')"
+                                                    class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all flex-shrink-0">
+                                                <i data-lucide="message-square" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                            <button @click="editExposedProfileFromList(model, profile)"
+                                                    :title="window.t('settings.models.table.profile_edit_tooltip')"
+                                                    class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all flex-shrink-0">
+                                                <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                            <button @click="unexposeProfileFromList(model, profile)"
+                                                    :title="window.t('settings.models.table.profile_unexpose_tooltip')"
+                                                    class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all flex-shrink-0">
+                                                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                        </div>
+                                    </template>
                                 </div>
                             </template>
                         </div>

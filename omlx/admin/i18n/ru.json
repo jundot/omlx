@@ -1130,5 +1130,12 @@
   "js.success.download_started": "Загрузка начата: {repo_id}",
   "js.success.settings_saved": "Настройки успешно сохранены",
   "settings.mcp.expose_tools": "Показывать инструменты MCP бэкенда клиентам",
-  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы."
+  "settings.mcp.expose_tools_hint": "Объединяет инструменты MCP бэкенда с ответами. Отключите, если ваш клиент использует свои собственные MCP-серверы.",
+  "settings.models.table.profile_via": "via",
+  "settings.models.table.profile_edit_tooltip": "Edit this exposed profile",
+  "settings.models.table.profile_unexpose_tooltip": "Remove from API",
+  "settings.models.table.profile_chat_tooltip": "Open in chat",
+  "settings.models.table.profile_loaded_base_variant": "loaded (base variant)",
+  "modal.model_settings.profiles.apply_hint": "Applying loads these settings into the form below — not saved until you click Save.",
+  "modal.model_settings.profiles.expose_hint": "Exposing publishes this profile as its own model entry in the API; it never changes the base model's settings."
 }

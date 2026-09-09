@@ -807,6 +807,69 @@ class TestExposeAsModelAPI:
         assert entry["exposed_profiles"][0]["api_name"] == "think-on"
         assert entry["exposed_profiles"][0]["model_id"] == "model-a:think-on"
 
+    def test_exposed_profile_variant_active_false_on_signature_mismatch(self, client):
+        """§3 Theme B fidelity fix (docs/named-profile-model-list-feature.md):
+        /admin/api/models must not silently report a profile as reusing the
+        resident engine when it was loaded with different engine-construction
+        settings -- selecting the profile would actually trigger a reload."""
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "thinking",
+                "display_name": "Thinking",
+                "settings": {"temperature": 0.6},
+                "expose_as_model": True,
+            },
+        )
+        pool = admin_routes._get_engine_pool()
+        entry = pool._entries["model-a"]
+        entry.engine = object()
+        # _FakePool._engine_runtime_signature always returns () -- any
+        # non-empty resident signature is therefore a real mismatch.
+        entry.runtime_settings_signature = (("mismatched", "true"),)
+        pool.get_status = lambda: {
+            "models": [
+                {
+                    "id": "model-a",
+                    "loaded": True,
+                    "pinned": False,
+                    "engine_type": "batched",
+                    "model_type": "llm",
+                }
+            ]
+        }
+
+        r = c.get("/admin/api/models")
+
+        assert r.status_code == 200
+        entry_data = r.json()["models"][0]
+        profile = next(
+            p for p in entry_data["exposed_profiles"] if p["name"] == "thinking"
+        )
+        assert profile["variant_active"] is False
+
+    def test_exposed_profile_omits_variant_flag_when_not_loaded(self, client):
+        c, _ = client
+        c.post(
+            "/admin/api/models/model-a/profiles",
+            json={
+                "name": "thinking",
+                "display_name": "Thinking",
+                "settings": {"temperature": 0.6},
+                "expose_as_model": True,
+            },
+        )
+
+        r = c.get("/admin/api/models")
+
+        assert r.status_code == 200
+        entry_data = r.json()["models"][0]
+        profile = next(
+            p for p in entry_data["exposed_profiles"] if p["name"] == "thinking"
+        )
+        assert "variant_active" not in profile
+
     def test_put_toggles_exposure_without_touching_settings(self, client):
         """A flag-only PUT flips exposure and leaves the profile's settings
         intact (None for expose_as_model means 'don't touch' on other fields)."""
@@ -978,12 +1041,16 @@ class TestExposeAsModelAPI:
         assert "api_name" in js
         assert "modal.model_settings.profiles.invalid_name" in en
         # Profile chips keep the display name visible in both API-on and
-        # API-off states. API state is shown as a badge and edited from the
-        # edit form, not toggled directly from the chip row.
+        # API-off states. API state is shown as a badge, editable from the
+        # edit form AND directly toggleable from the chip row's own API
+        # badge (docs/named-profile-model-list-feature.md §3 Theme A / 1.3)
+        # via the shared updateProfile PUT path.
         assert "profileTooltip(p)" in html
         assert "p.display_name || p.name" in html
         assert "p.expose_as_model ? (p.api_name || p.name)" not in html
-        assert "expose_as_model: !p.expose_as_model" not in html
+        assert "toggleProfileExpose(p)" in html
+        assert "toggleProfileExpose(p)" in js
+        assert "expose_as_model: !p.expose_as_model" in js
         assert "p.has_engine_fields" in html
         # Editing updates display_name/api_name/description/exposure without
         # renaming the internal profile key.
@@ -1000,15 +1067,23 @@ class TestExposeAsModelAPI:
         assert "updateProfileSettingsFromForm(p)" in html
         assert "_editDescription" in html
         assert "_editExposeAsModel" in html
-        assert "profileTooltip(profile)" in settings_html
+        # Settings-tab table: exposed profiles get their own indented child
+        # rows (§3 Theme B / Phase 2.1), not just a chip in the settings
+        # summary — display name, exposed model_id, "via <base>"
+        # attribution, and edit/expose-off/chat actions.
         assert "model.exposed_profiles" in settings_html
-        assert "profile.api_name || profile.name" in settings_html
+        assert "profile.display_name || profile.name" in settings_html
+        assert "profile.model_id" in settings_html
         assert settings_html.index("profile.has_engine_fields") < settings_html.index(
-            "profile.api_name || profile.name"
+            "profile.display_name || profile.name"
         )
+        assert "editExposedProfileFromList(model, profile)" in settings_html
+        assert "unexposeProfileFromList(model, profile)" in settings_html
+        assert "editExposedProfileFromList" in js
+        assert "unexposeProfileFromList" in js
         assert 'x-text="model.settings.active_profile_name"' not in settings_html
         assert "profileTooltip" in js
         assert "whitespace-pre-line" in dashboard_html
         assert "modal.model_settings.profiles.expose_as_model" in html
         assert "modal.model_settings.profiles.exposed_as" in en
-        assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
+        assert "modal.model_settings.profiles.expose_hint" in en
