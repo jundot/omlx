@@ -130,6 +130,62 @@
             </ul>
         </details>
 
+        <!-- SLO Status Cards -->
+        <div x-show="clusterSlos && clusterSlos.slos && clusterSlos.slos.length" x-cloak class="mb-6">
+            <div class="flex items-center gap-2 mb-3">
+                <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+                <h3 class="text-sm font-semibold text-neutral-900">Service Level Objectives</h3>
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+                      :class="{
+                          'bg-green-100 text-green-800': clusterSlos.overall_status === 'healthy',
+                          'bg-amber-100 text-amber-800': clusterSlos.overall_status === 'degraded',
+                          'bg-red-100 text-red-800': clusterSlos.overall_status === 'breached'
+                      }"
+                      x-text="clusterSlos.overall_status"></span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <template x-for="slo in (clusterSlos.slos || [])" :key="slo.name">
+                    <div class="rounded-xl border p-3 transition-colors"
+                         :class="{
+                             'border-green-200 bg-green-50': slo.status === 'healthy',
+                             'border-amber-200 bg-amber-50': slo.status === 'degraded',
+                             'border-red-200 bg-red-50': slo.status === 'breached'
+                         }">
+                        <div class="flex items-center justify-between mb-1.5">
+                            <span class="text-[10px] font-semibold uppercase tracking-wider"
+                                  :class="{
+                                      'text-green-700': slo.status === 'healthy',
+                                      'text-amber-700': slo.status === 'degraded',
+                                      'text-red-700': slo.status === 'breached'
+                                  }"
+                                  x-text="slo.status"></span>
+                            <span class="text-[10px] font-mono text-neutral-400" x-text="slo.metric_kind"></span>
+                        </div>
+                        <div class="text-xs font-semibold text-neutral-900 mb-0.5" x-text="slo.description || slo.name"></div>
+                        <div class="flex items-baseline gap-1.5 mt-1.5">
+                            <span class="text-lg font-bold tabular-nums"
+                                  :class="{
+                                      'text-green-700': slo.status === 'healthy',
+                                      'text-amber-700': slo.status === 'degraded',
+                                      'text-red-700': slo.status === 'breached'
+                                  }"
+                                  x-text="slo.compliance_pct + '%'"></span>
+                            <span class="text-[10px] text-neutral-400">compliance</span>
+                        </div>
+                        <div class="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-500">
+                            <span>Burn rate: <span class="font-semibold tabular-nums" x-text="slo.burn_rate.toFixed(2) + 'x'"></span></span>
+                            <span x-show="slo.time_to_breach_seconds != null">
+                                Breach in: <span class="font-semibold" x-text="slo.time_to_breach_seconds < 3600 ? Math.round(slo.time_to_breach_seconds / 60) + 'm' : Math.round(slo.time_to_breach_seconds / 3600) + 'h'"></span>
+                            </span>
+                        </div>
+                        <div class="mt-1 text-[10px] text-neutral-400 font-mono" x-show="slo.current_value != null">
+                            Current: <span x-text="slo.current_value"></span> / Target: <span x-text="slo.target"></span>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
         <!-- Where you are in setting up a cluster. Four states, in order. -->
         <div x-show="clusterStatus && clusterShowSetupDetails" x-cloak class="mb-6">
             <ol class="grid grid-cols-2 lg:grid-cols-4 gap-3">
