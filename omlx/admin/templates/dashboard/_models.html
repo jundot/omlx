@@ -858,8 +858,15 @@
                         <!-- ===== ModelScope Source ===== -->
                         <div x-show="downloaderSource === 'ms'" x-cloak>
 
+                            <!-- MS Checking Banner: shown only while the availability
+                                 check is in flight, so the amber "unavailable" banner
+                                 below doesn't flash misleadingly before it resolves. -->
+                            <div x-show="msChecking" x-cloak class="bg-neutral-50 border border-neutral-200 rounded-2xl p-6 mb-6 text-center">
+                                <p class="text-sm text-neutral-500" x-text="window.t('models.downloader.ms_checking')"></p>
+                            </div>
+
                             <!-- MS Unavailable Banner -->
-                            <div x-show="!msAvailable" class="bg-amber-50 border border-amber-200 rounded-2xl p-6 mb-6 text-center">
+                            <div x-show="!msChecking && !msAvailable" x-cloak class="bg-amber-50 border border-amber-200 rounded-2xl p-6 mb-6 text-center">
                                 <i data-lucide="alert-triangle" class="w-8 h-8 text-amber-400 mx-auto mb-3"></i>
                                 <p class="text-sm text-amber-700" x-text="window.t('models.downloader.ms_unavailable')"></p>
                             </div>

@@ -188,9 +188,13 @@ struct ServerScreen: View {
         .onChange(of: services.config) { _, _ in
             vm.applyConfig(services.config)
         }
-        .onChange(of: services.serverState) { _, _ in
+        .onChange(of: services.serverState) { _, newState in
             // After a restart triggered by saving host/port, reload to pick
-            // up the new effective values.
+            // up the new effective values. Skip .stopping/.stopped (and any
+            // other non-running-like state) — reloading there just hits a
+            // connection-refused getGlobalSettings() and paints a spurious
+            // error every time the user stops their own server (§G3).
+            guard newState.isRunningLike else { return }
             Task { await vm.load(client: services.client) }
         }
     }

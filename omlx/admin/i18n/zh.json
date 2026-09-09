@@ -1130,5 +1130,9 @@
   "js.success.download_started": "已开始下载：{repo_id}",
   "js.success.settings_saved": "设置已成功保存",
   "settings.mcp.expose_tools": "向客户端公开后端 MCP 工具",
-  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。"
+  "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?",
+  "js.error.save_claude_code_settings_failed": "Failed to save Claude Code settings",
+  "js.error.save_integration_settings_failed": "Failed to save integration settings",
+  "models.downloader.ms_checking": "Checking ModelScope availability…"
 }
