@@ -14,18 +14,14 @@ from mlx_lm.models.cache import make_prompt_cache
 
 def probabilities(logits, temperature, top_p=1.0, top_k=None):
     """Compute the exact filtered distribution used to sample and verify."""
-    values = logits.astype(mx.float32) / temperature
-    order = mx.argsort(-values, axis=-1)
-    sorted_values = mx.take_along_axis(values, order, axis=-1)
-    if top_k is not None and top_k < values.shape[-1]:
-        sorted_values = mx.where(
-            mx.arange(values.shape[-1]) < top_k, sorted_values, -mx.inf
-        )
-    probs = mx.softmax(sorted_values, axis=-1)
+    from ...utils.sampling import apply_top_k, apply_top_p
+
+    values = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     if top_p < 1:
-        probs = mx.where(mx.cumsum(probs, axis=-1) - probs > top_p, 0, probs)
-        probs = probs / mx.sum(probs, axis=-1, keepdims=True)
-    return mx.put_along_axis(mx.zeros_like(probs), order, probs, axis=-1)
+        values = apply_top_p(values, top_p)
+    if top_k is not None and top_k < values.shape[-1]:
+        values = apply_top_k(values, top_k)
+    return mx.softmax((values * (1 / temperature)).astype(mx.float32), axis=-1)
 
 
 def acceptance_and_residual(p, q, proposals, uniforms):
@@ -156,7 +152,9 @@ class UnoDecoder:
             self._trim(cache, frontier)
             verify_logits = self.model(proposals[None], cache=cache)[0]
             if self.constraint is not None:
-                verify_logits = self.constraint.verify(verify_logits, proposals.tolist())
+                verify_logits = self.constraint.verify(
+                    verify_logits, proposals.tolist()
+                )
             targets, p = self._sample(verify_logits)
             uniforms = residual = None
             if self.temperature == 0:

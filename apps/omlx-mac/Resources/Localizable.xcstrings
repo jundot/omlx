@@ -23985,37 +23985,37 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Use a conditional diffusion adapter with this base model."
+            "value": "Use Uno for one request. Overlapping requests use ordinary continuous batching."
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "このベースモデルで条件付き拡散アダプターを使用します。"
+            "value": "単一のリクエストには Uno を使用します。リクエストが重なると、通常の連続バッチ処理を使用します。"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "이 기본 모델에 조건부 확산 어댑터를 사용합니다."
+            "value": "요청이 하나일 때 Uno를 사용합니다. 요청이 겹치면 일반 연속 배치 처리를 사용합니다."
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Используйте адаптер условной диффузии с этой базовой моделью."
+            "value": "Для одного запроса используется Uno. При перекрытии запросов используется обычная непрерывная пакетная обработка."
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "为此基础模型使用条件扩散适配器。"
+            "value": "单个请求使用 Uno。请求重叠时使用常规连续批处理。"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "為此基礎模型使用條件擴散適配器。"
+            "value": "單一請求使用 Uno。請求重疊時使用一般連續批次處理。"
           }
         }
       }

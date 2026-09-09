@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "インポート中...",
   "modal.model_settings.mtp_conflict_turboquant": "Disable TurboQuant KV first.",
   "modal.model_settings.uno": "Uno を有効にする",
-  "modal.model_settings.uno_hint": "このベースモデルで条件付き拡散アダプターを使用します。",
+  "modal.model_settings.uno_hint": "単一のリクエストには Uno を使用します。リクエストが重なると、通常の連続バッチ処理を使用します。",
   "modal.model_settings.uno_missing": "互換性のあるローカルの Uno アダプターがありません。",
   "modal.model_settings.uno_conflict": "他のデコード高速化機能、文法制約、思考トークン制限を無効にしてください。Min P とペナルティの設定をクリアしてください。",
   "modal.model_settings.uno_adapter": "Uno アダプター",

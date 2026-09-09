@@ -3004,6 +3004,7 @@ class EnginePool:
                         adapter_path=adapter.model_path,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
+                        prefill_eviction_callback=prefill_eviction_callback,
                     )
                 elif deployment is not None:
                     from .engine.distributed import DistributedBatchedEngine

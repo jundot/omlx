@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "Importation...",
   "modal.model_settings.mtp_conflict_turboquant": "Disable TurboQuant KV first.",
   "modal.model_settings.uno": "Activer Uno",
-  "modal.model_settings.uno_hint": "Utilisez un adaptateur de diffusion conditionnelle avec ce modèle de base.",
+  "modal.model_settings.uno_hint": "Utilise Uno pour une requête. Les requêtes simultanées utilisent le traitement continu par lots habituel.",
   "modal.model_settings.uno_missing": "Aucun adaptateur Uno local compatible n’est disponible.",
   "modal.model_settings.uno_conflict": "Désactivez les autres accélérateurs de décodage, les contraintes grammaticales et les budgets de réflexion. Effacez les paramètres Min P et les pénalités.",
   "modal.model_settings.uno_adapter": "Adaptateur Uno",

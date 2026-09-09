@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "가져오는 중...",
   "modal.model_settings.mtp_conflict_turboquant": "TurboQuant KV 를 먼저 비활성화하세요.",
   "modal.model_settings.uno": "Uno 활성화",
-  "modal.model_settings.uno_hint": "이 기본 모델에 조건부 확산 어댑터를 사용합니다.",
+  "modal.model_settings.uno_hint": "요청이 하나일 때 Uno를 사용합니다. 요청이 겹치면 일반 연속 배치 처리를 사용합니다.",
   "modal.model_settings.uno_missing": "호환되는 로컬 Uno 어댑터가 없습니다.",
   "modal.model_settings.uno_conflict": "다른 디코딩 가속 기능, 문법 제약 및 Thinking 토큰 제한을 비활성화하세요. Min P와 페널티 설정을 지우세요.",
   "modal.model_settings.uno_adapter": "Uno 어댑터",

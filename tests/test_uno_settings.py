@@ -167,42 +167,40 @@ async def test_adapter_is_not_a_standalone_api_model(models, tmp_path, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("memory_abort", [False, True])
-async def test_closing_stream_waits_for_worker_and_releases_request(
-    monkeypatch, memory_abort
-):
-    import asyncio
-    import threading
-    from unittest.mock import MagicMock
-
-    from omlx.engine.base import GenerationOutput
+async def test_uno_stream_cleanup_uses_shared_engine(memory_abort):
+    from types import SimpleNamespace
     from omlx.engine.uno import UnoEngine
     from omlx.exceptions import PrefillMemoryAbortedError
+    from omlx.request import RequestOutput
+
+    collectors = {"request": object()}
+
+    async def outputs(_):
+        yield RequestOutput(request_id="request", new_text="a", output_text="a")
+        raise PrefillMemoryAbortedError("process memory limit")
+
+    async def abort(_):
+        collectors.clear()
 
     engine = UnoEngine("base", adapter_path="adapter")
-    engine._prefill_guard = MagicMock()
-    monkeypatch.setattr(engine, "_prompt_ids", lambda prompt: [3, 4])
-    monkeypatch.setattr(engine, "_preflight", lambda *args, **kwargs: None)
-    ended = threading.Event()
-
-    def run(ids, options, stops, cancelled, publish):
-        try:
-            publish(GenerationOutput(text="a", new_text="a", finished=False))
-            cancelled.wait(5)
-        finally:
-            ended.set()
-
-    monkeypatch.setattr(engine, "_run", run)
+    engine._loaded = True
+    engine._tokenizer = SimpleNamespace(encode=lambda _: [3, 4])
+    engine._bundle = SimpleNamespace(config={"vocab_size": 128}, context_length=1024)
+    engine._engine = SimpleNamespace(
+        add_request=AsyncMock(return_value="request"),
+        stream_outputs=outputs,
+        abort_request=AsyncMock(side_effect=abort),
+        engine=SimpleNamespace(_output_collectors=collectors),
+    )
     stream = engine.stream_generate("prompt")
     await anext(stream)
     assert engine.has_active_requests()
     if memory_abort:
-        assert await engine.abort_all_requests() == 1
-        assert await engine.abort_all_requests() == 0
         with pytest.raises(PrefillMemoryAbortedError, match="process memory limit"):
-            await asyncio.wait_for(anext(stream), timeout=2)
+            await anext(stream)
     else:
-        await asyncio.wait_for(stream.aclose(), timeout=2)
-    assert ended.is_set() and not engine._lock.locked()
+        await stream.aclose()
+    engine._engine.abort_request.assert_awaited_once_with("request")
     assert not engine.has_active_requests()
 
 
@@ -221,7 +219,7 @@ def test_uno_rejects_unsupported_kwargs_before_template_fallback(kwargs):
     for engine in (UnoEngine("base", adapter_path="adapter"),):
         engine._tokenizer = MagicMock()
         engine._model = SimpleNamespace(args=SimpleNamespace(model_type="k2_horizon"))
-        render = engine._chat_prompt
+        render = engine._apply_chat_template
         with pytest.raises(InvalidRequestError, match="K2"):
             render([{"role": "user", "content": "Hello"}], chat_template_kwargs=kwargs)
         engine._tokenizer.apply_chat_template.assert_not_called()
@@ -254,7 +252,9 @@ def test_uno_ane_setting_roundtrip_and_reservation(models, tmp_path):
         entry, ane
     ) - pool._entry_runtime_resident_size(
         entry, ordinary
-    ) == prefill_memory_reservation(config)
+    ) == prefill_memory_reservation(
+        config
+    )
 
 
 def test_future_dense_uno_identity_is_not_a_size_whitelist(models):

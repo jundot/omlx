@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "匯入中...",
   "modal.model_settings.mtp_conflict_turboquant": "請先停用 TurboQuant KV。",
   "modal.model_settings.uno": "啟用 Uno",
-  "modal.model_settings.uno_hint": "為此基礎模型使用條件擴散適配器。",
+  "modal.model_settings.uno_hint": "單一請求使用 Uno。請求重疊時使用一般連續批次處理。",
   "modal.model_settings.uno_missing": "沒有相容的本機 Uno 適配器。",
   "modal.model_settings.uno_conflict": "請停用其他解碼加速功能、文法限制和思考 Token 限制，並清除 Min P 和懲罰設定。",
   "modal.model_settings.uno_adapter": "Uno 適配器",

@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "Импорт...",
   "modal.model_settings.mtp_conflict_turboquant": "Сначала отключите TurboQuant KV.",
   "modal.model_settings.uno": "Включить Uno",
-  "modal.model_settings.uno_hint": "Используйте адаптер условной диффузии с этой базовой моделью.",
+  "modal.model_settings.uno_hint": "Для одного запроса используется Uno. При перекрытии запросов используется обычная непрерывная пакетная обработка.",
   "modal.model_settings.uno_missing": "Нет совместимого локального адаптера Uno.",
   "modal.model_settings.uno_conflict": "Отключите другие ускорители декодирования, грамматические ограничения и бюджет мышления. Очистите настройки Min P и штрафов.",
   "modal.model_settings.uno_adapter": "Адаптер Uno",

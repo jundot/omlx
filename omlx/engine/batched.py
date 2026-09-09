@@ -322,6 +322,9 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
+        if getattr(self, "is_uno_model", False):
+            await loop.run_in_executor(get_mlx_executor(), self._prepare_uno_model)
+
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
             apply_post_load_transforms,
@@ -681,6 +684,8 @@ class BatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
+        if not signature and getattr(self._model, "_omlx_k2_compiled", False):
+            signature = "k2-compiled-v1"
         if signature:
             scheduler_config.model_name = (
                 (scheduler_config.model_name or self._model_name) + ":" + signature
@@ -1016,6 +1021,19 @@ class BatchedEngine(BaseEngine):
         from ..request import SamplingParams
 
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
+        if getattr(self, "is_uno_model", False):
+            self._validate_uno_request(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                **kwargs,
+            )
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1096,6 +1114,19 @@ class BatchedEngine(BaseEngine):
         from ..request import SamplingParams
 
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
+        if getattr(self, "is_uno_model", False):
+            self._validate_uno_request(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                **kwargs,
+            )
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1292,6 +1323,8 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
+        if getattr(self, "is_uno_model", False):
+            self._validate_uno_request(prompt, tools=tools, **kwargs)
         # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
         # malformed input) are normally surfaced by the real chat path's
         # add_request → tokenize call as a 500 — there's no path-specific
@@ -1330,6 +1363,8 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        if getattr(self, "is_uno_model", False):
+            self._validate_uno_request(prompt, **kwargs)
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:

@@ -78,15 +78,16 @@ class CompiledBody(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         offsets = [c.offset if c is not None else 0 for c in cache]
-        if len(cache) != len(self.layers) or any(v != offsets[0] for v in offsets):
+        positions = [getattr(c, "_idx", offset) for c, offset in zip(cache, offsets)]
+        if len(cache) != len(self.layers) or any(v != positions[0] for v in positions):
             raise ValueError("Compiled K2 requires aligned layer cache offsets")
-        offset = mx.array(offsets[0], dtype=mx.int32)
         mask = create_attention_mask(h, cache[0])
         conditional = lora_mask is not None
         extra = (lora_mask,) if conditional else ()
         for index, (layer, c, regions) in enumerate(
             zip(self.layers, cache, self._regions)
         ):
+            offset = mx.array(offsets[index], dtype=mx.int32)
             q, k, v = regions["pre", conditional](h, offset, *extra)
             if c is not None:
                 k, v = c.update_and_fetch(k, v)

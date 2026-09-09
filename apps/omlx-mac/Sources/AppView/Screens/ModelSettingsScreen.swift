@@ -1667,7 +1667,7 @@ private struct ExperimentalSection: View {
                 Row(label: String(localized: "settings.uno.enable", defaultValue: "Enable Uno"),
                     sublabel: vm.unoUnavailableReason ?? String(
                         localized: "settings.uno.hint",
-                        defaultValue: "Use a conditional diffusion adapter with this base model.")) {
+                        defaultValue: "Use Uno for one request. Overlapping requests use ordinary continuous batching.")) {
                     RowSwitch(isOn: vm.bindProfile($vm.unoEnabled))
                         .disabled(!vm.unoEnabled && vm.unoUnavailableReason != nil)
                         .accessibilityLabel(String(localized: "settings.uno.enable", defaultValue: "Enable Uno"))

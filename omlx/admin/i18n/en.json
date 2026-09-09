@@ -728,7 +728,7 @@
   "modal.model_settings.mtplx_importing": "Importing...",
   "modal.model_settings.mtp_conflict_turboquant": "Disable TurboQuant KV first.",
   "modal.model_settings.uno": "Enable Uno",
-  "modal.model_settings.uno_hint": "Use a conditional diffusion adapter with this base model.",
+  "modal.model_settings.uno_hint": "Use Uno for one request. Overlapping requests use ordinary continuous batching.",
   "modal.model_settings.uno_missing": "No compatible local Uno adapter is available.",
   "modal.model_settings.uno_conflict": "Disable other decode accelerators, grammar constraints and thinking budgets. Clear Min P and penalty settings.",
   "modal.model_settings.uno_adapter": "Uno adapter",
