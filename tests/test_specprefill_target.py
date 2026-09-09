@@ -135,6 +135,7 @@ def _run(
     exact_prefix_cache: _TieredExactPrefixCache | None = None,
     static_prefix_tokens: list[int] | None = None,
     promote_static_prefix_to_hot_cache: bool = True,
+    with_indexer: bool = False,
 ) -> tuple[Any, _Logger, dict[str, Any]]:
     all_tokens = _all_tokens(
         system_token_count,
@@ -152,6 +153,9 @@ def _run(
     selected_array = mx.array(selected_indices)
     original_rope = object()
     attention_module = SimpleNamespace(rope=original_rope)
+    if with_indexer:
+        # DSA layers rotate twice: the top-k indexer owns its own rope.
+        attention_module.indexer = SimpleNamespace(rope=object())
     attention_layer = SimpleNamespace(self_attn=attention_module)
     model.layers = [attention_layer]
     logger = _Logger()
@@ -199,6 +203,11 @@ def _run(
         rope = _OffsetAdjustedRoPE(attention_module.rope, adjustment=10)
         attention_module.rope = rope
         trace["rope"] = rope
+        indexer = getattr(attention_module, "indexer", None)
+        if indexer is not None:
+            # The real sparse_prefill wraps every RoPE owner of a DSA layer.
+            indexer.rope = _OffsetAdjustedRoPE(indexer.rope, adjustment=10)
+            trace["indexer_rope"] = indexer.rope
         kwargs["progress_callback"](0, len(tokens))
 
     def use_stream(selected_stream: Any):
@@ -325,6 +334,22 @@ def test_runtime_patch_helpers_adjust_rope_log_and_handoff_result():
         "SpecPrefill: sparse prefill 2/10 conv tokens in 1.2s "
         "(total 15, cached 0, system 5 full, conv 10 sparse)",
     ]
+
+
+def test_kickoff_decrement_reaches_the_dsa_indexer():
+    """PR #2851 review: the kickoff reservation must reach EVERY RoPE owner
+    sparse_prefill wrapped. Decrementing only the attention rope leaves the
+    DSA top-k indexer one position ahead for the whole decode — wrong sparse
+    selection on every DSA layer, with no crash to reveal it."""
+    _, _, trace = _run(
+        system_token_count=5,
+        conversation_token_count=10,
+        selected_indices=[0, 5, 9],
+        with_indexer=True,
+    )
+
+    assert trace["rope"]._adjustment == 9
+    assert trace["indexer_rope"]._adjustment == 9
 
 
 def test_target_prefill_extends_an_existing_partial_prefix_cache():
