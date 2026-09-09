@@ -26,6 +26,7 @@ class IntegrationContext:
     max_tokens: int | None = None
     model_type: str | None = None
     reasoning: bool | None = None
+    available_models: tuple[dict, ...] = ()
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
     cross_session: bool = False

@@ -446,48 +446,89 @@ def launch_command(args, extra_args: list[str] | None = None):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    # Pre-fetch model status (context_window, max_tokens, model_type per model)
+    # Pre-fetch detailed model metadata. Codex also needs the authoritative
+    # visible model IDs from /v1/models to build its local model catalog.
     models_status_map: dict[str, dict] = {}
+    models_status_available = False
     try:
         resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
         if resp.ok:
-            for m in resp.json().get("models", []):
-                if m_id := m.get("id"):
-                    models_status_map[m_id] = m
-                if model_alias := m.get("model_alias"):
-                    models_status_map[model_alias] = m
+            status_models = resp.json().get("models")
+            if not isinstance(status_models, list):
+                raise ValueError("invalid model status response")
+
+            parsed_status_map: dict[str, dict] = {}
+            for m in status_models:
+                if not isinstance(m, dict):
+                    raise ValueError("invalid model status entry")
+                m_id = m.get("id")
+                model_type = m.get("model_type")
+                if (
+                    not isinstance(m_id, str)
+                    or not m_id
+                    or not isinstance(model_type, str)
+                    or not model_type
+                ):
+                    raise ValueError("incomplete model status entry")
+                parsed_status_map[m_id] = m
+                # Exposed profiles inherit their source model's alias in the
+                # status payload. Only the physical model should own that alias.
+                if not m.get("source_model_id") and (
+                    model_alias := m.get("model_alias")
+                ):
+                    parsed_status_map[model_alias] = m
+            models_status_map = parsed_status_map
+            models_status_available = True
     except Exception:
         pass
+
+    def _fetch_visible_models() -> list[str]:
+        try:
+            response = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
+            response.raise_for_status()
+            visible_ids = [m["id"] for m in response.json().get("data", [])]
+            if not models_status_available:
+                return visible_ids
+            return [
+                model_id
+                for model_id in visible_ids
+                if models_status_map.get(model_id, {}).get("model_type")
+                in ("llm", "vlm")
+            ]
+        except Exception:
+            return []
+
+    visible_models: list[str] | None = None
+    if tool_name in ("codex", "codex_app"):
+        visible_models = _fetch_visible_models()
 
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured.
     model = args.model
-    if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+    if tool_name == "claude" and not model and (
+        cli_opus_model or cli_sonnet_model or cli_haiku_model
+    ):
         model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
     elif not model:
-        # Fetch available models from server
-        try:
-            resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            models = [
-                m["id"]
-                for m in data.get("data", [])
-                if m.get("model_type") in ("llm", "vlm", None)
-            ]
-        except Exception:
-            models = []
+        if tool_name in ("codex", "codex_app") and not models_status_available:
+            print("Could not load model metadata for Codex.")
+            print("Specify a chat model explicitly with --model.")
+            sys.exit(1)
 
-        if not models:
+        if visible_models is None:
+            visible_models = _fetch_visible_models()
+
+        if not visible_models:
             print("No models available. Load a model first.")
             sys.exit(1)
 
-        if len(models) == 1:
-            model = models[0]
+        if len(visible_models) == 1:
+            model = visible_models[0]
             print(f"Using model: {model}")
         else:
             models_info_list = [
-                {"id": m_id, **models_status_map.get(m_id, {})} for m_id in models
+                {**models_status_map.get(m_id, {}), "id": m_id}
+                for m_id in visible_models
             ]
             model = integration.select_model(models_info_list, integration.display_name)
 
@@ -542,6 +583,16 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
+    catalog_model_ids = visible_models or []
+    if tool_name in ("codex", "codex_app") and not models_status_available:
+        # /v1/models has no model type, so it cannot safely distinguish chat
+        # models from embeddings and other visible API helpers. In degraded
+        # mode, catalog only the model the user actually selected.
+        catalog_model_ids = [model] if model else []
+    available_models = tuple(
+        {**models_status_map.get(model_id, {}), "id": model_id}
+        for model_id in catalog_model_ids
+    )
     ctx = IntegrationContext(
         host=connect_host,
         port=port,
@@ -554,6 +605,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
+        available_models=available_models,
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
