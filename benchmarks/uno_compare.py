@@ -122,10 +122,13 @@ async def run(args):
             (long_prompt + "\nSummarize the pattern in these records.", 0)
         ],
         "overlap": [
-            (prompt, 0),
-            ("What is 17 times 19? Reply with just the number.", 0),
+            (prompt + f" Use the function name merge_{i}.", 0)
+            for i in range(args.concurrency)
         ],
-        "staggered": [(prompt, 0), ("What is 17 times 19?", 0.25)],
+        "staggered": [
+            (prompt + f" Use the function name merge_{i}.", 0.15 * i)
+            for i in range(args.concurrency)
+        ],
     }
     report = {
         "label": args.label,
@@ -133,6 +136,8 @@ async def run(args):
         "temperature": args.temperature,
         "top_p": 0.95,
         "max_tokens": args.max_tokens,
+        "concurrency": args.concurrency,
+        "stagger_seconds": 0.15,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "results": [],
     }
@@ -169,4 +174,5 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, choices=[1, 2, 4, 8], default=8)
     asyncio.run(run(parser.parse_args()))
