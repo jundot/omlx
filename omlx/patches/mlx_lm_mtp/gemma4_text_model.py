@@ -263,9 +263,16 @@ def _patch_inner_model(mod: Any) -> None:
         state to restore and replay: every layer drops
         ``num_drafts - accepted`` positions. Trimmability is checked across
         all layers before any are trimmed, because a half-rolled-back cache
-        is unrecoverable. A sliding layer whose ring has wrapped reports
-        ``is_trimmable()`` False and the caller takes the standard step.
+        is unrecoverable.
+
+        A sliding layer whose ring has wrapped still trims: ``cache_rollback``
+        arms an undo log around the verify forward, so ``is_trimmable()``
+        answers for that snapshot rather than for the ring. A layer carrying
+        neither returns False and the caller takes the standard step.
         """
+        layers = self.model.layers
+        if len(cache) != len(layers):
+            return False
         trim_n = num_drafts - accepted
         if trim_n <= 0:
             return True
@@ -310,34 +317,56 @@ def _query_position(model: Any) -> int:
     raise RuntimeError("gemma4 mtp_forward: no cache offset available")
 
 
+def _is_head_key(key: str) -> bool:
+    return key.startswith(_MTP_KEY_PREFIXES) or ".mtp." in key
+
+
 def _align_head_dtype(weights: dict) -> dict:
     """Store the assistant head at the backbone's float dtype.
 
     The head ships bfloat16 and the combine step preserves that, so in a
     float16 build every head matmul meets float16 activations and MLX
     promotes the result to float32 — the head then runs at twice the
-    memory traffic it needs, on the decode hot path. bfloat16 -> float16
-    is lossless here (float16 carries 10 mantissa bits against bfloat16's
-    7, and the head's largest weight is 23.1 against a 65504 ceiling).
-    Mirrors the bfloat16 -> float16 normalisation deepseek_v4_model
-    already applies to its own MTP metadata.
+    memory traffic it needs, on the decode hot path. Mirrors the
+    bfloat16 -> float16 normalization deepseek_v4_model already applies to
+    its own MTP metadata.
+
+    Either direction is safe to cast, for a reason specific to drafting:
+    the head only proposes. Every token the engine emits is one the
+    backbone verified, so head precision moves the acceptance rate and can
+    never move the output. bfloat16 -> float16 is in any case lossless
+    here (float16 carries 10 mantissa bits against bfloat16's 7, and the
+    head's largest weight is 23.1 against a 65504 ceiling); float16 ->
+    bfloat16, which needs a checkpoint whose head and backbone were
+    written by different tools, drops 3 mantissa bits and is still worth
+    it against a float32 hot path.
+
+    The target is the dtype most of the backbone is stored in, not the
+    first one seen: in a quantized checkpoint most tensors are packed
+    uint32 with float scales beside them, and dict order would otherwise
+    let one unrepresentative tensor choose for the whole model.
     """
+    from collections import Counter
+
     import mlx.core as mx
 
-    target = None
+    counts: Counter = Counter()
     for key, value in weights.items():
-        if key.startswith(_MTP_KEY_PREFIXES) or ".mtp." in key:
+        if _is_head_key(key):
             continue
         if value.dtype in (mx.float16, mx.bfloat16):
-            target = value.dtype
-            break
-    if target is None:
+            counts[value.dtype] += 1
+    if not counts:
         return weights
+    target = counts.most_common(1)[0][0]
 
     aligned = {}
     for key, value in weights.items():
-        head = key.startswith(_MTP_KEY_PREFIXES) or ".mtp." in key
-        if head and value.dtype in (mx.float16, mx.bfloat16) and value.dtype != target:
+        if (
+            _is_head_key(key)
+            and value.dtype in (mx.float16, mx.bfloat16)
+            and value.dtype != target
+        ):
             value = value.astype(target)
         aligned[key] = value
     return aligned

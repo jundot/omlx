@@ -270,7 +270,7 @@ def _head_and_backbone_weights():
 
 
 def test_sanitize_strips_the_head_when_it_is_not_attached():
-    # The pre-existing behaviour for every plain gemma4 text quant: no
+    # The pre-existing behavior for every plain gemma4 text quant: no
     # binding site, so the merged head weights would be unexpected keys.
     model = _outer()
     assert getattr(model.language_model, "mtp", None) is None
@@ -323,7 +323,7 @@ def test_align_casts_a_float16_head_to_a_bfloat16_backbone():
 
 
 def test_align_leaves_non_float_head_tensors_alone():
-    # Quantised weights and their packed scales/biases must survive intact.
+    # Quantized weights and their packed scales/biases must survive intact.
     weights = {
         "model.embed_tokens.weight": mx.zeros((4, 4), dtype=mx.float16),
         "language_model.mtp.q_proj.weight": mx.zeros((4, 4), dtype=mx.uint32),
@@ -345,6 +345,23 @@ def test_align_is_a_noop_when_the_backbone_has_no_float_tensor():
     }
     out = _align(weights)
     assert out["language_model.mtp.pre_projection.weight"].dtype == mx.bfloat16
+
+
+def test_align_targets_the_dtype_most_of_the_backbone_uses():
+    # A quantized checkpoint is mostly packed uint32 with float scales; one
+    # unrepresentative tensor early in dict order must not choose for the
+    # whole model.
+    weights = {
+        "model.layers.0.self_attn.q_proj.scales": mx.zeros((4, 4), dtype=mx.bfloat16),
+        "model.embed_tokens.weight": mx.zeros((4, 4), dtype=mx.float16),
+        "model.norm.weight": mx.zeros((4,), dtype=mx.float16),
+        "model.layers.0.input_layernorm.weight": mx.zeros((4,), dtype=mx.float16),
+        "language_model.mtp.pre_projection.weight": mx.zeros(
+            (4, 4), dtype=mx.bfloat16
+        ),
+    }
+    out = _align(weights)
+    assert out["language_model.mtp.pre_projection.weight"].dtype == mx.float16
 
 
 def test_align_does_not_read_the_head_when_picking_the_target():
@@ -404,6 +421,99 @@ def test_mtp_forward_requires_a_prior_return_hidden_forward():
         model.mtp_forward(mx.zeros((1, 1, 24)), mx.zeros((1, 1), dtype=mx.uint32), [])
 
 
+def _stubbed_head_model(captured, committed):
+    """Model with a stub drafter, a K/V stash and a cache at ``committed``.
+
+    ``captured`` is how many positions the verify forward put in the stash;
+    ``committed`` is where the cache sits once rollback has trimmed it.
+    """
+    from unittest.mock import MagicMock
+
+    pytest.importorskip("mlx_vlm.speculative.drafters.gemma4_assistant")
+    lm_mtp.set_mtp_active(True)
+    model = _inner(_with_assistant())
+
+    drafter = MagicMock()
+    drafter._input_embed = lambda ids: mx.zeros((1, 1, 24), dtype=mx.float32)
+    drafter._input_embed_scale = 1.0
+    drafter.return_value = (
+        mx.zeros((1, 1, 24), dtype=mx.float32),
+        mx.zeros((1, 1, 64), dtype=mx.float32),
+    )
+    model.mtp = drafter
+    model._omlx_mtp_shared_kv = {
+        "full_attention": (
+            mx.zeros((1, 1, captured, 8)),
+            mx.zeros((1, 1, captured, 8)),
+        ),
+        "sliding_attention": (
+            mx.zeros((1, 1, captured, 8)),
+            mx.zeros((1, 1, captured, 8)),
+        ),
+    }
+    model._omlx_mtp_kv_offset = captured
+    model._omlx_mtp_cache_ref = [SimpleNamespace(offset=committed)]
+    return model, drafter
+
+
+def _draft(model):
+    return model.mtp_forward(
+        mx.zeros((1, 3, 24)), mx.zeros((1, 3), dtype=mx.uint32), []
+    )
+
+
+class TestRejectedTailSlicing:
+    """The stash is taken at the verify forward, so after a rejection it still
+    carries the rejected rows. Rollback trims the backbone cache first, which
+    is what makes the stash longer than the committed length — the difference
+    is exactly what has to come off before the head drafts again. Getting this
+    wrong lets the head attend over K/V for tokens that were thrown away, and
+    shows up only as a weak acceptance rate."""
+
+    def test_the_rejected_tail_is_sliced_off_every_layer_type(self):
+        # Depth-3 verify captured 4 positions; 2 drafts rejected leaves 2.
+        model, drafter = _stubbed_head_model(captured=4, committed=2)
+        _draft(model)
+        _, shared_kv, _ = drafter.call_args.args
+        for keys, values in shared_kv.values():
+            assert keys.shape[-2] == 2
+            assert values.shape[-2] == 2
+
+    def test_a_full_accept_leaves_the_stash_alone(self):
+        model, drafter = _stubbed_head_model(captured=4, committed=4)
+        stash = model._omlx_mtp_shared_kv
+        _draft(model)
+        _, shared_kv, _ = drafter.call_args.args
+        assert shared_kv is stash
+        for keys, _values in shared_kv.values():
+            assert keys.shape[-2] == 4
+
+    def test_the_head_is_told_the_committed_length(self):
+        model, drafter = _stubbed_head_model(captured=4, committed=2)
+        _draft(model)
+        assert drafter._kv_valid_len == 2
+
+    def test_the_query_position_is_the_last_committed_slot(self):
+        model, drafter = _stubbed_head_model(captured=4, committed=2)
+        _draft(model)
+        _, _, position_ids = drafter.call_args.args
+        assert position_ids.tolist() == [[1]]
+
+    def test_only_the_last_hidden_and_token_are_consumed(self):
+        model, drafter = _stubbed_head_model(captured=4, committed=4)
+        _draft(model)
+        inputs_embeds = drafter.call_args.args[0]
+        # Fused input is [token embedding (24) | backbone hidden (24)].
+        assert inputs_embeds.shape == (1, 1, 48)
+
+    def test_a_stale_bind_is_refreshed_before_drafting(self):
+        # nn.quantize() swaps embed_tokens after the __init__-time bind; a
+        # stale bind drafts through a random-init embedding.
+        model, drafter = _stubbed_head_model(captured=2, committed=2)
+        _draft(model)
+        drafter.bind.assert_called_once_with(model)
+
+
 # ---------------------------------------------------------------------------
 # Depth-k partial rollback
 # ---------------------------------------------------------------------------
@@ -422,12 +532,13 @@ class _FakeTrimmable:
         return n
 
 
-def _rollback(caches, accepted, num_drafts):
+def _rollback(caches, accepted, num_drafts, layer_count=None):
     from mlx_lm.models.gemma4_text import Model
 
-    return Model.mtp_partial_rollback(
-        SimpleNamespace(), caches, accepted, num_drafts
-    )
+    if layer_count is None:
+        layer_count = len(caches)
+    host = SimpleNamespace(model=SimpleNamespace(layers=[object()] * layer_count))
+    return Model.mtp_partial_rollback(host, caches, accepted, num_drafts)
 
 
 def test_rollback_is_a_noop_when_every_draft_was_accepted():
@@ -443,7 +554,7 @@ def test_rollback_trims_the_rejected_tail_from_every_layer():
 
 
 def test_rollback_refuses_rather_than_trimming_some_layers():
-    # A partial trim desynchronises per-layer KV lengths and is
+    # A partial trim desynchronizes per-layer KV lengths and is
     # unrecoverable; the caller falls back to a standard step instead.
     good_a, bad, good_b = _FakeTrimmable(), _FakeTrimmable(False), _FakeTrimmable()
     assert _rollback([good_a, bad, good_b], 0, 2) is False
@@ -461,11 +572,19 @@ def test_rollback_refuses_an_empty_cache():
     assert _rollback([None, None], 0, 1) is False
 
 
+def test_rollback_refuses_a_cache_of_the_wrong_length():
+    # A stale cache list would otherwise trim whichever entries happen to be
+    # present and leave the rest a position ahead.
+    caches = [_FakeTrimmable(), _FakeTrimmable()]
+    assert _rollback(caches, 0, 1, layer_count=3) is False
+    assert all(c.trimmed == 0 for c in caches)
+
+
 class TestPartialRollbackAcrossCacheClasses:
     """gemma4 interleaves sliding and full attention, so one verify block is
     rolled back across two cache classes at once. Both must land on the same
     committed length as a reference cache that only ever saw the confirmed
-    token plus the accepted drafts — otherwise the layers desynchronise by a
+    token plus the accepted drafts — otherwise the layers desynchronize by a
     position and every later forward is quietly wrong."""
 
     @staticmethod
