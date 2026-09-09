@@ -18,7 +18,11 @@
     </div>
     <p class="text-xs text-neutral-500 mb-4">{{ t('usage.note') }}</p>
     <p x-show="error" x-text="error" role="status" class="text-sm text-amber-700 mb-3"></p>
-    <div x-show="loading && !data" class="text-sm text-neutral-500">{{ t('usage.loading') }}</div>
+    <div x-show="disabled" role="status" class="flex flex-wrap items-center gap-3 bg-neutral-50 rounded-xl border border-neutral-200 p-4 mb-3 text-sm text-neutral-600">
+        <span>{{ t('usage.disabled') }}</span>
+        <button type="button" @click="setSettingsTab('global')" class="font-medium text-neutral-900 underline">{{ t('usage.open_settings') }}</button>
+    </div>
+    <div x-show="loading && !data && !disabled" class="text-sm text-neutral-500">{{ t('usage.loading') }}</div>
     <template x-if="data">
         <div :aria-busy="loading">
             <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">

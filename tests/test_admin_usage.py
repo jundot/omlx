@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Authenticated local admin usage endpoint, including degraded storage."""
 
+import asyncio
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +14,16 @@ from omlx.admin.auth import require_admin
 from omlx.admin.routes import router
 from omlx.server_metrics import ServerMetrics
 from omlx.usage_history import UsageHistory
+
+ROOT = Path(__file__).resolve().parents[1]
+I18N_DIR = ROOT / "omlx/admin/i18n"
+USAGE_HISTORY_I18N_KEYS = {
+    "settings.usage.section_label",
+    "settings.usage.history",
+    "settings.usage.history_hint",
+    "usage.disabled",
+    "usage.open_settings",
+}
 
 
 @pytest.fixture
@@ -154,3 +167,95 @@ def test_usage_template_renders_with_localized_labels(client):
         'id="usage-heading" class="text-xl font-bold">Usage History</h3>'
         in response.text
     )
+
+
+def test_usage_endpoint_reports_disabled_state(client):
+    client, metrics = client
+    metrics.usage_history.set_enabled(False)
+    response = client.get("/admin/api/usage?range=7d")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["enabled"] is False
+    assert data["totals"]["requests"] == 0
+    assert data["models"] == []
+    assert len(data["heatmap"]) == 7
+    metrics.usage_history.set_enabled(True)
+    data = client.get("/admin/api/usage?range=7d").json()
+    assert data["enabled"] is True
+    assert data["totals"]["requests"] == 1
+
+
+def test_global_settings_toggle_applies_at_runtime(client, tmp_path, monkeypatch):
+    from omlx.admin import routes as admin_routes
+    from omlx.settings import GlobalSettings
+
+    client, metrics = client
+    base_path = tmp_path / "settings"
+    gs = GlobalSettings(base_path=base_path)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+
+    current = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+    assert current["usage"] == {"usage_history": True}
+
+    result = asyncio.run(
+        admin_routes.update_global_settings(
+            request=admin_routes.GlobalSettingsRequest(usage_history=False),
+            is_admin=True,
+        )
+    )
+    assert result["success"] is True
+    assert "usage_history" in result["runtime_applied"]
+    assert gs.usage.usage_history is False
+    assert GlobalSettings.load(base_path=base_path).usage.usage_history is False
+    assert metrics.usage_history.enabled is False
+
+    # Serving statistics keep counting; history does not.
+    metrics.record_request_complete(100, 20, 60, 0.5, 1.0, "canonical-model", 2.0)
+    metrics.usage_history.flush()
+    assert metrics.get_snapshot()["total_requests"] == 2
+    assert client.get("/admin/api/usage").json()["enabled"] is False
+
+    result = asyncio.run(
+        admin_routes.update_global_settings(
+            request=admin_routes.GlobalSettingsRequest(usage_history=True),
+            is_admin=True,
+        )
+    )
+    assert result["success"] is True
+    assert gs.usage.usage_history is True
+    metrics.record_request_complete(100, 20, 60, 0.5, 1.0, "canonical-model", 2.0)
+    metrics.usage_history.flush()
+    data = client.get("/admin/api/usage").json()
+    assert data["enabled"] is True
+    assert data["totals"]["requests"] == 2
+
+    untouched = asyncio.run(
+        admin_routes.update_global_settings(
+            request=admin_routes.GlobalSettingsRequest(), is_admin=True
+        )
+    )
+    assert "usage_history" not in untouched["runtime_applied"]
+    assert gs.usage.usage_history is True
+
+
+def test_dashboard_renders_usage_history_switch_and_disabled_notice(client):
+    client, _ = client
+    html = client.get("/admin/dashboard").text
+    assert "globalSettings.usage.usage_history" in html
+    assert "Record usage history" in html
+    assert "Usage history is off. Turn it on in Settings" in html
+    assert "setSettingsTab('global')" in html
+    javascript = (ROOT / "omlx/admin/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+    assert "usage: { usage_history: true }" in javascript
+    assert "usage_history: this.globalSettings.usage.usage_history" in javascript
+
+
+def test_usage_history_i18n_keys_present_in_every_locale():
+    locales = sorted(I18N_DIR.glob("*.json"))
+    assert len(locales) == 9
+    for locale_path in locales:
+        locale = json.loads(locale_path.read_text(encoding="utf-8"))
+        missing = {key for key in USAGE_HISTORY_I18N_KEYS if not locale.get(key)}
+        assert not missing, f"{locale_path.name}: missing {sorted(missing)}"

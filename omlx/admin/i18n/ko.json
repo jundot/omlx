@@ -1131,6 +1131,9 @@
   "js.success.settings_saved": "설정이 저장되었습니다",
   "settings.mcp.expose_tools": "백엔드 MCP 도구를 클라이언트에 노출",
   "settings.mcp.expose_tools_hint": "백엔드 MCP 도구를 채팅 응답에 병합합니다. 클라이언트에 자체 MCP 서버가 있는 경우 비활성화하세요.",
+  "settings.usage.section_label": "사용 기록",
+  "settings.usage.history": "사용 기록 저장",
+  "settings.usage.history_hint": "모델별 시간당 토큰 합계를 로컬 usage.sqlite3에 저장합니다. 끄면 기존 기록은 유지되며, 다시 켜면 저장을 재개합니다.",
   "usage.heading": "사용 기록",
   "usage.range": "기간",
   "usage.today": "오늘",
@@ -1153,5 +1156,7 @@
   "usage.heatmap_note": "00–23시 · 진한 녹색일수록 토큰이 많음 · 서머타임으로 중복되는 시간은 합산",
   "usage.unavailable": "사용 기록을 사용할 수 없습니다. 추론은 정상적으로 계속됩니다.",
   "usage.delayed": "기록이 불완전할 수 있습니다: 저장이 지연되었거나 대기 버퍼가 넘쳤습니다.",
-  "usage.loading": "사용량 불러오는 중…"
+  "usage.loading": "사용량 불러오는 중…",
+  "usage.disabled": "사용 기록이 꺼져 있습니다. 설정 → 사용 기록에서 켜세요.",
+  "usage.open_settings": "설정 열기"
 }

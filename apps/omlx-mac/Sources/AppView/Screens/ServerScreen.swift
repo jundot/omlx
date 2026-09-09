@@ -126,6 +126,26 @@ struct ServerScreen: View {
                 }
             }
 
+            SectionHeader(String(localized: "server.section.usage",
+                                  defaultValue: "Usage History",
+                                  comment: "Section heading for the local usage history switch in Server screen"))
+            // Deep-link target for the Status screen's "Usage history is off"
+            // notice (see AppServices.ServerAnchor.usageHistory).
+            .id(ServerAnchor.usageHistory.rawValue)
+            ListGroup {
+                Row(
+                    label: String(localized: "server.row.usage_history",
+                                  defaultValue: "Record usage history",
+                                  comment: "Row label for the switch that records local hourly usage history"),
+                    sublabel: String(localized: "server.row.usage_history.sub",
+                                     defaultValue: "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history.",
+                                     comment: "Sublabel explaining the usage history switch"),
+                    isLast: true
+                ) {
+                    RowSwitch(isOn: vm.bind($vm.usageHistoryEnabled, save: vm.saveUsageHistory))
+                }
+            }
+
             SectionHeader(
                 String(localized: "server.section.storage",
                        defaultValue: "Storage",

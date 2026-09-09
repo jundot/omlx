@@ -1131,6 +1131,9 @@
   "js.success.settings_saved": "Configurações salvas com sucesso",
   "settings.mcp.expose_tools": "Expor ferramentas MCP do backend para clientes",
   "settings.mcp.expose_tools_hint": "Mescla as ferramentas MCP do backend nas respostas. Desative se o seu cliente tiver seus próprios servidores MCP.",
+  "settings.usage.section_label": "Histórico de uso",
+  "settings.usage.history": "Registrar histórico de uso",
+  "settings.usage.history_hint": "Armazena localmente os totais de tokens por modelo e hora em usage.sqlite3. Desativar mantém o histórico existente; reativar retoma o registro.",
   "usage.heading": "Histórico de uso",
   "usage.range": "Período",
   "usage.today": "Hoje",
@@ -1153,5 +1156,7 @@
   "usage.heatmap_note": "Horas 00–23 · verde mais escuro significa mais tokens · horas repetidas do horário de verão são combinadas",
   "usage.unavailable": "O histórico de uso está indisponível. A inferência continua normalmente.",
   "usage.delayed": "O histórico pode estar incompleto: o armazenamento está atrasado ou o buffer pendente transbordou.",
-  "usage.loading": "Carregando uso…"
+  "usage.loading": "Carregando uso…",
+  "usage.disabled": "O histórico de uso está desativado. Ative-o em Configurações → Histórico de uso.",
+  "usage.open_settings": "Abrir configurações"
 }

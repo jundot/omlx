@@ -8,6 +8,8 @@ struct UsageHistoryView: View {
     @State private var models: [String] = []
     @State private var data: UsageHistoryDTO?
     @State private var error: String?
+    /// Recording switched off in Server settings: a distinct state, not a failure.
+    @State private var disabled = false
 
     @State private var peak: Double = 1
 
@@ -58,7 +60,22 @@ struct UsageHistoryView: View {
                 Text(error).font(.omlxText(12)).foregroundStyle(.secondary)
                     .padding(.horizontal, 18)
             }
-            if let data {
+            if disabled {
+                HStack(spacing: 12) {
+                    Text(String(localized: "status.usage.disabled",
+                                defaultValue: "Usage history is off. Turn it on in Server settings.",
+                                comment: "Shown on the Status screen when usage history recording is switched off"))
+                        .font(.omlxText(12)).foregroundStyle(.secondary)
+                    Button(String(localized: "status.usage.open_settings",
+                                  defaultValue: "Open Server Settings",
+                                  comment: "Button that jumps from the Status screen to the usage history switch on the Server screen")) {
+                        services.requestedServerAnchor = .usageHistory
+                        services.requestedSection = .server
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                }
+                .padding(.horizontal, 18)
+            } else if let data {
                 totals(data.totals)
                 if data.totals.requests == 0 {
                     Text(String(localized: "status.usage.empty",
@@ -94,16 +111,24 @@ struct UsageHistoryView: View {
                 do {
                     let result = try await services.client.getUsage(range: period, model: model)
                     try Task.checkCancellation()
-                    data = result
-                    peak = Double(max(1, result.heatmap.flatMap(\.tokens).max() ?? 1))
-                    if model.isEmpty { models = result.models.compactMap(\.modelId) }
-                    error = result.available && result.droppedRequests == 0 ? nil :
-                        String(localized: "status.usage.delayed",
-                               defaultValue: "History may be incomplete: storage is delayed or the pending buffer overflowed.",
-                               comment: "Warning shown when usage history storage is degraded but data is still displayed")
+                    disabled = result.enabled == false
+                    if disabled {
+                        data = nil
+                        models = []
+                        error = nil
+                    } else {
+                        data = result
+                        peak = Double(max(1, result.heatmap.flatMap(\.tokens).max() ?? 1))
+                        if model.isEmpty { models = result.models.compactMap(\.modelId) }
+                        error = result.available && result.droppedRequests == 0 ? nil :
+                            String(localized: "status.usage.delayed",
+                                   defaultValue: "History may be incomplete: storage is delayed or the pending buffer overflowed.",
+                                   comment: "Warning shown when usage history storage is degraded but data is still displayed")
+                    }
                 } catch {
                     if Task.isCancelled { return }
                     data = nil
+                    disabled = false
                     self.error = String(localized: "status.usage.unavailable",
                                         defaultValue: "Usage history is unavailable. Inference continues normally.",
                                         comment: "Error shown when the usage history endpoint cannot be reached")

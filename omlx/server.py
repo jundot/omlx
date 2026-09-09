@@ -2247,7 +2247,12 @@ def init_server(
 
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
-    reset_server_metrics(stats_path=stats_path)
+    reset_server_metrics(
+        stats_path=stats_path,
+        usage_history_enabled=getattr(
+            getattr(global_settings, "usage", None), "usage_history", True
+        ),
+    )
 
     logger.info(
         f"Server initialized with {_server_state.engine_pool.model_count} models"

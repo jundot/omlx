@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -363,3 +364,65 @@ def test_server_metrics_initializes_and_closes_history(tmp_path):
         assert current.get_snapshot(scope="alltime")["total_requests"] == 1
     finally:
         reset_server_metrics()
+
+
+def test_runtime_toggle_flushes_then_stops_recording_and_resumes(history):
+    record(history)
+    history.set_enabled(False)  # flushes the pending aggregate synchronously
+    assert history.enabled is False
+    with sqlite3.connect(history.path) as db:
+        assert (
+            db.execute("SELECT SUM(requests) FROM model_usage_hourly").fetchone()[0]
+            == 1
+        )
+    record(history)  # ignored while off
+    assert not history._pending
+    assert history.flush()
+    disabled = history.query("7d")
+    assert disabled["enabled"] is False
+    assert disabled["totals"]["requests"] == 0
+    assert disabled["models"] == []
+    assert len(disabled["heatmap"]) == 7
+    with sqlite3.connect(history.path) as db:
+        assert (
+            db.execute("SELECT SUM(requests) FROM model_usage_hourly").fetchone()[0]
+            == 1
+        )
+    history.set_enabled(True)
+    record(history)
+    assert history.flush()
+    result = history.query("7d")
+    assert result["enabled"] is True
+    assert result["totals"]["requests"] == 2
+
+
+def test_disabled_history_never_opens_storage(tmp_path):
+    history = UsageHistory(tmp_path / "usage.sqlite3", enabled=False)
+    try:
+        record(history)
+        assert not history._pending
+        assert history.flush()
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(history.path) + suffix).unlink(missing_ok=True)
+        result = history.query()
+        assert result["enabled"] is False
+        assert result["totals"]["requests"] == 0
+        history.set_enabled(False)  # no change, no flush
+        assert not history.path.exists()
+    finally:
+        history.close()
+    assert not history.path.exists()
+
+
+def test_server_metrics_respects_disabled_recorder(tmp_path):
+    metrics = ServerMetrics()
+    metrics.usage_history = UsageHistory(tmp_path / "usage.sqlite3", enabled=False)
+    try:
+        metrics.record_request_complete(100, 20, 60, 0.5, 1.0, "model-a", 2.0)
+        assert metrics.get_snapshot()["total_requests"] == 1
+        metrics.usage_history.set_enabled(True)
+        metrics.record_request_complete(100, 20, 60, 0.5, 1.0, "model-a", 2.0)
+        assert metrics.usage_history.flush()
+        assert metrics.usage_history.query()["totals"]["requests"] == 1
+    finally:
+        metrics.close()

@@ -84,6 +84,8 @@ struct ClearHotCacheResponse: Codable, Sendable {
 
 /// Hourly operational aggregates; contains no conversation or client data.
 struct UsageHistoryDTO: Decodable {
+    /// `false` when recording is switched off in Settings; absent on older servers.
+    let enabled: Bool?
     let available: Bool
     let droppedRequests: Int
     let totals: UsageTotalsDTO

@@ -86,8 +86,9 @@ class UsageHistory:
     runs only at startup, on the writer, or on admin worker threads.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, enabled: bool = True):
         self.path = path.resolve()
+        self.enabled = enabled
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._pending: dict[tuple[int, str], list] = {}
@@ -201,7 +202,7 @@ class UsageHistory:
         minute = int(timestamp) // 60
         values = [1, *counts, *durations, int(request_duration is not None)]
         with self._lock:
-            if self._closed:
+            if self._closed or not self.enabled:
                 return
             # macOS local-time conversion is relatively expensive. Reuse one
             # minute's hour conversion; minute boundaries also cover fractional
@@ -220,15 +221,29 @@ class UsageHistory:
                     a + b for a, b in zip(self._pending[key], values, strict=True)
                 ]
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Runtime toggle. Disabling flushes pending aggregates; the file stays."""
+        with self._lock:
+            changed = self.enabled != enabled
+            self.enabled = enabled
+        if changed and not enabled:
+            self.flush()
+
     def _run(self) -> None:
         while not self._stop.wait(FLUSH_SECONDS):
-            self.flush()
+            # While disabled, only retry aggregates left over from a failed
+            # flush; otherwise leave usage.sqlite3 alone.
+            if self.enabled or self._pending:
+                self.flush()
 
     def flush(self) -> bool:
         """Persist a batch; never called by the inference path."""
         with self._flush_lock:
             with self._lock:
                 batch, self._pending = self._pending, {}
+            if not batch and not self.enabled:
+                # Nothing to persist and recording is off: leave the file alone.
+                return True
             connection = None
             try:
                 connection = self._connect()
@@ -288,21 +303,25 @@ class UsageHistory:
     ) -> dict:
         now = time.time() if now is None else now
         start, end = _bounds(period, now)
+        rows: list = []
         # Read-only connection: polling cannot silently recreate a deleted database.
+        # Disabled history answers with an empty, explicitly flagged payload
+        # without opening the database at all.
         connection = None
         try:
-            connection = sqlite3.connect(
-                self.path.as_uri() + "?mode=ro", uri=True, timeout=1
-            )
-            rows = connection.execute(
-                "SELECT * FROM model_usage_hourly WHERE timestamp_hour >= ? "
-                "AND timestamp_hour < ?" + (" AND model_id = ?" if model else ""),
-                (
-                    (start.timestamp(), end.timestamp(), model)
-                    if model
-                    else (start.timestamp(), end.timestamp())
-                ),
-            ).fetchall()
+            if self.enabled:
+                connection = sqlite3.connect(
+                    self.path.as_uri() + "?mode=ro", uri=True, timeout=1
+                )
+                rows = connection.execute(
+                    "SELECT * FROM model_usage_hourly WHERE timestamp_hour >= ? "
+                    "AND timestamp_hour < ?" + (" AND model_id = ?" if model else ""),
+                    (
+                        (start.timestamp(), end.timestamp(), model)
+                        if model
+                        else (start.timestamp(), end.timestamp())
+                    ),
+                ).fetchall()
         finally:
             if connection is not None:
                 connection.close()
@@ -335,6 +354,7 @@ class UsageHistory:
             "timezone": "server local time",
             "retention_days": RETENTION_DAYS,
             "flush_seconds": FLUSH_SECONDS,
+            "enabled": self.enabled,
             "available": self.available,
             "dropped_requests": self.dropped_requests,
             "totals": _summary(totals),

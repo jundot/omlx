@@ -19511,6 +19511,78 @@
         }
       }
     },
+    "server.section.usage" : {
+      "comment" : "Section heading for the local usage history switch in Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage History"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history" : {
+      "comment" : "Row label for the switch that records local hourly usage history",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Record usage history"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Записывать историю использования"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "记录使用历史"
+          }
+        }
+      }
+    },
+    "server.row.usage_history.sub" : {
+      "comment" : "Sublabel explaining the usage history switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохраняет почасовые итоги токенов по моделям в usage.sqlite3. При отключении существующая история сохраняется."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 usage.sqlite3 中存储各模型每小时的 token 总量。关闭后会保留现有历史。"
+          }
+        }
+      }
+    },
     "server.section.storage" : {
       "comment" : "Section heading for storage rows in Server screen",
       "extractionState" : "manual",
@@ -27013,6 +27085,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "使用历史不可用。推理正常继续。"
+          }
+        }
+      }
+    },
+    "status.usage.disabled" : {
+      "comment" : "Shown on the Status screen when usage history recording is switched off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usage history is off. Turn it on in Server settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "История использования отключена. Включите её в настройках сервера."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用历史已关闭。请在服务器设置中开启。"
+          }
+        }
+      }
+    },
+    "status.usage.open_settings" : {
+      "comment" : "Button that jumps from the Status screen to the usage history switch on the Server screen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Server Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть настройки сервера"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开服务器设置"
           }
         }
       }

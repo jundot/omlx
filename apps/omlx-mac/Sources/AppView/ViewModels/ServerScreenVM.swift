@@ -18,6 +18,9 @@ final class ServerScreenVM {
     var basePathText: String = AppConfig.defaultBasePath()
     var modelDirTexts: [String] = [""]
     var hfCacheEnabled: Bool = true
+    /// Live switch; commits through `saveUsageHistory()` like the other
+    /// auto-apply rows rather than the Apply button.
+    var usageHistoryEnabled: Bool = true
     var lastError: String?
     private(set) var isMovingBasePath: Bool = false
 
@@ -81,6 +84,7 @@ final class ServerScreenVM {
                 self.modelDirTexts = modelDirs
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -559,6 +563,10 @@ final class ServerScreenVM {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveUsageHistory() {
+        Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {

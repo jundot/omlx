@@ -1131,6 +1131,9 @@
   "js.success.settings_saved": "设置已成功保存",
   "settings.mcp.expose_tools": "向客户端公开后端 MCP 工具",
   "settings.mcp.expose_tools_hint": "将后端 MCP 工具合并到聊天响应中。如果您的客户端有自己的 MCP 服务器，请禁用此选项。",
+  "settings.usage.section_label": "使用历史",
+  "settings.usage.history": "记录使用历史",
+  "settings.usage.history_hint": "在本地的 usage.sqlite3 中存储各模型每小时的 token 总量。关闭后会保留现有历史；重新开启即恢复记录。",
   "usage.heading": "使用历史",
   "usage.range": "时间范围",
   "usage.today": "今天",
@@ -1153,5 +1156,7 @@
   "usage.heatmap_note": "00–23 时 · 绿色越深表示 Token 越多 · 夏令时重复的小时会合并",
   "usage.unavailable": "使用历史不可用。推理正常继续。",
   "usage.delayed": "历史记录可能不完整：存储延迟或待处理缓冲区已溢出。",
-  "usage.loading": "正在加载使用量…"
+  "usage.loading": "正在加载使用量…",
+  "usage.disabled": "使用历史已关闭。请在设置 → 使用历史中开启。",
+  "usage.open_settings": "打开设置"
 }

@@ -56,6 +56,21 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertEqual(usage.models.first?.modelId, "canonical-model")
         XCTAssertNil(usage.models.first?.generationTps)
         XCTAssertEqual(usage.heatmap.first?.tokens.reduce(0, +), 120)
+        XCTAssertNil(usage.enabled)
+    }
+
+    func testUsageHistoryDecodesDisabledState() throws {
+        let json = """
+        {"enabled": false, "available": true, "dropped_requests": 0,
+         "totals": {"requests": 0, "total_tokens": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "cached_tokens": 0,
+                    "generation_tps": null, "cache_efficiency": 0.0},
+         "models": [], "heatmap": []}
+        """
+        let usage = try Self.makeDecoder().decode(UsageHistoryDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(usage.enabled, false)
+        XCTAssertTrue(usage.models.isEmpty)
+        XCTAssertEqual(usage.totals.requests, 0)
     }
 
     // MARK: - oQ quantization

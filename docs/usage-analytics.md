@@ -77,6 +77,22 @@ To reset history, stop oMLX and remove `usage.sqlite3`, `usage.sqlite3-wal`, and
 `.corrupt` backup and its sidecars too if desired. Restart oMLX to begin fresh.
 Clearing Session or All Time in the dashboard does not erase history.
 
+## Disabling
+
+Usage history is on by default. Turn it off with the **Record usage history**
+switch (web dashboard: Settings → Usage History; macOS app: Server → Usage
+History), or set `usage.usage_history` to `false` in `settings.json`. The
+`OMLX_USAGE_HISTORY` environment variable (`0`/`false`/`off` or `1`/`true`/`on`)
+overrides the saved value at startup.
+
+The switch applies immediately, without a restart. Turning it off flushes any
+pending aggregates and then stops recording; `usage.sqlite3` stays in place, so
+turning it back on resumes the same history. While off, nothing is read from or
+written to the database: the Usage History panel reports that history is off
+and points to Settings, and `GET /admin/api/usage` returns `"enabled": false`
+with zero totals instead of the unavailable error. Cumulative Session and All
+Time statistics are unaffected.
+
 ## Admin API
 
 `GET /admin/api/usage?range=7d&model=<canonical-model-id>` uses the existing admin
@@ -87,7 +103,7 @@ Multi-day ranges include today; Yesterday is the preceding calendar day. Omit
 or removal. OpenAI-compatible responses and endpoints are unchanged.
 
 The JSON includes `totals`, `models`, `daily`, `hourly`, and `heatmap`, plus range,
-retention, refresh, availability, and overflow metadata. Aggregate metrics are
+retention, refresh, `enabled`, availability, and overflow metadata. Aggregate metrics are
 `requests`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`,
 `prefill_seconds`, `generation_seconds`, `request_seconds`, `timed_requests`,
 `cache_efficiency`, `generation_tps`, `prefill_tps`, and `average_request_seconds`.

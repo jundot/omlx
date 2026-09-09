@@ -385,10 +385,14 @@ def get_server_metrics() -> ServerMetrics:
     return _server_metrics
 
 
-def reset_server_metrics(stats_path: Optional[Path] = None) -> None:
+def reset_server_metrics(
+    stats_path: Optional[Path] = None, *, usage_history_enabled: bool = True
+) -> None:
     """Reset metrics (called on server start).
 
     If a previous instance exists and has a stats_path, save before resetting.
+    ``usage_history_enabled`` seeds the recorder from settings; the toggle can
+    still be flipped at runtime through the admin API.
     """
     global _server_metrics
     if _server_metrics is not None:
@@ -398,6 +402,8 @@ def reset_server_metrics(stats_path: Optional[Path] = None) -> None:
         from .usage_history import UsageHistory
 
         try:
-            _server_metrics.usage_history = UsageHistory(stats_path.parent / "usage.sqlite3")
+            _server_metrics.usage_history = UsageHistory(
+                stats_path.parent / "usage.sqlite3", enabled=usage_history_enabled
+            )
         except Exception:
             logger.warning("Usage history initialization failed; serving continues")

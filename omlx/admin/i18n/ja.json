@@ -1131,6 +1131,9 @@
   "js.success.settings_saved": "設定が保存されました",
   "settings.mcp.expose_tools": "バックエンドMCPツールをクライアントに公開",
   "settings.mcp.expose_tools_hint": "バックエンドのMCPツールをチャット応答にマージします。クライアントが独自のMCPサーバーを持つ場合は無効にしてください。",
+  "settings.usage.section_label": "使用履歴",
+  "settings.usage.history": "使用履歴を記録",
+  "settings.usage.history_hint": "モデル別の1時間ごとのトークン合計をローカルの usage.sqlite3 に保存します。オフにしても既存の履歴は保持され、再びオンにすると記録を再開します。",
   "usage.heading": "使用履歴",
   "usage.range": "期間",
   "usage.today": "今日",
@@ -1153,5 +1156,7 @@
   "usage.heatmap_note": "0〜23時 · 緑が濃いほどトークンが多い · 夏時間で重複する時間は合算",
   "usage.unavailable": "使用履歴を利用できません。推論は通常どおり続行します。",
   "usage.delayed": "履歴が不完全な可能性があります: 保存が遅延しているか、保留バッファがあふれました。",
-  "usage.loading": "使用履歴を読み込み中…"
+  "usage.loading": "使用履歴を読み込み中…",
+  "usage.disabled": "使用履歴はオフです。設定 → 使用履歴でオンにしてください。",
+  "usage.open_settings": "設定を開く"
 }

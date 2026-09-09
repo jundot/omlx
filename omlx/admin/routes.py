@@ -384,6 +384,9 @@ class GlobalSettingsRequest(BaseModel):
     mcp_config: str | None = None
     mcp_expose_tools: bool | None = None
 
+    # Usage history settings
+    usage_history: bool | None = None
+
     # HuggingFace settings
     hf_endpoint: str | None = None
     hf_cache_enabled: bool | None = None
@@ -3710,6 +3713,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "config_path": global_settings.mcp.config_path,
             "expose_tools": global_settings.mcp.expose_tools,
         },
+        "usage": {
+            "usage_history": global_settings.usage.usage_history,
+        },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
             "hf_cache_enabled": global_settings.huggingface.hf_cache_enabled,
@@ -4307,6 +4313,18 @@ async def update_global_settings(
     if request.mcp_expose_tools is not None:
         global_settings.mcp.expose_tools = request.mcp_expose_tools
         runtime_applied.append("mcp_expose_tools")
+
+    # Usage history recording is applied at runtime (no restart needed).
+    # Disabling flushes pending aggregates and leaves usage.sqlite3 in place.
+    if request.usage_history is not None:
+        global_settings.usage.usage_history = request.usage_history
+        from ..server_metrics import get_server_metrics
+
+        history = get_server_metrics().usage_history
+        if history is not None:
+            # Disabling flushes to SQLite; keep that off the event loop.
+            await asyncio.to_thread(history.set_enabled, request.usage_history)
+        runtime_applied.append("usage_history")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:

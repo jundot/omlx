@@ -814,6 +814,24 @@ class UISettings:
 
 
 @dataclass
+class UsageSettings:
+    """Local usage history settings."""
+
+    # Record hourly per-model serving aggregates to <base_path>/usage.sqlite3.
+    # Turning this off stops recording; existing history is kept on disk.
+    usage_history: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"usage_history": self.usage_history}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> UsageSettings:
+        """Create from dictionary."""
+        return cls(usage_history=data.get("usage_history", True))
+
+
+@dataclass
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
@@ -958,6 +976,7 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
+    usage: UsageSettings = field(default_factory=UsageSettings)
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
@@ -1054,6 +1073,8 @@ class GlobalSettings:
                 self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
+            if "usage" in data:
+                self.usage = UsageSettings.from_dict(data["usage"])
             if "idle_timeout" in data:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
@@ -1203,6 +1224,15 @@ class GlobalSettings:
                 self.logging.retention_days = int(retention_days)
             except ValueError:
                 logger.warning(f"Invalid OMLX_LOG_RETENTION_DAYS: {retention_days}")
+
+        # Usage history settings
+        if usage_history := os.getenv("OMLX_USAGE_HISTORY"):
+            self.usage.usage_history = usage_history.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         # Integration settings
         if markitdown_enabled := os.getenv("OMLX_MARKITDOWN_ENABLED"):
@@ -1396,6 +1426,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
@@ -1749,6 +1780,7 @@ class GlobalSettings:
             "claude_code": self.claude_code.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
+            "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 

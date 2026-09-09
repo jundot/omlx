@@ -1,7 +1,7 @@
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
-        range: 'today', model: '', models: [], data: null, error: '', loading: false, peak: 1, displayedQuery: '',
+        range: 'today', model: '', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
         timer: null, request: null,
         init() {
             this.$watch('mainTab', tab => {
@@ -26,6 +26,14 @@ function usageHistory() {
                 if (!response.ok) throw new Error('unavailable');
                 const data = await response.json();
                 if (request.signal.aborted) return;
+                // Recording switched off in Settings: a distinct state, not a storage failure.
+                this.disabled = data.enabled === false;
+                if (this.disabled) {
+                    this.data = null;
+                    this.models = [];
+                    this.error = '';
+                    return;
+                }
                 this.data = data;
                 this.peak = Math.max(1, ...data.heatmap.flatMap(day => day.tokens));
                 if (!this.model) this.models = data.models.map(row => row.model_id);
@@ -33,6 +41,7 @@ function usageHistory() {
             } catch (error) {
                 if (error.name === 'AbortError' || request.signal.aborted) return;
                 this.data = null;
+                this.disabled = false;
                 this.error = window.t('usage.unavailable');
             } finally {
                 if (this.request === request) this.loading = false;
