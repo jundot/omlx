@@ -146,7 +146,7 @@ def _patch_inner_model(mod: Any) -> None:
     def __init__(self, args):
         original_init(self, args)
         assistant = getattr(args, "mtp_assistant_config", None)
-        from . import is_mtp_active
+        from . import get_mtp_depth, is_mtp_active
 
         enabled = bool(assistant) and is_mtp_active()
         self._omlx_mtp_decode_enabled = enabled
@@ -160,11 +160,8 @@ def _patch_inner_model(mod: Any) -> None:
         self.mtp = Gemma4AssistantDraftModel(Gemma4AssistantConfig.from_dict(assistant))
         # Function refs read weights at call time, so binding pre-load is safe.
         self.mtp.bind(self)
-        # Deliberately NOT _omlx_mtp_chain. Depth-k needs partial rollback, and
-        # on this path _chain_rollback looks for ``mtp_partial_rollback`` (the
-        # qwen35 patch's method) because gemma4 reports no gdn_states. Without
-        # it every cycle raises _MtpStepFallback and the step is redone, which
-        # costs far more than drafting saves. Depth-1, as DeepSeek-V4 does.
+        self._omlx_mtp_chain = True
+        self._omlx_mtp_depth = get_mtp_depth()
 
     def __call__(self, inputs, cache=None, **kwargs):
         want_hidden = bool(kwargs.pop("return_hidden", False))
@@ -259,11 +256,35 @@ def _patch_inner_model(mod: Any) -> None:
         """The assistant head is stateless."""
         return []
 
+    def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
+        """Trim the rejected tail after a depth-k verify over [confirmed, d1..dk].
+
+        Gemma 4 is attention-only, so unlike qwen35 there is no recurrent
+        state to restore and replay: every layer drops
+        ``num_drafts - accepted`` positions. Trimmability is checked across
+        all layers before any are trimmed, because a half-rolled-back cache
+        is unrecoverable. A sliding layer whose ring has wrapped reports
+        ``is_trimmable()`` False and the caller takes the standard step.
+        """
+        trim_n = num_drafts - accepted
+        if trim_n <= 0:
+            return True
+        live = [c for c in cache if c is not None]
+        if not live:
+            return False
+        for c in live:
+            if not (hasattr(c, "is_trimmable") and c.is_trimmable()):
+                return False
+        for c in live:
+            c.trim(trim_n)
+        return True
+
     cls.__init__ = __init__
     cls.__call__ = __call__
     cls._omlx_logits = _omlx_logits
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_partial_rollback = mtp_partial_rollback
     cls._omlx_mtp_attach_patched = True
 
 
