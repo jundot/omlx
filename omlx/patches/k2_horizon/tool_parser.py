@@ -12,7 +12,8 @@ from mlx_lm.tool_parsers.glm47 import _get_string_arg_names, _normalize_argument
 tool_call_start = "<ifm|tool_calls>"
 tool_call_end = "</ifm|tool_calls>"
 
-_CALL_PATTERN = re.compile(r"<ifm\|tool_call>(.*?)</ifm\|tool_call>", re.DOTALL)
+_CALL_START = "<ifm|tool_call>"
+_CALL_END = "</ifm|tool_call>"
 _ARGUMENT_PATTERN = re.compile(
     r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
     r"(?:<ifm\|arg_type>(.*?)</ifm\|arg_type>\s*)?"
@@ -21,8 +22,7 @@ _ARGUMENT_PATTERN = re.compile(
 )
 
 
-def _parse_json_call(body: str, tools: list[Any] | None) -> dict[str, Any]:
-    payload = json.loads(body)
+def _parse_json_call(payload: Any, tools: list[Any] | None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("K2 Horizon JSON tool call must be an object")
     name = payload.get("name")
@@ -59,18 +59,56 @@ def _parse_xml_call(body: str, tools: list[Any] | None) -> dict[str, Any]:
     }
 
 
+def _parse_group_body(text: str, start: int, tools: list[Any] | None):
+    calls = []
+    while True:
+        while start < len(text) and text[start].isspace():
+            start += 1
+        if not text.startswith(_CALL_START, start):
+            break
+        body_start = start + len(_CALL_START)
+        while body_start < len(text) and text[body_start].isspace():
+            body_start += 1
+        if text.startswith("{", body_start):
+            payload, end = json.JSONDecoder().raw_decode(text, body_start)
+            call = _parse_json_call(payload, tools)
+            while end < len(text) and text[end].isspace():
+                end += 1
+        else:
+            end = text.find(_CALL_END, body_start)
+            if end < 0:
+                raise ValueError("K2 Horizon tool group contains an incomplete call")
+            call = _parse_xml_call(text[body_start:end].strip(), tools)
+        if not text.startswith(_CALL_END, end):
+            raise ValueError("K2 Horizon tool group contains an incomplete call")
+        calls.append(call)
+        start = end + len(_CALL_END)
+    if not calls:
+        raise ValueError("K2 Horizon tool group contains no complete <ifm|tool_call>")
+    return calls, start
+
+
 def parse_tool_call(text: str, tools: list[Any] | None = None) -> list[dict[str, Any]]:
     """Parse one ``<ifm|tool_calls>`` group body into OpenAI-style call dicts."""
-    bodies = [body.strip() for body in _CALL_PATTERN.findall(text)]
-    if not bodies:
-        raise ValueError("K2 Horizon tool group contains no complete <ifm|tool_call>")
-    if _CALL_PATTERN.sub("", text).strip():
+    calls, end = _parse_group_body(text, 0, tools)
+    if text[end:].strip():
         raise ValueError("K2 Horizon tool group contains an incomplete call")
-    return [
-        (
-            _parse_json_call(body, tools)
-            if body.startswith("{")
-            else _parse_xml_call(body, tools)
-        )
-        for body in bodies
-    ]
+    return calls
+
+
+def parse_tool_groups(text: str, tools: list[Any] | None = None):
+    """Parse complete groups, retaining prose outside their structural boundaries."""
+    visible, calls = [], []
+    position = 0
+    while True:
+        start = text.find(tool_call_start, position)
+        if start < 0:
+            visible.append(text[position:])
+            break
+        visible.append(text[position:start])
+        group, end = _parse_group_body(text, start + len(tool_call_start), tools)
+        if not text.startswith(tool_call_end, end):
+            raise ValueError("Incomplete or malformed K2 tool-call envelope")
+        calls.extend(group)
+        position = end + len(tool_call_end)
+    return "".join(visible), calls

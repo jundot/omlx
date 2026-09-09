@@ -123,6 +123,74 @@ def test_argument_may_mention_open_marker():
     )
 
 
+@pytest.mark.parametrize("marker", ["</ifm|tool_call>", "</ifm|tool_calls>"])
+def test_json_closing_markers_stay_inside_arguments(marker):
+    from omlx.api.tool_calling import parse_tool_calls
+
+    tools = [{"type": "function", "function": {"name": "edit"}}]
+    values = [f'escaped "quote" \\ {marker} tail', "second " + marker, "third"]
+    bodies = [
+        "<ifm|tool_call>"
+        + json.dumps({"name": "edit", "arguments": {"text": value}})
+        + "</ifm|tool_call>"
+        for value in values
+    ]
+    first = "<ifm|tool_calls> \n" + " \n".join(bodies[:2]) + " \n</ifm|tool_calls>"
+    second = "<ifm|tool_calls>" + bodies[2] + "</ifm|tool_calls>"
+    text = "before" + first + "between" + second + "after"
+    assert [
+        call["arguments"]["text"] for call in parse_tool_call("".join(bodies))
+    ] == values
+
+    session = session_for("", tools)
+    visible = "".join(session._emit(character).visible_text for character in text)
+    result = session.finalize()
+    assert result.error is None
+    assert visible + result.visible_text == "beforebetweenafter"
+    assert [
+        json.loads(call["arguments"])["text"] for call in result.tool_calls
+    ] == values
+    assert len({call["id"] for call in result.tool_calls}) == 3
+    clean, calls = parse_tool_calls(text, session._tokenizer, tools)
+    assert clean == "beforebetweenafter"
+    assert [json.loads(call.function.arguments)["text"] for call in calls] == values
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        '<ifm|tool_calls><ifm|tool_call>{"name":',
+        '<ifm|tool_calls><ifm|tool_call>{"name":"edit","arguments":{}}</ifm|tool_call>garbage</ifm|tool_calls>',
+    ],
+)
+def test_marker_argument_does_not_hide_a_malformed_trailing_group(tail):
+    good = '<ifm|tool_calls><ifm|tool_call>{"name":"edit","arguments":{"text":"literal </ifm|tool_calls>"}}</ifm|tool_call></ifm|tool_calls>'
+    result = session_for(
+        good + tail, [{"type": "function", "function": {"name": "edit"}}]
+    ).finalize()
+    assert result.error
+    assert result.tool_calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "before<ifm|tool_calls>garbage",
+        'before<ifm|tool_calls><ifm|tool_call>{"name":"edit","arguments":{"text":"literal </ifm|tool_calls> TAIL"}}</ifm|tool_call>garbage</ifm|tool_calls>after',
+    ],
+)
+def test_malformed_group_content_is_not_streamed(text):
+    session = session_for("", [{"type": "function", "function": {"name": "edit"}}])
+    visible = "".join(
+        session._emit(character).visible_text
+        for character in text
+    )
+    result = session.finalize()
+    assert visible + result.visible_text == "before"
+    assert result.error
+    assert result.tool_calls == []
+
+
 def test_parser_error_stays_with_its_batch_request(mock_model, mock_tokenizer):
     from omlx.engine_core import _raise_request_output_error
     from omlx.request import Request, RequestStatus, SamplingParams

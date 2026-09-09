@@ -1546,6 +1546,20 @@ def parse_tool_calls(
         - cleaned_text: Text with tool call tags and thinking tags removed
         - tool_calls: List of ToolCall objects, or None if no tool calls found
     """
+    if getattr(tokenizer, "tool_call_start", None) == "<ifm|tool_calls>":
+        from ..patches.k2_horizon.tool_parser import parse_tool_groups
+
+        cleaned_text, parsed = parse_tool_groups(text, tools)
+        tool_calls = [
+            _build_tool_call(call["name"], call["arguments"]) for call in parsed
+        ]
+        if any(call is None for call in tool_calls):
+            raise ValueError("K2 Horizon tool-call arguments failed validation")
+        cleaned_text = re.sub(
+            r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
+        ).strip()
+        return cleaned_text, tool_calls or None
+
     cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
     if tool_calls:
         _remap_tool_call_names(tool_calls, tools)
@@ -1893,6 +1907,7 @@ class ToolCallStreamFilter:
 
     _COMPLETED_ENVELOPE_MAX_COUNT = 16
     _COMPLETED_ENVELOPE_MAX_BYTES = 2 * 1024 * 1024
+    _IFM_CALL_MARKERS = ("<ifm|tool_call>", "</ifm|tool_call>")
 
     def __init__(
         self,
@@ -2071,6 +2086,7 @@ class ToolCallStreamFilter:
     # non-streaming parser accepts from ``_json_value_end``.
 
     def _reset_json_scan(self) -> None:
+        self._ifm_phase = "call"
         self._json_state = "undecided"
         self._json_depth = 0
         self._json_in_string = False
@@ -2176,6 +2192,57 @@ class ToolCallStreamFilter:
             i += 1
         self._json_scan_off = i
 
+    def _find_ifm_group_end(self, buffer: str) -> int:
+        """Keep the group hidden while scanning each inner call once."""
+        call_start, call_end = self._IFM_CALL_MARKERS
+        group_end = "</ifm|tool_calls>"
+        cursor = self._json_scan_off
+        while cursor < len(buffer):
+            if self._ifm_phase == "invalid":
+                return -1
+            if self._ifm_phase == "call":
+                cursor = _skip_ws(buffer, cursor)
+                if buffer.startswith(group_end, cursor):
+                    return cursor
+                if not buffer.startswith(call_start, cursor):
+                    self._json_scan_off = cursor
+                    if not any(
+                        marker.startswith(buffer[cursor:])
+                        for marker in (call_start, group_end)
+                    ):
+                        self._ifm_phase = "invalid"
+                    return -1
+                cursor += len(call_start)
+                self._reset_json_scan()
+                self._ifm_phase = "body"
+                self._json_scan_off = cursor
+            if self._ifm_phase == "body":
+                self._advance_json_scan(buffer)
+                if self._json_state in ("undecided", "scanning", "array_head"):
+                    return -1
+                if self._json_state == "complete":
+                    cursor = self._json_complete_off
+                else:
+                    end = buffer.find(call_end, cursor)
+                    if end < 0:
+                        self._json_scan_off = max(
+                            cursor, len(buffer) - len(call_end) + 1
+                        )
+                        return -1
+                    cursor = end
+                self._ifm_phase = "call_end"
+            if self._ifm_phase == "call_end":
+                cursor = _skip_ws(buffer, cursor)
+                if not buffer.startswith(call_end, cursor):
+                    self._json_scan_off = cursor
+                    if not call_end.startswith(buffer[cursor:]):
+                        self._ifm_phase = "invalid"
+                    return -1
+                cursor += len(call_end)
+                self._ifm_phase = "call"
+                self._json_scan_off = cursor
+        return -1
+
     def _find_suppression_end(self, buffer: str) -> int:
         """Index in ``buffer`` of the close marker that really ends the envelope.
 
@@ -2200,6 +2267,8 @@ class ToolCallStreamFilter:
         marker = self._suppressing_until
         if not marker:
             return -1
+        if marker == "</ifm|tool_calls>":
+            return self._find_ifm_group_end(buffer)
 
         self._advance_json_scan(buffer)
 
@@ -2614,6 +2683,14 @@ class ToolCallStreamFilter:
                     keep = self._partial_prefix_len(
                         self._buffer, self._suppressing_until
                     )
+                    if self._suppressing_until == "</ifm|tool_calls>":
+                        keep = max(
+                            keep,
+                            *(
+                                self._partial_prefix_len(self._buffer, marker)
+                                for marker in self._IFM_CALL_MARKERS
+                            ),
+                        )
                     if keep:
                         moved = self._buffer[:-keep]
                         self._pending_envelope_parts.append(moved)
@@ -2680,7 +2757,8 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
-        if self._suppressing:
+        # K2 reports incomplete groups through strict final parsing.
+        if self._suppressing or self._suppressing_until == "</ifm|tool_calls>":
             self._buffer = ""
             self._suppressing_until = None
             self._clear_pending_envelope()

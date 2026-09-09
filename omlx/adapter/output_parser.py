@@ -1323,22 +1323,11 @@ class K2HorizonOutputParserSession:
         error = None
         if self._tools:
             try:
-                from ..api.tool_calling import _marker_payloads, parse_tool_calls
-                from ..patches.k2_horizon.tool_parser import parse_tool_call
+                from ..api.tool_calling import parse_tool_calls
 
-                for payload in _marker_payloads(
-                    self._raw_text, _K2_TOOL_CALLS_START, _K2_TOOL_CALLS_END
-                ):
-                    parse_tool_call(payload, self._tools)
                 _, parsed_calls = parse_tool_calls(
                     self._raw_text, self._tokenizer, self._tools
                 )
-                if _K2_TOOL_CALLS_START in self._raw_text and (
-                    not parsed_calls
-                    or self._raw_text.rfind(_K2_TOOL_CALLS_START)
-                    > self._raw_text.rfind(_K2_TOOL_CALLS_END)
-                ):
-                    raise ValueError("Incomplete or malformed K2 tool-call envelope")
                 for call in parsed_calls or []:
                     tool_calls.append(
                         {
