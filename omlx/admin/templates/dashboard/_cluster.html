@@ -932,6 +932,141 @@
                     </div>
                 </div>
 
+                <!-- KV Cache observability -->
+                <div x-show="clusterNeuralFabricJob()?.live"
+                     x-cloak
+                     x-init="loadClusterKvCache()"
+                     x-effect="if (clusterNeuralFabricJob()?.live) pollClusterKvCache()"
+                     class="cluster-card mb-6"
+                     data-cluster-kv-cache>
+                    <div class="cluster-card__header">
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <i data-lucide="database" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">KV Cache</span>
+                            </div>
+                            <p class="text-xs text-neutral-400 mt-1">
+                                Cache hit rates, eviction pressure, and memory utilization per node
+                            </p>
+                        </div>
+                        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold"
+                              :class="clusterKvCacheScore() >= 0.8
+                                ? 'bg-green-50 text-green-700 border border-green-200'
+                                : (clusterKvCacheScore() >= 0.5
+                                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                  : 'bg-red-50 text-red-700 border border-red-200')">
+                            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+                            <span x-text="'Efficiency: ' + Math.round(clusterKvCacheScore() * 100) + '%'"></span>
+                        </span>
+                    </div>
+                    <div class="cluster-card__body">
+                        <!-- Per-node gauge cards -->
+                        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-5">
+                            <template x-for="node in clusterKvCacheNodes()" :key="'kv-' + node.rank">
+                                <div class="rounded-xl border p-4"
+                                     :class="node.memory_pressure > 0.9
+                                       ? 'border-red-200 bg-red-50'
+                                       : (node.memory_pressure > 0.7
+                                         ? 'border-amber-200 bg-amber-50'
+                                         : 'border-neutral-200 bg-white')">
+                                    <div class="flex items-start justify-between gap-2 mb-3">
+                                        <div>
+                                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400"
+                                                 x-text="'Rank ' + node.rank"></div>
+                                            <div class="text-sm font-semibold text-neutral-900 truncate"
+                                                 x-text="node.node_id"></div>
+                                        </div>
+                                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                                              :class="node.memory_pressure > 0.9
+                                                ? 'bg-red-100 text-red-700'
+                                                : (node.memory_pressure > 0.7
+                                                  ? 'bg-amber-100 text-amber-700'
+                                                  : 'bg-green-100 text-green-700')">
+                                            <span class="w-1 h-1 rounded-full bg-current"></span>
+                                            <span x-text="Math.round(node.memory_pressure * 100) + '%'"></span>
+                                        </span>
+                                    </div>
+                                    <div class="cluster-kv-gauge" role="meter"
+                                         :aria-label="node.node_id + ' cache utilization'"
+                                         :aria-valuenow="Math.round(node.memory_pressure * 100)"
+                                         aria-valuemin="0"
+                                         aria-valuemax="100">
+                                        <div class="cluster-kv-gauge__track">
+                                            <div class="cluster-kv-gauge__fill"
+                                                 :class="node.memory_pressure > 0.9
+                                                   ? 'cluster-kv-gauge__fill--danger'
+                                                   : (node.memory_pressure > 0.7
+                                                     ? 'cluster-kv-gauge__fill--warn'
+                                                     : '')"
+                                                 :style="'width:' + Math.round(node.memory_pressure * 100) + '%'"></div>
+                                        </div>
+                                    </div>
+                                    <dl class="grid grid-cols-2 gap-x-3 gap-y-2 mt-3 text-xs">
+                                        <div>
+                                            <dt class="text-neutral-400">Hit rate</dt>
+                                            <dd class="font-semibold text-neutral-900"
+                                                x-text="Math.round(node.hit_rate * 100) + '%'"></dd>
+                                        </div>
+                                        <div>
+                                            <dt class="text-neutral-400">Cache size</dt>
+                                            <dd class="font-semibold text-neutral-900"
+                                                x-text="node.cache_size_mb + ' MB'"></dd>
+                                        </div>
+                                        <div>
+                                            <dt class="text-neutral-400">Eviction</dt>
+                                            <dd class="font-semibold"
+                                                :class="node.eviction_rate > 0.05
+                                                  ? 'text-red-600'
+                                                  : 'text-neutral-900'"
+                                                x-text="(node.eviction_rate * 100).toFixed(1) + '%'"></dd>
+                                        </div>
+                                        <div>
+                                            <dt class="text-neutral-400">Entries</dt>
+                                            <dd class="font-semibold text-neutral-900"
+                                                x-text="node.entries"></dd>
+                                        </div>
+                                    </dl>
+                                </div>
+                            </template>
+                            <div x-show="!clusterKvCacheNodes().length"
+                                 class="col-span-full rounded-xl border border-dashed border-neutral-300 bg-white p-6 text-center">
+                                <div class="text-xs text-neutral-500">No KV cache data available yet. Cache metrics appear when a cluster is live.</div>
+                            </div>
+                        </div>
+
+                        <!-- Hit rate trend chart (SVG sparkline) -->
+                        <div class="rounded-xl border border-neutral-200 bg-white p-4">
+                            <div class="flex items-center justify-between gap-3 mb-3">
+                                <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Hit rate trend (last hour)</div>
+                                <span class="text-[10px] text-neutral-400">1-min resolution · 60 data points</span>
+                            </div>
+                            <svg class="cluster-kv-chart"
+                                 viewBox="0 0 600 120"
+                                 preserveAspectRatio="none"
+                                 aria-label="KV cache hit rate trend chart">
+                                <defs>
+                                    <linearGradient id="kv-chart-fill" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stop-color="rgba(34,211,238,0.22)" />
+                                        <stop offset="100%" stop-color="rgba(34,211,238,0)" />
+                                    </linearGradient>
+                                </defs>
+                                <path :d="clusterKvChartFillPath()" fill="url(#kv-chart-fill)" />
+                                <path :d="clusterKvChartLinePath()" fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-linecap="round" />
+                            </svg>
+                        </div>
+
+                        <!-- Eviction pressure alert -->
+                        <div x-show="clusterKvEvictionAlert()" x-cloak
+                             class="mt-4 flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+                            <i data-lucide="triangle-alert" class="w-4 h-4 text-red-600 mt-0.5 flex-shrink-0"></i>
+                            <div>
+                                <div class="text-xs font-semibold text-red-800">High eviction pressure</div>
+                                <div class="text-[11px] text-red-700 mt-0.5" x-text="clusterKvEvictionAlert()"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 {#
                 The old full-page shard/runtime console deliberately no longer renders.
                 Live product status belongs in the neural-fabric cockpit above; the
