@@ -9172,6 +9172,13 @@
                 if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
                 if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
                 if (activity.file_size_bytes != null && activity.file_size_bytes > 0) parts.push(this.formatByteCount(activity.file_size_bytes));
+                // Step-based engines (image diffusion): "12/28 steps · 4.3 steps/s".
+                if (activity.current_step != null && activity.total_steps != null) {
+                    parts.push(activity.current_step + '/' + activity.total_steps + ' steps');
+                }
+                if (activity.steps_per_second != null && activity.steps_per_second > 0) {
+                    parts.push(activity.steps_per_second.toFixed(1) + ' steps/s');
+                }
                 return parts.join(' · ');
             },
 

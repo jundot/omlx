@@ -25,8 +25,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "image"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "image"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -608,6 +608,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
+        # mflux image models ship no root config.json — classify their
+        # component layout before the LLM fallback.
+        if _is_mflux_image_model(model_path):
+            return "image"
         return "llm"
 
     try:
@@ -1076,14 +1080,31 @@ def estimate_text_only_model_size(model_path: Path) -> int:
     return 0
 
 
+def _is_mflux_image_model(path: Path) -> bool:
+    """mflux diffusion checkpoint: no root config.json, component layout
+    (text_encoder/ + vae/, transformer/ optional) or a diffusers-style
+    model_index.json."""
+    try:
+        if (path / "config.json").exists():
+            return False
+        if (path / "model_index.json").exists():
+            return True
+        return (path / "text_encoder").is_dir() and (path / "vae").is_dir()
+    except OSError:
+        return False
+
+
 def _is_adapter_dir(path: Path) -> bool:
     """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
     return (path / "adapter_config.json").exists()
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model (config.json, or the
+    mflux image component layout)."""
+    if _is_adapter_dir(path):
+        return False
+    return (path / "config.json").exists() or _is_mflux_image_model(path)
 
 
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
@@ -1480,6 +1501,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "image":
+            engine_type = "image"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

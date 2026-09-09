@@ -19,3 +19,14 @@ def format_bytes(bytes_value: int) -> str:
         return f"{bytes_value / 1024:.2f} KB"
     else:
         return f"{bytes_value} B"
+
+
+def make_json_safe(obj: object) -> object:
+    """Recursively convert non-JSON-serializable objects (like Exceptions) to strings."""
+    if isinstance(obj, Exception):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(item) for item in obj]
+    return obj
