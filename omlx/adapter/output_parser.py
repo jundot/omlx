@@ -26,6 +26,16 @@ from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 logger = logging.getLogger(__name__)
 
 
+def _decode_output_token(tokenizer, detokenizer, token_id: int) -> str:
+    if detokenizer is not None:
+        detokenizer.add_token(token_id)
+        return detokenizer.last_segment
+    try:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+    except TypeError:
+        return tokenizer.decode([token_id])
+
+
 @dataclass
 class OutputParserTokenResult:
     """Per-token parser result returned during streaming."""
@@ -244,16 +254,7 @@ class BailingHybridOutputParserSession:
             self._visible_filter = None
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode(
-                [token_id],
-                skip_special_tokens=False,
-            )
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     @staticmethod
     def _filtered_text(text: str, tool_filter: Any) -> str:
@@ -530,13 +531,7 @@ class DeepSeekV4OutputParserSession:
             self._visible_filter = None
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _filtered_text(self, text: str, tool_filter: Any) -> str:
         if not text:
@@ -645,13 +640,7 @@ class MiniMaxM3OutputParserSession:
         self._visible_normalizer = _MiniMaxM3ProtocolNormalizer()
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _filtered_text(
         self,
@@ -997,13 +986,7 @@ class InklingOutputParserSession:
             )
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         if self._splitter.stopped:
@@ -1133,13 +1116,7 @@ class Cohere2MoeOutputParserSession:
         self._tool_calls: dict[int, dict[str, str]] = {}
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _accumulate_tool_calls(self, tool_calls: list[Any]) -> None:
         for tool_call in tool_calls:
@@ -1276,13 +1253,7 @@ class K2HorizonOutputParserSession:
         self._in_reasoning = True
 
     def _decode_token(self, token_id: int) -> str:
-        if self._detokenizer is not None:
-            self._detokenizer.add_token(token_id)
-            return self._detokenizer.last_segment
-        try:
-            return self._tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            return self._tokenizer.decode([token_id])
+        return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
     def _emit(self, text: str) -> OutputParserTokenResult:
         self._raw_text += text

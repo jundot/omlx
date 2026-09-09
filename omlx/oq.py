@@ -7643,18 +7643,11 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
-def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
-    """Capture the untied GLM-5.3 output head without materializing logits."""
-    if str(getattr(model, "model_type", "")) != "glm5_next":
-        return False
-
-    language_model = getattr(model, "language_model", None)
-    core = getattr(language_model, "model", None)
+def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
+    """Capture normalized head inputs without materializing vocabulary logits."""
     norm = getattr(core, "norm", None)
-    if language_model is None or core is None or norm is None:
+    if core is None or norm is None:
         return False
-
-    name = "language_model.lm_head"
     module = collector._original_modules.get(name)
     if module is None:
         # Tied checkpoints project through embed_tokens and have no lm_head.
@@ -7666,25 +7659,22 @@ def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
     return name in collector.entries
 
 
+def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
+    if str(getattr(model, "model_type", "")) != "glm5_next":
+        return False
+    language_model = getattr(model, "language_model", None)
+    core = getattr(language_model, "model", None)
+    return _collect_untied_lm_head_imatrix(
+        core, hidden, collector, "language_model.lm_head"
+    )
+
+
 def _collect_k2_horizon_lm_head_imatrix(model, hidden, collector) -> bool:
-    """Capture the untied output head omitted by the trunk-layer walk."""
     if str(getattr(model, "model_type", "")) != "k2_horizon":
         return False
-
-    core = getattr(model, "model", None)
-    norm = getattr(core, "norm", None)
-    if core is None or norm is None:
-        return False
-
-    name = "lm_head"
-    module = collector._original_modules.get(name)
-    if module is None:
-        return False
-
-    if getattr(hidden, "ndim", 0) == 4:
-        hidden = hidden.mean(axis=2)
-    collector.collect_dense(name, module, norm(hidden))
-    return name in collector.entries
+    return _collect_untied_lm_head_imatrix(
+        getattr(model, "model", None), hidden, collector, "lm_head"
+    )
 
 
 def _collect_mtp_head_imatrix(
