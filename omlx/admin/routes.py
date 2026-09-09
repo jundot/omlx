@@ -4606,6 +4606,7 @@ def _global_settings_response(global_settings):
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
             "haiku_model": global_settings.claude_code.haiku_model,
+            "desktop_enabled": global_settings.claude_code.desktop_enabled,
         },
         "integrations": {
             "codex_model": global_settings.integrations.codex_model,
