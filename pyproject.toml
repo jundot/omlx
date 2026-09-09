@@ -88,10 +88,13 @@ dependencies = [
     "tiktoken",
     "protobuf",
     "requests>=2.28.0",
+    # PySocks: requests' SOCKS support (socksio only covers httpx).
+    "PySocks>=1.7.1",
     # OpenAI-compatible external endpoint client for admin benchmarks.
     # Already a transitive dep via huggingface-hub; pinned direct so
     # omlx.admin.external_api can import it unconditionally at module top.
-    "httpx>=0.27.0,<1",
+    # 0.28+ required for the socks5h:// proxy scheme.
+    "httpx>=0.28.0,<1",
     # SOCKS proxy support (used by httpx via huggingface-hub)
     "socksio>=1.0.0",
     # DuckDuckGo backend for the chat web_search tool. Pinned to 9.14.1:
