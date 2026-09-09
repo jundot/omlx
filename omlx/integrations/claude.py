@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -83,6 +84,20 @@ class ClaudeCodeIntegration(Integration):
             return str(local)
         return "claude"
 
+    def _write_launch_settings(self, base_url: str) -> str:
+        """Write a settings file that pins ANTHROPIC_BASE_URL for this launch.
+
+        A persisted "env" block in the user's own ~/.claude/settings.json
+        (e.g. from an unrelated proxy setup) takes precedence over the
+        ANTHROPIC_BASE_URL we set on the process environment. Passing our
+        own --settings file guarantees the launched session talks to the
+        omlx server regardless of what the user has configured globally.
+        """
+        path = Path.home() / ".omlx" / "claude_launch_settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}))
+        return str(path)
+
     def launch(self, ctx: IntegrationContext) -> None:
         disabled_reason = self.model_disabled_reason(
             {"id": ctx.model, "max_context_window": ctx.context_window}
@@ -94,8 +109,10 @@ class ClaudeCodeIntegration(Integration):
 
         env = self._scrubbed_env()
         env["ANTHROPIC_BASE_URL"] = ctx.base_url
-        # Use the actual omlx API key so Claude Code authenticates correctly.
-        # Fallback to "omlx" only when no API key is configured (open server).
+        # ANTHROPIC_AUTH_TOKEN overrides OAuth/keychain login without
+        # triggering the "Detected a custom API key... use it?" prompt that
+        # ANTHROPIC_API_KEY does. Fallback to "omlx" only when no API key is
+        # configured (open server).
         env["ANTHROPIC_AUTH_TOKEN"] = ctx.auth_token
         env["ANTHROPIC_API_KEY"] = ""
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
@@ -172,6 +189,17 @@ class ClaudeCodeIntegration(Integration):
             a in ("--disallowedTools", "--disallowed-tools") for a in extra_args
         ):
             extra_args = ["--disallowedTools", "LSP", *extra_args]
+        # A persisted "env" block in the user's own ~/.claude/settings.json
+        # (e.g. from an unrelated proxy plugin) takes precedence over the
+        # ANTHROPIC_BASE_URL set on the process environment above, which is
+        # what actually causes 401s against the real Anthropic API. Passing
+        # our own --settings file pins the base URL regardless of what the
+        # user has configured globally, independent of what plugins/hooks
+        # they have installed, while keeping CLAUDE.md auto-discovery,
+        # project hooks, and LSP intact for the launched session.
+        if "--settings" not in extra_args:
+            settings_path = self._write_launch_settings(ctx.base_url)
+            extra_args = ["--settings", settings_path, *extra_args]
         argv = [binary, *extra_args]
         print(f"Launching Claude Code with model {ctx.model}...")
         if ctx.context_window:
