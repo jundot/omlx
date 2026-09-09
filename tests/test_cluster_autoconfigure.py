@@ -1043,6 +1043,51 @@ def test_rdma_detection_does_not_ssh_to_itself(monkeypatch):
     assert calls == [["ibv_devices"]]
 
 
+def test_rdma_detection_retries_a_flaky_mdns_resolution(monkeypatch):
+    """A single dropped mDNS round trip for a remote peer must not read as
+    "no RDMA" — only the local branch above is exempt from retrying."""
+
+    import subprocess as sp
+
+    from omlx.cluster import transport
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", lambda _seconds: None)
+    calls = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return sp.CompletedProcess(argv, 255, "", "Could not resolve hostname")
+        return sp.CompletedProcess(argv, 0, "device node_GUID\n---- ----\nrdma_en6 abc\n", "")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+
+    assert transport._rdma_devices("Studio.local") == ["rdma_en6"]
+    assert len(calls) == 2
+
+
+def test_rdma_detection_on_a_local_host_never_sleeps(monkeypatch):
+    """This probe runs on every activation-progress poll (every 750ms); a
+    local Mac with no RDMA hardware fails ibv_devices deterministically, so
+    retrying it would add felt latency to every poll for no chance of success."""
+
+    import subprocess as sp
+
+    from omlx.cluster import transport
+
+    def exploding_sleep(_seconds):
+        raise AssertionError("the local RDMA probe must never sleep/retry")
+
+    monkeypatch.setattr("omlx.cluster.ssh_policy.time.sleep", exploding_sleep)
+    monkeypatch.setattr(
+        sp, "run", lambda *a, **k: sp.CompletedProcess(["ibv_devices"], 1, "", "no such device")
+    )
+    monkeypatch.setattr(transport, "subprocess", sp)
+
+    with pytest.raises(RuntimeError, match="RDMA device probe failed"):
+        transport._rdma_devices("127.0.0.1")
+
+
 def test_rdma_requires_every_host_to_have_a_device(monkeypatch):
     from omlx.cluster import transport
 
