@@ -323,7 +323,7 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(self, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
@@ -332,6 +332,13 @@ class ThinkingParser:
         emitted ``</think>`` and no content was ever produced, returns
         the accumulated thinking text as content so the client surfaces
         a non-empty answer body.
+
+        Args:
+            truncated: True when generation was cut short by ``max_tokens``
+                (``finish_reason == "length"``). The recovery below is skipped
+                in that case: the close tag is missing because the model was
+                stopped mid-thought, not because it finished without one, so
+                the accumulated text is reasoning and not an answer.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -348,7 +355,8 @@ class ThinkingParser:
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
         if (
-            self._in_thinking
+            not truncated
+            and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
             and self._thinking_accumulated
