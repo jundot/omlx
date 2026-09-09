@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact K2 names across token boundaries and speculative rollback."""
+"""K2 tool names across token boundaries and request isolation."""
 
 import json
 from types import SimpleNamespace

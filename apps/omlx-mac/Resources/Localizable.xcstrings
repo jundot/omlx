@@ -598,7 +598,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Takes effect after reload."
+            "value" : "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload."
           }
         },
         "ru" : {
@@ -649,7 +649,7 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Optional test of prompts, eight requests, and cache reuse. Targets three minutes; loading or cleanup can take longer. You can enable ANE without testing."
+            "value": "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing."
           }
         },
         "ru": {

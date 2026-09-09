@@ -270,11 +270,11 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
-    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     k2_ane_prefill_enabled: bool | None = None
     k2_ane_prefill_fraction: float | None = None
     k2_ane_prefill_shared_fraction: float | None = None
     k2_ane_prefill_sequence_length: int | None = None
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None

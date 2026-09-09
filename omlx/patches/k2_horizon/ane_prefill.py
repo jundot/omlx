@@ -55,7 +55,7 @@ def _projection_statements(weight, width, blob, prefix, source="x"):
 
 
 def _full_mlp_procedure(projections, width, blob):
-    """Undo input scaling before SiLU; use separate down-input scaling."""
+    """Undo input scaling before SiLU. Use separate down-input scaling."""
     dim = projections[0].shape[1]
     hidden = projections[0].shape[0]
     lines = [
@@ -182,7 +182,7 @@ class PrefillMLP:
         )
         mx.eval([v for values, _ in parts for v in values])
 
-        # Keep original float views; packed GPU suffixes are materialized once.
+        # Keep original float views. Materialize packed GPU suffixes once.
         def gpu(x):
             if not parts:
                 return mx.zeros_like(x)
@@ -228,10 +228,12 @@ class PrefillMLP:
 
 def partition_channels(hidden, fraction, alignment=64):
     if not math.isfinite(fraction) or not 0 < fraction <= 1:
-        raise ValueError("K2 ANE prefill fraction must be between zero and one")
+        raise ValueError("K2 ANE prefill fraction must be in (0, 1].")
     cut = hidden if fraction == 1 else int(hidden * fraction) // alignment * alignment
     if not 0 < cut <= hidden:
-        raise ValueError("K2 ANE prefill must leave channels on both devices")
+        raise ValueError(
+            "K2 ANE allocation must contain at least one aligned channel group."
+        )
     return cut
 
 

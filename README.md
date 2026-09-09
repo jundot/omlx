@@ -291,7 +291,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
 | Mistral | `[TOOL_CALLS]` |
-| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`; requires `omlx[grammar]` |
+| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`. Requires `omlx[grammar]` |
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 

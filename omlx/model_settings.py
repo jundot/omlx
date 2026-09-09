@@ -355,9 +355,9 @@ class ModelSettings:
                 if getattr(self, name, False):
                     raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
         if not 0 <= self.k2_ane_prefill_shared_fraction <= 1:
-            raise ValueError("K2 ANE shared fraction must be between zero and one.")
+            raise ValueError("K2 ANE shared fraction must be in [0, 1].")
         if not 0 < self.k2_ane_prefill_fraction <= 1:
-            raise ValueError("K2 ANE prefill fraction must be between zero and one.")
+            raise ValueError("K2 ANE prefill fraction must be in (0, 1].")
         if (
             type(self.k2_ane_prefill_sequence_length) is not int
             or self.k2_ane_prefill_sequence_length < 32

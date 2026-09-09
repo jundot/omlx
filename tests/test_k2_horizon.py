@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""K2 model math, quantization, and conditional decoding contracts."""
+"""K2 model arithmetic, quantization, and cache checks."""
 
 from types import SimpleNamespace
 

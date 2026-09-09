@@ -176,8 +176,8 @@ def router_logits(
     """Respect each sparse release's router rounding contract."""
     if x.dtype != mx.bfloat16 or weight.dtype != mx.bfloat16:
         raise ValueError(
-            "K2 Horizon routers require BF16 activations and weights; got "
-            f"{x.dtype} and {weight.dtype}"
+            "K2 Horizon routers require BF16 activations and weights. "
+            f"Received {x.dtype} and {weight.dtype}."
         )
     if partitions == 1:
         return (x @ weight.T).astype(mx.float32)

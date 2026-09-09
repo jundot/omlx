@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hardware-local, profile-guided Qwen ANE/CPU/GPU workload tuning.
+"""Evaluate Qwen and K2 hardware allocations without changing saved settings.
 
-Exploratory points run against one representative real MLP and GDN layer.
+For Qwen, exploratory points run against one representative real MLP and GDN layer.
 Their heterogeneous ANE widths are packed into a small temporary procedure
 bank, so only the predicted winner is eagerly compiled across the full model.
 Persisted model settings are never changed by a tuning run.
@@ -604,7 +604,7 @@ async def _measure_candidate(
 
     tokenizer = engine.tokenizer
     warmup_length = run.request.sequence_length + 1
-    # stream_generate reserves the final token; measure complete prefill tiles.
+    # stream_generate reserves the final token. Measure complete prefill tiles.
     measure_length = (
         run.request.sequence_length * (2 if candidate.backend == "k2" else 4) + 1
     )
@@ -2463,8 +2463,8 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         run.recommendation = None
         run.message = "Inconclusive: the three-minute test budget was reached"
         run.termination_reason = (
-            "The comparisons did not finish. Settings are unchanged; "
-            "you can still enable ANE directly."
+            "The comparisons did not finish. Settings are unchanged. "
+            "You can still enable ANE directly."
         )
     except asyncio.CancelledError:
         run.status = run.phase = "cancelled"
@@ -2478,7 +2478,7 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         terminal = run.status, run.phase, run.message
         run.status = "running"
         run.phase = "cleaning_up"
-        run.message = "Cleaning up the test model…"
+        run.message = "Unloading the test model…"
         try:
             if run.request.model_id in engine_pool.get_loaded_model_ids():
                 await engine_pool._unload_engine(run.request.model_id)

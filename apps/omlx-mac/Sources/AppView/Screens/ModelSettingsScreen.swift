@@ -1146,7 +1146,7 @@ private struct ExperimentalSection: View {
             if vm.isQwen35AnePrefillModel || vm.isK2Base {
                 if vm.isK2Base {
                     Row(label: String(localized: "settings.experimental.k2_ane.label", defaultValue: "K2 ANE Prompt Processing"),
-                        sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Takes effect after reload.")) {
+                        sublabel: String(localized: "settings.experimental.k2_ane.sub", defaultValue: "Use ANE for dense and shared-expert MLP prefill. Attention and decode stay on GPU. Changes take effect after reload.")) {
                         RowSwitch(isOn: vm.bindProfile($vm.k2AnePrefillEnabled))
                     }
                     if vm.k2AnePrefillEnabled {
@@ -1177,7 +1177,7 @@ private struct ExperimentalSection: View {
                 Row(label: String(localized: "settings.experimental.qwen_ane.tuner.label",
                                   defaultValue: "Tune ANE Split",
                                   comment: "Row label for the Qwen ANE/GPU split tuner"),
-                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "Optional test of prompts, eight requests, and cache reuse. Targets three minutes; loading or cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
+                    sublabel: vm.isK2Base ? String(localized: "settings.experimental.k2_ane.tuner.sub", defaultValue: "This optional test compares prompts, eight requests, and cache reuse. It targets three minutes, including reloads. Loading and cleanup can take longer. You can enable ANE without testing.") : String(localized: "settings.experimental.qwen_ane.tuner.sub",
                                      defaultValue: "Calibrates ANE, CPU, and GPU work on real model layers, then verifies the predicted split end to end. Use the result to update the working profile, then save or update that profile to persist it.",
                                      comment: "Sublabel explaining the Qwen ANE/GPU split tuner")) {
                     VStack(alignment: .trailing, spacing: 6) {
