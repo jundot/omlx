@@ -7854,6 +7854,9 @@
             aneTuningRecommendationText() {
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation) return '';
+                if (recommendation.backend === 'k2' && recommendation.reason) {
+                    return window.t(`modal.model_settings.ane_eval_${recommendation.reason}`);
+                }
                 const measured = recommendation.processing_tps !== null
                     && recommendation.processing_tps !== undefined;
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
@@ -7911,6 +7914,26 @@
                 }
                 const speedup = Number(result.speedup_percent);
                 return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+            },
+
+            aneComparisonLabel(result) {
+                return window.t(`modal.model_settings.ane_eval_${result.id}`);
+            },
+
+            aneComparisonValue(result, device) {
+                if (result.unavailable) {
+                    return window.t(`modal.model_settings.ane_eval_${result.unavailable}`);
+                }
+                const value = result[device];
+                return result.unit === 'ms'
+                    ? `${(value / 1000).toFixed(2)} s`
+                    : `${Number(value).toFixed(1)} tok/s`;
+            },
+
+            aneComparisonLatency(result, device) {
+                const value = result[`${device}_ttft_ms`];
+                if (result.unit === 'ms' || value == null) return '';
+                return `${window.t('modal.model_settings.ane_eval_first_token')}: ${(value / 1000).toFixed(2)} s`;
             },
 
             _scheduleANETuningPoll() {

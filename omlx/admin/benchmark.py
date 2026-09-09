@@ -1032,6 +1032,9 @@ async def _run_batch_test(
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
+    *,
+    staggered: bool = False,
+    skip_cache_store: bool = True,
 ) -> dict:
     """Run a continuous batching benchmark test.
 
@@ -1068,27 +1071,44 @@ async def _run_batch_test(
         top_p=1.0,
     )
 
-    async def _single_request(prompt: list[int]) -> dict:
+    first_token_ready = asyncio.Event()
+
+    async def _single_request(prompt: list[int], index: int) -> dict:
         """Run a single request within the batch."""
+        if staggered and index:
+            await first_token_ready.wait()
+            await asyncio.sleep(0.15 * (index - 1))
         start = time.perf_counter()
         first_token = None
         tokens = 0
         prev_tokens = 0
         reported_prompt_tokens = 0
+        cached_tokens = 0
+        finished = False
 
         request_id = await engine_core.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
-            skip_cache_store=True,
+            skip_cache_store=skip_cache_store,
         )
 
-        async for output in engine_core.stream_outputs(request_id):
-            if first_token is None and output.completion_tokens > prev_tokens:
-                first_token = time.perf_counter()
-            prev_tokens = output.completion_tokens
-            if output.finished:
-                tokens = output.completion_tokens
-                reported_prompt_tokens = output.prompt_tokens
+        try:
+            async for output in engine_core.stream_outputs(request_id):
+                if first_token is None and output.completion_tokens > prev_tokens:
+                    first_token = time.perf_counter()
+                    if index == 0:
+                        first_token_ready.set()
+                prev_tokens = output.completion_tokens
+                if output.finished:
+                    finished = True
+                    tokens = output.completion_tokens
+                    reported_prompt_tokens = output.prompt_tokens
+                    cached_tokens = int(getattr(output, "cached_tokens", 0) or 0)
+        finally:
+            if index == 0:
+                first_token_ready.set()
+            if not finished:
+                await engine_core.abort_request(request_id)
 
         end = time.perf_counter()
         if first_token is None:
@@ -1105,6 +1125,7 @@ async def _run_batch_test(
             "first_token_abs": first_token,
             "end_abs": end,
             "completion_tokens": tokens,
+            "cached_tokens": cached_tokens,
         }
 
     # Submit all requests concurrently. Nothing else generates during the
@@ -1115,9 +1136,16 @@ async def _run_batch_test(
         except Exception:
             pass
     wall_start = time.perf_counter()
-    results = await asyncio.gather(
-        *[_single_request(prompts[i]) for i in range(batch_size)]
-    )
+    tasks = [
+        asyncio.create_task(_single_request(prompts[i], i)) for i in range(batch_size)
+    ]
+    try:
+        results = await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     wall_end = time.perf_counter()
     peak_memory = 0
     if HAS_MLX:
@@ -1150,6 +1178,9 @@ async def _run_batch_test(
         "peak_memory_bytes": peak_memory,
         "total_gen_tokens": total_gen_tokens,
         "batch_size": batch_size,
+        "aggregate_tps": total_gen_tokens / max(wall_time, 1e-9),
+        "max_ttft_ms": max(r["ttft_s"] for r in results) * 1000,
+        "cached_tokens": [r["cached_tokens"] for r in results],
     }
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import statistics
 import time
 import uuid
@@ -29,6 +30,7 @@ from .benchmark import (
     _pin_speed_priority,
     _restore_speed_priority,
     _run_single_test,
+    _run_batch_test,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,8 @@ class ANETuningRun:
     results: list[dict[str, Any]] = field(default_factory=list)
     fractions: list[float] = field(default_factory=list)
     recommendation: dict[str, Any] | None = None
+    comparison: list[dict[str, Any]] = field(default_factory=list)
+    evaluation_prompts: dict[str, list[list[int]]] = field(default_factory=dict, repr=False)
     error_message: str = ""
     termination_reason: str = ""
     # Smallest gdn_fraction whose aligned ANE slice covers the z projection
@@ -188,14 +192,17 @@ def _planned_rows() -> list[_Candidate]:
 
 
 def create_run(request: ANETuningRequest) -> ANETuningRun:
-    fractions = _fraction_grid()
-    planned = _planned_rows()
+    fractions = _fraction_grid() if request.backend == "qwen" else []
+    planned = _planned_rows() if request.backend == "qwen" else []
     run = ANETuningRun(
         tuning_id=str(uuid.uuid4()),
         request=request,
         fractions=fractions,
         results=[_empty_result(candidate) for candidate in planned],
     )
+    if request.backend == "k2":
+        _runs[run.tuning_id] = run
+        return run
     # This is an upper bound until the loaded checkpoint tells us whether CPU
     # sharing and GDN are eligible. The live snapshot is reduced afterwards.
     cpu_gate_points = (
@@ -254,6 +261,7 @@ def run_snapshot(run: ANETuningRun) -> dict[str, Any]:
             for result in run.results
         ],
         "recommendation": run.recommendation,
+        "comparison": run.comparison,
         "error": run.error_message or None,
         "termination_reason": run.termination_reason or None,
     }
@@ -591,6 +599,9 @@ async def _measure_candidate(
     prompt = _generate_prompt(
         tokenizer, measure_length, BenchmarkContextProfile.CODE_PYTHON
     )
+    if candidate.backend == "k2":
+        warmup = run.evaluation_prompts.setdefault("warmup", [warmup])[0]
+        prompt = run.evaluation_prompts.setdefault("long", [prompt])[0]
 
     run.message = f"Warming {candidate.label}…"
     async for _ in engine.stream_generate(
@@ -616,6 +627,7 @@ async def _measure_candidate(
             logger.debug("ANE tuner profiling is unavailable", exc_info=True)
 
     samples: list[float] = []
+    ttft_samples: list[float] = []
     traces: list[dict[str, Any] | None] = []
     profile: dict[str, dict[str, float]] = {}
     try:
@@ -624,7 +636,7 @@ async def _measure_candidate(
         # avoid the average-of-two instability seen in repeated tuner runs.
         measurement_repeats = (
             max(3, run.request.repeats)
-            if candidate.enabled
+            if candidate.enabled or candidate.backend == "k2"
             else run.request.repeats
         )
         for sample_index in range(measurement_repeats):
@@ -648,6 +660,8 @@ async def _measure_candidate(
                 ),
             )
             samples.append(float(metrics["processing_tps"]))
+            if candidate.backend == "k2":
+                ttft_samples.append(float(metrics["ttft_ms"]))
             run.message = (
                 f"Testing {candidate.label}: sample {sample_index + 1}/"
                 f"{measurement_repeats} complete · {samples[-1]:.1f} tok/s"
@@ -698,7 +712,7 @@ async def _measure_candidate(
             "disable the path; check the serve log for 'Disabling ANE' warnings."
         )
 
-    return {
+    result = {
         "backend": candidate.backend,
         "shared_fraction": candidate.shared_fraction,
         "label": candidate.label,
@@ -716,6 +730,10 @@ async def _measure_candidate(
         "samples": [round(value, 2) for value in samples],
         "_profile": profile,
     }
+
+    if candidate.backend == "k2":
+        result["workloads"] = await _measure_k2_workloads(run, engine, candidate, ttft_samples)
+    return result
 
 
 def _nearest(value: float, choices: list[float]) -> float:
@@ -2402,23 +2420,7 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             await engine_pool._unload_engine(model_id)
         for slot, candidate in enumerate(candidates):
             await _measure_result_slot(run, slot, engine_pool, base, candidate)
-        baseline = run.results[0]
-        best = max(run.results, key=lambda row: row["processing_tps"])
-        if best["processing_tps"] < baseline["processing_tps"] * 1.03:
-            best = baseline
-        run.recommendation = {
-            key: best.get(key)
-            for key in (
-                "backend",
-                "enabled",
-                "mlp_fraction",
-                "shared_fraction",
-                "processing_tps",
-                "speedup_percent",
-            )
-        }
-        run.recommendation["sequence_length"] = run.request.sequence_length
-        run.recommendation["gdn_enabled"] = False
+        run.recommendation = _select_k2_recommendation(run)
         run.status = run.phase = "completed"
         run.message = "Tuning complete"
     except asyncio.CancelledError:
@@ -2435,3 +2437,179 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
                 await engine_pool._unload_engine(run.request.model_id)
         except Exception:
             logger.warning("Failed to unload model after K2 tuning", exc_info=True)
+
+
+async def _measure_k2_workloads(run, engine, candidate, long_ttft):
+    """Verify each split with short prompts, arrivals during decode, and KV reuse."""
+    for name, length, count in (("short", 256, 1), ("batch", 1024, 8)):
+        if name not in run.evaluation_prompts:
+            run.evaluation_prompts[name] = [
+                _generate_prompt(
+                    engine.tokenizer, length, BenchmarkContextProfile.CODE_PYTHON
+                )
+                for _ in range(count)
+            ]
+    results = {"long_prompt": {"unit": "ms", "samples": long_ttft}}
+    repeats = max(3, run.request.repeats)
+    for name, prompt_key, staggered, cached in (
+        ("short_prompt", "short", False, False),
+        ("concurrent", "batch", False, False),
+        ("staggered", "batch", True, False),
+        ("cached", "batch", False, True),
+    ):
+        unit = "ms" if name == "short_prompt" else "tok/s"
+        if cached and not engine.prefix_cache_enabled:
+            results[name] = {
+                "unit": unit,
+                "samples": [],
+                "unavailable": "cache_disabled",
+            }
+            continue
+        prompts = run.evaluation_prompts[prompt_key]
+        options = dict(
+            engine=engine,
+            prompts=prompts,
+            prompt_tokens=len(prompts[0]),
+            batch_size=len(prompts),
+            staggered=staggered,
+            skip_cache_store=not cached,
+        )
+        if cached:
+            run.message = f"Warming prefix cache: {candidate.label}"
+            await _run_batch_test(max_tokens=2, **options)
+        samples, first_tokens, cache_hits = [], [], []
+        for sample in range(repeats + 1):
+            run.message = f"Testing {candidate.label}: {name.replace('_', ' ')} ({sample}/{repeats})"
+            metrics = await _run_batch_test(max_tokens=128, **options)
+            if cached and not all(metrics["cached_tokens"]):
+                raise RuntimeError(
+                    "The cached-prompt test did not reuse every request's KV prefix"
+                )
+            if sample:
+                samples.append(
+                    metrics["avg_ttft_ms"] if unit == "ms" else metrics["aggregate_tps"]
+                )
+                first_tokens.append(metrics["max_ttft_ms"])
+                cache_hits.append(metrics["cached_tokens"])
+        results[name] = {
+            "unit": unit,
+            "samples": samples,
+            "max_ttft_ms": first_tokens,
+            "cached_tokens": cache_hits,
+        }
+    return results
+
+
+def _k2_comparison(baseline, candidate):
+    required = {"long_prompt", "short_prompt", "concurrent", "staggered", "cached"}
+    if (
+        set(baseline["workloads"]) != required
+        or set(candidate["workloads"]) != required
+    ):
+        raise RuntimeError("ANE evaluation is incomplete")
+    rows = []
+    for name, gpu in baseline["workloads"].items():
+        ane = candidate["workloads"][name]
+        unit = "ms" if name.endswith("prompt") else "tok/s"
+        if gpu["unit"] != unit or ane["unit"] != unit:
+            raise RuntimeError("ANE evaluation returned an invalid unit")
+        if not gpu["samples"] or not ane["samples"]:
+            if (
+                name != "cached"
+                or gpu.get("unavailable") != "cache_disabled"
+                or ane.get("unavailable") != "cache_disabled"
+            ):
+                raise RuntimeError("ANE evaluation is incomplete")
+            rows.append(
+                dict(
+                    id=name,
+                    unit=gpu["unit"],
+                    gpu=None,
+                    ane=None,
+                    improvement_percent=None,
+                    stable=False,
+                    unavailable="cache_disabled",
+                )
+            )
+            continue
+        for measurement in (gpu, ane):
+            sample_groups = [measurement["samples"]]
+            if name != "long_prompt":
+                sample_groups.append(measurement.get("max_ttft_ms", []))
+            for samples in sample_groups:
+                if len(samples) < 3:
+                    raise RuntimeError("ANE evaluation is incomplete")
+                if not all(math.isfinite(value) and value > 0 for value in samples):
+                    raise RuntimeError("ANE evaluation returned an invalid measurement")
+        g, a = statistics.median(gpu["samples"]), statistics.median(ane["samples"])
+        latency = gpu["unit"] == "ms"
+        ratio = g / a if latency else a / g
+        conservative = (
+            min(gpu["samples"]) / max(ane["samples"])
+            if latency
+            else min(ane["samples"]) / max(gpu["samples"])
+        )
+        first_tokens = {}
+        if gpu.get("max_ttft_ms") and ane.get("max_ttft_ms"):
+            conservative = min(
+                conservative, min(gpu["max_ttft_ms"]) / max(ane["max_ttft_ms"])
+            )
+            first_tokens = dict(
+                gpu_ttft_ms=statistics.median(gpu["max_ttft_ms"]),
+                ane_ttft_ms=statistics.median(ane["max_ttft_ms"]),
+            )
+        rows.append(
+            dict(
+                id=name,
+                unit=gpu["unit"],
+                gpu=g,
+                ane=a,
+                improvement_percent=(ratio - 1) * 100,
+                stable=conservative >= 0.97,
+                **first_tokens,
+            )
+        )
+    return rows
+
+
+def _select_k2_recommendation(run):
+    baseline = run.results[0]
+    candidates = []
+    for candidate in run.results[1:]:
+        rows = _k2_comparison(baseline, candidate)
+        measured = [row for row in rows if row["improvement_percent"] is not None]
+        safe = all(row["stable"] for row in measured)
+        gain = any(row["improvement_percent"] >= 3 for row in measured)
+        score = statistics.geometric_mean(
+            1 + row["improvement_percent"] / 100 for row in measured
+        )
+        candidates.append((safe and gain, score, candidate, rows))
+    eligible, _, comparison, run.comparison = max(candidates, key=lambda item: item[:2])
+    best = comparison if eligible else baseline
+    reason = "recommended" if eligible else "no_clear_gain"
+    if not eligible and any(
+        (row["improvement_percent"] or 0) < -3 for row in run.comparison
+    ):
+        reason = "slower"
+    elif not eligible and any(
+        row.get("ane_ttft_ms", 0) > row.get("gpu_ttft_ms", 0) * 1.03
+        for row in run.comparison
+    ):
+        reason = "latency"
+    return {
+        **{
+            key: best.get(key)
+            for key in (
+                "backend",
+                "enabled",
+                "mlp_fraction",
+                "shared_fraction",
+                "processing_tps",
+                "speedup_percent",
+            )
+        },
+        "sequence_length": run.request.sequence_length,
+        "gdn_enabled": False,
+        "reason": reason,
+        "comparison_label": comparison["label"],
+    }

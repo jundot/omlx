@@ -50,6 +50,7 @@ async def test_k2_tuner_preserves_settings_and_unloads(monkeypatch, peak, tmp_pa
         loaded.add("model")
         row = ane_tuning._empty_result(candidate)
         row["processing_tps"] = next(samples)
+        row["workloads"] = workloads(row["processing_tps"])
         return row
 
     monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
@@ -107,3 +108,120 @@ def test_tuner_candidates_follow_dense_and_shared_geometry():
     assert len(dense) == 3
     assert len(sparse) == 3
     assert all(row.shared_fraction > 0 for row in sparse[1:])
+
+
+def workloads(speed=100):
+    return {
+        name: {
+            "unit": "ms" if "prompt" in name else "tok/s",
+            "samples": [10000 / speed if "prompt" in name else speed] * 3,
+            "max_ttft_ms": [10000 / speed] * 3,
+        }
+        for name in ("long_prompt", "short_prompt", "concurrent", "staggered", "cached")
+    }
+
+
+@pytest.mark.parametrize(
+    "regression",
+    [None, "short_prompt", "concurrent", "staggered", "cached", "latency", "noise"],
+)
+def test_k2_verdict_requires_serving_improvement(regression):
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="model", backend="k2")
+    )
+    baseline = dict(
+        label="GPU only",
+        backend="k2",
+        enabled=False,
+        processing_tps=100,
+        workloads=workloads(),
+    )
+    candidate = dict(
+        label="Dense 33%",
+        backend="k2",
+        enabled=True,
+        processing_tps=120,
+        mlp_fraction=1 / 3,
+        workloads=workloads(120),
+    )
+    if regression in candidate["workloads"]:
+        candidate["workloads"][regression] = workloads(80)[regression]
+    if regression == "latency":
+        baseline["workloads"]["concurrent"]["max_ttft_ms"] = [100] * 3
+        candidate["workloads"]["concurrent"]["max_ttft_ms"] = [150] * 3
+    if regression == "noise":
+        candidate["workloads"]["concurrent"]["samples"] = [80, 120, 180]
+    run.results = [baseline, candidate]
+    result = ane_tuning._select_k2_recommendation(run)
+    assert result["enabled"] is (regression is None)
+    assert len(run.comparison) == 5
+    assert result["comparison_label"] == "Dense 33%"
+    assert ane_tuning.run_snapshot(run)["comparison"] == run.comparison
+
+
+def test_k2_verdict_rejects_missing_concurrency_measurement():
+    candidate = {"workloads": workloads(120)}
+    del candidate["workloads"]["staggered"]
+    with pytest.raises(RuntimeError, match="incomplete"):
+        ane_tuning._k2_comparison({"workloads": workloads()}, candidate)
+
+
+@pytest.mark.parametrize("samples", [[], [1], [float("nan")] * 3, [0] * 3])
+def test_k2_verdict_requires_valid_first_token_samples(samples):
+    candidate = {"workloads": workloads(120)}
+    candidate["workloads"]["staggered"]["max_ttft_ms"] = samples
+    with pytest.raises(RuntimeError, match="incomplete|invalid"):
+        ane_tuning._k2_comparison({"workloads": workloads()}, candidate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_enabled,cache_hits", [(True, True), (True, False), (False, False)]
+)
+async def test_k2_evaluation_covers_arrivals_and_proves_cache_reuse(
+    monkeypatch, cache_enabled, cache_hits
+):
+    calls = []
+
+    async def measure(**options):
+        calls.append(options)
+        return {
+            "avg_ttft_ms": 10,
+            "aggregate_tps": 100,
+            "max_ttft_ms": 15,
+            "cached_tokens": [256 if cache_hits else 0] * options["batch_size"],
+        }
+
+    monkeypatch.setattr(ane_tuning, "_run_batch_test", measure)
+    monkeypatch.setattr(
+        ane_tuning, "_generate_prompt", lambda _, length, profile: [1] * length
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="model", backend="k2")
+    )
+    engine = SimpleNamespace(tokenizer=object(), prefix_cache_enabled=cache_enabled)
+    candidate = ane_tuning._Candidate("GPU only", False, backend="k2")
+    if cache_enabled and not cache_hits:
+        with pytest.raises(RuntimeError, match="did not reuse"):
+            await ane_tuning._measure_k2_workloads(run, engine, candidate, [10] * 3)
+        return
+    results = await ane_tuning._measure_k2_workloads(run, engine, candidate, [10] * 3)
+    assert {
+        "short_prompt",
+        "long_prompt",
+        "concurrent",
+        "staggered",
+        "cached",
+    } == results.keys()
+    assert len(results["concurrent"]["samples"]) == 3
+    assert (
+        len([call for call in calls if call["staggered"] and call["batch_size"] == 8])
+        == 4
+    )
+    if cache_enabled:
+        assert all(all(row) for row in results["cached"]["cached_tokens"])
+        assert any(
+            call["max_tokens"] == 2 and not call["skip_cache_store"] for call in calls
+        )
+    else:
+        assert results["cached"]["unavailable"] == "cache_disabled"
