@@ -2666,7 +2666,7 @@ class TestEnginePoolPrefillEviction:
         assert f"phys_footprint={released_gb:.2f}GB" in decisions[1]
 
 
-class TestEnginePoolStatus:
+class TestEnginePoolStatusIsLoading:
     """Tests for get_status is_loading field."""
 
     def test_get_status_includes_is_loading(self, small_mock_model_dir):
