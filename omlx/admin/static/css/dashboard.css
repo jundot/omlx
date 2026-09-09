@@ -240,6 +240,198 @@
     .model-card-content img { max-width: 100%; border-radius: 0.5rem; margin: 0.5rem 0; }
     .model-card-content h1:first-child { margin-top: 0; }
 
+    /* ===================================================================
+       Cluster
+       Component styles for the cluster dashboard. These build on the CSS
+       custom property system defined above (--bg-primary, --text-primary,
+       --border-faint, etc.) and support dark mode via data-theme="dark".
+       =================================================================== */
+
+    /* === Cluster: card shell === */
+    .cluster-card {
+        background-color: var(--bg-primary);
+        border: 1px solid var(--border-faint);
+        border-radius: 1rem;
+        overflow: hidden;
+    }
+    .cluster-card__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 1rem 1.5rem;
+        background-color: var(--bg-tertiary);
+        border-bottom: 1px solid var(--border-faint);
+    }
+    .cluster-card__body {
+        padding: 1.5rem;
+    }
+
+    /* === Cluster: capacity bar === */
+    .cluster-capacity-bar {
+        display: flex;
+        width: 100%;
+        height: 0.34rem;
+        border-radius: 999px;
+        overflow: hidden;
+        background-color: var(--border-faint);
+    }
+    .cluster-capacity-bar__weights {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #6366f1, #818cf8);
+        transition: width 220ms ease;
+    }
+    .cluster-capacity-bar__kv {
+        display: block;
+        height: 100%;
+        background: linear-gradient(90deg, #0891b2, #22d3ee);
+        box-shadow: 0 0 9px rgba(34, 211, 238, 0.32);
+        transition: width 220ms ease;
+    }
+
+    /* === Cluster: health score ring === */
+    .cluster-health-ring {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 999px;
+        border: 2px solid var(--border-faint);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 700;
+    }
+    .cluster-health-ring--ok {
+        border-color: #22c55e;
+        color: #16a34a;
+    }
+    .cluster-health-ring--warn {
+        border-color: #f59e0b;
+        color: #d97706;
+    }
+    .cluster-health-ring--error {
+        border-color: #ef4444;
+        color: #dc2626;
+    }
+
+    /* === Cluster: node row === */
+    .cluster-node-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-secondary);
+    }
+    .cluster-node-row__identity {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        min-width: 0;
+    }
+    .cluster-node-row__icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 0.5rem;
+        flex-shrink: 0;
+    }
+    .cluster-node-row__icon--local {
+        background-color: var(--bg-tertiary);
+        color: var(--text-secondary);
+    }
+    .cluster-node-row__icon--worker {
+        background-color: rgba(34, 197, 94, 0.1);
+        color: #16a34a;
+    }
+    .cluster-node-row__name {
+        overflow: hidden;
+        font-size: 0.875rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .cluster-node-row__detail {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+    }
+
+    /* === Cluster: model row === */
+    .cluster-model-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-primary);
+        text-align: left;
+        transition: border-color 150ms ease, background-color 150ms ease;
+        width: 100%;
+    }
+    .cluster-model-row:hover {
+        border-color: var(--text-muted);
+    }
+    .cluster-model-row--selected {
+        border-color: var(--text-primary);
+        background-color: var(--text-primary);
+        color: var(--bg-primary);
+    }
+    .cluster-model-row__icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 0.5rem;
+        flex-shrink: 0;
+    }
+    .cluster-model-row__icon--default {
+        background-color: rgba(59, 130, 246, 0.1);
+        color: #2563eb;
+    }
+    .cluster-model-row__info {
+        display: flex;
+        min-width: 0;
+        flex: 1;
+        flex-direction: column;
+        gap: 0.125rem;
+    }
+
+    /* === Cluster: expand/collapse toggle === */
+    .cluster-toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background-color: var(--bg-primary);
+        text-align: left;
+        transition: background-color 150ms ease;
+    }
+    .cluster-toggle:hover {
+        background-color: var(--bg-secondary);
+    }
+    .cluster-toggle__chevron {
+        width: 1rem;
+        height: 1rem;
+        color: var(--text-muted);
+        transition: transform 150ms ease;
+    }
+    .cluster-toggle[aria-expanded="true"] .cluster-toggle__chevron {
+        transform: rotate(180deg);
+    }
+
     /* === Cluster neural fabric === */
     .cluster-fabric {
         position: relative;
