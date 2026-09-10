@@ -306,6 +306,7 @@ class ChatCompletionRequest(BaseModel):
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
+    parallel_tool_calls: bool | None = None
     # Structured output
     response_format: Optional[Union[ResponseFormat, dict]] = None
     # vLLM-compatible structured output (grammar, regex, choice, json)
