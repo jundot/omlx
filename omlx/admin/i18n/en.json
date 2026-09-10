@@ -1201,5 +1201,7 @@
   "usage.delayed": "History may be incomplete: storage is delayed or the pending buffer overflowed.",
   "usage.loading": "Loading usage…",
   "usage.disabled": "Usage history is off. Turn it on in Settings → Usage History.",
-  "usage.open_settings": "Open Settings"
+  "usage.open_settings": "Open Settings",
+  "modal.model_settings.repetition_context_size": "Repetition Context Size",
+  "modal.model_settings.repetition_context_size_hint": "Number of prior tokens considered for repetition penalty. Default: 20."
 }
