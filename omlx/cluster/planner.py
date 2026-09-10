@@ -615,6 +615,8 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
     if not isinstance(model_type, str):
         return False
     if supports_model_type(model_type):
@@ -640,7 +642,9 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
     model_type = config.get("model_type")
-    if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
+    if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "qwen4_exp_text"}:
         values.extend(
             (
                 _config_int(config, "linear_num_key_heads", 1),
@@ -748,6 +752,8 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
+    if not model_type and isinstance(config.get("text_config"), dict):
+        model_type = config["text_config"].get("model_type")
     if not isinstance(model_type, str):
         return False
     # An architecture oMLX explicitly vouches for wins, even a VLM: the

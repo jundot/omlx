@@ -52,6 +52,11 @@ NEMOTRON_H = TensorStrategy(
     model_types=("nemotron_h",),
     source="oMLX adapter derived from Exo's attention/Mamba/MoE strategy",
 )
+QWEN4_EXP = TensorStrategy(
+    name="qwen4_exp",
+    model_types=("qwen4_exp", "qwen4_exp_text"),
+    source="oMLX adapter for Qwen4/qwen4_exp hybrid linear/full attention with resident and SSD-sharded PLE",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -450,7 +455,7 @@ def _shard_qwen3_next(
                     group=group,
                 )
             layer.mlp = _wrap_sharded_moe(mlp, group, mx)
-        else:
+        elif hasattr(mlp, "gate_proj"):
             mlp.gate_proj = shard_linear(
                 mlp.gate_proj, "all-to-sharded", group=group
             )
@@ -465,6 +470,188 @@ def _shard_qwen3_next(
         _emit(
             progress,
             strategy=QWEN3_NEXT.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
+@_register(QWEN4_EXP)
+def _shard_qwen4_exp(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
+    layers = list(model.layers)
+    size = int(group.size())
+    rank = int(group.rank())
+    total = len(layers)
+
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        is_linear = (
+            getattr(layer, "layer_type", None) == "linear_attention"
+            or hasattr(layer, "linear_attn")
+            or getattr(layer, "is_linear", False)
+        )
+        if is_linear:
+            attention = layer.linear_attn
+            _require_divisible(attention.n_k, size, "linear key heads")
+            _require_divisible(attention.n_v, size, "linear value heads")
+
+            key_dim = int(attention.key_dim)
+            value_dim = int(attention.value_dim)
+            key_shard = key_dim // size
+            value_shard = value_dim // size
+            nv_shard = int(attention.n_v) // size
+
+            # In Qwen4_exp GatedDeltaNet, in_proj_qkv projects to [key_dim (Q), key_dim (K), value_dim (V)].
+            # Rank r slices Q, K, and V chunks contiguously:
+            indices = mx.concatenate(
+                [
+                    mx.arange(rank * key_shard, (rank + 1) * key_shard),
+                    mx.arange(
+                        key_dim + rank * key_shard,
+                        key_dim + (rank + 1) * key_shard,
+                    ),
+                    mx.arange(
+                        2 * key_dim + rank * value_shard,
+                        2 * key_dim + (rank + 1) * value_shard,
+                    ),
+                ]
+            )
+            attention.in_proj_qkv.weight = mx.contiguous(
+                attention.in_proj_qkv.weight[indices]
+            )
+            if getattr(attention.in_proj_qkv, "bias", None) is not None:
+                attention.in_proj_qkv.bias = mx.contiguous(
+                    attention.in_proj_qkv.bias[indices]
+                )
+
+            # in_proj_z maps hidden_size -> value_dim (split evenly across ranks)
+            attention.in_proj_z = shard_linear(
+                attention.in_proj_z,
+                "all-to-sharded",
+                group=group,
+            )
+
+            # in_proj_b and in_proj_a map hidden_size -> n_v heads
+            attention.in_proj_b = shard_linear(
+                attention.in_proj_b,
+                "all-to-sharded",
+                group=group,
+            )
+            attention.in_proj_a = shard_linear(
+                attention.in_proj_a,
+                "all-to-sharded",
+                group=group,
+            )
+
+            # Depthwise conv1d matches the in_proj_qkv channel split
+            attention.conv1d.weight = mx.contiguous(
+                attention.conv1d.weight[indices]
+            )
+            if getattr(attention.conv1d, "bias", None) is not None:
+                attention.conv1d.bias = mx.contiguous(
+                    attention.conv1d.bias[indices]
+                )
+            attention.conv1d.groups = key_shard * 2 + value_shard
+
+            # Decay and dt biases match the value heads slice
+            attention.A_log = mx.contiguous(
+                attention.A_log[rank * nv_shard : (rank + 1) * nv_shard]
+            )
+            attention.dt_bias = mx.contiguous(
+                attention.dt_bias[rank * nv_shard : (rank + 1) * nv_shard]
+            )
+
+            # Row-parallel out_proj maps value_shard -> hidden_size and all-reduces
+            attention.out_proj = shard_linear(
+                attention.out_proj,
+                "sharded-to-all",
+                group=group,
+            )
+
+            attention.n_k //= size
+            attention.n_v //= size
+            attention.key_dim = key_shard
+            attention.value_dim = value_shard
+            attention.conv_dim = key_shard * 2 + value_shard
+        else:
+            attention = layer.self_attn
+            _require_divisible(
+                attention.num_attention_heads,
+                size,
+                "attention heads",
+            )
+            _require_divisible(
+                attention.num_key_value_heads,
+                size,
+                "KV heads",
+            )
+            attention.q_proj = shard_linear(
+                attention.q_proj,
+                "all-to-sharded",
+                group=group,
+            )
+            attention.k_proj = shard_linear(
+                attention.k_proj,
+                "all-to-sharded",
+                group=group,
+            )
+            attention.v_proj = shard_linear(
+                attention.v_proj,
+                "all-to-sharded",
+                group=group,
+            )
+            attention.o_proj = shard_linear(
+                attention.o_proj,
+                "sharded-to-all",
+                group=group,
+            )
+            attention.num_attention_heads //= size
+            attention.num_key_value_heads //= size
+
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            for name, sharding in (
+                ("gate_proj", "all-to-sharded"),
+                ("down_proj", "sharded-to-all"),
+                ("up_proj", "all-to-sharded"),
+            ):
+                shard_inplace(
+                    getattr(mlp.switch_mlp, name),
+                    sharding,
+                    group=group,
+                )
+                if hasattr(mlp, "shared_expert") and hasattr(
+                    mlp.shared_expert, name
+                ):
+                    shard_inplace(
+                        getattr(mlp.shared_expert, name),
+                        sharding,
+                        group=group,
+                    )
+            layer.mlp = _wrap_sharded_moe(mlp, group, mx)
+        elif hasattr(mlp, "gate_proj"):
+            mlp.gate_proj = shard_linear(
+                mlp.gate_proj, "all-to-sharded", group=group
+            )
+            mlp.down_proj = shard_linear(
+                mlp.down_proj, "sharded-to-all", group=group
+            )
+            mlp.up_proj = shard_linear(
+                mlp.up_proj, "all-to-sharded", group=group
+            )
+
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=QWEN4_EXP.name,
             layer=index,
             loaded=index + 1,
             total=total,
@@ -646,6 +833,7 @@ def apply_tensor_strategy(
 
 __all__ = [
     "NEMOTRON_H",
+    "QWEN4_EXP",
     "QWEN3_NEXT",
     "TensorStrategy",
     "apply_tensor_strategy",
